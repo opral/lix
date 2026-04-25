@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use crate::backend::TransactionBeginMode;
-use crate::binary_cas::BlobDataReader;
+use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::engine2::live_state::CommittedLiveStateContext;
 use crate::engine2::live_state::LiveStateContext;
 use crate::engine2::schema_registry::SchemaRegistry;
@@ -29,6 +28,7 @@ pub(crate) struct Transaction<'a> {
     active_version_id: String,
     backend: &'a Arc<dyn LixBackend + Send + Sync>,
     committed_live_state: Arc<CommittedLiveStateContext>,
+    binary_cas: Arc<BinaryCasContext>,
     staged_writes: Arc<TransactionStagedWrites>,
     backend_transaction: Box<dyn LixBackendTransaction + 'a>,
     visible_schemas: Vec<JsonValue>,
@@ -42,6 +42,7 @@ impl<'a> Transaction<'a> {
         active_version_id: String,
         backend: &'a Arc<dyn LixBackend + Send + Sync>,
         committed_live_state: Arc<CommittedLiveStateContext>,
+        binary_cas: Arc<BinaryCasContext>,
         schema_registry: Arc<SchemaRegistry>,
         functions: DynFunctionProvider,
     ) -> Result<Self, LixError> {
@@ -60,6 +61,7 @@ impl<'a> Transaction<'a> {
             active_version_id,
             backend,
             committed_live_state,
+            binary_cas,
             staged_writes,
             backend_transaction,
             visible_schemas,
@@ -74,7 +76,12 @@ impl<'a> Transaction<'a> {
     /// does not produce canonical commit graph rows yet.
     pub(crate) async fn commit(mut self) -> Result<TransactionCommitOutcome, LixError> {
         let staged_writes = self.staged_writes.drain()?;
-        commit::commit_staged_writes(self.backend_transaction.as_mut(), staged_writes).await?;
+        commit::commit_staged_writes(
+            &self.binary_cas,
+            self.backend_transaction.as_mut(),
+            staged_writes,
+        )
+        .await?;
         self.backend_transaction.commit().await?;
         Ok(TransactionCommitOutcome::default())
     }
@@ -113,7 +120,7 @@ impl SqlExecutionContext for Transaction<'_> {
 
     /// Provides blob reads for file/data surfaces during SQL execution.
     fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
-        Arc::new(TransactionBackendBlobReader(Arc::clone(self.backend)))
+        Arc::clone(&self.binary_cas) as Arc<dyn BlobDataReader>
     }
 
     /// Provides the transaction-scoped write stager used by DataFusion provider
@@ -139,14 +146,4 @@ fn transaction_live_state(
     Ok(Arc::new(TransactionLiveStateContext::new(
         committed, staged,
     )))
-}
-
-struct TransactionBackendBlobReader(Arc<dyn LixBackend + Send + Sync>);
-
-#[async_trait]
-impl BlobDataReader for TransactionBackendBlobReader {
-    /// Loads blob bytes from the backend CAS for SQL file/data reads.
-    async fn load_blob_data_by_hash(&self, blob_hash: &str) -> Result<Option<Vec<u8>>, LixError> {
-        crate::binary_cas::load_blob_data_by_hash(self.0.as_ref(), blob_hash).await
-    }
 }

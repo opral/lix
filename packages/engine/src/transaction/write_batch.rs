@@ -27,6 +27,7 @@ impl WriteBatch {
         });
     }
 
+    #[allow(dead_code)]
     pub(crate) fn extend(&mut self, other: WriteBatch) {
         self.steps.extend(other.steps);
     }

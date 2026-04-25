@@ -190,8 +190,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::binary_cas::binary_blob_store_relation_name;
-    use crate::{LixBackendTransaction, QueryResult, SqlDialect, Value};
+    use crate::binary_cas::kv::{
+        KvBlobManifest, KvBlobManifestChunk, KvChunk, BINARY_CAS_CHUNK_NAMESPACE,
+        BINARY_CAS_MANIFEST_CHUNK_NAMESPACE, BINARY_CAS_MANIFEST_NAMESPACE,
+    };
+    use crate::{KvPair, KvScanRange, LixBackendTransaction, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
     use std::io::{Cursor, Write};
     use zip::write::SimpleFileOptions;
@@ -221,16 +224,73 @@ mod tests {
                     columns: Vec::new(),
                 });
             }
-            if sql.contains(binary_blob_store_relation_name()) {
-                return Ok(QueryResult {
-                    rows: vec![vec![Value::Blob(self.archive_bytes.clone())]],
-                    columns: Vec::new(),
-                });
-            }
             Ok(QueryResult {
                 rows: Vec::new(),
                 columns: Vec::new(),
             })
+        }
+
+        async fn kv_get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
+            match (namespace, key) {
+                (BINARY_CAS_MANIFEST_NAMESPACE, b"blob-plugin-json") => {
+                    serde_json::to_vec(&KvBlobManifest {
+                        size_bytes: self.archive_bytes.len() as u64,
+                        chunk_count: 1,
+                    })
+                    .map(Some)
+                    .map_err(|error| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!("test manifest encode failed: {error}"),
+                        )
+                    })
+                }
+                (BINARY_CAS_CHUNK_NAMESPACE, b"chunk-plugin-json") => {
+                    serde_json::to_vec(&KvChunk {
+                        codec: "raw".to_string(),
+                        codec_dict_id: None,
+                        data: self.archive_bytes.clone(),
+                    })
+                    .map(Some)
+                    .map_err(|error| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!("test chunk encode failed: {error}"),
+                        )
+                    })
+                }
+                _ => Ok(None),
+            }
+        }
+
+        async fn kv_scan(
+            &self,
+            namespace: &str,
+            range: KvScanRange,
+            _limit: Option<usize>,
+        ) -> Result<Vec<KvPair>, LixError> {
+            if namespace != BINARY_CAS_MANIFEST_CHUNK_NAMESPACE {
+                return Ok(Vec::new());
+            }
+            let key = b"blob-plugin-json/00000000000000000000".to_vec();
+            let include = match range {
+                KvScanRange::Prefix(prefix) => key.starts_with(&prefix),
+                KvScanRange::Range { start, end } => key >= start && key < end,
+            };
+            if !include {
+                return Ok(Vec::new());
+            }
+            let value = serde_json::to_vec(&KvBlobManifestChunk {
+                chunk_hash: "chunk-plugin-json".to_string(),
+                chunk_size: self.archive_bytes.len() as u64,
+            })
+            .map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("test manifest chunk encode failed: {error}"),
+                )
+            })?;
+            Ok(vec![KvPair::new(key, value)])
         }
 
         async fn begin_transaction(

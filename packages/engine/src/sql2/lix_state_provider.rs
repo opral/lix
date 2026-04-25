@@ -1377,7 +1377,6 @@ mod tests {
         LixStateUpdateExec,
     };
     use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest, LiveStateScanRequest};
-    use crate::sql2::StateRow;
     use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateRow};
     use crate::transaction::{PendingOverlay, PreparedWriteStatementStager, TransactionWriteDelta};
     use crate::{LixError, NullableKeyFilter};
@@ -1505,11 +1504,14 @@ mod tests {
 
     #[async_trait]
     impl LiveStateContext for EmptyLiveStateContext {
-        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
+        async fn scan_rows(
+            &self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<Vec<StateRow>, LixError> {
             Ok(vec![])
         }
 
-        async fn load_exact(
+        async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
         ) -> Result<Option<StateRow>, LixError> {
@@ -1519,11 +1521,14 @@ mod tests {
 
     #[async_trait]
     impl LiveStateContext for RowsLiveStateContext {
-        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
+        async fn scan_rows(
+            &self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<Vec<StateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
-        async fn load_exact(
+        async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
         ) -> Result<Option<StateRow>, LixError> {
