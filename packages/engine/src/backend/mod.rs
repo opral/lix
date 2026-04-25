@@ -19,5 +19,5 @@ pub use kv::{KvPair, KvScanRange};
 pub use prepared::{PreparedBatch, PreparedStatement};
 pub(crate) use transaction_adapter::TransactionBackendAdapter;
 pub use transaction_mode::TransactionBeginMode;
-pub use types::{LixBackend, LixBackendTransaction};
 pub(crate) use types::{transaction_backend_view, QueryExecutor};
+pub use types::{LixBackend, LixBackendTransaction};

@@ -136,7 +136,7 @@ impl RowRef<'_> {
 
 impl Session {
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
-        let committed_live_state: Arc<dyn crate::live_state::LiveStateContext> =
+        let committed_live_state: Arc<dyn crate::engine2::live_state::LiveStateContext> =
             self.committed_live_state.clone();
         let visible_schemas = self
             .schema_registry

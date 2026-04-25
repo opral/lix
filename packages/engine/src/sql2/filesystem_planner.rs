@@ -9,7 +9,6 @@ use crate::common::{
     directory_ancestor_paths, directory_name_from_path, normalize_directory_path,
     parent_directory_path, stable_content_fingerprint_hex, ParsedFilePath,
 };
-use crate::live_state::LiveRow;
 use crate::LixError;
 
 use super::execute::{FileDataWrite, StateRow};
@@ -481,7 +480,7 @@ pub(crate) fn plan_recursive_directory_delete(
 }
 
 pub(crate) fn directory_path_resolvers_from_state_rows(
-    rows: Vec<LiveRow>,
+    rows: Vec<StateRow>,
 ) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
     let mut directory_rows = BTreeMap::<String, BTreeMap<String, DirectoryDescriptorSeed>>::new();
     for row in rows {
@@ -630,8 +629,6 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use serde_json::Value as JsonValue;
-
-    use crate::live_state::LiveRow;
 
     use super::{
         blob_ref_row, directory_descriptor_row, file_descriptor_row, plan_file_path_update,
@@ -1189,8 +1186,8 @@ mod tests {
         }
     }
 
-    fn live_directory_row(entity_id: &str, version_id: &str, snapshot_content: &str) -> LiveRow {
-        LiveRow {
+    fn live_directory_row(entity_id: &str, version_id: &str, snapshot_content: &str) -> StateRow {
+        StateRow {
             entity_id: entity_id.to_string(),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id: None,

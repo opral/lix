@@ -3,8 +3,8 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use crate::engine2::live_state::{LiveStateRowRequest, LiveStateScanRequest};
 use crate::functions::{DynFunctionProvider, LixFunctionProvider};
-use crate::live_state::{ExactRowRequest, LiveRow, LiveStateScanRequest};
 use crate::sql2::{FileDataWrite, SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateRow};
 use crate::{LixError, NullableKeyFilter};
 
@@ -111,18 +111,12 @@ impl StagedStateRowOverlay {
     }
 
     /// Returns staged rows visible for a scan request.
-    pub(crate) fn scan(&self, request: &LiveStateScanRequest) -> Vec<LiveRow> {
+    pub(crate) fn scan(&self, request: &LiveStateScanRequest) -> Vec<StateRow> {
         self.rows
             .values()
             .filter(|row| staged_row_matches_scan(row, request))
-            .map(|row| live_row_from_state_row_ref(row))
-            .collect::<Result<Vec<_>, _>>()
-            .expect("engine2 staged rows should already be normalized")
-    }
-
-    /// Converts staged rows for commit into the live_state adapter shape.
-    pub(crate) fn into_live_rows(rows: Vec<StateRow>) -> Result<Vec<LiveRow>, LixError> {
-        rows.into_iter().map(live_row_from_state_row).collect()
+            .cloned()
+            .collect()
     }
 
     /// Returns staged identities that should suppress committed rows.
@@ -141,23 +135,20 @@ impl StagedStateRowOverlay {
     }
 
     /// Returns a staged exact-row answer, if this transaction has one.
-    pub(crate) fn load_exact(&self, request: &ExactRowRequest) -> Option<StagedExactRow> {
+    pub(crate) fn load_exact(&self, request: &LiveStateRowRequest) -> Option<StagedExactRow> {
         let identity = StagedStateRowIdentity::from_exact_request(request)?;
         self.rows.get(&identity).map(|row| {
             if row.snapshot_content.is_none() {
                 StagedExactRow::Tombstone
             } else {
-                StagedExactRow::Row(
-                    live_row_from_state_row_ref(row)
-                        .expect("engine2 staged rows should already be normalized"),
-                )
+                StagedExactRow::Row(row.clone())
             }
         })
     }
 }
 
 pub(crate) enum StagedExactRow {
-    Row(LiveRow),
+    Row(StateRow),
     Tombstone,
 }
 
@@ -181,17 +172,7 @@ impl StagedStateRowIdentity {
         }
     }
 
-    pub(crate) fn from_live_row(row: &LiveRow) -> Self {
-        Self {
-            untracked: row.untracked,
-            schema_key: row.schema_key.clone(),
-            entity_id: row.entity_id.clone(),
-            file_id: row.file_id.clone(),
-            version_id: row.version_id.clone(),
-        }
-    }
-
-    fn from_exact_request(request: &ExactRowRequest) -> Option<Self> {
+    fn from_exact_request(request: &LiveStateRowRequest) -> Option<Self> {
         let file_id = match &request.file_id {
             NullableKeyFilter::Null => None,
             NullableKeyFilter::Value(value) => Some(value.clone()),
@@ -263,36 +244,6 @@ fn normalize_state_row(
     Ok(row)
 }
 
-pub(crate) fn live_row_from_state_row(row: StateRow) -> Result<LiveRow, LixError> {
-    let schema_version = row.schema_version.ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "engine2 staged write requires schema_version for staging overlay",
-        )
-    })?;
-
-    Ok(LiveRow {
-        entity_id: row.entity_id,
-        file_id: row.file_id,
-        schema_key: row.schema_key,
-        schema_version,
-        version_id: row.version_id,
-        plugin_key: row.plugin_key,
-        metadata: row.metadata,
-        change_id: row.change_id,
-        commit_id: row.commit_id,
-        global: row.global,
-        untracked: row.untracked,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        snapshot_content: row.snapshot_content,
-    })
-}
-
-fn live_row_from_state_row_ref(row: &StateRow) -> Result<LiveRow, LixError> {
-    live_row_from_state_row(row.clone())
-}
-
 fn staged_row_matches_scan(row: &StateRow, request: &LiveStateScanRequest) -> bool {
     staged_row_identity_matches_scan(row, request)
         && (row.snapshot_content.is_some() || request.filter.include_tombstones)
@@ -338,8 +289,8 @@ fn nullable_key_matches_filter(value: &Option<String>, filter: &NullableKeyFilte
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine2::live_state::{LiveStateFilter, LiveStateRowRequest};
     use crate::functions::SharedFunctionProvider;
-    use crate::live_state::{ExactRowRequest, LiveStateFilter};
 
     #[tokio::test]
     async fn staging_overlay_uses_last_staged_row_for_exact_load() {
@@ -359,7 +310,7 @@ mod tests {
             .staging_overlay()
             .expect("overlay should build from staged rows");
         let row = overlay
-            .load_exact(&ExactRowRequest {
+            .load_exact(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: "global".to_string(),
                 entity_id: "sql2-duplicate-key".to_string(),
@@ -645,8 +596,8 @@ mod tests {
         }
     }
 
-    fn exact_request_for_key(key: &str) -> ExactRowRequest {
-        ExactRowRequest {
+    fn exact_request_for_key(key: &str) -> LiveStateRowRequest {
+        LiveStateRowRequest {
             schema_key: "lix_key_value".to_string(),
             version_id: "global".to_string(),
             entity_id: key.to_string(),

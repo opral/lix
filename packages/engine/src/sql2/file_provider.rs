@@ -27,10 +27,10 @@ use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 
 use crate::binary_cas::BlobDataReader;
-use crate::functions::DynFunctionProvider;
-use crate::live_state::{
-    LiveRow, LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
+use crate::engine2::live_state::{
+    LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
 };
+use crate::functions::DynFunctionProvider;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
@@ -599,7 +599,7 @@ impl ExecutionPlan for LixFileDeleteExec {
 
         let stream = stream::once(async move {
             let rows = live_state
-                .scan(&request)
+                .scan_rows(&request)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             let blob_ref_file_ids =
@@ -762,7 +762,7 @@ impl ExecutionPlan for LixFileUpdateExec {
 
         let stream = stream::once(async move {
             let rows = live_state
-                .scan(&request)
+                .scan_rows(&request)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             let source_batch = lix_file_record_batch(&table_schema, &blob_reader, rows)
@@ -919,7 +919,7 @@ impl ExecutionPlan for LixFileScanExec {
         let schema = Arc::clone(&self.schema);
         let batch_schema = Arc::clone(&schema);
         let fut = async move {
-            let rows = live_state.scan(&request).await.map_err(|error| {
+            let rows = live_state.scan_rows(&request).await.map_err(|error| {
                 DataFusionError::Execution(format!("sql2 lix_file scan failed: {error}"))
             })?;
             let batch = lix_file_record_batch(&batch_schema, &blob_reader, rows)
@@ -1092,7 +1092,7 @@ struct FileDescriptorRecord {
     name: String,
     extension: Option<String>,
     hidden: bool,
-    live: LiveRow,
+    live: StateRow,
 }
 
 #[derive(Debug, Clone)]
@@ -1646,7 +1646,7 @@ fn lix_file_delete_stage_from_batch(
 }
 
 fn blob_ref_file_ids_from_live_rows(
-    rows: &[LiveRow],
+    rows: &[StateRow],
 ) -> std::result::Result<BTreeSet<String>, LixError> {
     let mut file_ids = BTreeSet::new();
     for row in rows {
@@ -2011,7 +2011,7 @@ async fn file_path_resolvers_from_live_state(
     default_version_id: Option<&str>,
 ) -> std::result::Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
     let rows = live_state
-        .scan(&LiveStateScanRequest {
+        .scan_rows(&LiveStateScanRequest {
             filter: LiveStateFilter {
                 schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
                 version_ids: default_version_id
@@ -2034,7 +2034,7 @@ async fn file_path_resolvers_from_live_state(
 async fn lix_file_record_batch(
     schema: &SchemaRef,
     blob_reader: &Arc<dyn BlobDataReader>,
-    rows: Vec<LiveRow>,
+    rows: Vec<StateRow>,
 ) -> Result<RecordBatch, LixError> {
     let projected_columns = schema
         .fields()
@@ -2174,7 +2174,7 @@ async fn lix_file_record_batch(
         schema_keys.push(Some(file.live.schema_key));
         file_ids.push(file.live.file_id);
         plugin_keys.push(file.live.plugin_key);
-        schema_versions.push(Some(file.live.schema_version));
+        schema_versions.push(file.live.schema_version);
         globals.push(Some(file.live.global));
         change_ids.push(file.live.change_id);
         created_ats.push(file.live.created_at);
@@ -2619,10 +2619,11 @@ mod tests {
     use futures_util::stream;
     use serde_json::Value as JsonValue;
 
+    use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest, LiveStateScanRequest};
     use crate::functions::{
         DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
     };
-    use crate::live_state::{ExactRowRequest, LiveRow, LiveStateContext, LiveStateScanRequest};
+    use crate::sql2::StateRow;
     use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager};
     use crate::LixError;
 
@@ -2658,25 +2659,25 @@ mod tests {
 
     #[derive(Default)]
     struct RowsLiveStateContext {
-        rows: Vec<LiveRow>,
+        rows: Vec<StateRow>,
     }
 
     #[async_trait]
     impl LiveStateContext for RowsLiveStateContext {
-        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<LiveRow>, LixError> {
+        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
         async fn load_exact(
             &self,
-            _request: &ExactRowRequest,
-        ) -> Result<Option<LiveRow>, LixError> {
+            _request: &LiveStateRowRequest,
+        ) -> Result<Option<StateRow>, LixError> {
             Ok(None)
         }
     }
 
-    fn live_directory_row(entity_id: &str, version_id: &str, snapshot_content: &str) -> LiveRow {
-        LiveRow {
+    fn live_directory_row(entity_id: &str, version_id: &str, snapshot_content: &str) -> StateRow {
+        StateRow {
             entity_id: entity_id.to_string(),
             schema_key: super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
             file_id: None,

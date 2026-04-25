@@ -3,7 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::backend::{KvPair, KvScanRange, LixBackend, LixBackendTransaction, TransactionBeginMode};
+use crate::backend::{
+    KvPair, KvScanRange, LixBackend, LixBackendTransaction, TransactionBeginMode,
+};
 use crate::common::SqlDialect;
 use crate::{LixError, QueryResult, Value};
 
@@ -104,10 +106,7 @@ impl LixBackendTransaction for UnitTestTransaction {
     }
 
     async fn kv_get(&mut self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
-        Ok(self
-            .kv
-            .get(&(namespace.to_string(), key.to_vec()))
-            .cloned())
+        Ok(self.kv.get(&(namespace.to_string(), key.to_vec())).cloned())
     }
 
     async fn kv_scan(
@@ -143,12 +142,7 @@ impl LixBackendTransaction for UnitTestTransaction {
     }
 }
 
-fn scan_map(
-    kv: &KvMap,
-    namespace: &str,
-    range: &KvScanRange,
-    limit: Option<usize>,
-) -> Vec<KvPair> {
+fn scan_map(kv: &KvMap, namespace: &str, range: &KvScanRange, limit: Option<usize>) -> Vec<KvPair> {
     let mut pairs = kv
         .iter()
         .filter(|((candidate_namespace, key), _)| {

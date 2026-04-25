@@ -29,8 +29,8 @@ use futures_util::{stream, StreamExt, TryStreamExt};
 use serde_json::Value as JsonValue;
 
 use crate::common::{derive_entity_id_from_json_paths, EntityIdDerivationError};
-use crate::live_state::{
-    LiveRow, LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
+use crate::engine2::live_state::{
+    LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
@@ -614,7 +614,7 @@ impl ExecutionPlan for EntityDeleteExec {
                 Vec::new()
             } else {
                 live_state
-                    .scan(&request)
+                    .scan_rows(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?
             };
@@ -779,7 +779,7 @@ impl ExecutionPlan for EntityUpdateExec {
                 Vec::new()
             } else {
                 live_state
-                    .scan(&request)
+                    .scan_rows(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?
             };
@@ -1360,7 +1360,7 @@ impl ExecutionPlan for EntityScanExec {
                 Vec::new()
             } else {
                 live_state
-                    .scan(&request)
+                    .scan_rows(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?
             };
@@ -1396,7 +1396,7 @@ fn entity_live_state_scan_request(
 fn entity_record_batch(
     spec: &EntitySurfaceSpec,
     schema: SchemaRef,
-    rows: &[LiveRow],
+    rows: &[StateRow],
 ) -> Result<RecordBatch> {
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
@@ -1421,7 +1421,7 @@ fn entity_record_batch(
 fn entity_column_array(
     spec: &EntitySurfaceSpec,
     column_name: &str,
-    rows: &[LiveRow],
+    rows: &[StateRow],
     snapshots: &[Option<JsonValue>],
 ) -> Result<ArrayRef> {
     if let Some(property_name) = column_name.strip_prefix("lixcol_") {
@@ -1467,7 +1467,7 @@ fn entity_column_array(
     })
 }
 
-fn entity_system_column_array(column_name: &str, rows: &[LiveRow]) -> Result<ArrayRef> {
+fn entity_system_column_array(column_name: &str, rows: &[StateRow]) -> Result<ArrayRef> {
     Ok(match column_name {
         "entity_id" => string_array(rows.iter().map(|row| Some(row.entity_id.as_str()))),
         "schema_key" => string_array(rows.iter().map(|row| Some(row.schema_key.as_str()))),
@@ -1475,7 +1475,7 @@ fn entity_system_column_array(column_name: &str, rows: &[LiveRow]) -> Result<Arr
         "plugin_key" => string_array(rows.iter().map(|row| row.plugin_key.as_deref())),
         "snapshot_content" => string_array(rows.iter().map(|row| row.snapshot_content.as_deref())),
         "metadata" => string_array(rows.iter().map(|row| row.metadata.as_deref())),
-        "schema_version" => string_array(rows.iter().map(|row| Some(row.schema_version.as_str()))),
+        "schema_version" => string_array(rows.iter().map(|row| row.schema_version.as_deref())),
         "created_at" => string_array(rows.iter().map(|row| row.created_at.as_deref())),
         "updated_at" => string_array(rows.iter().map(|row| row.updated_at.as_deref())),
         "global" => Arc::new(BooleanArray::from(
@@ -1843,7 +1843,8 @@ mod tests {
         entity_record_batch, entity_surface_schema, schema_exposed_as_entity_surface,
         EntityColumnType, EntityInsertSink, EntityProviderVariant,
     };
-    use crate::live_state::{ExactRowRequest, LiveRow, LiveStateContext, LiveStateScanRequest};
+    use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest, LiveStateScanRequest};
+    use crate::sql2::StateRow;
     use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateRow};
     use crate::LixError;
 
@@ -1855,14 +1856,14 @@ mod tests {
 
     #[async_trait]
     impl LiveStateContext for EmptyLiveStateContext {
-        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<LiveRow>, LixError> {
+        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
             Ok(vec![])
         }
 
         async fn load_exact(
             &self,
-            _request: &ExactRowRequest,
-        ) -> Result<Option<LiveRow>, LixError> {
+            _request: &LiveStateRowRequest,
+        ) -> Result<Option<StateRow>, LixError> {
             Ok(None)
         }
     }
@@ -1875,8 +1876,8 @@ mod tests {
         }
     }
 
-    fn live_row() -> LiveRow {
-        LiveRow {
+    fn live_row() -> StateRow {
+        StateRow {
             entity_id: "entity-1".to_string(),
             schema_key: "project_message".to_string(),
             file_id: None,

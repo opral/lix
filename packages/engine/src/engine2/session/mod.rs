@@ -4,11 +4,12 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use crate::binary_cas::BlobDataReader;
+use crate::engine2::live_state::CommittedLiveStateContext;
+use crate::engine2::live_state::LiveStateContext;
 use crate::engine2::schema_registry::SchemaRegistry;
 use crate::functions::{
     DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
 };
-use crate::live_state::{CommittedLiveStateContext, LiveStateContext};
 use crate::sql2::SqlExecutionContext;
 use crate::{LixBackend, LixError};
 

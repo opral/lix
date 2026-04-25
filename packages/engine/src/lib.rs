@@ -36,7 +36,9 @@ pub use api::BootKeyValue;
 pub use api::{InitResult, Lix, LixConfig};
 pub(crate) use backend::QueryExecutor;
 pub use backend::TransactionBeginMode;
-pub use backend::{LixBackend, LixBackendTransaction, PreparedBatch, PreparedStatement};
+pub use backend::{
+    KvPair, KvScanRange, LixBackend, LixBackendTransaction, PreparedBatch, PreparedStatement,
+};
 pub use canonical::CanonicalJson;
 pub use canonical::{CanonicalCommitReceipt, UpdatedVersionRef};
 pub use common::LixError;
