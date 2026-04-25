@@ -1,15 +1,13 @@
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lix_engine::engine2::ExecuteResult;
-use lix_engine::wasm::NoopWasmRuntime;
 use lix_engine::{
-    Engine, KvPair, KvScanRange, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError,
-    PreparedBatch, QueryResult, SqlDialect, TransactionBeginMode, Value,
+    Engine, KvPair, KvScanRange, LixBackend, LixBackendTransaction, LixError, PreparedBatch,
+    QueryResult, SqlDialect, TransactionBeginMode, Value,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Column, Row, SqlitePool, ValueRef};
+use sqlx::{Row, SqlitePool};
 use tokio::sync::OnceCell;
 
 const TEST_KV_TABLE: &str = "lix_internal_kv";
@@ -26,22 +24,13 @@ fn session_execute_inserts_key_value_then_reads_it_back() {
                 .expect("failed to build tokio runtime");
             runtime.block_on(async {
                 let sqlite_uri = shared_memory_sqlite_uri("key_value_roundtrip");
-                let initializer = Lix::boot(LixConfig::new(
-                    Box::new(SqliteBackend::new(sqlite_uri.clone())),
-                    Arc::new(NoopWasmRuntime),
-                ));
-                initializer
-                    .initialize()
-                    .await
-                    .expect("backend initialization should succeed");
-
                 let engine = Engine::new(Box::new(SqliteBackend::new(sqlite_uri)))
                     .await
-                    .expect("initialized backend should create an engine");
+                    .expect("backend should create an engine");
                 let session = engine
                     .open_session("global")
                     .await
-                    .expect("initialized backend should open a session");
+                    .expect("backend should open a session");
 
                 let uuid_result = session
                     .execute("SELECT lix_uuid_v7()", &[])
@@ -90,7 +79,6 @@ fn session_execute_inserts_key_value_then_reads_it_back() {
 
                 drop(session);
                 drop(engine);
-                drop(initializer);
             });
         })
         .expect("failed to spawn sql2 test thread")
@@ -110,22 +98,13 @@ fn session_execute_registers_schema_then_writes_lix_state_row() {
                 .expect("failed to build tokio runtime");
             runtime.block_on(async {
                 let sqlite_uri = shared_memory_sqlite_uri("registered_schema_lix_state");
-                let initializer = Lix::boot(LixConfig::new(
-                    Box::new(SqliteBackend::new(sqlite_uri.clone())),
-                    Arc::new(NoopWasmRuntime),
-                ));
-                initializer
-                    .initialize()
-                    .await
-                    .expect("backend initialization should succeed");
-
                 let engine = Engine::new(Box::new(SqliteBackend::new(sqlite_uri)))
                     .await
-                    .expect("initialized backend should create an engine");
+                    .expect("backend should create an engine");
                 let session = engine
                     .open_session("global")
                     .await
-                    .expect("initialized backend should open a session");
+                    .expect("backend should open a session");
 
                 let register_schema_result = session
                     .execute(
@@ -179,7 +158,6 @@ fn session_execute_registers_schema_then_writes_lix_state_row() {
 
                 drop(session);
                 drop(engine);
-                drop(initializer);
             });
         })
         .expect("failed to spawn sql2 registered schema test thread")
@@ -199,22 +177,13 @@ fn session_execute_inserts_directory_then_reads_it_back() {
                 .expect("failed to build tokio runtime");
             runtime.block_on(async {
                 let sqlite_uri = shared_memory_sqlite_uri("directory_roundtrip");
-                let initializer = Lix::boot(LixConfig::new(
-                    Box::new(SqliteBackend::new(sqlite_uri.clone())),
-                    Arc::new(NoopWasmRuntime),
-                ));
-                initializer
-                    .initialize()
-                    .await
-                    .expect("backend initialization should succeed");
-
                 let engine = Engine::new(Box::new(SqliteBackend::new(sqlite_uri)))
                     .await
-                    .expect("initialized backend should create an engine");
+                    .expect("backend should create an engine");
                 let session = engine
                     .open_session("global")
                     .await
-                    .expect("initialized backend should open a session");
+                    .expect("backend should open a session");
 
                 let insert_result = session
                     .execute(
@@ -274,7 +243,6 @@ fn session_execute_inserts_directory_then_reads_it_back() {
 
                 drop(session);
                 drop(engine);
-                drop(initializer);
             });
         })
         .expect("failed to spawn sql2 directory test thread")
@@ -294,22 +262,13 @@ fn session_execute_inserts_file_then_reads_it_back() {
                 .expect("failed to build tokio runtime");
             runtime.block_on(async {
                 let sqlite_uri = shared_memory_sqlite_uri("file_roundtrip");
-                let initializer = Lix::boot(LixConfig::new(
-                    Box::new(SqliteBackend::new(sqlite_uri.clone())),
-                    Arc::new(NoopWasmRuntime),
-                ));
-                initializer
-                    .initialize()
-                    .await
-                    .expect("backend initialization should succeed");
-
                 let engine = Engine::new(Box::new(SqliteBackend::new(sqlite_uri)))
                     .await
-                    .expect("initialized backend should create an engine");
+                    .expect("backend should create an engine");
                 let session = engine
                     .open_session("global")
                     .await
-                    .expect("initialized backend should open a session");
+                    .expect("backend should open a session");
 
                 let file_result = session
                     .execute(
@@ -386,7 +345,6 @@ fn session_execute_inserts_file_then_reads_it_back() {
 
                 drop(session);
                 drop(engine);
-                drop(initializer);
             });
         })
         .expect("failed to spawn sql2 file test thread")
@@ -406,22 +364,13 @@ fn session_execute_updates_file_path_and_preserves_data() {
                 .expect("failed to build tokio runtime");
             runtime.block_on(async {
                 let sqlite_uri = shared_memory_sqlite_uri("file_path_update");
-                let initializer = Lix::boot(LixConfig::new(
-                    Box::new(SqliteBackend::new(sqlite_uri.clone())),
-                    Arc::new(NoopWasmRuntime),
-                ));
-                initializer
-                    .initialize()
-                    .await
-                    .expect("backend initialization should succeed");
-
                 let engine = Engine::new(Box::new(SqliteBackend::new(sqlite_uri)))
                     .await
-                    .expect("initialized backend should create an engine");
+                    .expect("backend should create an engine");
                 let session = engine
                     .open_session("global")
                     .await
-                    .expect("initialized backend should open a session");
+                    .expect("backend should open a session");
 
                 let insert_result = session
                     .execute(
@@ -506,7 +455,6 @@ fn session_execute_updates_file_path_and_preserves_data() {
 
                 drop(session);
                 drop(engine);
-                drop(initializer);
             });
         })
         .expect("failed to spawn sql2 file path update test thread")
@@ -526,22 +474,13 @@ fn session_execute_deletes_directory_recursively() {
                 .expect("failed to build tokio runtime");
             runtime.block_on(async {
                 let sqlite_uri = shared_memory_sqlite_uri("recursive_directory_delete");
-                let initializer = Lix::boot(LixConfig::new(
-                    Box::new(SqliteBackend::new(sqlite_uri.clone())),
-                    Arc::new(NoopWasmRuntime),
-                ));
-                initializer
-                    .initialize()
-                    .await
-                    .expect("backend initialization should succeed");
-
                 let engine = Engine::new(Box::new(SqliteBackend::new(sqlite_uri)))
                     .await
-                    .expect("initialized backend should create an engine");
+                    .expect("backend should create an engine");
                 let session = engine
                     .open_session("global")
                     .await
-                    .expect("initialized backend should open a session");
+                    .expect("backend should open a session");
 
                 let file_result = session
                     .execute(
@@ -649,7 +588,6 @@ fn session_execute_deletes_directory_recursively() {
 
                 drop(session);
                 drop(engine);
-                drop(initializer);
             });
         })
         .expect("failed to spawn sql2 recursive directory delete test thread")
@@ -711,21 +649,8 @@ impl LixBackend for SqliteBackend {
         SqlDialect::Sqlite
     }
 
-    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        let mut transaction = self
-            .begin_transaction(TransactionBeginMode::Deferred)
-            .await?;
-        let result = transaction.execute(sql, params).await;
-        match result {
-            Ok(result) => {
-                transaction.commit().await?;
-                Ok(result)
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
+    async fn execute(&self, _sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+        Err(sql_execute_unsupported_error())
     }
 
     async fn begin_transaction(
@@ -801,8 +726,8 @@ impl LixBackendTransaction for SqliteTransaction {
         self.mode
     }
 
-    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        execute_query_with_connection(&mut self.conn, sql, params).await
+    async fn execute(&mut self, _sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+        Err(sql_execute_unsupported_error())
     }
 
     async fn kv_get(&mut self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
@@ -876,28 +801,8 @@ impl LixBackendTransaction for SqliteTransaction {
         Ok(())
     }
 
-    async fn execute_batch(&mut self, batch: &PreparedBatch) -> Result<QueryResult, LixError> {
-        for step in &batch.steps {
-            if step.sql.trim().is_empty() {
-                continue;
-            }
-            let mut query = sqlx::query(step.sql.as_str()).persistent(false);
-            for param in &step.params {
-                query = bind_param_sqlite(query, param);
-            }
-            query
-                .execute(&mut *self.conn)
-                .await
-                .map_err(|err| LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!("{} | sql: {}", err, step.sql),
-                    hint: None,
-                })?;
-        }
-        Ok(QueryResult {
-            rows: Vec::new(),
-            columns: Vec::new(),
-        })
+    async fn execute_batch(&mut self, _batch: &PreparedBatch) -> Result<QueryResult, LixError> {
+        Err(sql_execute_unsupported_error())
     }
 
     async fn commit(mut self: Box<Self>) -> Result<(), LixError> {
@@ -915,80 +820,6 @@ impl LixBackendTransaction for SqliteTransaction {
             .map_err(to_lix_error)?;
         Ok(())
     }
-}
-
-async fn execute_query_with_connection(
-    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
-    sql: &str,
-    params: &[Value],
-) -> Result<QueryResult, LixError> {
-    let mut query = sqlx::query(sql).persistent(false);
-    for param in params {
-        query = bind_param_sqlite(query, param);
-    }
-
-    let rows = query.fetch_all(&mut **conn).await.map_err(|err| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("{} | sql: {}", err, sql),
-        hint: None,
-    })?;
-    let columns = rows
-        .first()
-        .map(|row| {
-            row.columns()
-                .iter()
-                .map(|column| column.name().to_string())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    let mut result_rows = Vec::with_capacity(rows.len());
-    for row in rows {
-        let mut out = Vec::with_capacity(row.columns().len());
-        for i in 0..row.columns().len() {
-            out.push(map_sqlite_value(&row, i)?);
-        }
-        result_rows.push(out);
-    }
-
-    Ok(QueryResult {
-        rows: result_rows,
-        columns,
-    })
-}
-
-fn bind_param_sqlite<'q>(
-    query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
-    param: &'q Value,
-) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
-    match param {
-        Value::Null => query.bind(Option::<i64>::None),
-        Value::Boolean(value) => query.bind(*value),
-        Value::Integer(value) => query.bind(*value),
-        Value::Real(value) => query.bind(*value),
-        Value::Text(value) => query.bind(value.as_str()),
-        Value::Json(value) => query.bind(value.to_string()),
-        Value::Blob(value) => query.bind(value.as_slice()),
-    }
-}
-
-fn map_sqlite_value(row: &sqlx::sqlite::SqliteRow, index: usize) -> Result<Value, LixError> {
-    if row.try_get_raw(index).map_err(to_lix_error)?.is_null() {
-        return Ok(Value::Null);
-    }
-    if let Ok(value) = row.try_get::<i64, _>(index) {
-        return Ok(Value::Integer(value));
-    }
-    if let Ok(value) = row.try_get::<f64, _>(index) {
-        return Ok(Value::Real(value));
-    }
-    if let Ok(value) = row.try_get::<String, _>(index) {
-        return Ok(Value::Text(value));
-    }
-    if let Ok(value) = row.try_get::<Vec<u8>, _>(index) {
-        return Ok(Value::Blob(value));
-    }
-    Ok(Value::Null)
 }
 
 async fn ensure_kv_table(
@@ -1013,6 +844,13 @@ fn kv_key_in_range(key: &[u8], range: &KvScanRange) -> bool {
         KvScanRange::Prefix(prefix) => key.starts_with(prefix),
         KvScanRange::Range { start, end } => key >= start.as_slice() && key < end.as_slice(),
     }
+}
+
+fn sql_execute_unsupported_error() -> LixError {
+    LixError::new(
+        "LIX_ERROR_UNKNOWN",
+        "engine2 test backend does not support SQL execution",
+    )
 }
 
 fn to_lix_error(error: impl std::fmt::Display) -> LixError {

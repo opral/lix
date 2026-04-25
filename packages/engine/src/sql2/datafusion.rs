@@ -1493,36 +1493,10 @@ async fn materialize_live_file_data_provider(
 
 async fn load_live_file_payload_bytes(
     backend: &dyn LixBackend,
-    file_id: &str,
-    version_id: &str,
+    _file_id: &str,
+    _version_id: &str,
     blob_hash: &str,
 ) -> Result<Option<Vec<u8>>, LixError> {
-    let cached = backend
-        .execute(
-            "SELECT data \
-             FROM lix_internal_file_data_cache \
-             WHERE file_id = $1 AND version_id = $2 \
-             LIMIT 1",
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-            ],
-        )
-        .await?;
-    if let Some(row) = cached.rows.first() {
-        return match row.first() {
-            Some(Value::Blob(bytes)) => Ok(Some(bytes.clone())),
-            Some(Value::Null) => Ok(None),
-            Some(other) => Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "sql2 expected blob cache payload for file '{file_id}' version '{version_id}', got {other:?}"
-                ),
-            )),
-            None => Ok(None),
-        };
-    }
-
     crate::binary_cas::load_blob_data_by_hash(backend, blob_hash).await
 }
 
