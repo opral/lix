@@ -1,5 +1,5 @@
-use crate::engine2::transaction::staging::StagedStateRowOverlay;
-use crate::sql2::StateRow;
+use crate::binary_cas::BinaryBlobWrite;
+use crate::engine2::transaction::staging::{StagedStateRowOverlay, StagedWriteSet};
 use crate::{LixBackendTransaction, LixError};
 
 /// Flushes transaction-staged state rows into live_state.
@@ -13,9 +13,22 @@ use crate::{LixBackendTransaction, LixError};
 /// live_state catch up from canonical state.
 pub(crate) async fn commit_staged_writes(
     transaction: &mut dyn LixBackendTransaction,
-    state_rows: Vec<StateRow>,
+    staged_writes: StagedWriteSet,
 ) -> Result<(), LixError> {
-    let live_rows = StagedStateRowOverlay::into_live_rows(state_rows)?;
+    if !staged_writes.file_data_writes.is_empty() {
+        let blob_writes = staged_writes
+            .file_data_writes
+            .iter()
+            .map(|write| BinaryBlobWrite {
+                file_id: &write.file_id,
+                version_id: &write.version_id,
+                data: &write.data,
+            })
+            .collect::<Vec<_>>();
+        crate::binary_cas::persist_blob_writes_in_transaction(transaction, &blob_writes).await?;
+    }
+
+    let live_rows = StagedStateRowOverlay::into_live_rows(staged_writes.state_rows)?;
     if live_rows.is_empty() {
         return Ok(());
     }
