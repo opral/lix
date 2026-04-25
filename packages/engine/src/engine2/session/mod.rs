@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
-use crate::binary_cas::BlobDataReader;
+use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::engine2::live_state::CommittedLiveStateContext;
 use crate::engine2::live_state::LiveStateContext;
 use crate::engine2::schema_registry::SchemaRegistry;
@@ -22,6 +22,7 @@ pub struct Session {
     active_version_id: String,
     backend: Arc<dyn LixBackend + Send + Sync>,
     committed_live_state: Arc<CommittedLiveStateContext>,
+    binary_cas: Arc<BinaryCasContext>,
     schema_registry: Arc<SchemaRegistry>,
     functions: DynFunctionProvider,
 }
@@ -31,12 +32,14 @@ impl Session {
         active_version_id: String,
         backend: Arc<dyn LixBackend + Send + Sync>,
         committed_live_state: Arc<CommittedLiveStateContext>,
+        binary_cas: Arc<BinaryCasContext>,
         schema_registry: Arc<SchemaRegistry>,
     ) -> Result<Self, LixError> {
         Ok(Self::new(
             active_version_id,
             backend,
             committed_live_state,
+            binary_cas,
             schema_registry,
         ))
     }
@@ -45,12 +48,14 @@ impl Session {
         active_version_id: String,
         backend: Arc<dyn LixBackend + Send + Sync>,
         committed_live_state: Arc<CommittedLiveStateContext>,
+        binary_cas: Arc<BinaryCasContext>,
         schema_registry: Arc<SchemaRegistry>,
     ) -> Self {
         Self {
             active_version_id,
             backend,
             committed_live_state,
+            binary_cas,
             schema_registry,
             // The session owns the function source so reads, writes, UDFs, and
             // provider-side staging can share one execution lineage.
@@ -69,8 +74,8 @@ impl Session {
 
 struct SessionSqlExecutionContext<'a> {
     active_version_id: &'a str,
-    backend: Arc<dyn LixBackend + Send + Sync>,
     committed_live_state: Arc<CommittedLiveStateContext>,
+    binary_cas: Arc<BinaryCasContext>,
     visible_schemas: Vec<JsonValue>,
     functions: DynFunctionProvider,
 }
@@ -90,7 +95,7 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
     }
 
     fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
-        Arc::new(BackendBlobReader(Arc::clone(&self.backend)))
+        Arc::clone(&self.binary_cas) as Arc<dyn BlobDataReader>
     }
 
     fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError> {
@@ -99,11 +104,9 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
     }
 }
 
-struct BackendBlobReader(Arc<dyn LixBackend + Send + Sync>);
-
 #[async_trait]
-impl BlobDataReader for BackendBlobReader {
+impl BlobDataReader for BinaryCasContext {
     async fn load_blob_data_by_hash(&self, blob_hash: &str) -> Result<Option<Vec<u8>>, LixError> {
-        crate::binary_cas::load_blob_data_by_hash(self.0.as_ref(), blob_hash).await
+        self.load_blob_data_by_hash(blob_hash).await
     }
 }

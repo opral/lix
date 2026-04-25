@@ -144,8 +144,8 @@ impl Session {
             .await?;
         let ctx = SessionSqlExecutionContext {
             active_version_id: self.active_version_id(),
-            backend: Arc::clone(&self.backend),
             committed_live_state: Arc::clone(&self.committed_live_state),
+            binary_cas: Arc::clone(&self.binary_cas),
             visible_schemas,
             functions: self.functions.clone(),
         };
@@ -159,6 +159,7 @@ impl Session {
                 self.active_version_id().to_string(),
                 &self.backend,
                 Arc::clone(&self.committed_live_state),
+                Arc::clone(&self.binary_cas),
                 Arc::clone(&self.schema_registry),
                 self.functions.clone(),
             )

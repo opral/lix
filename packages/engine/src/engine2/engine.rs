@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::binary_cas::BinaryCasContext;
 use crate::engine2::live_state::CommittedLiveStateContext;
 use crate::engine2::schema_registry::SchemaRegistry;
 use crate::engine2::session::Session;
@@ -9,6 +10,7 @@ use crate::{LixBackend, LixError};
 pub struct Engine {
     backend: Arc<dyn LixBackend + Send + Sync>,
     committed_live_state: Arc<CommittedLiveStateContext>,
+    binary_cas: Arc<BinaryCasContext>,
     schema_registry: Arc<SchemaRegistry>,
 }
 
@@ -38,13 +40,12 @@ impl Engine {
         //     Arc::clone(&backend),
         // ));
 
-        // let binary_cas_state = Arc::new(BinaryCasStateContext::new(Arc::clone(&backend)));
-        //
         // Session::execute later projects these stable state contexts into one
         // execution-scoped SQL context, optionally wrapped by a transaction
         // overlay for writes.
 
         Ok(Self {
+            binary_cas: Arc::new(BinaryCasContext::new(Arc::clone(&backend))),
             backend,
             committed_live_state,
             schema_registry: Arc::new(SchemaRegistry::new()),
@@ -63,6 +64,7 @@ impl Engine {
             active_version_id.into(),
             self.backend(),
             Arc::clone(&self.committed_live_state),
+            Arc::clone(&self.binary_cas),
             Arc::clone(&self.schema_registry),
         )
         .await

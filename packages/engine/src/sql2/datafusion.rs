@@ -1523,31 +1523,7 @@ async fn load_live_file_payload_bytes(
         };
     }
 
-    let inline = backend
-        .execute(
-            &format!(
-                "SELECT data \
-                 FROM {} \
-                 WHERE blob_hash = $1 \
-                 LIMIT 1",
-                crate::binary_cas::binary_blob_store_relation_name(),
-            ),
-            &[Value::Text(blob_hash.to_string())],
-        )
-        .await?;
-    if let Some(row) = inline.rows.first() {
-        return match row.first() {
-            Some(Value::Blob(bytes)) => Ok(Some(bytes.clone())),
-            Some(Value::Null) => Ok(None),
-            Some(other) => Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("sql2 expected inline blob payload for hash '{blob_hash}', got {other:?}"),
-            )),
-            None => Ok(None),
-        };
-    }
-
-    Ok(None)
+    crate::binary_cas::load_blob_data_by_hash(backend, blob_hash).await
 }
 
 async fn register_filesystem_history_view_with_state_history_provider(

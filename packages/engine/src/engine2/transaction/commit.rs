@@ -1,4 +1,4 @@
-use crate::binary_cas::BinaryBlobWrite;
+use crate::binary_cas::{BinaryBlobWrite, BinaryCasContext};
 use crate::engine2::live_state::write_state_rows;
 use crate::engine2::transaction::staging::StagedWriteSet;
 use crate::{LixBackendTransaction, LixError};
@@ -13,6 +13,7 @@ use crate::{LixBackendTransaction, LixError};
 /// generation. The future path should create commit graph rows first, then let
 /// live_state catch up from canonical state.
 pub(crate) async fn commit_staged_writes(
+    binary_cas: &BinaryCasContext,
     transaction: &mut dyn LixBackendTransaction,
     staged_writes: StagedWriteSet,
 ) -> Result<(), LixError> {
@@ -26,7 +27,10 @@ pub(crate) async fn commit_staged_writes(
                 data: &write.data,
             })
             .collect::<Vec<_>>();
-        crate::binary_cas::persist_blob_writes_in_transaction(transaction, &blob_writes).await?;
+        binary_cas
+            .writer(transaction)
+            .put_blob_writes(&blob_writes)
+            .await?;
     }
 
     if staged_writes.state_rows.is_empty() {
