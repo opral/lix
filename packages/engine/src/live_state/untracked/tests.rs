@@ -90,6 +90,7 @@ async fn live_untracked_state_roundtrips_helper_rows() {
             version_id: active_version_storage_version_id().to_string(),
             entity_id: "active-row".to_string(),
             file_id: NullableKeyFilter::Null,
+            untracked: true,
         },
     )
     .await
@@ -108,6 +109,7 @@ async fn live_untracked_state_roundtrips_helper_rows() {
             version_id: "global".to_string(),
             entity_id: "main".to_string(),
             file_id: NullableKeyFilter::Null,
+            untracked: true,
         },
     )
     .await
@@ -223,6 +225,7 @@ async fn live_untracked_state_delete_removes_rows() {
             version_id: "global".to_string(),
             entity_id: "main".to_string(),
             file_id: NullableKeyFilter::Null,
+            untracked: true,
         },
     )
     .await

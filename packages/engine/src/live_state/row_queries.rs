@@ -345,6 +345,7 @@ async fn load_exact_tracked_row(
             version_id: request.version_id.clone(),
             entity_id: request.entity_id.clone(),
             file_id: request.file_id.clone(),
+            untracked: false,
         },
     )
     .await?
@@ -365,6 +366,7 @@ async fn load_exact_tracked_row(
             version_id: request.version_id.clone(),
             entity_id: request.entity_id.clone(),
             file_id: request.file_id.clone(),
+            untracked: false,
         },
     )
     .await?;
@@ -393,6 +395,7 @@ async fn load_exact_untracked_row(
             version_id: request.version_id.clone(),
             entity_id: request.entity_id.clone(),
             file_id: request.file_id.clone(),
+            untracked: true,
         },
     )
     .await?;
@@ -544,6 +547,7 @@ async fn load_exact_untracked_row_for_lane(
             version_id: lane_version_id(&request.version_id, lane),
             entity_id: request.entity_id.clone(),
             file_id: request.file_id.clone(),
+            untracked: true,
         },
     )
     .await?;
@@ -615,6 +619,7 @@ async fn load_version_head_commit_id_from_live_row(
             version_id: version_ref_storage_version_id().to_string(),
             entity_id: version_id.to_string(),
             file_id: NullableKeyFilter::Null,
+            untracked: true,
         },
     )
     .await?

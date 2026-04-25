@@ -263,6 +263,7 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
             version_id: "main".to_string(),
             entity_id: "edge-1".to_string(),
             file_id: NullableKeyFilter::Null,
+            untracked: false,
         },
     )
     .await
@@ -281,6 +282,7 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
             version_id: "global".to_string(),
             entity_id: "main".to_string(),
             file_id: NullableKeyFilter::Null,
+            untracked: true,
         },
     )
     .await
@@ -399,6 +401,7 @@ async fn isolated_transaction_rollback_discards_staged_writes() {
             version_id: "main".to_string(),
             entity_id: "edge-1".to_string(),
             file_id: NullableKeyFilter::Null,
+            untracked: false,
         },
     )
     .await
@@ -412,6 +415,7 @@ async fn isolated_transaction_rollback_discards_staged_writes() {
             version_id: "global".to_string(),
             entity_id: "main".to_string(),
             file_id: NullableKeyFilter::Null,
+            untracked: true,
         },
     )
     .await

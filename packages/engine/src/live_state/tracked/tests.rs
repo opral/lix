@@ -94,6 +94,7 @@ async fn live_tracked_state_tombstones_hide_rows() {
             version_id: "main".to_string(),
             entity_id: "edge-1".to_string(),
             file_id: NullableKeyFilter::Null,
+            untracked: false,
         },
     )
     .await

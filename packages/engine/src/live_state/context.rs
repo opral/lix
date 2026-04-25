@@ -210,10 +210,10 @@ impl LiveStateContext for CommittedLiveStateContext {
             schema_version: None,
             plugin_key: crate::NullableKeyFilter::Any,
             global: None,
-            untracked: None,
+            untracked: Some(request.untracked),
             include_tombstones: false,
             include_global_overlay: true,
-            include_untracked_overlay: true,
+            include_untracked_overlay: request.untracked,
         };
         let backend = self.backend();
         let mut row = super::load_exact_live_row(backend, &query).await?;

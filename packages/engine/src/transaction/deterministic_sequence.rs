@@ -90,6 +90,7 @@ async fn load_runtime_sequence_untracked_row_with_executor(
             version_id: GLOBAL_VERSION_ID.to_string(),
             entity_id: deterministic_sequence_key().to_string(),
             file_id: NullableKeyFilter::Null,
+            untracked: true,
         },
     )
     .await

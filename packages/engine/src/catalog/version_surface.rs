@@ -246,6 +246,7 @@ async fn load_version_surface_row(
             version_id: GLOBAL_VERSION_ID.to_string(),
             entity_id: version_id.to_string(),
             file_id: NullableKeyFilter::Null,
+            untracked: false,
         },
     )
     .await?

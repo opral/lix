@@ -21,6 +21,7 @@ pub(crate) async fn load_create_commit_deterministic_sequence_start(
             version_id: GLOBAL_VERSION_ID.to_string(),
             entity_id: deterministic_sequence_key().to_string(),
             file_id: NullableKeyFilter::Null,
+            untracked: true,
         },
     )
     .await?;
@@ -67,6 +68,7 @@ pub(crate) async fn load_untracked_file_descriptor(
             version_id: version_id.to_string(),
             entity_id: file_id.to_string(),
             file_id: NullableKeyFilter::Null,
+            untracked: true,
         },
     )
     .await?
