@@ -1,16 +1,16 @@
-use crate::backend::KvScanRange;
+use crate::backend::{KvScanRange, KvStore, KvWriter};
 use crate::engine2::untracked_state::{
     UntrackedStateIdentity, UntrackedStateRow, UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
-use crate::{LixBackend, LixBackendTransaction, LixError, NullableKeyFilter};
+use crate::{LixError, NullableKeyFilter};
 
 const UNTRACKED_STATE_ROW_NAMESPACE: &str = "untracked_state.row";
 
 pub(crate) async fn scan_rows(
-    backend: &(dyn LixBackend + Send + Sync),
+    store: &mut impl KvStore,
     request: &UntrackedStateScanRequest,
 ) -> Result<Vec<UntrackedStateRow>, LixError> {
-    let mut rows = scan_all_untracked_rows(backend).await?;
+    let mut rows = scan_all_untracked_rows(store).await?;
     rows.retain(|row| row_matches_scan(row, request));
     if let Some(limit) = request.limit {
         rows.truncate(limit);
@@ -19,32 +19,13 @@ pub(crate) async fn scan_rows(
 }
 
 pub(crate) async fn load_row(
-    backend: &(dyn LixBackend + Send + Sync),
+    store: &mut impl KvStore,
     request: &UntrackedStateRowRequest,
 ) -> Result<Option<UntrackedStateRow>, LixError> {
     let Some(identity) = identity_from_request(request) else {
         return Ok(None);
     };
-    let Some(bytes) = backend
-        .kv_get(
-            UNTRACKED_STATE_ROW_NAMESPACE,
-            &encode_untracked_state_row_key(&identity),
-        )
-        .await?
-    else {
-        return Ok(None);
-    };
-    decode_untracked_state_row(&bytes).map(Some)
-}
-
-pub(crate) async fn load_row_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    request: &UntrackedStateRowRequest,
-) -> Result<Option<UntrackedStateRow>, LixError> {
-    let Some(identity) = identity_from_request(request) else {
-        return Ok(None);
-    };
-    let Some(bytes) = transaction
+    let Some(bytes) = store
         .kv_get(
             UNTRACKED_STATE_ROW_NAMESPACE,
             &encode_untracked_state_row_key(&identity),
@@ -57,34 +38,34 @@ pub(crate) async fn load_row_in_transaction(
 }
 
 pub(crate) async fn write_rows(
-    transaction: &mut dyn LixBackendTransaction,
+    writer: &mut impl KvWriter,
     rows: &[UntrackedStateRow],
 ) -> Result<(), LixError> {
     for row in rows {
         let identity = UntrackedStateIdentity::from_row(row);
         if row.snapshot_content.is_none() {
-            delete_untracked_row(transaction, &identity).await?;
+            delete_untracked_row(writer, &identity).await?;
         } else {
-            put_untracked_row(transaction, row, &identity).await?;
+            put_untracked_row(writer, row, &identity).await?;
         }
     }
     Ok(())
 }
 
 pub(crate) async fn delete_rows(
-    transaction: &mut dyn LixBackendTransaction,
+    writer: &mut impl KvWriter,
     identities: &[UntrackedStateIdentity],
 ) -> Result<(), LixError> {
     for identity in identities {
-        delete_untracked_row(transaction, identity).await?;
+        delete_untracked_row(writer, identity).await?;
     }
     Ok(())
 }
 
 async fn scan_all_untracked_rows(
-    backend: &(dyn LixBackend + Send + Sync),
+    store: &mut impl KvStore,
 ) -> Result<Vec<UntrackedStateRow>, LixError> {
-    backend
+    store
         .kv_scan(
             UNTRACKED_STATE_ROW_NAMESPACE,
             KvScanRange::prefix(Vec::new()),
@@ -130,11 +111,11 @@ fn identity_from_request(request: &UntrackedStateRowRequest) -> Option<Untracked
 }
 
 async fn put_untracked_row(
-    transaction: &mut dyn LixBackendTransaction,
+    writer: &mut impl KvWriter,
     row: &UntrackedStateRow,
     identity: &UntrackedStateIdentity,
 ) -> Result<(), LixError> {
-    transaction
+    writer
         .kv_put(
             UNTRACKED_STATE_ROW_NAMESPACE,
             &encode_untracked_state_row_key(identity),
@@ -144,10 +125,10 @@ async fn put_untracked_row(
 }
 
 async fn delete_untracked_row(
-    transaction: &mut dyn LixBackendTransaction,
+    writer: &mut impl KvWriter,
     identity: &UntrackedStateIdentity,
 ) -> Result<(), LixError> {
-    transaction
+    writer
         .kv_delete(
             UNTRACKED_STATE_ROW_NAMESPACE,
             &encode_untracked_state_row_key(identity),
@@ -199,13 +180,13 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, TransactionBeginMode};
+    use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
     use crate::engine2::untracked_state::UntrackedStateContext;
 
     #[tokio::test]
     async fn write_and_load_roundtrips() {
         let backend = Arc::new(UnitTestBackend::new());
-        let context = UntrackedStateContext::new(backend.clone());
+        let context = UntrackedStateContext::new();
         let row = untracked_row("global", "lix_key_value", "ui-tab");
 
         let mut transaction = backend
@@ -219,22 +200,25 @@ mod tests {
             .expect("write should succeed");
         transaction.commit().await.expect("commit should succeed");
 
-        let loaded = context
-            .load_row(&UntrackedStateRowRequest {
-                schema_key: "lix_key_value".to_string(),
-                version_id: "global".to_string(),
-                entity_id: "ui-tab".to_string(),
-                file_id: NullableKeyFilter::Null,
-            })
-            .await
-            .expect("load should succeed");
+        let loaded = {
+            let mut reader = context.reader(Arc::clone(&backend));
+            reader
+                .load_row(&UntrackedStateRowRequest {
+                    schema_key: "lix_key_value".to_string(),
+                    version_id: "global".to_string(),
+                    entity_id: "ui-tab".to_string(),
+                    file_id: NullableKeyFilter::Null,
+                })
+                .await
+        }
+        .expect("load should succeed");
         assert_eq!(loaded, Some(row));
     }
 
     #[tokio::test]
     async fn scan_filters_by_schema_and_version() {
         let backend = Arc::new(UnitTestBackend::new());
-        let context = UntrackedStateContext::new(backend.clone());
+        let context = UntrackedStateContext::new();
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await
@@ -250,17 +234,20 @@ mod tests {
             .expect("writes should succeed");
         transaction.commit().await.expect("commit should succeed");
 
-        let rows = context
-            .scan_rows(&UntrackedStateScanRequest {
-                filter: crate::engine2::untracked_state::UntrackedStateFilter {
-                    schema_keys: vec!["lix_key_value".to_string()],
-                    version_ids: vec!["version-a".to_string()],
+        let rows = {
+            let mut reader = context.reader(Arc::clone(&backend));
+            reader
+                .scan_rows(&UntrackedStateScanRequest {
+                    filter: crate::engine2::untracked_state::UntrackedStateFilter {
+                        schema_keys: vec!["lix_key_value".to_string()],
+                        version_ids: vec!["version-a".to_string()],
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            })
-            .await
-            .expect("scan should succeed");
+                })
+                .await
+        }
+        .expect("scan should succeed");
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_id, "version-ui");
@@ -269,7 +256,7 @@ mod tests {
     #[tokio::test]
     async fn delete_removes_row() {
         let backend = Arc::new(UnitTestBackend::new());
-        let context = UntrackedStateContext::new(backend.clone());
+        let context = UntrackedStateContext::new();
         let row = untracked_row("global", "lix_key_value", "ui-tab");
         let identity = UntrackedStateIdentity::from_row(&row);
 
@@ -288,15 +275,18 @@ mod tests {
             .expect("delete should succeed");
         transaction.commit().await.expect("commit should succeed");
 
-        let loaded = context
-            .load_row(&UntrackedStateRowRequest {
-                schema_key: "lix_key_value".to_string(),
-                version_id: "global".to_string(),
-                entity_id: "ui-tab".to_string(),
-                file_id: NullableKeyFilter::Null,
-            })
-            .await
-            .expect("load should succeed");
+        let loaded = {
+            let mut reader = context.reader(Arc::clone(&backend));
+            reader
+                .load_row(&UntrackedStateRowRequest {
+                    schema_key: "lix_key_value".to_string(),
+                    version_id: "global".to_string(),
+                    entity_id: "ui-tab".to_string(),
+                    file_id: NullableKeyFilter::Null,
+                })
+                .await
+        }
+        .expect("load should succeed");
         assert_eq!(loaded, None);
     }
 

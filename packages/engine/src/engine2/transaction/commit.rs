@@ -37,7 +37,7 @@ pub(crate) async fn commit_staged_writes(
             })
             .collect::<Vec<_>>();
         binary_cas
-            .writer(transaction)
+            .writer(&mut *transaction)
             .put_blob_writes(&blob_writes)
             .await?;
     }
@@ -66,7 +66,7 @@ pub(crate) async fn commit_staged_writes(
             .map(canonical_change_from_staged_row)
             .collect::<Result<Vec<_>, _>>()?;
         {
-            let mut writer = changelog.writer(transaction);
+            let mut writer = changelog.writer(&mut *transaction);
             writer.append_changes(&canonical_changes).await?;
         }
     }
@@ -194,18 +194,17 @@ async fn load_version_ref_head(
     transaction: &mut dyn LixBackendTransaction,
     version_id: &str,
 ) -> Result<Option<String>, LixError> {
-    let Some(row) = live_state
-        .load_row_in_transaction(
-            transaction,
-            &LiveStateRowRequest {
+    let Some(row) = ({
+        let reader = live_state.reader(&mut *transaction);
+        reader
+            .load_row(&LiveStateRowRequest {
                 schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
                 entity_id: version_id.to_string(),
                 file_id: crate::NullableKeyFilter::Null,
-            },
-        )
-        .await?
-    else {
+            })
+            .await?
+    }) else {
         return Ok(None);
     };
     let Some(snapshot_content) = row.snapshot_content.as_deref() else {
@@ -273,9 +272,7 @@ mod tests {
     use super::*;
     use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
     use crate::engine2::changelog::ChangelogContext;
-    use crate::engine2::live_state::{
-        CommittedLiveStateContext, LiveStateContext, LiveStateRowRequest,
-    };
+    use crate::engine2::live_state::{CommittedLiveStateContext, LiveStateRowRequest};
     use crate::engine2::untracked_state::{
         UntrackedStateContext, UntrackedStateRow, UntrackedStateRowRequest,
     };
@@ -285,9 +282,9 @@ mod tests {
     #[tokio::test]
     async fn commit_staged_writes_appends_changelog_changes_before_live_state_mirror() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let binary_cas = BinaryCasContext::new(Arc::clone(&backend));
-        let changelog = ChangelogContext::new(Arc::clone(&backend));
-        let live_state = CommittedLiveStateContext::new(Arc::clone(&backend));
+        let binary_cas = BinaryCasContext::new();
+        let changelog = ChangelogContext::new();
+        let live_state = CommittedLiveStateContext::new();
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await
@@ -315,10 +312,13 @@ mod tests {
             .await
             .expect("commit should persist kv");
 
-        let changes = changelog
-            .scan_changes(crate::engine2::changelog::ChangelogScanRequest::default())
-            .await
-            .expect("changelog scan should succeed");
+        let changes = {
+            let mut reader = changelog.reader(Arc::clone(&backend));
+            reader
+                .scan_changes(&crate::engine2::changelog::ChangelogScanRequest::default())
+                .await
+        }
+        .expect("changelog scan should succeed");
         let change_ids = changes
             .iter()
             .map(|change| change.id.as_str())
@@ -332,6 +332,7 @@ mod tests {
             .any(|change| change.schema_key == VERSION_REF_SCHEMA_KEY));
 
         let version_ref = live_state
+            .reader(Arc::clone(&backend))
             .load_row(&LiveStateRowRequest {
                 schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
@@ -360,10 +361,10 @@ mod tests {
     #[tokio::test]
     async fn commit_with_only_untracked_writes_does_not_create_lix_commit() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let binary_cas = BinaryCasContext::new(Arc::clone(&backend));
-        let changelog = ChangelogContext::new(Arc::clone(&backend));
-        let live_state = CommittedLiveStateContext::new(Arc::clone(&backend));
-        let untracked_state = UntrackedStateContext::new(Arc::clone(&backend));
+        let binary_cas = BinaryCasContext::new();
+        let changelog = ChangelogContext::new();
+        let live_state = CommittedLiveStateContext::new();
+        let untracked_state = UntrackedStateContext::new();
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await
@@ -388,22 +389,28 @@ mod tests {
             .await
             .expect("commit should persist kv");
 
-        let changes = changelog
-            .scan_changes(crate::engine2::changelog::ChangelogScanRequest::default())
-            .await
-            .expect("changelog scan should succeed");
+        let changes = {
+            let mut reader = changelog.reader(Arc::clone(&backend));
+            reader
+                .scan_changes(&crate::engine2::changelog::ChangelogScanRequest::default())
+                .await
+        }
+        .expect("changelog scan should succeed");
         assert!(changes.is_empty());
 
-        let loaded = untracked_state
-            .load_row(&UntrackedStateRowRequest {
-                schema_key: "test_schema".to_string(),
-                version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: "entity-1".to_string(),
-                file_id: NullableKeyFilter::Null,
-            })
-            .await
-            .expect("untracked row load should succeed")
-            .expect("untracked row should be persisted");
+        let loaded = {
+            let mut untracked_reader = untracked_state.reader(Arc::clone(&backend));
+            untracked_reader
+                .load_row(&UntrackedStateRowRequest {
+                    schema_key: "test_schema".to_string(),
+                    version_id: GLOBAL_VERSION_ID.to_string(),
+                    entity_id: "entity-1".to_string(),
+                    file_id: NullableKeyFilter::Null,
+                })
+                .await
+        }
+        .expect("untracked row load should succeed")
+        .expect("untracked row should be persisted");
         assert_eq!(
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked\"}")
@@ -413,10 +420,10 @@ mod tests {
     #[tokio::test]
     async fn tracked_write_deletes_matching_untracked_overlay() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let binary_cas = BinaryCasContext::new(Arc::clone(&backend));
-        let changelog = ChangelogContext::new(Arc::clone(&backend));
-        let untracked_state = UntrackedStateContext::new(Arc::clone(&backend));
-        let live_state = CommittedLiveStateContext::new(Arc::clone(&backend));
+        let binary_cas = BinaryCasContext::new();
+        let changelog = ChangelogContext::new();
+        let untracked_state = UntrackedStateContext::new();
+        let live_state = CommittedLiveStateContext::new();
 
         let mut seed_transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -460,13 +467,15 @@ mod tests {
             .await
             .expect("commit should persist kv");
 
-        let untracked = untracked_state
-            .load_row(&untracked_request())
-            .await
-            .expect("untracked load should succeed");
+        let untracked = {
+            let mut untracked_reader = untracked_state.reader(Arc::clone(&backend));
+            untracked_reader.load_row(&untracked_request()).await
+        }
+        .expect("untracked load should succeed");
         assert_eq!(untracked, None);
 
         let visible = live_state
+            .reader(Arc::clone(&backend))
             .load_row(&live_state_request())
             .await
             .expect("live-state load should succeed")
@@ -479,7 +488,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_parents_global_commit_to_existing_version_ref() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = CommittedLiveStateContext::new(Arc::clone(&backend));
+        let live_state = CommittedLiveStateContext::new();
         seed_version_ref(&backend, &live_state, GLOBAL_VERSION_ID, "initial-commit").await;
 
         let mut transaction = backend
@@ -554,7 +563,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_skips_empty_members() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = CommittedLiveStateContext::new(Arc::clone(&backend));
+        let live_state = CommittedLiveStateContext::new();
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await
@@ -578,7 +587,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_uses_existing_version_ref_as_parent() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = CommittedLiveStateContext::new(Arc::clone(&backend));
+        let live_state = CommittedLiveStateContext::new();
         seed_version_ref(&backend, &live_state, "version-a", "previous-commit").await;
 
         let mut transaction = backend

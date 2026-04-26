@@ -16,6 +16,8 @@ pub(crate) use ddl::{
 pub use image::{ImageChunkReader, ImageChunkWriter};
 pub use kv::{KvPair, KvScanRange};
 #[allow(unused_imports)]
+pub(crate) use kv::{KvStore, KvWriter};
+#[allow(unused_imports)]
 pub use prepared::{PreparedBatch, PreparedStatement};
 pub(crate) use transaction_adapter::TransactionBackendAdapter;
 pub use transaction_mode::TransactionBeginMode;

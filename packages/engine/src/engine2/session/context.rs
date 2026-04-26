@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
@@ -84,6 +83,7 @@ impl SessionContext {
 /// has no write stager.
 pub(super) struct SessionSqlExecutionContext<'a> {
     pub(super) active_version_id: &'a str,
+    pub(super) backend: Arc<dyn LixBackend + Send + Sync>,
     pub(super) committed_live_state: Arc<CommittedLiveStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) visible_schemas: Vec<JsonValue>,
@@ -96,8 +96,8 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
     }
 
     fn live_state(&self) -> Arc<dyn LiveStateContext> {
-        let live_state: Arc<dyn LiveStateContext> = self.committed_live_state.clone();
-        live_state
+        Arc::new(self.committed_live_state.reader(Arc::clone(&self.backend)))
+            as Arc<dyn LiveStateContext>
     }
 
     fn functions(&self) -> DynFunctionProvider {
@@ -105,18 +105,11 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
     }
 
     fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
-        Arc::clone(&self.binary_cas) as Arc<dyn BlobDataReader>
+        Arc::new(self.binary_cas.reader(Arc::clone(&self.backend))) as Arc<dyn BlobDataReader>
     }
 
     fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError> {
         let _ = version_id;
         Ok(self.visible_schemas.clone())
-    }
-}
-
-#[async_trait]
-impl BlobDataReader for BinaryCasContext {
-    async fn load_blob_data_by_hash(&self, blob_hash: &str) -> Result<Option<Vec<u8>>, LixError> {
-        self.load_blob_data_by_hash(blob_hash).await
     }
 }

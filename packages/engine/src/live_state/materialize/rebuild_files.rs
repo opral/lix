@@ -1,4 +1,3 @@
-use crate::binary_cas::BlobDataReader;
 use crate::catalog::{load_file_row_by_id, FilesystemProjectionScope};
 use crate::live_state::store::LiveStateBackendRef;
 use crate::live_state::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
@@ -150,7 +149,9 @@ pub(crate) async fn rebuild_file_payloads_with_plugins(
         if plugin.is_none() {
             let blob_ref = builtin_binary_blob_ref_from_changes(&changes, &descriptor.file_id)?;
             if let Some(blob_ref) = blob_ref {
-                let blob_data = backend
+                let binary_cas = crate::binary_cas::BinaryCasContext::new();
+                let mut reader = binary_cas.reader(backend);
+                let blob_data = reader
                     .load_blob_data_by_hash(&blob_ref.blob_hash)
                     .await?
                     .ok_or_else(|| LixError {

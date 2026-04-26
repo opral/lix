@@ -1,4 +1,3 @@
-use crate::binary_cas::BlobDataReader;
 use crate::{LixBackend, LixError};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -589,10 +588,12 @@ pub(crate) async fn load_file_history_rows(
         && !required_blob_hashes.is_empty()
     {
         let mut blob_data_by_hash = BTreeMap::new();
+        let binary_cas = crate::binary_cas::BinaryCasContext::new();
         for blob_hash in required_blob_hashes {
+            let mut reader = binary_cas.reader(backend);
             blob_data_by_hash.insert(
                 blob_hash.clone(),
-                backend.load_blob_data_by_hash(&blob_hash).await?,
+                reader.load_blob_data_by_hash(&blob_hash).await?,
             );
         }
         for (row, blob_hash) in rows.iter_mut().zip(pending_blob_hashes.into_iter()) {

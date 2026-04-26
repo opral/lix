@@ -244,10 +244,12 @@ async fn load_blob_data_by_hash_with_backend(
     blob_hashes: &std::collections::BTreeSet<String>,
 ) -> Result<std::collections::BTreeMap<String, Option<Vec<u8>>>, LixError> {
     let mut rows = std::collections::BTreeMap::new();
+    let binary_cas = crate::binary_cas::BinaryCasContext::new();
     for blob_hash in blob_hashes {
+        let mut reader = binary_cas.reader(backend);
         rows.insert(
             blob_hash.clone(),
-            crate::binary_cas::load_blob_data_by_hash(backend, blob_hash).await?,
+            reader.load_blob_data_by_hash(blob_hash).await?,
         );
     }
     Ok(rows)
