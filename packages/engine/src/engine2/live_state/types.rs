@@ -1,4 +1,7 @@
 use crate::engine2::changelog::CanonicalChange;
+use crate::engine2::untracked_state::{
+    UntrackedStateFilter, UntrackedStateRow, UntrackedStateRowRequest,
+};
 use crate::{NullableKeyFilter, Value};
 
 /// Durable row visible through live_state reads.
@@ -17,7 +20,7 @@ pub(crate) struct LiveStateRow {
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) global: bool,
-    pub(crate) change_id: String,
+    pub(crate) change_id: Option<String>,
     pub(crate) commit_id: Option<String>,
     pub(crate) untracked: bool,
     pub(crate) version_id: String,
@@ -26,7 +29,9 @@ pub(crate) struct LiveStateRow {
 impl From<LiveStateRow> for CanonicalChange {
     fn from(row: LiveStateRow) -> Self {
         CanonicalChange {
-            id: row.change_id,
+            id: row
+                .change_id
+                .expect("tracked live-state rows must carry change_id"),
             entity_id: row.entity_id,
             schema_key: row.schema_key,
             schema_version: row.schema_version,
@@ -35,6 +40,45 @@ impl From<LiveStateRow> for CanonicalChange {
             snapshot_content: row.snapshot_content,
             metadata: row.metadata,
             created_at: row.created_at,
+        }
+    }
+}
+
+impl From<UntrackedStateRow> for LiveStateRow {
+    fn from(row: UntrackedStateRow) -> Self {
+        LiveStateRow {
+            entity_id: row.entity_id,
+            schema_key: row.schema_key,
+            file_id: row.file_id,
+            plugin_key: row.plugin_key,
+            snapshot_content: row.snapshot_content,
+            metadata: row.metadata,
+            schema_version: row.schema_version,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            global: row.global,
+            change_id: None,
+            commit_id: None,
+            untracked: true,
+            version_id: row.version_id,
+        }
+    }
+}
+
+impl From<&LiveStateRow> for UntrackedStateRow {
+    fn from(row: &LiveStateRow) -> Self {
+        UntrackedStateRow {
+            entity_id: row.entity_id.clone(),
+            schema_key: row.schema_key.clone(),
+            file_id: row.file_id.clone(),
+            plugin_key: row.plugin_key.clone(),
+            snapshot_content: row.snapshot_content.clone(),
+            metadata: row.metadata.clone(),
+            schema_version: row.schema_version.clone(),
+            created_at: row.created_at.clone(),
+            updated_at: row.updated_at.clone(),
+            global: row.global,
+            version_id: row.version_id.clone(),
         }
     }
 }
@@ -92,6 +136,18 @@ pub(crate) struct LiveStateFilter {
     pub(crate) include_tombstones: bool,
 }
 
+impl From<LiveStateFilter> for UntrackedStateFilter {
+    fn from(filter: LiveStateFilter) -> Self {
+        Self {
+            schema_keys: filter.schema_keys,
+            entity_ids: filter.entity_ids,
+            version_ids: filter.version_ids,
+            file_ids: filter.file_ids,
+            plugin_keys: filter.plugin_keys,
+        }
+    }
+}
+
 /// Requested property set for a live-state scan.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct LiveStateProjection {
@@ -117,5 +173,35 @@ pub(crate) struct LiveStateRowRequest {
     pub(crate) version_id: String,
     pub(crate) entity_id: String,
     pub(crate) file_id: NullableKeyFilter<String>,
-    pub(crate) untracked: bool,
+}
+
+impl From<&LiveStateRowRequest> for UntrackedStateRowRequest {
+    fn from(request: &LiveStateRowRequest) -> Self {
+        Self {
+            schema_key: request.schema_key.clone(),
+            version_id: request.version_id.clone(),
+            entity_id: request.entity_id.clone(),
+            file_id: request.file_id.clone(),
+        }
+    }
+}
+
+/// Stable visible-row identity used for overlay composition.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LiveStateRowIdentity {
+    pub(crate) version_id: String,
+    pub(crate) schema_key: String,
+    pub(crate) entity_id: String,
+    pub(crate) file_id: Option<String>,
+}
+
+impl LiveStateRowIdentity {
+    pub(crate) fn from_row(row: &LiveStateRow) -> Self {
+        Self {
+            version_id: row.version_id.clone(),
+            schema_key: row.schema_key.clone(),
+            entity_id: row.entity_id.clone(),
+            file_id: row.file_id.clone(),
+        }
+    }
 }

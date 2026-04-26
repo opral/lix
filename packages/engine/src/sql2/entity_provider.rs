@@ -1483,7 +1483,7 @@ fn entity_system_column_array(column_name: &str, rows: &[LiveStateRow]) -> Resul
         "global" => Arc::new(BooleanArray::from(
             rows.iter().map(|row| row.global).collect::<Vec<_>>(),
         )) as ArrayRef,
-        "change_id" => string_array(rows.iter().map(|row| Some(row.change_id.as_str()))),
+        "change_id" => string_array(rows.iter().map(|row| row.change_id.as_deref())),
         "commit_id" => string_array(rows.iter().map(|row| row.commit_id.as_deref())),
         "untracked" => Arc::new(BooleanArray::from(
             rows.iter().map(|row| row.untracked).collect::<Vec<_>>(),
@@ -1895,7 +1895,7 @@ mod tests {
             metadata: Some("{\"source\":\"test\"}".to_string()),
             schema_version: "1".to_string(),
             version_id: "version-a".to_string(),
-            change_id: "change-a".to_string(),
+            change_id: Some("change-a".to_string()),
             commit_id: Some("commit-a".to_string()),
             global: false,
             untracked: false,

@@ -7,10 +7,12 @@
 
 pub(crate) mod changelog;
 pub mod engine;
+pub(crate) mod init;
 pub(crate) mod live_state;
 pub(crate) mod schema_registry;
 pub mod session;
 pub mod transaction;
+pub(crate) mod untracked_state;
 
 pub use engine::Engine;
 pub use session::SessionContext;
