@@ -164,7 +164,16 @@ impl StagedStateRowOverlay {
 
     /// Returns a staged exact-row answer, if this transaction has one.
     pub(crate) fn load_exact(&self, request: &LiveStateRowRequest) -> Option<StagedExactRow> {
-        let identity = StagedStateRowIdentity::from_exact_request(request)?;
+        let untracked_identity = StagedStateRowIdentity::from_exact_request(request, true)?;
+        if let Some(row) = self.rows.get(&untracked_identity) {
+            return Some(if row.snapshot_content.is_none() {
+                StagedExactRow::Tombstone
+            } else {
+                StagedExactRow::Row(LiveStateRow::from(row))
+            });
+        }
+
+        let identity = StagedStateRowIdentity::from_exact_request(request, false)?;
         self.rows.get(&identity).map(|row| {
             if row.snapshot_content.is_none() {
                 StagedExactRow::Tombstone
@@ -200,7 +209,7 @@ impl StagedStateRowIdentity {
         }
     }
 
-    fn from_exact_request(request: &LiveStateRowRequest) -> Option<Self> {
+    fn from_exact_request(request: &LiveStateRowRequest, untracked: bool) -> Option<Self> {
         let file_id = match &request.file_id {
             NullableKeyFilter::Null => None,
             NullableKeyFilter::Value(value) => Some(value.clone()),
@@ -208,7 +217,7 @@ impl StagedStateRowIdentity {
             NullableKeyFilter::Any => return None,
         };
         Some(Self {
-            untracked: request.untracked,
+            untracked,
             schema_key: request.schema_key.clone(),
             entity_id: request.entity_id.clone(),
             file_id,
@@ -293,7 +302,11 @@ fn hydrate_state_write_row(
         created_at: row.created_at.unwrap_or_else(|| updated_at.clone()),
         updated_at,
         global: row.global,
-        change_id: row.change_id.unwrap_or_else(|| functions.uuid_v7()),
+        change_id: if row.untracked {
+            row.change_id
+        } else {
+            Some(row.change_id.unwrap_or_else(|| functions.uuid_v7()))
+        },
         commit_id: row.commit_id,
         untracked: row.untracked,
         version_id: row.version_id,
@@ -317,10 +330,14 @@ fn add_row_to_commit_members(
     if row.untracked {
         return;
     }
+    let change_id = row
+        .change_id
+        .clone()
+        .expect("tracked staged rows must carry change_id for commit membership");
     members_by_version
         .entry(row.version_id.clone())
         .or_default()
-        .add_change_id(row.change_id.clone());
+        .add_change_id(change_id);
 }
 
 fn remove_row_from_commit_members(
@@ -333,7 +350,10 @@ fn remove_row_from_commit_members(
     let Some(members) = members_by_version.get_mut(&row.version_id) else {
         return;
     };
-    members.remove_change_id(&row.change_id);
+    let Some(change_id) = row.change_id.as_deref() else {
+        return;
+    };
+    members.remove_change_id(change_id);
     if members.is_empty() {
         members_by_version.remove(&row.version_id);
     }
@@ -410,7 +430,6 @@ mod tests {
                 version_id: "global".to_string(),
                 entity_id: "sql2-duplicate-key".to_string(),
                 file_id: NullableKeyFilter::Null,
-                untracked: true,
             })
             .expect("staged row should be visible");
 
@@ -656,7 +675,10 @@ mod tests {
 
         let drained = staged_writes.drain().expect("drain should succeed");
         assert_eq!(drained.state_rows.len(), 1);
-        assert_eq!(drained.state_rows[0].change_id, "change-untracked");
+        assert_eq!(
+            drained.state_rows[0].change_id.as_deref(),
+            Some("change-untracked")
+        );
         assert!(drained.commit_members_by_version.is_empty());
     }
 
@@ -748,14 +770,17 @@ mod tests {
 
         staged_writes
             .stage_write(SqlWriteIntent::WriteRows {
-                rows: vec![state_row("sql2-functions-key", "value")],
+                rows: vec![state_row("sql2-functions-key", "value").with_tracked()],
             })
             .await
             .expect("staging rows should succeed");
 
         let drained = staged_writes.drain().expect("drain should succeed");
         assert_eq!(drained.state_rows.len(), 1);
-        assert_eq!(drained.state_rows[0].change_id.as_str(), "test-uuid-1");
+        assert_eq!(
+            drained.state_rows[0].change_id.as_deref(),
+            Some("test-uuid-1")
+        );
         assert_eq!(
             drained.state_rows[0].created_at.as_str(),
             "test-timestamp-1"
@@ -823,7 +848,6 @@ mod tests {
             version_id: "global".to_string(),
             entity_id: key.to_string(),
             file_id: NullableKeyFilter::Null,
-            untracked: true,
         }
     }
 

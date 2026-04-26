@@ -16,7 +16,6 @@ use crate::transaction::TransactionCommitOutcome;
 use crate::{LixBackend, LixBackendTransaction, LixError};
 
 mod commit;
-mod commit_change_generator;
 mod live_state_overlay;
 mod staging;
 mod types;
@@ -85,6 +84,7 @@ impl<'a> Transaction<'a> {
         commit::commit_staged_writes(
             &self.binary_cas,
             &self.changelog,
+            &self.committed_live_state,
             self.backend_transaction.as_mut(),
             staged_writes,
             self.functions.clone(),

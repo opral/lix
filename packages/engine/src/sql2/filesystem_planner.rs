@@ -1184,7 +1184,7 @@ mod tests {
             metadata: None,
             schema_version: "1".to_string(),
             version_id: version_id.to_string(),
-            change_id: format!("change-{entity_id}"),
+            change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),
             global: false,
             untracked: false,

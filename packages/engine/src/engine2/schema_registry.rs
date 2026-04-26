@@ -216,7 +216,7 @@ mod tests {
             version_id: GLOBAL_VERSION_ID.to_string(),
             plugin_key: None,
             metadata: None,
-            change_id: "change-registered-schema".to_string(),
+            change_id: Some("change-registered-schema".to_string()),
             commit_id: None,
             global: true,
             untracked: true,

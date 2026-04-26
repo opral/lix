@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
-use crate::engine2::changelog::CanonicalChange;
 use crate::engine2::live_state::LiveStateRow;
+use crate::engine2::untracked_state::UntrackedStateRow;
 
 /// Transaction-hydrated state row.
 ///
@@ -19,7 +19,7 @@ pub(crate) struct StagedStateRow {
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) global: bool,
-    pub(crate) change_id: String,
+    pub(crate) change_id: Option<String>,
     pub(crate) commit_id: Option<String>,
     pub(crate) untracked: bool,
     pub(crate) version_id: String,
@@ -67,18 +67,20 @@ impl From<&StagedStateRow> for LiveStateRow {
     }
 }
 
-impl From<StagedStateRow> for CanonicalChange {
+impl From<StagedStateRow> for UntrackedStateRow {
     fn from(row: StagedStateRow) -> Self {
-        CanonicalChange {
-            id: row.change_id,
+        UntrackedStateRow {
             entity_id: row.entity_id,
             schema_key: row.schema_key,
-            schema_version: row.schema_version,
             file_id: row.file_id,
             plugin_key: row.plugin_key,
             snapshot_content: row.snapshot_content,
             metadata: row.metadata,
+            schema_version: row.schema_version,
             created_at: row.created_at,
+            updated_at: row.updated_at,
+            global: row.global,
+            version_id: row.version_id,
         }
     }
 }
