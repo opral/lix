@@ -1,109 +1,88 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 
-use crate::backend::KvScanRange;
+use crate::backend::{KvScanRange, KvStore, KvWriter};
 use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateContext as EngineLiveStateContext, LiveStateRowRequest, LiveStateScanRequest,
 };
 use crate::engine2::untracked_state::{
-    UntrackedStateContext, UntrackedStateIdentity, UntrackedStateRow, UntrackedStateScanRequest,
+    storage as untracked_storage, UntrackedStateIdentity, UntrackedStateRow,
+    UntrackedStateScanRequest,
 };
-use crate::{LixBackend, LixBackendTransaction, LixError, NullableKeyFilter};
+use crate::{LixError, NullableKeyFilter};
 
 const LIVE_STATE_ROW_NAMESPACE: &str = "live_state.row";
 
-/// Committed live-state view backed by the backend key/value API.
-pub(crate) struct CommittedLiveStateContext {
-    backend: Arc<dyn LixBackend + Send + Sync>,
-    untracked_state: Arc<UntrackedStateContext>,
-}
+/// Factory for committed live-state readers and writers.
+///
+/// The context does not perform reads itself. Callers choose the backing KV
+/// store explicitly with `reader(store)`, so all reads go through a
+/// caller-provided KV store.
+pub(crate) struct CommittedLiveStateContext;
 
 impl CommittedLiveStateContext {
-    pub(crate) fn new(backend: Arc<dyn LixBackend + Send + Sync>) -> Self {
-        Self {
-            untracked_state: Arc::new(UntrackedStateContext::new(Arc::clone(&backend))),
-            backend,
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    /// Creates a visible live-state reader over a caller-provided KV store.
+    pub(crate) fn reader<S>(&self, store: S) -> CommittedLiveStateReader<S>
+    where
+        S: KvStore,
+    {
+        CommittedLiveStateReader {
+            store: Mutex::new(store),
         }
     }
 
-    /// Creates a transaction-scoped writer for visible live-state rows.
+    /// Creates a visible live-state writer over a caller-provided KV writer.
     ///
     /// The writer owns the tracked/untracked routing rule: tracked rows update
     /// the tracked projection and clear matching untracked overlay rows, while
     /// untracked rows update only the local untracked overlay.
-    pub(crate) fn writer<'a>(
-        &'a self,
-        transaction: &'a mut dyn LixBackendTransaction,
-    ) -> CommittedLiveStateWriter<'a> {
-        CommittedLiveStateWriter {
-            untracked_state: Arc::clone(&self.untracked_state),
-            transaction,
-        }
-    }
-
-    /// Loads a visible row through an already-open backend transaction.
-    ///
-    /// Commit finalization uses this to resolve parent heads without opening a
-    /// second backend read while the write transaction is active.
-    pub(crate) async fn load_row_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        request: &LiveStateRowRequest,
-    ) -> Result<Option<LiveStateRow>, LixError> {
-        if let Some(row) = self
-            .untracked_state
-            .load_row_in_transaction(transaction, &request.into())
-            .await?
-            .map(LiveStateRow::from)
-        {
-            return Ok(Some(row));
-        }
-
-        let Some(identity) = StateRowIdentity::from_exact_parts(
-            false,
-            request.version_id.clone(),
-            request.schema_key.clone(),
-            request.entity_id.clone(),
-            request.file_id.clone(),
-        ) else {
-            return Ok(None);
-        };
-        let Some(bytes) = transaction
-            .kv_get(LIVE_STATE_ROW_NAMESPACE, &encode_state_row_key(&identity))
-            .await?
-        else {
-            return Ok(None);
-        };
-        let row = decode_state_row(&bytes)?;
-        Ok(row.snapshot_content.is_some().then_some(row))
+    pub(crate) fn writer<S>(&self, store: S) -> CommittedLiveStateWriter<S>
+    where
+        S: KvWriter,
+    {
+        CommittedLiveStateWriter { store }
     }
 }
 
-#[async_trait]
-impl EngineLiveStateContext for CommittedLiveStateContext {
-    async fn scan_rows(
+/// Visible live-state reader backed by a caller-provided KV store.
+pub(crate) struct CommittedLiveStateReader<S> {
+    store: Mutex<S>,
+}
+
+impl<S> CommittedLiveStateReader<S>
+where
+    S: KvStore,
+{
+    pub(crate) async fn scan_rows(
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<LiveStateRow>, LixError> {
-        let mut tracked_rows = scan_all_state_rows(self.backend.as_ref()).await?;
+        let mut store = self.store.lock().await;
+        let mut tracked_rows = scan_all_state_rows(&mut *store).await?;
         tracked_rows.retain(|row| state_row_matches_engine_scan(row, request));
         if !request.filter.include_tombstones {
             tracked_rows.retain(|row| row.snapshot_content.is_some());
         }
 
-        let untracked_rows = self
-            .untracked_state
-            .scan_rows(&UntrackedStateScanRequest {
-                filter: request.filter.clone().into(),
-                projection: Default::default(),
-                limit: None,
-            })
+        let untracked_rows = {
+            untracked_storage::scan_rows(
+                &mut *store,
+                &UntrackedStateScanRequest {
+                    filter: request.filter.clone().into(),
+                    projection: Default::default(),
+                    limit: None,
+                },
+            )
             .await?
-            .into_iter()
-            .map(LiveStateRow::from)
-            .collect::<Vec<_>>();
+        }
+        .into_iter()
+        .map(LiveStateRow::from)
+        .collect::<Vec<_>>();
 
         let mut rows = crate::engine2::live_state::overlay::overlay_untracked_rows(
             tracked_rows,
@@ -115,17 +94,18 @@ impl EngineLiveStateContext for CommittedLiveStateContext {
         Ok(rows)
     }
 
-    async fn load_row(
+    pub(crate) async fn load_row(
         &self,
         request: &LiveStateRowRequest,
     ) -> Result<Option<LiveStateRow>, LixError> {
-        if let Some(row) = self
-            .untracked_state
-            .load_row(&request.into())
-            .await?
-            .map(LiveStateRow::from)
+        let mut store = self.store.lock().await;
         {
-            return Ok(Some(row));
+            if let Some(row) = untracked_storage::load_row(&mut *store, &request.into())
+                .await?
+                .map(LiveStateRow::from)
+            {
+                return Ok(Some(row));
+            }
         }
 
         let Some(identity) = StateRowIdentity::from_exact_parts(
@@ -137,8 +117,7 @@ impl EngineLiveStateContext for CommittedLiveStateContext {
         ) else {
             return Ok(None);
         };
-        let Some(bytes) = self
-            .backend
+        let Some(bytes) = store
             .kv_get(LIVE_STATE_ROW_NAMESPACE, &encode_state_row_key(&identity))
             .await?
         else {
@@ -149,13 +128,35 @@ impl EngineLiveStateContext for CommittedLiveStateContext {
     }
 }
 
-/// Transaction-scoped writer for committed live-state visibility.
-pub(crate) struct CommittedLiveStateWriter<'a> {
-    untracked_state: Arc<UntrackedStateContext>,
-    transaction: &'a mut dyn LixBackendTransaction,
+#[async_trait]
+impl<S> EngineLiveStateContext for CommittedLiveStateReader<S>
+where
+    S: KvStore + Sync,
+{
+    async fn scan_rows(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<LiveStateRow>, LixError> {
+        CommittedLiveStateReader::scan_rows(self, request).await
+    }
+
+    async fn load_row(
+        &self,
+        request: &LiveStateRowRequest,
+    ) -> Result<Option<LiveStateRow>, LixError> {
+        CommittedLiveStateReader::load_row(self, request).await
+    }
 }
 
-impl CommittedLiveStateWriter<'_> {
+/// Writer for committed live-state visibility over a caller-provided KV writer.
+pub(crate) struct CommittedLiveStateWriter<S> {
+    store: S,
+}
+
+impl<S> CommittedLiveStateWriter<S>
+where
+    S: KvWriter,
+{
     pub(crate) async fn write_rows(&mut self, rows: &[LiveStateRow]) -> Result<(), LixError> {
         let (tracked_rows, untracked_rows): (Vec<_>, Vec<_>) =
             rows.iter().partition(|row| !row.untracked);
@@ -165,10 +166,7 @@ impl CommittedLiveStateWriter<'_> {
                 .into_iter()
                 .map(UntrackedStateRow::from)
                 .collect::<Vec<_>>();
-            self.untracked_state
-                .writer(self.transaction)
-                .write_rows(&untracked_rows)
-                .await?;
+            untracked_storage::write_rows(&mut self.store, &untracked_rows).await?;
         }
 
         if tracked_rows.is_empty() {
@@ -184,23 +182,20 @@ impl CommittedLiveStateWriter<'_> {
                 file_id: row.file_id.clone(),
             })
             .collect::<Vec<_>>();
-        self.untracked_state
-            .writer(self.transaction)
-            .delete_rows(&identities)
-            .await?;
+        {
+            untracked_storage::delete_rows(&mut self.store, &identities).await?;
+        }
 
         for row in tracked_rows {
-            put_state_row(self.transaction, row).await?;
+            put_state_row(&mut self.store, row).await?;
         }
 
         Ok(())
     }
 }
 
-async fn scan_all_state_rows(
-    backend: &(dyn LixBackend + Send + Sync),
-) -> Result<Vec<LiveStateRow>, LixError> {
-    backend
+async fn scan_all_state_rows(store: &mut impl KvStore) -> Result<Vec<LiveStateRow>, LixError> {
+    store
         .kv_scan(
             LIVE_STATE_ROW_NAMESPACE,
             KvScanRange::prefix(Vec::new()),
@@ -311,12 +306,9 @@ fn encode_state_row_key(identity: &StateRowIdentity) -> Vec<u8> {
     out
 }
 
-async fn put_state_row(
-    transaction: &mut dyn LixBackendTransaction,
-    row: &LiveStateRow,
-) -> Result<(), LixError> {
+async fn put_state_row(writer: &mut impl KvWriter, row: &LiveStateRow) -> Result<(), LixError> {
     let identity = StateRowIdentity::from_row(row);
-    transaction
+    writer
         .kv_put(
             LIVE_STATE_ROW_NAMESPACE,
             &encode_state_row_key(&identity),
@@ -333,6 +325,8 @@ fn push_component(out: &mut Vec<u8>, value: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
     use crate::engine2::untracked_state::{UntrackedStateContext, UntrackedStateRow};
@@ -360,8 +354,8 @@ mod tests {
     #[tokio::test]
     async fn committed_live_state_overlays_untracked_rows() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = CommittedLiveStateContext::new(Arc::clone(&backend));
-        let untracked_state = UntrackedStateContext::new(Arc::clone(&backend));
+        let live_state = CommittedLiveStateContext::new();
+        let untracked_state = UntrackedStateContext::new();
 
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -380,6 +374,7 @@ mod tests {
         transaction.commit().await.expect("commit should persist");
 
         let rows = live_state
+            .reader(Arc::clone(&backend))
             .scan_rows(&LiveStateScanRequest::default())
             .await
             .expect("scan should succeed");
@@ -392,6 +387,7 @@ mod tests {
         assert_eq!(rows[0].change_id, None);
 
         let loaded = live_state
+            .reader(Arc::clone(&backend))
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: "global".to_string(),
@@ -411,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn tracked_row_is_visible_without_untracked_overlay() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = CommittedLiveStateContext::new(Arc::clone(&backend));
+        let live_state = CommittedLiveStateContext::new();
 
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -424,7 +420,7 @@ mod tests {
             .expect("tracked row should write");
         transaction.commit().await.expect("commit should persist");
 
-        let loaded = load_selected_tab(&live_state)
+        let loaded = load_selected_tab(&live_state, Arc::clone(&backend))
             .await
             .expect("load should succeed")
             .expect("tracked row should be visible");
@@ -439,8 +435,8 @@ mod tests {
     #[tokio::test]
     async fn deleting_untracked_row_reveals_tracked_row() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = CommittedLiveStateContext::new(Arc::clone(&backend));
-        let untracked_state = UntrackedStateContext::new(Arc::clone(&backend));
+        let live_state = CommittedLiveStateContext::new();
+        let untracked_state = UntrackedStateContext::new();
 
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -467,7 +463,7 @@ mod tests {
             .expect("untracked row should delete");
         transaction.commit().await.expect("commit should persist");
 
-        let loaded = load_selected_tab(&live_state)
+        let loaded = load_selected_tab(&live_state, Arc::clone(&backend))
             .await
             .expect("load should succeed")
             .expect("tracked row should be visible again");
@@ -481,8 +477,10 @@ mod tests {
 
     async fn load_selected_tab(
         live_state: &CommittedLiveStateContext,
+        backend: Arc<dyn LixBackend + Send + Sync>,
     ) -> Result<Option<LiveStateRow>, LixError> {
         live_state
+            .reader(backend)
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: "global".to_string(),

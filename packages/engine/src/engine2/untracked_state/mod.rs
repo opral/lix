@@ -1,9 +1,9 @@
 mod context;
-mod storage;
+pub(crate) mod storage;
 mod types;
 
 #[allow(unused_imports)]
-pub(crate) use context::{UntrackedStateContext, UntrackedStateWriter};
+pub(crate) use context::{UntrackedStateContext, UntrackedStateReader, UntrackedStateWriter};
 #[allow(unused_imports)]
 pub(crate) use types::{
     UntrackedStateFilter, UntrackedStateIdentity, UntrackedStateProjection, UntrackedStateRow,

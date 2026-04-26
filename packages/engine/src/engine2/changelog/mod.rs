@@ -3,6 +3,6 @@ mod storage;
 mod types;
 
 #[allow(unused_imports)]
-pub(crate) use context::{ChangelogContext, ChangelogWriter};
+pub(crate) use context::{ChangelogContext, ChangelogReader, ChangelogWriter};
 #[allow(unused_imports)]
 pub(crate) use types::{CanonicalChange, ChangelogScanRequest};

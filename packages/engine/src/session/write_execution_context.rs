@@ -206,7 +206,11 @@ pub(crate) async fn persist_binary_blob_writes(
             data: write.data.as_slice(),
         })
         .collect::<Vec<_>>();
-    crate::binary_cas::persist_blob_writes_in_transaction(transaction, &cas_writes).await
+    let binary_cas = crate::binary_cas::BinaryCasContext::new();
+    binary_cas
+        .writer(&mut *transaction)
+        .put_blob_writes(&cas_writes)
+        .await
 }
 
 pub(crate) async fn garbage_collect_unreachable_binary_cas(

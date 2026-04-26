@@ -42,7 +42,6 @@ use super::entity_view::{
 };
 use super::filesystem_view::{PreparedSql2FilesystemViewPlan, Sql2FilesystemViewBaseRelation};
 use super::udf::{register_sql2_udfs, system_sql2_function_provider};
-use crate::binary_cas::BlobDataReader;
 use crate::catalog::SurfaceColumnType;
 use crate::catalog::{
     open_change_surface_snapshot, open_change_surface_snapshot_with_shared_backend,
@@ -1497,7 +1496,9 @@ async fn load_live_file_payload_bytes(
     _version_id: &str,
     blob_hash: &str,
 ) -> Result<Option<Vec<u8>>, LixError> {
-    crate::binary_cas::load_blob_data_by_hash(backend, blob_hash).await
+    let binary_cas = crate::binary_cas::BinaryCasContext::new();
+    let mut reader = binary_cas.reader(backend);
+    reader.load_blob_data_by_hash(blob_hash).await
 }
 
 async fn register_filesystem_history_view_with_state_history_provider(
@@ -4368,10 +4369,12 @@ async fn hydrate_filesystem_blob_columns(
     }
 
     let mut blob_data_by_hash = BTreeMap::new();
+    let binary_cas = crate::binary_cas::BinaryCasContext::new();
     for blob_hash in required_blob_hashes {
+        let mut reader = binary_cas.reader(backend);
         blob_data_by_hash.insert(
             blob_hash.clone(),
-            backend.load_blob_data_by_hash(&blob_hash).await?,
+            reader.load_blob_data_by_hash(&blob_hash).await?,
         );
     }
 

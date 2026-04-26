@@ -52,6 +52,7 @@ impl<'a> Transaction<'a> {
     ) -> Result<Self, LixError> {
         let staged_writes = Arc::new(TransactionStagedWrites::new(functions.clone()));
         let live_state = transaction_live_state(
+            backend,
             Arc::clone(&committed_live_state),
             Arc::clone(&staged_writes),
         )?;
@@ -115,6 +116,7 @@ impl SqlExecutionContext for Transaction<'_> {
     /// overlaid on top.
     fn live_state(&self) -> Arc<dyn LiveStateContext> {
         transaction_live_state(
+            self.backend,
             Arc::clone(&self.committed_live_state),
             Arc::clone(&self.staged_writes),
         )
@@ -128,7 +130,7 @@ impl SqlExecutionContext for Transaction<'_> {
 
     /// Provides blob reads for file/data surfaces during SQL execution.
     fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
-        Arc::clone(&self.binary_cas) as Arc<dyn BlobDataReader>
+        Arc::new(self.binary_cas.reader(Arc::clone(self.backend))) as Arc<dyn BlobDataReader>
     }
 
     /// Provides the transaction-scoped write stager used by DataFusion provider
@@ -146,11 +148,13 @@ impl SqlExecutionContext for Transaction<'_> {
 }
 
 fn transaction_live_state(
+    backend: &Arc<dyn LixBackend + Send + Sync>,
     committed_live_state: Arc<CommittedLiveStateContext>,
     staged_writes: Arc<TransactionStagedWrites>,
 ) -> Result<Arc<dyn LiveStateContext>, LixError> {
     let staged = staged_writes.staging_overlay()?;
-    let committed: Arc<dyn LiveStateContext> = committed_live_state;
+    let committed: Arc<dyn LiveStateContext> =
+        Arc::new(committed_live_state.reader(Arc::clone(backend)));
     Ok(Arc::new(TransactionLiveStateContext::new(
         committed, staged,
     )))

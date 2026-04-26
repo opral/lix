@@ -2,7 +2,6 @@ mod chunking;
 mod codec;
 mod context;
 pub(crate) mod kv;
-pub(crate) mod read;
 pub(crate) mod store;
 
 use crate::binary_cas::store::{BinaryCasBackendRef, BinaryCasTransactionRef};
@@ -21,35 +20,7 @@ pub(crate) struct BinaryBlobWrite<'a> {
     pub data: &'a [u8],
 }
 
-pub(crate) use context::BinaryCasContext;
-pub(crate) use read::BlobDataReader;
-
-pub(crate) async fn load_blob_data_by_hash(
-    backend: BinaryCasBackendRef<'_>,
-    blob_hash: &str,
-) -> Result<Option<Vec<u8>>, LixError> {
-    // Compatibility wrapper for callers that have not been threaded with
-    // BinaryCasContext yet.
-    read::load_binary_blob_data_by_hash(backend, blob_hash).await
-}
-
-pub(crate) async fn blob_exists(
-    backend: BinaryCasBackendRef<'_>,
-    blob_hash: &str,
-) -> Result<bool, LixError> {
-    // Compatibility wrapper for callers that have not been threaded with
-    // BinaryCasContext yet.
-    read::blob_exists(backend, blob_hash).await
-}
-
-pub(crate) async fn persist_blob_writes_in_transaction(
-    transaction: BinaryCasTransactionRef<'_>,
-    writes: &[BinaryBlobWrite<'_>],
-) -> Result<(), LixError> {
-    // Compatibility wrapper for callers that have not moved to
-    // BinaryCasContext::writer(...) yet.
-    kv::persist_blob_writes_in_transaction(transaction, writes).await
-}
+pub(crate) use context::{BinaryCasContext, BlobDataReader};
 
 pub(crate) fn append_blob_writes_to_write_batch(
     _write_batch: &mut WriteBatch,

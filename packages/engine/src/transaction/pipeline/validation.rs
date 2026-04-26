@@ -16,7 +16,6 @@ use std::sync::Arc;
 use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
 
-use crate::binary_cas::load_blob_data_by_hash;
 use crate::canonical::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME, CHECKPOINT_LABEL_SCHEMA_KEY};
 use crate::catalog::{
     builtin_catalog_compiler_facade, file_id_resolves_in_scope, load_file_row_by_id,
@@ -420,7 +419,9 @@ async fn collect_backend_visible_plugin_manifest_keys(
         else {
             continue;
         };
-        let Some(archive_bytes) = load_blob_data_by_hash(backend, blob_hash).await? else {
+        let binary_cas = crate::binary_cas::BinaryCasContext::new();
+        let mut reader = binary_cas.reader(backend);
+        let Some(archive_bytes) = reader.load_blob_data_by_hash(blob_hash).await? else {
             continue;
         };
         if let Some(plugin_key) =
@@ -1566,10 +1567,14 @@ async fn validate_filesystem_snapshot_integrity(
 
     let is_planned_blob = planned_binary_blob_hashes
         .is_some_and(|planned_binary_blob_hashes| planned_binary_blob_hashes.contains(blob_hash));
-    if require_binary_blob_ref_cas
-        && !is_planned_blob
-        && !crate::binary_cas::blob_exists(backend, blob_hash).await?
-    {
+    let blob_exists = if require_binary_blob_ref_cas && !is_planned_blob {
+        let binary_cas = crate::binary_cas::BinaryCasContext::new();
+        let mut reader = binary_cas.reader(backend);
+        reader.blob_exists(blob_hash).await?
+    } else {
+        true
+    };
+    if require_binary_blob_ref_cas && !is_planned_blob && !blob_exists {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(

@@ -32,10 +32,7 @@ impl Engine {
         //
         // let canonical_state = Arc::new(CanonicalStateContext::new(Arc::clone(&backend)));
 
-        let committed_live_state = Arc::new(
-            CommittedLiveStateContext::new(Arc::clone(&backend)),
-            // TODO pass canonical_state as argument. any canonical query shouldn't go through raw sql in live_state
-        );
+        let committed_live_state = Arc::new(CommittedLiveStateContext::new());
 
         // let history_state = Arc::new(HistoryStateContext::new(
         //     Arc::clone(&canonical_state),
@@ -47,8 +44,8 @@ impl Engine {
         // overlay for writes.
 
         Ok(Self {
-            binary_cas: Arc::new(BinaryCasContext::new(Arc::clone(&backend))),
-            changelog: Arc::new(ChangelogContext::new(Arc::clone(&backend))),
+            binary_cas: Arc::new(BinaryCasContext::new()),
+            changelog: Arc::new(ChangelogContext::new()),
             backend,
             committed_live_state,
             schema_registry: Arc::new(SchemaRegistry::new()),

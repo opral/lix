@@ -3,7 +3,6 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 
-use crate::binary_cas::load_blob_data_by_hash;
 use crate::common::LixError;
 use crate::live_state::{list_installed_plugin_archive_refs, PluginArchiveRef};
 use crate::LixBackend;
@@ -105,7 +104,10 @@ pub(crate) async fn load_installed_plugin_from_archive_ref_with_backend(
             hint: None,
         });
     };
-    let archive_bytes = load_blob_data_by_hash(backend, &archive_ref.blob_hash)
+    let binary_cas = crate::binary_cas::BinaryCasContext::new();
+    let mut reader = binary_cas.reader(backend);
+    let archive_bytes = reader
+        .load_blob_data_by_hash(&archive_ref.blob_hash)
         .await?
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),

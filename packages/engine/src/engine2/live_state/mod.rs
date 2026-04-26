@@ -4,7 +4,9 @@ mod overlay;
 mod types;
 
 #[allow(unused_imports)]
-pub(crate) use committed::{CommittedLiveStateContext, CommittedLiveStateWriter};
+pub(crate) use committed::{
+    CommittedLiveStateContext, CommittedLiveStateReader, CommittedLiveStateWriter,
+};
 #[allow(unused_imports)]
 pub(crate) use context::LiveStateContext;
 #[allow(unused_imports)]
