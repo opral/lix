@@ -3,26 +3,30 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::engine2::live_state::{LiveStateRowRequest, LiveStateScanRequest};
+use crate::engine2::live_state::{LiveStateRow, LiveStateRowRequest, LiveStateScanRequest};
+use crate::engine2::transaction::types::{StagedCommitMembers, StagedStateRow};
 use crate::functions::{DynFunctionProvider, LixFunctionProvider};
-use crate::sql2::{FileDataWrite, SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateRow};
+use crate::sql2::{FileDataWrite, SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateWriteRow};
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
 /// Transaction-local writes decoded by DataFusion provider hooks.
 ///
 /// This is the engine2 seam between SQL execution and transaction ownership:
 /// providers stage SQL write intents here, the transaction normalizes them into
-/// stable `StateRow`s, reads build a `StagedStateRowOverlay` from those rows,
+/// stable `StagedStateRow`s, reads build a `StagedStateRowOverlay` from those rows,
 /// and commit later drains the same rows.
 pub(crate) struct TransactionStagedWrites {
     functions: DynFunctionProvider,
-    rows: Mutex<BTreeMap<StagedStateRowIdentity, StateRow>>,
+    rows: Mutex<BTreeMap<StagedStateRowIdentity, StagedStateRow>>,
+    commit_members_by_version: Mutex<BTreeMap<String, StagedCommitMembers>>,
     file_data_writes: Mutex<Vec<FileDataWrite>>,
 }
 
 /// Drained transaction-local writes ready for commit.
 pub(crate) struct StagedWriteSet {
-    pub(crate) state_rows: Vec<StateRow>,
+    pub(crate) state_rows: Vec<StagedStateRow>,
+    pub(crate) commit_members_by_version: BTreeMap<String, StagedCommitMembers>,
     pub(crate) file_data_writes: Vec<FileDataWrite>,
 }
 
@@ -31,6 +35,7 @@ impl TransactionStagedWrites {
         Self {
             functions,
             rows: Mutex::new(BTreeMap::new()),
+            commit_members_by_version: Mutex::new(BTreeMap::new()),
             file_data_writes: Mutex::new(Vec::new()),
         }
     }
@@ -49,8 +54,15 @@ impl TransactionStagedWrites {
                 "failed to acquire transaction staged file data lock",
             )
         })?;
+        let mut commit_members_guard = self.commit_members_by_version.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged commit membership lock",
+            )
+        })?;
         Ok(StagedWriteSet {
             state_rows: std::mem::take(&mut *rows_guard).into_values().collect(),
+            commit_members_by_version: std::mem::take(&mut *commit_members_guard),
             file_data_writes: std::mem::take(&mut *file_data_guard),
         })
     }
@@ -76,14 +88,30 @@ impl SqlWriteStager for TransactionStagedWrites {
         };
         let (rows, file_data_writes) =
             state_rows_from_write_intent(write, &mut self.functions.clone())?;
+        for row in &rows {
+            validate_commit_membership_support(row)?;
+        }
         let mut guard = self.rows.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "failed to acquire transaction staged writes lock",
             )
         })?;
+        let mut commit_members_guard = self.commit_members_by_version.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged commit membership lock",
+            )
+        })?;
         for row in rows {
-            guard.insert(StagedStateRowIdentity::from(&row), row);
+            let identity = StagedStateRowIdentity::from(&row);
+            if let Some(previous) = guard.remove(&identity.opposite_untracked()) {
+                remove_row_from_commit_members(&mut commit_members_guard, &previous);
+            }
+            if let Some(previous) = guard.insert(identity, row.clone()) {
+                remove_row_from_commit_members(&mut commit_members_guard, &previous);
+            }
+            add_row_to_commit_members(&mut commit_members_guard, &row);
         }
         if !file_data_writes.is_empty() {
             self.file_data_writes
@@ -102,20 +130,20 @@ impl SqlWriteStager for TransactionStagedWrites {
 
 /// Read overlay derived from staged transaction writes.
 pub(crate) struct StagedStateRowOverlay {
-    rows: BTreeMap<StagedStateRowIdentity, StateRow>,
+    rows: BTreeMap<StagedStateRowIdentity, StagedStateRow>,
 }
 
 impl StagedStateRowOverlay {
-    fn new(rows: BTreeMap<StagedStateRowIdentity, StateRow>) -> Self {
+    fn new(rows: BTreeMap<StagedStateRowIdentity, StagedStateRow>) -> Self {
         Self { rows }
     }
 
     /// Returns staged rows visible for a scan request.
-    pub(crate) fn scan(&self, request: &LiveStateScanRequest) -> Vec<StateRow> {
+    pub(crate) fn scan(&self, request: &LiveStateScanRequest) -> Vec<LiveStateRow> {
         self.rows
             .values()
             .filter(|row| staged_row_matches_scan(row, request))
-            .cloned()
+            .map(LiveStateRow::from)
             .collect()
     }
 
@@ -141,14 +169,14 @@ impl StagedStateRowOverlay {
             if row.snapshot_content.is_none() {
                 StagedExactRow::Tombstone
             } else {
-                StagedExactRow::Row(row.clone())
+                StagedExactRow::Row(LiveStateRow::from(row))
             }
         })
     }
 }
 
 pub(crate) enum StagedExactRow {
-    Row(StateRow),
+    Row(LiveStateRow),
     Tombstone,
 }
 
@@ -162,7 +190,7 @@ pub(crate) struct StagedStateRowIdentity {
 }
 
 impl StagedStateRowIdentity {
-    fn from_state_row(row: &StateRow) -> Self {
+    fn from_staged_row(row: &StagedStateRow) -> Self {
         Self {
             untracked: row.untracked,
             schema_key: row.schema_key.clone(),
@@ -187,18 +215,40 @@ impl StagedStateRowIdentity {
             version_id: request.version_id.clone(),
         })
     }
+
+    fn opposite_untracked(&self) -> Self {
+        Self {
+            untracked: !self.untracked,
+            schema_key: self.schema_key.clone(),
+            entity_id: self.entity_id.clone(),
+            file_id: self.file_id.clone(),
+            version_id: self.version_id.clone(),
+        }
+    }
 }
 
-impl From<&StateRow> for StagedStateRowIdentity {
-    fn from(row: &StateRow) -> Self {
-        Self::from_state_row(row)
+impl From<&StagedStateRow> for StagedStateRowIdentity {
+    fn from(row: &StagedStateRow) -> Self {
+        Self::from_staged_row(row)
+    }
+}
+
+impl From<&LiveStateRow> for StagedStateRowIdentity {
+    fn from(row: &LiveStateRow) -> Self {
+        Self {
+            untracked: row.untracked,
+            schema_key: row.schema_key.clone(),
+            entity_id: row.entity_id.clone(),
+            file_id: row.file_id.clone(),
+            version_id: row.version_id.clone(),
+        }
     }
 }
 
 fn state_rows_from_write_intent(
     write: SqlWriteIntent,
     functions: &mut dyn LixFunctionProvider,
-) -> Result<(Vec<StateRow>, Vec<FileDataWrite>), LixError> {
+) -> Result<(Vec<StagedStateRow>, Vec<FileDataWrite>), LixError> {
     let mut state_rows = Vec::new();
     let mut file_data_writes = Vec::new();
     match write {
@@ -216,40 +266,85 @@ fn state_rows_from_write_intent(
 }
 
 fn push_state_rows(
-    state_rows: &mut Vec<StateRow>,
-    rows: Vec<StateRow>,
+    state_rows: &mut Vec<StagedStateRow>,
+    rows: Vec<StateWriteRow>,
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<(), LixError> {
     state_rows.reserve(rows.len());
     for row in rows {
-        state_rows.push(normalize_state_row(row, functions)?);
+        state_rows.push(hydrate_state_write_row(row, functions)?);
     }
     Ok(())
 }
 
-fn normalize_state_row(
-    mut row: StateRow,
+fn hydrate_state_write_row(
+    row: StateWriteRow,
     functions: &mut dyn LixFunctionProvider,
-) -> Result<StateRow, LixError> {
-    if row.schema_version.is_none() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "engine2 staged write requires schema_version for staging overlay",
-        ));
-    }
+) -> Result<StagedStateRow, LixError> {
     let updated_at = row.updated_at.unwrap_or_else(|| functions.timestamp());
-    row.created_at = row.created_at.or_else(|| Some(updated_at.clone()));
-    row.updated_at = Some(updated_at);
-    row.change_id = row.change_id.or_else(|| Some(functions.uuid_v7()));
-    Ok(row)
+    Ok(StagedStateRow {
+        entity_id: row.entity_id,
+        schema_key: row.schema_key,
+        file_id: row.file_id,
+        plugin_key: row.plugin_key,
+        snapshot_content: row.snapshot_content,
+        metadata: row.metadata,
+        schema_version: row.schema_version,
+        created_at: row.created_at.unwrap_or_else(|| updated_at.clone()),
+        updated_at,
+        global: row.global,
+        change_id: row.change_id.unwrap_or_else(|| functions.uuid_v7()),
+        commit_id: row.commit_id,
+        untracked: row.untracked,
+        version_id: row.version_id,
+    })
 }
 
-fn staged_row_matches_scan(row: &StateRow, request: &LiveStateScanRequest) -> bool {
+fn validate_commit_membership_support(row: &StagedStateRow) -> Result<(), LixError> {
+    if row.global && row.version_id != GLOBAL_VERSION_ID {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "engine2 global staged rows must use the global version id",
+        ));
+    }
+    Ok(())
+}
+
+fn add_row_to_commit_members(
+    members_by_version: &mut BTreeMap<String, StagedCommitMembers>,
+    row: &StagedStateRow,
+) {
+    if row.untracked {
+        return;
+    }
+    members_by_version
+        .entry(row.version_id.clone())
+        .or_default()
+        .add_change_id(row.change_id.clone());
+}
+
+fn remove_row_from_commit_members(
+    members_by_version: &mut BTreeMap<String, StagedCommitMembers>,
+    row: &StagedStateRow,
+) {
+    if row.untracked {
+        return;
+    }
+    let Some(members) = members_by_version.get_mut(&row.version_id) else {
+        return;
+    };
+    members.remove_change_id(&row.change_id);
+    if members.is_empty() {
+        members_by_version.remove(&row.version_id);
+    }
+}
+
+fn staged_row_matches_scan(row: &StagedStateRow, request: &LiveStateScanRequest) -> bool {
     staged_row_identity_matches_scan(row, request)
         && (row.snapshot_content.is_some() || request.filter.include_tombstones)
 }
 
-fn staged_row_identity_matches_scan(row: &StateRow, request: &LiveStateScanRequest) -> bool {
+fn staged_row_identity_matches_scan(row: &StagedStateRow, request: &LiveStateScanRequest) -> bool {
     if !request.filter.schema_keys.is_empty()
         && !request.filter.schema_keys.contains(&row.schema_key)
     {
@@ -477,6 +572,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn staged_writes_track_commit_members_for_tracked_global_rows() {
+        let staged_writes = test_staged_writes();
+
+        staged_writes
+            .stage_write(SqlWriteIntent::WriteRows {
+                rows: vec![state_row("tracked-key", "value").with_tracked()],
+            })
+            .await
+            .expect("tracked global row should stage");
+
+        let drained = staged_writes.drain().expect("drain should succeed");
+        let members = drained
+            .commit_members_by_version
+            .get("global")
+            .expect("global commit members should exist");
+        assert_eq!(
+            members.change_ids.iter().cloned().collect::<Vec<_>>(),
+            vec!["test-uuid-1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_writes_do_not_track_untracked_rows_as_commit_members() {
+        let staged_writes = test_staged_writes();
+
+        staged_writes
+            .stage_write(SqlWriteIntent::WriteRows {
+                rows: vec![state_row("untracked-key", "value")],
+            })
+            .await
+            .expect("untracked row should stage");
+
+        let drained = staged_writes.drain().expect("drain should succeed");
+        assert!(drained.commit_members_by_version.is_empty());
+    }
+
+    #[tokio::test]
+    async fn staged_writes_replace_commit_member_on_tracked_overwrite() {
+        let staged_writes = test_staged_writes();
+
+        staged_writes
+            .stage_write(SqlWriteIntent::WriteRows {
+                rows: vec![
+                    state_row("overwrite-key", "first")
+                        .with_tracked()
+                        .with_change_id("change-first"),
+                    state_row("overwrite-key", "second")
+                        .with_tracked()
+                        .with_change_id("change-second"),
+                ],
+            })
+            .await
+            .expect("tracked overwrite should stage");
+
+        let drained = staged_writes.drain().expect("drain should succeed");
+        let members = drained
+            .commit_members_by_version
+            .get("global")
+            .expect("global commit members should exist");
+        assert_eq!(
+            members.change_ids.iter().cloned().collect::<Vec<_>>(),
+            vec!["change-second".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_writes_untracked_overwrite_removes_tracked_commit_member() {
+        let staged_writes = test_staged_writes();
+
+        staged_writes
+            .stage_write(SqlWriteIntent::WriteRows {
+                rows: vec![
+                    state_row("tracked-to-untracked-key", "tracked")
+                        .with_tracked()
+                        .with_change_id("change-tracked"),
+                    state_row("tracked-to-untracked-key", "untracked")
+                        .with_change_id("change-untracked"),
+                ],
+            })
+            .await
+            .expect("untracked overwrite should stage");
+
+        let drained = staged_writes.drain().expect("drain should succeed");
+        assert_eq!(drained.state_rows.len(), 1);
+        assert_eq!(drained.state_rows[0].change_id, "change-untracked");
+        assert!(drained.commit_members_by_version.is_empty());
+    }
+
+    #[tokio::test]
+    async fn staged_writes_track_active_version_members_separately() {
+        let staged_writes = test_staged_writes();
+
+        staged_writes
+            .stage_write(SqlWriteIntent::WriteRows {
+                rows: vec![state_row("active-version-key", "value")
+                    .with_tracked()
+                    .with_version("version-a")],
+            })
+            .await
+            .expect("active-version tracked staging should accumulate members");
+
+        let drained = staged_writes.drain().expect("drain should succeed");
+        let members = drained
+            .commit_members_by_version
+            .get("version-a")
+            .expect("active-version commit members should exist");
+        assert_eq!(
+            members.change_ids.iter().cloned().collect::<Vec<_>>(),
+            vec!["test-uuid-1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_writes_reject_global_rows_with_non_global_version_id() {
+        let staged_writes = test_staged_writes();
+
+        let error = staged_writes
+            .stage_write(SqlWriteIntent::WriteRows {
+                rows: vec![{
+                    let mut row = state_row("invalid-global-key", "value");
+                    row.version_id = "version-a".to_string();
+                    row
+                }],
+            })
+            .await
+            .expect_err("global row with non-global version should fail");
+
+        assert!(error
+            .description
+            .contains("global staged rows must use the global version id"));
+    }
+
+    #[tokio::test]
     async fn staging_overlay_identity_matches_live_state_conflict_key() {
         let staged_writes = test_staged_writes();
 
@@ -507,11 +735,7 @@ mod tests {
             ..LiveStateScanRequest::default()
         });
 
-        assert_eq!(rows.len(), 5);
-        assert!(rows.iter().any(|row| {
-            row.snapshot_content.as_deref()
-                == Some("{\"key\":\"shared-entity\",\"value\":\"other-schema-version\"}")
-        }));
+        assert_eq!(rows.len(), 4);
         assert!(rows.iter().any(|row| {
             row.snapshot_content.as_deref()
                 == Some("{\"key\":\"shared-entity\",\"value\":\"tracked\"}")
@@ -531,17 +755,14 @@ mod tests {
 
         let drained = staged_writes.drain().expect("drain should succeed");
         assert_eq!(drained.state_rows.len(), 1);
+        assert_eq!(drained.state_rows[0].change_id.as_str(), "test-uuid-1");
         assert_eq!(
-            drained.state_rows[0].change_id.as_deref(),
-            Some("test-uuid-1")
+            drained.state_rows[0].created_at.as_str(),
+            "test-timestamp-1"
         );
         assert_eq!(
-            drained.state_rows[0].created_at.as_deref(),
-            Some("test-timestamp-1")
-        );
-        assert_eq!(
-            drained.state_rows[0].updated_at.as_deref(),
-            Some("test-timestamp-1")
+            drained.state_rows[0].updated_at.as_str(),
+            "test-timestamp-1"
         );
     }
 
@@ -570,15 +791,15 @@ mod tests {
         }
     }
 
-    fn state_row(key: &str, value: &str) -> StateRow {
-        StateRow {
+    fn state_row(key: &str, value: &str) -> StateWriteRow {
+        StateWriteRow {
             entity_id: key.to_string(),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             plugin_key: None,
             snapshot_content: Some(format!("{{\"key\":\"{key}\",\"value\":\"{value}\"}}")),
             metadata: None,
-            schema_version: Some("1".to_string()),
+            schema_version: "1".to_string(),
             created_at: None,
             updated_at: None,
             global: true,
@@ -589,8 +810,8 @@ mod tests {
         }
     }
 
-    fn tombstone_row(key: &str) -> StateRow {
-        StateRow {
+    fn tombstone_row(key: &str) -> StateWriteRow {
+        StateWriteRow {
             snapshot_content: None,
             ..state_row(key, "deleted")
         }
@@ -627,16 +848,17 @@ mod tests {
         fn with_plugin_key(self, plugin_key: &str) -> Self;
         fn with_tracked(self) -> Self;
         fn with_version(self, version_id: &str) -> Self;
+        fn with_change_id(self, change_id: &str) -> Self;
     }
 
-    impl StateRowTestExt for StateRow {
+    impl StateRowTestExt for StateWriteRow {
         fn with_schema(mut self, schema_key: &str) -> Self {
             self.schema_key = schema_key.to_string();
             self
         }
 
         fn with_schema_version(mut self, schema_version: &str) -> Self {
-            self.schema_version = Some(schema_version.to_string());
+            self.schema_version = schema_version.to_string();
             self
         }
 
@@ -657,6 +879,12 @@ mod tests {
 
         fn with_version(mut self, version_id: &str) -> Self {
             self.version_id = version_id.to_string();
+            self.global = version_id == GLOBAL_VERSION_ID;
+            self
+        }
+
+        fn with_change_id(mut self, change_id: &str) -> Self {
+            self.change_id = Some(change_id.to_string());
             self
         }
     }

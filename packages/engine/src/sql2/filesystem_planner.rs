@@ -9,10 +9,12 @@ use crate::common::{
     directory_ancestor_paths, directory_name_from_path, normalize_directory_path,
     parent_directory_path, stable_content_fingerprint_hex, ParsedFilePath,
 };
+use crate::engine2::live_state::LiveStateRow;
 use crate::LixError;
 
-use super::execute::{FileDataWrite, StateRow};
+use super::execute::FileDataWrite;
 use super::filesystem_visibility::VisibleFilesystem;
+use super::types::StateWriteRow;
 
 pub(crate) const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 pub(crate) const FILE_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
@@ -29,7 +31,7 @@ pub(crate) const BLOB_REF_SCHEMA_VERSION: &str = "1";
 /// filesystem write surface.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct FilesystemWritePlan {
-    pub(crate) rows: Vec<StateRow>,
+    pub(crate) rows: Vec<StateWriteRow>,
     pub(crate) file_data: Vec<FileDataWrite>,
     pub(crate) count: u64,
 }
@@ -38,7 +40,7 @@ pub(crate) struct FilesystemWritePlan {
 /// and the surface delete has been lowered into tombstone state rows.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct FilesystemDeletePlan {
-    pub(crate) rows: Vec<StateRow>,
+    pub(crate) rows: Vec<StateWriteRow>,
     pub(crate) count: u64,
 }
 
@@ -51,7 +53,6 @@ pub(crate) struct FilesystemRowContext {
     pub(crate) file_id: Option<String>,
     pub(crate) plugin_key: Option<String>,
     pub(crate) metadata: Option<String>,
-    pub(crate) schema_version: Option<String>,
 }
 
 impl FilesystemRowContext {
@@ -63,7 +64,6 @@ impl FilesystemRowContext {
             file_id: None,
             plugin_key: None,
             metadata: None,
-            schema_version: None,
         }
     }
 }
@@ -165,7 +165,7 @@ impl DirectoryPathResolver {
         context: FilesystemRowContext,
         hidden: bool,
         generate_directory_id: &mut dyn FnMut() -> String,
-    ) -> Result<Vec<StateRow>, LixError> {
+    ) -> Result<Vec<StateWriteRow>, LixError> {
         self.ensure_directory_path_with_leaf_id(
             directory_path,
             None,
@@ -182,7 +182,7 @@ impl DirectoryPathResolver {
         context: FilesystemRowContext,
         hidden: bool,
         generate_directory_id: &mut dyn FnMut() -> String,
-    ) -> Result<Vec<StateRow>, LixError> {
+    ) -> Result<Vec<StateWriteRow>, LixError> {
         let directory_path = normalize_directory_path(directory_path)?;
         if directory_path == "/" {
             return Ok(Vec::new());
@@ -230,12 +230,7 @@ impl DirectoryPathResolver {
     }
 }
 
-pub(crate) fn directory_descriptor_row(input: DirectoryDescriptorRowInput) -> StateRow {
-    let schema_version = input
-        .context
-        .schema_version
-        .clone()
-        .or_else(|| Some(DIRECTORY_DESCRIPTOR_SCHEMA_VERSION.to_string()));
+pub(crate) fn directory_descriptor_row(input: DirectoryDescriptorRowInput) -> StateWriteRow {
     let snapshot_content = json!({
         "id": input.id.clone(),
         "parent_id": input.parent_id.clone(),
@@ -247,18 +242,13 @@ pub(crate) fn directory_descriptor_row(input: DirectoryDescriptorRowInput) -> St
     state_row(
         input.id.clone(),
         DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-        schema_version,
+        DIRECTORY_DESCRIPTOR_SCHEMA_VERSION.to_string(),
         Some(snapshot_content),
         input.context,
     )
 }
 
-pub(crate) fn file_descriptor_row(input: FileDescriptorRowInput) -> StateRow {
-    let schema_version = input
-        .context
-        .schema_version
-        .clone()
-        .or_else(|| Some(FILE_DESCRIPTOR_SCHEMA_VERSION.to_string()));
+pub(crate) fn file_descriptor_row(input: FileDescriptorRowInput) -> StateWriteRow {
     let snapshot_content = json!({
         "id": input.id.clone(),
         "directory_id": input.directory_id.clone(),
@@ -271,18 +261,13 @@ pub(crate) fn file_descriptor_row(input: FileDescriptorRowInput) -> StateRow {
     state_row(
         input.id.clone(),
         FILE_DESCRIPTOR_SCHEMA_KEY,
-        schema_version,
+        FILE_DESCRIPTOR_SCHEMA_VERSION.to_string(),
         Some(snapshot_content),
         input.context,
     )
 }
 
-pub(crate) fn blob_ref_row(input: BlobRefRowInput) -> Result<StateRow, LixError> {
-    let schema_version = input
-        .context
-        .schema_version
-        .clone()
-        .or_else(|| Some(BLOB_REF_SCHEMA_VERSION.to_string()));
+pub(crate) fn blob_ref_row(input: BlobRefRowInput) -> Result<StateWriteRow, LixError> {
     let size_bytes = u64::try_from(input.data.len()).map_err(|_| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -302,7 +287,7 @@ pub(crate) fn blob_ref_row(input: BlobRefRowInput) -> Result<StateRow, LixError>
     Ok(state_row(
         input.file_id.clone(),
         BLOB_REF_SCHEMA_KEY,
-        schema_version,
+        BLOB_REF_SCHEMA_VERSION.to_string(),
         Some(snapshot_content),
         FilesystemRowContext {
             file_id: Some(input.file_id),
@@ -352,7 +337,6 @@ pub(crate) fn plan_file_path_write(
                 file_id: None,
                 plugin_key: None,
                 metadata: None,
-                schema_version: None,
                 ..input.context.clone()
             },
         })?);
@@ -420,7 +404,7 @@ pub(crate) fn plan_file_delete(input: FileDeleteInput) -> FilesystemDeletePlan {
     let mut rows = vec![tombstone_row(
         input.file_id.clone(),
         FILE_DESCRIPTOR_SCHEMA_KEY,
-        Some(FILE_DESCRIPTOR_SCHEMA_VERSION.to_string()),
+        FILE_DESCRIPTOR_SCHEMA_VERSION.to_string(),
         FilesystemRowContext {
             file_id: None,
             ..input.context.clone()
@@ -431,12 +415,11 @@ pub(crate) fn plan_file_delete(input: FileDeleteInput) -> FilesystemDeletePlan {
         rows.push(tombstone_row(
             input.file_id.clone(),
             BLOB_REF_SCHEMA_KEY,
-            Some(BLOB_REF_SCHEMA_VERSION.to_string()),
+            BLOB_REF_SCHEMA_VERSION.to_string(),
             FilesystemRowContext {
                 file_id: Some(input.file_id),
                 plugin_key: None,
                 metadata: None,
-                schema_version: None,
                 ..input.context
             },
         ));
@@ -450,7 +433,7 @@ pub(crate) fn plan_directory_delete(input: DirectoryDeleteInput) -> FilesystemDe
         rows: vec![tombstone_row(
             input.directory_id,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-            Some(DIRECTORY_DESCRIPTOR_SCHEMA_VERSION.to_string()),
+            DIRECTORY_DESCRIPTOR_SCHEMA_VERSION.to_string(),
             FilesystemRowContext {
                 file_id: None,
                 ..input.context
@@ -480,7 +463,7 @@ pub(crate) fn plan_recursive_directory_delete(
 }
 
 pub(crate) fn directory_path_resolvers_from_state_rows(
-    rows: Vec<StateRow>,
+    rows: Vec<LiveStateRow>,
 ) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
     let mut directory_rows = BTreeMap::<String, BTreeMap<String, DirectoryDescriptorSeed>>::new();
     for row in rows {
@@ -552,11 +535,11 @@ fn resolve_directory_seed_path(
 fn state_row(
     entity_id: String,
     schema_key: &str,
-    schema_version: Option<String>,
+    schema_version: String,
     snapshot_content: Option<String>,
     context: FilesystemRowContext,
-) -> StateRow {
-    StateRow {
+) -> StateWriteRow {
+    StateWriteRow {
         entity_id,
         schema_key: schema_key.to_string(),
         file_id: context.file_id,
@@ -577,9 +560,9 @@ fn state_row(
 fn tombstone_row(
     entity_id: String,
     schema_key: &str,
-    schema_version: Option<String>,
+    schema_version: String,
     context: FilesystemRowContext,
-) -> StateRow {
+) -> StateWriteRow {
     state_row(entity_id, schema_key, schema_version, None, context)
 }
 
@@ -587,7 +570,7 @@ fn collect_recursive_directory_delete(
     directory_id: &str,
     visible_filesystem: &VisibleFilesystem,
     context: &FilesystemRowContext,
-    rows: &mut Vec<StateRow>,
+    rows: &mut Vec<StateWriteRow>,
     count: &mut u64,
 ) {
     if let Some(child_ids) = visible_filesystem
@@ -636,6 +619,7 @@ mod tests {
         DirectoryPathResolver, FileDeleteInput, FileDescriptorRowInput, FilePathWriteInput,
         FilesystemRowContext,
     };
+    use crate::engine2::live_state::LiveStateRow;
     use crate::sql2::filesystem_visibility::{
         VisibleBlobRef, VisibleDirectory, VisibleFile, VisibleFilesystem,
     };
@@ -657,7 +641,7 @@ mod tests {
 
         assert_eq!(row.entity_id, "dir-docs");
         assert_eq!(row.schema_key, "lix_directory_descriptor");
-        assert_eq!(row.schema_version.as_deref(), Some("1"));
+        assert_eq!(row.schema_version.as_str(), "1");
         assert_eq!(row.version_id, "version-a");
         let snapshot: JsonValue =
             serde_json::from_str(row.snapshot_content.as_deref().unwrap()).unwrap();
@@ -680,7 +664,7 @@ mod tests {
 
         assert_eq!(row.entity_id, "file-readme");
         assert_eq!(row.schema_key, "lix_file_descriptor");
-        assert_eq!(row.schema_version.as_deref(), Some("1"));
+        assert_eq!(row.schema_version.as_str(), "1");
         let snapshot: JsonValue =
             serde_json::from_str(row.snapshot_content.as_deref().unwrap()).unwrap();
         assert_eq!(snapshot["directory_id"], "dir-docs");
@@ -700,7 +684,7 @@ mod tests {
         assert_eq!(row.entity_id, "file-readme");
         assert_eq!(row.file_id.as_deref(), Some("file-readme"));
         assert_eq!(row.schema_key, "lix_binary_blob_ref");
-        assert_eq!(row.schema_version.as_deref(), Some("1"));
+        assert_eq!(row.schema_version.as_str(), "1");
         let snapshot: JsonValue =
             serde_json::from_str(row.snapshot_content.as_deref().unwrap()).unwrap();
         assert_eq!(snapshot["id"], "file-readme");
@@ -1039,7 +1023,7 @@ mod tests {
         assert_eq!(descriptor.entity_id, "file-readme");
         assert_eq!(descriptor.file_id, None);
         assert_eq!(descriptor.snapshot_content, None);
-        assert_eq!(descriptor.schema_version.as_deref(), Some("1"));
+        assert_eq!(descriptor.schema_version.as_str(), "1");
 
         let blob_ref = plan
             .rows
@@ -1049,7 +1033,7 @@ mod tests {
         assert_eq!(blob_ref.entity_id, "file-readme");
         assert_eq!(blob_ref.file_id.as_deref(), Some("file-readme"));
         assert_eq!(blob_ref.snapshot_content, None);
-        assert_eq!(blob_ref.schema_version.as_deref(), Some("1"));
+        assert_eq!(blob_ref.schema_version.as_str(), "1");
     }
 
     #[test]
@@ -1079,7 +1063,7 @@ mod tests {
         assert_eq!(plan.rows[0].schema_key, "lix_directory_descriptor");
         assert_eq!(plan.rows[0].file_id, None);
         assert_eq!(plan.rows[0].snapshot_content, None);
-        assert_eq!(plan.rows[0].schema_version.as_deref(), Some("1"));
+        assert_eq!(plan.rows[0].schema_version.as_str(), "1");
     }
 
     #[test]
@@ -1186,8 +1170,12 @@ mod tests {
         }
     }
 
-    fn live_directory_row(entity_id: &str, version_id: &str, snapshot_content: &str) -> StateRow {
-        StateRow {
+    fn live_directory_row(
+        entity_id: &str,
+        version_id: &str,
+        snapshot_content: &str,
+    ) -> LiveStateRow {
+        LiveStateRow {
             entity_id: entity_id.to_string(),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id: None,
@@ -1196,12 +1184,12 @@ mod tests {
             metadata: None,
             schema_version: "1".to_string(),
             version_id: version_id.to_string(),
-            change_id: Some(format!("change-{entity_id}")),
+            change_id: format!("change-{entity_id}"),
             commit_id: Some(format!("commit-{entity_id}")),
             global: false,
             untracked: false,
-            created_at: Some("2026-04-23T00:00:00Z".to_string()),
-            updated_at: Some("2026-04-23T01:00:00Z".to_string()),
+            created_at: "2026-04-23T00:00:00Z".to_string(),
+            updated_at: "2026-04-23T01:00:00Z".to_string(),
         }
     }
 }

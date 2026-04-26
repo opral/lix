@@ -3,10 +3,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::backend::KvScanRange;
+use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateContext as EngineLiveStateContext, LiveStateRowRequest, LiveStateScanRequest,
 };
-use crate::sql2::StateRow;
 use crate::{LixBackend, LixBackendTransaction, LixError, NullableKeyFilter};
 
 const LIVE_STATE_ROW_NAMESPACE: &str = "live_state.row";
@@ -24,7 +24,10 @@ impl CommittedLiveStateContext {
 
 #[async_trait]
 impl EngineLiveStateContext for CommittedLiveStateContext {
-    async fn scan_rows(&self, request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
+    async fn scan_rows(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<LiveStateRow>, LixError> {
         let mut rows = scan_all_state_rows(self.backend.as_ref()).await?;
         rows.retain(|row| state_row_matches_engine_scan(row, request));
         if !request.filter.include_tombstones {
@@ -36,7 +39,10 @@ impl EngineLiveStateContext for CommittedLiveStateContext {
         Ok(rows)
     }
 
-    async fn load_row(&self, request: &LiveStateRowRequest) -> Result<Option<StateRow>, LixError> {
+    async fn load_row(
+        &self,
+        request: &LiveStateRowRequest,
+    ) -> Result<Option<LiveStateRow>, LixError> {
         let Some(identity) = StateRowIdentity::from_exact_parts(
             request.untracked,
             request.version_id.clone(),
@@ -60,7 +66,7 @@ impl EngineLiveStateContext for CommittedLiveStateContext {
 
 pub(crate) async fn write_state_rows(
     transaction: &mut dyn LixBackendTransaction,
-    rows: &[StateRow],
+    rows: &[LiveStateRow],
 ) -> Result<(), LixError> {
     for row in rows {
         put_state_row(transaction, row).await?;
@@ -70,7 +76,7 @@ pub(crate) async fn write_state_rows(
 
 async fn scan_all_state_rows(
     backend: &(dyn LixBackend + Send + Sync),
-) -> Result<Vec<StateRow>, LixError> {
+) -> Result<Vec<LiveStateRow>, LixError> {
     backend
         .kv_scan(
             LIVE_STATE_ROW_NAMESPACE,
@@ -83,7 +89,7 @@ async fn scan_all_state_rows(
         .collect()
 }
 
-fn state_row_matches_engine_scan(row: &StateRow, request: &LiveStateScanRequest) -> bool {
+fn state_row_matches_engine_scan(row: &LiveStateRow, request: &LiveStateScanRequest) -> bool {
     (request.filter.schema_keys.is_empty() || request.filter.schema_keys.contains(&row.schema_key))
         && (request.filter.entity_ids.is_empty()
             || request.filter.entity_ids.contains(&row.entity_id))
@@ -116,7 +122,7 @@ struct StateRowIdentity {
 }
 
 impl StateRowIdentity {
-    fn from_row(row: &StateRow) -> Self {
+    fn from_row(row: &LiveStateRow) -> Self {
         Self {
             untracked: row.untracked,
             version_id: row.version_id.clone(),
@@ -148,7 +154,7 @@ impl StateRowIdentity {
     }
 }
 
-fn encode_state_row(row: &StateRow) -> Result<Vec<u8>, LixError> {
+fn encode_state_row(row: &LiveStateRow) -> Result<Vec<u8>, LixError> {
     serde_json::to_vec(row).map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -157,7 +163,7 @@ fn encode_state_row(row: &StateRow) -> Result<Vec<u8>, LixError> {
     })
 }
 
-fn decode_state_row(bytes: &[u8]) -> Result<StateRow, LixError> {
+fn decode_state_row(bytes: &[u8]) -> Result<LiveStateRow, LixError> {
     serde_json::from_slice(bytes).map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -184,7 +190,7 @@ fn encode_state_row_key(identity: &StateRowIdentity) -> Vec<u8> {
 
 async fn put_state_row(
     transaction: &mut dyn LixBackendTransaction,
-    row: &StateRow,
+    row: &LiveStateRow,
 ) -> Result<(), LixError> {
     let identity = StateRowIdentity::from_row(row);
     transaction

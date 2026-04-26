@@ -5,6 +5,7 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod changelog;
 pub mod engine;
 pub(crate) mod live_state;
 pub(crate) mod schema_registry;
@@ -12,5 +13,5 @@ pub mod session;
 pub mod transaction;
 
 pub use engine::Engine;
-pub use session::Session;
+pub use session::SessionContext;
 pub use session::{ExecuteResult, Row, RowRef, RowSet};

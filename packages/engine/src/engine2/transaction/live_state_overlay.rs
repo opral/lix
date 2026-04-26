@@ -3,11 +3,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest, LiveStateScanRequest};
 use crate::engine2::transaction::staging::{
     StagedExactRow, StagedStateRowIdentity, StagedStateRowOverlay,
 };
-use crate::sql2::StateRow;
 use crate::LixError;
 
 /// Live-state view for one engine2 write transaction.
@@ -28,7 +28,10 @@ impl TransactionLiveStateContext {
 
 #[async_trait]
 impl LiveStateContext for TransactionLiveStateContext {
-    async fn scan_rows(&self, request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
+    async fn scan_rows(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<LiveStateRow>, LixError> {
         let mut rows = self.staged.scan(request);
         let hidden_identities = self.staged.identities_matching_scan(request);
         let mut visible_identities = rows
@@ -52,7 +55,10 @@ impl LiveStateContext for TransactionLiveStateContext {
         Ok(rows)
     }
 
-    async fn load_row(&self, request: &LiveStateRowRequest) -> Result<Option<StateRow>, LixError> {
+    async fn load_row(
+        &self,
+        request: &LiveStateRowRequest,
+    ) -> Result<Option<LiveStateRow>, LixError> {
         match self.staged.load_exact(request) {
             Some(StagedExactRow::Row(row)) => Ok(Some(row)),
             Some(StagedExactRow::Tombstone) => Ok(None),

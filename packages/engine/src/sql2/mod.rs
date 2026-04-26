@@ -9,6 +9,7 @@ mod filesystem_view;
 mod filesystem_visibility;
 mod history_provider;
 mod lix_state_provider;
+mod types;
 mod udf;
 
 #[allow(unused_imports)]
@@ -20,6 +21,7 @@ pub(crate) use entity_view::prepared_entity_view_plans_for_registry;
 pub(crate) use execute::{
     create_logical_plan, execute_logical_plan, execute_sql, stage_decoded_write, FileDataWrite,
     HistoryContext, SqlExecutionContext, SqlLogicalPlan, SqlStatementKind, SqlWriteIntent,
-    SqlWriteOutcome, SqlWriteStager, StateRow,
+    SqlWriteOutcome, SqlWriteStager,
 };
 pub(crate) use filesystem_view::prepared_filesystem_view_plans_for_registry;
+pub(crate) use types::StateWriteRow;

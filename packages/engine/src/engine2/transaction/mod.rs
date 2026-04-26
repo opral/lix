@@ -4,6 +4,7 @@ use serde_json::Value as JsonValue;
 
 use crate::backend::TransactionBeginMode;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
+use crate::engine2::changelog::ChangelogContext;
 use crate::engine2::live_state::CommittedLiveStateContext;
 use crate::engine2::live_state::LiveStateContext;
 use crate::engine2::schema_registry::SchemaRegistry;
@@ -15,13 +16,15 @@ use crate::transaction::TransactionCommitOutcome;
 use crate::{LixBackend, LixBackendTransaction, LixError};
 
 mod commit;
+mod commit_change_generator;
 mod live_state_overlay;
 mod staging;
+mod types;
 
 /// One execution-scoped write transaction for the engine2 SQL path.
 ///
 /// This is intentionally not a session-wide kitchen sink. It owns the backend
-/// write transaction for one `Session::execute(...)` call and projects staged
+/// write transaction for one `SessionContext::execute(...)` call and projects staged
 /// SQL writes back into the SQL DAG through an engine2-local live-state
 /// overlay.
 pub(crate) struct Transaction<'a> {
@@ -29,6 +32,7 @@ pub(crate) struct Transaction<'a> {
     backend: &'a Arc<dyn LixBackend + Send + Sync>,
     committed_live_state: Arc<CommittedLiveStateContext>,
     binary_cas: Arc<BinaryCasContext>,
+    changelog: Arc<ChangelogContext>,
     staged_writes: Arc<TransactionStagedWrites>,
     backend_transaction: Box<dyn LixBackendTransaction + 'a>,
     visible_schemas: Vec<JsonValue>,
@@ -43,6 +47,7 @@ impl<'a> Transaction<'a> {
         backend: &'a Arc<dyn LixBackend + Send + Sync>,
         committed_live_state: Arc<CommittedLiveStateContext>,
         binary_cas: Arc<BinaryCasContext>,
+        changelog: Arc<ChangelogContext>,
         schema_registry: Arc<SchemaRegistry>,
         functions: DynFunctionProvider,
     ) -> Result<Self, LixError> {
@@ -62,6 +67,7 @@ impl<'a> Transaction<'a> {
             backend,
             committed_live_state,
             binary_cas,
+            changelog,
             staged_writes,
             backend_transaction,
             visible_schemas,
@@ -78,8 +84,10 @@ impl<'a> Transaction<'a> {
         let staged_writes = self.staged_writes.drain()?;
         commit::commit_staged_writes(
             &self.binary_cas,
+            &self.changelog,
             self.backend_transaction.as_mut(),
             staged_writes,
+            self.functions.clone(),
         )
         .await?;
         self.backend_transaction.commit().await?;

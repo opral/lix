@@ -1,4 +1,43 @@
+use crate::engine2::changelog::CanonicalChange;
 use crate::{NullableKeyFilter, Value};
+
+/// Durable row visible through live_state reads.
+///
+/// Unlike provider write rows, live-state rows are fully hydrated facts. Missing
+/// generated fields should be caught before this type is constructed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LiveStateRow {
+    pub(crate) entity_id: String,
+    pub(crate) schema_key: String,
+    pub(crate) file_id: Option<String>,
+    pub(crate) plugin_key: Option<String>,
+    pub(crate) snapshot_content: Option<String>,
+    pub(crate) metadata: Option<String>,
+    pub(crate) schema_version: String,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) global: bool,
+    pub(crate) change_id: String,
+    pub(crate) commit_id: Option<String>,
+    pub(crate) untracked: bool,
+    pub(crate) version_id: String,
+}
+
+impl From<LiveStateRow> for CanonicalChange {
+    fn from(row: LiveStateRow) -> Self {
+        CanonicalChange {
+            id: row.change_id,
+            entity_id: row.entity_id,
+            schema_key: row.schema_key,
+            schema_version: row.schema_version,
+            file_id: row.file_id,
+            plugin_key: row.plugin_key,
+            snapshot_content: row.snapshot_content,
+            metadata: row.metadata,
+            created_at: row.created_at,
+        }
+    }
+}
 
 /// Which indexed field a live-state scan constraint applies to.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

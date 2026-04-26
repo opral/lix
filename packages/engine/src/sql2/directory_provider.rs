@@ -26,6 +26,7 @@ use datafusion::prelude::SessionContext;
 use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 
+use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
 };
@@ -33,10 +34,11 @@ use crate::functions::DynFunctionProvider;
 use crate::history::{
     StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRow,
 };
+use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
-use super::execute::{HistoryContext, SqlWriteIntent, SqlWriteStager, StateRow};
+use super::execute::{HistoryContext, SqlWriteIntent, SqlWriteStager};
 use super::filesystem_planner::{
     directory_descriptor_row, plan_recursive_directory_delete, DirectoryDescriptorRowInput,
     DirectoryPathResolver, FilesystemDeletePlan, FilesystemRowContext,
@@ -980,7 +982,7 @@ struct DirectoryDescriptorRecord {
     parent_id: Option<String>,
     name: String,
     hidden: bool,
-    live: StateRow,
+    live: LiveStateRow,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1172,7 +1174,7 @@ fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
 fn lix_directory_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<StateRow>> {
+) -> Result<Vec<StateWriteRow>> {
     lix_directory_write_rows_from_batch_with_options(batch, default_version_id, true)
 }
 
@@ -1181,7 +1183,7 @@ fn lix_directory_write_rows_from_batch_with_path_resolvers(
     default_version_id: Option<&str>,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
     generate_directory_id: &mut dyn FnMut() -> String,
-) -> Result<Vec<StateRow>> {
+) -> Result<Vec<StateWriteRow>> {
     lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         batch,
         default_version_id,
@@ -1194,7 +1196,7 @@ fn lix_directory_write_rows_from_batch_with_path_resolvers(
 fn lix_directory_existing_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<StateRow>> {
+) -> Result<Vec<StateWriteRow>> {
     lix_directory_write_rows_from_batch_with_options(batch, default_version_id, false)
 }
 
@@ -1215,7 +1217,7 @@ fn lix_directory_recursive_delete_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
     visible_filesystems: &BTreeMap<String, VisibleFilesystem>,
-) -> Result<(Vec<StateRow>, u64)> {
+) -> Result<(Vec<StateWriteRow>, u64)> {
     let mut rows = Vec::new();
     let mut seen = BTreeSet::new();
     for row_index in 0..batch.num_rows() {
@@ -1242,7 +1244,7 @@ fn lix_directory_recursive_delete_rows_from_batch(
 }
 
 fn append_deduped_delete_plan(
-    rows: &mut Vec<StateRow>,
+    rows: &mut Vec<StateWriteRow>,
     seen: &mut BTreeSet<StateRowDedupeKey>,
     plan: FilesystemDeletePlan,
 ) {
@@ -1263,8 +1265,8 @@ struct StateRowDedupeKey {
     untracked: bool,
 }
 
-impl From<&StateRow> for StateRowDedupeKey {
-    fn from(row: &StateRow) -> Self {
+impl From<&StateWriteRow> for StateRowDedupeKey {
+    fn from(row: &StateWriteRow) -> Self {
         Self {
             entity_id: row.entity_id.clone(),
             schema_key: row.schema_key.clone(),
@@ -1280,7 +1282,7 @@ fn lix_directory_write_rows_from_batch_with_options(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
     reject_read_only_fields: bool,
-) -> Result<Vec<StateRow>> {
+) -> Result<Vec<StateWriteRow>> {
     lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         batch,
         default_version_id,
@@ -1296,7 +1298,7 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
     reject_read_only_fields: bool,
     mut path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
     mut generate_directory_id: Option<&mut dyn FnMut() -> String>,
-) -> Result<Vec<StateRow>> {
+) -> Result<Vec<StateWriteRow>> {
     let mut rows = Vec::new();
     for row_index in 0..batch.num_rows() {
         if reject_read_only_fields {
@@ -1383,7 +1385,6 @@ fn directory_row_context_from_batch(
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         plugin_key: optional_string_value(batch, row_index, "lixcol_plugin_key")?,
         metadata: optional_string_value(batch, row_index, "lixcol_metadata")?,
-        schema_version: optional_string_value(batch, row_index, "lixcol_schema_version")?,
     })
 }
 
@@ -1424,7 +1425,7 @@ async fn directory_path_resolvers_from_live_state(
 }
 
 fn directory_path_seeds_from_live_rows(
-    rows: Vec<StateRow>,
+    rows: Vec<LiveStateRow>,
 ) -> std::result::Result<BTreeMap<String, Vec<(String, String)>>, LixError> {
     let mut directory_rows = Vec::<DirectoryDescriptorRecord>::new();
     for row in rows {
@@ -1465,7 +1466,7 @@ fn directory_path_seeds_from_live_rows(
 
 fn lix_directory_record_batch(
     schema: &SchemaRef,
-    rows: Vec<StateRow>,
+    rows: Vec<LiveStateRow>,
 ) -> Result<RecordBatch, LixError> {
     let mut directory_rows = Vec::<DirectoryDescriptorRecord>::new();
 
@@ -1938,12 +1939,13 @@ mod tests {
     use datafusion::physical_plan::SendableRecordBatchStream;
     use futures_util::stream;
 
-    use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest, LiveStateScanRequest};
+    use crate::engine2::live_state::{
+        LiveStateContext, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+    };
     use crate::functions::{
         DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
     };
-    use crate::sql2::StateRow;
-    use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateRow};
+    use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateWriteRow};
     use crate::LixError;
 
     use super::{
@@ -1981,24 +1983,27 @@ mod tests {
 
     #[derive(Default)]
     struct RowsLiveStateContext {
-        rows: Vec<StateRow>,
+        rows: Vec<LiveStateRow>,
     }
 
     #[async_trait]
     impl LiveStateContext for RowsLiveStateContext {
-        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
+        async fn scan_rows(
+            &self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<Vec<LiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
-        async fn load_exact(
+        async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<StateRow>, LixError> {
+        ) -> Result<Option<LiveStateRow>, LixError> {
             Ok(None)
         }
     }
 
-    fn live_row(entity_id: &str, version_id: &str, snapshot_content: &str) -> StateRow {
+    fn live_row(entity_id: &str, version_id: &str, snapshot_content: &str) -> LiveStateRow {
         live_filesystem_row(
             entity_id,
             super::DIRECTORY_SCHEMA_KEY,
@@ -2014,8 +2019,8 @@ mod tests {
         file_id: Option<&str>,
         version_id: &str,
         snapshot_content: &str,
-    ) -> StateRow {
-        StateRow {
+    ) -> LiveStateRow {
+        LiveStateRow {
             entity_id: entity_id.to_string(),
             schema_key: schema_key.to_string(),
             file_id: file_id.map(ToOwned::to_owned),
@@ -2024,16 +2029,16 @@ mod tests {
             metadata: Some("{\"source\":\"test\"}".to_string()),
             schema_version: "1".to_string(),
             version_id: version_id.to_string(),
-            change_id: Some(format!("change-{entity_id}")),
+            change_id: format!("change-{entity_id}"),
             commit_id: Some(format!("commit-{entity_id}")),
             global: false,
             untracked: false,
-            created_at: Some("2026-04-23T00:00:00Z".to_string()),
-            updated_at: Some("2026-04-23T01:00:00Z".to_string()),
+            created_at: "2026-04-23T00:00:00Z".to_string(),
+            updated_at: "2026-04-23T01:00:00Z".to_string(),
         }
     }
 
-    fn filesystem_rows() -> Vec<StateRow> {
+    fn filesystem_rows() -> Vec<LiveStateRow> {
         vec![
             live_filesystem_row(
                 "dir-docs",
@@ -2217,7 +2222,7 @@ mod tests {
 
         assert_eq!(
             rows,
-            vec![StateRow {
+            vec![StateWriteRow {
                 entity_id: "dir-docs".to_string(),
                 schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                 file_id: None,
@@ -2227,7 +2232,7 @@ mod tests {
                         .to_string()
                 ),
                 metadata: Some("{\"source\":\"directory\"}".to_string()),
-                schema_version: Some("1".to_string()),
+                schema_version: "1".to_string(),
                 created_at: None,
                 updated_at: None,
                 global: false,
@@ -2380,7 +2385,7 @@ mod tests {
         assert_eq!(
             stager.writes.lock().expect("writes lock").as_slice(),
             &[SqlWriteIntent::WriteRows {
-                rows: vec![StateRow {
+                rows: vec![StateWriteRow {
                     entity_id: "dir-docs".to_string(),
                     schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                     file_id: None,
@@ -2390,7 +2395,7 @@ mod tests {
                             .to_string()
                     ),
                     metadata: Some("{\"source\":\"directory\"}".to_string()),
-                    schema_version: Some("1".to_string()),
+                    schema_version: "1".to_string(),
                     created_at: None,
                     updated_at: None,
                     global: false,

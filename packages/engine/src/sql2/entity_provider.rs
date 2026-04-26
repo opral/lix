@@ -29,13 +29,15 @@ use futures_util::{stream, StreamExt, TryStreamExt};
 use serde_json::Value as JsonValue;
 
 use crate::common::{derive_entity_id_from_json_paths, EntityIdDerivationError};
+use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
 };
+use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
-use super::execute::{SqlWriteIntent, SqlWriteStager, StateRow};
+use super::execute::{SqlWriteIntent, SqlWriteStager};
 use super::udf::{
     lix_json_extract_boolean_expr, lix_json_extract_json_expr, lix_json_extract_text_expr,
 };
@@ -930,7 +932,7 @@ fn entity_lix_state_write_rows_from_batch(
     spec: &EntitySurfaceSpec,
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<StateRow>> {
+) -> Result<Vec<StateWriteRow>> {
     entity_lix_state_write_rows_from_batch_with_options(spec, batch, default_version_id, true)
 }
 
@@ -938,7 +940,7 @@ fn entity_existing_lix_state_write_rows_from_batch(
     spec: &EntitySurfaceSpec,
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<StateRow>> {
+) -> Result<Vec<StateWriteRow>> {
     entity_lix_state_write_rows_from_batch_with_options(spec, batch, default_version_id, false)
 }
 
@@ -947,7 +949,7 @@ fn entity_lix_state_write_rows_from_batch_with_options(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
     reject_read_only_fields: bool,
-) -> Result<Vec<StateRow>> {
+) -> Result<Vec<StateWriteRow>> {
     (0..batch.num_rows())
         .map(|row_index| {
             let explicit_global = optional_bool_value(batch, row_index, "lixcol_global")?;
@@ -1006,14 +1008,14 @@ fn entity_lix_state_write_rows_from_batch_with_options(
                 }
             };
 
-            Ok(StateRow {
+            Ok(StateWriteRow {
                 entity_id,
                 schema_key: spec.schema_key.clone(),
                 file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
                 plugin_key: optional_string_value(batch, row_index, "lixcol_plugin_key")?,
                 snapshot_content: Some(snapshot_content),
                 metadata: optional_string_value(batch, row_index, "lixcol_metadata")?,
-                schema_version: Some(schema_version),
+                schema_version: schema_version,
                 created_at: None,
                 updated_at: None,
                 global,
@@ -1396,7 +1398,7 @@ fn entity_live_state_scan_request(
 fn entity_record_batch(
     spec: &EntitySurfaceSpec,
     schema: SchemaRef,
-    rows: &[StateRow],
+    rows: &[LiveStateRow],
 ) -> Result<RecordBatch> {
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
@@ -1421,7 +1423,7 @@ fn entity_record_batch(
 fn entity_column_array(
     spec: &EntitySurfaceSpec,
     column_name: &str,
-    rows: &[StateRow],
+    rows: &[LiveStateRow],
     snapshots: &[Option<JsonValue>],
 ) -> Result<ArrayRef> {
     if let Some(property_name) = column_name.strip_prefix("lixcol_") {
@@ -1467,7 +1469,7 @@ fn entity_column_array(
     })
 }
 
-fn entity_system_column_array(column_name: &str, rows: &[StateRow]) -> Result<ArrayRef> {
+fn entity_system_column_array(column_name: &str, rows: &[LiveStateRow]) -> Result<ArrayRef> {
     Ok(match column_name {
         "entity_id" => string_array(rows.iter().map(|row| Some(row.entity_id.as_str()))),
         "schema_key" => string_array(rows.iter().map(|row| Some(row.schema_key.as_str()))),
@@ -1475,13 +1477,13 @@ fn entity_system_column_array(column_name: &str, rows: &[StateRow]) -> Result<Ar
         "plugin_key" => string_array(rows.iter().map(|row| row.plugin_key.as_deref())),
         "snapshot_content" => string_array(rows.iter().map(|row| row.snapshot_content.as_deref())),
         "metadata" => string_array(rows.iter().map(|row| row.metadata.as_deref())),
-        "schema_version" => string_array(rows.iter().map(|row| row.schema_version.as_deref())),
-        "created_at" => string_array(rows.iter().map(|row| row.created_at.as_deref())),
-        "updated_at" => string_array(rows.iter().map(|row| row.updated_at.as_deref())),
+        "schema_version" => string_array(rows.iter().map(|row| Some(row.schema_version.as_str()))),
+        "created_at" => string_array(rows.iter().map(|row| Some(row.created_at.as_str()))),
+        "updated_at" => string_array(rows.iter().map(|row| Some(row.updated_at.as_str()))),
         "global" => Arc::new(BooleanArray::from(
             rows.iter().map(|row| row.global).collect::<Vec<_>>(),
         )) as ArrayRef,
-        "change_id" => string_array(rows.iter().map(|row| row.change_id.as_deref())),
+        "change_id" => string_array(rows.iter().map(|row| Some(row.change_id.as_str()))),
         "commit_id" => string_array(rows.iter().map(|row| row.commit_id.as_deref())),
         "untracked" => Arc::new(BooleanArray::from(
             rows.iter().map(|row| row.untracked).collect::<Vec<_>>(),
@@ -1843,9 +1845,10 @@ mod tests {
         entity_record_batch, entity_surface_schema, schema_exposed_as_entity_surface,
         EntityColumnType, EntityInsertSink, EntityProviderVariant,
     };
-    use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest, LiveStateScanRequest};
-    use crate::sql2::StateRow;
-    use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateRow};
+    use crate::engine2::live_state::{
+        LiveStateContext, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+    };
+    use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateWriteRow};
     use crate::LixError;
 
     struct EmptyLiveStateContext;
@@ -1856,14 +1859,17 @@ mod tests {
 
     #[async_trait]
     impl LiveStateContext for EmptyLiveStateContext {
-        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
+        async fn scan_rows(
+            &self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<Vec<LiveStateRow>, LixError> {
             Ok(vec![])
         }
 
-        async fn load_exact(
+        async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<StateRow>, LixError> {
+        ) -> Result<Option<LiveStateRow>, LixError> {
             Ok(None)
         }
     }
@@ -1876,8 +1882,8 @@ mod tests {
         }
     }
 
-    fn live_row() -> StateRow {
-        StateRow {
+    fn live_row() -> LiveStateRow {
+        LiveStateRow {
             entity_id: "entity-1".to_string(),
             schema_key: "project_message".to_string(),
             file_id: None,
@@ -1889,12 +1895,12 @@ mod tests {
             metadata: Some("{\"source\":\"test\"}".to_string()),
             schema_version: "1".to_string(),
             version_id: "version-a".to_string(),
-            change_id: Some("change-a".to_string()),
+            change_id: "change-a".to_string(),
             commit_id: Some("commit-a".to_string()),
             global: false,
             untracked: false,
-            created_at: Some("2026-04-23T00:00:00Z".to_string()),
-            updated_at: Some("2026-04-23T01:00:00Z".to_string()),
+            created_at: "2026-04-23T00:00:00Z".to_string(),
+            updated_at: "2026-04-23T01:00:00Z".to_string(),
         }
     }
 
@@ -2131,7 +2137,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_id, "entity-1");
         assert_eq!(rows[0].schema_key, "project_message");
-        assert_eq!(rows[0].schema_version.as_deref(), Some("1"));
+        assert_eq!(rows[0].schema_version.as_str(), "1");
         assert_eq!(rows[0].version_id, "version-a");
         assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"entity\"}"));
         assert!(!rows[0].global);
@@ -2217,7 +2223,7 @@ mod tests {
         assert_eq!(
             stager.writes.lock().expect("writes lock").as_slice(),
             &[SqlWriteIntent::WriteRows {
-                rows: vec![StateRow {
+                rows: vec![StateWriteRow {
                     entity_id: "entity-1".to_string(),
                     schema_key: "project_message".to_string(),
                     file_id: None,
@@ -2227,7 +2233,7 @@ mod tests {
                             .to_string()
                     ),
                     metadata: Some("{\"source\":\"entity\"}".to_string()),
-                    schema_version: Some("1".to_string()),
+                    schema_version: "1".to_string(),
                     created_at: None,
                     updated_at: None,
                     global: false,
