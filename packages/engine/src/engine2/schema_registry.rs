@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
+use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{LiveStateContext, LiveStateFilter, LiveStateScanRequest};
 use crate::schema::{builtin_schema_definition, builtin_schema_keys, schema_key_from_definition};
-use crate::sql2::StateRow;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
@@ -91,7 +91,7 @@ fn schema_key_is_older(
 }
 
 fn decode_registered_schema_row(
-    row: &StateRow,
+    row: &LiveStateRow,
 ) -> Result<Option<(crate::schema::SchemaKey, JsonValue)>, LixError> {
     if row.schema_key != REGISTERED_SCHEMA_KEY {
         return Err(LixError::new(
@@ -169,11 +169,11 @@ mod tests {
     }
 
     struct RowsLiveStateContext {
-        rows: Vec<StateRow>,
+        rows: Vec<LiveStateRow>,
     }
 
     impl RowsLiveStateContext {
-        fn new(rows: Vec<StateRow>) -> Self {
+        fn new(rows: Vec<LiveStateRow>) -> Self {
             Self { rows }
         }
     }
@@ -183,7 +183,7 @@ mod tests {
         async fn scan_rows(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<StateRow>, LixError> {
+        ) -> Result<Vec<LiveStateRow>, LixError> {
             Ok(self
                 .rows
                 .iter()
@@ -202,26 +202,26 @@ mod tests {
         async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<StateRow>, LixError> {
+        ) -> Result<Option<LiveStateRow>, LixError> {
             Ok(None)
         }
     }
 
-    fn registered_schema_row(schema_key: &str, schema_version: &str) -> StateRow {
-        StateRow {
+    fn registered_schema_row(schema_key: &str, schema_version: &str) -> LiveStateRow {
+        LiveStateRow {
             entity_id: format!("{schema_key}~{schema_version}"),
             file_id: None,
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
-            schema_version: Some("1".to_string()),
+            schema_version: "1".to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
             plugin_key: None,
             metadata: None,
-            change_id: None,
+            change_id: "change-registered-schema".to_string(),
             commit_id: None,
             global: true,
             untracked: true,
-            created_at: None,
-            updated_at: None,
+            created_at: "2026-04-23T00:00:00Z".to_string(),
+            updated_at: "2026-04-23T01:00:00Z".to_string(),
             snapshot_content: Some(
                 json!({
                     "value": {

@@ -27,6 +27,7 @@ use super::entity_provider::register_entity_providers;
 use super::file_provider::register_lix_file_providers;
 use super::history_provider::register_history_providers;
 use super::lix_state_provider::register_lix_state_providers;
+use super::types::StateWriteRow;
 use super::udf::register_sql2_udfs;
 
 /// Single execution boundary for `sql2::execute_sql(...)`.
@@ -64,31 +65,13 @@ pub(crate) trait HistoryContext: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SqlWriteIntent {
     WriteRows {
-        rows: Vec<StateRow>,
+        rows: Vec<StateWriteRow>,
     },
     WriteRowsWithFileData {
-        rows: Vec<StateRow>,
+        rows: Vec<StateWriteRow>,
         file_data: Vec<FileDataWrite>,
         count: u64,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct StateRow {
-    pub(crate) entity_id: String,
-    pub(crate) schema_key: String,
-    pub(crate) file_id: Option<String>,
-    pub(crate) plugin_key: Option<String>,
-    pub(crate) snapshot_content: Option<String>,
-    pub(crate) metadata: Option<String>,
-    pub(crate) schema_version: Option<String>,
-    pub(crate) created_at: Option<String>,
-    pub(crate) updated_at: Option<String>,
-    pub(crate) global: bool,
-    pub(crate) change_id: Option<String>,
-    pub(crate) commit_id: Option<String>,
-    pub(crate) untracked: bool,
-    pub(crate) version_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,17 +195,12 @@ fn filesystem_state_from_file_data_writes(file_data: Vec<FileDataWrite>) -> Plan
     filesystem_state
 }
 
-fn mutation_row_from_state_row(row: StateRow) -> Result<MutationRow, LixError> {
+fn mutation_row_from_state_row(row: StateWriteRow) -> Result<MutationRow, LixError> {
     reject_read_only_lix_state_insert_field("created_at", &row.created_at)?;
     reject_read_only_lix_state_insert_field("updated_at", &row.updated_at)?;
     reject_read_only_lix_state_insert_field("change_id", &row.change_id)?;
     reject_read_only_lix_state_insert_field("commit_id", &row.commit_id)?;
-    let schema_version = row.schema_version.ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "INSERT into lix_state requires schema_version before staging",
-        )
-    })?;
+    let schema_version = row.schema_version;
     let operation = if row.snapshot_content.is_none() {
         MutationOperation::Delete
     } else {
@@ -495,10 +473,13 @@ mod tests {
 
     use super::{
         execute_sql, stage_decoded_write, HistoryContext, SqlExecutionContext, SqlWriteIntent,
-        SqlWriteStager, StateRow,
+        SqlWriteStager,
     };
     use crate::binary_cas::BlobDataReader;
-    use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest, LiveStateScanRequest};
+    use crate::engine2::live_state::{
+        CommittedLiveStateContext, LiveStateContext, LiveStateRow, LiveStateRowRequest,
+        LiveStateScanRequest,
+    };
     use crate::functions::{
         DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
     };
@@ -506,7 +487,7 @@ mod tests {
         StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRow,
         StateHistoryVersionScope,
     };
-    use crate::sql2::StateRow;
+    use crate::sql2::StateWriteRow;
     use crate::test_support::boot_test_engine;
     use crate::transaction::{PendingOverlay, PreparedWriteStatementStager, TransactionWriteDelta};
     use crate::{CreateVersionOptions, LixError, Value};
@@ -514,7 +495,7 @@ mod tests {
     struct DummyBlobReader;
     struct DummyLiveStateContext;
     struct RowsLiveStateContext {
-        rows: Vec<StateRow>,
+        rows: Vec<LiveStateRow>,
     }
     struct RowsHistoryContext {
         rows: Vec<StateHistoryRow>,
@@ -624,28 +605,34 @@ mod tests {
 
     #[async_trait]
     impl LiveStateContext for DummyLiveStateContext {
-        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
+        async fn scan_rows(
+            &self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<Vec<LiveStateRow>, LixError> {
             Ok(vec![])
         }
 
-        async fn load_exact(
+        async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<StateRow>, LixError> {
+        ) -> Result<Option<LiveStateRow>, LixError> {
             Ok(None)
         }
     }
 
     #[async_trait]
     impl LiveStateContext for RowsLiveStateContext {
-        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
+        async fn scan_rows(
+            &self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<Vec<LiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
-        async fn load_exact(
+        async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<StateRow>, LixError> {
+        ) -> Result<Option<LiveStateRow>, LixError> {
             Ok(None)
         }
     }
@@ -705,15 +692,15 @@ mod tests {
         }
     }
 
-    fn minimal_lix_state_write_row() -> StateRow {
-        StateRow {
+    fn minimal_lix_state_write_row() -> StateWriteRow {
+        StateWriteRow {
             entity_id: "entity-1".to_string(),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             plugin_key: None,
             snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
             metadata: None,
-            schema_version: Some("1".to_string()),
+            schema_version: "1".to_string(),
             created_at: None,
             updated_at: None,
             global: false,
@@ -724,8 +711,8 @@ mod tests {
         }
     }
 
-    fn live_lix_state_row(entity_id: &str, metadata: Option<&str>) -> StateRow {
-        StateRow {
+    fn live_lix_state_row(entity_id: &str, metadata: Option<&str>) -> LiveStateRow {
+        LiveStateRow {
             entity_id: entity_id.to_string(),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
@@ -734,17 +721,17 @@ mod tests {
             metadata: metadata.map(ToOwned::to_owned),
             schema_version: "1".to_string(),
             version_id: "version-a".to_string(),
-            change_id: Some(format!("change-{entity_id}")),
+            change_id: format!("change-{entity_id}"),
             commit_id: Some(format!("commit-{entity_id}")),
             global: false,
             untracked: false,
-            created_at: Some("2026-04-23T00:00:00Z".to_string()),
-            updated_at: Some("2026-04-23T01:00:00Z".to_string()),
+            created_at: "2026-04-23T00:00:00Z".to_string(),
+            updated_at: "2026-04-23T01:00:00Z".to_string(),
         }
     }
 
-    fn live_entity_row(entity_id: &str, version_id: &str, value: &str) -> StateRow {
-        StateRow {
+    fn live_entity_row(entity_id: &str, version_id: &str, value: &str) -> LiveStateRow {
+        LiveStateRow {
             entity_id: entity_id.to_string(),
             schema_key: "test_state_schema".to_string(),
             file_id: None,
@@ -753,12 +740,12 @@ mod tests {
             metadata: Some(format!("{{\"source\":\"{entity_id}\"}}")),
             schema_version: "1".to_string(),
             version_id: version_id.to_string(),
-            change_id: Some(format!("change-{entity_id}")),
+            change_id: format!("change-{entity_id}"),
             commit_id: Some(format!("commit-{entity_id}")),
             global: false,
             untracked: false,
-            created_at: Some("2026-04-23T00:00:00Z".to_string()),
-            updated_at: Some("2026-04-23T01:00:00Z".to_string()),
+            created_at: "2026-04-23T00:00:00Z".to_string(),
+            updated_at: "2026-04-23T01:00:00Z".to_string(),
         }
     }
 
@@ -768,8 +755,8 @@ mod tests {
         parent_id: Option<&str>,
         name: &str,
         hidden: bool,
-    ) -> StateRow {
-        StateRow {
+    ) -> LiveStateRow {
+        LiveStateRow {
             entity_id: entity_id.to_string(),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id: None,
@@ -786,12 +773,12 @@ mod tests {
             metadata: Some(format!("{{\"source\":\"{entity_id}\"}}")),
             schema_version: "1".to_string(),
             version_id: version_id.to_string(),
-            change_id: Some(format!("change-{entity_id}")),
+            change_id: format!("change-{entity_id}"),
             commit_id: Some(format!("commit-{entity_id}")),
             global: false,
             untracked: false,
-            created_at: Some("2026-04-23T00:00:00Z".to_string()),
-            updated_at: Some("2026-04-23T01:00:00Z".to_string()),
+            created_at: "2026-04-23T00:00:00Z".to_string(),
+            updated_at: "2026-04-23T01:00:00Z".to_string(),
         }
     }
 
@@ -802,8 +789,8 @@ mod tests {
         name: &str,
         extension: Option<&str>,
         hidden: bool,
-    ) -> StateRow {
-        StateRow {
+    ) -> LiveStateRow {
+        LiveStateRow {
             entity_id: entity_id.to_string(),
             schema_key: "lix_file_descriptor".to_string(),
             file_id: None,
@@ -821,12 +808,12 @@ mod tests {
             metadata: Some(format!("{{\"source\":\"{entity_id}\"}}")),
             schema_version: "1".to_string(),
             version_id: version_id.to_string(),
-            change_id: Some(format!("change-{entity_id}")),
+            change_id: format!("change-{entity_id}"),
             commit_id: Some(format!("commit-{entity_id}")),
             global: false,
             untracked: false,
-            created_at: Some("2026-04-23T00:00:00Z".to_string()),
-            updated_at: Some("2026-04-23T01:00:00Z".to_string()),
+            created_at: "2026-04-23T00:00:00Z".to_string(),
+            updated_at: "2026-04-23T01:00:00Z".to_string(),
         }
     }
 

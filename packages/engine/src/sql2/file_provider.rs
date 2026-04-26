@@ -27,10 +27,12 @@ use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 
 use crate::binary_cas::BlobDataReader;
+use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
 };
 use crate::functions::DynFunctionProvider;
+use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
@@ -42,7 +44,7 @@ use crate::history::{
     StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRow,
 };
 
-use super::execute::{FileDataWrite, HistoryContext, SqlWriteIntent, SqlWriteStager, StateRow};
+use super::execute::{FileDataWrite, HistoryContext, SqlWriteIntent, SqlWriteStager};
 use super::filesystem_planner::{
     blob_ref_row, directory_path_resolvers_from_state_rows, file_descriptor_row, plan_file_delete,
     plan_file_path_update, BlobRefRowInput, DirectoryPathResolver, FileDeleteInput,
@@ -1092,7 +1094,7 @@ struct FileDescriptorRecord {
     name: String,
     extension: Option<String>,
     hidden: bool,
-    live: StateRow,
+    live: LiveStateRow,
 }
 
 #[derive(Debug, Clone)]
@@ -1188,7 +1190,7 @@ struct FileHistoryOutputRow {
 
 #[derive(Debug, Default)]
 struct LixFileStagedBatch {
-    state_rows: Vec<StateRow>,
+    state_rows: Vec<StateWriteRow>,
     file_data_writes: Vec<FileDataWrite>,
     count: u64,
 }
@@ -1623,7 +1625,7 @@ fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
 fn lix_file_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<StateRow>> {
+) -> Result<Vec<StateWriteRow>> {
     Ok(lix_file_insert_stage_from_batch(batch, default_version_id)?.state_rows)
 }
 
@@ -1646,7 +1648,7 @@ fn lix_file_delete_stage_from_batch(
 }
 
 fn blob_ref_file_ids_from_live_rows(
-    rows: &[StateRow],
+    rows: &[LiveStateRow],
 ) -> std::result::Result<BTreeSet<String>, LixError> {
     let mut file_ids = BTreeSet::new();
     for row in rows {
@@ -1956,7 +1958,6 @@ fn stage_lix_file_data_write(
                 file_id: None,
                 plugin_key: None,
                 metadata: None,
-                schema_version: None,
                 ..context.clone()
             },
         })
@@ -1996,7 +1997,6 @@ fn file_row_context_from_batch(
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         plugin_key: optional_string_value(batch, row_index, "lixcol_plugin_key")?,
         metadata: optional_string_value(batch, row_index, "lixcol_metadata")?,
-        schema_version: optional_string_value(batch, row_index, "lixcol_schema_version")?,
     })
 }
 
@@ -2034,7 +2034,7 @@ async fn file_path_resolvers_from_live_state(
 async fn lix_file_record_batch(
     schema: &SchemaRef,
     blob_reader: &Arc<dyn BlobDataReader>,
-    rows: Vec<StateRow>,
+    rows: Vec<LiveStateRow>,
 ) -> Result<RecordBatch, LixError> {
     let projected_columns = schema
         .fields()
@@ -2619,11 +2619,11 @@ mod tests {
     use futures_util::stream;
     use serde_json::Value as JsonValue;
 
+    use crate::engine2::live_state::LiveStateRow;
     use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest, LiveStateScanRequest};
     use crate::functions::{
         DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
     };
-    use crate::sql2::StateRow;
     use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager};
     use crate::LixError;
 
@@ -2659,25 +2659,32 @@ mod tests {
 
     #[derive(Default)]
     struct RowsLiveStateContext {
-        rows: Vec<StateRow>,
+        rows: Vec<LiveStateRow>,
     }
 
     #[async_trait]
     impl LiveStateContext for RowsLiveStateContext {
-        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
+        async fn scan_rows(
+            &self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<Vec<LiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
-        async fn load_exact(
+        async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<StateRow>, LixError> {
+        ) -> Result<Option<LiveStateRow>, LixError> {
             Ok(None)
         }
     }
 
-    fn live_directory_row(entity_id: &str, version_id: &str, snapshot_content: &str) -> StateRow {
-        StateRow {
+    fn live_directory_row(
+        entity_id: &str,
+        version_id: &str,
+        snapshot_content: &str,
+    ) -> LiveStateRow {
+        LiveStateRow {
             entity_id: entity_id.to_string(),
             schema_key: super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
             file_id: None,
@@ -2686,12 +2693,12 @@ mod tests {
             metadata: None,
             schema_version: "1".to_string(),
             version_id: version_id.to_string(),
-            change_id: Some(format!("change-{entity_id}")),
+            change_id: format!("change-{entity_id}"),
             commit_id: Some(format!("commit-{entity_id}")),
             global: false,
             untracked: false,
-            created_at: Some("2026-04-23T00:00:00Z".to_string()),
-            updated_at: Some("2026-04-23T01:00:00Z".to_string()),
+            created_at: "2026-04-23T00:00:00Z".to_string(),
+            updated_at: "2026-04-23T01:00:00Z".to_string(),
         }
     }
 
@@ -2846,7 +2853,7 @@ mod tests {
         assert_eq!(rows[0].entity_id, "file-readme");
         assert_eq!(rows[0].schema_key, "lix_file_descriptor");
         assert_eq!(rows[0].version_id, "version-b");
-        assert_eq!(rows[0].schema_version.as_deref(), Some("1"));
+        assert_eq!(rows[0].schema_version.as_str(), "1");
         assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"file\"}"));
         let snapshot: JsonValue =
             serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap())

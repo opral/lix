@@ -25,13 +25,15 @@ use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use futures_util::{stream, StreamExt, TryStreamExt};
 
+use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
 };
+use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
-use super::execute::{SqlWriteIntent, SqlWriteStager, StateRow};
+use super::execute::{SqlWriteIntent, SqlWriteStager};
 
 pub(crate) async fn register_lix_state_providers(
     session: &SessionContext,
@@ -732,7 +734,7 @@ fn apply_lix_state_update_assignments(
 fn lix_state_stageable_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: &str,
-) -> Result<Vec<StateRow>> {
+) -> Result<Vec<StateWriteRow>> {
     let mut rows = lix_state_write_rows_from_batch(batch, default_version_id)?;
     for row in &mut rows {
         row.created_at = None;
@@ -746,7 +748,7 @@ fn lix_state_stageable_write_rows_from_batch(
 fn lix_state_deletable_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: &str,
-) -> Result<Vec<StateRow>> {
+) -> Result<Vec<StateWriteRow>> {
     let mut rows = lix_state_stageable_write_rows_from_batch(batch, default_version_id)?;
     for row in &mut rows {
         row.snapshot_content = None;
@@ -773,7 +775,7 @@ fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
 fn lix_state_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: &str,
-) -> Result<Vec<StateRow>> {
+) -> Result<Vec<StateWriteRow>> {
     (0..batch.num_rows())
         .map(|row_index| {
             let global = required_bool_value(batch, row_index, "global")?;
@@ -786,14 +788,14 @@ fn lix_state_write_rows_from_batch(
                     }
                 });
 
-            Ok(StateRow {
+            Ok(StateWriteRow {
                 entity_id: required_string_value(batch, row_index, "entity_id")?,
                 schema_key: required_string_value(batch, row_index, "schema_key")?,
                 file_id: optional_string_value(batch, row_index, "file_id")?,
                 plugin_key: optional_string_value(batch, row_index, "plugin_key")?,
                 snapshot_content: optional_string_value(batch, row_index, "snapshot_content")?,
                 metadata: optional_string_value(batch, row_index, "metadata")?,
-                schema_version: optional_string_value(batch, row_index, "schema_version")?,
+                schema_version: required_string_value(batch, row_index, "schema_version")?,
                 created_at: optional_string_value(batch, row_index, "created_at")?,
                 updated_at: optional_string_value(batch, row_index, "updated_at")?,
                 global,
@@ -1283,7 +1285,10 @@ fn is_null_literal(expr: &Expr) -> bool {
     matches!(expr, Expr::Literal(ScalarValue::Null, _))
 }
 
-fn lix_state_record_batch(schema: SchemaRef, rows: &[StateRow]) -> Result<RecordBatch, LixError> {
+fn lix_state_record_batch(
+    schema: SchemaRef,
+    rows: &[LiveStateRow],
+) -> Result<RecordBatch, LixError> {
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
         return RecordBatch::try_new_with_options(schema, vec![], &options).map_err(|error| {
@@ -1308,14 +1313,14 @@ fn lix_state_record_batch(schema: SchemaRef, rows: &[StateRow]) -> Result<Record
                 }
                 "metadata" => string_array(rows.iter().map(|row| row.metadata.as_deref())),
                 "schema_version" => {
-                    string_array(rows.iter().map(|row| row.schema_version.as_deref()))
+                    string_array(rows.iter().map(|row| Some(row.schema_version.as_str())))
                 }
-                "created_at" => string_array(rows.iter().map(|row| row.created_at.as_deref())),
-                "updated_at" => string_array(rows.iter().map(|row| row.updated_at.as_deref())),
+                "created_at" => string_array(rows.iter().map(|row| Some(row.created_at.as_str()))),
+                "updated_at" => string_array(rows.iter().map(|row| Some(row.updated_at.as_str()))),
                 "global" => Arc::new(BooleanArray::from(
                     rows.iter().map(|row| row.global).collect::<Vec<_>>(),
                 )) as ArrayRef,
-                "change_id" => string_array(rows.iter().map(|row| row.change_id.as_deref())),
+                "change_id" => string_array(rows.iter().map(|row| Some(row.change_id.as_str()))),
                 "commit_id" => string_array(rows.iter().map(|row| row.commit_id.as_deref())),
                 "untracked" => Arc::new(BooleanArray::from(
                     rows.iter().map(|row| row.untracked).collect::<Vec<_>>(),
@@ -1376,8 +1381,10 @@ mod tests {
         LixStateDeleteExec, LixStateFilterPredicate, LixStateInsertSink, LixStateProvider,
         LixStateUpdateExec,
     };
-    use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest, LiveStateScanRequest};
-    use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateRow};
+    use crate::engine2::live_state::{
+        LiveStateContext, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+    };
+    use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateWriteRow};
     use crate::transaction::{PendingOverlay, PreparedWriteStatementStager, TransactionWriteDelta};
     use crate::{LixError, NullableKeyFilter};
     use async_trait::async_trait;
@@ -1407,7 +1414,7 @@ mod tests {
 
     struct EmptyLiveStateContext;
     struct RowsLiveStateContext {
-        rows: Vec<StateRow>,
+        rows: Vec<LiveStateRow>,
     }
     struct DummyWriteStager;
     #[derive(Default)]
@@ -1507,14 +1514,14 @@ mod tests {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<StateRow>, LixError> {
+        ) -> Result<Vec<LiveStateRow>, LixError> {
             Ok(vec![])
         }
 
         async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<StateRow>, LixError> {
+        ) -> Result<Option<LiveStateRow>, LixError> {
             Ok(None)
         }
     }
@@ -1524,14 +1531,14 @@ mod tests {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<StateRow>, LixError> {
+        ) -> Result<Vec<LiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
         async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<StateRow>, LixError> {
+        ) -> Result<Option<LiveStateRow>, LixError> {
             Ok(None)
         }
     }
@@ -1619,8 +1626,8 @@ mod tests {
         .expect("valid stageable lix_state batch")
     }
 
-    fn live_row(entity_id: &str, metadata: Option<&str>) -> StateRow {
-        StateRow {
+    fn live_row(entity_id: &str, metadata: Option<&str>) -> LiveStateRow {
+        LiveStateRow {
             entity_id: entity_id.to_string(),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
@@ -1629,12 +1636,12 @@ mod tests {
             metadata: metadata.map(ToOwned::to_owned),
             schema_version: "1".to_string(),
             version_id: "version-a".to_string(),
-            change_id: Some(format!("change-{entity_id}")),
+            change_id: format!("change-{entity_id}"),
             commit_id: Some(format!("commit-{entity_id}")),
             global: false,
             untracked: false,
-            created_at: Some("2026-04-23T00:00:00Z".to_string()),
-            updated_at: Some("2026-04-23T01:00:00Z".to_string()),
+            created_at: "2026-04-23T00:00:00Z".to_string(),
+            updated_at: "2026-04-23T01:00:00Z".to_string(),
         }
     }
 
@@ -1917,14 +1924,14 @@ mod tests {
 
         assert_eq!(
             rows,
-            vec![StateRow {
+            vec![StateWriteRow {
                 entity_id: "entity-1".to_string(),
                 schema_key: "lix_key_value".to_string(),
                 file_id: None,
                 plugin_key: Some("plugin-a".to_string()),
                 snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
                 metadata: Some("{\"source\":\"test\"}".to_string()),
-                schema_version: Some("1".to_string()),
+                schema_version: "1".to_string(),
                 created_at: Some("2026-04-23T00:00:00Z".to_string()),
                 updated_at: Some("2026-04-23T01:00:00Z".to_string()),
                 global: false,
@@ -1967,14 +1974,14 @@ mod tests {
         assert_eq!(
             stager.writes.lock().expect("writes lock").as_slice(),
             &[SqlWriteIntent::WriteRows {
-                rows: vec![StateRow {
+                rows: vec![StateWriteRow {
                     entity_id: "entity-1".to_string(),
                     schema_key: "lix_key_value".to_string(),
                     file_id: None,
                     plugin_key: Some("plugin-a".to_string()),
                     snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
                     metadata: Some("{\"source\":\"test\"}".to_string()),
-                    schema_version: Some("1".to_string()),
+                    schema_version: "1".to_string(),
                     created_at: Some("2026-04-23T00:00:00Z".to_string()),
                     updated_at: Some("2026-04-23T01:00:00Z".to_string()),
                     global: false,
@@ -2111,14 +2118,14 @@ mod tests {
         assert_eq!(
             stager.writes.lock().expect("writes lock").as_slice(),
             &[SqlWriteIntent::WriteRows {
-                rows: vec![StateRow {
+                rows: vec![StateWriteRow {
                     entity_id: "entity-1".to_string(),
                     schema_key: "lix_key_value".to_string(),
                     file_id: None,
                     plugin_key: None,
                     snapshot_content: Some("{\"key\":\"hello\",\"value\":\"updated\"}".to_string()),
                     metadata: Some("lix_key_value".to_string()),
-                    schema_version: Some("1".to_string()),
+                    schema_version: "1".to_string(),
                     created_at: None,
                     updated_at: None,
                     global: false,
@@ -2169,14 +2176,14 @@ mod tests {
             stager.writes.lock().expect("writes lock").as_slice(),
             &[SqlWriteIntent::WriteRows {
                 rows: vec![
-                    StateRow {
+                    StateWriteRow {
                         entity_id: "entity-1".to_string(),
                         schema_key: "lix_key_value".to_string(),
                         file_id: None,
                         plugin_key: None,
                         snapshot_content: None,
                         metadata: Some("{\"source\":\"one\"}".to_string()),
-                        schema_version: Some("1".to_string()),
+                        schema_version: "1".to_string(),
                         created_at: None,
                         updated_at: None,
                         global: false,
@@ -2185,14 +2192,14 @@ mod tests {
                         untracked: false,
                         version_id: "version-a".to_string(),
                     },
-                    StateRow {
+                    StateWriteRow {
                         entity_id: "entity-2".to_string(),
                         schema_key: "lix_key_value".to_string(),
                         file_id: None,
                         plugin_key: None,
                         snapshot_content: None,
                         metadata: Some("{\"source\":\"two\"}".to_string()),
-                        schema_version: Some("1".to_string()),
+                        schema_version: "1".to_string(),
                         created_at: None,
                         updated_at: None,
                         global: false,

@@ -4,7 +4,7 @@ use crate::engine2::transaction::Transaction;
 use crate::sql2;
 use crate::{LixError, QueryResult, Value};
 
-use super::{Session, SessionSqlExecutionContext};
+use super::context::{SessionContext, SessionSqlExecutionContext};
 
 /// Result of executing one SQL statement through engine2.
 ///
@@ -134,7 +134,7 @@ impl RowRef<'_> {
     }
 }
 
-impl Session {
+impl SessionContext {
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         let committed_live_state: Arc<dyn crate::engine2::live_state::LiveStateContext> =
             self.committed_live_state.clone();
@@ -160,6 +160,7 @@ impl Session {
                 &self.backend,
                 Arc::clone(&self.committed_live_state),
                 Arc::clone(&self.binary_cas),
+                Arc::clone(&self.changelog),
                 Arc::clone(&self.schema_registry),
                 self.functions.clone(),
             )

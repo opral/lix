@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
+use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{LiveStateContext, LiveStateFilter, LiveStateScanRequest};
-use crate::sql2::StateRow;
 use crate::LixError;
 
 use super::filesystem_planner::{
@@ -53,7 +53,7 @@ impl VisibleFilesystem {
 
     /// Builds filesystem lookup indexes from rows that are already known to be
     /// transaction-visible.
-    pub(crate) fn from_live_rows(rows: Vec<StateRow>) -> Result<Self, LixError> {
+    pub(crate) fn from_live_rows(rows: Vec<LiveStateRow>) -> Result<Self, LixError> {
         let mut visible = Self::default();
 
         for row in rows {
@@ -184,7 +184,7 @@ struct BlobRefSnapshot {
     size_bytes: Option<u64>,
 }
 
-fn filesystem_row_context(row: &StateRow) -> FilesystemRowContext {
+fn filesystem_row_context(row: &LiveStateRow) -> FilesystemRowContext {
     FilesystemRowContext {
         version_id: row.version_id.clone(),
         global: row.global,
@@ -192,7 +192,6 @@ fn filesystem_row_context(row: &StateRow) -> FilesystemRowContext {
         file_id: row.file_id.clone(),
         plugin_key: row.plugin_key.clone(),
         metadata: row.metadata.clone(),
-        schema_version: row.schema_version.clone(),
     }
 }
 
@@ -200,8 +199,8 @@ fn filesystem_row_context(row: &StateRow) -> FilesystemRowContext {
 mod tests {
     use async_trait::async_trait;
 
+    use crate::engine2::live_state::LiveStateRow;
     use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest, LiveStateScanRequest};
-    use crate::sql2::StateRow;
     use crate::LixError;
 
     use super::{
@@ -287,17 +286,20 @@ mod tests {
         assert_eq!(blob_ref.size_bytes, Some(5));
     }
 
-    fn live_state(rows: Vec<StateRow>) -> std::sync::Arc<dyn LiveStateContext> {
+    fn live_state(rows: Vec<LiveStateRow>) -> std::sync::Arc<dyn LiveStateContext> {
         std::sync::Arc::new(RowsLiveStateContext { rows })
     }
 
     struct RowsLiveStateContext {
-        rows: Vec<StateRow>,
+        rows: Vec<LiveStateRow>,
     }
 
     #[async_trait]
     impl LiveStateContext for RowsLiveStateContext {
-        async fn scan(&self, request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
+        async fn scan_rows(
+            &self,
+            request: &LiveStateScanRequest,
+        ) -> Result<Vec<LiveStateRow>, LixError> {
             Ok(self
                 .rows
                 .iter()
@@ -311,15 +313,15 @@ mod tests {
                 .collect())
         }
 
-        async fn load_exact(
+        async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<StateRow>, LixError> {
+        ) -> Result<Option<LiveStateRow>, LixError> {
             Ok(None)
         }
     }
 
-    fn directory_row(entity_id: &str, snapshot_content: &str) -> StateRow {
+    fn directory_row(entity_id: &str, snapshot_content: &str) -> LiveStateRow {
         live_row(
             entity_id,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
@@ -328,7 +330,7 @@ mod tests {
         )
     }
 
-    fn file_row(entity_id: &str, snapshot_content: &str) -> StateRow {
+    fn file_row(entity_id: &str, snapshot_content: &str) -> LiveStateRow {
         live_row(
             entity_id,
             FILE_DESCRIPTOR_SCHEMA_KEY,
@@ -337,7 +339,7 @@ mod tests {
         )
     }
 
-    fn blob_ref_row(entity_id: &str, snapshot_content: &str) -> StateRow {
+    fn blob_ref_row(entity_id: &str, snapshot_content: &str) -> LiveStateRow {
         live_row(
             entity_id,
             BLOB_REF_SCHEMA_KEY,
@@ -351,8 +353,8 @@ mod tests {
         schema_key: &str,
         file_id: Option<String>,
         snapshot_content: &str,
-    ) -> StateRow {
-        StateRow {
+    ) -> LiveStateRow {
+        LiveStateRow {
             entity_id: entity_id.to_string(),
             schema_key: schema_key.to_string(),
             file_id,
@@ -361,12 +363,12 @@ mod tests {
             metadata: None,
             schema_version: "1".to_string(),
             version_id: "version-a".to_string(),
-            change_id: Some(format!("change-{entity_id}")),
+            change_id: format!("change-{entity_id}"),
             commit_id: Some(format!("commit-{entity_id}")),
             global: false,
             untracked: false,
-            created_at: Some("2026-04-23T00:00:00Z".to_string()),
-            updated_at: Some("2026-04-23T01:00:00Z".to_string()),
+            created_at: "2026-04-23T00:00:00Z".to_string(),
+            updated_at: "2026-04-23T01:00:00Z".to_string(),
         }
     }
 }
