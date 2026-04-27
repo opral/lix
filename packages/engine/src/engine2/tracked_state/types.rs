@@ -19,7 +19,7 @@ pub(crate) struct TrackedStateRow {
     pub(crate) updated_at: String,
     pub(crate) global: bool,
     pub(crate) change_id: String,
-    pub(crate) commit_id: Option<String>,
+    pub(crate) commit_id: String,
     pub(crate) version_id: String,
 }
 
@@ -56,6 +56,16 @@ pub(crate) struct TrackedStateScanRequest {
     pub(crate) projection: TrackedStateProjection,
     #[serde(default)]
     pub(crate) limit: Option<usize>,
+}
+
+/// Delete request for tracked-state projection rows.
+///
+/// This is a storage-level primitive. Rebuild code can delete a scoped
+/// projection, then write the rows derived from the commit graph.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub(crate) struct TrackedStateDeleteRequest {
+    #[serde(default)]
+    pub(crate) filter: TrackedStateFilter,
 }
 
 /// Point lookup request for one tracked-state row.

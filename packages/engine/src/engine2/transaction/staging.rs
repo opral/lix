@@ -86,8 +86,8 @@ impl SqlWriteStager for TransactionStagedWrites {
             SqlWriteIntent::WriteRows { rows } => rows.len() as u64,
             SqlWriteIntent::WriteRowsWithFileData { count, .. } => *count,
         };
-        let (rows, file_data_writes) =
-            state_rows_from_write_intent(write, &mut self.functions.clone())?;
+        let mut functions = self.functions.clone();
+        let (rows, file_data_writes) = state_rows_from_write_intent(write, &mut functions)?;
         for row in &rows {
             validate_commit_membership_support(row)?;
         }
@@ -103,15 +103,17 @@ impl SqlWriteStager for TransactionStagedWrites {
                 "failed to acquire transaction staged commit membership lock",
             )
         })?;
-        for row in rows {
+        for mut row in rows {
             let identity = StagedStateRowIdentity::from(&row);
             if let Some(previous) = guard.remove(&identity.opposite_untracked()) {
                 remove_row_from_commit_members(&mut commit_members_guard, &previous);
             }
-            if let Some(previous) = guard.insert(identity, row.clone()) {
+            if let Some(previous) = guard.remove(&identity) {
                 remove_row_from_commit_members(&mut commit_members_guard, &previous);
             }
-            add_row_to_commit_members(&mut commit_members_guard, &row);
+            add_row_to_commit_members(&mut commit_members_guard, &mut row, &mut functions);
+            let identity = StagedStateRowIdentity::from(&row);
+            guard.insert(identity, row);
         }
         if !file_data_writes.is_empty() {
             self.file_data_writes
@@ -325,7 +327,8 @@ fn validate_commit_membership_support(row: &StagedStateRow) -> Result<(), LixErr
 
 fn add_row_to_commit_members(
     members_by_version: &mut BTreeMap<String, StagedCommitMembers>,
-    row: &StagedStateRow,
+    row: &mut StagedStateRow,
+    functions: &mut dyn LixFunctionProvider,
 ) {
     if row.untracked {
         return;
@@ -334,10 +337,17 @@ fn add_row_to_commit_members(
         .change_id
         .clone()
         .expect("tracked staged rows must carry change_id for commit membership");
-    members_by_version
+    let members = members_by_version
         .entry(row.version_id.clone())
-        .or_default()
-        .add_change_id(change_id);
+        .or_insert_with(|| {
+            StagedCommitMembers::new(
+                functions.uuid_v7(),
+                functions.uuid_v7(),
+                functions.timestamp(),
+            )
+        });
+    row.commit_id = Some(members.commit_id.clone());
+    members.add_change_id(change_id);
 }
 
 fn remove_row_from_commit_members(
@@ -788,6 +798,33 @@ mod tests {
         assert_eq!(
             drained.state_rows[0].updated_at.as_str(),
             "test-timestamp-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_writes_stamp_tracked_rows_with_commit_id_during_staging() {
+        let staged_writes = test_staged_writes();
+
+        staged_writes
+            .stage_write(SqlWriteIntent::WriteRows {
+                rows: vec![state_row("tracked-commit-key", "value").with_tracked()],
+            })
+            .await
+            .expect("tracked row should stage");
+
+        let drained = staged_writes.drain().expect("drain should succeed");
+        assert_eq!(drained.state_rows.len(), 1);
+        assert_eq!(
+            drained.state_rows[0].commit_id.as_deref(),
+            Some("test-uuid-2")
+        );
+        assert_eq!(
+            drained
+                .commit_members_by_version
+                .get("global")
+                .expect("global commit members should exist")
+                .commit_id,
+            "test-uuid-2"
         );
     }
 

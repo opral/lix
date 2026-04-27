@@ -1,6 +1,6 @@
 use crate::backend::{KvStore, KvWriter};
 use crate::engine2::tracked_state::{
-    TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
+    TrackedStateDeleteRequest, TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
 };
 use crate::LixError;
 
@@ -67,5 +67,12 @@ where
 {
     pub(crate) async fn write_rows(&mut self, rows: &[TrackedStateRow]) -> Result<(), LixError> {
         crate::engine2::tracked_state::storage::write_rows(&mut self.store, rows).await
+    }
+
+    pub(crate) async fn delete_rows(
+        &mut self,
+        request: &TrackedStateDeleteRequest,
+    ) -> Result<usize, LixError> {
+        crate::engine2::tracked_state::storage::delete_rows(&mut self.store, request).await
     }
 }

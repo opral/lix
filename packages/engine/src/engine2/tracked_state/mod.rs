@@ -1,4 +1,5 @@
 mod context;
+pub(crate) mod rebuild;
 pub(crate) mod storage;
 mod types;
 
@@ -6,6 +7,6 @@ mod types;
 pub(crate) use context::{TrackedStateContext, TrackedStateReader, TrackedStateWriter};
 #[allow(unused_imports)]
 pub(crate) use types::{
-    TrackedStateFilter, TrackedStateProjection, TrackedStateRow, TrackedStateRowRequest,
-    TrackedStateScanRequest,
+    TrackedStateDeleteRequest, TrackedStateFilter, TrackedStateProjection, TrackedStateRow,
+    TrackedStateRowRequest, TrackedStateScanRequest,
 };
