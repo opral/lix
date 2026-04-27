@@ -14,17 +14,15 @@ use datafusion::logical_expr::{
 };
 use serde_json::Value as JsonValue;
 
-use crate::functions::{
-    DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
+use crate::engine2::functions::{
+    FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
 };
 
-pub(crate) fn system_sql2_function_provider() -> DynFunctionProvider {
-    SharedFunctionProvider::new(
-        Box::new(SystemFunctionProvider) as Box<dyn LixFunctionProvider + Send>
-    )
+pub(crate) fn system_sql2_function_provider() -> FunctionProviderHandle {
+    SharedFunctionProvider::new(Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>)
 }
 
-pub(crate) fn register_sql2_udfs(ctx: &SessionContext, functions: DynFunctionProvider) {
+pub(crate) fn register_sql2_udfs(ctx: &SessionContext, functions: FunctionProviderHandle) {
     ctx.register_udf(ScalarUDF::from(LixJsonExtract::new(
         "lix_json_extract",
         JsonExtractMode::Text,
@@ -384,7 +382,7 @@ impl ScalarUDFImpl for LixEmptyBlob {
 
 #[derive(Clone)]
 struct LixUuidV7 {
-    functions: DynFunctionProvider,
+    functions: FunctionProviderHandle,
 }
 
 impl PartialEq for LixUuidV7 {

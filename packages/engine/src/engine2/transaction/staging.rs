@@ -3,9 +3,9 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use crate::engine2::functions::{FunctionProvider, FunctionProviderHandle};
 use crate::engine2::live_state::{LiveStateRow, LiveStateRowRequest, LiveStateScanRequest};
 use crate::engine2::transaction::types::{StagedCommitMembers, StagedStateRow};
-use crate::functions::{DynFunctionProvider, LixFunctionProvider};
 use crate::sql2::{FileDataWrite, SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateWriteRow};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
@@ -17,7 +17,7 @@ use crate::{LixError, NullableKeyFilter};
 /// stable `StagedStateRow`s, reads build a `StagedStateRowOverlay` from those rows,
 /// and commit later drains the same rows.
 pub(crate) struct TransactionStagedWrites {
-    functions: DynFunctionProvider,
+    functions: FunctionProviderHandle,
     rows: Mutex<BTreeMap<StagedStateRowIdentity, StagedStateRow>>,
     commit_members_by_version: Mutex<BTreeMap<String, StagedCommitMembers>>,
     file_data_writes: Mutex<Vec<FileDataWrite>>,
@@ -31,7 +31,7 @@ pub(crate) struct StagedWriteSet {
 }
 
 impl TransactionStagedWrites {
-    pub(crate) fn new(functions: DynFunctionProvider) -> Self {
+    pub(crate) fn new(functions: FunctionProviderHandle) -> Self {
         Self {
             functions,
             rows: Mutex::new(BTreeMap::new()),
@@ -258,7 +258,7 @@ impl From<&LiveStateRow> for StagedStateRowIdentity {
 
 fn state_rows_from_write_intent(
     write: SqlWriteIntent,
-    functions: &mut dyn LixFunctionProvider,
+    functions: &mut dyn FunctionProvider,
 ) -> Result<(Vec<StagedStateRow>, Vec<FileDataWrite>), LixError> {
     let mut state_rows = Vec::new();
     let mut file_data_writes = Vec::new();
@@ -279,7 +279,7 @@ fn state_rows_from_write_intent(
 fn push_state_rows(
     state_rows: &mut Vec<StagedStateRow>,
     rows: Vec<StateWriteRow>,
-    functions: &mut dyn LixFunctionProvider,
+    functions: &mut dyn FunctionProvider,
 ) -> Result<(), LixError> {
     state_rows.reserve(rows.len());
     for row in rows {
@@ -290,7 +290,7 @@ fn push_state_rows(
 
 fn hydrate_state_write_row(
     row: StateWriteRow,
-    functions: &mut dyn LixFunctionProvider,
+    functions: &mut dyn FunctionProvider,
 ) -> Result<StagedStateRow, LixError> {
     let updated_at = row.updated_at.unwrap_or_else(|| functions.timestamp());
     Ok(StagedStateRow {
@@ -328,7 +328,7 @@ fn validate_commit_membership_support(row: &StagedStateRow) -> Result<(), LixErr
 fn add_row_to_commit_members(
     members_by_version: &mut BTreeMap<String, StagedCommitMembers>,
     row: &mut StagedStateRow,
-    functions: &mut dyn LixFunctionProvider,
+    functions: &mut dyn FunctionProvider,
 ) {
     if row.untracked {
         return;
@@ -414,8 +414,8 @@ fn nullable_key_matches_filter(value: &Option<String>, filter: &NullableKeyFilte
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine2::functions::SharedFunctionProvider;
     use crate::engine2::live_state::{LiveStateFilter, LiveStateRowRequest};
-    use crate::functions::SharedFunctionProvider;
 
     #[tokio::test]
     async fn staging_overlay_uses_last_staged_row_for_exact_load() {
@@ -832,7 +832,7 @@ mod tests {
         TransactionStagedWrites::new(SharedFunctionProvider::new(Box::new(
             TestFunctionProvider::default(),
         )
-            as Box<dyn LixFunctionProvider + Send>))
+            as Box<dyn FunctionProvider + Send>))
     }
 
     #[derive(Default)]
@@ -841,7 +841,7 @@ mod tests {
         timestamp_count: usize,
     }
 
-    impl LixFunctionProvider for TestFunctionProvider {
+    impl FunctionProvider for TestFunctionProvider {
         fn uuid_v7(&mut self) -> String {
             self.uuid_count += 1;
             format!("test-uuid-{}", self.uuid_count)

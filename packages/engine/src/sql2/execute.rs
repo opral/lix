@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::binary_cas::BlobDataReader;
+use crate::engine2::functions::FunctionProviderHandle;
 use crate::engine2::live_state::LiveStateReader;
-use crate::functions::DynFunctionProvider;
 use crate::history::{StateHistoryRequest, StateHistoryRow};
 use crate::sql::{
     MutationOperation, MutationRow, OptionalTextPatch, PlannedFilesystemFile,
@@ -42,7 +42,7 @@ use super::udf::register_sql2_udfs;
 pub(crate) trait SqlExecutionContext {
     fn active_version_id(&self) -> &str;
     fn live_state(&self) -> Arc<dyn LiveStateReader>;
-    fn functions(&self) -> DynFunctionProvider;
+    fn functions(&self) -> FunctionProviderHandle;
     fn history(&self) -> Option<Arc<dyn HistoryContext>> {
         None
     }
@@ -476,11 +476,11 @@ mod tests {
         SqlWriteStager,
     };
     use crate::binary_cas::BlobDataReader;
+    use crate::engine2::functions::{
+        FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
+    };
     use crate::engine2::live_state::{
         LiveStateContext, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
-    };
-    use crate::functions::{
-        DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
     };
     use crate::history::{
         StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRow,
@@ -506,9 +506,9 @@ mod tests {
     struct BackendBlobReader(Arc<dyn crate::LixBackend + Send + Sync>);
 
     #[allow(dead_code)]
-    fn test_functions() -> DynFunctionProvider {
+    fn test_functions() -> FunctionProviderHandle {
         SharedFunctionProvider::new(
-            Box::new(SystemFunctionProvider) as Box<dyn LixFunctionProvider + Send>
+            Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>
         )
     }
 
@@ -543,7 +543,7 @@ mod tests {
             Arc::clone(&self.live_state)
         }
 
-        fn functions(&self) -> DynFunctionProvider {
+        fn functions(&self) -> FunctionProviderHandle {
             test_functions()
         }
 
@@ -570,7 +570,7 @@ mod tests {
             Arc::clone(&self.live_state)
         }
 
-        fn functions(&self) -> DynFunctionProvider {
+        fn functions(&self) -> FunctionProviderHandle {
             test_functions()
         }
 
@@ -2259,7 +2259,7 @@ mod tests {
             Arc::clone(&self.live_state)
         }
 
-        fn functions(&self) -> DynFunctionProvider {
+        fn functions(&self) -> FunctionProviderHandle {
             test_functions()
         }
 

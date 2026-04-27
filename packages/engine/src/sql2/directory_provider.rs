@@ -26,11 +26,11 @@ use datafusion::prelude::SessionContext;
 use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 
+use crate::engine2::functions::FunctionProviderHandle;
 use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
-use crate::functions::DynFunctionProvider;
 use crate::history::{
     StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRow,
 };
@@ -52,7 +52,7 @@ pub(crate) async fn register_lix_directory_providers(
     active_version_id: &str,
     live_state: Arc<dyn LiveStateReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
-    functions: DynFunctionProvider,
+    functions: FunctionProviderHandle,
     history: Option<Arc<dyn HistoryContext>>,
 ) -> Result<(), LixError> {
     session
@@ -91,7 +91,7 @@ pub(crate) struct LixDirectoryProvider {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
-    functions: DynFunctionProvider,
+    functions: FunctionProviderHandle,
     default_version_id: Option<String>,
 }
 
@@ -106,7 +106,7 @@ impl LixDirectoryProvider {
         active_version_id: impl Into<String>,
         live_state: Arc<dyn LiveStateReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
-        functions: DynFunctionProvider,
+        functions: FunctionProviderHandle,
     ) -> Self {
         Self {
             schema: lix_directory_schema(),
@@ -120,7 +120,7 @@ impl LixDirectoryProvider {
     fn by_version(
         live_state: Arc<dyn LiveStateReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
-        functions: DynFunctionProvider,
+        functions: FunctionProviderHandle,
     ) -> Self {
         Self {
             schema: lix_directory_by_version_schema(),
@@ -335,7 +335,7 @@ struct LixDirectoryInsertSink {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
     write_stager: Arc<dyn SqlWriteStager>,
-    functions: DynFunctionProvider,
+    functions: FunctionProviderHandle,
     default_version_id: Option<String>,
 }
 
@@ -350,7 +350,7 @@ impl LixDirectoryInsertSink {
         schema: SchemaRef,
         live_state: Arc<dyn LiveStateReader>,
         write_stager: Arc<dyn SqlWriteStager>,
-        functions: DynFunctionProvider,
+        functions: FunctionProviderHandle,
         default_version_id: Option<String>,
     ) -> Self {
         Self {
@@ -1939,11 +1939,11 @@ mod tests {
     use datafusion::physical_plan::SendableRecordBatchStream;
     use futures_util::stream;
 
+    use crate::engine2::functions::{
+        FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
+    };
     use crate::engine2::live_state::{
         LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
-    };
-    use crate::functions::{
-        DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
     };
     use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateWriteRow};
     use crate::LixError;
@@ -1962,9 +1962,9 @@ mod tests {
         move || ids.next().expect("test id should exist").to_string()
     }
 
-    fn test_functions() -> DynFunctionProvider {
+    fn test_functions() -> FunctionProviderHandle {
         SharedFunctionProvider::new(
-            Box::new(SystemFunctionProvider) as Box<dyn LixFunctionProvider + Send>
+            Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>
         )
     }
 

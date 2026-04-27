@@ -5,11 +5,11 @@ use serde_json::Value as JsonValue;
 use crate::backend::TransactionBeginMode;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::engine2::changelog::ChangelogContext;
+use crate::engine2::functions::{FunctionContext, FunctionProviderHandle};
 use crate::engine2::live_state::{LiveStateContext, LiveStateReader};
 use crate::engine2::schema_registry::SchemaRegistry;
 use crate::engine2::transaction::live_state_overlay::TransactionLiveStateContext;
 use crate::engine2::transaction::staging::TransactionStagedWrites;
-use crate::functions::DynFunctionProvider;
 use crate::sql2::{SqlExecutionContext, SqlWriteStager};
 use crate::transaction::TransactionCommitOutcome;
 use crate::{LixBackend, LixBackendTransaction, LixError};
@@ -34,7 +34,7 @@ pub(crate) struct Transaction<'a> {
     staged_writes: Arc<TransactionStagedWrites>,
     backend_transaction: Box<dyn LixBackendTransaction + 'a>,
     visible_schemas: Vec<JsonValue>,
-    functions: DynFunctionProvider,
+    functions: FunctionProviderHandle,
 }
 
 impl<'a> Transaction<'a> {
@@ -47,7 +47,7 @@ impl<'a> Transaction<'a> {
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
         schema_registry: Arc<SchemaRegistry>,
-        functions: DynFunctionProvider,
+        functions: FunctionProviderHandle,
     ) -> Result<Self, LixError> {
         let staged_writes = Arc::new(TransactionStagedWrites::new(functions.clone()));
         let visible_live_state =
@@ -76,7 +76,10 @@ impl<'a> Transaction<'a> {
     /// The first engine2 write path is intentionally naive: it flushes staged
     /// state rows directly into live_state, commits the backend transaction, and
     /// does not produce canonical commit graph rows yet.
-    pub(crate) async fn commit(mut self) -> Result<TransactionCommitOutcome, LixError> {
+    pub(crate) async fn commit(
+        mut self,
+        runtime_functions: &FunctionContext,
+    ) -> Result<TransactionCommitOutcome, LixError> {
         let staged_writes = self.staged_writes.drain()?;
         commit::commit_staged_writes(
             &self.binary_cas,
@@ -86,6 +89,9 @@ impl<'a> Transaction<'a> {
             staged_writes,
         )
         .await?;
+        runtime_functions
+            .persist_if_needed(&mut self.live_state.writer(self.backend_transaction.as_mut()))
+            .await?;
         self.backend_transaction.commit().await?;
         Ok(TransactionCommitOutcome::default())
     }
@@ -118,7 +124,7 @@ impl SqlExecutionContext for Transaction<'_> {
     }
 
     /// Returns the same function provider used by the owning session.
-    fn functions(&self) -> DynFunctionProvider {
+    fn functions(&self) -> FunctionProviderHandle {
         self.functions.clone()
     }
 
