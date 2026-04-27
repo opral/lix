@@ -2,10 +2,13 @@ use std::sync::Arc;
 
 use crate::binary_cas::BinaryCasContext;
 use crate::engine2::changelog::ChangelogContext;
+use crate::engine2::init::InitReceipt;
 use crate::engine2::live_state::LiveStateContext;
+use crate::engine2::live_state::LiveStateRowRequest;
 use crate::engine2::schema_registry::SchemaRegistry;
 use crate::engine2::session::SessionContext;
-use crate::{LixBackend, LixError};
+use crate::version::GLOBAL_VERSION_ID;
+use crate::{LixBackend, LixError, NullableKeyFilter};
 
 #[derive(Clone)]
 pub struct Engine {
@@ -17,6 +20,21 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Seeds an empty backend with the engine2 repository bootstrap facts.
+    ///
+    /// Initialization is a storage lifecycle operation, separate from runtime
+    /// construction. Call this before `Engine::new(...)` for a brand-new
+    /// backend.
+    pub async fn initialize(
+        backend: Box<dyn LixBackend + Send + Sync>,
+    ) -> Result<InitReceipt, LixError> {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::from(backend);
+        let changelog = ChangelogContext::new();
+        let live_state = LiveStateContext::new();
+
+        crate::engine2::init::initialize(backend, &changelog, &live_state).await
+    }
+
     /// Creates a clean DataFusion-first engine over an initialized backend.
     ///
     /// SessionContext, execution, and transaction overlays are layered below the
@@ -24,15 +42,12 @@ impl Engine {
     pub async fn new(backend: Box<dyn LixBackend + Send + Sync>) -> Result<Self, LixError> {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::from(backend);
 
-        // TODO(engine2): assert that the backend has been initialized through an
-        // engine-owned storage readiness check. This should not ask live_state,
-        // because live_state is only one lower subsystem.
-
         // The engine is constructed bottom-up from the storage DAG:
         //
         // let canonical_state = Arc::new(CanonicalStateContext::new(Arc::clone(&backend)));
 
         let live_state = Arc::new(LiveStateContext::new());
+        assert_initialized(Arc::clone(&backend), live_state.as_ref()).await?;
 
         // let history_state = Arc::new(HistoryStateContext::new(
         //     Arc::clone(&canonical_state),
@@ -70,4 +85,29 @@ impl Engine {
         )
         .await
     }
+}
+
+async fn assert_initialized(
+    backend: Arc<dyn LixBackend + Send + Sync>,
+    live_state: &LiveStateContext,
+) -> Result<(), LixError> {
+    let reader = live_state.reader(backend);
+    let initialized = reader
+        .load_row(&LiveStateRowRequest {
+            schema_key: "lix_key_value".to_string(),
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            entity_id: "lix_id".to_string(),
+            file_id: NullableKeyFilter::Null,
+        })
+        .await?
+        .is_some();
+
+    if initialized {
+        return Ok(());
+    }
+
+    Err(LixError::new(
+        "LIX_ERROR_NOT_INITIALIZED",
+        "engine2 backend is not initialized; call Engine::initialize(...) before Engine::new(...)",
+    ))
 }

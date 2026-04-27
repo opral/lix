@@ -12,6 +12,146 @@ use tokio::sync::OnceCell;
 
 const TEST_KV_TABLE: &str = "lix_internal_kv";
 
+#[test]
+fn engine_new_rejects_uninitialized_backend() {
+    std::thread::Builder::new()
+        .name("engine2_uninitialized_backend".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+            runtime.block_on(async {
+                let sqlite_uri = shared_memory_sqlite_uri("uninitialized_backend");
+                match Engine::new(Box::new(SqliteBackend::new(sqlite_uri))).await {
+                    Ok(_) => panic!("uninitialized backend should not create an engine"),
+                    Err(error) => assert_eq!(error.code, "LIX_ERROR_NOT_INITIALIZED"),
+                }
+            });
+        })
+        .expect("failed to spawn engine2 uninitialized test thread")
+        .join()
+        .expect("engine2 uninitialized test thread panicked");
+}
+
+#[test]
+fn engine_initialize_seeds_repository_bootstrap_state() {
+    std::thread::Builder::new()
+        .name("engine2_initialize_bootstrap".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+            runtime.block_on(async {
+                let sqlite_uri = shared_memory_sqlite_uri("initialize_bootstrap");
+                let backend = std::sync::Arc::new(SqliteBackend::new(sqlite_uri));
+                let receipt = Engine::initialize(Box::new(SharedSqliteBackend(
+                    std::sync::Arc::clone(&backend),
+                )))
+                .await
+                .expect("backend should initialize");
+                let engine = Engine::new(Box::new(SharedSqliteBackend(std::sync::Arc::clone(
+                    &backend,
+                ))))
+                .await
+                .expect("initialized backend should create an engine");
+                let session = engine
+                    .open_session("global")
+                    .await
+                    .expect("initialized backend should open global session");
+                let main_session = engine
+                    .open_session(receipt.main_version_id.clone())
+                    .await
+                    .expect("initialized backend should open main session");
+
+                let version_result = session
+                    .execute(
+                        "SELECT entity_id, snapshot_content \
+                         FROM lix_state \
+                         WHERE schema_key = 'lix_version_descriptor' \
+                         ORDER BY entity_id",
+                        &[],
+                    )
+                    .await
+                    .expect("version descriptors should be readable");
+                let ExecuteResult::Rows(version_rows) = version_result else {
+                    panic!("SELECT should return version rows");
+                };
+                assert_eq!(version_rows.len(), 2);
+                let version_values = version_rows
+                    .rows()
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>();
+                assert!(version_values.contains(&vec![
+                    Value::Text("global".to_string()),
+                    Value::Text(
+                        "{\"hidden\":true,\"id\":\"global\",\"name\":\"global\"}".to_string()
+                    ),
+                ]));
+                assert!(version_values.contains(&vec![
+                    Value::Text(receipt.main_version_id.clone()),
+                    Value::Text(format!(
+                        "{{\"hidden\":false,\"id\":\"{}\",\"name\":\"main\"}}",
+                        receipt.main_version_id
+                    )),
+                ]));
+
+                let lix_id_result = session
+                    .execute("SELECT value FROM lix_key_value WHERE key = 'lix_id'", &[])
+                    .await
+                    .expect("lix_id key value should be readable");
+                assert_single_text(lix_id_result, &format!("\"{}\"", receipt.lix_id));
+
+                let refs_result = session
+                    .execute(
+                        "SELECT entity_id, snapshot_content, untracked \
+                         FROM lix_state \
+                         WHERE schema_key = 'lix_version_ref' \
+                         ORDER BY entity_id",
+                        &[],
+                    )
+                    .await
+                    .expect("version refs should be readable");
+                let ExecuteResult::Rows(ref_rows) = refs_result else {
+                    panic!("SELECT should return version ref rows");
+                };
+                assert_eq!(ref_rows.len(), 2);
+                let ref_values = ref_rows
+                    .rows()
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect::<Vec<_>>();
+                assert!(ref_values.contains(&vec![
+                    Value::Text("global".to_string()),
+                    Value::Text(format!(
+                        "{{\"commit_id\":\"{}\",\"id\":\"global\"}}",
+                        receipt.initial_commit_id
+                    )),
+                    Value::Boolean(true),
+                ]));
+                assert!(ref_values.contains(&vec![
+                    Value::Text(receipt.main_version_id.clone()),
+                    Value::Text(format!(
+                        "{{\"commit_id\":\"{}\",\"id\":\"{}\"}}",
+                        receipt.initial_commit_id, receipt.main_version_id
+                    )),
+                    Value::Boolean(true),
+                ]));
+
+                drop(main_session);
+                drop(session);
+                drop(engine);
+            });
+        })
+        .expect("failed to spawn engine2 initialize test thread")
+        .join()
+        .expect("engine2 initialize test thread panicked");
+}
+
 fn assert_single_text(result: ExecuteResult, expected: &str) {
     let ExecuteResult::Rows(row_set) = result else {
         panic!("SELECT should return rows");
@@ -35,11 +175,19 @@ fn session_execute_inserts_key_value_then_reads_it_back() {
                 .expect("failed to build tokio runtime");
             runtime.block_on(async {
                 let sqlite_uri = shared_memory_sqlite_uri("key_value_roundtrip");
-                let engine = Engine::new(Box::new(SqliteBackend::new(sqlite_uri)))
-                    .await
-                    .expect("backend should create an engine");
+                let backend = std::sync::Arc::new(SqliteBackend::new(sqlite_uri));
+                let receipt = Engine::initialize(Box::new(SharedSqliteBackend(
+                    std::sync::Arc::clone(&backend),
+                )))
+                .await
+                .expect("backend should initialize");
+                let engine = Engine::new(Box::new(SharedSqliteBackend(std::sync::Arc::clone(
+                    &backend,
+                ))))
+                .await
+                .expect("backend should create an engine");
                 let session = engine
-                    .open_session("global")
+                    .open_session(receipt.main_version_id.clone())
                     .await
                     .expect("backend should open a session");
 
@@ -109,11 +257,19 @@ fn session_execute_persists_deterministic_function_sequence_across_sessions() {
                 .expect("failed to build tokio runtime");
             runtime.block_on(async {
                 let sqlite_uri = shared_memory_sqlite_uri("deterministic_sequence");
-                let engine = Engine::new(Box::new(SqliteBackend::new(sqlite_uri)))
+                let backend = std::sync::Arc::new(SqliteBackend::new(sqlite_uri));
+                let receipt = Engine::initialize(Box::new(SharedSqliteBackend(
+                    std::sync::Arc::clone(&backend),
+                )))
+                    .await
+                    .expect("backend should initialize");
+                let engine = Engine::new(Box::new(SharedSqliteBackend(
+                    std::sync::Arc::clone(&backend),
+                )))
                     .await
                     .expect("backend should create an engine");
                 let session = engine
-                    .open_session("global")
+                    .open_session(receipt.main_version_id.clone())
                     .await
                     .expect("backend should open first session");
 
@@ -144,7 +300,7 @@ fn session_execute_persists_deterministic_function_sequence_across_sessions() {
                 );
 
                 let second_session = engine
-                    .open_session("global")
+                    .open_session(receipt.main_version_id.clone())
                     .await
                     .expect("backend should open second session");
                 assert_single_text(
@@ -159,7 +315,7 @@ fn session_execute_persists_deterministic_function_sequence_across_sessions() {
                         "INSERT INTO lix_state (\
                          entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version, global, untracked\
                          ) VALUES (\
-                         lix_uuid_v7(), 'lix_key_value', NULL, NULL, lix_json('{\"key\":\"det-write\",\"value\":\"ok\"}'), '1', true, false\
+                         lix_uuid_v7(), 'lix_key_value', NULL, NULL, lix_json('{\"key\":\"det-write\",\"value\":\"ok\"}'), '1', false, false\
                          )",
                         &[],
                     )
@@ -198,11 +354,19 @@ fn session_execute_does_not_persist_deterministic_sequence_after_failed_statemen
                 .expect("failed to build tokio runtime");
             runtime.block_on(async {
                 let sqlite_uri = shared_memory_sqlite_uri("deterministic_failed_statement");
-                let engine = Engine::new(Box::new(SqliteBackend::new(sqlite_uri)))
-                    .await
-                    .expect("backend should create an engine");
+                let backend = std::sync::Arc::new(SqliteBackend::new(sqlite_uri));
+                let receipt = Engine::initialize(Box::new(SharedSqliteBackend(
+                    std::sync::Arc::clone(&backend),
+                )))
+                .await
+                .expect("backend should initialize");
+                let engine = Engine::new(Box::new(SharedSqliteBackend(std::sync::Arc::clone(
+                    &backend,
+                ))))
+                .await
+                .expect("backend should create an engine");
                 let session = engine
-                    .open_session("global")
+                    .open_session(receipt.main_version_id.clone())
                     .await
                     .expect("backend should open a session");
 
@@ -271,11 +435,19 @@ fn session_execute_registers_schema_then_writes_lix_state_row() {
                 .expect("failed to build tokio runtime");
             runtime.block_on(async {
                 let sqlite_uri = shared_memory_sqlite_uri("registered_schema_lix_state");
-                let engine = Engine::new(Box::new(SqliteBackend::new(sqlite_uri)))
+                let backend = std::sync::Arc::new(SqliteBackend::new(sqlite_uri));
+                let receipt = Engine::initialize(Box::new(SharedSqliteBackend(
+                    std::sync::Arc::clone(&backend),
+                )))
+                    .await
+                    .expect("backend should initialize");
+                let engine = Engine::new(Box::new(SharedSqliteBackend(
+                    std::sync::Arc::clone(&backend),
+                )))
                     .await
                     .expect("backend should create an engine");
                 let session = engine
-                    .open_session("global")
+                    .open_session(receipt.main_version_id.clone())
                     .await
                     .expect("backend should open a session");
 
@@ -298,7 +470,7 @@ fn session_execute_registers_schema_then_writes_lix_state_row() {
                         "INSERT INTO lix_state (\
                          entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version, global, untracked\
                          ) VALUES (\
-                         'dummy-1', 'engine2_dummy_schema', NULL, NULL, lix_json('{\"id\":\"dummy-1\",\"name\":\"Dummy\"}'), '1', true, true\
+                         'dummy-1', 'engine2_dummy_schema', NULL, NULL, lix_json('{\"id\":\"dummy-1\",\"name\":\"Dummy\"}'), '1', false, true\
                          )",
                         &[],
                     )
@@ -350,11 +522,19 @@ fn session_execute_inserts_directory_then_reads_it_back() {
                 .expect("failed to build tokio runtime");
             runtime.block_on(async {
                 let sqlite_uri = shared_memory_sqlite_uri("directory_roundtrip");
-                let engine = Engine::new(Box::new(SqliteBackend::new(sqlite_uri)))
-                    .await
-                    .expect("backend should create an engine");
+                let backend = std::sync::Arc::new(SqliteBackend::new(sqlite_uri));
+                let receipt = Engine::initialize(Box::new(SharedSqliteBackend(
+                    std::sync::Arc::clone(&backend),
+                )))
+                .await
+                .expect("backend should initialize");
+                let engine = Engine::new(Box::new(SharedSqliteBackend(std::sync::Arc::clone(
+                    &backend,
+                ))))
+                .await
+                .expect("backend should create an engine");
                 let session = engine
-                    .open_session("global")
+                    .open_session(receipt.main_version_id.clone())
                     .await
                     .expect("backend should open a session");
 
@@ -435,11 +615,19 @@ fn session_execute_inserts_file_then_reads_it_back() {
                 .expect("failed to build tokio runtime");
             runtime.block_on(async {
                 let sqlite_uri = shared_memory_sqlite_uri("file_roundtrip");
-                let engine = Engine::new(Box::new(SqliteBackend::new(sqlite_uri)))
+                let backend = std::sync::Arc::new(SqliteBackend::new(sqlite_uri));
+                let receipt = Engine::initialize(Box::new(SharedSqliteBackend(
+                    std::sync::Arc::clone(&backend),
+                )))
+                    .await
+                    .expect("backend should initialize");
+                let engine = Engine::new(Box::new(SharedSqliteBackend(
+                    std::sync::Arc::clone(&backend),
+                )))
                     .await
                     .expect("backend should create an engine");
                 let session = engine
-                    .open_session("global")
+                    .open_session(receipt.main_version_id.clone())
                     .await
                     .expect("backend should open a session");
 
@@ -537,11 +725,19 @@ fn session_execute_updates_file_path_and_preserves_data() {
                 .expect("failed to build tokio runtime");
             runtime.block_on(async {
                 let sqlite_uri = shared_memory_sqlite_uri("file_path_update");
-                let engine = Engine::new(Box::new(SqliteBackend::new(sqlite_uri)))
-                    .await
-                    .expect("backend should create an engine");
+                let backend = std::sync::Arc::new(SqliteBackend::new(sqlite_uri));
+                let receipt = Engine::initialize(Box::new(SharedSqliteBackend(
+                    std::sync::Arc::clone(&backend),
+                )))
+                .await
+                .expect("backend should initialize");
+                let engine = Engine::new(Box::new(SharedSqliteBackend(std::sync::Arc::clone(
+                    &backend,
+                ))))
+                .await
+                .expect("backend should create an engine");
                 let session = engine
-                    .open_session("global")
+                    .open_session(receipt.main_version_id.clone())
                     .await
                     .expect("backend should open a session");
 
@@ -647,11 +843,19 @@ fn session_execute_deletes_directory_recursively() {
                 .expect("failed to build tokio runtime");
             runtime.block_on(async {
                 let sqlite_uri = shared_memory_sqlite_uri("recursive_directory_delete");
-                let engine = Engine::new(Box::new(SqliteBackend::new(sqlite_uri)))
+                let backend = std::sync::Arc::new(SqliteBackend::new(sqlite_uri));
+                let receipt = Engine::initialize(Box::new(SharedSqliteBackend(
+                    std::sync::Arc::clone(&backend),
+                )))
+                    .await
+                    .expect("backend should initialize");
+                let engine = Engine::new(Box::new(SharedSqliteBackend(
+                    std::sync::Arc::clone(&backend),
+                )))
                     .await
                     .expect("backend should create an engine");
                 let session = engine
-                    .open_session("global")
+                    .open_session(receipt.main_version_id.clone())
                     .await
                     .expect("backend should open a session");
 
@@ -785,6 +989,8 @@ struct SqliteBackend {
     pool: OnceCell<SqlitePool>,
 }
 
+struct SharedSqliteBackend(std::sync::Arc<SqliteBackend>);
+
 impl SqliteBackend {
     fn new(uri: String) -> Self {
         Self {
@@ -814,6 +1020,44 @@ impl SqliteBackend {
 struct SqliteTransaction {
     conn: sqlx::pool::PoolConnection<sqlx::Sqlite>,
     mode: TransactionBeginMode,
+}
+
+#[async_trait::async_trait]
+impl LixBackend for SharedSqliteBackend {
+    fn dialect(&self) -> SqlDialect {
+        self.0.as_ref().dialect()
+    }
+
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
+        self.0.as_ref().execute(sql, params).await
+    }
+
+    async fn begin_transaction(
+        &self,
+        mode: TransactionBeginMode,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+        self.0.as_ref().begin_transaction(mode).await
+    }
+
+    async fn begin_savepoint(
+        &self,
+        name: &str,
+    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+        self.0.as_ref().begin_savepoint(name).await
+    }
+
+    async fn kv_get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
+        self.0.as_ref().kv_get(namespace, key).await
+    }
+
+    async fn kv_scan(
+        &self,
+        namespace: &str,
+        range: KvScanRange,
+        limit: Option<usize>,
+    ) -> Result<Vec<KvPair>, LixError> {
+        self.0.as_ref().kv_scan(namespace, range, limit).await
+    }
 }
 
 #[async_trait::async_trait]

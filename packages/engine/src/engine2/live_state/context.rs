@@ -11,6 +11,7 @@ use crate::engine2::tracked_state::{
 use crate::engine2::untracked_state::{
     UntrackedStateContext, UntrackedStateIdentity, UntrackedStateRow, UntrackedStateScanRequest,
 };
+use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
 /// Serving facade for visible live-state readers and writers.
@@ -118,26 +119,39 @@ where
         request: &LiveStateRowRequest,
     ) -> Result<Option<LiveStateRow>, LixError> {
         let mut store = self.store.lock().await;
-        {
-            let store: &mut dyn KvStore = &mut *store;
-            if let Some(row) = self
-                .untracked_state
-                .reader(store)
-                .load_row(&request.into())
-                .await?
-                .map(LiveStateRow::from)
-            {
-                return Ok(Some(row));
+        for candidate in load_row_candidates(request) {
+            match candidate.source {
+                LiveStateLookupSource::Untracked => {
+                    let store: &mut dyn KvStore = &mut *store;
+                    if let Some(row) = self
+                        .untracked_state
+                        .reader(store)
+                        .load_row(&untracked_row_request_from_live(
+                            request,
+                            &candidate.version_id,
+                        ))
+                        .await?
+                    {
+                        return Ok(Some(LiveStateRow::from(row)));
+                    }
+                }
+                LiveStateLookupSource::Tracked => {
+                    let store: &mut dyn KvStore = &mut *store;
+                    if let Some(row) = self
+                        .tracked_state
+                        .reader(store)
+                        .load_row(&tracked_row_request_from_live(
+                            request,
+                            &candidate.version_id,
+                        ))
+                        .await?
+                    {
+                        return Ok(Some(LiveStateRow::from(row)));
+                    }
+                }
             }
         }
-
-        let tracked_request = tracked_row_request_from_live(request);
-        let store: &mut dyn KvStore = &mut *store;
-        self.tracked_state
-            .reader(store)
-            .load_row(&tracked_request)
-            .await
-            .map(|row| row.map(LiveStateRow::from))
+        Ok(None)
     }
 }
 
@@ -240,10 +254,65 @@ fn tracked_scan_request_from_live(request: &LiveStateScanRequest) -> TrackedStat
     }
 }
 
-fn tracked_row_request_from_live(request: &LiveStateRowRequest) -> TrackedStateRowRequest {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveStateLookupSource {
+    Untracked,
+    Tracked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveStateLookupCandidate {
+    source: LiveStateLookupSource,
+    version_id: String,
+}
+
+fn load_row_candidates(request: &LiveStateRowRequest) -> Vec<LiveStateLookupCandidate> {
+    let mut candidates = vec![
+        LiveStateLookupCandidate {
+            source: LiveStateLookupSource::Untracked,
+            version_id: request.version_id.clone(),
+        },
+        LiveStateLookupCandidate {
+            source: LiveStateLookupSource::Tracked,
+            version_id: request.version_id.clone(),
+        },
+    ];
+
+    if request.version_id != GLOBAL_VERSION_ID {
+        candidates.extend([
+            LiveStateLookupCandidate {
+                source: LiveStateLookupSource::Untracked,
+                version_id: GLOBAL_VERSION_ID.to_string(),
+            },
+            LiveStateLookupCandidate {
+                source: LiveStateLookupSource::Tracked,
+                version_id: GLOBAL_VERSION_ID.to_string(),
+            },
+        ]);
+    }
+
+    candidates
+}
+
+fn untracked_row_request_from_live(
+    request: &LiveStateRowRequest,
+    version_id: &str,
+) -> crate::engine2::untracked_state::UntrackedStateRowRequest {
+    crate::engine2::untracked_state::UntrackedStateRowRequest {
+        schema_key: request.schema_key.clone(),
+        version_id: version_id.to_string(),
+        entity_id: request.entity_id.clone(),
+        file_id: request.file_id.clone(),
+    }
+}
+
+fn tracked_row_request_from_live(
+    request: &LiveStateRowRequest,
+    version_id: &str,
+) -> TrackedStateRowRequest {
     TrackedStateRowRequest {
         schema_key: request.schema_key.clone(),
-        version_id: request.version_id.clone(),
+        version_id: version_id.to_string(),
         entity_id: request.entity_id.clone(),
         file_id: request.file_id.clone(),
     }
@@ -255,6 +324,7 @@ mod tests {
 
     use super::*;
     use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::engine2::live_state::LiveStateFilter;
     use crate::engine2::untracked_state::{UntrackedStateContext, UntrackedStateRow};
     use crate::NullableKeyFilter;
 
@@ -382,6 +452,172 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn load_row_falls_back_to_global_tracked_row_for_requested_version() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let live_state = LiveStateContext::new();
+
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        live_state
+            .writer(transaction.as_mut())
+            .write_rows(&[tracked_row("global-tracked", Some("change-global"))])
+            .await
+            .expect("tracked row should write");
+        transaction.commit().await.expect("commit should persist");
+
+        let loaded = load_selected_tab_at(&live_state, Arc::clone(&backend), "version-a")
+            .await
+            .expect("load should succeed")
+            .expect("global row should be visible for requested version");
+
+        assert_eq!(loaded.version_id, "global");
+        assert!(!loaded.untracked);
+        assert_eq!(
+            loaded.snapshot_content.as_deref(),
+            Some("{\"value\":\"global-tracked\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn load_row_prefers_requested_version_over_global() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let live_state = LiveStateContext::new();
+
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        live_state
+            .writer(transaction.as_mut())
+            .write_rows(&[
+                tracked_row("global-tracked", Some("change-global")),
+                tracked_row_at("version-a", "version-tracked", Some("change-version")),
+            ])
+            .await
+            .expect("tracked rows should write");
+        transaction.commit().await.expect("commit should persist");
+
+        let loaded = load_selected_tab_at(&live_state, Arc::clone(&backend), "version-a")
+            .await
+            .expect("load should succeed")
+            .expect("version row should be visible");
+
+        assert_eq!(loaded.version_id, "version-a");
+        assert!(!loaded.untracked);
+        assert_eq!(
+            loaded.snapshot_content.as_deref(),
+            Some("{\"value\":\"version-tracked\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn load_row_prefers_requested_untracked_over_requested_tracked_and_global_rows() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let live_state = LiveStateContext::new();
+        let untracked_state = UntrackedStateContext::new();
+
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        live_state
+            .writer(transaction.as_mut())
+            .write_rows(&[
+                tracked_row("global-tracked", Some("change-global")),
+                tracked_row_at("version-a", "version-tracked", Some("change-version")),
+            ])
+            .await
+            .expect("tracked rows should write");
+        untracked_state
+            .writer(transaction.as_mut())
+            .write_rows(&[
+                untracked_row_at("global", "global-untracked"),
+                untracked_row_at("version-a", "version-untracked"),
+            ])
+            .await
+            .expect("untracked rows should write");
+        transaction.commit().await.expect("commit should persist");
+
+        let loaded = load_selected_tab_at(&live_state, Arc::clone(&backend), "version-a")
+            .await
+            .expect("load should succeed")
+            .expect("version untracked row should be visible");
+
+        assert_eq!(loaded.version_id, "version-a");
+        assert!(loaded.untracked);
+        assert_eq!(
+            loaded.snapshot_content.as_deref(),
+            Some("{\"value\":\"version-untracked\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_rows_overlays_requested_version_over_global() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let live_state = LiveStateContext::new();
+
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        live_state
+            .writer(transaction.as_mut())
+            .write_rows(&[
+                tracked_row("global-tracked", Some("change-global")),
+                tracked_row_at("version-a", "version-tracked", Some("change-version")),
+            ])
+            .await
+            .expect("rows should write");
+        transaction.commit().await.expect("commit should persist");
+
+        let rows = scan_selected_tab_at(&live_state, Arc::clone(&backend), "version-a", false)
+            .await
+            .expect("scan should succeed");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some("{\"value\":\"version-tracked\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn winning_tombstone_hides_row_unless_tombstones_are_included() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let live_state = LiveStateContext::new();
+
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        live_state
+            .writer(transaction.as_mut())
+            .write_rows(&[
+                tracked_row("global-tracked", Some("change-global")),
+                tombstone_tracked_row_at("version-a", Some("change-tombstone")),
+            ])
+            .await
+            .expect("rows should write");
+        transaction.commit().await.expect("commit should persist");
+
+        let hidden = scan_selected_tab_at(&live_state, Arc::clone(&backend), "version-a", false)
+            .await
+            .expect("scan should succeed");
+        assert_eq!(hidden.len(), 0);
+
+        let with_tombstone =
+            scan_selected_tab_at(&live_state, Arc::clone(&backend), "version-a", true)
+                .await
+                .expect("scan should succeed");
+        assert_eq!(with_tombstone.len(), 1);
+        assert_eq!(with_tombstone[0].version_id, "version-a");
+        assert_eq!(with_tombstone[0].snapshot_content, None);
+    }
+
     async fn load_selected_tab(
         live_state: &LiveStateContext,
         backend: Arc<dyn LixBackend + Send + Sync>,
@@ -397,7 +633,49 @@ mod tests {
             .await
     }
 
+    async fn load_selected_tab_at(
+        live_state: &LiveStateContext,
+        backend: Arc<dyn LixBackend + Send + Sync>,
+        version_id: &str,
+    ) -> Result<Option<LiveStateRow>, LixError> {
+        live_state
+            .reader(backend)
+            .load_row(&LiveStateRowRequest {
+                schema_key: "lix_key_value".to_string(),
+                version_id: version_id.to_string(),
+                entity_id: "selected-tab".to_string(),
+                file_id: NullableKeyFilter::Null,
+            })
+            .await
+    }
+
+    async fn scan_selected_tab_at(
+        live_state: &LiveStateContext,
+        backend: Arc<dyn LixBackend + Send + Sync>,
+        version_id: &str,
+        include_tombstones: bool,
+    ) -> Result<Vec<LiveStateRow>, LixError> {
+        live_state
+            .reader(backend)
+            .scan_rows(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec!["lix_key_value".to_string()],
+                    entity_ids: vec!["selected-tab".to_string()],
+                    version_ids: vec![version_id.to_string()],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    include_tombstones,
+                    ..LiveStateFilter::default()
+                },
+                ..LiveStateScanRequest::default()
+            })
+            .await
+    }
+
     fn tracked_row(value: &str, change_id: Option<&str>) -> LiveStateRow {
+        tracked_row_at("global", value, change_id)
+    }
+
+    fn tracked_row_at(version_id: &str, value: &str, change_id: Option<&str>) -> LiveStateRow {
         LiveStateRow {
             entity_id: "selected-tab".to_string(),
             schema_key: "lix_key_value".to_string(),
@@ -408,15 +686,26 @@ mod tests {
             schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            global: true,
+            global: version_id == "global",
             change_id: change_id.map(str::to_string),
             commit_id: Some("commit-tracked".to_string()),
             untracked: false,
-            version_id: "global".to_string(),
+            version_id: version_id.to_string(),
+        }
+    }
+
+    fn tombstone_tracked_row_at(version_id: &str, change_id: Option<&str>) -> LiveStateRow {
+        LiveStateRow {
+            snapshot_content: None,
+            ..tracked_row_at(version_id, "ignored", change_id)
         }
     }
 
     fn untracked_row(value: &str) -> UntrackedStateRow {
+        untracked_row_at("global", value)
+    }
+
+    fn untracked_row_at(version_id: &str, value: &str) -> UntrackedStateRow {
         UntrackedStateRow {
             entity_id: "selected-tab".to_string(),
             schema_key: "lix_key_value".to_string(),
@@ -427,8 +716,8 @@ mod tests {
             schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            global: true,
-            version_id: "global".to_string(),
+            global: version_id == "global",
+            version_id: version_id.to_string(),
         }
     }
 }
