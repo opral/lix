@@ -8,6 +8,7 @@
 pub(crate) mod changelog;
 pub(crate) mod commit_graph;
 pub mod engine;
+pub(crate) mod functions;
 pub(crate) mod init;
 pub(crate) mod live_state;
 pub(crate) mod schema_registry;

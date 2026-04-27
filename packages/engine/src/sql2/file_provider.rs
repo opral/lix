@@ -27,11 +27,11 @@ use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 
 use crate::binary_cas::BlobDataReader;
+use crate::engine2::functions::FunctionProviderHandle;
 use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
-use crate::functions::DynFunctionProvider;
 use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
@@ -57,7 +57,7 @@ pub(crate) async fn register_lix_file_providers(
     live_state: Arc<dyn LiveStateReader>,
     blob_reader: Arc<dyn BlobDataReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
-    functions: DynFunctionProvider,
+    functions: FunctionProviderHandle,
     history: Option<Arc<dyn HistoryContext>>,
 ) -> Result<(), LixError> {
     session
@@ -115,7 +115,7 @@ pub(crate) struct LixFileProvider {
     live_state: Arc<dyn LiveStateReader>,
     blob_reader: Arc<dyn BlobDataReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
-    functions: DynFunctionProvider,
+    functions: FunctionProviderHandle,
     default_version_id: Option<String>,
 }
 
@@ -131,7 +131,7 @@ impl LixFileProvider {
         live_state: Arc<dyn LiveStateReader>,
         blob_reader: Arc<dyn BlobDataReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
-        functions: DynFunctionProvider,
+        functions: FunctionProviderHandle,
     ) -> Self {
         Self {
             schema: lix_file_schema(),
@@ -147,7 +147,7 @@ impl LixFileProvider {
         live_state: Arc<dyn LiveStateReader>,
         blob_reader: Arc<dyn BlobDataReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
-        functions: DynFunctionProvider,
+        functions: FunctionProviderHandle,
     ) -> Self {
         Self {
             schema: lix_file_by_version_schema(),
@@ -380,7 +380,7 @@ struct LixFileInsertSink {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
     write_stager: Arc<dyn SqlWriteStager>,
-    functions: DynFunctionProvider,
+    functions: FunctionProviderHandle,
     default_version_id: Option<String>,
 }
 
@@ -395,7 +395,7 @@ impl LixFileInsertSink {
         schema: SchemaRef,
         live_state: Arc<dyn LiveStateReader>,
         write_stager: Arc<dyn SqlWriteStager>,
-        functions: DynFunctionProvider,
+        functions: FunctionProviderHandle,
         default_version_id: Option<String>,
     ) -> Self {
         Self {
@@ -645,7 +645,7 @@ struct LixFileUpdateExec {
     write_stager: Arc<dyn SqlWriteStager>,
     table_schema: SchemaRef,
     default_version_id: Option<String>,
-    functions: DynFunctionProvider,
+    functions: FunctionProviderHandle,
     request: LiveStateScanRequest,
     assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
     filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -666,7 +666,7 @@ impl LixFileUpdateExec {
         write_stager: Arc<dyn SqlWriteStager>,
         table_schema: SchemaRef,
         default_version_id: Option<String>,
-        functions: DynFunctionProvider,
+        functions: FunctionProviderHandle,
         request: LiveStateScanRequest,
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -2619,11 +2619,11 @@ mod tests {
     use futures_util::stream;
     use serde_json::Value as JsonValue;
 
+    use crate::engine2::functions::{
+        FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
+    };
     use crate::engine2::live_state::LiveStateRow;
     use crate::engine2::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
-    use crate::functions::{
-        DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
-    };
     use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager};
     use crate::LixError;
 
@@ -2638,9 +2638,9 @@ mod tests {
         move || ids.next().expect("test id should exist").to_string()
     }
 
-    fn test_functions() -> DynFunctionProvider {
+    fn test_functions() -> FunctionProviderHandle {
         SharedFunctionProvider::new(
-            Box::new(SystemFunctionProvider) as Box<dyn LixFunctionProvider + Send>
+            Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>
         )
     }
 

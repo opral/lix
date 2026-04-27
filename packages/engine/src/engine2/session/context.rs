@@ -4,11 +4,9 @@ use serde_json::Value as JsonValue;
 
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::engine2::changelog::ChangelogContext;
+use crate::engine2::functions::FunctionProviderHandle;
 use crate::engine2::live_state::{LiveStateContext, LiveStateReader};
 use crate::engine2::schema_registry::SchemaRegistry;
-use crate::functions::{
-    DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
-};
 use crate::sql2::SqlExecutionContext;
 use crate::{LixBackend, LixError};
 
@@ -25,7 +23,6 @@ pub struct SessionContext {
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) changelog: Arc<ChangelogContext>,
     pub(super) schema_registry: Arc<SchemaRegistry>,
-    pub(super) functions: DynFunctionProvider,
 }
 
 impl SessionContext {
@@ -62,13 +59,6 @@ impl SessionContext {
             binary_cas,
             changelog,
             schema_registry,
-            // The session owns the function source so reads, writes, UDFs, and
-            // provider-side staging can share one execution lineage.
-            // TODO(engine2): replace the system provider with runtime-bound or
-            // deterministic bindings when engine2 owns that boot layer.
-            functions: SharedFunctionProvider::new(
-                Box::new(SystemFunctionProvider) as Box<dyn LixFunctionProvider + Send>
-            ),
         }
     }
 
@@ -87,7 +77,7 @@ pub(super) struct SessionSqlExecutionContext<'a> {
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) visible_schemas: Vec<JsonValue>,
-    pub(super) functions: DynFunctionProvider,
+    pub(super) functions: FunctionProviderHandle,
 }
 
 impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
@@ -99,7 +89,7 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
         Arc::new(self.live_state.reader(Arc::clone(&self.backend))) as Arc<dyn LiveStateReader>
     }
 
-    fn functions(&self) -> DynFunctionProvider {
+    fn functions(&self) -> FunctionProviderHandle {
         self.functions.clone()
     }
 

@@ -1,8 +1,8 @@
 use serde_json::json;
 
 use crate::engine2::changelog::CanonicalChange;
+use crate::engine2::functions::FunctionProviderHandle;
 use crate::engine2::untracked_state::UntrackedStateRow;
-use crate::functions::DynFunctionProvider;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
@@ -40,7 +40,7 @@ pub(crate) struct InitReceipt {
 ///
 /// The initial commit tracks durable content rows. Version refs are moving
 /// pointers and therefore live in untracked local state instead of changelog.
-pub(crate) fn plan_init_seed(functions: DynFunctionProvider) -> Result<InitSeedPlan, LixError> {
+pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSeedPlan, LixError> {
     let main_version_id = functions.call_uuid_v7();
     let lix_id = functions.call_uuid_v7();
     let initial_commit_id = functions.call_uuid_v7();
@@ -212,7 +212,7 @@ mod tests {
     use serde_json::Value as JsonValue;
 
     use super::*;
-    use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+    use crate::engine2::functions::{FunctionProvider, SharedFunctionProvider};
 
     #[test]
     fn plan_init_seed_returns_tracked_changes_and_untracked_version_refs() {
@@ -292,9 +292,9 @@ mod tests {
         .expect("snapshot should be JSON")
     }
 
-    fn test_functions() -> DynFunctionProvider {
+    fn test_functions() -> FunctionProviderHandle {
         SharedFunctionProvider::new(
-            Box::new(TestFunctionProvider::default()) as Box<dyn LixFunctionProvider + Send>
+            Box::new(TestFunctionProvider::default()) as Box<dyn FunctionProvider + Send>
         )
     }
 
@@ -304,7 +304,7 @@ mod tests {
         timestamp_count: usize,
     }
 
-    impl LixFunctionProvider for TestFunctionProvider {
+    impl FunctionProvider for TestFunctionProvider {
         fn uuid_v7(&mut self) -> String {
             self.uuid_count += 1;
             format!("test-uuid-{}", self.uuid_count)

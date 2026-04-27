@@ -12,6 +12,17 @@ use tokio::sync::OnceCell;
 
 const TEST_KV_TABLE: &str = "lix_internal_kv";
 
+fn assert_single_text(result: ExecuteResult, expected: &str) {
+    let ExecuteResult::Rows(row_set) = result else {
+        panic!("SELECT should return rows");
+    };
+    assert_eq!(row_set.len(), 1);
+    assert_eq!(
+        row_set.rows()[0].values(),
+        &[Value::Text(expected.to_string())]
+    );
+}
+
 #[test]
 fn session_execute_inserts_key_value_then_reads_it_back() {
     std::thread::Builder::new()
@@ -84,6 +95,168 @@ fn session_execute_inserts_key_value_then_reads_it_back() {
         .expect("failed to spawn sql2 test thread")
         .join()
         .expect("sql2 test thread panicked");
+}
+
+#[test]
+fn session_execute_persists_deterministic_function_sequence_across_sessions() {
+    std::thread::Builder::new()
+        .name("sql2_deterministic_sequence_roundtrip".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+            runtime.block_on(async {
+                let sqlite_uri = shared_memory_sqlite_uri("deterministic_sequence");
+                let engine = Engine::new(Box::new(SqliteBackend::new(sqlite_uri)))
+                    .await
+                    .expect("backend should create an engine");
+                let session = engine
+                    .open_session("global")
+                    .await
+                    .expect("backend should open first session");
+
+                let mode_result = session
+                    .execute(
+                        "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
+                         VALUES ('lix_deterministic_mode', \
+                         lix_json('{\"enabled\":true}'), true, true)",
+                        &[],
+                    )
+                    .await
+                    .expect("deterministic mode insert should succeed");
+                assert_eq!(mode_result, ExecuteResult::AffectedRows(1));
+
+                assert_single_text(
+                    session
+                        .execute("SELECT lix_uuid_v7()", &[])
+                        .await
+                        .expect("first deterministic uuid should succeed"),
+                    "01920000-0000-7000-8000-000000000000",
+                );
+                assert_single_text(
+                    session
+                        .execute("SELECT lix_uuid_v7()", &[])
+                        .await
+                        .expect("second deterministic uuid should succeed"),
+                    "01920000-0000-7000-8000-000000000001",
+                );
+
+                let second_session = engine
+                    .open_session("global")
+                    .await
+                    .expect("backend should open second session");
+                assert_single_text(
+                    second_session
+                        .execute("SELECT lix_uuid_v7()", &[])
+                        .await
+                        .expect("third deterministic uuid should succeed"),
+                    "01920000-0000-7000-8000-000000000002",
+                );
+                let write_result = second_session
+                    .execute(
+                        "INSERT INTO lix_state (\
+                         entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version, global, untracked\
+                         ) VALUES (\
+                         lix_uuid_v7(), 'lix_key_value', NULL, NULL, lix_json('{\"key\":\"det-write\",\"value\":\"ok\"}'), '1', true, false\
+                         )",
+                        &[],
+                    )
+                    .await
+                    .expect("deterministic write should succeed");
+                assert_eq!(write_result, ExecuteResult::AffectedRows(1));
+                assert_single_text(
+                    second_session
+                        .execute("SELECT lix_uuid_v7()", &[])
+                        .await
+                        .expect("uuid after deterministic write should continue"),
+                    // The tracked write consumes deterministic values for the
+                    // SQL-provided entity id, row metadata, and commit metadata.
+                    "01920000-0000-7000-8000-000000000009",
+                );
+
+                drop(second_session);
+                drop(session);
+                drop(engine);
+            });
+        })
+        .expect("failed to spawn sql2 deterministic test thread")
+        .join()
+        .expect("sql2 deterministic test thread panicked");
+}
+
+#[test]
+fn session_execute_does_not_persist_deterministic_sequence_after_failed_statement() {
+    std::thread::Builder::new()
+        .name("sql2_deterministic_failed_statement".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+            runtime.block_on(async {
+                let sqlite_uri = shared_memory_sqlite_uri("deterministic_failed_statement");
+                let engine = Engine::new(Box::new(SqliteBackend::new(sqlite_uri)))
+                    .await
+                    .expect("backend should create an engine");
+                let session = engine
+                    .open_session("global")
+                    .await
+                    .expect("backend should open a session");
+
+                let mode_result = session
+                    .execute(
+                        "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
+                         VALUES ('lix_deterministic_mode', \
+                         lix_json('{\"enabled\":true}'), true, true)",
+                        &[],
+                    )
+                    .await
+                    .expect("deterministic mode insert should succeed");
+                assert_eq!(mode_result, ExecuteResult::AffectedRows(1));
+
+                let failed_read = session
+                    .execute("SELECT lix_uuid_v7() FROM missing_engine2_table", &[])
+                    .await;
+                assert!(
+                    failed_read.is_err(),
+                    "missing table query should fail before persisting deterministic sequence"
+                );
+                assert_single_text(
+                    session
+                        .execute("SELECT lix_uuid_v7()", &[])
+                        .await
+                        .expect("first deterministic uuid should still start at zero"),
+                    "01920000-0000-7000-8000-000000000000",
+                );
+
+                let failed_write = session
+                    .execute(
+                        "INSERT INTO missing_engine2_table VALUES (lix_uuid_v7())",
+                        &[],
+                    )
+                    .await;
+                assert!(
+                    failed_write.is_err(),
+                    "failed write should not persist deterministic sequence"
+                );
+                assert_single_text(
+                    session
+                        .execute("SELECT lix_uuid_v7()", &[])
+                        .await
+                        .expect("second deterministic uuid should continue after last success"),
+                    "01920000-0000-7000-8000-000000000001",
+                );
+
+                drop(session);
+                drop(engine);
+            });
+        })
+        .expect("failed to spawn sql2 deterministic failure test thread")
+        .join()
+        .expect("sql2 deterministic failure test thread panicked");
 }
 
 #[test]

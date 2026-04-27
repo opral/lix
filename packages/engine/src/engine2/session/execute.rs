@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use crate::backend::TransactionBeginMode;
+use crate::engine2::functions::FunctionContext;
 use crate::engine2::transaction::Transaction;
 use crate::sql2;
 use crate::{LixError, QueryResult, Value};
@@ -138,6 +140,8 @@ impl SessionContext {
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         let live_state: Arc<dyn crate::engine2::live_state::LiveStateReader> =
             Arc::new(self.live_state.reader(Arc::clone(&self.backend)));
+        let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
+        let functions = runtime_functions.provider();
         let visible_schemas = self
             .schema_registry
             .visible_schemas(live_state, self.active_version_id())
@@ -148,7 +152,7 @@ impl SessionContext {
             live_state: Arc::clone(&self.live_state),
             binary_cas: Arc::clone(&self.binary_cas),
             visible_schemas,
-            functions: self.functions.clone(),
+            functions: functions.clone(),
         };
 
         let plan = sql2::create_logical_plan(&ctx, sql).await?;
@@ -163,7 +167,7 @@ impl SessionContext {
                 Arc::clone(&self.binary_cas),
                 Arc::clone(&self.changelog),
                 Arc::clone(&self.schema_registry),
-                self.functions.clone(),
+                functions,
             )
             .await?;
             // Re-plan against the transaction so DataFusion provider hooks
@@ -173,7 +177,7 @@ impl SessionContext {
             match result {
                 Ok(result) => {
                     let affected_rows = affected_rows_from_query_result(result)?;
-                    transaction.commit().await?;
+                    transaction.commit(&runtime_functions).await?;
                     return Ok(ExecuteResult::AffectedRows(affected_rows));
                 }
                 Err(error) => {
@@ -184,7 +188,29 @@ impl SessionContext {
         } else {
             sql2::execute_logical_plan(&ctx, plan, params).await?
         };
+        self.persist_runtime_functions_if_needed(&runtime_functions)
+            .await?;
         Ok(ExecuteResult::Rows(RowSet::from_query_result(result)))
+    }
+
+    /// Persists execution-scoped runtime function state after a successful read.
+    ///
+    /// Reads do not otherwise own a write transaction, but SQL functions such as
+    /// `lix_uuid_v7()` can still advance runtime state. Persisting happens only
+    /// after successful execution so failed reads do not consume durable
+    /// sequence state.
+    async fn persist_runtime_functions_if_needed(
+        &self,
+        runtime_functions: &FunctionContext,
+    ) -> Result<(), LixError> {
+        let mut transaction = self
+            .backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await?;
+        runtime_functions
+            .persist_if_needed(&mut self.live_state.writer(transaction.as_mut()))
+            .await?;
+        transaction.commit().await
     }
 }
 
