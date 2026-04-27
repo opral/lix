@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use crate::engine2::live_state::LiveStateRow;
-use crate::engine2::live_state::{LiveStateContext, LiveStateFilter, LiveStateScanRequest};
+use crate::engine2::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
 use crate::LixError;
 
 use super::filesystem_planner::{
@@ -16,7 +16,7 @@ use super::filesystem_planner::{
 
 /// Transaction-visible filesystem metadata decoded from live-state rows.
 ///
-/// The helper intentionally depends only on `LiveStateContext`. In engine2
+/// The helper intentionally depends only on `LiveStateReader`. In engine2
 /// write execution that context is the transaction overlay, so staged writes
 /// are visible here without reaching into transaction internals.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -31,7 +31,7 @@ impl VisibleFilesystem {
     /// Loads filesystem rows for a single version from transaction-visible
     /// live state and builds lookup indexes used by filesystem write planning.
     pub(crate) async fn load(
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         version_id: &str,
     ) -> Result<Self, LixError> {
         let rows = live_state
@@ -200,7 +200,7 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::engine2::live_state::LiveStateRow;
-    use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest, LiveStateScanRequest};
+    use crate::engine2::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
     use crate::LixError;
 
     use super::{
@@ -286,16 +286,16 @@ mod tests {
         assert_eq!(blob_ref.size_bytes, Some(5));
     }
 
-    fn live_state(rows: Vec<LiveStateRow>) -> std::sync::Arc<dyn LiveStateContext> {
-        std::sync::Arc::new(RowsLiveStateContext { rows })
+    fn live_state(rows: Vec<LiveStateRow>) -> std::sync::Arc<dyn LiveStateReader> {
+        std::sync::Arc::new(RowsLiveStateReader { rows })
     }
 
-    struct RowsLiveStateContext {
+    struct RowsLiveStateReader {
         rows: Vec<LiveStateRow>,
     }
 
     #[async_trait]
-    impl LiveStateContext for RowsLiveStateContext {
+    impl LiveStateReader for RowsLiveStateReader {
         async fn scan_rows(
             &self,
             request: &LiveStateScanRequest,

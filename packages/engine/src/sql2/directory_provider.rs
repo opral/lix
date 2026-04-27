@@ -28,7 +28,7 @@ use serde::Deserialize;
 
 use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
-    LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
+    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
 use crate::functions::DynFunctionProvider;
 use crate::history::{
@@ -50,7 +50,7 @@ const DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
 pub(crate) async fn register_lix_directory_providers(
     session: &SessionContext,
     active_version_id: &str,
-    live_state: Arc<dyn LiveStateContext>,
+    live_state: Arc<dyn LiveStateReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
     functions: DynFunctionProvider,
     history: Option<Arc<dyn HistoryContext>>,
@@ -89,7 +89,7 @@ pub(crate) async fn register_lix_directory_providers(
 
 pub(crate) struct LixDirectoryProvider {
     schema: SchemaRef,
-    live_state: Arc<dyn LiveStateContext>,
+    live_state: Arc<dyn LiveStateReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
     functions: DynFunctionProvider,
     default_version_id: Option<String>,
@@ -104,7 +104,7 @@ impl std::fmt::Debug for LixDirectoryProvider {
 impl LixDirectoryProvider {
     fn active_version(
         active_version_id: impl Into<String>,
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
         functions: DynFunctionProvider,
     ) -> Self {
@@ -118,7 +118,7 @@ impl LixDirectoryProvider {
     }
 
     fn by_version(
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
         functions: DynFunctionProvider,
     ) -> Self {
@@ -333,7 +333,7 @@ impl TableProvider for LixDirectoryProvider {
 
 struct LixDirectoryInsertSink {
     schema: SchemaRef,
-    live_state: Arc<dyn LiveStateContext>,
+    live_state: Arc<dyn LiveStateReader>,
     write_stager: Arc<dyn SqlWriteStager>,
     functions: DynFunctionProvider,
     default_version_id: Option<String>,
@@ -348,7 +348,7 @@ impl std::fmt::Debug for LixDirectoryInsertSink {
 impl LixDirectoryInsertSink {
     fn new(
         schema: SchemaRef,
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         write_stager: Arc<dyn SqlWriteStager>,
         functions: DynFunctionProvider,
         default_version_id: Option<String>,
@@ -404,7 +404,7 @@ impl DataSink for LixDirectoryInsertSink {
                 if path_resolvers.is_none() {
                     // TODO(engine2): make transaction-scoped live-state reads
                     // use transaction-owned read services instead of requiring
-                    // the committed layer to open a separate backend read.
+                    // the live-state layer to open a separate backend read.
                     path_resolvers = Some(
                         directory_path_resolvers_from_live_state(
                             Arc::clone(&self.live_state),
@@ -441,7 +441,7 @@ impl DataSink for LixDirectoryInsertSink {
 }
 
 struct LixDirectoryDeleteExec {
-    live_state: Arc<dyn LiveStateContext>,
+    live_state: Arc<dyn LiveStateReader>,
     write_stager: Arc<dyn SqlWriteStager>,
     table_schema: SchemaRef,
     default_version_id: Option<String>,
@@ -459,7 +459,7 @@ impl std::fmt::Debug for LixDirectoryDeleteExec {
 
 impl LixDirectoryDeleteExec {
     fn new(
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         write_stager: Arc<dyn SqlWriteStager>,
         table_schema: SchemaRef,
         default_version_id: Option<String>,
@@ -592,7 +592,7 @@ impl ExecutionPlan for LixDirectoryDeleteExec {
 }
 
 struct LixDirectoryUpdateExec {
-    live_state: Arc<dyn LiveStateContext>,
+    live_state: Arc<dyn LiveStateReader>,
     write_stager: Arc<dyn SqlWriteStager>,
     table_schema: SchemaRef,
     default_version_id: Option<String>,
@@ -611,7 +611,7 @@ impl std::fmt::Debug for LixDirectoryUpdateExec {
 
 impl LixDirectoryUpdateExec {
     fn new(
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         write_stager: Arc<dyn SqlWriteStager>,
         table_schema: SchemaRef,
         default_version_id: Option<String>,
@@ -745,7 +745,7 @@ impl ExecutionPlan for LixDirectoryUpdateExec {
 }
 
 struct LixDirectoryScanExec {
-    live_state: Arc<dyn LiveStateContext>,
+    live_state: Arc<dyn LiveStateReader>,
     schema: SchemaRef,
     request: LiveStateScanRequest,
     properties: Arc<PlanProperties>,
@@ -759,7 +759,7 @@ impl std::fmt::Debug for LixDirectoryScanExec {
 
 impl LixDirectoryScanExec {
     fn new(
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         schema: SchemaRef,
         request: LiveStateScanRequest,
     ) -> Self {
@@ -1395,7 +1395,7 @@ fn directory_path_resolver_key(context: &FilesystemRowContext) -> String {
 }
 
 async fn directory_path_resolvers_from_live_state(
-    live_state: Arc<dyn LiveStateContext>,
+    live_state: Arc<dyn LiveStateReader>,
     default_version_id: Option<&str>,
 ) -> std::result::Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
     let rows = live_state
@@ -1940,7 +1940,7 @@ mod tests {
     use futures_util::stream;
 
     use crate::engine2::live_state::{
-        LiveStateContext, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+        LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
     use crate::functions::{
         DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
@@ -1982,12 +1982,12 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RowsLiveStateContext {
+    struct RowsLiveStateReader {
         rows: Vec<LiveStateRow>,
     }
 
     #[async_trait]
-    impl LiveStateContext for RowsLiveStateContext {
+    impl LiveStateReader for RowsLiveStateReader {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
@@ -2367,7 +2367,7 @@ mod tests {
         let batch = directory_insert_batch(true, false);
         let sink = LixDirectoryInsertSink::new(
             batch.schema(),
-            Arc::new(RowsLiveStateContext::default()) as Arc<dyn LiveStateContext>,
+            Arc::new(RowsLiveStateReader::default()) as Arc<dyn LiveStateReader>,
             Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
             test_functions(),
             None,
@@ -2414,13 +2414,13 @@ mod tests {
         let batch = directory_path_insert_batch("/docs/nested/");
         let sink = LixDirectoryInsertSink::new(
             batch.schema(),
-            Arc::new(RowsLiveStateContext {
+            Arc::new(RowsLiveStateReader {
                 rows: vec![live_row(
                     "dir-docs",
                     "version-a",
                     "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}",
                 )],
-            }) as Arc<dyn LiveStateContext>,
+            }) as Arc<dyn LiveStateReader>,
             Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
             test_functions(),
             None,

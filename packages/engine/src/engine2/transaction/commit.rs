@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::binary_cas::{BinaryBlobWrite, BinaryCasContext};
 use crate::engine2::changelog::{CanonicalChange, ChangelogContext};
-use crate::engine2::live_state::{CommittedLiveStateContext, LiveStateRow, LiveStateRowRequest};
+use crate::engine2::live_state::{LiveStateContext, LiveStateRow, LiveStateRowRequest};
 use crate::engine2::transaction::staging::StagedWriteSet;
 use crate::engine2::transaction::types::{StagedCommitMembers, StagedStateRow};
 use crate::functions::{DynFunctionProvider, LixFunctionProvider};
@@ -21,7 +21,7 @@ const VERSION_REF_SCHEMA_VERSION: &str = "1";
 pub(crate) async fn commit_staged_writes(
     binary_cas: &BinaryCasContext,
     changelog: &ChangelogContext,
-    live_state: &CommittedLiveStateContext,
+    live_state: &LiveStateContext,
     transaction: &mut dyn LixBackendTransaction,
     staged_writes: StagedWriteSet,
     functions: DynFunctionProvider,
@@ -73,7 +73,7 @@ pub(crate) async fn commit_staged_writes(
 
     // TODO(engine2): live_state should eventually catch up from changelog
     // rather than being mirrored here. Keeping this bridge makes the current
-    // SQL read path see committed writes immediately while changelog becomes
+    // SQL read path see durable writes immediately while changelog becomes
     // the source of truth.
     let live_state_rows = changelog_rows
         .into_iter()
@@ -131,7 +131,7 @@ struct FinalizedCommitRows {
 
 async fn finalize_commit_rows(
     commit_members_by_version: BTreeMap<String, StagedCommitMembers>,
-    live_state: &CommittedLiveStateContext,
+    live_state: &LiveStateContext,
     transaction: &mut dyn LixBackendTransaction,
     functions: DynFunctionProvider,
 ) -> Result<FinalizedCommitRows, LixError> {
@@ -190,7 +190,7 @@ async fn finalize_commit_rows(
 }
 
 async fn load_version_ref_head(
-    live_state: &CommittedLiveStateContext,
+    live_state: &LiveStateContext,
     transaction: &mut dyn LixBackendTransaction,
     version_id: &str,
 ) -> Result<Option<String>, LixError> {
@@ -272,7 +272,7 @@ mod tests {
     use super::*;
     use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
     use crate::engine2::changelog::ChangelogContext;
-    use crate::engine2::live_state::{CommittedLiveStateContext, LiveStateRowRequest};
+    use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest};
     use crate::engine2::untracked_state::{
         UntrackedStateContext, UntrackedStateRow, UntrackedStateRowRequest,
     };
@@ -284,7 +284,7 @@ mod tests {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
-        let live_state = CommittedLiveStateContext::new();
+        let live_state = LiveStateContext::new();
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await
@@ -363,7 +363,7 @@ mod tests {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
-        let live_state = CommittedLiveStateContext::new();
+        let live_state = LiveStateContext::new();
         let untracked_state = UntrackedStateContext::new();
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -423,7 +423,7 @@ mod tests {
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
         let untracked_state = UntrackedStateContext::new();
-        let live_state = CommittedLiveStateContext::new();
+        let live_state = LiveStateContext::new();
 
         let mut seed_transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -488,7 +488,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_parents_global_commit_to_existing_version_ref() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = CommittedLiveStateContext::new();
+        let live_state = LiveStateContext::new();
         seed_version_ref(&backend, &live_state, GLOBAL_VERSION_ID, "initial-commit").await;
 
         let mut transaction = backend
@@ -563,7 +563,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_skips_empty_members() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = CommittedLiveStateContext::new();
+        let live_state = LiveStateContext::new();
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await
@@ -587,7 +587,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_uses_existing_version_ref_as_parent() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = CommittedLiveStateContext::new();
+        let live_state = LiveStateContext::new();
         seed_version_ref(&backend, &live_state, "version-a", "previous-commit").await;
 
         let mut transaction = backend
@@ -667,7 +667,7 @@ mod tests {
 
     async fn seed_version_ref(
         backend: &Arc<dyn LixBackend + Send + Sync>,
-        live_state: &CommittedLiveStateContext,
+        live_state: &LiveStateContext,
         version_id: &str,
         commit_id: &str,
     ) {

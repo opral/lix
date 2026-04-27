@@ -119,6 +119,22 @@ where
 }
 
 #[async_trait]
+impl KvStore for &mut dyn KvStore {
+    async fn kv_get(&mut self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
+        (**self).kv_get(namespace, key).await
+    }
+
+    async fn kv_scan(
+        &mut self,
+        namespace: &str,
+        range: KvScanRange,
+        limit: Option<usize>,
+    ) -> Result<Vec<KvPair>, LixError> {
+        (**self).kv_scan(namespace, range, limit).await
+    }
+}
+
+#[async_trait]
 impl<T> KvStore for &mut T
 where
     T: LixBackendTransaction + ?Sized,
@@ -134,6 +150,33 @@ where
         limit: Option<usize>,
     ) -> Result<Vec<KvPair>, LixError> {
         (**self).kv_scan(namespace, range, limit).await
+    }
+}
+
+#[async_trait]
+impl KvStore for &mut dyn KvWriter {
+    async fn kv_get(&mut self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
+        (**self).kv_get(namespace, key).await
+    }
+
+    async fn kv_scan(
+        &mut self,
+        namespace: &str,
+        range: KvScanRange,
+        limit: Option<usize>,
+    ) -> Result<Vec<KvPair>, LixError> {
+        (**self).kv_scan(namespace, range, limit).await
+    }
+}
+
+#[async_trait]
+impl KvWriter for &mut dyn KvWriter {
+    async fn kv_put(&mut self, namespace: &str, key: &[u8], value: &[u8]) -> Result<(), LixError> {
+        (**self).kv_put(namespace, key, value).await
+    }
+
+    async fn kv_delete(&mut self, namespace: &str, key: &[u8]) -> Result<(), LixError> {
+        (**self).kv_delete(namespace, key).await
     }
 }
 

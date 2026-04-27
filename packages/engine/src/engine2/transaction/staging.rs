@@ -147,9 +147,9 @@ impl StagedStateRowOverlay {
             .collect()
     }
 
-    /// Returns staged identities that should suppress committed rows.
+    /// Returns staged identities that should suppress base live-state rows.
     ///
-    /// Tombstones also suppress committed rows, even when the caller is not
+    /// Tombstones also suppress base live-state rows, even when the caller is not
     /// asking to see tombstone rows.
     pub(crate) fn identities_matching_scan(
         &self,

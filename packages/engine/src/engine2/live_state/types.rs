@@ -1,4 +1,5 @@
 use crate::engine2::changelog::CanonicalChange;
+use crate::engine2::tracked_state::TrackedStateRow;
 use crate::engine2::untracked_state::{
     UntrackedStateFilter, UntrackedStateRow, UntrackedStateRowRequest,
 };
@@ -62,6 +63,62 @@ impl From<UntrackedStateRow> for LiveStateRow {
             untracked: true,
             version_id: row.version_id,
         }
+    }
+}
+
+impl From<TrackedStateRow> for LiveStateRow {
+    fn from(row: TrackedStateRow) -> Self {
+        LiveStateRow {
+            entity_id: row.entity_id,
+            schema_key: row.schema_key,
+            file_id: row.file_id,
+            plugin_key: row.plugin_key,
+            snapshot_content: row.snapshot_content,
+            metadata: row.metadata,
+            schema_version: row.schema_version,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            global: row.global,
+            change_id: Some(row.change_id),
+            commit_id: row.commit_id,
+            untracked: false,
+            version_id: row.version_id,
+        }
+    }
+}
+
+impl TryFrom<&LiveStateRow> for TrackedStateRow {
+    type Error = crate::LixError;
+
+    fn try_from(row: &LiveStateRow) -> Result<Self, Self::Error> {
+        if row.untracked {
+            return Err(crate::LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked_state cannot store untracked live-state rows",
+            ));
+        }
+        let Some(change_id) = row.change_id.clone() else {
+            return Err(crate::LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked_state rows require change_id",
+            ));
+        };
+
+        Ok(TrackedStateRow {
+            entity_id: row.entity_id.clone(),
+            schema_key: row.schema_key.clone(),
+            file_id: row.file_id.clone(),
+            plugin_key: row.plugin_key.clone(),
+            snapshot_content: row.snapshot_content.clone(),
+            metadata: row.metadata.clone(),
+            schema_version: row.schema_version.clone(),
+            created_at: row.created_at.clone(),
+            updated_at: row.updated_at.clone(),
+            global: row.global,
+            change_id,
+            commit_id: row.commit_id.clone(),
+            version_id: row.version_id.clone(),
+        })
     }
 }
 

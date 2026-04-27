@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::binary_cas::BlobDataReader;
-use crate::engine2::live_state::LiveStateContext;
+use crate::engine2::live_state::LiveStateReader;
 use crate::functions::DynFunctionProvider;
 use crate::history::{StateHistoryRequest, StateHistoryRow};
 use crate::sql::{
@@ -41,7 +41,7 @@ use super::udf::register_sql2_udfs;
 #[allow(dead_code)]
 pub(crate) trait SqlExecutionContext {
     fn active_version_id(&self) -> &str;
-    fn live_state(&self) -> Arc<dyn LiveStateContext>;
+    fn live_state(&self) -> Arc<dyn LiveStateReader>;
     fn functions(&self) -> DynFunctionProvider;
     fn history(&self) -> Option<Arc<dyn HistoryContext>> {
         None
@@ -90,7 +90,7 @@ pub(crate) struct SqlWriteOutcome {
 /// Execution-scoped authority for staging SQL writes into the current Lix
 /// transaction.
 ///
-/// `LiveStateContext` stays read-only and visibility-oriented. Write execution
+/// `LiveStateReader` stays read-only and visibility-oriented. Write execution
 /// plans use this boundary to stage mutations through the transaction pipeline.
 #[async_trait]
 #[allow(dead_code)]
@@ -477,8 +477,7 @@ mod tests {
     };
     use crate::binary_cas::BlobDataReader;
     use crate::engine2::live_state::{
-        CommittedLiveStateContext, LiveStateContext, LiveStateRow, LiveStateRowRequest,
-        LiveStateScanRequest,
+        LiveStateContext, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
     use crate::functions::{
         DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
@@ -493,8 +492,8 @@ mod tests {
     use crate::{CreateVersionOptions, LixError, Value};
 
     struct DummyBlobReader;
-    struct DummyLiveStateContext;
-    struct RowsLiveStateContext {
+    struct DummyLiveStateReader;
+    struct RowsLiveStateReader {
         rows: Vec<LiveStateRow>,
     }
     struct RowsHistoryContext {
@@ -522,7 +521,7 @@ mod tests {
     struct DummySqlExecutionContext<'a> {
         active_version_id: &'a str,
         blob_reader: Arc<dyn BlobDataReader>,
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
         schema_definitions: Vec<JsonValue>,
     }
@@ -530,7 +529,7 @@ mod tests {
     struct HistorySqlExecutionContext<'a> {
         active_version_id: &'a str,
         blob_reader: Arc<dyn BlobDataReader>,
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         history: Arc<dyn HistoryContext>,
         schema_definitions: Vec<JsonValue>,
     }
@@ -540,7 +539,7 @@ mod tests {
             self.active_version_id
         }
 
-        fn live_state(&self) -> Arc<dyn LiveStateContext> {
+        fn live_state(&self) -> Arc<dyn LiveStateReader> {
             Arc::clone(&self.live_state)
         }
 
@@ -567,7 +566,7 @@ mod tests {
             self.active_version_id
         }
 
-        fn live_state(&self) -> Arc<dyn LiveStateContext> {
+        fn live_state(&self) -> Arc<dyn LiveStateReader> {
             Arc::clone(&self.live_state)
         }
 
@@ -604,7 +603,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl LiveStateContext for DummyLiveStateContext {
+    impl LiveStateReader for DummyLiveStateReader {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
@@ -621,7 +620,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl LiveStateContext for RowsLiveStateContext {
+    impl LiveStateReader for RowsLiveStateReader {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
@@ -908,17 +907,17 @@ mod tests {
     #[tokio::test]
     async fn sql_execution_context_exposes_live_state_and_blob_reader() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateContext);
+        let live_state = Arc::new(DummyLiveStateReader);
         let ctx = DummySqlExecutionContext {
             active_version_id: "version-a",
             blob_reader: Arc::clone(&blob_reader),
-            live_state: Arc::clone(&live_state) as Arc<dyn LiveStateContext>,
+            live_state: Arc::clone(&live_state) as Arc<dyn LiveStateReader>,
             write_stager: None,
             schema_definitions: vec![],
         };
 
         let actual = ctx.live_state();
-        let expected = live_state as Arc<dyn LiveStateContext>;
+        let expected = live_state as Arc<dyn LiveStateReader>;
         assert_eq!(ctx.active_version_id(), "version-a");
         assert!(Arc::ptr_eq(&actual, &expected));
         assert!(Arc::ptr_eq(&ctx.blob_reader(), &blob_reader));
@@ -927,7 +926,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_uses_execution_context_boundary() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateContext);
+        let live_state = Arc::new(DummyLiveStateReader);
         let ctx = DummySqlExecutionContext {
             active_version_id: "version-a",
             blob_reader,
@@ -945,7 +944,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_reads_lix_state_history_from_history_context() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateContext);
+        let live_state = Arc::new(DummyLiveStateReader);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let history = Arc::new(RowsHistoryContext {
             rows: vec![StateHistoryRow {
@@ -1026,7 +1025,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_reads_entity_history_view_from_history_context() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateContext);
+        let live_state = Arc::new(DummyLiveStateReader);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let history = Arc::new(RowsHistoryContext {
             rows: vec![StateHistoryRow {
@@ -1104,7 +1103,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_reads_directory_history_view_from_history_context() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateContext);
+        let live_state = Arc::new(DummyLiveStateReader);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let history = Arc::new(RowsHistoryContext {
             rows: vec![StateHistoryRow {
@@ -1187,7 +1186,7 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(RowsBlobReader {
             blobs: BTreeMap::from([("blob-a".to_string(), b"hello".to_vec())]),
         });
-        let live_state = Arc::new(DummyLiveStateContext);
+        let live_state = Arc::new(DummyLiveStateReader);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let history = Arc::new(RowsHistoryContext {
             rows: vec![
@@ -1307,7 +1306,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_lix_state_values_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateContext);
+        let live_state = Arc::new(DummyLiveStateReader);
         let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
         let ctx = DummySqlExecutionContext {
             active_version_id: "version-a",
@@ -1352,7 +1351,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_lix_state_select_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateContext);
+        let live_state = Arc::new(DummyLiveStateReader);
         let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
         let ctx = DummySqlExecutionContext {
             active_version_id: "version-a",
@@ -1405,7 +1404,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_entity_by_version_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateContext);
+        let live_state = Arc::new(DummyLiveStateReader);
         let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
         let ctx = DummySqlExecutionContext {
             active_version_id: "version-a",
@@ -1454,7 +1453,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_active_entity_defaults_active_version() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateContext);
+        let live_state = Arc::new(DummyLiveStateReader);
         let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
         let ctx = DummySqlExecutionContext {
             active_version_id: "version-a",
@@ -1501,7 +1500,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_directory_by_version_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateContext);
+        let live_state = Arc::new(DummyLiveStateReader);
         let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
         let ctx = DummySqlExecutionContext {
             active_version_id: "version-a",
@@ -1543,7 +1542,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_active_directory_defaults_active_version() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateContext);
+        let live_state = Arc::new(DummyLiveStateReader);
         let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
         let ctx = DummySqlExecutionContext {
             active_version_id: "version-a",
@@ -1579,7 +1578,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_directory_stages_rewritten_descriptor() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateContext {
+        let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
                 live_directory_row("dir-docs", "version-a", None, "docs", false),
                 live_directory_row("dir-guides", "version-a", Some("dir-docs"), "guides", false),
@@ -1631,7 +1630,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_directory_rejects_path_assignment() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateContext {
+        let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![live_directory_row(
                 "dir-docs",
                 "version-a",
@@ -1667,7 +1666,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_delete_directory_by_version_stages_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateContext {
+        let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
                 live_directory_row("dir-docs", "version-a", None, "docs", false),
                 live_directory_row("dir-guides", "version-b", Some("dir-docs"), "guides", false),
@@ -1710,7 +1709,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_file_by_version_stages_descriptor_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateContext);
+        let live_state = Arc::new(DummyLiveStateReader);
         let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
         let ctx = DummySqlExecutionContext {
             active_version_id: "version-a",
@@ -1756,7 +1755,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_active_file_defaults_active_version() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateContext);
+        let live_state = Arc::new(DummyLiveStateReader);
         let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
         let ctx = DummySqlExecutionContext {
             active_version_id: "version-a",
@@ -1792,7 +1791,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_insert_into_file_with_data_stages_blob_ref() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(DummyLiveStateContext);
+        let live_state = Arc::new(DummyLiveStateReader);
         let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
         let ctx = DummySqlExecutionContext {
             active_version_id: "version-a",
@@ -1841,7 +1840,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_file_stages_rewritten_descriptor() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateContext {
+        let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
                 live_file_row(
                     "file-readme",
@@ -1909,7 +1908,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_file_stages_data_blob_ref() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateContext {
+        let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![live_file_row(
                 "file-readme",
                 "version-a",
@@ -1960,7 +1959,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_file_rejects_path_assignment() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateContext {
+        let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![live_file_row(
                 "file-readme",
                 "version-a",
@@ -1997,7 +1996,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_delete_file_by_version_stages_descriptor_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateContext {
+        let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
                 live_file_row(
                     "file-readme",
@@ -2054,7 +2053,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_entity_surface_stages_rewritten_snapshot() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateContext {
+        let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
                 live_entity_row("entity-a", "version-a", "A"),
                 live_entity_row("entity-b", "version-a", "B"),
@@ -2111,7 +2110,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_delete_entity_by_version_stages_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateContext {
+        let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
                 live_entity_row("entity-a", "version-a", "A"),
                 live_entity_row("entity-b", "version-b", "B"),
@@ -2161,7 +2160,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_lix_state_stages_rewritten_rows() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateContext {
+        let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
                 live_lix_state_row("entity-1", Some("{\"source\":\"match\"}")),
                 live_lix_state_row("entity-2", Some("{\"source\":\"skip\"}")),
@@ -2209,7 +2208,7 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_delete_lix_state_without_where_stages_all_rows() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
-        let live_state = Arc::new(RowsLiveStateContext {
+        let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
                 live_lix_state_row("entity-1", Some("{\"source\":\"one\"}")),
                 live_lix_state_row("entity-2", Some("{\"source\":\"two\"}")),
@@ -2247,7 +2246,7 @@ mod tests {
     struct BackendSqlExecutionContext<'a> {
         active_version_id: &'a str,
         blob_reader: Arc<dyn BlobDataReader>,
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         schema_definitions: Vec<JsonValue>,
     }
 
@@ -2256,7 +2255,7 @@ mod tests {
             self.active_version_id
         }
 
-        fn live_state(&self) -> Arc<dyn LiveStateContext> {
+        fn live_state(&self) -> Arc<dyn LiveStateReader> {
             Arc::clone(&self.live_state)
         }
 
@@ -2380,9 +2379,7 @@ mod tests {
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(
-                        CommittedLiveStateContext::new().reader(Arc::clone(&backend_ref)),
-                    ),
+                    live_state: Arc::new(LiveStateContext::new().reader(Arc::clone(&backend_ref))),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2429,9 +2426,7 @@ mod tests {
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(
-                        CommittedLiveStateContext::new().reader(Arc::clone(&backend_ref)),
-                    ),
+                    live_state: Arc::new(LiveStateContext::new().reader(Arc::clone(&backend_ref))),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2467,9 +2462,7 @@ mod tests {
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(
-                        CommittedLiveStateContext::new().reader(Arc::clone(&backend_ref)),
-                    ),
+                    live_state: Arc::new(LiveStateContext::new().reader(Arc::clone(&backend_ref))),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2508,9 +2501,7 @@ mod tests {
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(
-                        CommittedLiveStateContext::new().reader(Arc::clone(&backend_ref)),
-                    ),
+                    live_state: Arc::new(LiveStateContext::new().reader(Arc::clone(&backend_ref))),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2545,9 +2536,7 @@ mod tests {
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(
-                        CommittedLiveStateContext::new().reader(Arc::clone(&backend_ref)),
-                    ),
+                    live_state: Arc::new(LiveStateContext::new().reader(Arc::clone(&backend_ref))),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2583,9 +2572,7 @@ mod tests {
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(
-                        CommittedLiveStateContext::new().reader(Arc::clone(&backend_ref)),
-                    ),
+                    live_state: Arc::new(LiveStateContext::new().reader(Arc::clone(&backend_ref))),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2622,9 +2609,7 @@ mod tests {
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(
-                        CommittedLiveStateContext::new().reader(Arc::clone(&backend_ref)),
-                    ),
+                    live_state: Arc::new(LiveStateContext::new().reader(Arc::clone(&backend_ref))),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2660,9 +2645,7 @@ mod tests {
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(
-                        CommittedLiveStateContext::new().reader(Arc::clone(&backend_ref)),
-                    ),
+                    live_state: Arc::new(LiveStateContext::new().reader(Arc::clone(&backend_ref))),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2707,9 +2690,7 @@ mod tests {
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(
-                        CommittedLiveStateContext::new().reader(Arc::clone(&backend_ref)),
-                    ),
+                    live_state: Arc::new(LiveStateContext::new().reader(Arc::clone(&backend_ref))),
                     schema_definitions: vec![schema_definition],
                 };
 
