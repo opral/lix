@@ -5,8 +5,7 @@ use serde_json::Value as JsonValue;
 use crate::backend::TransactionBeginMode;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::engine2::changelog::ChangelogContext;
-use crate::engine2::live_state::CommittedLiveStateContext;
-use crate::engine2::live_state::LiveStateContext;
+use crate::engine2::live_state::{LiveStateContext, LiveStateReader};
 use crate::engine2::schema_registry::SchemaRegistry;
 use crate::engine2::transaction::live_state_overlay::TransactionLiveStateContext;
 use crate::engine2::transaction::staging::TransactionStagedWrites;
@@ -29,7 +28,7 @@ mod types;
 pub(crate) struct Transaction<'a> {
     active_version_id: String,
     backend: &'a Arc<dyn LixBackend + Send + Sync>,
-    committed_live_state: Arc<CommittedLiveStateContext>,
+    live_state: Arc<LiveStateContext>,
     binary_cas: Arc<BinaryCasContext>,
     changelog: Arc<ChangelogContext>,
     staged_writes: Arc<TransactionStagedWrites>,
@@ -44,20 +43,17 @@ impl<'a> Transaction<'a> {
     pub(crate) async fn open(
         active_version_id: String,
         backend: &'a Arc<dyn LixBackend + Send + Sync>,
-        committed_live_state: Arc<CommittedLiveStateContext>,
+        live_state: Arc<LiveStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
         schema_registry: Arc<SchemaRegistry>,
         functions: DynFunctionProvider,
     ) -> Result<Self, LixError> {
         let staged_writes = Arc::new(TransactionStagedWrites::new(functions.clone()));
-        let live_state = transaction_live_state(
-            backend,
-            Arc::clone(&committed_live_state),
-            Arc::clone(&staged_writes),
-        )?;
+        let visible_live_state =
+            transaction_live_state(backend, Arc::clone(&live_state), Arc::clone(&staged_writes))?;
         let visible_schemas = schema_registry
-            .visible_schemas(live_state, &active_version_id)
+            .visible_schemas(visible_live_state, &active_version_id)
             .await?;
         let backend_transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -65,7 +61,7 @@ impl<'a> Transaction<'a> {
         Ok(Self {
             active_version_id,
             backend,
-            committed_live_state,
+            live_state,
             binary_cas,
             changelog,
             staged_writes,
@@ -85,7 +81,7 @@ impl<'a> Transaction<'a> {
         commit::commit_staged_writes(
             &self.binary_cas,
             &self.changelog,
-            &self.committed_live_state,
+            &self.live_state,
             self.backend_transaction.as_mut(),
             staged_writes,
             self.functions.clone(),
@@ -112,12 +108,11 @@ impl SqlExecutionContext for Transaction<'_> {
         &self.active_version_id
     }
 
-    /// Returns committed live state with this transaction's staged rows
-    /// overlaid on top.
-    fn live_state(&self) -> Arc<dyn LiveStateContext> {
+    /// Returns live state with this transaction's staged rows overlaid on top.
+    fn live_state(&self) -> Arc<dyn LiveStateReader> {
         transaction_live_state(
             self.backend,
-            Arc::clone(&self.committed_live_state),
+            Arc::clone(&self.live_state),
             Arc::clone(&self.staged_writes),
         )
         .expect("engine2 transaction should build staging overlay")
@@ -149,13 +144,10 @@ impl SqlExecutionContext for Transaction<'_> {
 
 fn transaction_live_state(
     backend: &Arc<dyn LixBackend + Send + Sync>,
-    committed_live_state: Arc<CommittedLiveStateContext>,
+    live_state: Arc<LiveStateContext>,
     staged_writes: Arc<TransactionStagedWrites>,
-) -> Result<Arc<dyn LiveStateContext>, LixError> {
+) -> Result<Arc<dyn LiveStateReader>, LixError> {
     let staged = staged_writes.staging_overlay()?;
-    let committed: Arc<dyn LiveStateContext> =
-        Arc::new(committed_live_state.reader(Arc::clone(backend)));
-    Ok(Arc::new(TransactionLiveStateContext::new(
-        committed, staged,
-    )))
+    let base: Arc<dyn LiveStateReader> = Arc::new(live_state.reader(Arc::clone(backend)));
+    Ok(Arc::new(TransactionLiveStateContext::new(base, staged)))
 }

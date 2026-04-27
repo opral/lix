@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serde_json::Value as JsonValue;
 
 use crate::engine2::live_state::LiveStateRow;
-use crate::engine2::live_state::{LiveStateContext, LiveStateFilter, LiveStateScanRequest};
+use crate::engine2::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
 use crate::schema::{builtin_schema_definition, builtin_schema_keys, schema_key_from_definition};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
@@ -27,7 +27,7 @@ impl SchemaRegistry {
     /// Loads schema definitions visible for SQL planning at `version_id`.
     pub(crate) async fn visible_schemas(
         &self,
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         version_id: &str,
     ) -> Result<Vec<JsonValue>, LixError> {
         let mut schemas = builtin_schema_definitions()?;
@@ -136,7 +136,7 @@ mod tests {
         let registry = SchemaRegistry::new();
 
         let schemas = registry
-            .visible_schemas(Arc::new(RowsLiveStateContext::new(Vec::new())), "global")
+            .visible_schemas(Arc::new(RowsLiveStateReader::new(Vec::new())), "global")
             .await
             .expect("schema visibility should load");
 
@@ -154,7 +154,7 @@ mod tests {
 
         let schemas = registry
             .visible_schemas(
-                Arc::new(RowsLiveStateContext::new(vec![registered_schema_row(
+                Arc::new(RowsLiveStateReader::new(vec![registered_schema_row(
                     "engine2_dynamic_schema",
                     "1",
                 )])),
@@ -168,18 +168,18 @@ mod tests {
         }));
     }
 
-    struct RowsLiveStateContext {
+    struct RowsLiveStateReader {
         rows: Vec<LiveStateRow>,
     }
 
-    impl RowsLiveStateContext {
+    impl RowsLiveStateReader {
         fn new(rows: Vec<LiveStateRow>) -> Self {
             Self { rows }
         }
     }
 
     #[async_trait]
-    impl LiveStateContext for RowsLiveStateContext {
+    impl LiveStateReader for RowsLiveStateReader {
         async fn scan_rows(
             &self,
             request: &LiveStateScanRequest,

@@ -31,7 +31,7 @@ use serde_json::Value as JsonValue;
 use crate::common::{derive_entity_id_from_json_paths, EntityIdDerivationError};
 use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
-    LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
+    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
 use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
@@ -45,7 +45,7 @@ use super::udf::{
 pub(crate) async fn register_entity_providers(
     ctx: &SessionContext,
     active_version_id: &str,
-    live_state: Arc<dyn LiveStateContext>,
+    live_state: Arc<dyn LiveStateReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
     history_available: bool,
     schema_definitions: &[JsonValue],
@@ -190,7 +190,7 @@ struct EntitySurfaceSpec {
 
 pub(crate) struct EntityProvider {
     spec: Arc<EntitySurfaceSpec>,
-    live_state: Arc<dyn LiveStateContext>,
+    live_state: Arc<dyn LiveStateReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
     schema: SchemaRef,
     variant: EntityProviderVariant,
@@ -209,7 +209,7 @@ impl std::fmt::Debug for EntityProvider {
 impl EntityProvider {
     fn active(
         spec: Arc<EntitySurfaceSpec>,
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
         active_version_id: String,
     ) -> Self {
@@ -225,7 +225,7 @@ impl EntityProvider {
 
     fn by_version(
         spec: Arc<EntitySurfaceSpec>,
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
     ) -> Self {
         Self {
@@ -496,7 +496,7 @@ impl DataSink for EntityInsertSink {
 
 struct EntityDeleteExec {
     spec: Arc<EntitySurfaceSpec>,
-    live_state: Arc<dyn LiveStateContext>,
+    live_state: Arc<dyn LiveStateReader>,
     write_stager: Arc<dyn SqlWriteStager>,
     table_schema: SchemaRef,
     default_version_id: Option<String>,
@@ -517,7 +517,7 @@ impl std::fmt::Debug for EntityDeleteExec {
 impl EntityDeleteExec {
     fn new(
         spec: Arc<EntitySurfaceSpec>,
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         write_stager: Arc<dyn SqlWriteStager>,
         table_schema: SchemaRef,
         default_version_id: Option<String>,
@@ -656,7 +656,7 @@ impl ExecutionPlan for EntityDeleteExec {
 
 struct EntityUpdateExec {
     spec: Arc<EntitySurfaceSpec>,
-    live_state: Arc<dyn LiveStateContext>,
+    live_state: Arc<dyn LiveStateReader>,
     write_stager: Arc<dyn SqlWriteStager>,
     table_schema: SchemaRef,
     default_version_id: Option<String>,
@@ -678,7 +678,7 @@ impl std::fmt::Debug for EntityUpdateExec {
 impl EntityUpdateExec {
     fn new(
         spec: Arc<EntitySurfaceSpec>,
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         write_stager: Arc<dyn SqlWriteStager>,
         table_schema: SchemaRef,
         default_version_id: Option<String>,
@@ -1260,7 +1260,7 @@ fn optional_scalar_value(
 
 struct EntityScanExec {
     spec: Arc<EntitySurfaceSpec>,
-    live_state: Arc<dyn LiveStateContext>,
+    live_state: Arc<dyn LiveStateReader>,
     schema: SchemaRef,
     request: LiveStateScanRequest,
     properties: Arc<PlanProperties>,
@@ -1277,7 +1277,7 @@ impl std::fmt::Debug for EntityScanExec {
 impl EntityScanExec {
     fn new(
         spec: Arc<EntitySurfaceSpec>,
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         schema: SchemaRef,
         request: LiveStateScanRequest,
     ) -> Self {
@@ -1846,19 +1846,19 @@ mod tests {
         EntityColumnType, EntityInsertSink, EntityProviderVariant,
     };
     use crate::engine2::live_state::{
-        LiveStateContext, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+        LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
     use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateWriteRow};
     use crate::LixError;
 
-    struct EmptyLiveStateContext;
+    struct EmptyLiveStateReader;
     #[derive(Default)]
     struct CapturingWriteStager {
         writes: Mutex<Vec<SqlWriteIntent>>,
     }
 
     #[async_trait]
-    impl LiveStateContext for EmptyLiveStateContext {
+    impl LiveStateReader for EmptyLiveStateReader {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
@@ -2120,7 +2120,7 @@ mod tests {
         );
         let provider = super::EntityProvider::by_version(
             spec,
-            Arc::new(EmptyLiveStateContext) as Arc<dyn LiveStateContext>,
+            Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
             None,
         );
 

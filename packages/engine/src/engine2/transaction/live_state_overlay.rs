@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::engine2::live_state::LiveStateRow;
-use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest, LiveStateScanRequest};
+use crate::engine2::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
 use crate::engine2::transaction::staging::{
     StagedExactRow, StagedStateRowIdentity, StagedStateRowOverlay,
 };
@@ -12,22 +12,22 @@ use crate::LixError;
 
 /// Live-state view for one engine2 write transaction.
 ///
-/// Reads see staged rows first. Committed rows with the same identity are
+/// Reads see staged rows first. Base rows with the same identity are
 /// hidden so staged updates and deletes behave like transaction-local state.
 pub(crate) struct TransactionLiveStateContext {
-    committed: Arc<dyn LiveStateContext>,
+    base: Arc<dyn LiveStateReader>,
     staged: StagedStateRowOverlay,
 }
 
 impl TransactionLiveStateContext {
-    /// Composes committed live state with the transaction-local staging overlay.
-    pub(crate) fn new(committed: Arc<dyn LiveStateContext>, staged: StagedStateRowOverlay) -> Self {
-        Self { committed, staged }
+    /// Composes base live state with the transaction-local staging overlay.
+    pub(crate) fn new(base: Arc<dyn LiveStateReader>, staged: StagedStateRowOverlay) -> Self {
+        Self { base, staged }
     }
 }
 
 #[async_trait]
-impl LiveStateContext for TransactionLiveStateContext {
+impl LiveStateReader for TransactionLiveStateContext {
     async fn scan_rows(
         &self,
         request: &LiveStateScanRequest,
@@ -39,7 +39,7 @@ impl LiveStateContext for TransactionLiveStateContext {
             .map(StagedStateRowIdentity::from)
             .collect::<BTreeSet<_>>();
 
-        for row in self.committed.scan_rows(request).await? {
+        for row in self.base.scan_rows(request).await? {
             let identity = StagedStateRowIdentity::from(&row);
             if hidden_identities.contains(&identity) {
                 continue;
@@ -62,7 +62,7 @@ impl LiveStateContext for TransactionLiveStateContext {
         match self.staged.load_exact(request) {
             Some(StagedExactRow::Row(row)) => Ok(Some(row)),
             Some(StagedExactRow::Tombstone) => Ok(None),
-            None => self.committed.load_row(request).await,
+            None => self.base.load_row(request).await,
         }
     }
 }

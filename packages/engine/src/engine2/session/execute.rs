@@ -136,16 +136,16 @@ impl RowRef<'_> {
 
 impl SessionContext {
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
-        let committed_live_state: Arc<dyn crate::engine2::live_state::LiveStateContext> =
-            Arc::new(self.committed_live_state.reader(Arc::clone(&self.backend)));
+        let live_state: Arc<dyn crate::engine2::live_state::LiveStateReader> =
+            Arc::new(self.live_state.reader(Arc::clone(&self.backend)));
         let visible_schemas = self
             .schema_registry
-            .visible_schemas(committed_live_state, self.active_version_id())
+            .visible_schemas(live_state, self.active_version_id())
             .await?;
         let ctx = SessionSqlExecutionContext {
             active_version_id: self.active_version_id(),
             backend: Arc::clone(&self.backend),
-            committed_live_state: Arc::clone(&self.committed_live_state),
+            live_state: Arc::clone(&self.live_state),
             binary_cas: Arc::clone(&self.binary_cas),
             visible_schemas,
             functions: self.functions.clone(),
@@ -159,7 +159,7 @@ impl SessionContext {
             let transaction = Transaction::open(
                 self.active_version_id().to_string(),
                 &self.backend,
-                Arc::clone(&self.committed_live_state),
+                Arc::clone(&self.live_state),
                 Arc::clone(&self.binary_cas),
                 Arc::clone(&self.changelog),
                 Arc::clone(&self.schema_registry),

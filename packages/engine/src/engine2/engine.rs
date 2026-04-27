@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::binary_cas::BinaryCasContext;
 use crate::engine2::changelog::ChangelogContext;
-use crate::engine2::live_state::CommittedLiveStateContext;
+use crate::engine2::live_state::LiveStateContext;
 use crate::engine2::schema_registry::SchemaRegistry;
 use crate::engine2::session::SessionContext;
 use crate::{LixBackend, LixError};
@@ -10,7 +10,7 @@ use crate::{LixBackend, LixError};
 #[derive(Clone)]
 pub struct Engine {
     backend: Arc<dyn LixBackend + Send + Sync>,
-    committed_live_state: Arc<CommittedLiveStateContext>,
+    live_state: Arc<LiveStateContext>,
     binary_cas: Arc<BinaryCasContext>,
     changelog: Arc<ChangelogContext>,
     schema_registry: Arc<SchemaRegistry>,
@@ -32,7 +32,7 @@ impl Engine {
         //
         // let canonical_state = Arc::new(CanonicalStateContext::new(Arc::clone(&backend)));
 
-        let committed_live_state = Arc::new(CommittedLiveStateContext::new());
+        let live_state = Arc::new(LiveStateContext::new());
 
         // let history_state = Arc::new(HistoryStateContext::new(
         //     Arc::clone(&canonical_state),
@@ -47,7 +47,7 @@ impl Engine {
             binary_cas: Arc::new(BinaryCasContext::new()),
             changelog: Arc::new(ChangelogContext::new()),
             backend,
-            committed_live_state,
+            live_state,
             schema_registry: Arc::new(SchemaRegistry::new()),
         })
     }
@@ -63,7 +63,7 @@ impl Engine {
         SessionContext::open(
             active_version_id.into(),
             self.backend(),
-            Arc::clone(&self.committed_live_state),
+            Arc::clone(&self.live_state),
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.changelog),
             Arc::clone(&self.schema_registry),

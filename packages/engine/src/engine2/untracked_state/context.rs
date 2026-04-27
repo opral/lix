@@ -9,6 +9,7 @@ use crate::LixError;
 /// Untracked state is not change-controlled, but it is still durable local
 /// state. It is read alongside tracked live state and can override tracked rows
 /// with the same identity.
+#[derive(Clone, Copy)]
 pub(crate) struct UntrackedStateContext;
 
 impl UntrackedStateContext {

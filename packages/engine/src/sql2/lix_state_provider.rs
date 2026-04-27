@@ -27,7 +27,7 @@ use futures_util::{stream, StreamExt, TryStreamExt};
 
 use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
-    LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
+    LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
 use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
@@ -38,7 +38,7 @@ use super::execute::{SqlWriteIntent, SqlWriteStager};
 pub(crate) async fn register_lix_state_providers(
     session: &SessionContext,
     active_version_id: &str,
-    live_state: Arc<dyn LiveStateContext>,
+    live_state: Arc<dyn LiveStateReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
 ) -> Result<(), LixError> {
     session
@@ -62,7 +62,7 @@ pub(crate) async fn register_lix_state_providers(
 
 pub(crate) struct LixStateProvider {
     schema: SchemaRef,
-    live_state: Arc<dyn LiveStateContext>,
+    live_state: Arc<dyn LiveStateReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
     default_version_id: Option<String>,
 }
@@ -78,7 +78,7 @@ impl std::fmt::Debug for LixStateProvider {
 impl LixStateProvider {
     pub(crate) fn active_version(
         active_version_id: impl Into<String>,
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
     ) -> Self {
         Self {
@@ -90,7 +90,7 @@ impl LixStateProvider {
     }
 
     pub(crate) fn by_version(
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
     ) -> Self {
         Self {
@@ -348,7 +348,7 @@ impl DataSink for LixStateInsertSink {
 }
 
 struct LixStateDeleteExec {
-    live_state: Arc<dyn LiveStateContext>,
+    live_state: Arc<dyn LiveStateReader>,
     write_stager: Arc<dyn SqlWriteStager>,
     table_schema: SchemaRef,
     default_version_id: String,
@@ -366,7 +366,7 @@ impl std::fmt::Debug for LixStateDeleteExec {
 
 impl LixStateDeleteExec {
     fn new(
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         write_stager: Arc<dyn SqlWriteStager>,
         table_schema: SchemaRef,
         default_version_id: String,
@@ -490,7 +490,7 @@ impl ExecutionPlan for LixStateDeleteExec {
 }
 
 struct LixStateUpdateExec {
-    live_state: Arc<dyn LiveStateContext>,
+    live_state: Arc<dyn LiveStateReader>,
     write_stager: Arc<dyn SqlWriteStager>,
     table_schema: SchemaRef,
     default_version_id: String,
@@ -509,7 +509,7 @@ impl std::fmt::Debug for LixStateUpdateExec {
 
 impl LixStateUpdateExec {
     fn new(
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         write_stager: Arc<dyn SqlWriteStager>,
         table_schema: SchemaRef,
         default_version_id: String,
@@ -882,7 +882,7 @@ fn optional_scalar_value(
 }
 
 struct LixStateScanExec {
-    live_state: Arc<dyn LiveStateContext>,
+    live_state: Arc<dyn LiveStateReader>,
     schema: SchemaRef,
     request: LiveStateScanRequest,
     properties: Arc<PlanProperties>,
@@ -896,7 +896,7 @@ impl std::fmt::Debug for LixStateScanExec {
 
 impl LixStateScanExec {
     fn new(
-        live_state: Arc<dyn LiveStateContext>,
+        live_state: Arc<dyn LiveStateReader>,
         schema: SchemaRef,
         request: LiveStateScanRequest,
     ) -> Self {
@@ -1382,7 +1382,7 @@ mod tests {
         LixStateUpdateExec,
     };
     use crate::engine2::live_state::{
-        LiveStateContext, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+        LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
     use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateWriteRow};
     use crate::transaction::{PendingOverlay, PreparedWriteStatementStager, TransactionWriteDelta};
@@ -1412,8 +1412,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
-    struct EmptyLiveStateContext;
-    struct RowsLiveStateContext {
+    struct EmptyLiveStateReader;
+    struct RowsLiveStateReader {
         rows: Vec<LiveStateRow>,
     }
     struct DummyWriteStager;
@@ -1510,7 +1510,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl LiveStateContext for EmptyLiveStateContext {
+    impl LiveStateReader for EmptyLiveStateReader {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
@@ -1527,7 +1527,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl LiveStateContext for RowsLiveStateContext {
+    impl LiveStateReader for RowsLiveStateReader {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
@@ -1752,7 +1752,7 @@ mod tests {
     #[tokio::test]
     async fn registers_active_lix_state_with_write_context_only() {
         let session = SessionContext::new();
-        let live_state = Arc::new(EmptyLiveStateContext) as Arc<dyn LiveStateContext>;
+        let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
         let write_stager = Arc::new(DummyWriteStager) as Arc<dyn SqlWriteStager>;
 
         register_lix_state_providers(
@@ -1788,7 +1788,7 @@ mod tests {
     #[tokio::test]
     async fn insert_into_requires_write_transaction() {
         let session = SessionContext::new();
-        let live_state = Arc::new(EmptyLiveStateContext) as Arc<dyn LiveStateContext>;
+        let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
         let provider = LixStateProvider::active_version("version-a", live_state, None);
         let input = Arc::new(EmptyExec::new(provider.schema())) as Arc<dyn ExecutionPlan>;
 
@@ -1806,7 +1806,7 @@ mod tests {
     #[tokio::test]
     async fn update_requires_write_transaction() {
         let session = SessionContext::new();
-        let live_state = Arc::new(EmptyLiveStateContext) as Arc<dyn LiveStateContext>;
+        let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
         let provider = LixStateProvider::active_version("version-a", live_state, None);
 
         let error = provider
@@ -1827,7 +1827,7 @@ mod tests {
     #[tokio::test]
     async fn delete_requires_write_transaction() {
         let session = SessionContext::new();
-        let live_state = Arc::new(EmptyLiveStateContext) as Arc<dyn LiveStateContext>;
+        let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
         let provider = LixStateProvider::active_version("version-a", live_state, None);
 
         let error = provider
@@ -1844,7 +1844,7 @@ mod tests {
     #[tokio::test]
     async fn delete_returns_lix_state_delete_exec_with_write_stager() {
         let session = SessionContext::new();
-        let live_state = Arc::new(EmptyLiveStateContext) as Arc<dyn LiveStateContext>;
+        let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
         let write_stager = Arc::new(DummyWriteStager) as Arc<dyn SqlWriteStager>;
         let provider =
             LixStateProvider::active_version("version-a", live_state, Some(write_stager));
@@ -1860,7 +1860,7 @@ mod tests {
     #[tokio::test]
     async fn update_rejects_read_only_lix_state_columns() {
         let session = SessionContext::new();
-        let live_state = Arc::new(EmptyLiveStateContext) as Arc<dyn LiveStateContext>;
+        let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
         let write_stager = Arc::new(DummyWriteStager) as Arc<dyn SqlWriteStager>;
         let provider =
             LixStateProvider::active_version("version-a", live_state, Some(write_stager));
@@ -1883,7 +1883,7 @@ mod tests {
     #[tokio::test]
     async fn update_returns_lix_state_update_exec_with_write_stager() {
         let session = SessionContext::new();
-        let live_state = Arc::new(EmptyLiveStateContext) as Arc<dyn LiveStateContext>;
+        let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
         let write_stager = Arc::new(DummyWriteStager) as Arc<dyn SqlWriteStager>;
         let provider =
             LixStateProvider::active_version("version-a", live_state, Some(write_stager));
@@ -1903,7 +1903,7 @@ mod tests {
     #[tokio::test]
     async fn insert_into_returns_data_sink_exec_with_write_stager() {
         let session = SessionContext::new();
-        let live_state = Arc::new(EmptyLiveStateContext) as Arc<dyn LiveStateContext>;
+        let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
         let write_stager = Arc::new(DummyWriteStager) as Arc<dyn SqlWriteStager>;
         let provider =
             LixStateProvider::active_version("version-a", live_state, Some(write_stager));
@@ -2031,7 +2031,7 @@ mod tests {
     #[tokio::test]
     async fn insert_plan_returns_datafusion_count_uint64() {
         let session = SessionContext::new();
-        let live_state = Arc::new(EmptyLiveStateContext) as Arc<dyn LiveStateContext>;
+        let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
         let stager = Arc::new(Mutex::new(CapturingBufferedWriteStager::default()));
         let provider = LixStateProvider::active_version(
             "version-a",
@@ -2070,12 +2070,12 @@ mod tests {
     #[tokio::test]
     async fn update_plan_evaluates_filters_assignments_and_stages_rows() {
         let session = SessionContext::new();
-        let live_state = Arc::new(RowsLiveStateContext {
+        let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
                 live_row("entity-1", Some("{\"source\":\"match\"}")),
                 live_row("entity-2", Some("{\"source\":\"skip\"}")),
             ],
-        }) as Arc<dyn LiveStateContext>;
+        }) as Arc<dyn LiveStateReader>;
         let stager = Arc::new(CapturingWriteStager::default());
         let provider = LixStateProvider::active_version(
             "version-a",
@@ -2141,12 +2141,12 @@ mod tests {
     #[tokio::test]
     async fn delete_plan_with_empty_filters_stages_all_visible_rows() {
         let session = SessionContext::new();
-        let live_state = Arc::new(RowsLiveStateContext {
+        let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
                 live_row("entity-1", Some("{\"source\":\"one\"}")),
                 live_row("entity-2", Some("{\"source\":\"two\"}")),
             ],
-        }) as Arc<dyn LiveStateContext>;
+        }) as Arc<dyn LiveStateReader>;
         let stager = Arc::new(CapturingWriteStager::default());
         let provider = LixStateProvider::active_version(
             "version-a",

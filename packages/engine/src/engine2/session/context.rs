@@ -4,7 +4,7 @@ use serde_json::Value as JsonValue;
 
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::engine2::changelog::ChangelogContext;
-use crate::engine2::live_state::{CommittedLiveStateContext, LiveStateContext};
+use crate::engine2::live_state::{LiveStateContext, LiveStateReader};
 use crate::engine2::schema_registry::SchemaRegistry;
 use crate::functions::{
     DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
@@ -21,7 +21,7 @@ use crate::{LixBackend, LixError};
 pub struct SessionContext {
     pub(super) active_version_id: String,
     pub(super) backend: Arc<dyn LixBackend + Send + Sync>,
-    pub(super) committed_live_state: Arc<CommittedLiveStateContext>,
+    pub(super) live_state: Arc<LiveStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) changelog: Arc<ChangelogContext>,
     pub(super) schema_registry: Arc<SchemaRegistry>,
@@ -32,7 +32,7 @@ impl SessionContext {
     pub(crate) async fn open(
         active_version_id: String,
         backend: Arc<dyn LixBackend + Send + Sync>,
-        committed_live_state: Arc<CommittedLiveStateContext>,
+        live_state: Arc<LiveStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
         schema_registry: Arc<SchemaRegistry>,
@@ -40,7 +40,7 @@ impl SessionContext {
         Ok(Self::new(
             active_version_id,
             backend,
-            committed_live_state,
+            live_state,
             binary_cas,
             changelog,
             schema_registry,
@@ -50,7 +50,7 @@ impl SessionContext {
     pub(crate) fn new(
         active_version_id: String,
         backend: Arc<dyn LixBackend + Send + Sync>,
-        committed_live_state: Arc<CommittedLiveStateContext>,
+        live_state: Arc<LiveStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
         schema_registry: Arc<SchemaRegistry>,
@@ -58,7 +58,7 @@ impl SessionContext {
         Self {
             active_version_id,
             backend,
-            committed_live_state,
+            live_state,
             binary_cas,
             changelog,
             schema_registry,
@@ -84,7 +84,7 @@ impl SessionContext {
 pub(super) struct SessionSqlExecutionContext<'a> {
     pub(super) active_version_id: &'a str,
     pub(super) backend: Arc<dyn LixBackend + Send + Sync>,
-    pub(super) committed_live_state: Arc<CommittedLiveStateContext>,
+    pub(super) live_state: Arc<LiveStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) visible_schemas: Vec<JsonValue>,
     pub(super) functions: DynFunctionProvider,
@@ -95,9 +95,8 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
         self.active_version_id
     }
 
-    fn live_state(&self) -> Arc<dyn LiveStateContext> {
-        Arc::new(self.committed_live_state.reader(Arc::clone(&self.backend)))
-            as Arc<dyn LiveStateContext>
+    fn live_state(&self) -> Arc<dyn LiveStateReader> {
+        Arc::new(self.live_state.reader(Arc::clone(&self.backend))) as Arc<dyn LiveStateReader>
     }
 
     fn functions(&self) -> DynFunctionProvider {
