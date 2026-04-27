@@ -80,7 +80,7 @@ impl From<TrackedStateRow> for LiveStateRow {
             updated_at: row.updated_at,
             global: row.global,
             change_id: Some(row.change_id),
-            commit_id: row.commit_id,
+            commit_id: Some(row.commit_id),
             untracked: false,
             version_id: row.version_id,
         }
@@ -103,6 +103,12 @@ impl TryFrom<&LiveStateRow> for TrackedStateRow {
                 "tracked_state rows require change_id",
             ));
         };
+        let Some(commit_id) = row.commit_id.clone() else {
+            return Err(crate::LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked_state rows require commit_id",
+            ));
+        };
 
         Ok(TrackedStateRow {
             entity_id: row.entity_id.clone(),
@@ -116,7 +122,7 @@ impl TryFrom<&LiveStateRow> for TrackedStateRow {
             updated_at: row.updated_at.clone(),
             global: row.global,
             change_id,
-            commit_id: row.commit_id.clone(),
+            commit_id,
             version_id: row.version_id.clone(),
         })
     }

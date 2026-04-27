@@ -1,6 +1,6 @@
 use crate::backend::{KvScanRange, KvStore, KvWriter};
 use crate::engine2::tracked_state::{
-    TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
+    TrackedStateDeleteRequest, TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
 };
 use crate::{LixError, NullableKeyFilter};
 
@@ -51,6 +51,27 @@ pub(crate) async fn write_rows(
     Ok(())
 }
 
+pub(crate) async fn delete_rows(
+    writer: &mut impl KvWriter,
+    request: &TrackedStateDeleteRequest,
+) -> Result<usize, LixError> {
+    let rows = scan_all_rows(writer).await?;
+    let mut deleted = 0usize;
+    for row in rows {
+        if row_matches_filter(&row, &request.filter) {
+            let identity = TrackedStateRowIdentity::from_row(&row);
+            writer
+                .kv_delete(
+                    TRACKED_STATE_ROW_NAMESPACE,
+                    &encode_tracked_state_row_key(&identity),
+                )
+                .await?;
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
 async fn scan_all_rows(store: &mut impl KvStore) -> Result<Vec<TrackedStateRow>, LixError> {
     store
         .kv_scan(
@@ -65,13 +86,18 @@ async fn scan_all_rows(store: &mut impl KvStore) -> Result<Vec<TrackedStateRow>,
 }
 
 fn row_matches_scan(row: &TrackedStateRow, request: &TrackedStateScanRequest) -> bool {
-    (request.filter.schema_keys.is_empty() || request.filter.schema_keys.contains(&row.schema_key))
-        && (request.filter.entity_ids.is_empty()
-            || request.filter.entity_ids.contains(&row.entity_id))
-        && (request.filter.version_ids.is_empty()
-            || request.filter.version_ids.contains(&row.version_id))
-        && nullable_matches_filters(&row.file_id, &request.filter.file_ids)
-        && nullable_matches_filters(&row.plugin_key, &request.filter.plugin_keys)
+    row_matches_filter(row, &request.filter)
+}
+
+fn row_matches_filter(
+    row: &TrackedStateRow,
+    filter: &crate::engine2::tracked_state::TrackedStateFilter,
+) -> bool {
+    (filter.schema_keys.is_empty() || filter.schema_keys.contains(&row.schema_key))
+        && (filter.entity_ids.is_empty() || filter.entity_ids.contains(&row.entity_id))
+        && (filter.version_ids.is_empty() || filter.version_ids.contains(&row.version_id))
+        && nullable_matches_filters(&row.file_id, &filter.file_ids)
+        && nullable_matches_filters(&row.plugin_key, &filter.plugin_keys)
 }
 
 fn nullable_matches_filters(value: &Option<String>, filters: &[NullableKeyFilter<String>]) -> bool {
@@ -175,7 +201,9 @@ mod tests {
 
     use super::*;
     use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
-    use crate::engine2::tracked_state::{TrackedStateFilter, TrackedStateScanRequest};
+    use crate::engine2::tracked_state::{
+        TrackedStateDeleteRequest, TrackedStateFilter, TrackedStateScanRequest,
+    };
 
     #[test]
     fn row_key_distinguishes_null_and_value_file_id() {
@@ -327,6 +355,88 @@ mod tests {
         assert_eq!(loaded, None);
     }
 
+    #[tokio::test]
+    async fn delete_rows_removes_matching_version_rows() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let version_a_row = tracked_row("schema_a", "version_a", "entity-a", Some("{}"));
+        let version_b_row = tracked_row("schema_a", "version_b", "entity-b", Some("{}"));
+
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        {
+            let mut writer = transaction.as_mut();
+            write_rows(&mut writer, &[version_a_row.clone(), version_b_row.clone()])
+                .await
+                .expect("rows should write");
+            let deleted = delete_rows(
+                &mut writer,
+                &TrackedStateDeleteRequest {
+                    filter: TrackedStateFilter {
+                        version_ids: vec!["version_a".to_string()],
+                        ..Default::default()
+                    },
+                },
+            )
+            .await
+            .expect("delete should succeed");
+            assert_eq!(deleted, 1);
+        }
+        transaction.commit().await.expect("commit should persist");
+
+        let mut store = Arc::clone(&backend);
+        let rows = scan_rows(
+            &mut store,
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    version_ids: vec!["version_a".to_string(), "version_b".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("scan should succeed");
+        assert_eq!(rows, vec![version_b_row]);
+    }
+
+    #[tokio::test]
+    async fn writer_delete_rows_routes_to_storage() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let context = crate::engine2::tracked_state::TrackedStateContext::new();
+        let row = tracked_row("schema_a", "version_a", "entity-a", Some("{}"));
+
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        {
+            let mut writer = context.writer(transaction.as_mut());
+            writer
+                .write_rows(std::slice::from_ref(&row))
+                .await
+                .expect("row should write");
+            let deleted = writer
+                .delete_rows(&TrackedStateDeleteRequest {
+                    filter: TrackedStateFilter {
+                        version_ids: vec!["version_a".to_string()],
+                        ..Default::default()
+                    },
+                })
+                .await
+                .expect("delete should succeed");
+            assert_eq!(deleted, 1);
+        }
+        transaction.commit().await.expect("commit should persist");
+
+        let mut store = Arc::clone(&backend);
+        let rows = scan_rows(&mut store, &TrackedStateScanRequest::default())
+            .await
+            .expect("scan should succeed");
+        assert!(rows.is_empty());
+    }
+
     fn tracked_row(
         schema_key: &str,
         version_id: &str,
@@ -345,7 +455,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             global: version_id == "global",
             change_id: format!("change-{version_id}-{entity_id}"),
-            commit_id: Some(format!("commit-{version_id}")),
+            commit_id: format!("commit-{version_id}"),
             version_id: version_id.to_string(),
         }
     }

@@ -84,7 +84,6 @@ impl<'a> Transaction<'a> {
             &self.live_state,
             self.backend_transaction.as_mut(),
             staged_writes,
-            self.functions.clone(),
         )
         .await?;
         self.backend_transaction.commit().await?;

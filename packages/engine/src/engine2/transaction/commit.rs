@@ -5,7 +5,6 @@ use crate::engine2::changelog::{CanonicalChange, ChangelogContext};
 use crate::engine2::live_state::{LiveStateContext, LiveStateRow, LiveStateRowRequest};
 use crate::engine2::transaction::staging::StagedWriteSet;
 use crate::engine2::transaction::types::{StagedCommitMembers, StagedStateRow};
-use crate::functions::{DynFunctionProvider, LixFunctionProvider};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError};
 
@@ -24,7 +23,6 @@ pub(crate) async fn commit_staged_writes(
     live_state: &LiveStateContext,
     transaction: &mut dyn LixBackendTransaction,
     staged_writes: StagedWriteSet,
-    functions: DynFunctionProvider,
 ) -> Result<(), LixError> {
     if !staged_writes.file_data_writes.is_empty() {
         let blob_writes = staged_writes
@@ -50,7 +48,6 @@ pub(crate) async fn commit_staged_writes(
         staged_writes.commit_members_by_version,
         live_state,
         transaction,
-        functions,
     )
     .await?;
     changelog_rows.extend(finalized.commit_rows);
@@ -133,9 +130,7 @@ async fn finalize_commit_rows(
     commit_members_by_version: BTreeMap<String, StagedCommitMembers>,
     live_state: &LiveStateContext,
     transaction: &mut dyn LixBackendTransaction,
-    functions: DynFunctionProvider,
 ) -> Result<FinalizedCommitRows, LixError> {
-    let mut functions = functions.clone();
     let mut commit_rows = Vec::new();
     let mut version_ref_rows = Vec::new();
 
@@ -144,9 +139,9 @@ async fn finalize_commit_rows(
             continue;
         }
 
-        let commit_id = functions.uuid_v7();
-        let commit_change_id = functions.uuid_v7();
-        let timestamp = functions.timestamp();
+        let commit_id = members.commit_id;
+        let commit_change_id = members.commit_change_id;
+        let timestamp = members.created_at;
         let change_ids = members.change_ids.into_iter().collect::<Vec<_>>();
         let parent_commit_ids = load_version_ref_head(live_state, transaction, &version_id)
             .await?
@@ -276,7 +271,6 @@ mod tests {
     use crate::engine2::untracked_state::{
         UntrackedStateContext, UntrackedStateRow, UntrackedStateRowRequest,
     };
-    use crate::functions::SharedFunctionProvider;
     use crate::NullableKeyFilter;
 
     #[tokio::test]
@@ -303,7 +297,6 @@ mod tests {
                 )]),
                 file_data_writes: Vec::new(),
             },
-            test_functions(),
         )
         .await
         .expect("commit should flush staged rows");
@@ -380,7 +373,6 @@ mod tests {
                 commit_members_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
-            test_functions(),
         )
         .await
         .expect("commit should flush untracked row");
@@ -458,7 +450,6 @@ mod tests {
                 )]),
                 file_data_writes: Vec::new(),
             },
-            test_functions(),
         )
         .await
         .expect("tracked commit should flush");
@@ -502,7 +493,6 @@ mod tests {
             )]),
             &live_state,
             transaction.as_mut(),
-            test_functions(),
         )
         .await
         .expect("global commit row should finalize");
@@ -575,7 +565,6 @@ mod tests {
             )]),
             &live_state,
             transaction.as_mut(),
-            test_functions(),
         )
         .await
         .expect("empty members should be ignored");
@@ -598,7 +587,6 @@ mod tests {
             BTreeMap::from([("version-a".to_string(), members(["change-a"]))]),
             &live_state,
             transaction.as_mut(),
-            test_functions(),
         )
         .await
         .expect("active-version commit finalization should resolve parent");
@@ -658,7 +646,11 @@ mod tests {
     }
 
     fn members<const N: usize>(change_ids: [&str; N]) -> StagedCommitMembers {
-        let mut members = StagedCommitMembers::default();
+        let mut members = StagedCommitMembers::new(
+            "test-uuid-1".to_string(),
+            "test-uuid-2".to_string(),
+            "test-timestamp-1".to_string(),
+        );
         for change_id in change_ids {
             members.add_change_id(change_id.to_string());
         }
@@ -693,30 +685,6 @@ mod tests {
             .expect("seed transaction should persist");
     }
 
-    fn test_functions() -> DynFunctionProvider {
-        SharedFunctionProvider::new(
-            Box::new(TestFunctionProvider::default()) as Box<dyn LixFunctionProvider + Send>
-        )
-    }
-
-    #[derive(Default)]
-    struct TestFunctionProvider {
-        uuid_count: usize,
-        timestamp_count: usize,
-    }
-
-    impl LixFunctionProvider for TestFunctionProvider {
-        fn uuid_v7(&mut self) -> String {
-            self.uuid_count += 1;
-            format!("test-uuid-{}", self.uuid_count)
-        }
-
-        fn timestamp(&mut self) -> String {
-            self.timestamp_count += 1;
-            format!("test-timestamp-{}", self.timestamp_count)
-        }
-    }
-
     fn tracked_global_row(change_id: &str) -> StagedStateRow {
         StagedStateRow {
             entity_id: "entity-1".to_string(),
@@ -730,7 +698,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             global: true,
             change_id: Some(change_id.to_string()),
-            commit_id: None,
+            commit_id: Some("test-uuid-1".to_string()),
             untracked: false,
             version_id: GLOBAL_VERSION_ID.to_string(),
         }
@@ -740,6 +708,7 @@ mod tests {
         StagedStateRow {
             snapshot_content: Some("{\"value\":\"untracked\"}".to_string()),
             change_id: None,
+            commit_id: None,
             untracked: true,
             ..tracked_global_row(change_id)
         }

@@ -92,10 +92,22 @@ impl From<StagedStateRow> for UntrackedStateRow {
 /// to the future commit for a version.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct StagedCommitMembers {
+    pub(crate) commit_id: String,
+    pub(crate) commit_change_id: String,
+    pub(crate) created_at: String,
     pub(crate) change_ids: BTreeSet<String>,
 }
 
 impl StagedCommitMembers {
+    pub(crate) fn new(commit_id: String, commit_change_id: String, created_at: String) -> Self {
+        Self {
+            commit_id,
+            commit_change_id,
+            created_at,
+            change_ids: BTreeSet::new(),
+        }
+    }
+
     pub(crate) fn add_change_id(&mut self, change_id: String) {
         self.change_ids.insert(change_id);
     }
