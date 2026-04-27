@@ -1,10 +1,14 @@
 use serde_json::json;
+use std::sync::Arc;
 
-use crate::engine2::changelog::CanonicalChange;
-use crate::engine2::functions::FunctionProviderHandle;
+use crate::engine2::changelog::{CanonicalChange, ChangelogContext};
+use crate::engine2::functions::{
+    FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
+};
+use crate::engine2::live_state::{LiveStateContext, LiveStateRow};
 use crate::engine2::untracked_state::UntrackedStateRow;
 use crate::version::GLOBAL_VERSION_ID;
-use crate::LixError;
+use crate::{LixBackend, LixError, TransactionBeginMode};
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const KEY_VALUE_SCHEMA_VERSION: &str = "1";
@@ -29,11 +33,11 @@ pub(crate) struct InitSeedPlan {
 
 /// Values generated while planning the initial repository seed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InitReceipt {
-    pub(crate) lix_id: String,
-    pub(crate) global_version_id: String,
-    pub(crate) main_version_id: String,
-    pub(crate) initial_commit_id: String,
+pub struct InitReceipt {
+    pub lix_id: String,
+    pub global_version_id: String,
+    pub main_version_id: String,
+    pub initial_commit_id: String,
 }
 
 /// Builds the canonical bootstrap changes for a new engine2 repository.
@@ -118,6 +122,70 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
             initial_commit_id,
         },
     })
+}
+
+/// Initializes an empty engine2 repository in one backend transaction.
+///
+/// The pure seed planner decides which bootstrap facts exist. This function is
+/// only responsible for durably writing those facts to their owning stores:
+/// changelog for tracked changes, and live_state for the serving projection plus
+/// untracked moving refs.
+pub(crate) async fn initialize(
+    backend: Arc<dyn LixBackend + Send + Sync>,
+    changelog: &ChangelogContext,
+    live_state: &LiveStateContext,
+) -> Result<InitReceipt, LixError> {
+    let functions = SharedFunctionProvider::new(
+        Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>
+    );
+    let plan = plan_init_seed(functions)?;
+    let receipt = plan.receipt.clone();
+
+    let mut transaction = backend
+        .begin_transaction(TransactionBeginMode::Write)
+        .await?;
+
+    {
+        let mut writer = changelog.writer(transaction.as_mut());
+        writer.append_changes(&plan.changes).await?;
+    }
+
+    let mut live_rows = plan
+        .changes
+        .iter()
+        .map(|change| live_state_row_from_initial_change(change, &receipt.initial_commit_id))
+        .collect::<Vec<_>>();
+    live_rows.extend(plan.untracked_rows.into_iter().map(LiveStateRow::from));
+
+    {
+        let mut writer = live_state.writer(transaction.as_mut());
+        writer.write_rows(&live_rows).await?;
+    }
+
+    transaction.commit().await?;
+    Ok(receipt)
+}
+
+fn live_state_row_from_initial_change(
+    change: &CanonicalChange,
+    initial_commit_id: &str,
+) -> LiveStateRow {
+    LiveStateRow {
+        entity_id: change.entity_id.clone(),
+        schema_key: change.schema_key.clone(),
+        file_id: change.file_id.clone(),
+        plugin_key: change.plugin_key.clone(),
+        snapshot_content: change.snapshot_content.clone(),
+        metadata: change.metadata.clone(),
+        schema_version: change.schema_version.clone(),
+        created_at: change.created_at.clone(),
+        updated_at: change.created_at.clone(),
+        global: true,
+        change_id: Some(change.id.clone()),
+        commit_id: Some(initial_commit_id.to_string()),
+        untracked: false,
+        version_id: GLOBAL_VERSION_ID.to_string(),
+    }
 }
 
 fn untracked_row(
