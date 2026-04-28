@@ -1,4 +1,6 @@
 use crate::backend::{KvStore, KvWriter};
+use crate::engine2::commit_graph::CommitGraphContext;
+use crate::engine2::tracked_state::rebuild::TrackedStateRebuildReport;
 use crate::engine2::tracked_state::{
     TrackedStateDeleteRequest, TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
 };
@@ -29,6 +31,34 @@ impl TrackedStateContext {
         S: KvWriter,
     {
         TrackedStateWriter { store }
+    }
+
+    /// Rebuilds one version's tracked projection from a commit graph head.
+    ///
+    /// The commit graph determines the effective canonical entities at the
+    /// requested head. Tracked state owns replacing its serving projection with
+    /// those entities.
+    pub(crate) async fn rebuild_version_state<R, W>(
+        &self,
+        commit_graph: &CommitGraphContext,
+        read_store: R,
+        write_store: W,
+        version_id: &str,
+        head_commit_id: &str,
+    ) -> Result<TrackedStateRebuildReport, LixError>
+    where
+        R: KvStore,
+        W: KvWriter,
+    {
+        crate::engine2::tracked_state::rebuild::rebuild_version_state(
+            self,
+            commit_graph,
+            read_store,
+            write_store,
+            version_id,
+            head_commit_id,
+        )
+        .await
     }
 }
 

@@ -7,12 +7,16 @@ use crate::engine2::live_state::LiveStateContext;
 use crate::engine2::live_state::LiveStateRowRequest;
 use crate::engine2::schema_registry::SchemaRegistry;
 use crate::engine2::session::SessionContext;
+use crate::engine2::tracked_state::TrackedStateContext;
+use crate::engine2::untracked_state::UntrackedStateContext;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, NullableKeyFilter};
 
 #[derive(Clone)]
 pub struct Engine {
     backend: Arc<dyn LixBackend + Send + Sync>,
+    tracked_state: Arc<TrackedStateContext>,
+    untracked_state: Arc<UntrackedStateContext>,
     live_state: Arc<LiveStateContext>,
     binary_cas: Arc<BinaryCasContext>,
     changelog: Arc<ChangelogContext>,
@@ -30,7 +34,9 @@ impl Engine {
     ) -> Result<InitReceipt, LixError> {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::from(backend);
         let changelog = ChangelogContext::new();
-        let live_state = LiveStateContext::new();
+        let tracked_state = TrackedStateContext::new();
+        let untracked_state = UntrackedStateContext::new();
+        let live_state = LiveStateContext::new(tracked_state, untracked_state);
 
         crate::engine2::init::initialize(backend, &changelog, &live_state).await
     }
@@ -46,7 +52,9 @@ impl Engine {
         //
         // let canonical_state = Arc::new(CanonicalStateContext::new(Arc::clone(&backend)));
 
-        let live_state = Arc::new(LiveStateContext::new());
+        let tracked_state = Arc::new(TrackedStateContext::new());
+        let untracked_state = Arc::new(UntrackedStateContext::new());
+        let live_state = Arc::new(LiveStateContext::new(*tracked_state, *untracked_state));
         assert_initialized(Arc::clone(&backend), live_state.as_ref()).await?;
 
         // let history_state = Arc::new(HistoryStateContext::new(
@@ -62,6 +70,8 @@ impl Engine {
             binary_cas: Arc::new(BinaryCasContext::new()),
             changelog: Arc::new(ChangelogContext::new()),
             backend,
+            tracked_state,
+            untracked_state,
             live_state,
             schema_registry: Arc::new(SchemaRegistry::new()),
         })
@@ -69,6 +79,10 @@ impl Engine {
 
     pub(crate) fn backend(&self) -> Arc<dyn LixBackend + Send + Sync> {
         Arc::clone(&self.backend)
+    }
+
+    pub(crate) fn tracked_state(&self) -> Arc<TrackedStateContext> {
+        Arc::clone(&self.tracked_state)
     }
 
     pub async fn open_session(

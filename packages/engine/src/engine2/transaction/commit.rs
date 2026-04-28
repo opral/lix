@@ -278,7 +278,10 @@ mod tests {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await
@@ -356,7 +359,10 @@ mod tests {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
         let untracked_state = UntrackedStateContext::new();
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -415,7 +421,10 @@ mod tests {
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
         let untracked_state = UntrackedStateContext::new();
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
 
         let mut seed_transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -479,7 +488,10 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_parents_global_commit_to_existing_version_ref() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
         seed_version_ref(&backend, &live_state, GLOBAL_VERSION_ID, "initial-commit").await;
 
         let mut transaction = backend
@@ -553,7 +565,10 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_skips_empty_members() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await
@@ -576,7 +591,10 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_uses_existing_version_ref_as_parent() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
         seed_version_ref(&backend, &live_state, "version-a", "previous-commit").await;
 
         let mut transaction = backend

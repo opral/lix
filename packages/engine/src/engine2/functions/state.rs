@@ -183,7 +183,10 @@ mod tests {
     #[tokio::test]
     async fn missing_mode_is_disabled() {
         let backend = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
         let reader = live_state.reader(Arc::clone(&backend));
 
         let mode = load_mode(&reader)
@@ -196,7 +199,10 @@ mod tests {
     #[tokio::test]
     async fn valid_mode_decodes_flags() {
         let backend = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
         write_test_key_value(
             Arc::clone(&backend),
             &live_state,
@@ -223,7 +229,10 @@ mod tests {
     #[tokio::test]
     async fn missing_sequence_is_uninitialized() {
         let backend = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
         let reader = live_state.reader(Arc::clone(&backend));
 
         let sequence = load_sequence(&reader)
@@ -236,7 +245,10 @@ mod tests {
     #[tokio::test]
     async fn valid_sequence_decodes_highest_seen() {
         let backend = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
         write_test_key_value(
             Arc::clone(&backend),
             &live_state,
@@ -257,7 +269,10 @@ mod tests {
     #[tokio::test]
     async fn write_sequence_persists_untracked_global_key_value() {
         let backend = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
         let mut tx = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await

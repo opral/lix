@@ -270,6 +270,9 @@ fn observe_change(
 ) {
     let identity = CanonicalEntityIdentity::from_change(&change);
     if let Some(accumulator) = entities.get_mut(&identity) {
+        // TODO: represent unresolved parent-parent merge conflicts instead of
+        // collapsing them through deterministic traversal order. A head commit
+        // change for the same identity should remain the explicit resolution.
         accumulator.entity.created_at = change.created_at.clone();
         return;
     }
@@ -750,6 +753,213 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn entities_at_head_change_overrides_both_merge_parents() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let changelog = ChangelogContext::new();
+        append_changes(
+            Arc::clone(&backend),
+            &changelog,
+            &[
+                entity_change(
+                    "change-left",
+                    "entity-1",
+                    "test_schema",
+                    "{\"value\":\"left\"}",
+                ),
+                entity_change(
+                    "change-right",
+                    "entity-1",
+                    "test_schema",
+                    "{\"value\":\"right\"}",
+                ),
+                entity_change(
+                    "change-resolved",
+                    "entity-1",
+                    "test_schema",
+                    "{\"value\":\"resolved\"}",
+                ),
+                commit_change("commit-left-change", "commit-left", &["change-left"], &[]),
+                commit_change(
+                    "commit-right-change",
+                    "commit-right",
+                    &["change-right"],
+                    &[],
+                ),
+                commit_change(
+                    "commit-head-change",
+                    "commit-head",
+                    &["change-resolved"],
+                    &["commit-left", "commit-right"],
+                ),
+            ],
+        )
+        .await;
+
+        let graph = CommitGraphContext::new(changelog);
+        let mut reader = graph.reader(backend);
+        let entities = reader
+            .entities_at("commit-head")
+            .await
+            .expect("entities should resolve");
+
+        assert_eq!(
+            entity_ids_for_schema(&entities, "test_schema"),
+            vec![("change-resolved".to_string(), "commit-head".to_string(), 0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn entities_at_distinguishes_same_entity_with_different_file_id() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let changelog = ChangelogContext::new();
+        append_changes(
+            Arc::clone(&backend),
+            &changelog,
+            &[
+                entity_change_with_file_and_plugin(
+                    "change-file-a",
+                    "entity-1",
+                    "test_schema",
+                    Some("file-a"),
+                    None,
+                    "{\"value\":\"file-a\"}",
+                ),
+                entity_change_with_file_and_plugin(
+                    "change-file-b",
+                    "entity-1",
+                    "test_schema",
+                    Some("file-b"),
+                    None,
+                    "{\"value\":\"file-b\"}",
+                ),
+                commit_change(
+                    "commit-head-change",
+                    "commit-head",
+                    &["change-file-a", "change-file-b"],
+                    &[],
+                ),
+            ],
+        )
+        .await;
+
+        let graph = CommitGraphContext::new(changelog);
+        let mut reader = graph.reader(backend);
+        let entities = reader
+            .entities_at("commit-head")
+            .await
+            .expect("entities should resolve");
+
+        assert_eq!(
+            entity_ids_for_schema(&entities, "test_schema"),
+            vec![
+                ("change-file-b".to_string(), "commit-head".to_string(), 0),
+                ("change-file-a".to_string(), "commit-head".to_string(), 0),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn entities_at_does_not_distinguish_same_entity_with_different_plugin_key() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let changelog = ChangelogContext::new();
+        append_changes(
+            Arc::clone(&backend),
+            &changelog,
+            &[
+                entity_change_with_file_and_plugin(
+                    "change-plugin-a",
+                    "entity-1",
+                    "test_schema",
+                    None,
+                    Some("plugin-a"),
+                    "{\"value\":\"plugin-a\"}",
+                ),
+                entity_change_with_file_and_plugin(
+                    "change-plugin-b",
+                    "entity-1",
+                    "test_schema",
+                    None,
+                    Some("plugin-b"),
+                    "{\"value\":\"plugin-b\"}",
+                ),
+                commit_change(
+                    "commit-head-change",
+                    "commit-head",
+                    &["change-plugin-a", "change-plugin-b"],
+                    &[],
+                ),
+            ],
+        )
+        .await;
+
+        let graph = CommitGraphContext::new(changelog);
+        let mut reader = graph.reader(backend);
+        let entities = reader
+            .entities_at("commit-head")
+            .await
+            .expect("entities should resolve");
+        let entity = entities
+            .iter()
+            .find(|entity| entity.change.schema_key == "test_schema")
+            .expect("plugin-key entity should resolve");
+
+        assert_eq!(
+            entity_ids_for_schema(&entities, "test_schema"),
+            vec![("change-plugin-b".to_string(), "commit-head".to_string(), 0)]
+        );
+        assert_eq!(entity.change.plugin_key.as_deref(), Some("plugin-b"));
+    }
+
+    #[tokio::test]
+    async fn entities_at_head_tombstone_hides_parent_entity() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let changelog = ChangelogContext::new();
+        append_changes(
+            Arc::clone(&backend),
+            &changelog,
+            &[
+                entity_change(
+                    "change-created",
+                    "entity-1",
+                    "test_schema",
+                    "{\"value\":\"created\"}",
+                ),
+                entity_tombstone("change-deleted", "entity-1", "test_schema"),
+                commit_change(
+                    "commit-root-change",
+                    "commit-root",
+                    &["change-created"],
+                    &[],
+                ),
+                commit_change(
+                    "commit-head-change",
+                    "commit-head",
+                    &["change-deleted"],
+                    &["commit-root"],
+                ),
+            ],
+        )
+        .await;
+
+        let graph = CommitGraphContext::new(changelog);
+        let mut reader = graph.reader(backend);
+        let entities = reader
+            .entities_at("commit-head")
+            .await
+            .expect("entities should resolve");
+        let entity = entities
+            .iter()
+            .find(|entity| entity.change.schema_key == "test_schema")
+            .expect("tombstone entity should resolve");
+
+        assert_eq!(
+            entity_ids_for_schema(&entities, "test_schema"),
+            vec![("change-deleted".to_string(), "commit-head".to_string(), 0)]
+        );
+        assert_eq!(entity.change.snapshot_content, None);
+    }
+
+    #[tokio::test]
     async fn entities_at_includes_reachable_commit_rows() {
         let backend = Arc::new(UnitTestBackend::new());
         let changelog = ChangelogContext::new();
@@ -889,6 +1099,41 @@ mod tests {
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             created_at: created_at.to_string(),
+        }
+    }
+
+    fn entity_change_with_file_and_plugin(
+        change_id: &str,
+        entity_id: &str,
+        schema_key: &str,
+        file_id: Option<&str>,
+        plugin_key: Option<&str>,
+        snapshot_content: &str,
+    ) -> CanonicalChange {
+        CanonicalChange {
+            id: change_id.to_string(),
+            entity_id: entity_id.to_string(),
+            schema_key: schema_key.to_string(),
+            schema_version: "1".to_string(),
+            file_id: file_id.map(str::to_string),
+            plugin_key: plugin_key.map(str::to_string),
+            snapshot_content: Some(snapshot_content.to_string()),
+            metadata: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn entity_tombstone(change_id: &str, entity_id: &str, schema_key: &str) -> CanonicalChange {
+        CanonicalChange {
+            id: change_id.to_string(),
+            entity_id: entity_id.to_string(),
+            schema_key: schema_key.to_string(),
+            schema_version: "1".to_string(),
+            file_id: None,
+            plugin_key: None,
+            snapshot_content: None,
+            metadata: None,
+            created_at: "2026-01-02T00:00:00Z".to_string(),
         }
     }
 
