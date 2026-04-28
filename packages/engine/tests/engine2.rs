@@ -230,8 +230,9 @@ simulation_test2!(
                 .await
                 .expect("uuid after deterministic write should continue"),
             // The tracked write consumes deterministic values for the
-            // SQL-provided entity id, row metadata, and commit metadata.
-            "01920000-0000-7000-8000-000000000009",
+            // SQL-provided entity id, row metadata, commit metadata, and the
+            // derived change-set id.
+            "01920000-0000-7000-8000-00000000000a",
         );
     }
 );

@@ -2,6 +2,7 @@ mod context;
 mod overlay;
 mod reader;
 mod types;
+mod visibility;
 
 #[allow(unused_imports)]
 pub(crate) use context::{LiveStateContext, LiveStateStoreReader, LiveStateWriter};

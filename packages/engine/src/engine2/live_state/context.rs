@@ -2,8 +2,10 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::backend::{KvStore, KvWriter};
-use crate::engine2::live_state::LiveStateRow;
-use crate::engine2::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
+use crate::engine2::live_state::visibility;
+use crate::engine2::live_state::{
+    LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+};
 use crate::engine2::tracked_state::{
     TrackedStateContext, TrackedStateFilter, TrackedStateProjection, TrackedStateRow,
     TrackedStateRowRequest, TrackedStateScanRequest,
@@ -111,6 +113,11 @@ where
             tracked_rows,
             untracked_rows,
         );
+        rows = visibility::resolve_scan_rows(
+            rows,
+            &request.filter.version_ids,
+            request.filter.include_tombstones,
+        );
         if let Some(limit) = request.limit {
             rows.truncate(limit);
         }
@@ -135,7 +142,11 @@ where
                         ))
                         .await?
                     {
-                        return Ok(Some(LiveStateRow::from(row)));
+                        return Ok(Some(visibility::project_loaded_row(
+                            LiveStateRow::from(row),
+                            &request.version_id,
+                            &candidate.version_id,
+                        )));
                     }
                 }
                 LiveStateLookupSource::Tracked => {
@@ -149,7 +160,11 @@ where
                         ))
                         .await?
                     {
-                        return Ok(Some(LiveStateRow::from(row)));
+                        return Ok(Some(visibility::project_loaded_row(
+                            LiveStateRow::from(row),
+                            &request.version_id,
+                            &candidate.version_id,
+                        )));
                     }
                 }
             }
@@ -245,15 +260,17 @@ fn tracked_scan_request_from_live(request: &LiveStateScanRequest) -> TrackedStat
         filter: TrackedStateFilter {
             schema_keys: request.filter.schema_keys.clone(),
             entity_ids: request.filter.entity_ids.clone(),
-            version_ids: request.filter.version_ids.clone(),
+            version_ids: visibility::expanded_version_ids(&request.filter.version_ids),
             file_ids: request.filter.file_ids.clone(),
             plugin_keys: request.filter.plugin_keys.clone(),
-            include_tombstones: request.filter.include_tombstones,
+            // Scan tombstones internally so version-local tombstones can hide
+            // global fallback rows before the serving facade filters them.
+            include_tombstones: true,
         },
         projection: TrackedStateProjection {
             columns: request.projection.columns.clone(),
         },
-        limit: request.limit,
+        limit: None,
     }
 }
 
@@ -488,7 +505,8 @@ mod tests {
             .expect("load should succeed")
             .expect("global row should be visible for requested version");
 
-        assert_eq!(loaded.version_id, "global");
+        assert_eq!(loaded.version_id, "version-a");
+        assert!(loaded.global);
         assert!(!loaded.untracked);
         assert_eq!(
             loaded.snapshot_content.as_deref(),
@@ -606,6 +624,38 @@ mod tests {
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"value\":\"version-tracked\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_rows_projects_global_row_into_requested_version() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
+
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        live_state
+            .writer(transaction.as_mut())
+            .write_rows(&[tracked_row("global-tracked", Some("change-global"))])
+            .await
+            .expect("rows should write");
+        transaction.commit().await.expect("commit should persist");
+
+        let rows = scan_selected_tab_at(&live_state, Arc::clone(&backend), "version-a", false)
+            .await
+            .expect("scan should succeed");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].version_id, "version-a");
+        assert!(rows[0].global);
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some("{\"value\":\"global-tracked\"}")
         );
     }
 

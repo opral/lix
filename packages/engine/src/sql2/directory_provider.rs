@@ -34,6 +34,7 @@ use crate::engine2::live_state::{
 use crate::history::{
     StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRow,
 };
+use crate::sql2::version_scope::resolve_provider_version_ids;
 use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
@@ -227,7 +228,14 @@ impl TableProvider for LixDirectoryProvider {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let projected_schema = projected_schema(&self.schema, projection)?;
-        let request = lix_directory_scan_request(self.default_version_id.as_deref(), limit);
+        let mut request = lix_directory_scan_request(self.default_version_id.as_deref(), limit);
+        request.filter.version_ids = resolve_provider_version_ids(
+            Arc::clone(&self.live_state),
+            self.default_version_id.as_deref(),
+            request.filter.version_ids,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
         Ok(Arc::new(LixDirectoryScanExec::new(
             Arc::clone(&self.live_state),
             projected_schema,

@@ -84,6 +84,79 @@ simulation_test2!(lix_state_delete_hides_row, |sim| async move {
     assert_eq!(rows.len(), 0);
 });
 
+simulation_test2!(
+    lix_state_global_rows_are_visible_through_version_overlay,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim
+            .open_main_session(&engine)
+            .await
+            .expect("main session should open");
+
+        session
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version, global, untracked\
+                 ) VALUES (\
+                 'state-global-overlay', 'lix_key_value', NULL, NULL, lix_json('{\"key\":\"state-global-overlay\",\"value\":\"global\"}'), '1', true, false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("global lix_state insert should succeed");
+
+        let active_result = session
+            .execute(
+                "SELECT entity_id, global, untracked \
+                 FROM lix_state \
+                 WHERE entity_id = 'state-global-overlay' AND schema_key = 'lix_key_value'",
+                &[],
+            )
+            .await
+            .expect("active lix_state read should succeed");
+        assert_rows_eq(
+            active_result,
+            vec![vec![
+                Value::Text("state-global-overlay".to_string()),
+                Value::Boolean(true),
+                Value::Boolean(false),
+            ]],
+        );
+
+        let by_version_result = session
+            .execute(
+                &format!(
+                    "SELECT entity_id, version_id, global, untracked \
+                 FROM lix_state_by_version \
+                 WHERE entity_id = 'state-global-overlay' AND schema_key = 'lix_key_value' \
+                 AND version_id IN ('{}', 'global') \
+                 ORDER BY version_id",
+                    sim.main_version_id()
+                ),
+                &[],
+            )
+            .await
+            .expect("by-version lix_state read should succeed");
+        assert_rows_eq(
+            by_version_result,
+            vec![
+                vec![
+                    Value::Text("state-global-overlay".to_string()),
+                    Value::Text(sim.main_version_id().to_string()),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                ],
+                vec![
+                    Value::Text("state-global-overlay".to_string()),
+                    Value::Text("global".to_string()),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                ],
+            ],
+        );
+    }
+);
+
 fn assert_single_text(result: ExecuteResult, expected: &str) {
     let ExecuteResult::Rows(row_set) = result else {
         panic!("SELECT should return rows");
@@ -93,4 +166,16 @@ fn assert_single_text(result: ExecuteResult, expected: &str) {
         row_set.rows()[0].values(),
         &[Value::Text(expected.to_string())]
     );
+}
+
+fn assert_rows_eq(result: ExecuteResult, expected: Vec<Vec<Value>>) {
+    let ExecuteResult::Rows(row_set) = result else {
+        panic!("SELECT should return rows");
+    };
+    let rows = row_set
+        .rows()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(rows, expected);
 }

@@ -177,3 +177,121 @@ fn version_ref_row(
         version_id: GLOBAL_VERSION_ID.to_string(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest};
+    use crate::engine2::tracked_state::TrackedStateContext;
+    use crate::engine2::untracked_state::UntrackedStateContext;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn load_head_returns_none_when_missing() {
+        let backend = UnitTestBackend::new();
+        let version_ref = test_version_ref();
+
+        let head = version_ref
+            .reader(&backend)
+            .load_head("missing-version")
+            .await
+            .expect("missing version ref should load cleanly");
+
+        assert_eq!(head, None);
+    }
+
+    #[tokio::test]
+    async fn advance_head_writes_untracked_global_ref() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let live_state = Arc::new(test_live_state());
+        let version_ref = VersionRefContext::new(Arc::clone(&live_state));
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+
+        version_ref
+            .writer(transaction.as_mut())
+            .advance_head("version-a", "commit-a", "2026-01-01T00:00:00Z")
+            .await
+            .expect("version head should advance");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let head = version_ref
+            .reader(Arc::clone(&backend))
+            .load_head("version-a")
+            .await
+            .expect("version head should load")
+            .expect("version head should exist");
+        assert_eq!(head.version_id, "version-a");
+        assert_eq!(head.commit_id, "commit-a");
+
+        let row = live_state
+            .reader(backend)
+            .load_row(&LiveStateRowRequest {
+                schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
+                version_id: GLOBAL_VERSION_ID.to_string(),
+                entity_id: "version-a".to_string(),
+                file_id: NullableKeyFilter::Null,
+            })
+            .await
+            .expect("version-ref row should load")
+            .expect("version-ref row should exist");
+        assert!(row.global);
+        assert!(row.untracked);
+        assert_eq!(row.change_id, None);
+        assert_eq!(row.commit_id, None);
+        assert_eq!(row.created_at, "2026-01-01T00:00:00Z");
+        assert_eq!(row.updated_at, "2026-01-01T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn malformed_snapshot_errors_clearly() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let live_state = Arc::new(test_live_state());
+        let version_ref = VersionRefContext::new(Arc::clone(&live_state));
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        let mut row = version_ref_row("version-b", "commit-b", "2026-01-01T00:00:00Z")
+            .expect("version-ref row should plan");
+        row.snapshot_content = Some("{not-json".to_string());
+        live_state
+            .writer(transaction.as_mut())
+            .write_rows(&[row])
+            .await
+            .expect("malformed row should write for test setup");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let error = version_ref
+            .reader(backend)
+            .load_head("version-b")
+            .await
+            .expect_err("malformed snapshot should error");
+
+        assert!(
+            error
+                .description
+                .contains("engine2 version-ref snapshot parse failed"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    fn test_version_ref() -> VersionRefContext {
+        VersionRefContext::new(Arc::new(test_live_state()))
+    }
+
+    fn test_live_state() -> LiveStateContext {
+        LiveStateContext::new(TrackedStateContext::new(), UntrackedStateContext::new())
+    }
+}
