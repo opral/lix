@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::binary_cas::BlobDataReader;
+use crate::engine2::changelog::ChangelogReader;
 use crate::engine2::functions::FunctionProviderHandle;
 use crate::engine2::live_state::LiveStateReader;
 use crate::history::{StateHistoryRequest, StateHistoryRow};
@@ -22,6 +23,7 @@ use crate::transaction::{
 };
 use crate::{LixError, QueryResult, Value};
 
+use super::change_provider::register_lix_change_provider;
 use super::directory_provider::register_lix_directory_providers;
 use super::entity_provider::register_entity_providers;
 use super::file_provider::register_lix_file_providers;
@@ -29,6 +31,7 @@ use super::history_provider::register_history_providers;
 use super::lix_state_provider::register_lix_state_providers;
 use super::types::StateWriteRow;
 use super::udf::register_sql2_udfs;
+use super::version_provider::register_lix_version_provider;
 
 /// Single execution boundary for `sql2::execute_sql(...)`.
 ///
@@ -44,6 +47,9 @@ pub(crate) trait SqlExecutionContext {
     fn live_state(&self) -> Arc<dyn LiveStateReader>;
     fn functions(&self) -> FunctionProviderHandle;
     fn history(&self) -> Option<Arc<dyn HistoryContext>> {
+        None
+    }
+    fn changelog(&self) -> Option<Arc<dyn ChangelogReader>> {
         None
     }
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
@@ -330,6 +336,10 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
         ctx.write_stager(),
     )
     .await?;
+    register_lix_version_provider(&session, ctx.live_state()).await?;
+    if let Some(changelog) = ctx.changelog() {
+        register_lix_change_provider(&session, changelog).await?;
+    }
     let state_history_provider = register_history_providers(
         &session,
         ctx.active_version_id(),

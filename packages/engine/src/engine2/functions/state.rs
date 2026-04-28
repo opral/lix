@@ -2,7 +2,7 @@ use serde_json::Value as JsonValue;
 
 use crate::engine2::functions::{DeterministicMode, DeterministicSequence};
 use crate::engine2::live_state::{
-    LiveStateContextWriter, LiveStateReader, LiveStateRow, LiveStateRowRequest,
+    LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateWriter,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
@@ -46,7 +46,7 @@ pub(crate) async fn load_sequence(
 /// The row is untracked global `lix_key_value` state: it is durable local
 /// runtime state, not a changelog fact.
 pub(crate) async fn write_sequence<S>(
-    writer: &mut LiveStateContextWriter<S>,
+    writer: &mut LiveStateWriter<S>,
     sequence: DeterministicSequence,
     timestamp: &str,
 ) -> Result<(), LixError>

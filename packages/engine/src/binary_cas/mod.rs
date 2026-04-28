@@ -20,7 +20,8 @@ pub(crate) struct BinaryBlobWrite<'a> {
     pub data: &'a [u8],
 }
 
-pub(crate) use context::{BinaryCasContext, BlobDataReader};
+#[allow(unused_imports)]
+pub(crate) use context::{BinaryCasContext, BinaryCasReader, BinaryCasStoreReader, BlobDataReader};
 
 pub(crate) fn append_blob_writes_to_write_batch(
     _write_batch: &mut WriteBatch,

@@ -2,7 +2,7 @@ use crate::engine2::functions::{
     state, DeterministicFunctionProvider, DeterministicSequence, FunctionProvider,
     FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
 };
-use crate::engine2::live_state::{LiveStateContextWriter, LiveStateReader};
+use crate::engine2::live_state::{LiveStateReader, LiveStateWriter};
 use crate::LixError;
 
 /// Execution-scoped runtime function context.
@@ -56,7 +56,7 @@ impl FunctionContext {
     /// deterministic mode is disabled.
     pub(crate) async fn persist_if_needed<S>(
         &self,
-        writer: &mut LiveStateContextWriter<S>,
+        writer: &mut LiveStateWriter<S>,
     ) -> Result<(), LixError>
     where
         S: crate::backend::KvWriter,

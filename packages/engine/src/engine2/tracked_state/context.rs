@@ -18,11 +18,11 @@ impl TrackedStateContext {
     }
 
     /// Creates a tracked-state reader over a caller-provided KV store.
-    pub(crate) fn reader<S>(&self, store: S) -> TrackedStateReader<S>
+    pub(crate) fn reader<S>(&self, store: S) -> TrackedStateStoreReader<S>
     where
         S: KvStore,
     {
-        TrackedStateReader { store }
+        TrackedStateStoreReader { store }
     }
 
     /// Creates a tracked-state writer over a caller-provided KV writer.
@@ -62,12 +62,26 @@ impl TrackedStateContext {
     }
 }
 
-/// Reader for rebuildable tracked-state rows.
-pub(crate) struct TrackedStateReader<S> {
+/// Read side for rebuildable tracked-state rows.
+#[async_trait::async_trait]
+pub(crate) trait TrackedStateReader {
+    async fn scan_rows(
+        &mut self,
+        request: &TrackedStateScanRequest,
+    ) -> Result<Vec<TrackedStateRow>, LixError>;
+
+    async fn load_row(
+        &mut self,
+        request: &TrackedStateRowRequest,
+    ) -> Result<Option<TrackedStateRow>, LixError>;
+}
+
+/// Store-backed tracked-state reader created by `TrackedStateContext`.
+pub(crate) struct TrackedStateStoreReader<S> {
     store: S,
 }
 
-impl<S> TrackedStateReader<S>
+impl<S> TrackedStateStoreReader<S>
 where
     S: KvStore,
 {
@@ -83,6 +97,26 @@ where
         request: &TrackedStateRowRequest,
     ) -> Result<Option<TrackedStateRow>, LixError> {
         crate::engine2::tracked_state::storage::load_row(&mut self.store, request).await
+    }
+}
+
+#[async_trait::async_trait]
+impl<S> TrackedStateReader for TrackedStateStoreReader<S>
+where
+    S: KvStore + Send,
+{
+    async fn scan_rows(
+        &mut self,
+        request: &TrackedStateScanRequest,
+    ) -> Result<Vec<TrackedStateRow>, LixError> {
+        TrackedStateStoreReader::scan_rows(self, request).await
+    }
+
+    async fn load_row(
+        &mut self,
+        request: &TrackedStateRowRequest,
+    ) -> Result<Option<TrackedStateRow>, LixError> {
+        TrackedStateStoreReader::load_row(self, request).await
     }
 }
 

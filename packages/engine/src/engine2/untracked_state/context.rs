@@ -20,11 +20,11 @@ impl UntrackedStateContext {
     /// Creates a reader over a caller-provided KV store.
     ///
     /// The caller decides which KV store supplies visibility for the read.
-    pub(crate) fn reader<S>(&self, store: S) -> UntrackedStateReader<S>
+    pub(crate) fn reader<S>(&self, store: S) -> UntrackedStateStoreReader<S>
     where
         S: KvStore,
     {
-        UntrackedStateReader { store }
+        UntrackedStateStoreReader { store }
     }
 
     /// Creates a writer over a caller-provided KV writer.
@@ -39,12 +39,26 @@ impl UntrackedStateContext {
     }
 }
 
-/// Reader for durable local untracked overlay rows.
-pub(crate) struct UntrackedStateReader<S> {
+/// Read side for durable local untracked overlay rows.
+#[async_trait::async_trait]
+pub(crate) trait UntrackedStateReader {
+    async fn scan_rows(
+        &mut self,
+        request: &UntrackedStateScanRequest,
+    ) -> Result<Vec<UntrackedStateRow>, LixError>;
+
+    async fn load_row(
+        &mut self,
+        request: &UntrackedStateRowRequest,
+    ) -> Result<Option<UntrackedStateRow>, LixError>;
+}
+
+/// Store-backed untracked-state reader created by `UntrackedStateContext`.
+pub(crate) struct UntrackedStateStoreReader<S> {
     store: S,
 }
 
-impl<S> UntrackedStateReader<S>
+impl<S> UntrackedStateStoreReader<S>
 where
     S: KvStore,
 {
@@ -60,6 +74,26 @@ where
         request: &UntrackedStateRowRequest,
     ) -> Result<Option<UntrackedStateRow>, LixError> {
         crate::engine2::untracked_state::storage::load_row(&mut self.store, request).await
+    }
+}
+
+#[async_trait::async_trait]
+impl<S> UntrackedStateReader for UntrackedStateStoreReader<S>
+where
+    S: KvStore + Send,
+{
+    async fn scan_rows(
+        &mut self,
+        request: &UntrackedStateScanRequest,
+    ) -> Result<Vec<UntrackedStateRow>, LixError> {
+        UntrackedStateStoreReader::scan_rows(self, request).await
+    }
+
+    async fn load_row(
+        &mut self,
+        request: &UntrackedStateRowRequest,
+    ) -> Result<Option<UntrackedStateRow>, LixError> {
+        UntrackedStateStoreReader::load_row(self, request).await
     }
 }
 

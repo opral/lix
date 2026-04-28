@@ -28,11 +28,11 @@ impl BinaryCasContext {
     /// The store can be the shared backend outside a transaction or the active
     /// transaction handle when reads must participate in transaction-local
     /// visibility.
-    pub(crate) fn reader<S>(&self, store: S) -> BinaryCasReader<S>
+    pub(crate) fn reader<S>(&self, store: S) -> BinaryCasStoreReader<S>
     where
         S: KvStore,
     {
-        BinaryCasReader { store }
+        BinaryCasStoreReader { store }
     }
 
     pub(crate) fn writer<S>(&self, store: S) -> BinaryCasWriter<S>
@@ -44,21 +44,31 @@ impl BinaryCasContext {
 }
 
 #[async_trait]
-impl BlobDataReader for BinaryCasReader<Arc<dyn LixBackend + Send + Sync>> {
+impl BlobDataReader for BinaryCasStoreReader<Arc<dyn LixBackend + Send + Sync>> {
     async fn load_blob_data_by_hash(&self, blob_hash: &str) -> Result<Option<Vec<u8>>, LixError> {
-        let mut reader = BinaryCasReader {
+        let mut reader = BinaryCasStoreReader {
             store: Arc::clone(&self.store),
         };
-        BinaryCasReader::load_blob_data_by_hash(&mut reader, blob_hash).await
+        let reader: &mut dyn BinaryCasReader = &mut reader;
+        reader.load_blob_data_by_hash(blob_hash).await
     }
 }
 
+/// Read side for Binary CAS blobs.
+#[async_trait]
+pub(crate) trait BinaryCasReader {
+    async fn load_blob_data_by_hash(
+        &mut self,
+        blob_hash: &str,
+    ) -> Result<Option<Vec<u8>>, LixError>;
+}
+
 /// Binary CAS reader over a caller-supplied KV store.
-pub(crate) struct BinaryCasReader<S> {
+pub(crate) struct BinaryCasStoreReader<S> {
     store: S,
 }
 
-impl<S> BinaryCasReader<S>
+impl<S> BinaryCasStoreReader<S>
 where
     S: KvStore,
 {
@@ -71,6 +81,19 @@ where
 
     pub(crate) async fn blob_exists(&mut self, blob_hash: &str) -> Result<bool, LixError> {
         crate::binary_cas::kv::blob_exists(&mut self.store, blob_hash).await
+    }
+}
+
+#[async_trait]
+impl<S> BinaryCasReader for BinaryCasStoreReader<S>
+where
+    S: KvStore + Send,
+{
+    async fn load_blob_data_by_hash(
+        &mut self,
+        blob_hash: &str,
+    ) -> Result<Option<Vec<u8>>, LixError> {
+        BinaryCasStoreReader::load_blob_data_by_hash(self, blob_hash).await
     }
 }
 

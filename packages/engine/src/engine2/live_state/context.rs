@@ -36,11 +36,11 @@ impl LiveStateContext {
     }
 
     /// Creates a visible live-state reader over a caller-provided KV store.
-    pub(crate) fn reader<S>(&self, store: S) -> LiveStateContextReader<S>
+    pub(crate) fn reader<S>(&self, store: S) -> LiveStateStoreReader<S>
     where
         S: KvStore,
     {
-        LiveStateContextReader {
+        LiveStateStoreReader {
             store: Mutex::new(store),
             tracked_state: self.tracked_state,
             untracked_state: self.untracked_state,
@@ -52,11 +52,11 @@ impl LiveStateContext {
     /// The writer owns the tracked/untracked routing rule: tracked rows update
     /// the tracked projection and clear matching untracked overlay rows, while
     /// untracked rows update only the local untracked overlay.
-    pub(crate) fn writer<S>(&self, store: S) -> LiveStateContextWriter<S>
+    pub(crate) fn writer<S>(&self, store: S) -> LiveStateWriter<S>
     where
         S: KvWriter,
     {
-        LiveStateContextWriter {
+        LiveStateWriter {
             store,
             tracked_state: self.tracked_state,
             untracked_state: self.untracked_state,
@@ -65,13 +65,13 @@ impl LiveStateContext {
 }
 
 /// Visible live-state reader backed by a caller-provided KV store.
-pub(crate) struct LiveStateContextReader<S> {
+pub(crate) struct LiveStateStoreReader<S> {
     store: Mutex<S>,
     tracked_state: TrackedStateContext,
     untracked_state: UntrackedStateContext,
 }
 
-impl<S> LiveStateContextReader<S>
+impl<S> LiveStateStoreReader<S>
 where
     S: KvStore,
 {
@@ -159,7 +159,7 @@ where
 }
 
 #[async_trait]
-impl<S> LiveStateReader for LiveStateContextReader<S>
+impl<S> LiveStateReader for LiveStateStoreReader<S>
 where
     S: KvStore + Sync,
 {
@@ -167,25 +167,25 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<LiveStateRow>, LixError> {
-        LiveStateContextReader::scan_rows(self, request).await
+        LiveStateStoreReader::scan_rows(self, request).await
     }
 
     async fn load_row(
         &self,
         request: &LiveStateRowRequest,
     ) -> Result<Option<LiveStateRow>, LixError> {
-        LiveStateContextReader::load_row(self, request).await
+        LiveStateStoreReader::load_row(self, request).await
     }
 }
 
 /// Writer for visible live-state rows over a caller-provided KV writer.
-pub(crate) struct LiveStateContextWriter<S> {
+pub(crate) struct LiveStateWriter<S> {
     store: S,
     tracked_state: TrackedStateContext,
     untracked_state: UntrackedStateContext,
 }
 
-impl<S> LiveStateContextWriter<S>
+impl<S> LiveStateWriter<S>
 where
     S: KvWriter,
 {

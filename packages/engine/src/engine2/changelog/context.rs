@@ -1,6 +1,7 @@
 use crate::backend::{KvStore, KvWriter};
-use crate::engine2::changelog::{CanonicalChange, ChangelogScanRequest};
+use crate::engine2::changelog::{CanonicalChange, ChangelogReader, ChangelogScanRequest};
 use crate::LixError;
+use tokio::sync::Mutex;
 
 /// Durable append-only ledger for Lix changes.
 ///
@@ -17,11 +18,13 @@ impl ChangelogContext {
     /// Creates a changelog reader over a caller-provided KV store.
     ///
     /// The caller decides which KV store supplies visibility for the read.
-    pub(crate) fn reader<S>(&self, store: S) -> ChangelogReader<S>
+    pub(crate) fn reader<S>(&self, store: S) -> ChangelogStoreReader<S>
     where
         S: KvStore,
     {
-        ChangelogReader { store }
+        ChangelogStoreReader {
+            store: Mutex::new(store),
+        }
     }
 
     /// Creates a changelog writer over a caller-provided KV writer.
@@ -33,27 +36,46 @@ impl ChangelogContext {
     }
 }
 
-/// Reader for durable changelog facts.
-pub(crate) struct ChangelogReader<S> {
-    store: S,
+/// KV-backed changelog reader created by `ChangelogContext`.
+pub(crate) struct ChangelogStoreReader<S> {
+    store: Mutex<S>,
 }
 
-impl<S> ChangelogReader<S>
+impl<S> ChangelogStoreReader<S>
 where
     S: KvStore,
 {
     pub(crate) async fn load_change(
-        &mut self,
+        &self,
         change_id: &str,
     ) -> Result<Option<CanonicalChange>, LixError> {
-        crate::engine2::changelog::storage::load_change(&mut self.store, change_id).await
+        let mut store = self.store.lock().await;
+        crate::engine2::changelog::storage::load_change(&mut *store, change_id).await
     }
 
     pub(crate) async fn scan_changes(
-        &mut self,
+        &self,
         request: &ChangelogScanRequest,
     ) -> Result<Vec<CanonicalChange>, LixError> {
-        crate::engine2::changelog::storage::scan_changes(&mut self.store, request).await
+        let mut store = self.store.lock().await;
+        crate::engine2::changelog::storage::scan_changes(&mut *store, request).await
+    }
+}
+
+#[async_trait::async_trait]
+impl<S> ChangelogReader for ChangelogStoreReader<S>
+where
+    S: KvStore,
+{
+    async fn load_change(&self, change_id: &str) -> Result<Option<CanonicalChange>, LixError> {
+        ChangelogStoreReader::load_change(self, change_id).await
+    }
+
+    async fn scan_changes(
+        &self,
+        request: &ChangelogScanRequest,
+    ) -> Result<Vec<CanonicalChange>, LixError> {
+        ChangelogStoreReader::scan_changes(self, request).await
     }
 }
 

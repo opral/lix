@@ -1,0 +1,177 @@
+use crate::simulation_test2;
+use lix_engine::engine2::ExecuteResult;
+use lix_engine::Value;
+
+simulation_test2!(lix_directory_insert_reads_nested_paths, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim
+        .open_main_session(&engine)
+        .await
+        .expect("main session should open");
+
+    let insert_result = session
+        .execute(
+            "INSERT INTO lix_directory (id, parent_id, name, hidden) \
+             VALUES ('dir-docs', NULL, 'docs', false)",
+            &[],
+        )
+        .await
+        .expect("directory insert should succeed");
+    assert_eq!(insert_result, ExecuteResult::AffectedRows(1));
+
+    let nested_insert_result = session
+        .execute(
+            "INSERT INTO lix_directory (id, path, hidden) \
+             VALUES ('dir-nested', '/docs/nested/', false)",
+            &[],
+        )
+        .await
+        .expect("nested directory path insert should succeed");
+    assert_eq!(nested_insert_result, ExecuteResult::AffectedRows(1));
+
+    let result = session
+        .execute(
+            "SELECT id, path, parent_id, name, hidden \
+             FROM lix_directory \
+             WHERE id IN ('dir-docs', 'dir-nested') \
+             ORDER BY path",
+            &[],
+        )
+        .await
+        .expect("directory read should succeed");
+    let ExecuteResult::Rows(row_set) = result else {
+        panic!("SELECT should return rows");
+    };
+    assert_eq!(row_set.len(), 2);
+    assert_eq!(
+        row_set.rows()[0].values(),
+        &[
+            Value::Text("dir-docs".to_string()),
+            Value::Text("/docs/".to_string()),
+            Value::Null,
+            Value::Text("docs".to_string()),
+            Value::Boolean(false),
+        ]
+    );
+    assert_eq!(
+        row_set.rows()[1].values(),
+        &[
+            Value::Text("dir-nested".to_string()),
+            Value::Text("/docs/nested/".to_string()),
+            Value::Text("dir-docs".to_string()),
+            Value::Text("nested".to_string()),
+            Value::Boolean(false),
+        ]
+    );
+});
+
+simulation_test2!(
+    lix_directory_delete_recursively_deletes_tree,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim
+            .open_main_session(&engine)
+            .await
+            .expect("main session should open");
+
+        let file_result = session
+            .execute(
+                "INSERT INTO lix_file (id, path, data, hidden) \
+             VALUES ('file-readme', '/docs/guides/readme.md', X'68656C6C6F', false)",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+        assert_eq!(file_result, ExecuteResult::AffectedRows(1));
+
+        let directory_ids_result = session
+            .execute(
+                "SELECT id \
+             FROM lix_directory \
+             WHERE path IN ('/docs/', '/docs/guides/') \
+             ORDER BY path",
+                &[],
+            )
+            .await
+            .expect("directory id read before delete should succeed");
+        let ExecuteResult::Rows(directory_id_rows) = directory_ids_result else {
+            panic!("SELECT should return directory id rows");
+        };
+        assert_eq!(directory_id_rows.len(), 2);
+        let directory_ids = directory_id_rows
+            .rows()
+            .iter()
+            .map(|row| {
+                let Value::Text(id) = &row.values()[0] else {
+                    panic!("directory id should be text");
+                };
+                id.clone()
+            })
+            .collect::<Vec<_>>();
+
+        let delete_result = session
+            .execute("DELETE FROM lix_directory WHERE path = '/docs/'", &[])
+            .await
+            .expect("recursive directory delete should succeed");
+        assert_eq!(delete_result, ExecuteResult::AffectedRows(1));
+
+        let directories_result = session
+            .execute(
+                "SELECT id, path \
+             FROM lix_directory \
+             WHERE path IN ('/docs/', '/docs/guides/') \
+             ORDER BY path",
+                &[],
+            )
+            .await
+            .expect("directory read after delete should succeed");
+        let ExecuteResult::Rows(directory_rows) = directories_result else {
+            panic!("SELECT should return directory rows");
+        };
+        assert_eq!(
+            directory_rows.len(),
+            0,
+            "recursive directory delete should delete the root and child directories"
+        );
+
+        let file_result = session
+            .execute(
+                "SELECT id, path \
+             FROM lix_file \
+             WHERE path = '/docs/guides/readme.md'",
+                &[],
+            )
+            .await
+            .expect("file read after delete should succeed");
+        let ExecuteResult::Rows(file_rows) = file_result else {
+            panic!("SELECT should return file rows");
+        };
+        assert_eq!(
+            file_rows.len(),
+            0,
+            "recursive directory delete should delete nested files"
+        );
+
+        let state_result = session
+            .execute(
+                &format!(
+                    "SELECT entity_id, schema_key \
+                 FROM lix_state \
+                 WHERE entity_id IN ('{}', '{}', 'file-readme') \
+                 ORDER BY schema_key, entity_id",
+                    directory_ids[0], directory_ids[1]
+                ),
+                &[],
+            )
+            .await
+            .expect("state read after delete should succeed");
+        let ExecuteResult::Rows(state_rows) = state_result else {
+            panic!("SELECT should return state rows");
+        };
+        assert_eq!(
+            state_rows.len(),
+            0,
+            "recursive directory delete should make descriptor/blob-ref state rows not visible"
+        );
+    }
+);

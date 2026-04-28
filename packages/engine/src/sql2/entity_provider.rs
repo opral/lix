@@ -1766,7 +1766,10 @@ fn format_json_pointer(segments: &[String]) -> String {
 }
 
 fn schema_exposed_as_entity_surface(schema_key: &str) -> bool {
-    !matches!(schema_key, "lix_active_version" | "lix_active_account")
+    !matches!(
+        schema_key,
+        "lix_active_version" | "lix_active_account" | "lix_change"
+    )
 }
 
 fn entity_column_type_from_schema(schema: &JsonValue) -> Option<EntityColumnType> {

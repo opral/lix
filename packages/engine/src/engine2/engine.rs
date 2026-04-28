@@ -10,6 +10,7 @@ use crate::engine2::schema_registry::SchemaRegistry;
 use crate::engine2::session::SessionContext;
 use crate::engine2::tracked_state::TrackedStateContext;
 use crate::engine2::untracked_state::UntrackedStateContext;
+use crate::engine2::version_ref::VersionRefContext;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, NullableKeyFilter, TransactionBeginMode};
 
@@ -19,6 +20,7 @@ pub struct Engine {
     tracked_state: Arc<TrackedStateContext>,
     untracked_state: Arc<UntrackedStateContext>,
     live_state: Arc<LiveStateContext>,
+    version_ref: Arc<VersionRefContext>,
     binary_cas: Arc<BinaryCasContext>,
     changelog: Arc<ChangelogContext>,
     schema_registry: Arc<SchemaRegistry>,
@@ -56,6 +58,7 @@ impl Engine {
         let tracked_state = Arc::new(TrackedStateContext::new());
         let untracked_state = Arc::new(UntrackedStateContext::new());
         let live_state = Arc::new(LiveStateContext::new(*tracked_state, *untracked_state));
+        let version_ref = Arc::new(VersionRefContext::new(Arc::clone(&live_state)));
         assert_initialized(Arc::clone(&backend), live_state.as_ref()).await?;
 
         // let history_state = Arc::new(HistoryStateContext::new(
@@ -74,6 +77,7 @@ impl Engine {
             tracked_state,
             untracked_state,
             live_state,
+            version_ref,
             schema_registry: Arc::new(SchemaRegistry::new()),
         })
     }
@@ -86,6 +90,25 @@ impl Engine {
         Arc::clone(&self.tracked_state)
     }
 
+    pub(crate) fn version_ref(&self) -> Arc<VersionRefContext> {
+        Arc::clone(&self.version_ref)
+    }
+
+    /// Loads the current commit head for a version.
+    ///
+    /// This is the public engine-level form of the typed `version_ref` context:
+    /// callers should not need to know that version heads are represented as
+    /// untracked `lix_version_ref` rows in live_state.
+    pub async fn load_version_head_commit_id(
+        &self,
+        version_id: &str,
+    ) -> Result<Option<String>, LixError> {
+        self.version_ref
+            .reader(self.backend())
+            .load_head_commit_id(version_id)
+            .await
+    }
+
     pub async fn open_session(
         &self,
         active_version_id: impl Into<String>,
@@ -96,6 +119,7 @@ impl Engine {
             Arc::clone(&self.live_state),
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.changelog),
+            Arc::clone(&self.version_ref),
             Arc::clone(&self.schema_registry),
         )
         .await
@@ -111,8 +135,15 @@ impl Engine {
         &self,
         version_id: &str,
     ) -> Result<(), LixError> {
-        let head_commit_id =
-            load_version_head(self.live_state.as_ref(), self.backend(), version_id).await?;
+        let head_commit_id = self
+            .load_version_head_commit_id(version_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("missing version ref for version '{version_id}'"),
+                )
+            })?;
         let commit_graph = CommitGraphContext::new(ChangelogContext::new());
         let mut transaction = self
             .backend
@@ -154,49 +185,4 @@ async fn assert_initialized(
         "LIX_ERROR_NOT_INITIALIZED",
         "engine2 backend is not initialized; call Engine::initialize(...) before Engine::new(...)",
     ))
-}
-
-async fn load_version_head(
-    live_state: &LiveStateContext,
-    backend: Arc<dyn LixBackend + Send + Sync>,
-    version_id: &str,
-) -> Result<String, LixError> {
-    let reader = live_state.reader(backend);
-    let row = reader
-        .load_row(&LiveStateRowRequest {
-            schema_key: "lix_version_ref".to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: version_id.to_string(),
-            file_id: NullableKeyFilter::Null,
-        })
-        .await?
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("missing version ref for version '{version_id}'"),
-            )
-        })?;
-    let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("version ref for version '{version_id}' is missing snapshot_content"),
-        )
-    })?;
-    let snapshot =
-        serde_json::from_str::<serde_json::Value>(snapshot_content).map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("version ref snapshot is invalid JSON: {error}"),
-            )
-        })?;
-    snapshot
-        .get("commit_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("version ref for version '{version_id}' is missing commit_id"),
-            )
-        })
 }
