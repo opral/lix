@@ -21,5 +21,6 @@ pub(crate) mod untracked_state;
 mod tests;
 
 pub use engine::Engine;
+pub use init::InitReceipt;
 pub use session::SessionContext;
 pub use session::{ExecuteResult, Row, RowRef, RowSet};
