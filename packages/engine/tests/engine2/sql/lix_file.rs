@@ -172,3 +172,62 @@ simulation_test2!(lix_file_path_update_preserves_data, |sim| async move {
         "path update should not stage an extra directory descriptor"
     );
 });
+
+simulation_test2!(lix_file_by_version_expands_global_rows, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim
+        .open_main_session(&engine)
+        .await
+        .expect("main session should open");
+
+    session
+        .execute(
+            "INSERT INTO lix_file (id, path, data, hidden, lixcol_global, lixcol_untracked) \
+             VALUES ('file-global-overlay', '/global.txt', X'67', false, true, false)",
+            &[],
+        )
+        .await
+        .expect("global file insert should succeed");
+
+    let result = session
+        .execute(
+            "SELECT id, path, lixcol_version_id, lixcol_global, lixcol_untracked \
+             FROM lix_file_by_version \
+             WHERE id = 'file-global-overlay' \
+             ORDER BY lixcol_version_id",
+            &[],
+        )
+        .await
+        .expect("file by-version read should succeed");
+    assert_rows_eq(
+        result,
+        vec![
+            vec![
+                Value::Text("file-global-overlay".to_string()),
+                Value::Text("/global.txt".to_string()),
+                Value::Text(sim.main_version_id().to_string()),
+                Value::Boolean(true),
+                Value::Boolean(false),
+            ],
+            vec![
+                Value::Text("file-global-overlay".to_string()),
+                Value::Text("/global.txt".to_string()),
+                Value::Text("global".to_string()),
+                Value::Boolean(true),
+                Value::Boolean(false),
+            ],
+        ],
+    );
+});
+
+fn assert_rows_eq(result: ExecuteResult, expected: Vec<Vec<Value>>) {
+    let ExecuteResult::Rows(row_set) = result else {
+        panic!("SELECT should return rows");
+    };
+    let rows = row_set
+        .rows()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(rows, expected);
+}

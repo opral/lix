@@ -29,6 +29,7 @@ use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
+use crate::sql2::version_scope::resolve_provider_version_ids;
 use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
@@ -141,13 +142,22 @@ impl TableProvider for LixStateProvider {
     ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         let route = LixStateByVersionRoute::from_filters(filters);
         let projected_schema = projected_schema(&self.schema, projection)?;
-        let request = lix_state_scan_request(
+        let mut request = lix_state_scan_request(
             &self.schema,
             self.default_version_id.as_deref(),
             projection,
             &route,
             limit,
         );
+        if !route.contradictory {
+            request.filter.version_ids = resolve_provider_version_ids(
+                Arc::clone(&self.live_state),
+                self.default_version_id.as_deref(),
+                request.filter.version_ids,
+            )
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
+        }
         Ok(Arc::new(LixStateScanExec::new(
             Arc::clone(&self.live_state),
             projected_schema,
@@ -1041,44 +1051,46 @@ impl LixStateByVersionRoute {
     fn from_filters(filters: &[Expr]) -> Self {
         let mut route = Self::default();
         for filter in filters {
-            let Some(predicate) = parse_lix_state_filter(filter) else {
+            let Some(predicates) = parse_lix_state_filters(filter) else {
                 continue;
             };
-            match predicate {
-                LixStateFilterPredicate::SchemaKeys(values) => {
-                    merge_string_route_slot(
-                        &mut route.schema_keys,
-                        values,
-                        &mut route.contradictory,
-                    );
-                }
-                LixStateFilterPredicate::VersionIds(values) => {
-                    merge_string_route_slot(
-                        &mut route.version_ids,
-                        values,
-                        &mut route.contradictory,
-                    );
-                }
-                LixStateFilterPredicate::EntityIds(values) => {
-                    merge_string_route_slot(
-                        &mut route.entity_ids,
-                        values,
-                        &mut route.contradictory,
-                    );
-                }
-                LixStateFilterPredicate::FileId(filter) => {
-                    merge_nullable_key_route_slot(
-                        &mut route.file_id,
-                        filter,
-                        &mut route.contradictory,
-                    );
-                }
-                LixStateFilterPredicate::PluginKey(filter) => {
-                    merge_nullable_key_route_slot(
-                        &mut route.plugin_key,
-                        filter,
-                        &mut route.contradictory,
-                    );
+            for predicate in predicates {
+                match predicate {
+                    LixStateFilterPredicate::SchemaKeys(values) => {
+                        merge_string_route_slot(
+                            &mut route.schema_keys,
+                            values,
+                            &mut route.contradictory,
+                        );
+                    }
+                    LixStateFilterPredicate::VersionIds(values) => {
+                        merge_string_route_slot(
+                            &mut route.version_ids,
+                            values,
+                            &mut route.contradictory,
+                        );
+                    }
+                    LixStateFilterPredicate::EntityIds(values) => {
+                        merge_string_route_slot(
+                            &mut route.entity_ids,
+                            values,
+                            &mut route.contradictory,
+                        );
+                    }
+                    LixStateFilterPredicate::FileId(filter) => {
+                        merge_nullable_key_route_slot(
+                            &mut route.file_id,
+                            filter,
+                            &mut route.contradictory,
+                        );
+                    }
+                    LixStateFilterPredicate::PluginKey(filter) => {
+                        merge_nullable_key_route_slot(
+                            &mut route.plugin_key,
+                            filter,
+                            &mut route.contradictory,
+                        );
+                    }
                 }
             }
         }
@@ -1186,10 +1198,23 @@ fn merge_nullable_key_route_slot(
 }
 
 fn parse_lix_state_filter(expr: &Expr) -> Option<LixStateFilterPredicate> {
+    parse_lix_state_filters(expr)?.into_iter().next()
+}
+
+fn parse_lix_state_filters(expr: &Expr) -> Option<Vec<LixStateFilterPredicate>> {
     match expr {
-        Expr::BinaryExpr(binary_expr) => parse_lix_state_binary_filter(binary_expr),
-        Expr::InList(in_list) => parse_lix_state_in_list_filter(in_list),
-        Expr::IsNull(expr) => parse_lix_state_null_filter(expr),
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
+            let mut predicates = parse_lix_state_filters(&binary_expr.left)?;
+            predicates.extend(parse_lix_state_filters(&binary_expr.right)?);
+            Some(predicates)
+        }
+        Expr::BinaryExpr(binary_expr) => {
+            parse_lix_state_binary_filter(binary_expr).map(|predicate| vec![predicate])
+        }
+        Expr::InList(in_list) => {
+            parse_lix_state_in_list_filter(in_list).map(|predicate| vec![predicate])
+        }
+        Expr::IsNull(expr) => parse_lix_state_null_filter(expr).map(|predicate| vec![predicate]),
         _ => None,
     }
 }
@@ -1710,6 +1735,35 @@ mod tests {
             ]
         );
         assert_eq!(request.limit, Some(10));
+    }
+
+    #[test]
+    fn builds_route_from_and_filter_tree() {
+        let route = LixStateByVersionRoute::from_filters(&[Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(col("entity_id")),
+                Operator::Eq,
+                Box::new(str_lit("entity-a")),
+            ))),
+            Operator::And,
+            Box::new(Expr::InList(InList::new(
+                Box::new(col("version_id")),
+                vec![str_lit("version-a"), str_lit("global")],
+                false,
+            ))),
+        ))]);
+
+        assert_eq!(
+            route.entity_ids,
+            Some(BTreeSet::from(["entity-a".to_string()]))
+        );
+        assert_eq!(
+            route.version_ids,
+            Some(BTreeSet::from([
+                "global".to_string(),
+                "version-a".to_string()
+            ]))
+        );
     }
 
     #[test]

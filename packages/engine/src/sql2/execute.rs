@@ -24,6 +24,7 @@ use crate::transaction::{
 use crate::{LixError, QueryResult, Value};
 
 use super::change_provider::register_lix_change_provider;
+use super::commit_provider::register_commit_providers;
 use super::directory_provider::register_lix_directory_providers;
 use super::entity_provider::register_entity_providers;
 use super::file_provider::register_lix_file_providers;
@@ -338,7 +339,14 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
     .await?;
     register_lix_version_provider(&session, ctx.live_state()).await?;
     if let Some(changelog) = ctx.changelog() {
-        register_lix_change_provider(&session, changelog).await?;
+        register_lix_change_provider(&session, Arc::clone(&changelog)).await?;
+        register_commit_providers(
+            &session,
+            ctx.active_version_id(),
+            changelog,
+            ctx.live_state(),
+        )
+        .await?;
     }
     let state_history_provider = register_history_providers(
         &session,

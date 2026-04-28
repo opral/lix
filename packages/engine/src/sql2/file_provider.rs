@@ -32,6 +32,7 @@ use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
+use crate::sql2::version_scope::resolve_provider_version_ids;
 use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
@@ -268,7 +269,14 @@ impl TableProvider for LixFileProvider {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let projected_schema = projected_schema(&self.schema, projection)?;
-        let request = lix_file_scan_request(self.default_version_id.as_deref(), limit);
+        let mut request = lix_file_scan_request(self.default_version_id.as_deref(), limit);
+        request.filter.version_ids = resolve_provider_version_ids(
+            Arc::clone(&self.live_state),
+            self.default_version_id.as_deref(),
+            request.filter.version_ids,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
         Ok(Arc::new(LixFileScanExec::new(
             Arc::clone(&self.live_state),
             Arc::clone(&self.blob_reader),

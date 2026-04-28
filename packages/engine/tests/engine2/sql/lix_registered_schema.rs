@@ -61,3 +61,76 @@ simulation_test2!(
         );
     }
 );
+
+simulation_test2!(entity_by_version_expands_global_rows, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim
+        .open_main_session(&engine)
+        .await
+        .expect("main session should open");
+
+    session
+        .execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"engine2_overlay_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             true,\
+             true\
+             )",
+            &[],
+        )
+        .await
+        .expect("registered schema insert should succeed");
+
+    session
+            .execute(
+                "INSERT INTO engine2_overlay_schema \
+                 (lixcol_entity_id, id, name, lixcol_global, lixcol_untracked) \
+                 VALUES ('entity-global-overlay', 'entity-global-overlay', 'Global Entity', true, false)",
+                &[],
+            )
+            .await
+            .expect("global entity insert should succeed");
+
+    let result = session
+        .execute(
+            "SELECT id, name, lixcol_version_id, lixcol_global, lixcol_untracked \
+                 FROM engine2_overlay_schema_by_version \
+                 WHERE lixcol_entity_id = 'entity-global-overlay' \
+                 ORDER BY lixcol_version_id",
+            &[],
+        )
+        .await
+        .expect("entity by-version read should succeed");
+    assert_rows_eq(
+        result,
+        vec![
+            vec![
+                Value::Text("entity-global-overlay".to_string()),
+                Value::Text("Global Entity".to_string()),
+                Value::Text(sim.main_version_id().to_string()),
+                Value::Boolean(true),
+                Value::Boolean(false),
+            ],
+            vec![
+                Value::Text("entity-global-overlay".to_string()),
+                Value::Text("Global Entity".to_string()),
+                Value::Text("global".to_string()),
+                Value::Boolean(true),
+                Value::Boolean(false),
+            ],
+        ],
+    );
+});
+
+fn assert_rows_eq(result: ExecuteResult, expected: Vec<Vec<Value>>) {
+    let ExecuteResult::Rows(row_set) = result else {
+        panic!("SELECT should return rows");
+    };
+    let rows = row_set
+        .rows()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(rows, expected);
+}

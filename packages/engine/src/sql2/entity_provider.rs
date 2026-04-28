@@ -33,6 +33,7 @@ use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
+use crate::sql2::version_scope::resolve_provider_version_ids;
 use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
@@ -271,11 +272,18 @@ impl TableProvider for EntityProvider {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let projected_schema = projected_schema(&self.schema, projection)?;
-        let request = entity_live_state_scan_request(
+        let mut request = entity_live_state_scan_request(
             &self.spec.schema_key,
             self.active_version_id.as_deref(),
             limit,
         );
+        request.filter.version_ids = resolve_provider_version_ids(
+            Arc::clone(&self.live_state),
+            self.active_version_id.as_deref(),
+            request.filter.version_ids,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
 
         Ok(Arc::new(EntityScanExec::new(
             Arc::clone(&self.spec),
@@ -1768,7 +1776,13 @@ fn format_json_pointer(segments: &[String]) -> String {
 fn schema_exposed_as_entity_surface(schema_key: &str) -> bool {
     !matches!(
         schema_key,
-        "lix_active_version" | "lix_active_account" | "lix_change"
+        "lix_active_version"
+            | "lix_active_account"
+            | "lix_change"
+            | "lix_commit"
+            | "lix_commit_edge"
+            | "lix_change_set"
+            | "lix_change_set_element"
     )
 }
 

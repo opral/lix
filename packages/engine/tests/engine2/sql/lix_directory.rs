@@ -175,3 +175,65 @@ simulation_test2!(
         );
     }
 );
+
+simulation_test2!(
+    lix_directory_by_version_expands_global_rows,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim
+            .open_main_session(&engine)
+            .await
+            .expect("main session should open");
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path, hidden, lixcol_global, lixcol_untracked) \
+                 VALUES ('dir-global-overlay', '/shared/', false, true, false)",
+                &[],
+            )
+            .await
+            .expect("global directory insert should succeed");
+
+        let result = session
+            .execute(
+                "SELECT id, path, lixcol_version_id, lixcol_global, lixcol_untracked \
+                 FROM lix_directory_by_version \
+                 WHERE id = 'dir-global-overlay' \
+                 ORDER BY lixcol_version_id",
+                &[],
+            )
+            .await
+            .expect("directory by-version read should succeed");
+        assert_rows_eq(
+            result,
+            vec![
+                vec![
+                    Value::Text("dir-global-overlay".to_string()),
+                    Value::Text("/shared/".to_string()),
+                    Value::Text(sim.main_version_id().to_string()),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                ],
+                vec![
+                    Value::Text("dir-global-overlay".to_string()),
+                    Value::Text("/shared/".to_string()),
+                    Value::Text("global".to_string()),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                ],
+            ],
+        );
+    }
+);
+
+fn assert_rows_eq(result: ExecuteResult, expected: Vec<Vec<Value>>) {
+    let ExecuteResult::Rows(row_set) = result else {
+        panic!("SELECT should return rows");
+    };
+    let rows = row_set
+        .rows()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(rows, expected);
+}

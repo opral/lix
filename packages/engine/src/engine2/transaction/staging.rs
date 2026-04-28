@@ -343,6 +343,7 @@ fn add_row_to_commit_members(
             StagedCommitMembers::new(
                 functions.uuid_v7(),
                 functions.uuid_v7(),
+                functions.uuid_v7(),
                 functions.timestamp(),
             )
         });

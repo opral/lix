@@ -157,6 +157,7 @@ async fn finalize_commit_rows(
 
         let commit_id = members.commit_id;
         let commit_change_id = members.commit_change_id;
+        let change_set_id = members.change_set_id;
         let timestamp = members.created_at;
         let change_ids = members.change_ids.into_iter().collect::<Vec<_>>();
         let parent_commit_ids = version_ref
@@ -167,6 +168,7 @@ async fn finalize_commit_rows(
             .collect::<Vec<_>>();
         let snapshot_content = serde_json::to_string(&serde_json::json!({
             "id": commit_id,
+            "change_set_id": change_set_id,
             "change_ids": change_ids,
             "parent_commit_ids": parent_commit_ids,
         }))
@@ -570,6 +572,7 @@ mod tests {
         let mut members = StagedCommitMembers::new(
             "test-uuid-1".to_string(),
             "test-uuid-2".to_string(),
+            "test-uuid-3".to_string(),
             "test-timestamp-1".to_string(),
         );
         for change_id in change_ids {
