@@ -31,6 +31,7 @@ use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
+use crate::engine2::version_ref::VersionRefReader;
 use crate::history::{
     StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRow,
 };
@@ -52,6 +53,7 @@ pub(crate) async fn register_lix_directory_providers(
     session: &SessionContext,
     active_version_id: &str,
     live_state: Arc<dyn LiveStateReader>,
+    version_ref: Arc<dyn VersionRefReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
     functions: FunctionProviderHandle,
     history: Option<Arc<dyn HistoryContext>>,
@@ -61,6 +63,7 @@ pub(crate) async fn register_lix_directory_providers(
             "lix_directory_by_version",
             Arc::new(LixDirectoryProvider::by_version(
                 Arc::clone(&live_state),
+                Arc::clone(&version_ref),
                 write_stager.as_ref().map(Arc::clone),
                 functions.clone(),
             )),
@@ -72,6 +75,7 @@ pub(crate) async fn register_lix_directory_providers(
             Arc::new(LixDirectoryProvider::active_version(
                 active_version_id,
                 live_state,
+                version_ref,
                 write_stager,
                 functions,
             )),
@@ -91,6 +95,7 @@ pub(crate) async fn register_lix_directory_providers(
 pub(crate) struct LixDirectoryProvider {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
+    version_ref: Arc<dyn VersionRefReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
     functions: FunctionProviderHandle,
     default_version_id: Option<String>,
@@ -106,12 +111,14 @@ impl LixDirectoryProvider {
     fn active_version(
         active_version_id: impl Into<String>,
         live_state: Arc<dyn LiveStateReader>,
+        version_ref: Arc<dyn VersionRefReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
         functions: FunctionProviderHandle,
     ) -> Self {
         Self {
             schema: lix_directory_schema(),
             live_state,
+            version_ref,
             write_stager,
             functions,
             default_version_id: Some(active_version_id.into()),
@@ -120,12 +127,14 @@ impl LixDirectoryProvider {
 
     fn by_version(
         live_state: Arc<dyn LiveStateReader>,
+        version_ref: Arc<dyn VersionRefReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
         functions: FunctionProviderHandle,
     ) -> Self {
         Self {
             schema: lix_directory_by_version_schema(),
             live_state,
+            version_ref,
             write_stager,
             functions,
             default_version_id: None,
@@ -230,7 +239,7 @@ impl TableProvider for LixDirectoryProvider {
         let projected_schema = projected_schema(&self.schema, projection)?;
         let mut request = lix_directory_scan_request(self.default_version_id.as_deref(), limit);
         request.filter.version_ids = resolve_provider_version_ids(
-            Arc::clone(&self.live_state),
+            self.version_ref.as_ref(),
             self.default_version_id.as_deref(),
             request.filter.version_ids,
         )

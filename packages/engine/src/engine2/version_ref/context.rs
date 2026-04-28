@@ -4,9 +4,10 @@ use serde_json::json;
 
 use crate::backend::{KvStore, KvWriter};
 use crate::engine2::live_state::{
-    LiveStateContext, LiveStateRow, LiveStateRowRequest, LiveStateStoreReader, LiveStateWriter,
+    LiveStateContext, LiveStateFilter, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+    LiveStateStoreReader, LiveStateWriter,
 };
-use crate::engine2::version_ref::VersionHead;
+use crate::engine2::version_ref::{VersionHead, VersionRefReader};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
@@ -28,11 +29,11 @@ impl VersionRefContext {
     }
 
     /// Creates a version-ref reader over a caller-provided KV store.
-    pub(crate) fn reader<S>(&self, store: S) -> VersionRefReader<S>
+    pub(crate) fn reader<S>(&self, store: S) -> VersionRefStoreReader<S>
     where
         S: KvStore,
     {
-        VersionRefReader {
+        VersionRefStoreReader {
             live_state_reader: self.live_state.reader(store),
         }
     }
@@ -49,14 +50,14 @@ impl VersionRefContext {
 }
 
 /// Read side for version heads.
-pub(crate) struct VersionRefReader<S>
+pub(crate) struct VersionRefStoreReader<S>
 where
     S: KvStore,
 {
     live_state_reader: LiveStateStoreReader<S>,
 }
 
-impl<S> VersionRefReader<S>
+impl<S> VersionRefStoreReader<S>
 where
     S: KvStore,
 {
@@ -85,6 +86,47 @@ where
         version_id: &str,
     ) -> Result<Option<String>, LixError> {
         Ok(self.load_head(version_id).await?.map(|head| head.commit_id))
+    }
+
+    pub(crate) async fn scan_heads(&self) -> Result<Vec<VersionHead>, LixError> {
+        let rows = self
+            .live_state_reader
+            .scan_rows(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec![VERSION_REF_SCHEMA_KEY.to_string()],
+                    version_ids: vec![GLOBAL_VERSION_ID.to_string()],
+                    ..LiveStateFilter::default()
+                },
+                ..LiveStateScanRequest::default()
+            })
+            .await?;
+        let mut heads = rows
+            .iter()
+            .map(|row| decode_version_head(&row.entity_id, row))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        heads.sort_by(|left, right| left.version_id.cmp(&right.version_id));
+        Ok(heads)
+    }
+}
+
+#[async_trait::async_trait]
+impl<S> VersionRefReader for VersionRefStoreReader<S>
+where
+    S: KvStore,
+{
+    async fn load_head(&self, version_id: &str) -> Result<Option<VersionHead>, LixError> {
+        VersionRefStoreReader::load_head(self, version_id).await
+    }
+
+    async fn load_head_commit_id(&self, version_id: &str) -> Result<Option<String>, LixError> {
+        VersionRefStoreReader::load_head_commit_id(self, version_id).await
+    }
+
+    async fn scan_heads(&self) -> Result<Vec<VersionHead>, LixError> {
+        VersionRefStoreReader::scan_heads(self).await
     }
 }
 
@@ -249,6 +291,51 @@ mod tests {
         assert_eq!(row.commit_id, None);
         assert_eq!(row.created_at, "2026-01-01T00:00:00Z");
         assert_eq!(row.updated_at, "2026-01-01T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn scan_heads_returns_sorted_version_heads() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let version_ref = test_version_ref();
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+
+        version_ref
+            .writer(transaction.as_mut())
+            .advance_head("version-b", "commit-b", "2026-01-01T00:00:00Z")
+            .await
+            .expect("version-b should advance");
+        version_ref
+            .writer(transaction.as_mut())
+            .advance_head("version-a", "commit-a", "2026-01-01T00:00:00Z")
+            .await
+            .expect("version-a should advance");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let heads = version_ref
+            .reader(backend)
+            .scan_heads()
+            .await
+            .expect("heads should scan");
+
+        assert_eq!(
+            heads,
+            vec![
+                VersionHead {
+                    version_id: "version-a".to_string(),
+                    commit_id: "commit-a".to_string(),
+                },
+                VersionHead {
+                    version_id: "version-b".to_string(),
+                    commit_id: "commit-b".to_string(),
+                },
+            ]
+        );
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -18,10 +18,10 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
 };
 use futures_util::stream;
-use serde_json::Value as JsonValue;
+use tokio::sync::Mutex;
 
-use crate::engine2::changelog::{CanonicalChange, ChangelogReader, ChangelogScanRequest};
-use crate::engine2::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
+use crate::engine2::commit_graph::{CommitGraphCommit, CommitGraphReader};
+use crate::engine2::version_ref::VersionRefReader;
 use crate::sql2::version_scope::resolve_provider_version_ids;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
@@ -29,15 +29,16 @@ use crate::LixError;
 pub(crate) async fn register_commit_providers(
     session: &datafusion::prelude::SessionContext,
     active_version_id: &str,
-    changelog: Arc<dyn ChangelogReader>,
-    live_state: Arc<dyn LiveStateReader>,
+    commit_graph: Box<dyn CommitGraphReader>,
+    version_ref: Arc<dyn VersionRefReader>,
 ) -> Result<(), LixError> {
+    let commit_graph = Arc::new(Mutex::new(commit_graph));
     for surface in CommitSurface::all() {
         let provider = Arc::new(CommitSurfaceProvider::new(
             surface,
             active_version_id.to_string(),
-            Arc::clone(&changelog),
-            Arc::clone(&live_state),
+            Arc::clone(&commit_graph),
+            Arc::clone(&version_ref),
         ));
         session
             .register_table(surface.table_name(), provider)
@@ -113,8 +114,8 @@ struct CommitSurfaceProvider {
     surface: CommitSurface,
     active_version_id: String,
     schema: SchemaRef,
-    changelog: Arc<dyn ChangelogReader>,
-    live_state: Arc<dyn LiveStateReader>,
+    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    version_ref: Arc<dyn VersionRefReader>,
 }
 
 impl std::fmt::Debug for CommitSurfaceProvider {
@@ -129,15 +130,15 @@ impl CommitSurfaceProvider {
     fn new(
         surface: CommitSurface,
         active_version_id: String,
-        changelog: Arc<dyn ChangelogReader>,
-        live_state: Arc<dyn LiveStateReader>,
+        commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+        version_ref: Arc<dyn VersionRefReader>,
     ) -> Self {
         Self {
             surface,
             active_version_id,
             schema: surface.schema(),
-            changelog,
-            live_state,
+            commit_graph,
+            version_ref,
         }
     }
 }
@@ -176,8 +177,8 @@ impl TableProvider for CommitSurfaceProvider {
         Ok(Arc::new(CommitSurfaceScanExec::new(
             self.surface,
             self.active_version_id.clone(),
-            Arc::clone(&self.changelog),
-            Arc::clone(&self.live_state),
+            Arc::clone(&self.commit_graph),
+            Arc::clone(&self.version_ref),
             projected_schema(&self.schema, projection),
             projection.cloned(),
             limit,
@@ -188,8 +189,8 @@ impl TableProvider for CommitSurfaceProvider {
 struct CommitSurfaceScanExec {
     surface: CommitSurface,
     active_version_id: String,
-    changelog: Arc<dyn ChangelogReader>,
-    live_state: Arc<dyn LiveStateReader>,
+    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    version_ref: Arc<dyn VersionRefReader>,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
@@ -208,8 +209,8 @@ impl CommitSurfaceScanExec {
     fn new(
         surface: CommitSurface,
         active_version_id: String,
-        changelog: Arc<dyn ChangelogReader>,
-        live_state: Arc<dyn LiveStateReader>,
+        commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+        version_ref: Arc<dyn VersionRefReader>,
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
@@ -223,8 +224,8 @@ impl CommitSurfaceScanExec {
         Self {
             surface,
             active_version_id,
-            changelog,
-            live_state,
+            commit_graph,
+            version_ref,
             schema,
             projection,
             limit,
@@ -286,23 +287,27 @@ impl ExecutionPlan for CommitSurfaceScanExec {
 
         let surface = self.surface;
         let active_version_id = self.active_version_id.clone();
-        let changelog = Arc::clone(&self.changelog);
-        let live_state = Arc::clone(&self.live_state);
+        let commit_graph = Arc::clone(&self.commit_graph);
+        let version_ref = Arc::clone(&self.version_ref);
         let projection = self.projection.clone();
         let limit = self.limit;
         let schema = Arc::clone(&self.schema);
         let stream = stream::once(async move {
             let version_ids = resolve_provider_version_ids(
-                Arc::clone(&live_state),
+                version_ref.as_ref(),
                 (!surface.by_version()).then_some(active_version_id.as_str()),
                 Vec::new(),
             )
             .await
             .map_err(lix_error_to_datafusion_error)?;
-            let model = CommitSurfaceModel::load(changelog, live_state)
-                .await
-                .map_err(lix_error_to_datafusion_error)?;
-            let rows = model.rows_for_surface(surface, &version_ids);
+            let rows = rows_for_surface(
+                surface,
+                &version_ids,
+                Arc::clone(&commit_graph),
+                Arc::clone(&version_ref),
+            )
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
             let rows = match limit {
                 Some(limit) => rows.into_iter().take(limit).collect::<Vec<_>>(),
                 None => rows,
@@ -311,20 +316,6 @@ impl ExecutionPlan for CommitSurfaceScanExec {
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
-}
-
-#[derive(Debug, Clone)]
-struct ParsedCommit {
-    id: String,
-    change_set_id: String,
-    change_ids: Vec<String>,
-    parent_commit_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct VersionHead {
-    version_id: String,
-    commit_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -353,244 +344,104 @@ enum SurfaceRow {
     },
 }
 
-struct CommitSurfaceModel {
-    commits: BTreeMap<String, ParsedCommit>,
-    changes: BTreeMap<String, CanonicalChange>,
-    version_heads: Vec<VersionHead>,
-}
+async fn rows_for_surface(
+    surface: CommitSurface,
+    version_ids: &[String],
+    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    version_ref: Arc<dyn VersionRefReader>,
+) -> Result<Vec<SurfaceRow>, LixError> {
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::<String>::new();
+    let mut graph = commit_graph.lock().await;
 
-impl CommitSurfaceModel {
-    async fn load(
-        changelog: Arc<dyn ChangelogReader>,
-        live_state: Arc<dyn LiveStateReader>,
-    ) -> Result<Self, LixError> {
-        let changes = changelog
-            .scan_changes(&ChangelogScanRequest::default())
-            .await?;
-        let changes_by_id = changes
-            .into_iter()
-            .map(|change| (change.id.clone(), change))
-            .collect::<BTreeMap<_, _>>();
-        let commits = changes_by_id
-            .values()
-            .filter(|change| change.schema_key == "lix_commit")
-            .map(parse_commit_change)
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|commit| (commit.id.clone(), commit))
-            .collect::<BTreeMap<_, _>>();
-        let version_heads = load_version_heads(live_state).await?;
-        Ok(Self {
-            commits,
-            changes: changes_by_id,
-            version_heads,
-        })
-    }
-
-    fn rows_for_surface(&self, surface: CommitSurface, version_ids: &[String]) -> Vec<SurfaceRow> {
-        let mut rows = Vec::new();
-        let mut seen = BTreeSet::<String>::new();
-        for version_id in version_ids {
-            let commit_ids = self.visible_commit_ids(version_id, surface.by_version());
-            for commit_id in commit_ids {
-                let Some(commit) = self.commits.get(&commit_id) else {
-                    continue;
-                };
-                match surface {
-                    CommitSurface::Commit | CommitSurface::CommitByVersion => {
-                        let key = format!("{version_id}\0commit\0{}", commit.id);
-                        if seen.insert(key) {
-                            rows.push(SurfaceRow::Commit {
-                                version_id: surface.by_version().then(|| version_id.clone()),
-                                id: commit.id.clone(),
-                                change_set_id: commit.change_set_id.clone(),
-                            });
-                        }
+    for version_id in version_ids {
+        let commits = visible_commits_for_version(
+            &mut **graph,
+            version_ref.as_ref(),
+            version_id,
+            surface.by_version(),
+        )
+        .await?;
+        match surface {
+            CommitSurface::Commit | CommitSurface::CommitByVersion => {
+                for commit in commits {
+                    let key = format!("{version_id}\0commit\0{}", commit.commit_id);
+                    if seen.insert(key) {
+                        rows.push(SurfaceRow::Commit {
+                            version_id: surface.by_version().then(|| version_id.clone()),
+                            id: commit.commit_id,
+                            change_set_id: commit.change_set_id,
+                        });
                     }
-                    CommitSurface::CommitEdge | CommitSurface::CommitEdgeByVersion => {
-                        for parent_id in &commit.parent_commit_ids {
-                            let key = format!("{version_id}\0edge\0{parent_id}\0{}", commit.id);
-                            if seen.insert(key) {
-                                rows.push(SurfaceRow::CommitEdge {
-                                    version_id: surface.by_version().then(|| version_id.clone()),
-                                    parent_id: parent_id.clone(),
-                                    child_id: commit.id.clone(),
-                                });
-                            }
-                        }
+                }
+            }
+            CommitSurface::CommitEdge | CommitSurface::CommitEdgeByVersion => {
+                for edge in graph.commit_edges(&commits) {
+                    let key = format!(
+                        "{version_id}\0edge\0{}\0{}",
+                        edge.parent_commit_id, edge.child_commit_id
+                    );
+                    if seen.insert(key) {
+                        rows.push(SurfaceRow::CommitEdge {
+                            version_id: surface.by_version().then(|| version_id.clone()),
+                            parent_id: edge.parent_commit_id,
+                            child_id: edge.child_commit_id,
+                        });
                     }
-                    CommitSurface::ChangeSet | CommitSurface::ChangeSetByVersion => {
-                        let key = format!("{version_id}\0change_set\0{}", commit.change_set_id);
-                        if seen.insert(key) {
-                            rows.push(SurfaceRow::ChangeSet {
-                                version_id: surface.by_version().then(|| version_id.clone()),
-                                id: commit.change_set_id.clone(),
-                            });
-                        }
+                }
+            }
+            CommitSurface::ChangeSet | CommitSurface::ChangeSetByVersion => {
+                for change_set in graph.change_sets(&commits) {
+                    let key = format!("{version_id}\0change_set\0{}", change_set.id);
+                    if seen.insert(key) {
+                        rows.push(SurfaceRow::ChangeSet {
+                            version_id: surface.by_version().then(|| version_id.clone()),
+                            id: change_set.id,
+                        });
                     }
-                    CommitSurface::ChangeSetElement | CommitSurface::ChangeSetElementByVersion => {
-                        for change_id in &commit.change_ids {
-                            let Some(change) = self.changes.get(change_id) else {
-                                continue;
-                            };
-                            let key = format!(
-                                "{version_id}\0change_set_element\0{}\0{}",
-                                commit.change_set_id, change.id
-                            );
-                            if seen.insert(key) {
-                                rows.push(SurfaceRow::ChangeSetElement {
-                                    version_id: surface.by_version().then(|| version_id.clone()),
-                                    change_set_id: commit.change_set_id.clone(),
-                                    change_id: change.id.clone(),
-                                    entity_id: change.entity_id.clone(),
-                                    schema_key: change.schema_key.clone(),
-                                    file_id: change.file_id.clone(),
-                                });
-                            }
-                        }
+                }
+            }
+            CommitSurface::ChangeSetElement | CommitSurface::ChangeSetElementByVersion => {
+                for element in graph.change_set_elements(&commits).await? {
+                    let key = format!(
+                        "{version_id}\0change_set_element\0{}\0{}",
+                        element.change_set_id, element.change.id
+                    );
+                    if seen.insert(key) {
+                        rows.push(SurfaceRow::ChangeSetElement {
+                            version_id: surface.by_version().then(|| version_id.clone()),
+                            change_set_id: element.change_set_id,
+                            change_id: element.change.id,
+                            entity_id: element.change.entity_id,
+                            schema_key: element.change.schema_key,
+                            file_id: element.change.file_id,
+                        });
                     }
                 }
             }
         }
-        rows
     }
+    Ok(rows)
+}
 
-    fn visible_commit_ids(&self, version_id: &str, by_version: bool) -> Vec<String> {
-        if by_version && version_id == GLOBAL_VERSION_ID {
-            return self.commits.keys().cloned().collect();
-        }
-        self.reachable_commit_ids(version_id)
+async fn visible_commits_for_version(
+    commit_graph: &mut dyn CommitGraphReader,
+    version_ref: &dyn VersionRefReader,
+    version_id: &str,
+    by_version: bool,
+) -> Result<Vec<CommitGraphCommit>, LixError> {
+    if by_version && version_id == GLOBAL_VERSION_ID {
+        return commit_graph.all_commits().await;
     }
-
-    fn reachable_commit_ids(&self, version_id: &str) -> Vec<String> {
-        let Some(head) = self
-            .version_heads
-            .iter()
-            .find(|head| head.version_id == version_id)
-        else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        let mut seen = BTreeSet::new();
-        self.collect_reachable(&head.commit_id, &mut seen, &mut out);
-        out
-    }
-
-    fn collect_reachable(
-        &self,
-        commit_id: &str,
-        seen: &mut BTreeSet<String>,
-        out: &mut Vec<String>,
-    ) {
-        if !seen.insert(commit_id.to_string()) {
-            return;
-        }
-        let Some(commit) = self.commits.get(commit_id) else {
-            return;
-        };
-        out.push(commit.id.clone());
-        for parent_id in &commit.parent_commit_ids {
-            self.collect_reachable(parent_id, seen, out);
-        }
-    }
-}
-
-async fn load_version_heads(
-    live_state: Arc<dyn LiveStateReader>,
-) -> Result<Vec<VersionHead>, LixError> {
-    let rows = live_state
-        .scan_rows(&LiveStateScanRequest {
-            filter: LiveStateFilter {
-                schema_keys: vec!["lix_version_ref".to_string()],
-                version_ids: vec![GLOBAL_VERSION_ID.to_string()],
-                ..LiveStateFilter::default()
-            },
-            projection: Default::default(),
-            limit: None,
-        })
-        .await?;
-    rows.into_iter()
-        .map(|row| parse_version_head(&row))
-        .collect()
-}
-
-fn parse_version_head(
-    row: &crate::engine2::live_state::LiveStateRow,
-) -> Result<VersionHead, LixError> {
-    let snapshot = parse_snapshot(row.snapshot_content.as_deref(), "lix_version_ref")?;
-    let commit_id = required_string(&snapshot, "commit_id", "lix_version_ref")?;
-    Ok(VersionHead {
-        version_id: row.entity_id.clone(),
-        commit_id,
-    })
-}
-
-fn parse_commit_change(change: &CanonicalChange) -> Result<ParsedCommit, LixError> {
-    let snapshot = parse_snapshot(change.snapshot_content.as_deref(), "lix_commit")?;
-    Ok(ParsedCommit {
-        id: required_string(&snapshot, "id", "lix_commit")?,
-        change_set_id: required_string(&snapshot, "change_set_id", "lix_commit")?,
-        change_ids: string_array_field(&snapshot, "change_ids", "lix_commit")?,
-        parent_commit_ids: string_array_field(&snapshot, "parent_commit_ids", "lix_commit")?,
-    })
-}
-
-fn parse_snapshot(snapshot_content: Option<&str>, schema_key: &str) -> Result<JsonValue, LixError> {
-    let snapshot_content = snapshot_content.ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("{schema_key} row is missing snapshot_content"),
-        )
-    })?;
-    serde_json::from_str(snapshot_content).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("{schema_key} snapshot_content is invalid JSON: {error}"),
-        )
-    })
-}
-
-fn required_string(
-    snapshot: &JsonValue,
-    field: &str,
-    schema_key: &str,
-) -> Result<String, LixError> {
-    snapshot
-        .get(field)
-        .and_then(JsonValue::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("{schema_key} snapshot_content is missing {field}"),
-            )
-        })
-}
-
-fn string_array_field(
-    snapshot: &JsonValue,
-    field: &str,
-    schema_key: &str,
-) -> Result<Vec<String>, LixError> {
-    Ok(snapshot
-        .get(field)
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("{schema_key} snapshot_content is missing {field}"),
-            )
-        })?
-        .iter()
-        .map(|value| {
-            value.as_str().map(str::to_string).ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("{schema_key}.{field} must contain only strings"),
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?)
+    let Some(head_commit_id) = version_ref.load_head_commit_id(version_id).await? else {
+        return Ok(Vec::new());
+    };
+    Ok(commit_graph
+        .reachable_commits(&head_commit_id)
+        .await?
+        .into_iter()
+        .map(|reachable| reachable.commit)
+        .collect())
 }
 
 fn surface_record_batch(

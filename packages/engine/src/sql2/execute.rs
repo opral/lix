@@ -9,8 +9,10 @@ use async_trait::async_trait;
 
 use crate::binary_cas::BlobDataReader;
 use crate::engine2::changelog::ChangelogReader;
+use crate::engine2::commit_graph::CommitGraphReader;
 use crate::engine2::functions::FunctionProviderHandle;
 use crate::engine2::live_state::LiveStateReader;
+use crate::engine2::version_ref::VersionRefReader;
 use crate::history::{StateHistoryRequest, StateHistoryRow};
 use crate::sql::{
     MutationOperation, MutationRow, OptionalTextPatch, PlannedFilesystemFile,
@@ -51,6 +53,12 @@ pub(crate) trait SqlExecutionContext {
         None
     }
     fn changelog(&self) -> Option<Arc<dyn ChangelogReader>> {
+        None
+    }
+    fn commit_graph(&self) -> Option<Box<dyn CommitGraphReader>> {
+        None
+    }
+    fn version_ref(&self) -> Option<Arc<dyn VersionRefReader>> {
         None
     }
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
@@ -330,21 +338,30 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
     let session = SessionContext::new();
     register_sql2_udfs(&session, ctx.functions());
     let history = ctx.history();
+    let version_ref = ctx.version_ref().ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "sql2 execution requires a version-ref reader",
+        )
+    })?;
     register_lix_state_providers(
         &session,
         ctx.active_version_id(),
         ctx.live_state(),
+        Arc::clone(&version_ref),
         ctx.write_stager(),
     )
     .await?;
-    register_lix_version_provider(&session, ctx.live_state()).await?;
+    register_lix_version_provider(&session, ctx.live_state(), Arc::clone(&version_ref)).await?;
     if let Some(changelog) = ctx.changelog() {
         register_lix_change_provider(&session, Arc::clone(&changelog)).await?;
+    }
+    if let Some(commit_graph) = ctx.commit_graph() {
         register_commit_providers(
             &session,
             ctx.active_version_id(),
-            changelog,
-            ctx.live_state(),
+            commit_graph,
+            Arc::clone(&version_ref),
         )
         .await?;
     }
@@ -358,6 +375,7 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
         &session,
         ctx.active_version_id(),
         ctx.live_state(),
+        Arc::clone(&version_ref),
         ctx.write_stager(),
         ctx.functions(),
         history.as_ref().map(Arc::clone),
@@ -367,6 +385,7 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
         &session,
         ctx.active_version_id(),
         ctx.live_state(),
+        Arc::clone(&version_ref),
         ctx.blob_reader(),
         ctx.write_stager(),
         ctx.functions(),
@@ -377,6 +396,7 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
         &session,
         ctx.active_version_id(),
         ctx.live_state(),
+        Arc::clone(&version_ref),
         ctx.write_stager(),
         state_history_provider.is_some(),
         &ctx.list_visible_schemas(ctx.active_version_id())?,

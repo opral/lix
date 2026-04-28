@@ -5,13 +5,14 @@ use serde_json::Value as JsonValue;
 use crate::backend::TransactionBeginMode;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::engine2::changelog::{ChangelogContext, ChangelogReader};
+use crate::engine2::commit_graph::{CommitGraphContext, CommitGraphReader};
 use crate::engine2::functions::{FunctionContext, FunctionProviderHandle};
 use crate::engine2::live_state::{LiveStateContext, LiveStateReader};
 use crate::engine2::schema_registry::SchemaRegistry;
 use crate::engine2::transaction::commit;
 use crate::engine2::transaction::live_state_overlay::TransactionLiveStateContext;
 use crate::engine2::transaction::staging::TransactionStagedWrites;
-use crate::engine2::version_ref::VersionRefContext;
+use crate::engine2::version_ref::{VersionRefContext, VersionRefReader};
 use crate::sql2::{SqlExecutionContext, SqlWriteStager};
 use crate::transaction::TransactionCommitOutcome;
 use crate::{LixBackend, LixBackendTransaction, LixError};
@@ -126,6 +127,16 @@ impl SqlExecutionContext for Transaction<'_> {
 
     fn changelog(&self) -> Option<Arc<dyn ChangelogReader>> {
         Some(Arc::new(self.changelog.reader(Arc::clone(self.backend))))
+    }
+
+    fn commit_graph(&self) -> Option<Box<dyn CommitGraphReader>> {
+        Some(Box::new(
+            CommitGraphContext::new(ChangelogContext::new()).reader(Arc::clone(self.backend)),
+        ))
+    }
+
+    fn version_ref(&self) -> Option<Arc<dyn VersionRefReader>> {
+        Some(Arc::new(self.version_ref.reader(Arc::clone(self.backend))))
     }
 
     /// Returns the same function provider used by the owning session.

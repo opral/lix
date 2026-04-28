@@ -2,6 +2,8 @@ use crate::simulation_test2;
 use lix_engine::engine2::ExecuteResult;
 use lix_engine::Value;
 
+use super::assert_rows_eq;
+
 simulation_test2!(lix_directory_insert_reads_nested_paths, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim
@@ -225,15 +227,3 @@ simulation_test2!(
         );
     }
 );
-
-fn assert_rows_eq(result: ExecuteResult, expected: Vec<Vec<Value>>) {
-    let ExecuteResult::Rows(row_set) = result else {
-        panic!("SELECT should return rows");
-    };
-    let rows = row_set
-        .rows()
-        .iter()
-        .map(|row| row.values().to_vec())
-        .collect::<Vec<_>>();
-    assert_eq!(rows, expected);
-}

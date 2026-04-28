@@ -1,8 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::backend::KvStore;
 use crate::engine2::changelog::{CanonicalChange, ChangelogContext, ChangelogStoreReader};
-use crate::engine2::commit_graph::{CommitGraphCommit, CommitGraphEntity};
+use crate::engine2::commit_graph::walker::walk_reachable_commits;
+use crate::engine2::commit_graph::{
+    CommitGraphChangeSet, CommitGraphChangeSetElement, CommitGraphCommit, CommitGraphEdge,
+    CommitGraphEntity, CommitGraphReader, ReachableCommitGraphCommit,
+};
 use crate::LixError;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
@@ -21,25 +25,25 @@ impl CommitGraphContext {
     }
 
     /// Creates a graph reader over a caller-provided KV store.
-    pub(crate) fn reader<S>(&self, store: S) -> CommitGraphReader<S>
+    pub(crate) fn reader<S>(&self, store: S) -> CommitGraphStoreReader<S>
     where
         S: KvStore,
     {
-        CommitGraphReader {
+        CommitGraphStoreReader {
             changelog: self.changelog.reader(store),
         }
     }
 }
 
 /// Commit-graph reader that resolves changelog entities at a commit head.
-pub(crate) struct CommitGraphReader<S>
+pub(crate) struct CommitGraphStoreReader<S>
 where
     S: KvStore,
 {
     changelog: ChangelogStoreReader<S>,
 }
 
-impl<S> CommitGraphReader<S>
+impl<S> CommitGraphStoreReader<S>
 where
     S: KvStore,
 {
@@ -57,7 +61,7 @@ where
     }
 
     /// Loads and parses a `lix_commit` canonical change by commit id.
-    async fn load_commit(
+    pub(crate) async fn load_commit(
         &mut self,
         commit_id: &str,
     ) -> Result<Option<CommitGraphCommit>, LixError> {
@@ -67,40 +71,83 @@ where
         parse_commit_change(change).map(Some)
     }
 
+    /// Loads every commit fact from the changelog.
+    ///
+    /// This is used by global commit surfaces where the caller wants the durable
+    /// graph facts themselves, not reachability from a particular version head.
+    pub(crate) async fn all_commits(&mut self) -> Result<Vec<CommitGraphCommit>, LixError> {
+        let changes = self
+            .changelog
+            .scan_changes(&crate::engine2::changelog::ChangelogScanRequest { limit: None })
+            .await?;
+        let mut commits = changes
+            .into_iter()
+            .filter(|change| change.schema_key == COMMIT_SCHEMA_KEY)
+            .map(parse_commit_change)
+            .collect::<Result<Vec<_>, _>>()?;
+        commits.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));
+        Ok(commits)
+    }
+
     /// Walks from `head_commit_id` through parent commits and records nearest depth.
-    async fn reachable_commits(
+    pub(crate) async fn reachable_commits(
         &mut self,
         head_commit_id: &str,
-    ) -> Result<Vec<ReachableCommit>, LixError> {
-        let mut loader = CommitTraversalLoader::new(self);
-        let mut visiting = BTreeSet::new();
-        let mut nearest_depths = BTreeMap::new();
-        loader
-            .walk_commit(head_commit_id, 0, &mut visiting, &mut nearest_depths)
-            .await?;
+    ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
+        walk_reachable_commits(self, head_commit_id).await
+    }
 
-        let mut commits = nearest_depths
-            .into_iter()
-            .map(|(commit_id, depth)| {
-                let commit = loader
-                    .loaded
-                    .remove(&commit_id)
-                    .expect("visited commit should be cached");
-                ReachableCommit { commit, depth }
+    /// Derives parent/child edges from parsed commits.
+    pub(crate) fn commit_edges(&self, commits: &[CommitGraphCommit]) -> Vec<CommitGraphEdge> {
+        commits
+            .iter()
+            .flat_map(|commit| {
+                commit
+                    .parent_commit_ids
+                    .iter()
+                    .map(|parent_commit_id| CommitGraphEdge {
+                        parent_commit_id: parent_commit_id.clone(),
+                        child_commit_id: commit.commit_id.clone(),
+                    })
             })
-            .collect::<Vec<_>>();
-        commits.sort_by(|left, right| {
-            left.depth
-                .cmp(&right.depth)
-                .then_with(|| left.commit.commit_id.cmp(&right.commit.commit_id))
-        });
-        Ok(commits)
+            .collect()
+    }
+
+    /// Derives one change-set row for each parsed commit.
+    pub(crate) fn change_sets(&self, commits: &[CommitGraphCommit]) -> Vec<CommitGraphChangeSet> {
+        commits
+            .iter()
+            .map(|commit| CommitGraphChangeSet {
+                id: commit.change_set_id.clone(),
+                commit_id: commit.commit_id.clone(),
+            })
+            .collect()
+    }
+
+    /// Loads the canonical changes referenced by each commit's change set.
+    pub(crate) async fn change_set_elements(
+        &mut self,
+        commits: &[CommitGraphCommit],
+    ) -> Result<Vec<CommitGraphChangeSetElement>, LixError> {
+        let mut elements = Vec::new();
+        for commit in commits {
+            for change_id in &commit.change_ids {
+                let change = self
+                    .load_member_change(change_id, &commit.commit_id)
+                    .await?;
+                elements.push(CommitGraphChangeSetElement {
+                    change_set_id: commit.change_set_id.clone(),
+                    change,
+                });
+            }
+        }
+        Ok(elements)
     }
 
     /// Selects the first reachable change for each canonical entity identity.
     async fn select_entities(
         &mut self,
-        commits: Vec<ReachableCommit>,
+        commits: Vec<ReachableCommitGraphCommit>,
     ) -> Result<Vec<CommitGraphEntity>, LixError> {
         let mut order = Vec::new();
         let mut entities = BTreeMap::new();
@@ -160,105 +207,43 @@ where
     }
 }
 
-#[derive(Debug)]
-struct ReachableCommit {
-    commit: CommitGraphCommit,
-    depth: u32,
-}
-
-struct CommitTraversalLoader<'a, S>
+#[async_trait::async_trait]
+impl<S> CommitGraphReader for CommitGraphStoreReader<S>
 where
     S: KvStore,
 {
-    reader: &'a mut CommitGraphReader<S>,
-    loaded: BTreeMap<String, CommitGraphCommit>,
-}
-
-impl<'a, S> CommitTraversalLoader<'a, S>
-where
-    S: KvStore,
-{
-    fn new(reader: &'a mut CommitGraphReader<S>) -> Self {
-        Self {
-            reader,
-            loaded: BTreeMap::new(),
-        }
-    }
-
-    async fn walk_commit(
+    async fn load_commit(
         &mut self,
         commit_id: &str,
-        depth: u32,
-        visiting: &mut BTreeSet<String>,
-        nearest_depths: &mut BTreeMap<String, u32>,
-    ) -> Result<(), LixError> {
-        let mut stack = vec![TraversalFrame {
-            commit_id: commit_id.to_string(),
-            depth,
-            expanded: false,
-        }];
-
-        while let Some(frame) = stack.pop() {
-            if frame.expanded {
-                visiting.remove(&frame.commit_id);
-                continue;
-            }
-
-            if visiting.contains(&frame.commit_id) {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "commit_graph cycle detected at commit '{}'",
-                        frame.commit_id
-                    ),
-                ));
-            }
-
-            if let Some(previous_depth) = nearest_depths.get(&frame.commit_id) {
-                if *previous_depth <= frame.depth {
-                    continue;
-                }
-            }
-
-            let commit = self.load_commit(&frame.commit_id).await?;
-            nearest_depths.insert(frame.commit_id.clone(), frame.depth);
-
-            visiting.insert(frame.commit_id.clone());
-            stack.push(TraversalFrame {
-                commit_id: frame.commit_id,
-                depth: frame.depth,
-                expanded: true,
-            });
-            for parent_commit_id in commit.parent_commit_ids.iter().rev() {
-                stack.push(TraversalFrame {
-                    commit_id: parent_commit_id.clone(),
-                    depth: frame.depth + 1,
-                    expanded: false,
-                });
-            }
-        }
-        Ok(())
+    ) -> Result<Option<CommitGraphCommit>, LixError> {
+        CommitGraphStoreReader::load_commit(self, commit_id).await
     }
 
-    async fn load_commit(&mut self, commit_id: &str) -> Result<CommitGraphCommit, LixError> {
-        if let Some(commit) = self.loaded.get(commit_id) {
-            return Ok(commit.clone());
-        }
-        let Some(commit) = self.reader.load_commit(commit_id).await? else {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("commit_graph missing commit '{commit_id}'"),
-            ));
-        };
-        self.loaded.insert(commit_id.to_string(), commit.clone());
-        Ok(commit)
+    async fn all_commits(&mut self) -> Result<Vec<CommitGraphCommit>, LixError> {
+        CommitGraphStoreReader::all_commits(self).await
     }
-}
 
-struct TraversalFrame {
-    commit_id: String,
-    depth: u32,
-    expanded: bool,
+    async fn reachable_commits(
+        &mut self,
+        head_commit_id: &str,
+    ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
+        CommitGraphStoreReader::reachable_commits(self, head_commit_id).await
+    }
+
+    fn commit_edges(&self, commits: &[CommitGraphCommit]) -> Vec<CommitGraphEdge> {
+        CommitGraphStoreReader::commit_edges(self, commits)
+    }
+
+    fn change_sets(&self, commits: &[CommitGraphCommit]) -> Vec<CommitGraphChangeSet> {
+        CommitGraphStoreReader::change_sets(self, commits)
+    }
+
+    async fn change_set_elements(
+        &mut self,
+        commits: &[CommitGraphCommit],
+    ) -> Result<Vec<CommitGraphChangeSetElement>, LixError> {
+        CommitGraphStoreReader::change_set_elements(self, commits).await
+    }
 }
 
 fn observe_change(
@@ -376,10 +361,12 @@ fn parse_commit_change(
     let change_ids = required_string_array(&snapshot, "change_ids", &change.entity_id)?;
     let parent_commit_ids =
         required_string_array(&snapshot, "parent_commit_ids", &change.entity_id)?;
+    let change_set_id = required_string(&snapshot, "change_set_id", &change.entity_id)?;
 
     Ok(CommitGraphCommit {
         change,
         commit_id,
+        change_set_id,
         change_ids,
         parent_commit_ids,
     })
@@ -468,6 +455,7 @@ mod tests {
             .expect("commit should exist");
 
         assert_eq!(commit.commit_id, "commit-1");
+        assert_eq!(commit.change_set_id, "change-set-1");
         assert_eq!(commit.change_ids, vec!["change-1", "change-2"]);
         assert_eq!(commit.parent_commit_ids, vec!["parent-1"]);
         assert_eq!(commit.change.id, "commit-1-change");
@@ -519,6 +507,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_commits_returns_parsed_commits_sorted_by_id() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let changelog = ChangelogContext::new();
+        append_changes(
+            Arc::clone(&backend),
+            &changelog,
+            &[
+                commit_change("commit-b-change", "commit-b", &[], &[]),
+                entity_change("change-1", "entity-1", "example", "{}"),
+                commit_change("commit-a-change", "commit-a", &[], &[]),
+            ],
+        )
+        .await;
+
+        let graph = CommitGraphContext::new(changelog);
+        let mut reader = graph.reader(backend);
+        let commits = reader
+            .all_commits()
+            .await
+            .expect("commit scan should succeed");
+
+        assert_eq!(
+            commits
+                .iter()
+                .map(|commit| commit.commit_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["commit-a", "commit-b"]
+        );
+    }
+
+    #[tokio::test]
     async fn entities_at_walks_ancestors_and_computes_nearest_depth() {
         let backend = Arc::new(UnitTestBackend::new());
         let changelog = ChangelogContext::new();
@@ -562,55 +581,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn entities_at_errors_on_missing_parent_commit() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let changelog = ChangelogContext::new();
-        append_changes(
-            Arc::clone(&backend),
-            &changelog,
-            &[commit_change(
-                "commit-head-change",
-                "commit-head",
-                &[],
-                &["missing-parent"],
-            )],
-        )
-        .await;
+    async fn commit_edges_are_derived_from_parent_commit_ids() {
+        let graph = CommitGraphContext::new(ChangelogContext::new());
+        let reader = graph.reader(Arc::new(UnitTestBackend::new()));
+        let commits = vec![parsed_commit(
+            "commit-head",
+            &[],
+            &["commit-left", "commit-right"],
+        )];
 
-        let graph = CommitGraphContext::new(changelog);
-        let mut reader = graph.reader(backend);
-        let error = reader
-            .entities_at("commit-head")
-            .await
-            .expect_err("missing parent should fail");
+        let edges = reader.commit_edges(&commits);
 
-        assert!(error.description.contains("missing-parent"));
+        assert_eq!(
+            edges
+                .iter()
+                .map(|edge| (
+                    edge.parent_commit_id.as_str(),
+                    edge.child_commit_id.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("commit-left", "commit-head"),
+                ("commit-right", "commit-head")
+            ]
+        );
     }
 
     #[tokio::test]
-    async fn entities_at_errors_on_cycle() {
+    async fn change_sets_are_derived_from_commits() {
+        let graph = CommitGraphContext::new(ChangelogContext::new());
+        let reader = graph.reader(Arc::new(UnitTestBackend::new()));
+        let commits = vec![parsed_commit("commit-1", &[], &[])];
+
+        let change_sets = reader.change_sets(&commits);
+
+        assert_eq!(change_sets.len(), 1);
+        assert_eq!(change_sets[0].id, "change-set-1");
+        assert_eq!(change_sets[0].commit_id, "commit-1");
+    }
+
+    #[tokio::test]
+    async fn change_set_elements_load_member_changes() {
         let backend = Arc::new(UnitTestBackend::new());
         let changelog = ChangelogContext::new();
         append_changes(
             Arc::clone(&backend),
             &changelog,
             &[
-                commit_change("commit-a-change", "commit-a", &[], &["commit-b"]),
-                commit_change("commit-b-change", "commit-b", &[], &["commit-a"]),
+                entity_change("change-1", "entity-1", "example", "{}"),
+                commit_change("commit-1-change", "commit-1", &["change-1"], &[]),
             ],
         )
         .await;
 
         let graph = CommitGraphContext::new(changelog);
         let mut reader = graph.reader(backend);
-        let error = reader
-            .entities_at("commit-a")
+        let commits = reader
+            .all_commits()
             .await
-            .expect_err("cycle should fail");
+            .expect("commit scan should succeed");
+        let elements = reader
+            .change_set_elements(&commits)
+            .await
+            .expect("change-set elements should load");
 
-        assert!(error.description.contains("cycle"));
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].change_set_id, "change-set-1");
+        assert_eq!(elements[0].change.id, "change-1");
+        assert_eq!(elements[0].change.entity_id, "entity-1");
     }
-
     #[tokio::test]
     async fn entities_at_selects_nearest_member_change_for_identity() {
         let backend = Arc::new(UnitTestBackend::new());
@@ -1065,6 +1104,20 @@ mod tests {
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
         }
+    }
+
+    fn parsed_commit(
+        commit_id: &str,
+        change_ids: &[&str],
+        parent_commit_ids: &[&str],
+    ) -> crate::engine2::commit_graph::CommitGraphCommit {
+        super::parse_commit_change(commit_change(
+            &format!("{commit_id}-change"),
+            commit_id,
+            change_ids,
+            parent_commit_ids,
+        ))
+        .expect("commit helper should parse")
     }
 
     fn entity_change(

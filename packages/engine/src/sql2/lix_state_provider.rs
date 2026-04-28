@@ -29,6 +29,7 @@ use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
+use crate::engine2::version_ref::VersionRefReader;
 use crate::sql2::version_scope::resolve_provider_version_ids;
 use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
@@ -40,12 +41,17 @@ pub(crate) async fn register_lix_state_providers(
     session: &SessionContext,
     active_version_id: &str,
     live_state: Arc<dyn LiveStateReader>,
+    version_ref: Arc<dyn VersionRefReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
 ) -> Result<(), LixError> {
     session
         .register_table(
             "lix_state_by_version",
-            Arc::new(LixStateProvider::by_version(Arc::clone(&live_state), None)),
+            Arc::new(LixStateProvider::by_version(
+                Arc::clone(&live_state),
+                Arc::clone(&version_ref),
+                None,
+            )),
         )
         .map_err(datafusion_error_to_lix_error)?;
     session
@@ -54,6 +60,7 @@ pub(crate) async fn register_lix_state_providers(
             Arc::new(LixStateProvider::active_version(
                 active_version_id,
                 live_state,
+                version_ref,
                 write_stager,
             )),
         )
@@ -64,6 +71,7 @@ pub(crate) async fn register_lix_state_providers(
 pub(crate) struct LixStateProvider {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
+    version_ref: Arc<dyn VersionRefReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
     default_version_id: Option<String>,
 }
@@ -80,11 +88,13 @@ impl LixStateProvider {
     pub(crate) fn active_version(
         active_version_id: impl Into<String>,
         live_state: Arc<dyn LiveStateReader>,
+        version_ref: Arc<dyn VersionRefReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
     ) -> Self {
         Self {
             schema: lix_state_schema(),
             live_state,
+            version_ref,
             write_stager,
             default_version_id: Some(active_version_id.into()),
         }
@@ -92,11 +102,13 @@ impl LixStateProvider {
 
     pub(crate) fn by_version(
         live_state: Arc<dyn LiveStateReader>,
+        version_ref: Arc<dyn VersionRefReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
     ) -> Self {
         Self {
             schema: lix_state_by_version_schema(),
             live_state,
+            version_ref,
             write_stager,
             default_version_id: None,
         }
@@ -151,7 +163,7 @@ impl TableProvider for LixStateProvider {
         );
         if !route.contradictory {
             request.filter.version_ids = resolve_provider_version_ids(
-                Arc::clone(&self.live_state),
+                self.version_ref.as_ref(),
                 self.default_version_id.as_deref(),
                 request.filter.version_ids,
             )
@@ -1409,6 +1421,7 @@ mod tests {
     use crate::engine2::live_state::{
         LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
+    use crate::engine2::version_ref::{VersionHead, VersionRefReader};
     use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateWriteRow};
     use crate::transaction::{PendingOverlay, PreparedWriteStatementStager, TransactionWriteDelta};
     use crate::{LixError, NullableKeyFilter};
@@ -1438,6 +1451,7 @@ mod tests {
     use std::sync::Mutex;
 
     struct EmptyLiveStateReader;
+    struct EmptyVersionRefReader;
     struct RowsLiveStateReader {
         rows: Vec<LiveStateRow>,
     }
@@ -1549,6 +1563,21 @@ mod tests {
         ) -> Result<Option<LiveStateRow>, LixError> {
             Ok(None)
         }
+    }
+
+    #[async_trait]
+    impl VersionRefReader for EmptyVersionRefReader {
+        async fn load_head(&self, _version_id: &str) -> Result<Option<VersionHead>, LixError> {
+            Ok(None)
+        }
+
+        async fn scan_heads(&self) -> Result<Vec<VersionHead>, LixError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn empty_version_ref() -> Arc<dyn VersionRefReader> {
+        Arc::new(EmptyVersionRefReader)
     }
 
     #[async_trait]
@@ -1813,6 +1842,7 @@ mod tests {
             &session,
             "version-a",
             live_state,
+            empty_version_ref(),
             Some(Arc::clone(&write_stager)),
         )
         .await
@@ -1843,7 +1873,8 @@ mod tests {
     async fn insert_into_requires_write_transaction() {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
-        let provider = LixStateProvider::active_version("version-a", live_state, None);
+        let provider =
+            LixStateProvider::active_version("version-a", live_state, empty_version_ref(), None);
         let input = Arc::new(EmptyExec::new(provider.schema())) as Arc<dyn ExecutionPlan>;
 
         let error = provider
@@ -1861,7 +1892,8 @@ mod tests {
     async fn update_requires_write_transaction() {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
-        let provider = LixStateProvider::active_version("version-a", live_state, None);
+        let provider =
+            LixStateProvider::active_version("version-a", live_state, empty_version_ref(), None);
 
         let error = provider
             .update(
@@ -1882,7 +1914,8 @@ mod tests {
     async fn delete_requires_write_transaction() {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
-        let provider = LixStateProvider::active_version("version-a", live_state, None);
+        let provider =
+            LixStateProvider::active_version("version-a", live_state, empty_version_ref(), None);
 
         let error = provider
             .delete_from(&session.state(), vec![])
@@ -1900,8 +1933,12 @@ mod tests {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
         let write_stager = Arc::new(DummyWriteStager) as Arc<dyn SqlWriteStager>;
-        let provider =
-            LixStateProvider::active_version("version-a", live_state, Some(write_stager));
+        let provider = LixStateProvider::active_version(
+            "version-a",
+            live_state,
+            empty_version_ref(),
+            Some(write_stager),
+        );
 
         let plan = provider
             .delete_from(&session.state(), vec![])
@@ -1916,8 +1953,12 @@ mod tests {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
         let write_stager = Arc::new(DummyWriteStager) as Arc<dyn SqlWriteStager>;
-        let provider =
-            LixStateProvider::active_version("version-a", live_state, Some(write_stager));
+        let provider = LixStateProvider::active_version(
+            "version-a",
+            live_state,
+            empty_version_ref(),
+            Some(write_stager),
+        );
 
         let error = provider
             .update(
@@ -1939,8 +1980,12 @@ mod tests {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
         let write_stager = Arc::new(DummyWriteStager) as Arc<dyn SqlWriteStager>;
-        let provider =
-            LixStateProvider::active_version("version-a", live_state, Some(write_stager));
+        let provider = LixStateProvider::active_version(
+            "version-a",
+            live_state,
+            empty_version_ref(),
+            Some(write_stager),
+        );
 
         let plan = provider
             .update(
@@ -1959,8 +2004,12 @@ mod tests {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
         let write_stager = Arc::new(DummyWriteStager) as Arc<dyn SqlWriteStager>;
-        let provider =
-            LixStateProvider::active_version("version-a", live_state, Some(write_stager));
+        let provider = LixStateProvider::active_version(
+            "version-a",
+            live_state,
+            empty_version_ref(),
+            Some(write_stager),
+        );
         let input = Arc::new(EmptyExec::new(provider.schema())) as Arc<dyn ExecutionPlan>;
 
         let plan = provider
@@ -2090,6 +2139,7 @@ mod tests {
         let provider = LixStateProvider::active_version(
             "version-a",
             live_state,
+            empty_version_ref(),
             Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
         );
         let input = Arc::new(SingleBatchExec::new(one_row_stageable_lix_state_batch()))
@@ -2134,6 +2184,7 @@ mod tests {
         let provider = LixStateProvider::active_version(
             "version-a",
             live_state,
+            empty_version_ref(),
             Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
         );
 
@@ -2205,6 +2256,7 @@ mod tests {
         let provider = LixStateProvider::active_version(
             "version-a",
             live_state,
+            empty_version_ref(),
             Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
         );
 
