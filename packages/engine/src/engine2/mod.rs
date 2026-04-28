@@ -17,6 +17,9 @@ pub(crate) mod tracked_state;
 pub mod transaction;
 pub(crate) mod untracked_state;
 
+#[cfg(test)]
+mod tests;
+
 pub use engine::Engine;
 pub use session::SessionContext;
 pub use session::{ExecuteResult, Row, RowRef, RowSet};

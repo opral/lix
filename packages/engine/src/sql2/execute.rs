@@ -482,6 +482,8 @@ mod tests {
     use crate::engine2::live_state::{
         LiveStateContext, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
+    use crate::engine2::tracked_state::TrackedStateContext;
+    use crate::engine2::untracked_state::UntrackedStateContext;
     use crate::history::{
         StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRow,
         StateHistoryVersionScope,
@@ -2347,6 +2349,10 @@ mod tests {
         Ok((backend, session, schema_definition))
     }
 
+    fn test_live_state_context() -> LiveStateContext {
+        LiveStateContext::new(TrackedStateContext::new(), UntrackedStateContext::new())
+    }
+
     fn run_async_test_with_large_stack(
         test: impl FnOnce() -> futures_util::future::LocalBoxFuture<'static, ()> + Send + 'static,
     ) {
@@ -2379,7 +2385,9 @@ mod tests {
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(LiveStateContext::new().reader(Arc::clone(&backend_ref))),
+                    live_state: Arc::new(
+                        test_live_state_context().reader(Arc::clone(&backend_ref)),
+                    ),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2426,7 +2434,9 @@ mod tests {
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(LiveStateContext::new().reader(Arc::clone(&backend_ref))),
+                    live_state: Arc::new(
+                        test_live_state_context().reader(Arc::clone(&backend_ref)),
+                    ),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2462,7 +2472,9 @@ mod tests {
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(LiveStateContext::new().reader(Arc::clone(&backend_ref))),
+                    live_state: Arc::new(
+                        test_live_state_context().reader(Arc::clone(&backend_ref)),
+                    ),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2501,7 +2513,9 @@ mod tests {
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(LiveStateContext::new().reader(Arc::clone(&backend_ref))),
+                    live_state: Arc::new(
+                        test_live_state_context().reader(Arc::clone(&backend_ref)),
+                    ),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2536,7 +2550,9 @@ mod tests {
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(LiveStateContext::new().reader(Arc::clone(&backend_ref))),
+                    live_state: Arc::new(
+                        test_live_state_context().reader(Arc::clone(&backend_ref)),
+                    ),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2572,7 +2588,9 @@ mod tests {
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(LiveStateContext::new().reader(Arc::clone(&backend_ref))),
+                    live_state: Arc::new(
+                        test_live_state_context().reader(Arc::clone(&backend_ref)),
+                    ),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2609,7 +2627,9 @@ mod tests {
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(LiveStateContext::new().reader(Arc::clone(&backend_ref))),
+                    live_state: Arc::new(
+                        test_live_state_context().reader(Arc::clone(&backend_ref)),
+                    ),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2645,7 +2665,9 @@ mod tests {
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(LiveStateContext::new().reader(Arc::clone(&backend_ref))),
+                    live_state: Arc::new(
+                        test_live_state_context().reader(Arc::clone(&backend_ref)),
+                    ),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2690,7 +2712,9 @@ mod tests {
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(LiveStateContext::new().reader(Arc::clone(&backend_ref))),
+                    live_state: Arc::new(
+                        test_live_state_context().reader(Arc::clone(&backend_ref)),
+                    ),
                     schema_definitions: vec![schema_definition],
                 };
 

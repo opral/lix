@@ -25,10 +25,13 @@ pub(crate) struct LiveStateContext {
 }
 
 impl LiveStateContext {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(
+        tracked_state: TrackedStateContext,
+        untracked_state: UntrackedStateContext,
+    ) -> Self {
         Self {
-            tracked_state: TrackedStateContext::new(),
-            untracked_state: UntrackedStateContext::new(),
+            tracked_state,
+            untracked_state,
         }
     }
 
@@ -331,7 +334,10 @@ mod tests {
     #[tokio::test]
     async fn live_state_overlays_untracked_rows() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
         let untracked_state = UntrackedStateContext::new();
 
         let mut transaction = backend
@@ -384,7 +390,10 @@ mod tests {
     #[tokio::test]
     async fn tracked_row_is_visible_without_untracked_overlay() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
 
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -412,7 +421,10 @@ mod tests {
     #[tokio::test]
     async fn deleting_untracked_row_reveals_tracked_row() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
         let untracked_state = UntrackedStateContext::new();
 
         let mut transaction = backend
@@ -455,7 +467,10 @@ mod tests {
     #[tokio::test]
     async fn load_row_falls_back_to_global_tracked_row_for_requested_version() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
 
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -484,7 +499,10 @@ mod tests {
     #[tokio::test]
     async fn load_row_prefers_requested_version_over_global() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
 
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -516,7 +534,10 @@ mod tests {
     #[tokio::test]
     async fn load_row_prefers_requested_untracked_over_requested_tracked_and_global_rows() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
         let untracked_state = UntrackedStateContext::new();
 
         let mut transaction = backend
@@ -557,7 +578,10 @@ mod tests {
     #[tokio::test]
     async fn scan_rows_overlays_requested_version_over_global() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
 
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -588,7 +612,10 @@ mod tests {
     #[tokio::test]
     async fn winning_tombstone_hides_row_unless_tombstones_are_included() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new();
+        let live_state = LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+        );
 
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
