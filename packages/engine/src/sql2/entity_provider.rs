@@ -33,6 +33,7 @@ use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
+use crate::engine2::version_ref::VersionRefReader;
 use crate::sql2::version_scope::resolve_provider_version_ids;
 use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
@@ -47,6 +48,7 @@ pub(crate) async fn register_entity_providers(
     ctx: &SessionContext,
     active_version_id: &str,
     live_state: Arc<dyn LiveStateReader>,
+    version_ref: Arc<dyn VersionRefReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
     history_available: bool,
     schema_definitions: &[JsonValue],
@@ -67,6 +69,7 @@ pub(crate) async fn register_entity_providers(
             Arc::new(EntityProvider::by_version(
                 Arc::clone(&spec),
                 Arc::clone(&live_state),
+                Arc::clone(&version_ref),
                 write_stager.as_ref().map(Arc::clone),
             )),
         )
@@ -77,6 +80,7 @@ pub(crate) async fn register_entity_providers(
             Arc::new(EntityProvider::active(
                 Arc::clone(&spec),
                 Arc::clone(&live_state),
+                Arc::clone(&version_ref),
                 write_stager.as_ref().map(Arc::clone),
                 active_version_id.to_string(),
             )),
@@ -192,6 +196,7 @@ struct EntitySurfaceSpec {
 pub(crate) struct EntityProvider {
     spec: Arc<EntitySurfaceSpec>,
     live_state: Arc<dyn LiveStateReader>,
+    version_ref: Arc<dyn VersionRefReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
     schema: SchemaRef,
     variant: EntityProviderVariant,
@@ -211,6 +216,7 @@ impl EntityProvider {
     fn active(
         spec: Arc<EntitySurfaceSpec>,
         live_state: Arc<dyn LiveStateReader>,
+        version_ref: Arc<dyn VersionRefReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
         active_version_id: String,
     ) -> Self {
@@ -218,6 +224,7 @@ impl EntityProvider {
             schema: entity_surface_schema(&spec, EntityProviderVariant::Active),
             spec,
             live_state,
+            version_ref,
             write_stager,
             variant: EntityProviderVariant::Active,
             active_version_id: Some(active_version_id),
@@ -227,12 +234,14 @@ impl EntityProvider {
     fn by_version(
         spec: Arc<EntitySurfaceSpec>,
         live_state: Arc<dyn LiveStateReader>,
+        version_ref: Arc<dyn VersionRefReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
     ) -> Self {
         Self {
             schema: entity_surface_schema(&spec, EntityProviderVariant::ByVersion),
             spec,
             live_state,
+            version_ref,
             write_stager,
             variant: EntityProviderVariant::ByVersion,
             active_version_id: None,
@@ -278,7 +287,7 @@ impl TableProvider for EntityProvider {
             limit,
         );
         request.filter.version_ids = resolve_provider_version_ids(
-            Arc::clone(&self.live_state),
+            self.version_ref.as_ref(),
             self.active_version_id.as_deref(),
             request.filter.version_ids,
         )
@@ -1865,10 +1874,12 @@ mod tests {
     use crate::engine2::live_state::{
         LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
+    use crate::engine2::version_ref::{VersionHead, VersionRefReader};
     use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateWriteRow};
     use crate::LixError;
 
     struct EmptyLiveStateReader;
+    struct EmptyVersionRefReader;
     #[derive(Default)]
     struct CapturingWriteStager {
         writes: Mutex<Vec<SqlWriteIntent>>,
@@ -1889,6 +1900,21 @@ mod tests {
         ) -> Result<Option<LiveStateRow>, LixError> {
             Ok(None)
         }
+    }
+
+    #[async_trait]
+    impl VersionRefReader for EmptyVersionRefReader {
+        async fn load_head(&self, _version_id: &str) -> Result<Option<VersionHead>, LixError> {
+            Ok(None)
+        }
+
+        async fn scan_heads(&self) -> Result<Vec<VersionHead>, LixError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn empty_version_ref() -> Arc<dyn VersionRefReader> {
+        Arc::new(EmptyVersionRefReader)
     }
 
     #[async_trait]
@@ -2138,6 +2164,7 @@ mod tests {
         let provider = super::EntityProvider::by_version(
             spec,
             Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
+            empty_version_ref(),
             None,
         );
 

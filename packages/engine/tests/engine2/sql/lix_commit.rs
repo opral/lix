@@ -1,6 +1,7 @@
 use crate::simulation_test2;
-use lix_engine::engine2::ExecuteResult;
 use lix_engine::Value;
+
+use super::select_rows;
 
 simulation_test2!(
     lix_commit_surfaces_expose_commits_edges_and_change_sets,
@@ -248,23 +249,6 @@ simulation_test2!(
         );
     }
 );
-
-async fn select_rows(
-    session: &crate::support::simulation_test::engine2::SimSession,
-    sql: &str,
-) -> Vec<Vec<Value>> {
-    let result = session
-        .execute(sql, &[])
-        .await
-        .expect("SELECT should succeed");
-    let ExecuteResult::Rows(rows) = result else {
-        panic!("SELECT should return rows");
-    };
-    rows.rows()
-        .iter()
-        .map(|row| row.values().to_vec())
-        .collect()
-}
 
 fn text_value(value: &Value) -> String {
     let Value::Text(value) = value else {

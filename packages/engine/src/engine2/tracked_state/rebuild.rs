@@ -552,6 +552,7 @@ mod tests {
             snapshot_content: Some(
                 serde_json::to_string(&json!({
                     "id": commit_id,
+                    "change_set_id": format!("change-set-{commit_id}"),
                     "change_ids": change_ids,
                     "parent_commit_ids": parent_commit_ids,
                 }))

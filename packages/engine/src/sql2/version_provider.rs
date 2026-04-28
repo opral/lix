@@ -20,17 +20,22 @@ use futures_util::stream;
 use serde_json::Value as JsonValue;
 
 use crate::engine2::live_state::{
-    LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+    LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateScanRequest,
 };
+use crate::engine2::version_ref::VersionRefReader;
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{LixError, NullableKeyFilter};
+use crate::LixError;
 
 pub(crate) async fn register_lix_version_provider(
     session: &datafusion::prelude::SessionContext,
     live_state: Arc<dyn LiveStateReader>,
+    version_ref: Arc<dyn VersionRefReader>,
 ) -> Result<(), LixError> {
     session
-        .register_table("lix_version", Arc::new(LixVersionProvider::new(live_state)))
+        .register_table(
+            "lix_version",
+            Arc::new(LixVersionProvider::new(live_state, version_ref)),
+        )
         .map_err(datafusion_error_to_lix_error)?;
     Ok(())
 }
@@ -38,6 +43,7 @@ pub(crate) async fn register_lix_version_provider(
 struct LixVersionProvider {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
+    version_ref: Arc<dyn VersionRefReader>,
 }
 
 impl std::fmt::Debug for LixVersionProvider {
@@ -47,10 +53,11 @@ impl std::fmt::Debug for LixVersionProvider {
 }
 
 impl LixVersionProvider {
-    fn new(live_state: Arc<dyn LiveStateReader>) -> Self {
+    fn new(live_state: Arc<dyn LiveStateReader>, version_ref: Arc<dyn VersionRefReader>) -> Self {
         Self {
             schema: lix_version_schema(),
             live_state,
+            version_ref,
         }
     }
 }
@@ -88,6 +95,7 @@ impl TableProvider for LixVersionProvider {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(LixVersionScanExec::new(
             Arc::clone(&self.live_state),
+            Arc::clone(&self.version_ref),
             projected_schema(&self.schema, projection),
             projection.cloned(),
         )))
@@ -96,6 +104,7 @@ impl TableProvider for LixVersionProvider {
 
 struct LixVersionScanExec {
     live_state: Arc<dyn LiveStateReader>,
+    version_ref: Arc<dyn VersionRefReader>,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
     properties: Arc<PlanProperties>,
@@ -110,6 +119,7 @@ impl std::fmt::Debug for LixVersionScanExec {
 impl LixVersionScanExec {
     fn new(
         live_state: Arc<dyn LiveStateReader>,
+        version_ref: Arc<dyn VersionRefReader>,
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
     ) -> Self {
@@ -121,6 +131,7 @@ impl LixVersionScanExec {
         );
         Self {
             live_state,
+            version_ref,
             schema,
             projection,
             properties: Arc::new(properties),
@@ -180,10 +191,11 @@ impl ExecutionPlan for LixVersionScanExec {
         }
 
         let live_state = Arc::clone(&self.live_state);
+        let version_ref = Arc::clone(&self.version_ref);
         let projection = version_projection_for_scan(self.projection.as_ref());
         let schema = Arc::clone(&self.schema);
         let stream = stream::once(async move {
-            let rows = load_version_rows(live_state)
+            let rows = load_version_rows(live_state, version_ref)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             version_record_batch(&projection, &rows)
@@ -210,6 +222,7 @@ enum VersionColumn {
 
 async fn load_version_rows(
     live_state: Arc<dyn LiveStateReader>,
+    version_ref: Arc<dyn VersionRefReader>,
 ) -> Result<Vec<VersionRow>, LixError> {
     let descriptor_rows = live_state
         .scan_rows(&LiveStateScanRequest {
@@ -226,19 +239,11 @@ async fn load_version_rows(
     let mut out = Vec::new();
     for descriptor_row in descriptor_rows {
         let descriptor = parse_descriptor(&descriptor_row)?;
-        let Some(ref_row) = live_state
-            .load_row(&LiveStateRowRequest {
-                schema_key: "lix_version_ref".to_string(),
-                version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: descriptor.id.clone(),
-                file_id: NullableKeyFilter::Null,
-            })
-            .await?
-        else {
+        let Some(commit_id) = version_ref.load_head_commit_id(&descriptor.id).await? else {
             continue;
         };
         out.push(VersionRow {
-            commit_id: parse_ref_commit_id(&ref_row)?,
+            commit_id,
             id: descriptor.id,
             name: descriptor.name,
             hidden: descriptor.hidden,
@@ -276,15 +281,6 @@ fn parse_descriptor(row: &LiveStateRow) -> Result<VersionDescriptor, LixError> {
         .and_then(JsonValue::as_bool)
         .unwrap_or(false);
     Ok(VersionDescriptor { id, name, hidden })
-}
-
-fn parse_ref_commit_id(row: &LiveStateRow) -> Result<String, LixError> {
-    let snapshot = parse_snapshot(row, "lix_version_ref")?;
-    snapshot
-        .get("commit_id")
-        .and_then(JsonValue::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", "lix_version_ref is missing commit_id"))
 }
 
 fn parse_snapshot(row: &LiveStateRow, schema_key: &str) -> Result<JsonValue, LixError> {

@@ -32,6 +32,7 @@ use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
+use crate::engine2::version_ref::VersionRefReader;
 use crate::sql2::version_scope::resolve_provider_version_ids;
 use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
@@ -56,6 +57,7 @@ pub(crate) async fn register_lix_file_providers(
     session: &SessionContext,
     active_version_id: &str,
     live_state: Arc<dyn LiveStateReader>,
+    version_ref: Arc<dyn VersionRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
     functions: FunctionProviderHandle,
@@ -66,6 +68,7 @@ pub(crate) async fn register_lix_file_providers(
             "lix_file_by_version",
             Arc::new(LixFileProvider::by_version(
                 Arc::clone(&live_state),
+                Arc::clone(&version_ref),
                 Arc::clone(&blob_reader),
                 write_stager.as_ref().map(Arc::clone),
                 functions.clone(),
@@ -78,6 +81,7 @@ pub(crate) async fn register_lix_file_providers(
             Arc::new(LixFileProvider::active_version(
                 active_version_id,
                 live_state,
+                version_ref,
                 Arc::clone(&blob_reader),
                 write_stager,
                 functions,
@@ -114,6 +118,7 @@ pub(crate) async fn register_lix_file_providers(
 pub(crate) struct LixFileProvider {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
+    version_ref: Arc<dyn VersionRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
     functions: FunctionProviderHandle,
@@ -130,6 +135,7 @@ impl LixFileProvider {
     pub(crate) fn active_version(
         active_version_id: impl Into<String>,
         live_state: Arc<dyn LiveStateReader>,
+        version_ref: Arc<dyn VersionRefReader>,
         blob_reader: Arc<dyn BlobDataReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
         functions: FunctionProviderHandle,
@@ -137,6 +143,7 @@ impl LixFileProvider {
         Self {
             schema: lix_file_schema(),
             live_state,
+            version_ref,
             blob_reader,
             write_stager,
             functions,
@@ -146,6 +153,7 @@ impl LixFileProvider {
 
     pub(crate) fn by_version(
         live_state: Arc<dyn LiveStateReader>,
+        version_ref: Arc<dyn VersionRefReader>,
         blob_reader: Arc<dyn BlobDataReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
         functions: FunctionProviderHandle,
@@ -153,6 +161,7 @@ impl LixFileProvider {
         Self {
             schema: lix_file_by_version_schema(),
             live_state,
+            version_ref,
             blob_reader,
             write_stager,
             functions,
@@ -271,7 +280,7 @@ impl TableProvider for LixFileProvider {
         let projected_schema = projected_schema(&self.schema, projection)?;
         let mut request = lix_file_scan_request(self.default_version_id.as_deref(), limit);
         request.filter.version_ids = resolve_provider_version_ids(
-            Arc::clone(&self.live_state),
+            self.version_ref.as_ref(),
             self.default_version_id.as_deref(),
             request.filter.version_ids,
         )
