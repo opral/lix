@@ -3,10 +3,11 @@ use std::sync::Arc;
 use serde_json::Value as JsonValue;
 
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
-use crate::engine2::changelog::ChangelogContext;
+use crate::engine2::changelog::{ChangelogContext, ChangelogReader};
 use crate::engine2::functions::FunctionProviderHandle;
 use crate::engine2::live_state::{LiveStateContext, LiveStateReader};
 use crate::engine2::schema_registry::SchemaRegistry;
+use crate::engine2::version_ref::VersionRefContext;
 use crate::sql2::SqlExecutionContext;
 use crate::{LixBackend, LixError};
 
@@ -22,6 +23,7 @@ pub struct SessionContext {
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) changelog: Arc<ChangelogContext>,
+    pub(super) version_ref: Arc<VersionRefContext>,
     pub(super) schema_registry: Arc<SchemaRegistry>,
 }
 
@@ -32,6 +34,7 @@ impl SessionContext {
         live_state: Arc<LiveStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
+        version_ref: Arc<VersionRefContext>,
         schema_registry: Arc<SchemaRegistry>,
     ) -> Result<Self, LixError> {
         Ok(Self::new(
@@ -40,6 +43,7 @@ impl SessionContext {
             live_state,
             binary_cas,
             changelog,
+            version_ref,
             schema_registry,
         ))
     }
@@ -50,6 +54,7 @@ impl SessionContext {
         live_state: Arc<LiveStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
+        version_ref: Arc<VersionRefContext>,
         schema_registry: Arc<SchemaRegistry>,
     ) -> Self {
         Self {
@@ -58,6 +63,7 @@ impl SessionContext {
             live_state,
             binary_cas,
             changelog,
+            version_ref,
             schema_registry,
         }
     }
@@ -76,6 +82,7 @@ pub(super) struct SessionSqlExecutionContext<'a> {
     pub(super) backend: Arc<dyn LixBackend + Send + Sync>,
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
+    pub(super) changelog: Arc<ChangelogContext>,
     pub(super) visible_schemas: Vec<JsonValue>,
     pub(super) functions: FunctionProviderHandle,
 }
@@ -87,6 +94,10 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
 
     fn live_state(&self) -> Arc<dyn LiveStateReader> {
         Arc::new(self.live_state.reader(Arc::clone(&self.backend))) as Arc<dyn LiveStateReader>
+    }
+
+    fn changelog(&self) -> Option<Arc<dyn ChangelogReader>> {
+        Some(Arc::new(self.changelog.reader(Arc::clone(&self.backend))))
     }
 
     fn functions(&self) -> FunctionProviderHandle {

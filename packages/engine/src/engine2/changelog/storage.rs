@@ -103,7 +103,7 @@ mod tests {
         tx.commit().await.expect("commit should succeed");
 
         let loaded = {
-            let mut reader = changelog.reader(backend);
+            let reader = changelog.reader(backend);
             reader.load_change("change-1").await
         }
         .expect("load should succeed");
@@ -126,7 +126,7 @@ mod tests {
         tx.commit().await.expect("commit should succeed");
 
         let changes = {
-            let mut reader = changelog.reader(backend);
+            let reader = changelog.reader(backend);
             reader
                 .scan_changes(&ChangelogScanRequest { limit: Some(1) })
                 .await

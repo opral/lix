@@ -151,6 +151,7 @@ impl SessionContext {
             backend: Arc::clone(&self.backend),
             live_state: Arc::clone(&self.live_state),
             binary_cas: Arc::clone(&self.binary_cas),
+            changelog: Arc::clone(&self.changelog),
             visible_schemas,
             functions: functions.clone(),
         };
@@ -166,6 +167,7 @@ impl SessionContext {
                 Arc::clone(&self.live_state),
                 Arc::clone(&self.binary_cas),
                 Arc::clone(&self.changelog),
+                Arc::clone(&self.version_ref),
                 Arc::clone(&self.schema_registry),
                 functions,
             )

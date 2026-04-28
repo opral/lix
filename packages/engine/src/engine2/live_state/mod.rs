@@ -4,7 +4,7 @@ mod reader;
 mod types;
 
 #[allow(unused_imports)]
-pub(crate) use context::{LiveStateContext, LiveStateContextReader, LiveStateContextWriter};
+pub(crate) use context::{LiveStateContext, LiveStateStoreReader, LiveStateWriter};
 #[allow(unused_imports)]
 pub(crate) use reader::LiveStateReader;
 #[allow(unused_imports)]

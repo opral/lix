@@ -1,16 +1,9 @@
-use serde_json::Value as JsonValue;
-
 use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
 use crate::engine2::changelog::ChangelogContext;
 use crate::engine2::commit_graph::CommitGraphContext;
-use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest};
-use crate::engine2::tracked_state::{
-    TrackedStateContext, TrackedStateDeleteRequest, TrackedStateFilter,
-};
-use crate::engine2::untracked_state::UntrackedStateContext;
+use crate::engine2::tracked_state::{TrackedStateDeleteRequest, TrackedStateFilter};
 use crate::engine2::{Engine, ExecuteResult};
-use crate::version::GLOBAL_VERSION_ID;
-use crate::{LixError, NullableKeyFilter, Value};
+use crate::Value;
 
 #[tokio::test]
 async fn tracked_state_rebuild_restores_sql_reads_from_changelog() {
@@ -40,9 +33,13 @@ async fn tracked_state_rebuild_restores_sql_reads_from_changelog() {
     assert_eq!(insert_result, ExecuteResult::AffectedRows(1));
     assert_key_value_visible(&session, "\"before-rebuild\"").await;
 
-    let head_commit_id = load_version_head(&backend, &receipt.main_version_id)
+    let head_commit_id = engine
+        .version_ref()
+        .reader(&backend)
+        .load_head_commit_id(&receipt.main_version_id)
         .await
-        .expect("version head should load");
+        .expect("version head should load")
+        .expect("version head should exist");
     delete_tracked_rows_for_version(&engine, &backend, &receipt.main_version_id).await;
     assert_key_value_missing(&session).await;
 
@@ -102,51 +99,6 @@ async fn delete_tracked_rows_for_version(
         .commit()
         .await
         .expect("delete transaction should commit");
-}
-
-async fn load_version_head(
-    backend: &UnitTestBackend,
-    version_id: &str,
-) -> Result<String, LixError> {
-    let live_state =
-        LiveStateContext::new(TrackedStateContext::new(), UntrackedStateContext::new());
-    let row = live_state
-        .reader(backend)
-        .load_row(&LiveStateRowRequest {
-            schema_key: "lix_version_ref".to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: version_id.to_string(),
-            file_id: NullableKeyFilter::Null,
-        })
-        .await?
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("missing version ref for version '{version_id}'"),
-            )
-        })?;
-    let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("version ref for version '{version_id}' is missing snapshot_content"),
-        )
-    })?;
-    let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("version ref snapshot is invalid JSON: {error}"),
-        )
-    })?;
-    snapshot
-        .get("commit_id")
-        .and_then(JsonValue::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("version ref for version '{version_id}' is missing commit_id"),
-            )
-        })
 }
 
 async fn assert_key_value_visible(session: &crate::engine2::SessionContext, expected: &str) {

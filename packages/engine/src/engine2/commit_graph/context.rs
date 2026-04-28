@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::KvStore;
-use crate::engine2::changelog::{CanonicalChange, ChangelogContext};
+use crate::engine2::changelog::{CanonicalChange, ChangelogContext, ChangelogStoreReader};
 use crate::engine2::commit_graph::{CommitGraphCommit, CommitGraphEntity};
 use crate::LixError;
 
@@ -31,12 +31,12 @@ impl CommitGraphContext {
     }
 }
 
-/// Reader that resolves entities at a commit head.
+/// Commit-graph reader that resolves changelog entities at a commit head.
 pub(crate) struct CommitGraphReader<S>
 where
     S: KvStore,
 {
-    changelog: crate::engine2::changelog::ChangelogReader<S>,
+    changelog: ChangelogStoreReader<S>,
 }
 
 impl<S> CommitGraphReader<S>
@@ -61,7 +61,7 @@ where
         &mut self,
         commit_id: &str,
     ) -> Result<Option<CommitGraphCommit>, LixError> {
-        let Some(change) = find_commit_change(&mut self.changelog, commit_id).await? else {
+        let Some(change) = find_commit_change(&self.changelog, commit_id).await? else {
             return Ok(None);
         };
         parse_commit_change(change).map(Some)
@@ -315,7 +315,7 @@ impl CanonicalEntityIdentity {
 }
 
 async fn find_commit_change<S>(
-    changelog: &mut crate::engine2::changelog::ChangelogReader<S>,
+    changelog: &ChangelogStoreReader<S>,
     commit_id: &str,
 ) -> Result<Option<crate::engine2::changelog::CanonicalChange>, LixError>
 where

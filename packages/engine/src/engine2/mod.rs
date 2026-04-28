@@ -16,6 +16,7 @@ pub mod session;
 pub(crate) mod tracked_state;
 pub mod transaction;
 pub(crate) mod untracked_state;
+pub(crate) mod version_ref;
 
 #[cfg(test)]
 mod tests;

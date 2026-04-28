@@ -1,3 +1,4 @@
+mod change_provider;
 mod datafusion;
 mod directory_provider;
 mod entity_provider;
@@ -11,6 +12,7 @@ mod history_provider;
 mod lix_state_provider;
 mod types;
 mod udf;
+mod version_provider;
 
 #[allow(unused_imports)]
 pub(crate) use datafusion::{
