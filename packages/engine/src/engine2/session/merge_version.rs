@@ -43,9 +43,10 @@ impl SessionContext {
             Arc::new(self.live_state.reader(Arc::clone(&self.backend)));
         let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
         let functions = runtime_functions.provider();
+        let active_version_id = self.active_version_id().await?;
 
         let mut transaction = Transaction::open(
-            self.active_version_id().to_string(),
+            active_version_id.clone(),
             &self.backend,
             Arc::clone(&self.live_state),
             Arc::clone(&self.binary_cas),
@@ -59,14 +60,14 @@ impl SessionContext {
         let (target_head, source_head) = {
             let reader = self.version_ref.reader(transaction.kv_store());
             let target_head = reader
-                .load_head_commit_id(self.active_version_id())
+                .load_head_commit_id(&active_version_id)
                 .await?
                 .ok_or_else(|| {
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!(
                             "cannot merge into missing active version ref '{}'",
-                            self.active_version_id()
+                            active_version_id
                         ),
                     )
                 })?;
@@ -112,7 +113,7 @@ impl SessionContext {
             ));
         }
 
-        let rows = stage_rows_from_merge_plan(&merge_plan, self.active_version_id());
+        let rows = stage_rows_from_merge_plan(&merge_plan, &active_version_id);
         if rows.is_empty() {
             transaction.rollback().await?;
             return Ok(MergeVersionReceipt { merged_changes: 0 });
@@ -120,7 +121,7 @@ impl SessionContext {
 
         let merged_changes = rows.len();
         transaction.stage_rows(rows)?;
-        transaction.add_commit_parent(self.active_version_id().to_string(), source_head)?;
+        transaction.add_commit_parent(active_version_id, source_head)?;
         transaction.commit(&runtime_functions).await?;
         Ok(MergeVersionReceipt { merged_changes })
     }

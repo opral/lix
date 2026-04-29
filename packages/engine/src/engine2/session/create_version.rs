@@ -44,10 +44,11 @@ impl SessionContext {
             Arc::new(self.live_state.reader(Arc::clone(&self.backend)));
         let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
         let functions = runtime_functions.provider();
+        let active_version_id = self.active_version_id().await?;
         let version_id = options.id.unwrap_or_else(|| functions.call_uuid_v7());
 
         let mut transaction = Transaction::open(
-            self.active_version_id().to_string(),
+            active_version_id.clone(),
             &self.backend,
             Arc::clone(&self.live_state),
             Arc::clone(&self.binary_cas),
@@ -61,14 +62,14 @@ impl SessionContext {
         let source_head = {
             let reader = self.version_ref.reader(transaction.kv_store());
             reader
-                .load_head_commit_id(self.active_version_id())
+                .load_head_commit_id(&active_version_id)
                 .await?
                 .ok_or_else(|| {
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!(
                             "cannot create version from missing active version ref '{}'",
-                            self.active_version_id()
+                            active_version_id
                         ),
                     )
                 })?

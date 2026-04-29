@@ -50,6 +50,18 @@ impl Engine2Simulation {
         self.engine.clone()
     }
 
+    /// Boots a fresh engine from the current backend snapshot.
+    ///
+    /// This is the simulation equivalent of closing the app and reopening the
+    /// same repository. It lets tests distinguish persisted workspace state
+    /// from in-memory session state.
+    pub async fn reboot_engine_from_current_snapshot(&self) -> Result<Engine, LixError> {
+        Engine::new(Box::new(InMemoryKvBackend::from_snapshot(
+            self.backend.snapshot(),
+        )))
+        .await
+    }
+
     /// Opens a session on the initialized main version.
     pub async fn open_main_session(&self, engine: &Engine) -> Result<SimSession, LixError> {
         let session = engine
@@ -58,7 +70,16 @@ impl Engine2Simulation {
         Ok(SimSession {
             sim: self.clone(),
             engine: engine.clone(),
-            active_version_id: self.receipt.main_version_id.clone(),
+            session,
+        })
+    }
+
+    /// Opens a session that follows the shared workspace version selector.
+    pub async fn open_workspace_session(&self, engine: &Engine) -> Result<SimSession, LixError> {
+        let session = engine.open_workspace_session().await?;
+        Ok(SimSession {
+            sim: self.clone(),
+            engine: engine.clone(),
             session,
         })
     }
@@ -74,7 +95,6 @@ impl Engine2Simulation {
         Ok(SimSession {
             sim: self.clone(),
             engine: engine.clone(),
-            active_version_id,
             session,
         })
     }
@@ -85,7 +105,6 @@ impl Engine2Simulation {
         Ok(SimSession {
             sim: self.clone(),
             engine: engine.clone(),
-            active_version_id: "global".to_string(),
             session,
         })
     }
@@ -128,17 +147,21 @@ impl Engine2Simulation {
 pub struct SimSession {
     sim: Engine2Simulation,
     engine: Engine,
-    active_version_id: String,
     session: SessionContext,
 }
 
 impl SimSession {
+    pub async fn active_version_id(&self) -> Result<String, LixError> {
+        self.session.active_version_id().await
+    }
+
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         match classify_statement(sql) {
             StatementKind::Read => {
+                let active_version_id = self.session.active_version_id().await?;
                 self.sim
                     .rebuild_tracked_state
-                    .before_read(&self.engine, &self.active_version_id)
+                    .before_read(&self.engine, &active_version_id)
                     .await?;
                 self.session.execute(sql, params).await
             }
@@ -184,7 +207,6 @@ impl SimSession {
             SimSession {
                 sim: self.sim.clone(),
                 engine: self.engine.clone(),
-                active_version_id: receipt.version_id.clone(),
                 session,
             },
             receipt,

@@ -13,6 +13,7 @@ use crate::{LixBackend, LixError, TransactionBeginMode};
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const KEY_VALUE_SCHEMA_VERSION: &str = "1";
 const LIX_ID_KEY: &str = "lix_id";
+const WORKSPACE_VERSION_KEY: &str = "lix_workspace_version_id";
 const VERSION_DESCRIPTOR_SCHEMA_KEY: &str = "lix_version_descriptor";
 const VERSION_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
 const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
@@ -106,6 +107,13 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         version_ref_snapshot(&main_version_id, &initial_commit_id)?,
         &timestamp,
     );
+    let workspace_version_row = untracked_row(
+        WORKSPACE_VERSION_KEY.to_string(),
+        KEY_VALUE_SCHEMA_KEY,
+        KEY_VALUE_SCHEMA_VERSION,
+        key_value_snapshot(WORKSPACE_VERSION_KEY, &main_version_id)?,
+        &timestamp,
+    );
 
     Ok(InitSeedPlan {
         changes: vec![
@@ -114,7 +122,11 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
             kv_lix_id_change,
             initial_commit_change,
         ],
-        untracked_rows: vec![global_version_ref_row, main_version_ref_row],
+        untracked_rows: vec![
+            global_version_ref_row,
+            main_version_ref_row,
+            workspace_version_row,
+        ],
         receipt: InitReceipt {
             lix_id,
             global_version_id: GLOBAL_VERSION_ID.to_string(),
@@ -283,11 +295,11 @@ mod tests {
     use crate::engine2::functions::{FunctionProvider, SharedFunctionProvider};
 
     #[test]
-    fn plan_init_seed_returns_tracked_changes_and_untracked_version_refs() {
+    fn plan_init_seed_returns_tracked_changes_and_untracked_workspace_state() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
 
         assert_eq!(plan.changes.len(), 4);
-        assert_eq!(plan.untracked_rows.len(), 2);
+        assert_eq!(plan.untracked_rows.len(), 3);
         assert_eq!(plan.receipt.global_version_id, GLOBAL_VERSION_ID);
         assert_eq!(plan.receipt.main_version_id, "test-uuid-1");
         assert_eq!(plan.receipt.lix_id, "test-uuid-2");
@@ -323,7 +335,11 @@ mod tests {
     #[test]
     fn plan_init_seed_version_refs_point_to_initial_commit() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
-        let version_refs = plan.untracked_rows.iter().collect::<Vec<_>>();
+        let version_refs = plan
+            .untracked_rows
+            .iter()
+            .filter(|row| row.schema_key == VERSION_REF_SCHEMA_KEY)
+            .collect::<Vec<_>>();
 
         assert_eq!(version_refs.len(), 2);
         assert!(plan
@@ -339,6 +355,30 @@ mod tests {
                 Some(plan.receipt.initial_commit_id.as_str())
             );
         }
+    }
+
+    #[test]
+    fn plan_init_seed_workspace_version_points_to_main_version() {
+        let plan = plan_init_seed(test_functions()).expect("init seed should plan");
+        let workspace_row = plan
+            .untracked_rows
+            .iter()
+            .find(|row| {
+                row.schema_key == KEY_VALUE_SCHEMA_KEY && row.entity_id == WORKSPACE_VERSION_KEY
+            })
+            .expect("workspace version row should exist");
+
+        assert_eq!(workspace_row.version_id, GLOBAL_VERSION_ID);
+        assert!(workspace_row.global);
+        let snapshot = untracked_snapshot(workspace_row);
+        assert_eq!(
+            snapshot.get("key").and_then(JsonValue::as_str),
+            Some(WORKSPACE_VERSION_KEY)
+        );
+        assert_eq!(
+            snapshot.get("value").and_then(JsonValue::as_str),
+            Some(plan.receipt.main_version_id.as_str())
+        );
     }
 
     fn snapshot(change: &CanonicalChange) -> JsonValue {
