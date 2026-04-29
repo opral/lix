@@ -69,8 +69,16 @@ where
     S: crate::backend::KvStore,
 {
     let scan_request = scan_request_for_diff(request);
-    let left_rows = keyed_rows(reader.scan_rows_at_commit(left_commit_id, &scan_request).await?);
-    let right_rows = keyed_rows(reader.scan_rows_at_commit(right_commit_id, &scan_request).await?);
+    let left_rows = keyed_rows(
+        reader
+            .scan_rows_at_commit(left_commit_id, &scan_request)
+            .await?,
+    );
+    let right_rows = keyed_rows(
+        reader
+            .scan_rows_at_commit(right_commit_id, &scan_request)
+            .await?,
+    );
     let identities = left_rows
         .keys()
         .chain(right_rows.keys())
@@ -193,10 +201,16 @@ mod tests {
 
         let diff = diff(&backend, &tracked_state).await;
 
-        assert_eq!(kinds(&diff), vec![("entity-a", TrackedStateDiffKind::Added)]);
+        assert_eq!(
+            kinds(&diff),
+            vec![("entity-a", TrackedStateDiffKind::Added)]
+        );
         assert!(diff.entries[0].before.is_none());
         assert_eq!(
-            diff.entries[0].after.as_ref().map(|row| row.change_id.as_str()),
+            diff.entries[0]
+                .after
+                .as_ref()
+                .map(|row| row.change_id.as_str()),
             Some("after")
         );
         assert!(!diff.entries[0].before_is_live());
@@ -265,7 +279,10 @@ mod tests {
 
         let diff = diff(&backend, &tracked_state).await;
 
-        assert_eq!(kinds(&diff), vec![("entity-a", TrackedStateDiffKind::Added)]);
+        assert_eq!(
+            kinds(&diff),
+            vec![("entity-a", TrackedStateDiffKind::Added)]
+        );
         let entry = &diff.entries[0];
         assert_eq!(
             entry.before.as_ref().map(|row| row.change_id.as_str()),
@@ -327,10 +344,7 @@ mod tests {
         let diff = diff(&backend, &tracked_state).await;
 
         assert_eq!(diff.entries.len(), 1);
-        assert_eq!(
-            diff.entries[0].identity.file_id.as_deref(),
-            Some("file-b")
-        );
+        assert_eq!(diff.entries[0].identity.file_id.as_deref(), Some("file-b"));
         assert_eq!(diff.entries[0].kind, TrackedStateDiffKind::Added);
     }
 
@@ -361,7 +375,10 @@ mod tests {
             .await
             .expect("diff should load");
 
-        assert_eq!(kinds(&diff), vec![("entity-b", TrackedStateDiffKind::Added)]);
+        assert_eq!(
+            kinds(&diff),
+            vec![("entity-b", TrackedStateDiffKind::Added)]
+        );
     }
 
     async fn diff(

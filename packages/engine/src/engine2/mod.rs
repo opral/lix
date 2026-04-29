@@ -13,6 +13,8 @@ pub(crate) mod init;
 pub(crate) mod live_state;
 pub(crate) mod schema_registry;
 pub mod session;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod tracked_state;
 pub mod transaction;
 pub(crate) mod untracked_state;

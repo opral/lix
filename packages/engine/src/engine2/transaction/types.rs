@@ -1,7 +1,71 @@
 use std::collections::BTreeSet;
 
+use async_trait::async_trait;
+
 use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::untracked_state::UntrackedStateRow;
+use crate::LixError;
+
+/// Incoming state row before transaction hydration.
+///
+/// Write frontends produce this shape after decoding their own surface. The
+/// transaction later assigns generated fields and turns it into a
+/// `StagedStateRow`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StageRow {
+    pub(crate) entity_id: String,
+    pub(crate) schema_key: String,
+    pub(crate) file_id: Option<String>,
+    pub(crate) plugin_key: Option<String>,
+    pub(crate) snapshot_content: Option<String>,
+    pub(crate) metadata: Option<String>,
+    pub(crate) schema_version: String,
+    pub(crate) created_at: Option<String>,
+    pub(crate) updated_at: Option<String>,
+    pub(crate) global: bool,
+    pub(crate) change_id: Option<String>,
+    pub(crate) commit_id: Option<String>,
+    pub(crate) untracked: bool,
+    pub(crate) version_id: String,
+}
+
+/// Incoming file payload paired with staged filesystem rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StageFileData {
+    pub(crate) file_id: String,
+    pub(crate) version_id: String,
+    pub(crate) untracked: bool,
+    pub(crate) data: Vec<u8>,
+}
+
+/// One decoded write batch before transaction hydration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StageWrite {
+    Rows {
+        rows: Vec<StageRow>,
+    },
+    RowsWithFileData {
+        rows: Vec<StageRow>,
+        file_data: Vec<StageFileData>,
+        count: u64,
+    },
+}
+
+/// Result returned after staging a decoded write batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StageWriteOutcome {
+    pub(crate) count: u64,
+}
+
+/// Execution-scoped authority for staging decoded writes into a transaction.
+///
+/// SQL providers, session APIs, and future write frontends should all target
+/// this boundary instead of depending on concrete transaction internals.
+#[async_trait]
+#[allow(dead_code)]
+pub(crate) trait StageWriteStager: Send + Sync {
+    async fn stage_write(&self, write: StageWrite) -> Result<StageWriteOutcome, LixError>;
+}
 
 /// Transaction-hydrated state row.
 ///

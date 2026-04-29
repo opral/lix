@@ -31,18 +31,18 @@ use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
+use crate::engine2::transaction::types::StageRow;
 use crate::engine2::version_ref::VersionRefReader;
 use crate::sql2::version_scope::resolve_provider_version_ids;
-use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
-use super::execute::{SqlWriteIntent, SqlWriteStager};
 use super::filesystem_planner::{
     directory_descriptor_row, plan_recursive_directory_delete, DirectoryDescriptorRowInput,
     DirectoryPathResolver, FilesystemDeletePlan, FilesystemRowContext,
 };
 use super::filesystem_visibility::VisibleFilesystem;
+use crate::engine2::transaction::types::{StageWrite, StageWriteStager};
 
 const DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
@@ -51,7 +51,7 @@ pub(crate) async fn register_lix_directory_providers(
     active_version_id: &str,
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
-    write_stager: Option<Arc<dyn SqlWriteStager>>,
+    write_stager: Option<Arc<dyn StageWriteStager>>,
     functions: FunctionProviderHandle,
 ) -> Result<(), LixError> {
     session
@@ -84,7 +84,7 @@ pub(crate) struct LixDirectoryProvider {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
-    write_stager: Option<Arc<dyn SqlWriteStager>>,
+    write_stager: Option<Arc<dyn StageWriteStager>>,
     functions: FunctionProviderHandle,
     default_version_id: Option<String>,
 }
@@ -100,7 +100,7 @@ impl LixDirectoryProvider {
         active_version_id: impl Into<String>,
         live_state: Arc<dyn LiveStateReader>,
         version_ref: Arc<dyn VersionRefReader>,
-        write_stager: Option<Arc<dyn SqlWriteStager>>,
+        write_stager: Option<Arc<dyn StageWriteStager>>,
         functions: FunctionProviderHandle,
     ) -> Self {
         Self {
@@ -116,7 +116,7 @@ impl LixDirectoryProvider {
     fn by_version(
         live_state: Arc<dyn LiveStateReader>,
         version_ref: Arc<dyn VersionRefReader>,
-        write_stager: Option<Arc<dyn SqlWriteStager>>,
+        write_stager: Option<Arc<dyn StageWriteStager>>,
         functions: FunctionProviderHandle,
     ) -> Self {
         Self {
@@ -276,7 +276,7 @@ impl TableProvider for LixDirectoryProvider {
 struct LixDirectoryInsertSink {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
-    write_stager: Arc<dyn SqlWriteStager>,
+    write_stager: Arc<dyn StageWriteStager>,
     functions: FunctionProviderHandle,
     default_version_id: Option<String>,
 }
@@ -291,7 +291,7 @@ impl LixDirectoryInsertSink {
     fn new(
         schema: SchemaRef,
         live_state: Arc<dyn LiveStateReader>,
-        write_stager: Arc<dyn SqlWriteStager>,
+        write_stager: Arc<dyn StageWriteStager>,
         functions: FunctionProviderHandle,
         default_version_id: Option<String>,
     ) -> Self {
@@ -374,7 +374,7 @@ impl DataSink for LixDirectoryInsertSink {
         }
 
         self.write_stager
-            .stage_write(SqlWriteIntent::WriteRows { rows })
+            .stage_write(StageWrite::Rows { rows })
             .await
             .map_err(lix_error_to_datafusion_error)?;
 
@@ -384,7 +384,7 @@ impl DataSink for LixDirectoryInsertSink {
 
 struct LixDirectoryDeleteExec {
     live_state: Arc<dyn LiveStateReader>,
-    write_stager: Arc<dyn SqlWriteStager>,
+    write_stager: Arc<dyn StageWriteStager>,
     table_schema: SchemaRef,
     default_version_id: Option<String>,
     request: LiveStateScanRequest,
@@ -402,7 +402,7 @@ impl std::fmt::Debug for LixDirectoryDeleteExec {
 impl LixDirectoryDeleteExec {
     fn new(
         live_state: Arc<dyn LiveStateReader>,
-        write_stager: Arc<dyn SqlWriteStager>,
+        write_stager: Arc<dyn StageWriteStager>,
         table_schema: SchemaRef,
         default_version_id: Option<String>,
         request: LiveStateScanRequest,
@@ -515,7 +515,7 @@ impl ExecutionPlan for LixDirectoryDeleteExec {
 
             if count > 0 {
                 write_stager
-                    .stage_write(SqlWriteIntent::WriteRows { rows: write_rows })
+                    .stage_write(StageWrite::Rows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -535,7 +535,7 @@ impl ExecutionPlan for LixDirectoryDeleteExec {
 
 struct LixDirectoryUpdateExec {
     live_state: Arc<dyn LiveStateReader>,
-    write_stager: Arc<dyn SqlWriteStager>,
+    write_stager: Arc<dyn StageWriteStager>,
     table_schema: SchemaRef,
     default_version_id: Option<String>,
     request: LiveStateScanRequest,
@@ -554,7 +554,7 @@ impl std::fmt::Debug for LixDirectoryUpdateExec {
 impl LixDirectoryUpdateExec {
     fn new(
         live_state: Arc<dyn LiveStateReader>,
-        write_stager: Arc<dyn SqlWriteStager>,
+        write_stager: Arc<dyn StageWriteStager>,
         table_schema: SchemaRef,
         default_version_id: Option<String>,
         request: LiveStateScanRequest,
@@ -668,7 +668,7 @@ impl ExecutionPlan for LixDirectoryUpdateExec {
 
             if count > 0 {
                 write_stager
-                    .stage_write(SqlWriteIntent::WriteRows { rows: write_rows })
+                    .stage_write(StageWrite::Rows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -815,7 +815,7 @@ struct DirectoryDescriptorSnapshot {
 fn lix_directory_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StageRow>> {
     lix_directory_write_rows_from_batch_with_options(batch, default_version_id, true)
 }
 
@@ -824,7 +824,7 @@ fn lix_directory_write_rows_from_batch_with_path_resolvers(
     default_version_id: Option<&str>,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
     generate_directory_id: &mut dyn FnMut() -> String,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StageRow>> {
     lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         batch,
         default_version_id,
@@ -837,7 +837,7 @@ fn lix_directory_write_rows_from_batch_with_path_resolvers(
 fn lix_directory_existing_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StageRow>> {
     lix_directory_write_rows_from_batch_with_options(batch, default_version_id, false)
 }
 
@@ -858,7 +858,7 @@ fn lix_directory_recursive_delete_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
     visible_filesystems: &BTreeMap<String, VisibleFilesystem>,
-) -> Result<(Vec<StateWriteRow>, u64)> {
+) -> Result<(Vec<StageRow>, u64)> {
     let mut rows = Vec::new();
     let mut seen = BTreeSet::new();
     for row_index in 0..batch.num_rows() {
@@ -885,7 +885,7 @@ fn lix_directory_recursive_delete_rows_from_batch(
 }
 
 fn append_deduped_delete_plan(
-    rows: &mut Vec<StateWriteRow>,
+    rows: &mut Vec<StageRow>,
     seen: &mut BTreeSet<StateRowDedupeKey>,
     plan: FilesystemDeletePlan,
 ) {
@@ -906,8 +906,8 @@ struct StateRowDedupeKey {
     untracked: bool,
 }
 
-impl From<&StateWriteRow> for StateRowDedupeKey {
-    fn from(row: &StateWriteRow) -> Self {
+impl From<&StageRow> for StateRowDedupeKey {
+    fn from(row: &StageRow) -> Self {
         Self {
             entity_id: row.entity_id.clone(),
             schema_key: row.schema_key.clone(),
@@ -923,7 +923,7 @@ fn lix_directory_write_rows_from_batch_with_options(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
     reject_read_only_fields: bool,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StageRow>> {
     lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         batch,
         default_version_id,
@@ -939,7 +939,7 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
     reject_read_only_fields: bool,
     mut path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
     mut generate_directory_id: Option<&mut dyn FnMut() -> String>,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StageRow>> {
     let mut rows = Vec::new();
     for row_index in 0..batch.num_rows() {
         if reject_read_only_fields {
@@ -956,7 +956,7 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         let hidden = optional_bool_value(batch, row_index, "hidden")?.unwrap_or(false);
         let context = directory_row_context_from_batch(batch, row_index, default_version_id)?;
 
-        if let Some(path) = path {
+        if let Some(path) = path.filter(|_| reject_read_only_fields) {
             reject_read_only_lix_directory_insert_field(batch, row_index, "parent_id")?;
             reject_read_only_lix_directory_insert_field(batch, row_index, "name")?;
 
@@ -1564,7 +1564,9 @@ mod tests {
     use crate::engine2::live_state::{
         LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
-    use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateWriteRow};
+    use crate::engine2::transaction::types::{
+        StageRow, StageWrite, StageWriteOutcome, StageWriteStager,
+    };
     use crate::LixError;
 
     use super::{
@@ -1589,14 +1591,14 @@ mod tests {
 
     #[derive(Default)]
     struct CapturingWriteStager {
-        writes: std::sync::Mutex<Vec<SqlWriteIntent>>,
+        writes: std::sync::Mutex<Vec<StageWrite>>,
     }
 
     #[async_trait]
-    impl SqlWriteStager for CapturingWriteStager {
-        async fn stage_write(&self, write: SqlWriteIntent) -> Result<SqlWriteOutcome, LixError> {
+    impl StageWriteStager for CapturingWriteStager {
+        async fn stage_write(&self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
             self.writes.lock().expect("writes lock").push(write);
-            Ok(SqlWriteOutcome { count: 0 })
+            Ok(StageWriteOutcome { count: 0 })
         }
     }
 
@@ -1841,7 +1843,7 @@ mod tests {
 
         assert_eq!(
             rows,
-            vec![StateWriteRow {
+            vec![StageRow {
                 entity_id: "dir-docs".to_string(),
                 schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                 file_id: None,
@@ -1987,7 +1989,7 @@ mod tests {
         let sink = LixDirectoryInsertSink::new(
             batch.schema(),
             Arc::new(RowsLiveStateReader::default()) as Arc<dyn LiveStateReader>,
-            Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
+            Arc::clone(&stager) as Arc<dyn StageWriteStager>,
             test_functions(),
             None,
         );
@@ -2003,8 +2005,8 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(
             stager.writes.lock().expect("writes lock").as_slice(),
-            &[SqlWriteIntent::WriteRows {
-                rows: vec![StateWriteRow {
+            &[StageWrite::Rows {
+                rows: vec![StageRow {
                     entity_id: "dir-docs".to_string(),
                     schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                     file_id: None,
@@ -2040,7 +2042,7 @@ mod tests {
                     "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}",
                 )],
             }) as Arc<dyn LiveStateReader>,
-            Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
+            Arc::clone(&stager) as Arc<dyn StageWriteStager>,
             test_functions(),
             None,
         );
@@ -2055,8 +2057,8 @@ mod tests {
 
         assert_eq!(count, 1);
         let guard = stager.writes.lock().expect("writes lock");
-        let [SqlWriteIntent::WriteRows { rows }] = guard.as_slice() else {
-            panic!("expected one directory write intent");
+        let [StageWrite::Rows { rows }] = guard.as_slice() else {
+            panic!("expected one directory staged write");
         };
         assert_eq!(rows.len(), 1);
         let snapshot: serde_json::Value =

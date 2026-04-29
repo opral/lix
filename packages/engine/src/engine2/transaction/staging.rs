@@ -5,29 +5,31 @@ use async_trait::async_trait;
 
 use crate::engine2::functions::{FunctionProvider, FunctionProviderHandle};
 use crate::engine2::live_state::{LiveStateRow, LiveStateRowRequest, LiveStateScanRequest};
+use crate::engine2::transaction::types::{
+    StageFileData, StageRow, StageWrite, StageWriteOutcome, StageWriteStager,
+};
 use crate::engine2::transaction::types::{StagedCommitMembers, StagedStateRow};
-use crate::sql2::{FileDataWrite, SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateWriteRow};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
 /// Transaction-local writes decoded by DataFusion provider hooks.
 ///
 /// This is the engine2 seam between SQL execution and transaction ownership:
-/// providers stage SQL write intents here, the transaction normalizes them into
+/// write frontends stage decoded writes here, the transaction normalizes them into
 /// stable `StagedStateRow`s, reads build a `StagedStateRowOverlay` from those rows,
 /// and commit later drains the same rows.
 pub(crate) struct TransactionStagedWrites {
     functions: FunctionProviderHandle,
     rows: Mutex<BTreeMap<StagedStateRowIdentity, StagedStateRow>>,
     commit_members_by_version: Mutex<BTreeMap<String, StagedCommitMembers>>,
-    file_data_writes: Mutex<Vec<FileDataWrite>>,
+    file_data_writes: Mutex<Vec<StageFileData>>,
 }
 
 /// Drained transaction-local writes ready for commit.
 pub(crate) struct StagedWriteSet {
     pub(crate) state_rows: Vec<StagedStateRow>,
     pub(crate) commit_members_by_version: BTreeMap<String, StagedCommitMembers>,
-    pub(crate) file_data_writes: Vec<FileDataWrite>,
+    pub(crate) file_data_writes: Vec<StageFileData>,
 }
 
 impl TransactionStagedWrites {
@@ -77,17 +79,20 @@ impl TransactionStagedWrites {
         })?;
         Ok(StagedStateRowOverlay::new(guard.clone()))
     }
-}
 
-#[async_trait]
-impl SqlWriteStager for TransactionStagedWrites {
-    async fn stage_write(&self, write: SqlWriteIntent) -> Result<SqlWriteOutcome, LixError> {
+    /// Stages one decoded write batch into this transaction.
+    ///
+    /// This is the single hydration boundary for engine2 writes:
+    /// frontends hand us `StageRow`s, and this method assigns timestamps,
+    /// change ids, commit ids, and commit membership before commit routing ever
+    /// sees the rows.
+    pub(crate) fn stage_write(&self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
         let count = match &write {
-            SqlWriteIntent::WriteRows { rows } => rows.len() as u64,
-            SqlWriteIntent::WriteRowsWithFileData { count, .. } => *count,
+            StageWrite::Rows { rows } => rows.len() as u64,
+            StageWrite::RowsWithFileData { count, .. } => *count,
         };
         let mut functions = self.functions.clone();
-        let (rows, file_data_writes) = state_rows_from_write_intent(write, &mut functions)?;
+        let (rows, file_data_writes) = state_rows_from_stage_write(write, &mut functions)?;
         for row in &rows {
             validate_commit_membership_support(row)?;
         }
@@ -126,7 +131,14 @@ impl SqlWriteStager for TransactionStagedWrites {
                 })?
                 .extend(file_data_writes);
         }
-        Ok(SqlWriteOutcome { count })
+        Ok(StageWriteOutcome { count })
+    }
+}
+
+#[async_trait]
+impl StageWriteStager for TransactionStagedWrites {
+    async fn stage_write(&self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
+        TransactionStagedWrites::stage_write(self, write)
     }
 }
 
@@ -256,17 +268,17 @@ impl From<&LiveStateRow> for StagedStateRowIdentity {
     }
 }
 
-fn state_rows_from_write_intent(
-    write: SqlWriteIntent,
+fn state_rows_from_stage_write(
+    write: StageWrite,
     functions: &mut dyn FunctionProvider,
-) -> Result<(Vec<StagedStateRow>, Vec<FileDataWrite>), LixError> {
+) -> Result<(Vec<StagedStateRow>, Vec<StageFileData>), LixError> {
     let mut state_rows = Vec::new();
     let mut file_data_writes = Vec::new();
     match write {
-        SqlWriteIntent::WriteRows { rows } => {
+        StageWrite::Rows { rows } => {
             push_state_rows(&mut state_rows, rows, functions)?;
         }
-        SqlWriteIntent::WriteRowsWithFileData {
+        StageWrite::RowsWithFileData {
             rows, file_data, ..
         } => {
             push_state_rows(&mut state_rows, rows, functions)?;
@@ -278,7 +290,7 @@ fn state_rows_from_write_intent(
 
 fn push_state_rows(
     state_rows: &mut Vec<StagedStateRow>,
-    rows: Vec<StateWriteRow>,
+    rows: Vec<StageRow>,
     functions: &mut dyn FunctionProvider,
 ) -> Result<(), LixError> {
     state_rows.reserve(rows.len());
@@ -289,7 +301,7 @@ fn push_state_rows(
 }
 
 fn hydrate_state_write_row(
-    row: StateWriteRow,
+    row: StageRow,
     functions: &mut dyn FunctionProvider,
 ) -> Result<StagedStateRow, LixError> {
     let updated_at = row.updated_at.unwrap_or_else(|| functions.timestamp());
@@ -423,13 +435,12 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(SqlWriteIntent::WriteRows {
+            .stage_write(StageWrite::Rows {
                 rows: vec![
                     state_row("sql2-duplicate-key", "first"),
                     state_row("sql2-duplicate-key", "second"),
                 ],
             })
-            .await
             .expect("staging rows should succeed");
 
         let overlay = staged_writes
@@ -458,13 +469,12 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(SqlWriteIntent::WriteRows {
+            .stage_write(StageWrite::Rows {
                 rows: vec![
                     state_row("sql2-duplicate-key", "first"),
                     state_row("sql2-duplicate-key", "second"),
                 ],
             })
-            .await
             .expect("staging rows should succeed");
 
         let overlay = staged_writes
@@ -484,13 +494,12 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(SqlWriteIntent::WriteRows {
+            .stage_write(StageWrite::Rows {
                 rows: vec![
                     state_row("sql2-delete-key", "visible"),
                     tombstone_row("sql2-delete-key"),
                 ],
             })
-            .await
             .expect("staging rows should succeed");
 
         let overlay = staged_writes
@@ -514,13 +523,12 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(SqlWriteIntent::WriteRows {
+            .stage_write(StageWrite::Rows {
                 rows: vec![
                     tombstone_row("sql2-resurrect-key"),
                     state_row("sql2-resurrect-key", "visible-again"),
                 ],
             })
-            .await
             .expect("staging rows should succeed");
 
         let overlay = staged_writes
@@ -550,14 +558,13 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(SqlWriteIntent::WriteRows {
+            .stage_write(StageWrite::Rows {
                 rows: vec![
                     state_row("sql2-key-a", "first"),
                     state_row("sql2-key-a", "second"),
                     state_row("sql2-key-b", "only"),
                 ],
             })
-            .await
             .expect("staging rows should succeed");
 
         let drained = staged_writes.drain().expect("drain should succeed");
@@ -580,9 +587,9 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(SqlWriteIntent::WriteRowsWithFileData {
+            .stage_write(StageWrite::RowsWithFileData {
                 rows: vec![state_row("file-readme", "descriptor")],
-                file_data: vec![FileDataWrite {
+                file_data: vec![StageFileData {
                     file_id: "file-readme".to_string(),
                     version_id: "global".to_string(),
                     untracked: true,
@@ -590,7 +597,6 @@ mod tests {
                 }],
                 count: 1,
             })
-            .await
             .expect("staging rows with file data should succeed");
 
         let drained = staged_writes.drain().expect("drain should succeed");
@@ -606,10 +612,9 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(SqlWriteIntent::WriteRows {
+            .stage_write(StageWrite::Rows {
                 rows: vec![state_row("tracked-key", "value").with_tracked()],
             })
-            .await
             .expect("tracked global row should stage");
 
         let drained = staged_writes.drain().expect("drain should succeed");
@@ -628,10 +633,9 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(SqlWriteIntent::WriteRows {
+            .stage_write(StageWrite::Rows {
                 rows: vec![state_row("untracked-key", "value")],
             })
-            .await
             .expect("untracked row should stage");
 
         let drained = staged_writes.drain().expect("drain should succeed");
@@ -643,7 +647,7 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(SqlWriteIntent::WriteRows {
+            .stage_write(StageWrite::Rows {
                 rows: vec![
                     state_row("overwrite-key", "first")
                         .with_tracked()
@@ -653,7 +657,6 @@ mod tests {
                         .with_change_id("change-second"),
                 ],
             })
-            .await
             .expect("tracked overwrite should stage");
 
         let drained = staged_writes.drain().expect("drain should succeed");
@@ -672,7 +675,7 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(SqlWriteIntent::WriteRows {
+            .stage_write(StageWrite::Rows {
                 rows: vec![
                     state_row("tracked-to-untracked-key", "tracked")
                         .with_tracked()
@@ -681,7 +684,6 @@ mod tests {
                         .with_change_id("change-untracked"),
                 ],
             })
-            .await
             .expect("untracked overwrite should stage");
 
         let drained = staged_writes.drain().expect("drain should succeed");
@@ -698,12 +700,11 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(SqlWriteIntent::WriteRows {
+            .stage_write(StageWrite::Rows {
                 rows: vec![state_row("active-version-key", "value")
                     .with_tracked()
                     .with_version("version-a")],
             })
-            .await
             .expect("active-version tracked staging should accumulate members");
 
         let drained = staged_writes.drain().expect("drain should succeed");
@@ -722,14 +723,13 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         let error = staged_writes
-            .stage_write(SqlWriteIntent::WriteRows {
+            .stage_write(StageWrite::Rows {
                 rows: vec![{
                     let mut row = state_row("invalid-global-key", "value");
                     row.version_id = "version-a".to_string();
                     row
                 }],
             })
-            .await
             .expect_err("global row with non-global version should fail");
 
         assert!(error
@@ -742,7 +742,7 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(SqlWriteIntent::WriteRows {
+            .stage_write(StageWrite::Rows {
                 rows: vec![
                     state_row("shared-entity", "base"),
                     state_row("shared-entity", "other-version").with_version("version-b"),
@@ -753,7 +753,6 @@ mod tests {
                     state_row("shared-entity", "tracked").with_tracked(),
                 ],
             })
-            .await
             .expect("staging rows should succeed");
 
         let overlay = staged_writes
@@ -780,10 +779,9 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(SqlWriteIntent::WriteRows {
+            .stage_write(StageWrite::Rows {
                 rows: vec![state_row("sql2-functions-key", "value").with_tracked()],
             })
-            .await
             .expect("staging rows should succeed");
 
         let drained = staged_writes.drain().expect("drain should succeed");
@@ -807,10 +805,9 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(SqlWriteIntent::WriteRows {
+            .stage_write(StageWrite::Rows {
                 rows: vec![state_row("tracked-commit-key", "value").with_tracked()],
             })
-            .await
             .expect("tracked row should stage");
 
         let drained = staged_writes.drain().expect("drain should succeed");
@@ -854,8 +851,8 @@ mod tests {
         }
     }
 
-    fn state_row(key: &str, value: &str) -> StateWriteRow {
-        StateWriteRow {
+    fn state_row(key: &str, value: &str) -> StageRow {
+        StageRow {
             entity_id: key.to_string(),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
@@ -873,8 +870,8 @@ mod tests {
         }
     }
 
-    fn tombstone_row(key: &str) -> StateWriteRow {
-        StateWriteRow {
+    fn tombstone_row(key: &str) -> StageRow {
+        StageRow {
             snapshot_content: None,
             ..state_row(key, "deleted")
         }
@@ -913,7 +910,7 @@ mod tests {
         fn with_change_id(self, change_id: &str) -> Self;
     }
 
-    impl StateRowTestExt for StateWriteRow {
+    impl StateRowTestExt for StageRow {
         fn with_schema(mut self, schema_key: &str) -> Self {
             self.schema_key = schema_key.to_string();
             self

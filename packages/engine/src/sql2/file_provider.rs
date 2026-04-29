@@ -32,9 +32,9 @@ use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
+use crate::engine2::transaction::types::StageRow;
 use crate::engine2::version_ref::VersionRefReader;
 use crate::sql2::version_scope::resolve_provider_version_ids;
-use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
@@ -42,12 +42,12 @@ const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
-use super::execute::{FileDataWrite, SqlWriteIntent, SqlWriteStager};
 use super::filesystem_planner::{
     blob_ref_row, directory_path_resolvers_from_state_rows, file_descriptor_row, plan_file_delete,
     plan_file_path_update, BlobRefRowInput, DirectoryPathResolver, FileDeleteInput,
     FileDescriptorRowInput, FilePathWriteInput, FilesystemDeletePlan, FilesystemRowContext,
 };
+use crate::engine2::transaction::types::{StageFileData, StageWrite, StageWriteStager};
 
 pub(crate) async fn register_lix_file_providers(
     session: &SessionContext,
@@ -55,7 +55,7 @@ pub(crate) async fn register_lix_file_providers(
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
-    write_stager: Option<Arc<dyn SqlWriteStager>>,
+    write_stager: Option<Arc<dyn StageWriteStager>>,
     functions: FunctionProviderHandle,
 ) -> Result<(), LixError> {
     session
@@ -91,7 +91,7 @@ pub(crate) struct LixFileProvider {
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
-    write_stager: Option<Arc<dyn SqlWriteStager>>,
+    write_stager: Option<Arc<dyn StageWriteStager>>,
     functions: FunctionProviderHandle,
     default_version_id: Option<String>,
 }
@@ -108,7 +108,7 @@ impl LixFileProvider {
         live_state: Arc<dyn LiveStateReader>,
         version_ref: Arc<dyn VersionRefReader>,
         blob_reader: Arc<dyn BlobDataReader>,
-        write_stager: Option<Arc<dyn SqlWriteStager>>,
+        write_stager: Option<Arc<dyn StageWriteStager>>,
         functions: FunctionProviderHandle,
     ) -> Self {
         Self {
@@ -126,7 +126,7 @@ impl LixFileProvider {
         live_state: Arc<dyn LiveStateReader>,
         version_ref: Arc<dyn VersionRefReader>,
         blob_reader: Arc<dyn BlobDataReader>,
-        write_stager: Option<Arc<dyn SqlWriteStager>>,
+        write_stager: Option<Arc<dyn StageWriteStager>>,
         functions: FunctionProviderHandle,
     ) -> Self {
         Self {
@@ -291,7 +291,7 @@ impl TableProvider for LixFileProvider {
 struct LixFileInsertSink {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
-    write_stager: Arc<dyn SqlWriteStager>,
+    write_stager: Arc<dyn StageWriteStager>,
     functions: FunctionProviderHandle,
     default_version_id: Option<String>,
 }
@@ -306,7 +306,7 @@ impl LixFileInsertSink {
     fn new(
         schema: SchemaRef,
         live_state: Arc<dyn LiveStateReader>,
-        write_stager: Arc<dyn SqlWriteStager>,
+        write_stager: Arc<dyn StageWriteStager>,
         functions: FunctionProviderHandle,
         default_version_id: Option<String>,
     ) -> Self {
@@ -381,11 +381,11 @@ impl DataSink for LixFileInsertSink {
 
         if !staged.state_rows.is_empty() || !staged.file_data_writes.is_empty() {
             let intent = if staged.file_data_writes.is_empty() {
-                SqlWriteIntent::WriteRows {
+                StageWrite::Rows {
                     rows: staged.state_rows,
                 }
             } else {
-                SqlWriteIntent::WriteRowsWithFileData {
+                StageWrite::RowsWithFileData {
                     rows: staged.state_rows,
                     file_data: staged.file_data_writes,
                     count: staged.count,
@@ -404,7 +404,7 @@ impl DataSink for LixFileInsertSink {
 struct LixFileDeleteExec {
     live_state: Arc<dyn LiveStateReader>,
     blob_reader: Arc<dyn BlobDataReader>,
-    write_stager: Arc<dyn SqlWriteStager>,
+    write_stager: Arc<dyn StageWriteStager>,
     table_schema: SchemaRef,
     default_version_id: Option<String>,
     request: LiveStateScanRequest,
@@ -423,7 +423,7 @@ impl LixFileDeleteExec {
     fn new(
         live_state: Arc<dyn LiveStateReader>,
         blob_reader: Arc<dyn BlobDataReader>,
-        write_stager: Arc<dyn SqlWriteStager>,
+        write_stager: Arc<dyn StageWriteStager>,
         table_schema: SchemaRef,
         default_version_id: Option<String>,
         request: LiveStateScanRequest,
@@ -531,7 +531,7 @@ impl ExecutionPlan for LixFileDeleteExec {
 
             if count > 0 {
                 write_stager
-                    .stage_write(SqlWriteIntent::WriteRows {
+                    .stage_write(StageWrite::Rows {
                         rows: staged.state_rows,
                     })
                     .await
@@ -554,7 +554,7 @@ impl ExecutionPlan for LixFileDeleteExec {
 struct LixFileUpdateExec {
     live_state: Arc<dyn LiveStateReader>,
     blob_reader: Arc<dyn BlobDataReader>,
-    write_stager: Arc<dyn SqlWriteStager>,
+    write_stager: Arc<dyn StageWriteStager>,
     table_schema: SchemaRef,
     default_version_id: Option<String>,
     functions: FunctionProviderHandle,
@@ -575,7 +575,7 @@ impl LixFileUpdateExec {
     fn new(
         live_state: Arc<dyn LiveStateReader>,
         blob_reader: Arc<dyn BlobDataReader>,
-        write_stager: Arc<dyn SqlWriteStager>,
+        write_stager: Arc<dyn StageWriteStager>,
         table_schema: SchemaRef,
         default_version_id: Option<String>,
         functions: FunctionProviderHandle,
@@ -710,11 +710,11 @@ impl ExecutionPlan for LixFileUpdateExec {
 
             if count > 0 {
                 let intent = if staged.file_data_writes.is_empty() {
-                    SqlWriteIntent::WriteRows {
+                    StageWrite::Rows {
                         rows: staged.state_rows,
                     }
                 } else {
-                    SqlWriteIntent::WriteRowsWithFileData {
+                    StageWrite::RowsWithFileData {
                         rows: staged.state_rows,
                         file_data: staged.file_data_writes,
                         count,
@@ -898,8 +898,8 @@ struct DirectoryDescriptorSnapshot {
 
 #[derive(Debug, Default)]
 struct LixFileStagedBatch {
-    state_rows: Vec<StateWriteRow>,
-    file_data_writes: Vec<FileDataWrite>,
+    state_rows: Vec<StageRow>,
+    file_data_writes: Vec<StageFileData>,
     count: u64,
 }
 
@@ -926,7 +926,7 @@ impl LixFileStagedBatch {
 fn lix_file_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StageRow>> {
     Ok(lix_file_insert_stage_from_batch(batch, default_version_id)?.state_rows)
 }
 
@@ -1264,7 +1264,7 @@ fn stage_lix_file_data_write(
         })
         .map_err(lix_error_to_datafusion_error)?,
     );
-    staged.file_data_writes.push(FileDataWrite {
+    staged.file_data_writes.push(StageFileData {
         file_id,
         version_id: context.version_id,
         untracked: context.untracked,
@@ -1904,7 +1904,7 @@ mod tests {
     };
     use crate::engine2::live_state::LiveStateRow;
     use crate::engine2::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
-    use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager};
+    use crate::engine2::transaction::types::{StageWrite, StageWriteOutcome, StageWriteStager};
     use crate::LixError;
 
     use super::{
@@ -1926,14 +1926,14 @@ mod tests {
 
     #[derive(Default)]
     struct CapturingWriteStager {
-        writes: std::sync::Mutex<Vec<SqlWriteIntent>>,
+        writes: std::sync::Mutex<Vec<StageWrite>>,
     }
 
     #[async_trait]
-    impl SqlWriteStager for CapturingWriteStager {
-        async fn stage_write(&self, write: SqlWriteIntent) -> Result<SqlWriteOutcome, LixError> {
+    impl StageWriteStager for CapturingWriteStager {
+        async fn stage_write(&self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
             self.writes.lock().expect("writes lock").push(write);
-            Ok(SqlWriteOutcome { count: 0 })
+            Ok(StageWriteOutcome { count: 0 })
         }
     }
 
@@ -2560,7 +2560,7 @@ mod tests {
         let sink = LixFileInsertSink::new(
             batch.schema(),
             Arc::new(RowsLiveStateReader::default()) as Arc<dyn LiveStateReader>,
-            Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
+            Arc::clone(&stager) as Arc<dyn StageWriteStager>,
             test_functions(),
             None,
         );
@@ -2574,12 +2574,12 @@ mod tests {
         let writes = stager.writes.lock().expect("writes lock");
         assert_eq!(writes.len(), 1);
         match &writes[0] {
-            SqlWriteIntent::WriteRows { rows } => {
+            StageWrite::Rows { rows } => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].entity_id, "file-readme");
                 assert_eq!(rows[0].schema_key, "lix_file_descriptor");
             }
-            other => panic!("expected insert write intent, got {other:?}"),
+            other => panic!("expected insert staged write, got {other:?}"),
         }
     }
 
@@ -2590,7 +2590,7 @@ mod tests {
         let sink = LixFileInsertSink::new(
             batch.schema(),
             Arc::new(RowsLiveStateReader::default()) as Arc<dyn LiveStateReader>,
-            Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
+            Arc::clone(&stager) as Arc<dyn StageWriteStager>,
             test_functions(),
             None,
         );
@@ -2604,7 +2604,7 @@ mod tests {
         let writes = stager.writes.lock().expect("writes lock");
         assert_eq!(writes.len(), 1);
         match &writes[0] {
-            SqlWriteIntent::WriteRowsWithFileData {
+            StageWrite::RowsWithFileData {
                 rows,
                 file_data,
                 count,
@@ -2621,7 +2621,7 @@ mod tests {
                 assert_eq!(file_data[0].file_id, "file-readme");
                 assert_eq!(file_data[0].data, b"hello");
             }
-            other => panic!("expected insert with file data write intent, got {other:?}"),
+            other => panic!("expected insert with file data staged write, got {other:?}"),
         }
     }
 
@@ -2645,7 +2645,7 @@ mod tests {
                     ),
                 ],
             }) as Arc<dyn LiveStateReader>,
-            Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
+            Arc::clone(&stager) as Arc<dyn StageWriteStager>,
             test_functions(),
             None,
         );
@@ -2659,7 +2659,7 @@ mod tests {
         let writes = stager.writes.lock().expect("writes lock");
         assert_eq!(writes.len(), 1);
         match &writes[0] {
-            SqlWriteIntent::WriteRowsWithFileData {
+            StageWrite::RowsWithFileData {
                 rows,
                 file_data,
                 count,
@@ -2676,7 +2676,7 @@ mod tests {
                         .expect("descriptor snapshot JSON");
                 assert_eq!(snapshot["directory_id"], "dir-guides");
             }
-            other => panic!("expected insert with file data write intent, got {other:?}"),
+            other => panic!("expected insert with file data staged write, got {other:?}"),
         }
     }
 }

@@ -29,20 +29,20 @@ use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
+use crate::engine2::transaction::types::StageRow;
 use crate::engine2::version_ref::VersionRefReader;
 use crate::sql2::version_scope::resolve_provider_version_ids;
-use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
-use super::execute::{SqlWriteIntent, SqlWriteStager};
+use crate::engine2::transaction::types::{StageWrite, StageWriteStager};
 
 pub(crate) async fn register_lix_state_providers(
     session: &SessionContext,
     active_version_id: &str,
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
-    write_stager: Option<Arc<dyn SqlWriteStager>>,
+    write_stager: Option<Arc<dyn StageWriteStager>>,
 ) -> Result<(), LixError> {
     session
         .register_table(
@@ -72,7 +72,7 @@ pub(crate) struct LixStateProvider {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
-    write_stager: Option<Arc<dyn SqlWriteStager>>,
+    write_stager: Option<Arc<dyn StageWriteStager>>,
     default_version_id: Option<String>,
 }
 
@@ -89,7 +89,7 @@ impl LixStateProvider {
         active_version_id: impl Into<String>,
         live_state: Arc<dyn LiveStateReader>,
         version_ref: Arc<dyn VersionRefReader>,
-        write_stager: Option<Arc<dyn SqlWriteStager>>,
+        write_stager: Option<Arc<dyn StageWriteStager>>,
     ) -> Self {
         Self {
             schema: lix_state_schema(),
@@ -103,7 +103,7 @@ impl LixStateProvider {
     pub(crate) fn by_version(
         live_state: Arc<dyn LiveStateReader>,
         version_ref: Arc<dyn VersionRefReader>,
-        write_stager: Option<Arc<dyn SqlWriteStager>>,
+        write_stager: Option<Arc<dyn StageWriteStager>>,
     ) -> Self {
         Self {
             schema: lix_state_by_version_schema(),
@@ -300,7 +300,7 @@ impl TableProvider for LixStateProvider {
 
 struct LixStateInsertSink {
     schema: SchemaRef,
-    write_stager: Arc<dyn SqlWriteStager>,
+    write_stager: Arc<dyn StageWriteStager>,
     default_version_id: String,
 }
 
@@ -313,7 +313,7 @@ impl std::fmt::Debug for LixStateInsertSink {
 impl LixStateInsertSink {
     fn new(
         schema: SchemaRef,
-        write_stager: Arc<dyn SqlWriteStager>,
+        write_stager: Arc<dyn StageWriteStager>,
         default_version_id: String,
     ) -> Self {
         Self {
@@ -361,7 +361,7 @@ impl DataSink for LixStateInsertSink {
             .map_err(|_| DataFusionError::Execution("INSERT row count overflow".into()))?;
 
         self.write_stager
-            .stage_write(SqlWriteIntent::WriteRows { rows })
+            .stage_write(StageWrite::Rows { rows })
             .await
             .map_err(lix_error_to_datafusion_error)?;
 
@@ -371,7 +371,7 @@ impl DataSink for LixStateInsertSink {
 
 struct LixStateDeleteExec {
     live_state: Arc<dyn LiveStateReader>,
-    write_stager: Arc<dyn SqlWriteStager>,
+    write_stager: Arc<dyn StageWriteStager>,
     table_schema: SchemaRef,
     default_version_id: String,
     request: LiveStateScanRequest,
@@ -389,7 +389,7 @@ impl std::fmt::Debug for LixStateDeleteExec {
 impl LixStateDeleteExec {
     fn new(
         live_state: Arc<dyn LiveStateReader>,
-        write_stager: Arc<dyn SqlWriteStager>,
+        write_stager: Arc<dyn StageWriteStager>,
         table_schema: SchemaRef,
         default_version_id: String,
         request: LiveStateScanRequest,
@@ -494,7 +494,7 @@ impl ExecutionPlan for LixStateDeleteExec {
 
             if count > 0 {
                 write_stager
-                    .stage_write(SqlWriteIntent::WriteRows { rows: write_rows })
+                    .stage_write(StageWrite::Rows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -513,7 +513,7 @@ impl ExecutionPlan for LixStateDeleteExec {
 
 struct LixStateUpdateExec {
     live_state: Arc<dyn LiveStateReader>,
-    write_stager: Arc<dyn SqlWriteStager>,
+    write_stager: Arc<dyn StageWriteStager>,
     table_schema: SchemaRef,
     default_version_id: String,
     request: LiveStateScanRequest,
@@ -532,7 +532,7 @@ impl std::fmt::Debug for LixStateUpdateExec {
 impl LixStateUpdateExec {
     fn new(
         live_state: Arc<dyn LiveStateReader>,
-        write_stager: Arc<dyn SqlWriteStager>,
+        write_stager: Arc<dyn StageWriteStager>,
         table_schema: SchemaRef,
         default_version_id: String,
         request: LiveStateScanRequest,
@@ -647,7 +647,7 @@ impl ExecutionPlan for LixStateUpdateExec {
 
             if count > 0 {
                 write_stager
-                    .stage_write(SqlWriteIntent::WriteRows { rows: write_rows })
+                    .stage_write(StageWrite::Rows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -756,7 +756,7 @@ fn apply_lix_state_update_assignments(
 fn lix_state_stageable_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: &str,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StageRow>> {
     let mut rows = lix_state_write_rows_from_batch(batch, default_version_id)?;
     for row in &mut rows {
         row.created_at = None;
@@ -770,7 +770,7 @@ fn lix_state_stageable_write_rows_from_batch(
 fn lix_state_deletable_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: &str,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StageRow>> {
     let mut rows = lix_state_stageable_write_rows_from_batch(batch, default_version_id)?;
     for row in &mut rows {
         row.snapshot_content = None;
@@ -797,7 +797,7 @@ fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
 fn lix_state_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: &str,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StageRow>> {
     (0..batch.num_rows())
         .map(|row_index| {
             let global = required_bool_value(batch, row_index, "global")?;
@@ -810,7 +810,7 @@ fn lix_state_write_rows_from_batch(
                     }
                 });
 
-            Ok(StateWriteRow {
+            Ok(StageRow {
                 entity_id: required_string_value(batch, row_index, "entity_id")?,
                 schema_key: required_string_value(batch, row_index, "schema_key")?,
                 file_id: optional_string_value(batch, row_index, "file_id")?,
@@ -1421,9 +1421,10 @@ mod tests {
     use crate::engine2::live_state::{
         LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
+    use crate::engine2::transaction::types::{
+        StageRow, StageWrite, StageWriteOutcome, StageWriteStager,
+    };
     use crate::engine2::version_ref::{VersionHead, VersionRefReader};
-    use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateWriteRow};
-    use crate::transaction::{PendingOverlay, PreparedWriteStatementStager, TransactionWriteDelta};
     use crate::{LixError, NullableKeyFilter};
     use async_trait::async_trait;
     use datafusion::arrow::array::{ArrayRef, BooleanArray, StringArray, UInt64Array};
@@ -1458,11 +1459,7 @@ mod tests {
     struct DummyWriteStager;
     #[derive(Default)]
     struct CapturingWriteStager {
-        writes: Mutex<Vec<SqlWriteIntent>>,
-    }
-    #[derive(Default)]
-    struct CapturingBufferedWriteStager {
-        deltas: Vec<TransactionWriteDelta>,
+        writes: Mutex<Vec<StageWrite>>,
     }
 
     struct SingleBatchExec {
@@ -1598,29 +1595,17 @@ mod tests {
     }
 
     #[async_trait]
-    impl SqlWriteStager for DummyWriteStager {
-        async fn stage_write(&self, _write: SqlWriteIntent) -> Result<SqlWriteOutcome, LixError> {
-            Ok(SqlWriteOutcome { count: 0 })
+    impl StageWriteStager for DummyWriteStager {
+        async fn stage_write(&self, _write: StageWrite) -> Result<StageWriteOutcome, LixError> {
+            Ok(StageWriteOutcome { count: 0 })
         }
     }
 
     #[async_trait]
-    impl SqlWriteStager for CapturingWriteStager {
-        async fn stage_write(&self, write: SqlWriteIntent) -> Result<SqlWriteOutcome, LixError> {
+    impl StageWriteStager for CapturingWriteStager {
+        async fn stage_write(&self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
             self.writes.lock().expect("writes lock").push(write);
-            Ok(SqlWriteOutcome { count: 0 })
-        }
-    }
-
-    impl PreparedWriteStatementStager for CapturingBufferedWriteStager {
-        fn mark_public_surface_registry_refresh_pending(&mut self) {}
-
-        fn stage_transaction_write_delta(
-            &mut self,
-            delta: TransactionWriteDelta,
-        ) -> Result<(), LixError> {
-            self.deltas.push(delta);
-            Ok(())
+            Ok(StageWriteOutcome { count: 0 })
         }
     }
 
@@ -1836,7 +1821,7 @@ mod tests {
     async fn registers_active_lix_state_with_write_context_only() {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
-        let write_stager = Arc::new(DummyWriteStager) as Arc<dyn SqlWriteStager>;
+        let write_stager = Arc::new(DummyWriteStager) as Arc<dyn StageWriteStager>;
 
         register_lix_state_providers(
             &session,
@@ -1932,7 +1917,7 @@ mod tests {
     async fn delete_returns_lix_state_delete_exec_with_write_stager() {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
-        let write_stager = Arc::new(DummyWriteStager) as Arc<dyn SqlWriteStager>;
+        let write_stager = Arc::new(DummyWriteStager) as Arc<dyn StageWriteStager>;
         let provider = LixStateProvider::active_version(
             "version-a",
             live_state,
@@ -1952,7 +1937,7 @@ mod tests {
     async fn update_rejects_read_only_lix_state_columns() {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
-        let write_stager = Arc::new(DummyWriteStager) as Arc<dyn SqlWriteStager>;
+        let write_stager = Arc::new(DummyWriteStager) as Arc<dyn StageWriteStager>;
         let provider = LixStateProvider::active_version(
             "version-a",
             live_state,
@@ -1979,7 +1964,7 @@ mod tests {
     async fn update_returns_lix_state_update_exec_with_write_stager() {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
-        let write_stager = Arc::new(DummyWriteStager) as Arc<dyn SqlWriteStager>;
+        let write_stager = Arc::new(DummyWriteStager) as Arc<dyn StageWriteStager>;
         let provider = LixStateProvider::active_version(
             "version-a",
             live_state,
@@ -2003,7 +1988,7 @@ mod tests {
     async fn insert_into_returns_data_sink_exec_with_write_stager() {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
-        let write_stager = Arc::new(DummyWriteStager) as Arc<dyn SqlWriteStager>;
+        let write_stager = Arc::new(DummyWriteStager) as Arc<dyn StageWriteStager>;
         let provider = LixStateProvider::active_version(
             "version-a",
             live_state,
@@ -2027,7 +2012,7 @@ mod tests {
 
         assert_eq!(
             rows,
-            vec![StateWriteRow {
+            vec![StageRow {
                 entity_id: "entity-1".to_string(),
                 schema_key: "lix_key_value".to_string(),
                 file_id: None,
@@ -2060,7 +2045,7 @@ mod tests {
         let stager = Arc::new(CapturingWriteStager::default());
         let sink = LixStateInsertSink::new(
             lix_state_schema(),
-            Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
+            Arc::clone(&stager) as Arc<dyn StageWriteStager>,
             "version-a".to_string(),
         );
         let batch = one_row_lix_state_batch(false);
@@ -2076,8 +2061,8 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(
             stager.writes.lock().expect("writes lock").as_slice(),
-            &[SqlWriteIntent::WriteRows {
-                rows: vec![StateWriteRow {
+            &[StageWrite::Rows {
+                rows: vec![StageRow {
                     entity_id: "entity-1".to_string(),
                     schema_key: "lix_key_value".to_string(),
                     file_id: None,
@@ -2098,49 +2083,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_sink_stages_through_buffered_transaction_delta() {
-        let stager = Arc::new(Mutex::new(CapturingBufferedWriteStager::default()));
-        let sink = LixStateInsertSink::new(
-            lix_state_schema(),
-            Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
-            "version-a".to_string(),
-        );
-        let batch = one_row_stageable_lix_state_batch();
-        let stream = stream::iter(vec![Ok(batch)]);
-        let stream: SendableRecordBatchStream =
-            Box::pin(RecordBatchStreamAdapter::new(lix_state_schema(), stream));
-
-        let count = sink
-            .write_all(stream, &Arc::new(TaskContext::default()))
-            .await
-            .expect("sink should stage through buffered path");
-
-        assert_eq!(count, 1);
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
-            .pending_write_overlay()
-            .expect("staged delta should expose pending overlay");
-        let rows = overlay.visible_semantic_rows(false, "lix_key_value");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "entity-1");
-        assert_eq!(rows[0].version_id, "version-a");
-        assert_eq!(
-            rows[0].snapshot_content.as_deref(),
-            Some("{\"key\":\"hello\",\"value\":\"world\"}")
-        );
-    }
-
-    #[tokio::test]
     async fn insert_plan_returns_datafusion_count_uint64() {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
-        let stager = Arc::new(Mutex::new(CapturingBufferedWriteStager::default()));
+        let stager = Arc::new(CapturingWriteStager::default());
         let provider = LixStateProvider::active_version(
             "version-a",
             live_state,
             empty_version_ref(),
-            Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
         );
         let input = Arc::new(SingleBatchExec::new(one_row_stageable_lix_state_batch()))
             as Arc<dyn ExecutionPlan>;
@@ -2166,9 +2117,7 @@ mod tests {
             .downcast_ref::<UInt64Array>()
             .expect("count should be UInt64");
         assert_eq!(count.value(0), 1);
-
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
+        assert_eq!(stager.writes.lock().expect("writes lock").len(), 1);
     }
 
     #[tokio::test]
@@ -2185,7 +2134,7 @@ mod tests {
             "version-a",
             live_state,
             empty_version_ref(),
-            Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
         );
 
         let plan = provider
@@ -2222,8 +2171,8 @@ mod tests {
 
         assert_eq!(
             stager.writes.lock().expect("writes lock").as_slice(),
-            &[SqlWriteIntent::WriteRows {
-                rows: vec![StateWriteRow {
+            &[StageWrite::Rows {
+                rows: vec![StageRow {
                     entity_id: "entity-1".to_string(),
                     schema_key: "lix_key_value".to_string(),
                     file_id: None,
@@ -2257,7 +2206,7 @@ mod tests {
             "version-a",
             live_state,
             empty_version_ref(),
-            Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
         );
 
         let plan = provider
@@ -2280,9 +2229,9 @@ mod tests {
 
         assert_eq!(
             stager.writes.lock().expect("writes lock").as_slice(),
-            &[SqlWriteIntent::WriteRows {
+            &[StageWrite::Rows {
                 rows: vec![
-                    StateWriteRow {
+                    StageRow {
                         entity_id: "entity-1".to_string(),
                         schema_key: "lix_key_value".to_string(),
                         file_id: None,
@@ -2298,7 +2247,7 @@ mod tests {
                         untracked: false,
                         version_id: "version-a".to_string(),
                     },
-                    StateWriteRow {
+                    StageRow {
                         entity_id: "entity-2".to_string(),
                         schema_key: "lix_key_value".to_string(),
                         file_id: None,

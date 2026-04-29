@@ -2,9 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::backend::KvStore;
 use crate::engine2::changelog::{CanonicalChange, ChangelogContext, ChangelogStoreReader};
-use crate::engine2::commit_graph::walker::{
-    best_common_ancestors, walk_reachable_commits,
-};
+use crate::engine2::commit_graph::walker::{best_common_ancestors, walk_reachable_commits};
 use crate::engine2::commit_graph::{
     CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphChangeSet,
     CommitGraphChangeSetElement, CommitGraphCommit, CommitGraphEdge, CommitGraphEntity,

@@ -12,9 +12,8 @@ use crate::common::{
 use crate::engine2::live_state::LiveStateRow;
 use crate::LixError;
 
-use super::execute::FileDataWrite;
 use super::filesystem_visibility::VisibleFilesystem;
-use super::types::StateWriteRow;
+use crate::engine2::transaction::types::{StageFileData, StageRow};
 
 pub(crate) const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 pub(crate) const FILE_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
@@ -31,8 +30,8 @@ pub(crate) const BLOB_REF_SCHEMA_VERSION: &str = "1";
 /// filesystem write surface.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct FilesystemWritePlan {
-    pub(crate) rows: Vec<StateWriteRow>,
-    pub(crate) file_data: Vec<FileDataWrite>,
+    pub(crate) rows: Vec<StageRow>,
+    pub(crate) file_data: Vec<StageFileData>,
     pub(crate) count: u64,
 }
 
@@ -40,7 +39,7 @@ pub(crate) struct FilesystemWritePlan {
 /// and the surface delete has been lowered into tombstone state rows.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct FilesystemDeletePlan {
-    pub(crate) rows: Vec<StateWriteRow>,
+    pub(crate) rows: Vec<StageRow>,
     pub(crate) count: u64,
 }
 
@@ -165,7 +164,7 @@ impl DirectoryPathResolver {
         context: FilesystemRowContext,
         hidden: bool,
         generate_directory_id: &mut dyn FnMut() -> String,
-    ) -> Result<Vec<StateWriteRow>, LixError> {
+    ) -> Result<Vec<StageRow>, LixError> {
         self.ensure_directory_path_with_leaf_id(
             directory_path,
             None,
@@ -182,7 +181,7 @@ impl DirectoryPathResolver {
         context: FilesystemRowContext,
         hidden: bool,
         generate_directory_id: &mut dyn FnMut() -> String,
-    ) -> Result<Vec<StateWriteRow>, LixError> {
+    ) -> Result<Vec<StageRow>, LixError> {
         let directory_path = normalize_directory_path(directory_path)?;
         if directory_path == "/" {
             return Ok(Vec::new());
@@ -230,7 +229,7 @@ impl DirectoryPathResolver {
     }
 }
 
-pub(crate) fn directory_descriptor_row(input: DirectoryDescriptorRowInput) -> StateWriteRow {
+pub(crate) fn directory_descriptor_row(input: DirectoryDescriptorRowInput) -> StageRow {
     let snapshot_content = json!({
         "id": input.id.clone(),
         "parent_id": input.parent_id.clone(),
@@ -248,7 +247,7 @@ pub(crate) fn directory_descriptor_row(input: DirectoryDescriptorRowInput) -> St
     )
 }
 
-pub(crate) fn file_descriptor_row(input: FileDescriptorRowInput) -> StateWriteRow {
+pub(crate) fn file_descriptor_row(input: FileDescriptorRowInput) -> StageRow {
     let snapshot_content = json!({
         "id": input.id.clone(),
         "directory_id": input.directory_id.clone(),
@@ -267,7 +266,7 @@ pub(crate) fn file_descriptor_row(input: FileDescriptorRowInput) -> StateWriteRo
     )
 }
 
-pub(crate) fn blob_ref_row(input: BlobRefRowInput) -> Result<StateWriteRow, LixError> {
+pub(crate) fn blob_ref_row(input: BlobRefRowInput) -> Result<StageRow, LixError> {
     let size_bytes = u64::try_from(input.data.len()).map_err(|_| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -340,7 +339,7 @@ pub(crate) fn plan_file_path_write(
                 ..input.context.clone()
             },
         })?);
-        file_data.push(FileDataWrite {
+        file_data.push(StageFileData {
             file_id: input.id,
             version_id: input.context.version_id,
             untracked: input.context.untracked,
@@ -538,8 +537,8 @@ fn state_row(
     schema_version: String,
     snapshot_content: Option<String>,
     context: FilesystemRowContext,
-) -> StateWriteRow {
-    StateWriteRow {
+) -> StageRow {
+    StageRow {
         entity_id,
         schema_key: schema_key.to_string(),
         file_id: context.file_id,
@@ -562,7 +561,7 @@ fn tombstone_row(
     schema_key: &str,
     schema_version: String,
     context: FilesystemRowContext,
-) -> StateWriteRow {
+) -> StageRow {
     state_row(entity_id, schema_key, schema_version, None, context)
 }
 
@@ -570,7 +569,7 @@ fn collect_recursive_directory_delete(
     directory_id: &str,
     visible_filesystem: &VisibleFilesystem,
     context: &FilesystemRowContext,
-    rows: &mut Vec<StateWriteRow>,
+    rows: &mut Vec<StageRow>,
     count: &mut u64,
 ) {
     if let Some(child_ids) = visible_filesystem

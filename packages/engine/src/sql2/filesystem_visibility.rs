@@ -14,11 +14,11 @@ use super::filesystem_planner::{
     FILE_DESCRIPTOR_SCHEMA_KEY,
 };
 
-/// Transaction-visible filesystem metadata decoded from live-state rows.
+/// Execution-visible filesystem metadata decoded from live-state rows.
 ///
 /// The helper intentionally depends only on `LiveStateReader`. In engine2
-/// write execution that context is the transaction overlay, so staged writes
-/// are visible here without reaching into transaction internals.
+/// write execution that context may include staged rows, so filesystem planning
+/// sees pending writes without reaching into write-execution internals.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct VisibleFilesystem {
     pub(crate) directories_by_id: BTreeMap<String, VisibleDirectory>,
@@ -28,8 +28,8 @@ pub(crate) struct VisibleFilesystem {
 }
 
 impl VisibleFilesystem {
-    /// Loads filesystem rows for a single version from transaction-visible
-    /// live state and builds lookup indexes used by filesystem write planning.
+    /// Loads filesystem rows for a single version from execution-visible live
+    /// state and builds lookup indexes used by filesystem write planning.
     pub(crate) async fn load(
         live_state: Arc<dyn LiveStateReader>,
         version_id: &str,

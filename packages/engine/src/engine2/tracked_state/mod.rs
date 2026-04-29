@@ -13,11 +13,6 @@ pub(crate) use context::{
     TrackedStateContext, TrackedStateReader, TrackedStateStoreReader, TrackedStateWriter,
 };
 #[allow(unused_imports)]
-pub(crate) use types::{
-    TrackedStateFilter, TrackedStateProjection, TrackedStateRow, TrackedStateRowRequest,
-    TrackedStateScanRequest,
-};
-#[allow(unused_imports)]
 pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
     TrackedStateDiffRequest,
@@ -25,4 +20,9 @@ pub(crate) use diff::{
 #[allow(unused_imports)]
 pub(crate) use merge::{
     plan_merge, TrackedStateMergeApply, TrackedStateMergeConflict, TrackedStateMergePlan,
+};
+#[allow(unused_imports)]
+pub(crate) use types::{
+    TrackedStateFilter, TrackedStateProjection, TrackedStateRow, TrackedStateRowRequest,
+    TrackedStateScanRequest,
 };

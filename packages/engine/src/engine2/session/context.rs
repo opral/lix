@@ -98,16 +98,16 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
         Arc::new(self.live_state.reader(Arc::clone(&self.backend))) as Arc<dyn LiveStateReader>
     }
 
-    fn changelog(&self) -> Option<Arc<dyn ChangelogReader>> {
-        Some(Arc::new(self.changelog.reader(Arc::clone(&self.backend))))
+    fn changelog(&self) -> Arc<dyn ChangelogReader> {
+        Arc::new(self.changelog.reader(Arc::clone(&self.backend)))
     }
 
     fn commit_graph(&self) -> Box<dyn CommitGraphReader> {
         Box::new(CommitGraphContext::new(ChangelogContext::new()).reader(Arc::clone(&self.backend)))
     }
 
-    fn version_ref(&self) -> Option<Arc<dyn VersionRefReader>> {
-        Some(Arc::new(self.version_ref.reader(Arc::clone(&self.backend))))
+    fn version_ref(&self) -> Arc<dyn VersionRefReader> {
+        Arc::new(self.version_ref.reader(Arc::clone(&self.backend)))
     }
 
     fn functions(&self) -> FunctionProviderHandle {

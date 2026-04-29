@@ -406,13 +406,23 @@ mod tests {
         let (backend, tracked_state) = seed_merge_roots(
             &[row_with_value("entity-a", "change-base", "base", "base")],
             &[row_with_value("entity-a", "change-base", "base", "base")],
-            &[row_with_value("entity-a", "change-source", "source", "source")],
+            &[row_with_value(
+                "entity-a",
+                "change-source",
+                "source",
+                "source",
+            )],
         )
         .await;
 
         let plan = tracked_state
             .reader(Arc::clone(&backend))
-            .plan_merge("base", "target", "source", &TrackedStateDiffRequest::default())
+            .plan_merge(
+                "base",
+                "target",
+                "source",
+                &TrackedStateDiffRequest::default(),
+            )
             .await
             .expect("merge should plan");
 
@@ -431,7 +441,12 @@ mod tests {
 
         let plan = tracked_state
             .reader(Arc::clone(&backend))
-            .plan_merge("base", "target", "source", &TrackedStateDiffRequest::default())
+            .plan_merge(
+                "base",
+                "target",
+                "source",
+                &TrackedStateDiffRequest::default(),
+            )
             .await
             .expect("merge should plan");
 
@@ -443,14 +458,29 @@ mod tests {
     async fn plan_merge_from_roots_reports_divergent_modification_conflict() {
         let (backend, tracked_state) = seed_merge_roots(
             &[row_with_value("entity-a", "change-base", "base", "base")],
-            &[row_with_value("entity-a", "change-target", "target", "target")],
-            &[row_with_value("entity-a", "change-source", "source", "source")],
+            &[row_with_value(
+                "entity-a",
+                "change-target",
+                "target",
+                "target",
+            )],
+            &[row_with_value(
+                "entity-a",
+                "change-source",
+                "source",
+                "source",
+            )],
         )
         .await;
 
         let plan = tracked_state
             .reader(Arc::clone(&backend))
-            .plan_merge("base", "target", "source", &TrackedStateDiffRequest::default())
+            .plan_merge(
+                "base",
+                "target",
+                "source",
+                &TrackedStateDiffRequest::default(),
+            )
             .await
             .expect("merge should plan");
 
@@ -469,7 +499,12 @@ mod tests {
 
         let plan = tracked_state
             .reader(Arc::clone(&backend))
-            .plan_merge("base", "target", "source", &TrackedStateDiffRequest::default())
+            .plan_merge(
+                "base",
+                "target",
+                "source",
+                &TrackedStateDiffRequest::default(),
+            )
             .await
             .expect("merge should plan");
 
