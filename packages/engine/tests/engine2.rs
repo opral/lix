@@ -1,6 +1,7 @@
 mod support;
 
 mod engine2 {
+    pub mod branching;
     pub mod commit_graph;
     pub mod sql;
 }

@@ -426,7 +426,7 @@ mod tests {
             .await
             .expect("merge should plan");
 
-        assert_eq!(merge_apply_ids(&plan), vec!["entity-a"]);
+        assert_eq!(merge_patch_ids(&plan), vec!["entity-a"]);
         assert!(plan.conflicts.is_empty());
     }
 
@@ -450,7 +450,7 @@ mod tests {
             .await
             .expect("merge should plan");
 
-        assert!(plan.apply.is_empty());
+        assert!(plan.patches.is_empty());
         assert!(plan.conflicts.is_empty());
     }
 
@@ -484,7 +484,7 @@ mod tests {
             .await
             .expect("merge should plan");
 
-        assert!(plan.apply.is_empty());
+        assert!(plan.patches.is_empty());
         assert_eq!(merge_conflict_ids(&plan), vec!["entity-a"]);
     }
 
@@ -508,8 +508,8 @@ mod tests {
             .await
             .expect("merge should plan");
 
-        assert_eq!(merge_apply_ids(&plan), vec!["entity-a"]);
-        assert_eq!(plan.apply[0].row.snapshot_content, None);
+        assert_eq!(merge_patch_ids(&plan), vec!["entity-a"]);
+        assert_eq!(plan.patches[0].source_row.snapshot_content, None);
     }
 
     async fn seed_merge_roots(
@@ -545,8 +545,8 @@ mod tests {
         (backend, tracked_state)
     }
 
-    fn merge_apply_ids(plan: &TrackedStateMergePlan) -> Vec<&str> {
-        plan.apply
+    fn merge_patch_ids(plan: &TrackedStateMergePlan) -> Vec<&str> {
+        plan.patches
             .iter()
             .map(|entry| entry.identity.entity_id.as_str())
             .collect()

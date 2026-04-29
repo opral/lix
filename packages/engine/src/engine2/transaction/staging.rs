@@ -22,6 +22,7 @@ pub(crate) struct TransactionStagedWrites {
     functions: FunctionProviderHandle,
     rows: Mutex<BTreeMap<StagedStateRowIdentity, StagedStateRow>>,
     commit_members_by_version: Mutex<BTreeMap<String, StagedCommitMembers>>,
+    extra_commit_parents_by_version: Mutex<BTreeMap<String, Vec<String>>>,
     file_data_writes: Mutex<Vec<StageFileData>>,
 }
 
@@ -29,6 +30,7 @@ pub(crate) struct TransactionStagedWrites {
 pub(crate) struct StagedWriteSet {
     pub(crate) state_rows: Vec<StagedStateRow>,
     pub(crate) commit_members_by_version: BTreeMap<String, StagedCommitMembers>,
+    pub(crate) extra_commit_parents_by_version: BTreeMap<String, Vec<String>>,
     pub(crate) file_data_writes: Vec<StageFileData>,
 }
 
@@ -38,6 +40,7 @@ impl TransactionStagedWrites {
             functions,
             rows: Mutex::new(BTreeMap::new()),
             commit_members_by_version: Mutex::new(BTreeMap::new()),
+            extra_commit_parents_by_version: Mutex::new(BTreeMap::new()),
             file_data_writes: Mutex::new(Vec::new()),
         }
     }
@@ -62,11 +65,43 @@ impl TransactionStagedWrites {
                 "failed to acquire transaction staged commit membership lock",
             )
         })?;
+        let mut extra_parents_guard =
+            self.extra_commit_parents_by_version.lock().map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "failed to acquire transaction staged extra commit parents lock",
+                )
+            })?;
         Ok(StagedWriteSet {
             state_rows: std::mem::take(&mut *rows_guard).into_values().collect(),
             commit_members_by_version: std::mem::take(&mut *commit_members_guard),
+            extra_commit_parents_by_version: std::mem::take(&mut *extra_parents_guard),
             file_data_writes: std::mem::take(&mut *file_data_guard),
         })
+    }
+
+    /// Records an additional parent for the commit generated for `version_id`.
+    ///
+    /// Normal writes parent the new commit to the version's previous head.
+    /// Merges add the source version head as an extra parent so the commit graph
+    /// preserves branch ancestry while tracked-state roots still apply source
+    /// rows onto the target root.
+    pub(crate) fn add_commit_parent(
+        &self,
+        version_id: String,
+        parent_commit_id: String,
+    ) -> Result<(), LixError> {
+        let mut guard = self.extra_commit_parents_by_version.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged extra commit parents lock",
+            )
+        })?;
+        let parents = guard.entry(version_id).or_default();
+        if !parents.contains(&parent_commit_id) {
+            parents.push(parent_commit_id);
+        }
+        Ok(())
     }
 
     /// Builds the transaction-local read overlay from currently staged writes.

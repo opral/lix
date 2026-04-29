@@ -25,5 +25,8 @@ mod tests;
 
 pub use engine::Engine;
 pub use init::InitReceipt;
-pub use session::SessionContext;
+pub use session::{
+    CreateVersionOptions, CreateVersionReceipt, MergeVersionOptions, MergeVersionReceipt,
+    SessionContext, SwitchVersionOptions, SwitchVersionReceipt,
+};
 pub use session::{ExecuteResult, Row, RowRef, RowSet};

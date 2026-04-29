@@ -680,13 +680,9 @@ fn parent_commit_id_from_commit_row(row: &&LiveStateRow) -> Result<Option<String
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    if parent_commit_ids.len() > 1 {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked root writes do not support multi-parent commits yet",
-        ));
-    }
-
+    // Tracked roots inherit from the first parent. Merge commits record
+    // additional parents for graph ancestry, but the merge operation has
+    // already materialized the source-side rows as target-version writes.
     Ok(parent_commit_ids.into_iter().next())
 }
 
@@ -1549,15 +1545,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_rejects_multi_parent_commit_root_until_merge_roots_are_supported() {
+    async fn writer_uses_first_parent_as_merge_root_base() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
+        let mut seed_transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("seed transaction should open");
+        TrackedStateContext::new()
+            .writer(seed_transaction.as_mut())
+            .write_root("parent-left", None, &[])
+            .await
+            .expect("first parent root should exist");
+        seed_transaction
+            .commit()
+            .await
+            .expect("seed transaction should commit");
+
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await
             .expect("transaction should open");
 
-        let error = live_state
+        live_state
             .writer(transaction.as_mut())
             .write_rows(&[
                 tracked_row_at_with_commit(
@@ -1572,12 +1582,7 @@ mod tests {
                 ),
             ])
             .await
-            .expect_err("multi-parent tracked roots need an explicit merge planner");
-
-        assert!(
-            error.description.contains("multi-parent commits"),
-            "unexpected error: {error:?}"
-        );
+            .expect("merge commit should use first parent as tracked-root base");
     }
 
     #[tokio::test]
