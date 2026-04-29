@@ -1,7 +1,6 @@
 use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
 use crate::engine2::changelog::ChangelogContext;
 use crate::engine2::commit_graph::CommitGraphContext;
-use crate::engine2::tracked_state::{TrackedStateDeleteRequest, TrackedStateFilter};
 use crate::engine2::{Engine, ExecuteResult};
 use crate::Value;
 
@@ -40,7 +39,7 @@ async fn tracked_state_rebuild_restores_sql_reads_from_changelog() {
         .await
         .expect("version head should load")
         .expect("version head should exist");
-    delete_tracked_rows_for_version(&engine, &backend, &receipt.main_version_id).await;
+    delete_tracked_root_for_commit(&engine, &backend, &head_commit_id).await;
     assert_key_value_missing(&session).await;
 
     let commit_graph = CommitGraphContext::new(ChangelogContext::new());
@@ -50,11 +49,10 @@ async fn tracked_state_rebuild_restores_sql_reads_from_changelog() {
         .expect("rebuild transaction should open");
     let rebuild_report = engine
         .tracked_state()
-        .rebuild_version_state(
+        .rebuild_state_at_commit(
             &commit_graph,
             &backend,
             rebuild_transaction.as_mut(),
-            &receipt.main_version_id,
             &head_commit_id,
         )
         .await
@@ -70,31 +68,21 @@ async fn tracked_state_rebuild_restores_sql_reads_from_changelog() {
     assert_key_value_visible(&session, "\"before-rebuild\"").await;
 }
 
-async fn delete_tracked_rows_for_version(
+async fn delete_tracked_root_for_commit(
     engine: &Engine,
     backend: &UnitTestBackend,
-    version_id: &str,
+    commit_id: &str,
 ) {
     let mut transaction = backend
         .begin_transaction(TransactionBeginMode::Write)
         .await
         .expect("delete transaction should open");
     let tracked_state = engine.tracked_state();
-    let deleted = tracked_state
+    tracked_state
         .writer(transaction.as_mut())
-        .delete_rows(&TrackedStateDeleteRequest {
-            filter: TrackedStateFilter {
-                version_ids: vec![version_id.to_string()],
-                include_tombstones: true,
-                ..Default::default()
-            },
-        })
+        .delete_root_for_rebuild(commit_id)
         .await
-        .expect("tracked rows should delete");
-    assert!(
-        deleted > 0,
-        "test should delete tracked rows for the version"
-    );
+        .expect("tracked root should delete");
     transaction
         .commit()
         .await

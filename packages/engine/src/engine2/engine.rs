@@ -37,9 +37,10 @@ impl Engine {
     ) -> Result<InitReceipt, LixError> {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::from(backend);
         let changelog = ChangelogContext::new();
+        let commit_graph = CommitGraphContext::new(changelog);
         let tracked_state = TrackedStateContext::new();
         let untracked_state = UntrackedStateContext::new();
-        let live_state = LiveStateContext::new(tracked_state, untracked_state);
+        let live_state = LiveStateContext::new(tracked_state, untracked_state, commit_graph);
 
         crate::engine2::init::initialize(backend, &changelog, &live_state).await
     }
@@ -51,20 +52,17 @@ impl Engine {
     pub async fn new(backend: Box<dyn LixBackend + Send + Sync>) -> Result<Self, LixError> {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::from(backend);
 
-        // The engine is constructed bottom-up from the storage DAG:
-        //
-        // let canonical_state = Arc::new(CanonicalStateContext::new(Arc::clone(&backend)));
-
         let tracked_state = Arc::new(TrackedStateContext::new());
         let untracked_state = Arc::new(UntrackedStateContext::new());
-        let live_state = Arc::new(LiveStateContext::new(*tracked_state, *untracked_state));
+        let changelog = Arc::new(ChangelogContext::new());
+        let commit_graph = CommitGraphContext::new(changelog.as_ref().clone());
+        let live_state = Arc::new(LiveStateContext::new(
+            tracked_state.as_ref().clone(),
+            *untracked_state,
+            commit_graph,
+        ));
         let version_ref = Arc::new(VersionRefContext::new(Arc::clone(&live_state)));
         assert_initialized(Arc::clone(&backend), live_state.as_ref()).await?;
-
-        // let history_state = Arc::new(HistoryStateContext::new(
-        //     Arc::clone(&canonical_state),
-        //     Arc::clone(&backend),
-        // ));
 
         // SessionContext::execute later projects these stable state contexts into one
         // execution-scoped SQL context, optionally wrapped by a transaction
@@ -72,7 +70,7 @@ impl Engine {
 
         Ok(Self {
             binary_cas: Arc::new(BinaryCasContext::new()),
-            changelog: Arc::new(ChangelogContext::new()),
+            changelog,
             backend,
             tracked_state,
             untracked_state,
@@ -150,11 +148,10 @@ impl Engine {
             .begin_transaction(TransactionBeginMode::Write)
             .await?;
         self.tracked_state
-            .rebuild_version_state(
+            .rebuild_state_at_commit(
                 &commit_graph,
                 self.backend(),
                 transaction.as_mut(),
-                version_id,
                 &head_commit_id,
             )
             .await?;

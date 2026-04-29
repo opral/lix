@@ -176,7 +176,7 @@ impl SessionContext {
             // Re-plan against the transaction so DataFusion provider hooks
             // stage writes through the transaction-owned write stager.
             let tx_plan = sql2::create_logical_plan(&transaction, sql).await?;
-            let result = sql2::execute_logical_plan(&transaction, tx_plan, params).await;
+            let result = sql2::execute_logical_plan(tx_plan, params).await;
             match result {
                 Ok(result) => {
                     let affected_rows = affected_rows_from_query_result(result)?;
@@ -189,7 +189,7 @@ impl SessionContext {
                 }
             }
         } else {
-            sql2::execute_logical_plan(&ctx, plan, params).await?
+            sql2::execute_logical_plan(plan, params).await?
         };
         self.persist_runtime_functions_if_needed(&runtime_functions)
             .await?;

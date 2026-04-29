@@ -14,7 +14,8 @@ use crate::{LixBackendTransaction, LixError};
 /// Providers decode DataFusion DML into hydrated `StagedStateRow`s. Untracked
 /// rows are durable local overlay state and bypass changelog/commit rows.
 /// Tracked rows receive normal `lix_commit` rows, append canonical changelog
-/// facts, then mirror into live_state while catch-up is still MVP.
+/// facts, then update the live-state serving projection. The tracked side of
+/// that projection is a prolly root keyed by the new commit id.
 pub(crate) async fn commit_staged_writes(
     binary_cas: &BinaryCasContext,
     changelog: &ChangelogContext,
@@ -67,10 +68,9 @@ pub(crate) async fn commit_staged_writes(
         }
     }
 
-    // TODO(engine2): live_state should eventually catch up from changelog
-    // rather than being mirrored here. Keeping this bridge makes the current
-    // SQL read path see durable writes immediately while changelog becomes
-    // the source of truth.
+    // The serving projection is updated in the same backend transaction as the
+    // changelog append. Tracked rows become prolly mutations under their owning
+    // commit root; untracked rows remain in the separate local overlay store.
     let live_state_rows = changelog_rows
         .into_iter()
         .chain(untracked_rows)
@@ -126,8 +126,8 @@ fn canonical_change_from_staged_row(row: &StagedStateRow) -> Result<CanonicalCha
 ///
 /// Commit finalization output split by durability target.
 ///
-/// `commit_rows` are tracked rows. They are ordinary changelog facts and are
-/// also mirrored into live_state for immediate visibility.
+/// `commit_rows` are ordinary changelog facts. live_state later projects them
+/// from commit_graph; tracked_state roots do not store commit graph facts.
 ///
 /// `version_heads` are moving refs. They are written through `VersionRefContext`
 /// and must never be appended to changelog.
@@ -225,15 +225,22 @@ mod tests {
     use crate::engine2::version_ref::VersionRefContext;
     use crate::NullableKeyFilter;
 
+    fn live_state_context() -> LiveStateContext {
+        LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+            crate::engine2::commit_graph::CommitGraphContext::new(
+                crate::engine2::changelog::ChangelogContext::new(),
+            ),
+        )
+    }
+
     #[tokio::test]
-    async fn commit_staged_writes_appends_changelog_changes_before_live_state_mirror() {
+    async fn commit_staged_writes_appends_changelog_and_updates_serving_projection() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
-        let live_state = Arc::new(LiveStateContext::new(
-            crate::engine2::tracked_state::TrackedStateContext::new(),
-            crate::engine2::untracked_state::UntrackedStateContext::new(),
-        ));
+        let live_state = Arc::new(live_state_context());
         let version_ref = VersionRefContext::new(Arc::clone(&live_state));
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -294,10 +301,7 @@ mod tests {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
-        let live_state = Arc::new(LiveStateContext::new(
-            crate::engine2::tracked_state::TrackedStateContext::new(),
-            crate::engine2::untracked_state::UntrackedStateContext::new(),
-        ));
+        let live_state = Arc::new(live_state_context());
         let version_ref = VersionRefContext::new(Arc::clone(&live_state));
         let untracked_state = UntrackedStateContext::new();
         let mut transaction = backend
@@ -358,10 +362,7 @@ mod tests {
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
         let untracked_state = UntrackedStateContext::new();
-        let live_state = Arc::new(LiveStateContext::new(
-            crate::engine2::tracked_state::TrackedStateContext::new(),
-            crate::engine2::untracked_state::UntrackedStateContext::new(),
-        ));
+        let live_state = Arc::new(live_state_context());
         let version_ref = VersionRefContext::new(Arc::clone(&live_state));
 
         let mut seed_transaction = backend
@@ -425,12 +426,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_global_tracked_write_creates_one_commit_and_advances_only_touched_version() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let binary_cas = BinaryCasContext::new();
+        let changelog = ChangelogContext::new();
+        let live_state = Arc::new(live_state_context());
+        let version_ref = VersionRefContext::new(Arc::clone(&live_state));
+        seed_version_ref(&backend, &version_ref, GLOBAL_VERSION_ID, "global-before").await;
+        seed_version_ref(&backend, &version_ref, "version-a", "version-a-before").await;
+
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        commit_staged_writes(
+            &binary_cas,
+            &changelog,
+            live_state.as_ref(),
+            &version_ref,
+            transaction.as_mut(),
+            StagedWriteSet {
+                state_rows: vec![tracked_version_row("version-a", "change-version-a")],
+                commit_members_by_version: BTreeMap::from([(
+                    "version-a".to_string(),
+                    members(["change-version-a"]),
+                )]),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("version commit should flush");
+        transaction
+            .commit()
+            .await
+            .expect("commit should persist kv");
+
+        let changes = changelog
+            .reader(Arc::clone(&backend))
+            .scan_changes(&crate::engine2::changelog::ChangelogScanRequest::default())
+            .await
+            .expect("changelog scan should succeed");
+        let commit_changes = changes
+            .iter()
+            .filter(|change| change.schema_key == "lix_commit")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commit_changes.len(),
+            1,
+            "a write to one non-global version must create exactly one commit"
+        );
+        assert_eq!(commit_changes[0].entity_id, "test-uuid-1");
+        assert!(changes.iter().any(|change| change.id == "change-version-a"));
+        assert!(!changes
+            .iter()
+            .any(|change| change.schema_key == "lix_version_ref"));
+
+        let global_head = version_ref
+            .reader(Arc::clone(&backend))
+            .load_head_commit_id(GLOBAL_VERSION_ID)
+            .await
+            .expect("global head should load");
+        let version_head = version_ref
+            .reader(Arc::clone(&backend))
+            .load_head_commit_id("version-a")
+            .await
+            .expect("version head should load");
+        assert_eq!(global_head.as_deref(), Some("global-before"));
+        assert_eq!(version_head.as_deref(), Some("test-uuid-1"));
+    }
+
+    #[tokio::test]
     async fn finalize_commit_rows_parents_global_commit_to_existing_version_ref() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = Arc::new(LiveStateContext::new(
-            crate::engine2::tracked_state::TrackedStateContext::new(),
-            crate::engine2::untracked_state::UntrackedStateContext::new(),
-        ));
+        let live_state = Arc::new(live_state_context());
         let version_ref = VersionRefContext::new(Arc::clone(&live_state));
         seed_version_ref(&backend, &version_ref, GLOBAL_VERSION_ID, "initial-commit").await;
 
@@ -502,10 +570,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_skips_empty_members() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = Arc::new(LiveStateContext::new(
-            crate::engine2::tracked_state::TrackedStateContext::new(),
-            crate::engine2::untracked_state::UntrackedStateContext::new(),
-        ));
+        let live_state = Arc::new(live_state_context());
         let version_ref = VersionRefContext::new(Arc::clone(&live_state));
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -529,10 +594,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_uses_existing_version_ref_as_parent() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = Arc::new(LiveStateContext::new(
-            crate::engine2::tracked_state::TrackedStateContext::new(),
-            crate::engine2::untracked_state::UntrackedStateContext::new(),
-        ));
+        let live_state = Arc::new(live_state_context());
         let version_ref = VersionRefContext::new(Arc::clone(&live_state));
         seed_version_ref(&backend, &version_ref, "version-a", "previous-commit").await;
 
@@ -603,6 +665,10 @@ mod tests {
     }
 
     fn tracked_global_row(change_id: &str) -> StagedStateRow {
+        tracked_version_row(GLOBAL_VERSION_ID, change_id)
+    }
+
+    fn tracked_version_row(version_id: &str, change_id: &str) -> StagedStateRow {
         StagedStateRow {
             entity_id: "entity-1".to_string(),
             schema_key: "test_schema".to_string(),
@@ -613,11 +679,11 @@ mod tests {
             schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            global: true,
+            global: version_id == GLOBAL_VERSION_ID,
             change_id: Some(change_id.to_string()),
             commit_id: Some("test-uuid-1".to_string()),
             untracked: false,
-            version_id: GLOBAL_VERSION_ID.to_string(),
+            version_id: version_id.to_string(),
         }
     }
 

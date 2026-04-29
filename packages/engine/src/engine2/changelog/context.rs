@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 /// This layer only records already-generated change facts. Transaction commit
 /// code is responsible for producing user changes plus normal `lix_commit`
 /// rows before appending them here.
+#[derive(Clone, Copy)]
 pub(crate) struct ChangelogContext;
 
 impl ChangelogContext {

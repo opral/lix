@@ -155,8 +155,7 @@ impl SqlExecutionContext for Transaction<'_> {
 
     /// Returns the transaction-scoped schema snapshot for SQL surface
     /// registration.
-    fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError> {
-        let _ = version_id;
+    fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
         Ok(self.visible_schemas.clone())
     }
 }

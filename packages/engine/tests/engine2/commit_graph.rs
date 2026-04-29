@@ -37,6 +37,66 @@ simulation_test2!(
 );
 
 simulation_test2!(
+    tracked_write_creates_one_commit_without_advancing_global_ref,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim
+            .open_main_session(&engine)
+            .await
+            .expect("main session should open");
+        let global_session = sim
+            .open_global_session(&engine)
+            .await
+            .expect("global session should open");
+        let global_head_before = engine
+            .load_version_head_commit_id("global")
+            .await
+            .expect("global head should load")
+            .expect("global head should exist");
+        let main_head_before = engine
+            .load_version_head_commit_id(sim.main_version_id())
+            .await
+            .expect("main head should load")
+            .expect("main head should exist");
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('one-commit-model', 'ok')",
+                &[],
+            )
+            .await
+            .expect("tracked write should succeed");
+
+        let global_head_after = engine
+            .load_version_head_commit_id("global")
+            .await
+            .expect("global head should load")
+            .expect("global head should exist");
+        let main_head_after = engine
+            .load_version_head_commit_id(sim.main_version_id())
+            .await
+            .expect("main head should load")
+            .expect("main head should exist");
+
+        assert_eq!(
+            global_head_after, global_head_before,
+            "non-global writes must not advance the global version ref"
+        );
+        assert_ne!(
+            main_head_after, main_head_before,
+            "tracked write should advance exactly the touched version ref"
+        );
+
+        let commit_snapshot = load_commit_snapshot(&global_session, &main_head_after).await;
+        assert_eq!(
+            commit_snapshot.get("id").and_then(JsonValue::as_str),
+            Some(main_head_after.as_str()),
+            "the touched-version commit should still be globally visible through lix_state"
+        );
+    }
+);
+
+simulation_test2!(
     second_commit_parents_previous_version_head,
     |sim| async move {
         let engine = sim.boot_engine().await;

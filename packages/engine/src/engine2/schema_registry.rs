@@ -6,7 +6,6 @@ use serde_json::Value as JsonValue;
 use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
 use crate::schema::{builtin_schema_definition, builtin_schema_keys, schema_key_from_definition};
-use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -31,25 +30,23 @@ impl SchemaRegistry {
         version_id: &str,
     ) -> Result<Vec<JsonValue>, LixError> {
         let mut schemas = builtin_schema_definitions()?;
-        for version_id in [GLOBAL_VERSION_ID, version_id] {
-            for row in live_state
-                .scan_rows(&LiveStateScanRequest {
-                    filter: LiveStateFilter {
-                        schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
-                        version_ids: vec![version_id.to_string()],
-                        file_ids: vec![NullableKeyFilter::Null],
-                        include_tombstones: false,
-                        ..LiveStateFilter::default()
-                    },
-                    ..LiveStateScanRequest::default()
-                })
-                .await?
-            {
-                let Some((key, schema)) = decode_registered_schema_row(&row)? else {
-                    continue;
-                };
-                upsert_latest_schema(&mut schemas, key, schema);
-            }
+        for row in live_state
+            .scan_rows(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
+                    version_ids: vec![version_id.to_string()],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    include_tombstones: false,
+                    ..LiveStateFilter::default()
+                },
+                ..LiveStateScanRequest::default()
+            })
+            .await?
+        {
+            let Some((key, schema)) = decode_registered_schema_row(&row)? else {
+                continue;
+            };
+            upsert_latest_schema(&mut schemas, key, schema);
         }
         Ok(schemas.into_values().map(|(_, schema)| schema).collect())
     }
@@ -130,6 +127,7 @@ mod tests {
 
     use super::*;
     use crate::engine2::live_state::LiveStateRowRequest;
+    use crate::version::GLOBAL_VERSION_ID;
 
     #[tokio::test]
     async fn visible_schemas_include_builtin_registered_schema() {
@@ -201,9 +199,17 @@ mod tests {
 
         async fn load_row(
             &self,
-            _request: &LiveStateRowRequest,
+            request: &LiveStateRowRequest,
         ) -> Result<Option<LiveStateRow>, LixError> {
-            Ok(None)
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| {
+                    row.schema_key == request.schema_key
+                        && row.version_id == request.version_id
+                        && row.entity_id == request.entity_id
+                })
+                .cloned())
         }
     }
 

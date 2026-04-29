@@ -379,6 +379,12 @@ mod tests {
     }
 
     fn test_live_state() -> LiveStateContext {
-        LiveStateContext::new(TrackedStateContext::new(), UntrackedStateContext::new())
+        LiveStateContext::new(
+            TrackedStateContext::new(),
+            UntrackedStateContext::new(),
+            crate::engine2::commit_graph::CommitGraphContext::new(
+                crate::engine2::changelog::ChangelogContext::new(),
+            ),
+        )
     }
 }
