@@ -500,11 +500,11 @@ mod tests {
         );
         assert_eq!(plan.base_relation.relation_name(), "lix_state_history");
         assert_eq!(
-            plan.column_plan("lixcol_root_commit_id")
+            plan.column_plan("lixcol_start_commit_id")
                 .expect("history root column should compile")
                 .expression,
             PreparedSql2EntityViewExpr::BaseRelationColumn {
-                column_name: "root_commit_id".to_string()
+                column_name: "start_commit_id".to_string()
             }
         );
         assert_eq!(
@@ -515,14 +515,7 @@ mod tests {
                 column_name: "depth".to_string()
             }
         );
-        assert_eq!(
-            plan.column_plan("lixcol_version_id")
-                .expect("history version column should compile")
-                .expression,
-            PreparedSql2EntityViewExpr::BaseRelationColumn {
-                column_name: "version_id".to_string()
-            }
-        );
+        assert!(plan.column_plan("lixcol_version_id").is_none());
     }
 
     #[test]
@@ -853,7 +846,7 @@ mod tests {
             .projected_schema(&[
                 "lixcol_commit_id".to_string(),
                 "lixcol_commit_created_at".to_string(),
-                "lixcol_root_commit_id".to_string(),
+                "lixcol_start_commit_id".to_string(),
                 "lixcol_depth".to_string(),
                 "lixcol_metadata".to_string(),
             ])
@@ -863,7 +856,7 @@ mod tests {
         assert!(!schema.field(0).is_nullable());
         assert_eq!(schema.field(1).name(), "lixcol_commit_created_at");
         assert!(!schema.field(1).is_nullable());
-        assert_eq!(schema.field(2).name(), "lixcol_root_commit_id");
+        assert_eq!(schema.field(2).name(), "lixcol_start_commit_id");
         assert!(!schema.field(2).is_nullable());
         assert_eq!(schema.field(3).name(), "lixcol_depth");
         assert!(!schema.field(3).is_nullable());
@@ -936,9 +929,8 @@ mod tests {
         assert!(display.contains("schema_key = Utf8(\"project_event\")"));
         assert!(display.contains("value"));
         assert!(display.contains("lixcol_entity_id"));
-        assert!(display.contains("lixcol_root_commit_id"));
+        assert!(display.contains("lixcol_start_commit_id"));
         assert!(display.contains("lixcol_depth"));
-        assert!(display.contains("lixcol_version_id"));
     }
 
     fn default_state_relation_schema() -> SchemaRef {
@@ -971,9 +963,8 @@ mod tests {
             Field::new("change_id", DataType::Utf8, false),
             Field::new("commit_id", DataType::Utf8, false),
             Field::new("commit_created_at", DataType::Utf8, false),
-            Field::new("root_commit_id", DataType::Utf8, false),
+            Field::new("start_commit_id", DataType::Utf8, false),
             Field::new("depth", DataType::Int64, false),
-            Field::new("version_id", DataType::Utf8, false),
         ]))
     }
 }

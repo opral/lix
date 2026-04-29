@@ -927,7 +927,7 @@ fn filesystem_base_relation_columns(
             ("change_id", "change_id"),
             ("commit_id", "commit_id"),
             ("commit_created_at", "commit_created_at"),
-            ("root_commit_id", "root_commit_id"),
+            ("start_commit_id", "start_commit_id"),
             ("depth", "depth"),
             ("lixcol_metadata", "metadata"),
             ("id", "id"),
@@ -965,7 +965,7 @@ fn filesystem_base_relation_columns(
             ("change_id", "change_id"),
             ("commit_id", "commit_id"),
             ("commit_created_at", "commit_created_at"),
-            ("root_commit_id", "root_commit_id"),
+            ("start_commit_id", "start_commit_id"),
             ("depth", "depth"),
             ("lixcol_metadata", "metadata"),
             ("id", "id"),
@@ -1001,7 +1001,7 @@ fn filesystem_base_relation_columns(
             ("change_id", "change_id"),
             ("commit_id", "commit_id"),
             ("commit_created_at", "commit_created_at"),
-            ("root_commit_id", "root_commit_id"),
+            ("start_commit_id", "start_commit_id"),
             ("depth", "depth"),
             ("lixcol_metadata", "metadata"),
             ("id", "id"),
@@ -1294,7 +1294,7 @@ mod sql_fragments {
                SELECT \
                  id, \
                  version_id, \
-                 root_commit_id, \
+                 start_commit_id, \
                  depth, \
                  '/' || name || '/' AS path \
                FROM {directory_winner_relation_name} \
@@ -1304,14 +1304,14 @@ mod sql_fragments {
                SELECT \
                  child.id, \
                  child.version_id, \
-                 child.root_commit_id, \
+                 child.start_commit_id, \
                  child.depth, \
                  parent.path || child.name || '/' AS path \
                FROM {directory_winner_relation_name} child \
                JOIN directory_paths parent \
                  ON parent.id = child.parent_id \
                 AND parent.version_id = child.version_id \
-                AND parent.root_commit_id = child.root_commit_id \
+                AND parent.start_commit_id = child.start_commit_id \
                 AND parent.depth = child.depth \
                WHERE child.schema_key = '{directory_schema_key}' \
              ) \
@@ -1546,18 +1546,18 @@ mod sql_fragments {
             "WITH descriptor_max_blob_depth AS ( \
            SELECT \
              fd.id, \
-             fd.root_commit_id, \
+             fd.start_commit_id, \
              MAX(b.depth) AS max_blob_depth \
            FROM {file_history_rows_relation_name} fd \
            LEFT JOIN {blob_history_rows_relation_name} b \
              ON b.id = fd.id \
-            AND b.root_commit_id = fd.root_commit_id \
-           GROUP BY fd.id, fd.root_commit_id \
+            AND b.start_commit_id = fd.start_commit_id \
+           GROUP BY fd.id, fd.start_commit_id \
          ), \
          descriptor_directory_ids AS ( \
            SELECT DISTINCT \
              fd.id, \
-             fd.root_commit_id, \
+             fd.start_commit_id, \
              fd.directory_id \
            FROM {file_history_rows_relation_name} fd \
            WHERE fd.directory_id IS NOT NULL \
@@ -1567,7 +1567,7 @@ mod sql_fragments {
              fd.id, \
              fd.file_id, \
              fd.plugin_key, \
-             fd.root_commit_id, \
+             fd.start_commit_id, \
              fd.depth AS raw_depth, \
              fd.change_id, \
              fd.commit_id, \
@@ -1576,7 +1576,7 @@ mod sql_fragments {
            FROM {file_history_rows_relation_name} fd \
            LEFT JOIN descriptor_max_blob_depth mb \
              ON mb.id = fd.id \
-            AND mb.root_commit_id = fd.root_commit_id \
+            AND mb.start_commit_id = fd.start_commit_id \
            WHERE mb.max_blob_depth IS NULL \
               OR fd.depth <= mb.max_blob_depth \
          ), \
@@ -1585,7 +1585,7 @@ mod sql_fragments {
              ddi.id, \
              d.file_id, \
              d.plugin_key, \
-             d.root_commit_id, \
+             d.start_commit_id, \
              d.depth AS raw_depth, \
              d.change_id, \
              d.commit_id, \
@@ -1594,10 +1594,10 @@ mod sql_fragments {
            FROM descriptor_directory_ids ddi \
            JOIN {directory_history_rows_relation_name} d \
              ON d.id = ddi.directory_id \
-            AND d.root_commit_id = ddi.root_commit_id \
+            AND d.start_commit_id = ddi.start_commit_id \
            LEFT JOIN descriptor_max_blob_depth mb \
              ON mb.id = ddi.id \
-            AND mb.root_commit_id = ddi.root_commit_id \
+            AND mb.start_commit_id = ddi.start_commit_id \
            WHERE mb.max_blob_depth IS NULL \
               OR d.depth <= mb.max_blob_depth \
          ), \
@@ -1606,7 +1606,7 @@ mod sql_fragments {
              b.file_id AS id, \
              b.file_id, \
              b.plugin_key, \
-             b.root_commit_id, \
+             b.start_commit_id, \
              b.depth AS raw_depth, \
              b.change_id, \
              b.commit_id, \
@@ -1626,7 +1626,7 @@ mod sql_fragments {
            id, \
            file_id, \
            plugin_key, \
-           root_commit_id, \
+           start_commit_id, \
            raw_depth, \
            change_id, \
            commit_id, \
@@ -1635,7 +1635,7 @@ mod sql_fragments {
            SELECT \
              c.*, \
              ROW_NUMBER() OVER ( \
-               PARTITION BY c.id, c.root_commit_id, c.raw_depth \
+               PARTITION BY c.id, c.start_commit_id, c.raw_depth \
                ORDER BY \
                  c.commit_created_at DESC, \
                  c.commit_id DESC, \
@@ -1656,13 +1656,13 @@ mod sql_fragments {
            id, \
            file_id, \
            plugin_key, \
-           root_commit_id, \
+           start_commit_id, \
            raw_depth, \
            change_id, \
            commit_id, \
            commit_created_at, \
            ROW_NUMBER() OVER ( \
-             PARTITION BY id, root_commit_id \
+             PARTITION BY id, start_commit_id \
              ORDER BY \
                raw_depth ASC, \
                commit_id DESC, \
@@ -1681,7 +1681,7 @@ mod sql_fragments {
            id, \
            file_id, \
            plugin_key, \
-           root_commit_id, \
+           start_commit_id, \
            raw_depth, \
            depth, \
            change_id, \
@@ -1702,7 +1702,7 @@ mod sql_fragments {
              e.id, \
              fd.file_id, \
              fd.plugin_key, \
-             e.root_commit_id, \
+             e.start_commit_id, \
              e.raw_depth, \
              e.depth, \
              e.change_id, \
@@ -1719,7 +1719,7 @@ mod sql_fragments {
              fd.hidden, \
              fd.depth AS descriptor_depth, \
              ROW_NUMBER() OVER ( \
-               PARTITION BY e.id, e.root_commit_id, e.depth \
+               PARTITION BY e.id, e.start_commit_id, e.depth \
                ORDER BY \
                  fd.depth ASC, \
                  fd.commit_created_at DESC, \
@@ -1729,7 +1729,7 @@ mod sql_fragments {
            FROM {events_relation_name} e \
            JOIN {file_history_rows_relation_name} fd \
              ON fd.id = e.id \
-            AND fd.root_commit_id = e.root_commit_id \
+            AND fd.start_commit_id = e.start_commit_id \
             AND fd.depth >= e.raw_depth \
          ) ranked \
          WHERE descriptor_rank = 1"
@@ -1744,7 +1744,7 @@ mod sql_fragments {
             "WITH RECURSIVE target_requests AS ( \
            SELECT DISTINCT \
              dr.id AS file_id, \
-             dr.root_commit_id, \
+             dr.start_commit_id, \
              dr.depth AS event_depth, \
              dr.descriptor_depth AS target_depth, \
              dr.directory_id, \
@@ -1755,7 +1755,7 @@ mod sql_fragments {
          visible_directory_rows AS ( \
            SELECT \
              file_id, \
-             root_commit_id, \
+             start_commit_id, \
              event_depth, \
              target_depth, \
              version_id, \
@@ -1765,7 +1765,7 @@ mod sql_fragments {
            FROM ( \
              SELECT \
                tr.file_id, \
-               tr.root_commit_id, \
+               tr.start_commit_id, \
                tr.event_depth, \
                tr.target_depth, \
                tr.version_id, \
@@ -1775,7 +1775,7 @@ mod sql_fragments {
                ROW_NUMBER() OVER ( \
                  PARTITION BY \
                    tr.file_id, \
-                   tr.root_commit_id, \
+                   tr.start_commit_id, \
                    tr.event_depth, \
                    tr.target_depth, \
                    tr.version_id, \
@@ -1788,7 +1788,7 @@ mod sql_fragments {
                ) AS visible_rank \
              FROM target_requests tr \
              JOIN {directory_history_rows_relation_name} d \
-               ON d.root_commit_id = tr.root_commit_id \
+               ON d.start_commit_id = tr.start_commit_id \
               AND d.version_id = tr.version_id \
               AND d.depth >= tr.target_depth \
            ) ranked \
@@ -1797,7 +1797,7 @@ mod sql_fragments {
          directory_paths AS ( \
            SELECT \
              vdr.file_id, \
-             vdr.root_commit_id, \
+             vdr.start_commit_id, \
              vdr.event_depth, \
              vdr.target_depth, \
              vdr.version_id, \
@@ -1809,7 +1809,7 @@ mod sql_fragments {
            UNION ALL \
            SELECT \
              child.file_id, \
-             child.root_commit_id, \
+             child.start_commit_id, \
              child.event_depth, \
              child.target_depth, \
              child.version_id, \
@@ -1820,14 +1820,14 @@ mod sql_fragments {
            JOIN directory_paths parent \
              ON parent.id = child.parent_id \
             AND parent.file_id = child.file_id \
-            AND parent.root_commit_id = child.root_commit_id \
+            AND parent.start_commit_id = child.start_commit_id \
             AND parent.event_depth = child.event_depth \
             AND parent.target_depth = child.target_depth \
             AND parent.version_id = child.version_id \
          ) \
          SELECT \
            dr.id, \
-           dr.root_commit_id, \
+           dr.start_commit_id, \
            dr.depth AS event_depth, \
            CASE \
              WHEN dr.directory_id IS NULL THEN \
@@ -1846,7 +1846,7 @@ mod sql_fragments {
          LEFT JOIN directory_paths dp \
            ON dp.id = dr.directory_id \
          AND dp.file_id = dr.id \
-         AND dp.root_commit_id = dr.root_commit_id \
+         AND dp.start_commit_id = dr.start_commit_id \
          AND dp.event_depth = dr.depth \
          AND dp.target_depth = dr.descriptor_depth \
          AND dp.version_id = dr.version_id"
@@ -1860,19 +1860,19 @@ mod sql_fragments {
         format!(
             "SELECT \
            id, \
-           root_commit_id, \
+           start_commit_id, \
            event_depth, \
            blob_hash, \
            size_bytes \
          FROM ( \
            SELECT \
              e.id, \
-             e.root_commit_id, \
+             e.start_commit_id, \
              e.depth AS event_depth, \
              b.blob_hash, \
              b.size_bytes, \
              ROW_NUMBER() OVER ( \
-               PARTITION BY e.id, e.root_commit_id, e.depth \
+               PARTITION BY e.id, e.start_commit_id, e.depth \
                ORDER BY \
                  b.depth ASC, \
                  b.commit_created_at DESC, \
@@ -1882,7 +1882,7 @@ mod sql_fragments {
            FROM {events_relation_name} e \
            JOIN {blob_history_rows_relation_name} b \
              ON b.id = e.id \
-            AND b.root_commit_id = e.root_commit_id \
+            AND b.start_commit_id = e.start_commit_id \
             AND b.depth >= e.raw_depth \
          ) ranked \
          WHERE blob_rank = 1"
@@ -1905,7 +1905,7 @@ mod sql_fragments {
                     "lixcol_change_id" => "e.change_id".to_string(),
                     "lixcol_commit_id" => "e.commit_id".to_string(),
                     "lixcol_commit_created_at" => "e.commit_created_at".to_string(),
-                    "lixcol_root_commit_id" => "e.root_commit_id".to_string(),
+                    "lixcol_start_commit_id" => "e.start_commit_id".to_string(),
                     "lixcol_depth" => "e.depth".to_string(),
                     _ => match &column.expression {
                         PreparedSql2FilesystemViewExpr::FileDescriptorColumn { column_name } => {
@@ -1936,15 +1936,15 @@ mod sql_fragments {
          FROM {events_relation_name} e \
          JOIN {descriptor_resolution_relation_name} d \
            ON d.id = e.id \
-          AND d.root_commit_id = e.root_commit_id \
+          AND d.start_commit_id = e.start_commit_id \
           AND d.depth = e.depth \
          LEFT JOIN {file_paths_relation_name} p \
            ON p.id = e.id \
-          AND p.root_commit_id = e.root_commit_id \
+          AND p.start_commit_id = e.start_commit_id \
           AND p.event_depth = e.depth \
          LEFT JOIN {file_blob_relation_name} b \
            ON b.id = e.id \
-          AND b.root_commit_id = e.root_commit_id \
+          AND b.start_commit_id = e.start_commit_id \
           AND b.event_depth = e.depth"
         )
     }
@@ -1990,7 +1990,7 @@ mod sql_fragments {
         let path_join = if matches!(plan.surface_variant, SurfaceVariant::History) {
             "ON dp.id = d.id \
           AND dp.version_id = d.version_id \
-          AND dp.root_commit_id = d.root_commit_id \
+          AND dp.start_commit_id = d.start_commit_id \
           AND dp.depth = d.depth"
         } else {
             "ON dp.id = d.id \
@@ -2042,7 +2042,7 @@ fn is_file_history_event_owned_column(
             "lixcol_change_id"
                 | "lixcol_commit_id"
                 | "lixcol_commit_created_at"
-                | "lixcol_root_commit_id"
+                | "lixcol_start_commit_id"
                 | "lixcol_depth"
         )
 }
@@ -2313,7 +2313,7 @@ mod tests {
                 "updated_at".to_string(),
                 "commit_id".to_string(),
                 "commit_created_at".to_string(),
-                "root_commit_id".to_string(),
+                "start_commit_id".to_string(),
                 "depth".to_string(),
                 "untracked".to_string(),
                 "metadata".to_string(),
@@ -2548,7 +2548,7 @@ mod tests {
                     Field::new("updated_at", DataType::Utf8, true),
                     Field::new("commit_id", DataType::Utf8, true),
                     Field::new("commit_created_at", DataType::Utf8, true),
-                    Field::new("root_commit_id", DataType::Utf8, true),
+                    Field::new("start_commit_id", DataType::Utf8, true),
                     Field::new("depth", DataType::Int64, true),
                     Field::new("untracked", DataType::Boolean, false),
                     Field::new("metadata", DataType::Utf8, true),
@@ -2592,7 +2592,7 @@ mod tests {
                     Field::new("change_id", DataType::Utf8, true),
                     Field::new("commit_id", DataType::Utf8, true),
                     Field::new("commit_created_at", DataType::Utf8, true),
-                    Field::new("root_commit_id", DataType::Utf8, true),
+                    Field::new("start_commit_id", DataType::Utf8, true),
                     Field::new("depth", DataType::Int64, true),
                     Field::new("untracked", DataType::Boolean, false),
                     Field::new("metadata", DataType::Utf8, true),
@@ -2659,7 +2659,7 @@ mod tests {
                     Field::new("updated_at", DataType::Utf8, true),
                     Field::new("commit_id", DataType::Utf8, true),
                     Field::new("commit_created_at", DataType::Utf8, true),
-                    Field::new("root_commit_id", DataType::Utf8, true),
+                    Field::new("start_commit_id", DataType::Utf8, true),
                     Field::new("depth", DataType::Int64, true),
                     Field::new("untracked", DataType::Boolean, false),
                     Field::new("metadata", DataType::Utf8, true),
@@ -2717,7 +2717,7 @@ mod tests {
                     Field::new("updated_at", DataType::Utf8, true),
                     Field::new("commit_id", DataType::Utf8, true),
                     Field::new("commit_created_at", DataType::Utf8, true),
-                    Field::new("root_commit_id", DataType::Utf8, true),
+                    Field::new("start_commit_id", DataType::Utf8, true),
                     Field::new("depth", DataType::Int64, true),
                     Field::new("untracked", DataType::Boolean, false),
                     Field::new("metadata", DataType::Utf8, true),
@@ -2775,7 +2775,7 @@ mod tests {
                     Field::new("updated_at", DataType::Utf8, true),
                     Field::new("commit_id", DataType::Utf8, true),
                     Field::new("commit_created_at", DataType::Utf8, true),
-                    Field::new("root_commit_id", DataType::Utf8, true),
+                    Field::new("start_commit_id", DataType::Utf8, true),
                     Field::new("depth", DataType::Int64, true),
                     Field::new("untracked", DataType::Boolean, false),
                     Field::new("metadata", DataType::Utf8, true),
@@ -2899,7 +2899,7 @@ mod tests {
                     Field::new("updated_at", DataType::Utf8, true),
                     Field::new("commit_id", DataType::Utf8, true),
                     Field::new("commit_created_at", DataType::Utf8, true),
-                    Field::new("root_commit_id", DataType::Utf8, true),
+                    Field::new("start_commit_id", DataType::Utf8, true),
                     Field::new("depth", DataType::Int64, true),
                     Field::new("untracked", DataType::Boolean, false),
                     Field::new("metadata", DataType::Utf8, true),
@@ -2924,7 +2924,7 @@ mod tests {
                     Field::new("updated_at", DataType::Utf8, true),
                     Field::new("commit_id", DataType::Utf8, true),
                     Field::new("commit_created_at", DataType::Utf8, true),
-                    Field::new("root_commit_id", DataType::Utf8, true),
+                    Field::new("start_commit_id", DataType::Utf8, true),
                     Field::new("depth", DataType::Int64, true),
                     Field::new("untracked", DataType::Boolean, false),
                     Field::new("metadata", DataType::Utf8, true),
@@ -3158,7 +3158,7 @@ mod tests {
                     Field::new("name", DataType::Utf8, false),
                     Field::new("extension", DataType::Utf8, true),
                     Field::new("version_id", DataType::Utf8, false),
-                    Field::new("root_commit_id", DataType::Utf8, false),
+                    Field::new("start_commit_id", DataType::Utf8, false),
                     Field::new("depth", DataType::Int64, false),
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
@@ -3184,7 +3184,7 @@ mod tests {
                     Field::new("parent_id", DataType::Utf8, true),
                     Field::new("name", DataType::Utf8, false),
                     Field::new("version_id", DataType::Utf8, false),
-                    Field::new("root_commit_id", DataType::Utf8, false),
+                    Field::new("start_commit_id", DataType::Utf8, false),
                     Field::new("depth", DataType::Int64, false),
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
@@ -3210,7 +3210,7 @@ mod tests {
                     Field::new("blob_hash", DataType::Utf8, true),
                     Field::new("size_bytes", DataType::Int64, true),
                     Field::new("version_id", DataType::Utf8, false),
-                    Field::new("root_commit_id", DataType::Utf8, false),
+                    Field::new("start_commit_id", DataType::Utf8, false),
                     Field::new("depth", DataType::Int64, false),
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
@@ -3252,7 +3252,7 @@ mod tests {
         assert!(rendered.contains("__lix_file_history_descriptor_resolution"));
         assert!(rendered.contains("__lix_file_history_paths"));
         assert!(rendered.contains("__lix_file_history_blob_resolution"));
-        assert!(rendered.contains("lixcol_root_commit_id"));
+        assert!(rendered.contains("lixcol_start_commit_id"));
         assert!(rendered.contains("lixcol_depth"));
         assert!(rendered.contains("candidate_source_priority"));
     }
@@ -3273,7 +3273,7 @@ mod tests {
         let rendered =
             super::sql_fragments::filesystem_file_history_events_sql("__event_candidates");
         assert!(rendered.contains("FROM __event_candidates"));
-        assert!(rendered.contains("PARTITION BY id, root_commit_id"));
+        assert!(rendered.contains("PARTITION BY id, start_commit_id"));
         assert!(rendered.contains("raw_depth ASC"));
         assert!(rendered.contains(") - 1 AS depth"));
 
@@ -3344,7 +3344,7 @@ mod tests {
             "__file_history_rows",
         );
         assert!(rendered.contains("fd.depth >= e.raw_depth"));
-        assert!(rendered.contains("PARTITION BY e.id, e.root_commit_id, e.depth"));
+        assert!(rendered.contains("PARTITION BY e.id, e.start_commit_id, e.depth"));
         assert!(rendered.contains("fd.name"));
         assert!(rendered.contains("fd.extension"));
         assert!(rendered.contains("fd.hidden"));
@@ -3407,7 +3407,7 @@ mod tests {
         assert!(rendered.contains("FROM __events e"));
         assert!(rendered.contains("JOIN __blob_history_rows b"));
         assert!(rendered.contains("b.depth >= e.raw_depth"));
-        assert!(rendered.contains("PARTITION BY e.id, e.root_commit_id, e.depth"));
+        assert!(rendered.contains("PARTITION BY e.id, e.start_commit_id, e.depth"));
         assert!(rendered.contains("blob_hash"));
         assert!(rendered.contains("size_bytes"));
 
@@ -3475,7 +3475,7 @@ mod tests {
             "lixcol_change_id",
             "lixcol_commit_id",
             "lixcol_commit_created_at",
-            "lixcol_root_commit_id",
+            "lixcol_start_commit_id",
             "lixcol_depth",
         ] {
             let column = file
@@ -3512,7 +3512,7 @@ mod tests {
         assert!(rendered.contains("e.change_id AS lixcol_change_id"));
         assert!(rendered.contains("e.commit_id AS lixcol_commit_id"));
         assert!(rendered.contains("e.commit_created_at AS lixcol_commit_created_at"));
-        assert!(rendered.contains("e.root_commit_id AS lixcol_root_commit_id"));
+        assert!(rendered.contains("e.start_commit_id AS lixcol_start_commit_id"));
         assert!(rendered.contains("e.depth AS lixcol_depth"));
         assert!(rendered.contains("d.schema_key AS lixcol_schema_key"));
         assert!(rendered.contains("d.version_id AS lixcol_version_id"));
@@ -3546,7 +3546,7 @@ mod tests {
                     Field::new("name", DataType::Utf8, false),
                     Field::new("extension", DataType::Utf8, true),
                     Field::new("version_id", DataType::Utf8, false),
-                    Field::new("root_commit_id", DataType::Utf8, false),
+                    Field::new("start_commit_id", DataType::Utf8, false),
                     Field::new("depth", DataType::Int64, false),
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
@@ -3572,7 +3572,7 @@ mod tests {
                     Field::new("parent_id", DataType::Utf8, true),
                     Field::new("name", DataType::Utf8, false),
                     Field::new("version_id", DataType::Utf8, false),
-                    Field::new("root_commit_id", DataType::Utf8, false),
+                    Field::new("start_commit_id", DataType::Utf8, false),
                     Field::new("depth", DataType::Int64, false),
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
@@ -3598,7 +3598,7 @@ mod tests {
                     Field::new("blob_hash", DataType::Utf8, true),
                     Field::new("size_bytes", DataType::Int64, true),
                     Field::new("version_id", DataType::Utf8, false),
-                    Field::new("root_commit_id", DataType::Utf8, false),
+                    Field::new("start_commit_id", DataType::Utf8, false),
                     Field::new("depth", DataType::Int64, false),
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
@@ -3638,7 +3638,7 @@ mod tests {
         let rendered = format!("{:?}", view.logical_plan());
         assert!(rendered.contains("__lix_file_history_events"));
         assert!(rendered.contains("lixcol_version_id"));
-        assert!(rendered.contains("lixcol_root_commit_id"));
+        assert!(rendered.contains("lixcol_start_commit_id"));
         assert!(rendered.contains("lixcol_depth"));
         assert!(!rendered.contains(" AS metadata"));
     }
@@ -3789,7 +3789,7 @@ mod tests {
                     Field::new("parent_id", DataType::Utf8, true),
                     Field::new("name", DataType::Utf8, false),
                     Field::new("version_id", DataType::Utf8, false),
-                    Field::new("root_commit_id", DataType::Utf8, false),
+                    Field::new("start_commit_id", DataType::Utf8, false),
                     Field::new("depth", DataType::Int64, false),
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
@@ -3830,9 +3830,9 @@ mod tests {
         assert!(rendered.contains("lix_directory_descriptor_history_winners"));
         assert!(rendered.contains("__lix_directory_paths"));
         assert!(!rendered.contains(" AS metadata"));
-        assert!(rendered.contains("root_commit_id"));
+        assert!(rendered.contains("start_commit_id"));
         assert!(rendered.contains("depth"));
-        assert!(rendered.contains("lixcol_root_commit_id"));
+        assert!(rendered.contains("lixcol_start_commit_id"));
         assert!(rendered.contains("lixcol_depth"));
     }
 }

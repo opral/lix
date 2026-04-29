@@ -169,7 +169,7 @@ pub(crate) fn state_relation_column_is_nullable_for_variant(
         },
         SurfaceVariant::History => match column_name {
             "entity_id" | "schema_key" | "schema_version" | "change_id" | "commit_id"
-            | "commit_created_at" | "root_commit_id" | "depth" | "version_id" => Some(false),
+            | "commit_created_at" | "start_commit_id" | "depth" => Some(false),
             "file_id" | "plugin_key" | "snapshot_content" | "metadata" => Some(true),
             _ => None,
         },
@@ -221,9 +221,8 @@ fn state_history_columns() -> Vec<String> {
         "change_id".to_string(),
         "commit_id".to_string(),
         "commit_created_at".to_string(),
-        "root_commit_id".to_string(),
+        "start_commit_id".to_string(),
         "depth".to_string(),
-        "version_id".to_string(),
     ]
 }
 
@@ -244,7 +243,7 @@ fn state_column_types() -> BTreeMap<String, SurfaceColumnType> {
         ("untracked".to_string(), SurfaceColumnType::Boolean),
         ("version_id".to_string(), SurfaceColumnType::String),
         ("commit_created_at".to_string(), SurfaceColumnType::String),
-        ("root_commit_id".to_string(), SurfaceColumnType::String),
+        ("start_commit_id".to_string(), SurfaceColumnType::String),
         ("depth".to_string(), SurfaceColumnType::Integer),
     ])
 }

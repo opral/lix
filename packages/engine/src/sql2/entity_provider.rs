@@ -13,11 +13,9 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{not_impl_err, DFSchema, DataFusionError, Result, ScalarValue};
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::TableType;
-use datafusion::datasource::ViewTable;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::expr_fn::{col, try_cast};
-use datafusion::logical_expr::{lit, Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::{create_physical_expr, EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -29,6 +27,7 @@ use futures_util::{stream, StreamExt, TryStreamExt};
 use serde_json::Value as JsonValue;
 
 use crate::common::{derive_entity_id_from_json_paths, EntityIdDerivationError};
+use crate::engine2::commit_graph::CommitGraphReader;
 use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
@@ -39,10 +38,8 @@ use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
+use super::entity_history_provider::EntityHistoryProvider;
 use super::execute::{SqlWriteIntent, SqlWriteStager};
-use super::udf::{
-    lix_json_extract_boolean_expr, lix_json_extract_json_expr, lix_json_extract_text_expr,
-};
 
 pub(crate) async fn register_entity_providers(
     ctx: &SessionContext,
@@ -50,7 +47,7 @@ pub(crate) async fn register_entity_providers(
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
-    history_available: bool,
+    commit_graph: Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>,
     schema_definitions: &[JsonValue],
 ) -> Result<(), LixError> {
     for schema in schema_definitions {
@@ -87,96 +84,29 @@ pub(crate) async fn register_entity_providers(
         )
         .map_err(datafusion_error_to_lix_error)?;
 
-        if history_available {
-            let history_name = format!("{}_history", spec.schema_key);
-            ctx.register_table(
-                &history_name,
-                entity_history_view_provider(ctx, &spec).await?,
-            )
-            .map_err(datafusion_error_to_lix_error)?;
-        }
+        let history_name = format!("{}_history", spec.schema_key);
+        ctx.register_table(
+            &history_name,
+            Arc::new(EntityHistoryProvider::new(
+                Arc::clone(&spec),
+                Arc::clone(&commit_graph),
+            )),
+        )
+        .map_err(datafusion_error_to_lix_error)?;
     }
 
     Ok(())
 }
 
-async fn entity_history_view_provider(
-    ctx: &SessionContext,
-    spec: &EntitySurfaceSpec,
-) -> Result<Arc<dyn TableProvider>, LixError> {
-    let dataframe = ctx
-        .sql("SELECT * FROM lix_state_history")
-        .await
-        .map_err(datafusion_error_to_lix_error)?
-        .filter(col("schema_key").eq(lit(spec.schema_key.clone())))
-        .map_err(datafusion_error_to_lix_error)?
-        .select(entity_history_projection_exprs(spec).map_err(datafusion_error_to_lix_error)?)
-        .map_err(datafusion_error_to_lix_error)?;
-
-    Ok(Arc::new(ViewTable::new(
-        dataframe.into_unoptimized_plan(),
-        None,
-    )))
-}
-
-fn entity_history_projection_exprs(spec: &EntitySurfaceSpec) -> Result<Vec<Expr>> {
-    let mut projections = spec
-        .visible_columns
-        .iter()
-        .map(|column_name| {
-            let column_type = spec.column_types.get(column_name).ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "sql2 entity provider '{}' does not expose column '{}'",
-                    spec.schema_key, column_name
-                ))
-            })?;
-            Ok(
-                entity_history_payload_projection_expr(column_name, *column_type)
-                    .alias(column_name.clone()),
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    projections.extend(
-        entity_system_fields(EntityProviderVariant::History)
-            .into_iter()
-            .filter_map(|field| {
-                let public_name = field.name().strip_prefix("lixcol_")?;
-                Some(col(public_name).alias(field.name().clone()))
-            }),
-    );
-    Ok(projections)
-}
-
-fn entity_history_payload_projection_expr(
-    property_name: &str,
-    column_type: EntityColumnType,
-) -> Expr {
-    let snapshot_content = col("snapshot_content");
-    match column_type {
-        EntityColumnType::String => lix_json_extract_text_expr(snapshot_content, property_name),
-        EntityColumnType::Json => lix_json_extract_json_expr(snapshot_content, property_name),
-        EntityColumnType::Boolean => lix_json_extract_boolean_expr(snapshot_content, property_name),
-        EntityColumnType::Integer => try_cast(
-            lix_json_extract_text_expr(snapshot_content, property_name),
-            DataType::Int64,
-        ),
-        EntityColumnType::Number => try_cast(
-            lix_json_extract_text_expr(snapshot_content, property_name),
-            DataType::Float64,
-        ),
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EntityProviderVariant {
+pub(super) enum EntityProviderVariant {
     Active,
     ByVersion,
     History,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EntityColumnType {
+pub(super) enum EntityColumnType {
     String,
     Json,
     Integer,
@@ -185,12 +115,12 @@ enum EntityColumnType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct EntitySurfaceSpec {
-    schema_key: String,
+pub(super) struct EntitySurfaceSpec {
+    pub(super) schema_key: String,
     schema_version: Option<String>,
     primary_key_paths: Vec<Vec<String>>,
-    visible_columns: Vec<String>,
-    column_types: BTreeMap<String, EntityColumnType>,
+    pub(super) visible_columns: Vec<String>,
+    pub(super) column_types: BTreeMap<String, EntityColumnType>,
 }
 
 pub(crate) struct EntityProvider {
@@ -1514,7 +1444,7 @@ fn entity_system_column_array(column_name: &str, rows: &[LiveStateRow]) -> Resul
     })
 }
 
-fn parse_snapshot(snapshot_content: Option<&str>) -> Result<Option<JsonValue>> {
+pub(super) fn parse_snapshot(snapshot_content: Option<&str>) -> Result<Option<JsonValue>> {
     snapshot_content
         .map(|snapshot| {
             serde_json::from_str::<JsonValue>(snapshot).map_err(|error| {
@@ -1526,7 +1456,7 @@ fn parse_snapshot(snapshot_content: Option<&str>) -> Result<Option<JsonValue>> {
         .transpose()
 }
 
-fn entity_json_text_value(
+pub(super) fn entity_json_text_value(
     value: Option<&JsonValue>,
     column_type: EntityColumnType,
 ) -> Result<Option<String>> {
@@ -1544,7 +1474,7 @@ fn entity_json_text_value(
     })
 }
 
-fn entity_i64_value(value: Option<&JsonValue>) -> Option<i64> {
+pub(super) fn entity_i64_value(value: Option<&JsonValue>) -> Option<i64> {
     match value {
         Some(JsonValue::Number(number)) => number.as_i64(),
         Some(JsonValue::String(value)) => value.parse::<i64>().ok(),
@@ -1552,7 +1482,7 @@ fn entity_i64_value(value: Option<&JsonValue>) -> Option<i64> {
     }
 }
 
-fn entity_f64_value(value: Option<&JsonValue>) -> Option<f64> {
+pub(super) fn entity_f64_value(value: Option<&JsonValue>) -> Option<f64> {
     match value {
         Some(JsonValue::Number(number)) => number.as_f64(),
         Some(JsonValue::String(value)) => value.parse::<f64>().ok(),
@@ -1566,14 +1496,17 @@ fn json_to_string(value: &JsonValue) -> Result<String> {
     })
 }
 
-fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
+pub(super) fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
     let values = values
         .map(|value| value.map(ToOwned::to_owned))
         .collect::<Vec<_>>();
     Arc::new(StringArray::from(values)) as ArrayRef
 }
 
-fn entity_surface_schema(spec: &EntitySurfaceSpec, variant: EntityProviderVariant) -> SchemaRef {
+pub(super) fn entity_surface_schema(
+    spec: &EntitySurfaceSpec,
+    variant: EntityProviderVariant,
+) -> SchemaRef {
     let mut fields = spec
         .visible_columns
         .iter()
@@ -1600,7 +1533,7 @@ fn arrow_data_type_for_entity_column_type(column_type: EntityColumnType) -> Data
     }
 }
 
-fn entity_system_fields(variant: EntityProviderVariant) -> Vec<Field> {
+pub(super) fn entity_system_fields(variant: EntityProviderVariant) -> Vec<Field> {
     if variant == EntityProviderVariant::History {
         return vec![
             Field::new("lixcol_entity_id", DataType::Utf8, false),
@@ -1613,9 +1546,8 @@ fn entity_system_fields(variant: EntityProviderVariant) -> Vec<Field> {
             Field::new("lixcol_change_id", DataType::Utf8, false),
             Field::new("lixcol_commit_id", DataType::Utf8, false),
             Field::new("lixcol_commit_created_at", DataType::Utf8, false),
-            Field::new("lixcol_root_commit_id", DataType::Utf8, false),
+            Field::new("lixcol_start_commit_id", DataType::Utf8, false),
             Field::new("lixcol_depth", DataType::Int64, false),
-            Field::new("lixcol_version_id", DataType::Utf8, false),
         ];
     }
 

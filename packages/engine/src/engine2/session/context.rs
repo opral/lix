@@ -102,10 +102,8 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
         Some(Arc::new(self.changelog.reader(Arc::clone(&self.backend))))
     }
 
-    fn commit_graph(&self) -> Option<Box<dyn CommitGraphReader>> {
-        Some(Box::new(
-            CommitGraphContext::new(ChangelogContext::new()).reader(Arc::clone(&self.backend)),
-        ))
+    fn commit_graph(&self) -> Box<dyn CommitGraphReader> {
+        Box::new(CommitGraphContext::new(ChangelogContext::new()).reader(Arc::clone(&self.backend)))
     }
 
     fn version_ref(&self) -> Option<Arc<dyn VersionRefReader>> {
