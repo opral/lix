@@ -742,14 +742,13 @@ fn filesystem_file_history_columns() -> Vec<String> {
         "lixcol_entity_id".to_string(),
         "lixcol_schema_key".to_string(),
         "lixcol_file_id".to_string(),
-        "lixcol_version_id".to_string(),
         "lixcol_plugin_key".to_string(),
         "lixcol_schema_version".to_string(),
         "lixcol_change_id".to_string(),
         "lixcol_metadata".to_string(),
         "lixcol_commit_id".to_string(),
         "lixcol_commit_created_at".to_string(),
-        "lixcol_root_commit_id".to_string(),
+        "lixcol_start_commit_id".to_string(),
         "lixcol_depth".to_string(),
     ]
 }
@@ -790,14 +789,13 @@ fn filesystem_directory_history_columns() -> Vec<String> {
         "lixcol_entity_id".to_string(),
         "lixcol_schema_key".to_string(),
         "lixcol_file_id".to_string(),
-        "lixcol_version_id".to_string(),
         "lixcol_plugin_key".to_string(),
         "lixcol_schema_version".to_string(),
         "lixcol_change_id".to_string(),
         "lixcol_metadata".to_string(),
         "lixcol_commit_id".to_string(),
         "lixcol_commit_created_at".to_string(),
-        "lixcol_root_commit_id".to_string(),
+        "lixcol_start_commit_id".to_string(),
         "lixcol_depth".to_string(),
     ]
 }
@@ -942,7 +940,7 @@ mod tests {
             .contains(&"lixcol_commit_created_at".to_string()));
         assert!(descriptor
             .hidden_columns
-            .contains(&"lixcol_root_commit_id".to_string()));
+            .contains(&"lixcol_start_commit_id".to_string()));
         assert!(descriptor
             .hidden_columns
             .contains(&"lixcol_depth".to_string()));

@@ -4,8 +4,9 @@ use crate::backend::KvStore;
 use crate::engine2::changelog::{CanonicalChange, ChangelogContext, ChangelogStoreReader};
 use crate::engine2::commit_graph::walker::walk_reachable_commits;
 use crate::engine2::commit_graph::{
-    CommitGraphChangeSet, CommitGraphChangeSetElement, CommitGraphCommit, CommitGraphEdge,
-    CommitGraphEntity, CommitGraphReader, ReachableCommitGraphCommit,
+    CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphChangeSet,
+    CommitGraphChangeSetElement, CommitGraphCommit, CommitGraphEdge, CommitGraphEntity,
+    CommitGraphReader, ReachableCommitGraphCommit,
 };
 use crate::LixError;
 
@@ -144,6 +145,41 @@ where
         Ok(elements)
     }
 
+    /// Returns canonical member changes reachable from `start_commit_id`.
+    ///
+    /// This is the primitive history API. It reports the commit/depth where
+    /// each matching canonical change was observed and leaves row shaping to
+    /// callers such as SQL providers.
+    pub(crate) async fn change_history_from_commit(
+        &mut self,
+        start_commit_id: &str,
+        request: &CommitGraphChangeHistoryRequest,
+    ) -> Result<Vec<CommitGraphChangeHistoryEntry>, LixError> {
+        let commits = self.reachable_commits(start_commit_id).await?;
+        let mut entries = Vec::new();
+
+        for reachable in commits {
+            if !depth_matches(reachable.depth, request) {
+                continue;
+            }
+
+            let commit_id = reachable.commit.commit_id;
+            for change_id in reachable.commit.change_ids {
+                let change = self.load_member_change(&change_id, &commit_id).await?;
+                if change_matches_history_request(&change, request) {
+                    entries.push(CommitGraphChangeHistoryEntry {
+                        change,
+                        commit_id: commit_id.clone(),
+                        start_commit_id: start_commit_id.to_string(),
+                        depth: reachable.depth,
+                    });
+                }
+            }
+        }
+
+        Ok(entries)
+    }
+
     /// Selects the first reachable change for each canonical entity identity.
     async fn select_entities(
         &mut self,
@@ -244,6 +280,33 @@ where
     ) -> Result<Vec<CommitGraphChangeSetElement>, LixError> {
         CommitGraphStoreReader::change_set_elements(self, commits).await
     }
+
+    async fn change_history_from_commit(
+        &mut self,
+        start_commit_id: &str,
+        request: &CommitGraphChangeHistoryRequest,
+    ) -> Result<Vec<CommitGraphChangeHistoryEntry>, LixError> {
+        CommitGraphStoreReader::change_history_from_commit(self, start_commit_id, request).await
+    }
+}
+
+fn depth_matches(depth: u32, request: &CommitGraphChangeHistoryRequest) -> bool {
+    request.min_depth.map_or(true, |min| depth >= min)
+        && request.max_depth.map_or(true, |max| depth <= max)
+}
+
+fn change_matches_history_request(
+    change: &CanonicalChange,
+    request: &CommitGraphChangeHistoryRequest,
+) -> bool {
+    (request.include_tombstones || change.snapshot_content.is_some())
+        && (request.entity_ids.is_empty() || request.entity_ids.contains(&change.entity_id))
+        && (request.schema_keys.is_empty() || request.schema_keys.contains(&change.schema_key))
+        && (request.file_ids.is_empty()
+            || change
+                .file_id
+                .as_ref()
+                .is_some_and(|file_id| request.file_ids.contains(file_id)))
 }
 
 fn observe_change(
@@ -428,7 +491,7 @@ mod tests {
 
     use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
     use crate::engine2::changelog::{CanonicalChange, ChangelogContext};
-    use crate::engine2::commit_graph::CommitGraphContext;
+    use crate::engine2::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphContext};
 
     #[tokio::test]
     async fn load_commit_parses_commit_snapshot() {
@@ -650,6 +713,158 @@ mod tests {
         assert_eq!(elements[0].change.id, "change-1");
         assert_eq!(elements[0].change.entity_id, "entity-1");
     }
+
+    #[tokio::test]
+    async fn change_history_from_commit_reports_matching_canonical_changes_with_depth() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let changelog = ChangelogContext::new();
+        append_changes(
+            Arc::clone(&backend),
+            &changelog,
+            &[
+                entity_change("change-root", "entity-root", "test_schema", "{}"),
+                entity_change("change-head", "entity-head", "test_schema", "{}"),
+                commit_change("commit-root-change", "commit-root", &["change-root"], &[]),
+                commit_change(
+                    "commit-head-change",
+                    "commit-head",
+                    &["change-head"],
+                    &["commit-root"],
+                ),
+            ],
+        )
+        .await;
+
+        let graph = CommitGraphContext::new(changelog);
+        let mut reader = graph.reader(backend);
+        let history = reader
+            .change_history_from_commit(
+                "commit-head",
+                &CommitGraphChangeHistoryRequest {
+                    schema_keys: vec!["test_schema".to_string()],
+                    include_tombstones: true,
+                    ..CommitGraphChangeHistoryRequest::default()
+                },
+            )
+            .await
+            .expect("history should resolve");
+
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| (
+                    entry.change.id.as_str(),
+                    entry.commit_id.as_str(),
+                    entry.start_commit_id.as_str(),
+                    entry.depth
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("change-head", "commit-head", "commit-head", 0),
+                ("change-root", "commit-root", "commit-head", 1),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn change_history_from_commit_filters_depth_entity_file_and_tombstones() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let changelog = ChangelogContext::new();
+        append_changes(
+            Arc::clone(&backend),
+            &changelog,
+            &[
+                entity_change_with_file_and_plugin(
+                    "change-file-a",
+                    "entity-1",
+                    "test_schema",
+                    Some("file-a"),
+                    None,
+                    "{}",
+                ),
+                entity_tombstone("change-tombstone", "entity-1", "test_schema"),
+                entity_change_with_file_and_plugin(
+                    "change-file-b",
+                    "entity-2",
+                    "test_schema",
+                    Some("file-b"),
+                    None,
+                    "{}",
+                ),
+                commit_change("commit-root-change", "commit-root", &["change-file-a"], &[]),
+                commit_change(
+                    "commit-head-change",
+                    "commit-head",
+                    &["change-tombstone", "change-file-b"],
+                    &["commit-root"],
+                ),
+            ],
+        )
+        .await;
+
+        let graph = CommitGraphContext::new(changelog);
+        let mut reader = graph.reader(backend);
+        let history = reader
+            .change_history_from_commit(
+                "commit-head",
+                &CommitGraphChangeHistoryRequest {
+                    entity_ids: vec!["entity-1".to_string()],
+                    file_ids: vec!["file-a".to_string()],
+                    min_depth: Some(1),
+                    max_depth: Some(1),
+                    include_tombstones: false,
+                    ..CommitGraphChangeHistoryRequest::default()
+                },
+            )
+            .await
+            .expect("history should resolve");
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].change.id, "change-file-a");
+        assert_eq!(history[0].depth, 1);
+    }
+
+    #[tokio::test]
+    async fn change_history_from_commit_includes_tombstones_when_requested() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let changelog = ChangelogContext::new();
+        append_changes(
+            Arc::clone(&backend),
+            &changelog,
+            &[
+                entity_tombstone("change-deleted", "entity-1", "test_schema"),
+                commit_change(
+                    "commit-head-change",
+                    "commit-head",
+                    &["change-deleted"],
+                    &[],
+                ),
+            ],
+        )
+        .await;
+
+        let graph = CommitGraphContext::new(changelog);
+        let mut reader = graph.reader(backend);
+        let hidden = reader
+            .change_history_from_commit("commit-head", &CommitGraphChangeHistoryRequest::default())
+            .await
+            .expect("history should resolve");
+        let visible = reader
+            .change_history_from_commit(
+                "commit-head",
+                &CommitGraphChangeHistoryRequest {
+                    include_tombstones: true,
+                    ..CommitGraphChangeHistoryRequest::default()
+                },
+            )
+            .await
+            .expect("history should resolve");
+
+        assert!(hidden.is_empty());
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].change.id, "change-deleted");
+    }
+
     #[tokio::test]
     async fn entities_at_selects_nearest_member_change_for_identity() {
         let backend = Arc::new(UnitTestBackend::new());

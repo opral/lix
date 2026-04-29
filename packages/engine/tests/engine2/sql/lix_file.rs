@@ -25,7 +25,7 @@ simulation_test2!(
 
         let result = session
             .execute(
-                "SELECT id, path, data, hidden \
+                "SELECT id, path, data, hidden, lixcol_schema_key \
              FROM lix_file \
              WHERE id = 'file-readme'",
                 &[],
@@ -43,6 +43,7 @@ simulation_test2!(
                 Value::Text("/docs/guides/readme.md".to_string()),
                 Value::Blob(b"hello".to_vec()),
                 Value::Boolean(false),
+                Value::Text("lix_file_descriptor".to_string()),
             ]
         );
 

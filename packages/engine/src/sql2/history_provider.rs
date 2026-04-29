@@ -6,10 +6,10 @@ use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{DataFusionError, Result, ScalarValue};
+use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -18,36 +18,29 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::SessionContext;
 use futures_util::{stream, TryStreamExt};
+use tokio::sync::Mutex;
 
-use crate::history::{
-    StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRootScope,
-    StateHistoryRow, StateHistoryVersionScope,
-};
+use crate::engine2::commit_graph::CommitGraphReader;
 use crate::LixError;
 
-use super::execute::HistoryContext;
+use super::history_route::{load_history_entries, parse_history_filter, HistoryRoute};
 
 pub(crate) async fn register_history_providers(
     session: &SessionContext,
-    active_version_id: &str,
-    history: Option<Arc<dyn HistoryContext>>,
-) -> Result<Option<Arc<dyn TableProvider>>, LixError> {
-    let Some(history) = history else {
-        return Ok(None);
-    };
-
-    let provider: Arc<dyn TableProvider> =
-        Arc::new(LixStateHistoryProvider::new(active_version_id, history));
+    commit_graph: Box<dyn CommitGraphReader>,
+) -> Result<Arc<dyn TableProvider>, LixError> {
+    let provider: Arc<dyn TableProvider> = Arc::new(LixStateHistoryProvider::new(Arc::new(
+        Mutex::new(commit_graph),
+    )));
     session
         .register_table("lix_state_history", Arc::clone(&provider))
         .map_err(datafusion_error_to_lix_error)?;
-    Ok(Some(provider))
+    Ok(provider)
 }
 
 pub(crate) struct LixStateHistoryProvider {
-    active_version_id: String,
     schema: SchemaRef,
-    history: Arc<dyn HistoryContext>,
+    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
 }
 
 impl std::fmt::Debug for LixStateHistoryProvider {
@@ -57,14 +50,10 @@ impl std::fmt::Debug for LixStateHistoryProvider {
 }
 
 impl LixStateHistoryProvider {
-    pub(crate) fn new(
-        active_version_id: impl Into<String>,
-        history: Arc<dyn HistoryContext>,
-    ) -> Self {
+    pub(crate) fn new(commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>) -> Self {
         Self {
-            active_version_id: active_version_id.into(),
             schema: lix_state_history_schema(),
-            history,
+            commit_graph,
         }
     }
 }
@@ -90,7 +79,7 @@ impl TableProvider for LixStateHistoryProvider {
         Ok(filters
             .iter()
             .map(|filter| {
-                if parse_state_history_filter(filter).is_some() {
+                if parse_history_filter(filter).is_some() {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -108,22 +97,20 @@ impl TableProvider for LixStateHistoryProvider {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let projected_schema = projected_schema(&self.schema, projection)?;
         Ok(Arc::new(LixStateHistoryScanExec::new(
-            self.active_version_id.clone(),
-            Arc::clone(&self.history),
+            Arc::clone(&self.commit_graph),
             projected_schema,
             projection.cloned(),
-            StateHistoryRoute::from_filters(filters),
+            HistoryRoute::from_filters(filters),
             limit,
         )))
     }
 }
 
 struct LixStateHistoryScanExec {
-    active_version_id: String,
-    history: Arc<dyn HistoryContext>,
+    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
-    route: StateHistoryRoute,
+    route: HistoryRoute,
     limit: Option<usize>,
     properties: Arc<PlanProperties>,
 }
@@ -131,7 +118,6 @@ struct LixStateHistoryScanExec {
 impl std::fmt::Debug for LixStateHistoryScanExec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LixStateHistoryScanExec")
-            .field("active_version_id", &self.active_version_id)
             .field("limit", &self.limit)
             .field("route", &self.route)
             .finish()
@@ -140,11 +126,10 @@ impl std::fmt::Debug for LixStateHistoryScanExec {
 
 impl LixStateHistoryScanExec {
     fn new(
-        active_version_id: String,
-        history: Arc<dyn HistoryContext>,
+        commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
-        route: StateHistoryRoute,
+        route: HistoryRoute,
         limit: Option<usize>,
     ) -> Self {
         let properties = PlanProperties::new(
@@ -154,8 +139,7 @@ impl LixStateHistoryScanExec {
             Boundedness::Bounded,
         );
         Self {
-            active_version_id,
-            history,
+            commit_graph,
             schema,
             projection,
             route,
@@ -171,8 +155,8 @@ impl DisplayAs for LixStateHistoryScanExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "LixStateHistoryScanExec(active_version_id={}, limit={:?}, route={:?})",
-                    self.active_version_id, self.limit, self.route
+                    "LixStateHistoryScanExec(limit={:?}, route={:?})",
+                    self.limit, self.route
                 )
             }
             DisplayFormatType::TreeRender => write!(f, "LixStateHistoryScanExec"),
@@ -220,8 +204,8 @@ impl ExecutionPlan for LixStateHistoryScanExec {
             )));
         }
 
-        let history = Arc::clone(&self.history);
-        let request = state_history_request(&self.active_version_id, &self.route);
+        let commit_graph = Arc::clone(&self.commit_graph);
+        let route = self.route.clone();
         let schema = Arc::clone(&self.schema);
         let stream_schema = Arc::clone(&schema);
         let limit = self.limit;
@@ -231,11 +215,10 @@ impl ExecutionPlan for LixStateHistoryScanExec {
             .is_some_and(|projection| projection.is_empty());
 
         let stream = stream::once(async move {
-            let rows = if request_contradictory(&request) {
+            let rows = if route.is_contradictory() {
                 Vec::new()
             } else {
-                history
-                    .scan_state_history(&request)
+                load_state_history_rows(commit_graph, &route)
                     .await
                     .map_err(lix_error_to_datafusion_error)?
             };
@@ -278,9 +261,8 @@ fn lix_state_history_schema() -> SchemaRef {
         Field::new("change_id", DataType::Utf8, false),
         Field::new("commit_id", DataType::Utf8, false),
         Field::new("commit_created_at", DataType::Utf8, false),
-        Field::new("root_commit_id", DataType::Utf8, false),
+        Field::new("start_commit_id", DataType::Utf8, false),
         Field::new("depth", DataType::Int64, false),
-        Field::new("version_id", DataType::Utf8, false),
     ]))
 }
 
@@ -299,7 +281,26 @@ fn projected_schema(base_schema: &SchemaRef, projection: Option<&Vec<usize>>) ->
     Ok(Arc::new(Schema::new(fields)))
 }
 
-fn state_history_record_batch(schema: SchemaRef, rows: &[StateHistoryRow]) -> Result<RecordBatch> {
+#[derive(Debug, Clone)]
+struct StateHistorySqlRow {
+    entity_id: String,
+    schema_key: String,
+    file_id: Option<String>,
+    plugin_key: Option<String>,
+    snapshot_content: Option<String>,
+    metadata: Option<String>,
+    schema_version: String,
+    change_id: String,
+    commit_id: String,
+    commit_created_at: String,
+    start_commit_id: String,
+    depth: i64,
+}
+
+fn state_history_record_batch(
+    schema: SchemaRef,
+    rows: &[StateHistorySqlRow],
+) -> Result<RecordBatch> {
     let arrays = schema
         .fields()
         .iter()
@@ -321,13 +322,12 @@ fn state_history_record_batch(schema: SchemaRef, rows: &[StateHistoryRow]) -> Re
                 "commit_created_at" => {
                     string_array(rows.iter().map(|row| Some(row.commit_created_at.as_str())))
                 }
-                "root_commit_id" => {
-                    string_array(rows.iter().map(|row| Some(row.root_commit_id.as_str())))
+                "start_commit_id" => {
+                    string_array(rows.iter().map(|row| Some(row.start_commit_id.as_str())))
                 }
                 "depth" => Arc::new(Int64Array::from(
                     rows.iter().map(|row| row.depth).collect::<Vec<_>>(),
                 )) as ArrayRef,
-                "version_id" => string_array(rows.iter().map(|row| Some(row.version_id.as_str()))),
                 other => {
                     return Err(DataFusionError::Execution(format!(
                         "lix_state_history provider does not support projected column '{other}'"
@@ -343,176 +343,38 @@ fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
     Arc::new(StringArray::from(values.collect::<Vec<_>>())) as ArrayRef
 }
 
-fn state_history_request(
-    active_version_id: &str,
-    route: &StateHistoryRoute,
-) -> StateHistoryRequest {
-    let mut request = StateHistoryRequest {
-        lineage_scope: StateHistoryLineageScope::ActiveVersion,
-        lineage_version_id: Some(active_version_id.to_string()),
-        content_mode: StateHistoryContentMode::IncludeSnapshotContent,
-        ..StateHistoryRequest::default()
-    };
+async fn load_state_history_rows(
+    commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    route: &HistoryRoute,
+) -> Result<Vec<StateHistorySqlRow>, LixError> {
+    let entries = load_history_entries(commit_graph, route, Vec::new()).await?;
+    let mut rows = entries
+        .into_iter()
+        .map(|entry| StateHistorySqlRow {
+            entity_id: entry.change.entity_id,
+            schema_key: entry.change.schema_key,
+            file_id: entry.change.file_id,
+            plugin_key: entry.change.plugin_key,
+            snapshot_content: entry.change.snapshot_content,
+            metadata: entry.change.metadata,
+            schema_version: entry.change.schema_version,
+            change_id: entry.change.id,
+            commit_id: entry.commit_id,
+            commit_created_at: entry.commit_created_at,
+            start_commit_id: entry.start_commit_id,
+            depth: i64::from(entry.depth),
+        })
+        .collect::<Vec<_>>();
 
-    if !route.root_commit_ids.is_empty() {
-        request.root_scope = StateHistoryRootScope::RequestedRoots(route.root_commit_ids.clone());
-    }
-    if !route.entity_ids.is_empty() {
-        request.entity_ids = route.entity_ids.clone();
-    }
-    if !route.schema_keys.is_empty() {
-        request.schema_keys = route.schema_keys.clone();
-    }
-    if !route.version_ids.is_empty() {
-        request.version_scope =
-            StateHistoryVersionScope::RequestedVersions(route.version_ids.clone());
-    }
-    request.min_depth = route.min_depth;
-    request.max_depth = route.max_depth;
-    request
-}
-
-fn request_contradictory(request: &StateHistoryRequest) -> bool {
-    request
-        .min_depth
-        .zip(request.max_depth)
-        .is_some_and(|(min, max)| min > max)
-        || matches!(request.root_scope, StateHistoryRootScope::RequestedRoots(ref roots) if roots.is_empty())
-        || matches!(request.version_scope, StateHistoryVersionScope::RequestedVersions(ref versions) if versions.is_empty())
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct StateHistoryRoute {
-    root_commit_ids: Vec<String>,
-    entity_ids: Vec<String>,
-    schema_keys: Vec<String>,
-    version_ids: Vec<String>,
-    min_depth: Option<i64>,
-    max_depth: Option<i64>,
-}
-
-impl StateHistoryRoute {
-    fn from_filters(filters: &[Expr]) -> Self {
-        let mut route = Self::default();
-        for filter in filters {
-            apply_state_history_filter(filter, &mut route);
-        }
-        route
-    }
-}
-
-fn canonical_state_history_column_name(name: &str) -> Option<&str> {
-    match name {
-        "root_commit_id" | "lixcol_root_commit_id" => Some("root_commit_id"),
-        "entity_id" | "lixcol_entity_id" => Some("entity_id"),
-        "schema_key" | "lixcol_schema_key" => Some("schema_key"),
-        "version_id" | "lixcol_version_id" => Some("version_id"),
-        "depth" | "lixcol_depth" => Some("depth"),
-        _ => None,
-    }
-}
-
-fn parse_state_history_filter(expr: &Expr) -> Option<()> {
-    let Expr::BinaryExpr(binary_expr) = expr else {
-        return None;
-    };
-    match binary_expr.op {
-        Operator::Eq | Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq => {}
-        _ => return None,
-    }
-
-    let Expr::Column(column) = &*binary_expr.left else {
-        return None;
-    };
-    let Expr::Literal(_, _) = &*binary_expr.right else {
-        return None;
-    };
-
-    canonical_state_history_column_name(column.name.as_str()).and_then(|column_name| {
-        match column_name {
-            "root_commit_id" | "entity_id" | "schema_key" | "version_id" | "depth" => Some(()),
-            _ => None,
-        }
-    })
-}
-
-fn apply_state_history_filter(expr: &Expr, route: &mut StateHistoryRoute) {
-    let Expr::BinaryExpr(binary_expr) = expr else {
-        return;
-    };
-    let Expr::Column(column) = &*binary_expr.left else {
-        return;
-    };
-    let Some(column_name) = canonical_state_history_column_name(column.name.as_str()) else {
-        return;
-    };
-    let right = &*binary_expr.right;
-    match (column_name, &binary_expr.op, right) {
-        ("root_commit_id", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _))
-        | ("entity_id", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _))
-        | ("schema_key", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _))
-        | ("version_id", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _)) => {
-            let bucket = match column_name {
-                "root_commit_id" => &mut route.root_commit_ids,
-                "entity_id" => &mut route.entity_ids,
-                "schema_key" => &mut route.schema_keys,
-                "version_id" => &mut route.version_ids,
-                _ => unreachable!(),
-            };
-            if !bucket.contains(value) {
-                bucket.push(value.clone());
-            }
-        }
-        ("depth", Operator::Eq, depth_expr) => {
-            if let Some(value) = scalar_i64_literal(depth_expr) {
-                route.min_depth = Some(value);
-                route.max_depth = Some(value);
-            }
-        }
-        ("depth", Operator::Gt, depth_expr) => {
-            if let Some(value) = scalar_i64_literal(depth_expr) {
-                route.min_depth = Some(
-                    route
-                        .min_depth
-                        .map_or(value + 1, |current| current.max(value + 1)),
-                );
-            }
-        }
-        ("depth", Operator::GtEq, depth_expr) => {
-            if let Some(value) = scalar_i64_literal(depth_expr) {
-                route.min_depth = Some(route.min_depth.map_or(value, |current| current.max(value)));
-            }
-        }
-        ("depth", Operator::Lt, depth_expr) => {
-            if let Some(value) = scalar_i64_literal(depth_expr) {
-                route.max_depth = Some(
-                    route
-                        .max_depth
-                        .map_or(value - 1, |current| current.min(value - 1)),
-                );
-            }
-        }
-        ("depth", Operator::LtEq, depth_expr) => {
-            if let Some(value) = scalar_i64_literal(depth_expr) {
-                route.max_depth = Some(route.max_depth.map_or(value, |current| current.min(value)));
-            }
-        }
-        _ => {}
-    }
-}
-
-fn scalar_i64_literal(expr: &Expr) -> Option<i64> {
-    match expr {
-        Expr::Literal(ScalarValue::Int8(Some(value)), _) => Some(i64::from(*value)),
-        Expr::Literal(ScalarValue::Int16(Some(value)), _) => Some(i64::from(*value)),
-        Expr::Literal(ScalarValue::Int32(Some(value)), _) => Some(i64::from(*value)),
-        Expr::Literal(ScalarValue::Int64(Some(value)), _) => Some(*value),
-        Expr::Literal(ScalarValue::UInt8(Some(value)), _) => Some(i64::from(*value)),
-        Expr::Literal(ScalarValue::UInt16(Some(value)), _) => Some(i64::from(*value)),
-        Expr::Literal(ScalarValue::UInt32(Some(value)), _) => Some(i64::from(*value)),
-        Expr::Literal(ScalarValue::UInt64(Some(value)), _) => i64::try_from(*value).ok(),
-        _ => None,
-    }
+    rows.sort_by(|left, right| {
+        left.entity_id
+            .cmp(&right.entity_id)
+            .then(left.file_id.cmp(&right.file_id))
+            .then(left.schema_key.cmp(&right.schema_key))
+            .then(left.depth.cmp(&right.depth))
+            .then(left.change_id.cmp(&right.change_id))
+    });
+    Ok(rows)
 }
 
 fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {

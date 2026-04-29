@@ -13,7 +13,6 @@ use crate::engine2::commit_graph::CommitGraphReader;
 use crate::engine2::functions::FunctionProviderHandle;
 use crate::engine2::live_state::LiveStateReader;
 use crate::engine2::version_ref::VersionRefReader;
-use crate::history::{StateHistoryRequest, StateHistoryRow};
 use crate::sql::{
     MutationOperation, MutationRow, OptionalTextPatch, PlannedFilesystemFile,
     PlannedFilesystemState,
@@ -27,8 +26,10 @@ use crate::{LixError, QueryResult, Value};
 
 use super::change_provider::register_lix_change_provider;
 use super::commit_provider::register_commit_providers;
+use super::directory_history_provider::register_lix_directory_history_provider;
 use super::directory_provider::register_lix_directory_providers;
 use super::entity_provider::register_entity_providers;
+use super::file_history_provider::register_lix_file_history_provider;
 use super::file_provider::register_lix_file_providers;
 use super::history_provider::register_history_providers;
 use super::lix_state_provider::register_lix_state_providers;
@@ -49,15 +50,10 @@ pub(crate) trait SqlExecutionContext {
     fn active_version_id(&self) -> &str;
     fn live_state(&self) -> Arc<dyn LiveStateReader>;
     fn functions(&self) -> FunctionProviderHandle;
-    fn history(&self) -> Option<Arc<dyn HistoryContext>> {
-        None
-    }
     fn changelog(&self) -> Option<Arc<dyn ChangelogReader>> {
         None
     }
-    fn commit_graph(&self) -> Option<Box<dyn CommitGraphReader>> {
-        None
-    }
+    fn commit_graph(&self) -> Box<dyn CommitGraphReader>;
     fn version_ref(&self) -> Option<Arc<dyn VersionRefReader>> {
         None
     }
@@ -73,8 +69,8 @@ pub(crate) trait SqlExecutionContext {
 pub(crate) trait HistoryContext: Send + Sync {
     async fn scan_state_history(
         &self,
-        request: &StateHistoryRequest,
-    ) -> Result<Vec<StateHistoryRow>, LixError>;
+        request: &crate::history::StateHistoryRequest,
+    ) -> Result<Vec<crate::history::StateHistoryRow>, LixError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,7 +333,6 @@ pub(crate) async fn execute_logical_plan(
 async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, LixError> {
     let session = SessionContext::new();
     register_sql2_udfs(&session, ctx.functions());
-    let history = ctx.history();
     let version_ref = ctx.version_ref().ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -356,21 +351,22 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
     if let Some(changelog) = ctx.changelog() {
         register_lix_change_provider(&session, Arc::clone(&changelog)).await?;
     }
-    if let Some(commit_graph) = ctx.commit_graph() {
-        register_commit_providers(
-            &session,
-            ctx.active_version_id(),
-            commit_graph,
-            Arc::clone(&version_ref),
-        )
-        .await?;
-    }
-    let state_history_provider = register_history_providers(
+    let commit_graph = ctx.commit_graph();
+    register_commit_providers(
         &session,
         ctx.active_version_id(),
-        history.as_ref().map(Arc::clone),
+        commit_graph,
+        Arc::clone(&version_ref),
     )
     .await?;
+    let state_history_commit_graph = ctx.commit_graph();
+    register_history_providers(&session, state_history_commit_graph).await?;
+    let file_history_commit_graph = ctx.commit_graph();
+    register_lix_file_history_provider(&session, file_history_commit_graph, ctx.blob_reader())
+        .await?;
+    let directory_history_commit_graph = ctx.commit_graph();
+    register_lix_directory_history_provider(&session, directory_history_commit_graph).await?;
+    let entity_commit_graph = Arc::new(tokio::sync::Mutex::new(ctx.commit_graph()));
     register_lix_directory_providers(
         &session,
         ctx.active_version_id(),
@@ -378,7 +374,6 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
         Arc::clone(&version_ref),
         ctx.write_stager(),
         ctx.functions(),
-        history.as_ref().map(Arc::clone),
     )
     .await?;
     register_lix_file_providers(
@@ -389,7 +384,6 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
         ctx.blob_reader(),
         ctx.write_stager(),
         ctx.functions(),
-        history.as_ref().map(Arc::clone),
     )
     .await?;
     register_entity_providers(
@@ -398,7 +392,7 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
         ctx.live_state(),
         Arc::clone(&version_ref),
         ctx.write_stager(),
-        state_history_provider.is_some(),
+        entity_commit_graph,
         &ctx.list_visible_schemas(ctx.active_version_id())?,
     )
     .await?;
@@ -514,6 +508,11 @@ mod tests {
         SqlWriteStager,
     };
     use crate::binary_cas::BlobDataReader;
+    use crate::engine2::commit_graph::{
+        CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphChangeSet,
+        CommitGraphChangeSetElement, CommitGraphCommit, CommitGraphEdge, CommitGraphReader,
+        ReachableCommitGraphCommit,
+    };
     use crate::engine2::functions::{
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
@@ -544,6 +543,7 @@ mod tests {
         blobs: BTreeMap<String, Vec<u8>>,
     }
     struct BackendBlobReader(Arc<dyn crate::LixBackend + Send + Sync>);
+    struct DummyCommitGraphReader;
 
     #[allow(dead_code)]
     fn test_functions() -> FunctionProviderHandle {
@@ -591,6 +591,10 @@ mod tests {
             Arc::clone(&self.blob_reader)
         }
 
+        fn commit_graph(&self) -> Box<dyn CommitGraphReader> {
+            Box::new(DummyCommitGraphReader)
+        }
+
         fn write_stager(&self) -> Option<Arc<dyn SqlWriteStager>> {
             self.write_stager.as_ref().map(Arc::clone)
         }
@@ -614,17 +618,61 @@ mod tests {
             test_functions()
         }
 
-        fn history(&self) -> Option<Arc<dyn HistoryContext>> {
-            Some(Arc::clone(&self.history))
-        }
-
         fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
             Arc::clone(&self.blob_reader)
+        }
+
+        fn commit_graph(&self) -> Box<dyn CommitGraphReader> {
+            Box::new(DummyCommitGraphReader)
         }
 
         fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError> {
             let _ = version_id;
             Ok(self.schema_definitions.clone())
+        }
+    }
+
+    #[async_trait]
+    impl CommitGraphReader for DummyCommitGraphReader {
+        async fn load_commit(
+            &mut self,
+            _commit_id: &str,
+        ) -> Result<Option<CommitGraphCommit>, LixError> {
+            Ok(None)
+        }
+
+        async fn all_commits(&mut self) -> Result<Vec<CommitGraphCommit>, LixError> {
+            Ok(Vec::new())
+        }
+
+        async fn reachable_commits(
+            &mut self,
+            _head_commit_id: &str,
+        ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
+            Ok(Vec::new())
+        }
+
+        fn commit_edges(&self, _commits: &[CommitGraphCommit]) -> Vec<CommitGraphEdge> {
+            Vec::new()
+        }
+
+        fn change_sets(&self, _commits: &[CommitGraphCommit]) -> Vec<CommitGraphChangeSet> {
+            Vec::new()
+        }
+
+        async fn change_set_elements(
+            &mut self,
+            _commits: &[CommitGraphCommit],
+        ) -> Result<Vec<CommitGraphChangeSetElement>, LixError> {
+            Ok(Vec::new())
+        }
+
+        async fn change_history_from_commit(
+            &mut self,
+            _start_commit_id: &str,
+            _request: &CommitGraphChangeHistoryRequest,
+        ) -> Result<Vec<CommitGraphChangeHistoryEntry>, LixError> {
+            Ok(Vec::new())
         }
     }
 
@@ -2305,6 +2353,10 @@ mod tests {
 
         fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
             Arc::clone(&self.blob_reader)
+        }
+
+        fn commit_graph(&self) -> Box<dyn CommitGraphReader> {
+            Box::new(DummyCommitGraphReader)
         }
 
         fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError> {

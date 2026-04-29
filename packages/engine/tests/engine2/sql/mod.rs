@@ -1,10 +1,14 @@
+mod entity_history;
 mod lix_change;
 mod lix_commit;
 mod lix_directory;
+mod lix_directory_history;
 mod lix_file;
+mod lix_file_history;
 mod lix_key_value;
 mod lix_registered_schema;
 mod lix_state;
+mod lix_state_history;
 mod lix_version;
 
 use lix_engine::engine2::ExecuteResult;

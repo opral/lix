@@ -42,6 +42,29 @@ pub(crate) struct CommitGraphChangeSetElement {
     pub(crate) change: CanonicalChange,
 }
 
+/// Filter for canonical change history from a chosen traversal start commit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CommitGraphChangeHistoryRequest {
+    pub(crate) entity_ids: Vec<String>,
+    pub(crate) schema_keys: Vec<String>,
+    pub(crate) file_ids: Vec<String>,
+    pub(crate) min_depth: Option<u32>,
+    pub(crate) max_depth: Option<u32>,
+    pub(crate) include_tombstones: bool,
+}
+
+/// Canonical change observed while walking commit history from a start commit.
+///
+/// `start_commit_id` is the traversal anchor requested by the caller. It is not
+/// necessarily a graph root or a version head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommitGraphChangeHistoryEntry {
+    pub(crate) change: CanonicalChange,
+    pub(crate) commit_id: String,
+    pub(crate) start_commit_id: String,
+    pub(crate) depth: u32,
+}
+
 /// Execution-scoped reader for commit graph facts.
 ///
 /// SQL surfaces consume this trait so they depend on graph semantics, not on
@@ -66,6 +89,12 @@ pub(crate) trait CommitGraphReader: Send + Sync {
         &mut self,
         commits: &[CommitGraphCommit],
     ) -> Result<Vec<CommitGraphChangeSetElement>, LixError>;
+
+    async fn change_history_from_commit(
+        &mut self,
+        start_commit_id: &str,
+        request: &CommitGraphChangeHistoryRequest,
+    ) -> Result<Vec<CommitGraphChangeHistoryEntry>, LixError>;
 }
 
 /// Canonical entity selected by resolving the commit graph at a commit head.
