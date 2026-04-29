@@ -124,6 +124,19 @@ impl Engine {
         .await
     }
 
+    pub async fn open_workspace_session(&self) -> Result<SessionContext, LixError> {
+        SessionContext::open_workspace(
+            self.backend(),
+            Arc::clone(&self.live_state),
+            Arc::clone(&self.tracked_state),
+            Arc::clone(&self.binary_cas),
+            Arc::clone(&self.changelog),
+            Arc::clone(&self.version_ref),
+            Arc::clone(&self.schema_registry),
+        )
+        .await
+    }
+
     /// Rebuilds the tracked serving projection for one version from changelog.
     ///
     /// This is intentionally an engine-level operation: callers should not need

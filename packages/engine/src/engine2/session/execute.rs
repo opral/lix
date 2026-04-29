@@ -142,12 +142,13 @@ impl SessionContext {
             Arc::new(self.live_state.reader(Arc::clone(&self.backend)));
         let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
         let functions = runtime_functions.provider();
+        let active_version_id = self.active_version_id().await?;
         let visible_schemas = self
             .schema_registry
-            .visible_schemas(live_state, self.active_version_id())
+            .visible_schemas(live_state, &active_version_id)
             .await?;
         let ctx = SessionSqlExecutionContext {
-            active_version_id: self.active_version_id(),
+            active_version_id: &active_version_id,
             backend: Arc::clone(&self.backend),
             live_state: Arc::clone(&self.live_state),
             binary_cas: Arc::clone(&self.binary_cas),
@@ -163,7 +164,7 @@ impl SessionContext {
             // through a transaction-aware SQL context, then commit on success
             // or rollback on error.
             let transaction = Transaction::open(
-                self.active_version_id().to_string(),
+                active_version_id.clone(),
                 &self.backend,
                 Arc::clone(&self.live_state),
                 Arc::clone(&self.binary_cas),

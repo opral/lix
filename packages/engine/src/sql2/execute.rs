@@ -821,8 +821,9 @@ mod tests {
             )
             .await?;
 
+        let active_version_id = session.active_version_id().await?;
         let head_commit_id = engine
-            .load_version_head_commit_id(session.active_version_id())
+            .load_version_head_commit_id(&active_version_id)
             .await?
             .ok_or_else(|| {
                 LixError::new(

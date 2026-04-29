@@ -6,12 +6,21 @@ use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::engine2::changelog::{ChangelogContext, ChangelogReader};
 use crate::engine2::commit_graph::{CommitGraphContext, CommitGraphReader};
 use crate::engine2::functions::FunctionProviderHandle;
-use crate::engine2::live_state::{LiveStateContext, LiveStateReader};
+use crate::engine2::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
 use crate::engine2::schema_registry::SchemaRegistry;
 use crate::engine2::tracked_state::TrackedStateContext;
 use crate::engine2::version_ref::{VersionRefContext, VersionRefReader};
 use crate::sql2::SqlExecutionContext;
-use crate::{LixBackend, LixError};
+use crate::version::GLOBAL_VERSION_ID;
+use crate::{LixBackend, LixError, NullableKeyFilter};
+
+pub(super) const WORKSPACE_VERSION_KEY: &str = "lix_workspace_version_id";
+
+#[derive(Clone)]
+pub(super) enum SessionMode {
+    Pinned { version_id: String },
+    Workspace,
+}
 
 /// Session-context state for engine2 SQL execution.
 ///
@@ -20,7 +29,7 @@ use crate::{LixBackend, LixError};
 /// SQL context or a transaction-owned write context.
 #[derive(Clone)]
 pub struct SessionContext {
-    pub(super) active_version_id: String,
+    pub(super) mode: SessionMode,
     pub(super) backend: Arc<dyn LixBackend + Send + Sync>,
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) tracked_state: Arc<TrackedStateContext>,
@@ -31,6 +40,29 @@ pub struct SessionContext {
 }
 
 impl SessionContext {
+    pub(crate) async fn open_workspace(
+        backend: Arc<dyn LixBackend + Send + Sync>,
+        live_state: Arc<LiveStateContext>,
+        tracked_state: Arc<TrackedStateContext>,
+        binary_cas: Arc<BinaryCasContext>,
+        changelog: Arc<ChangelogContext>,
+        version_ref: Arc<VersionRefContext>,
+        schema_registry: Arc<SchemaRegistry>,
+    ) -> Result<Self, LixError> {
+        let session = Self::new(
+            SessionMode::Workspace,
+            backend,
+            live_state,
+            tracked_state,
+            binary_cas,
+            changelog,
+            version_ref,
+            schema_registry,
+        );
+        session.active_version_id().await?;
+        Ok(session)
+    }
+
     pub(crate) async fn open(
         active_version_id: String,
         backend: Arc<dyn LixBackend + Send + Sync>,
@@ -42,7 +74,9 @@ impl SessionContext {
         schema_registry: Arc<SchemaRegistry>,
     ) -> Result<Self, LixError> {
         Ok(Self::new(
-            active_version_id,
+            SessionMode::Pinned {
+                version_id: active_version_id,
+            },
             backend,
             live_state,
             tracked_state,
@@ -53,8 +87,8 @@ impl SessionContext {
         ))
     }
 
-    pub(crate) fn new(
-        active_version_id: String,
+    pub(super) fn new(
+        mode: SessionMode,
         backend: Arc<dyn LixBackend + Send + Sync>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
@@ -64,7 +98,7 @@ impl SessionContext {
         schema_registry: Arc<SchemaRegistry>,
     ) -> Self {
         Self {
-            active_version_id,
+            mode,
             backend,
             live_state,
             tracked_state,
@@ -75,8 +109,73 @@ impl SessionContext {
         }
     }
 
-    pub fn active_version_id(&self) -> &str {
-        &self.active_version_id
+    /// Resolves the version this session should operate on right now.
+    ///
+    /// Pinned sessions are pure in-memory views over one version. Workspace
+    /// sessions read the shared workspace selector from untracked global
+    /// `lix_key_value` state so multiple open app sessions can observe the same
+    /// active workspace version.
+    pub async fn active_version_id(&self) -> Result<String, LixError> {
+        match &self.mode {
+            SessionMode::Pinned { version_id } => Ok(version_id.clone()),
+            SessionMode::Workspace => self.load_workspace_version_id().await,
+        }
+    }
+
+    async fn load_workspace_version_id(&self) -> Result<String, LixError> {
+        let row = self
+            .live_state
+            .reader(Arc::clone(&self.backend))
+            .load_row(&LiveStateRowRequest {
+                schema_key: "lix_key_value".to_string(),
+                version_id: GLOBAL_VERSION_ID.to_string(),
+                entity_id: WORKSPACE_VERSION_KEY.to_string(),
+                file_id: NullableKeyFilter::Null,
+            })
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "workspace version selector is missing lix_key_value:lix_workspace_version_id",
+                )
+            })?;
+        let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "workspace version selector is missing snapshot_content",
+            )
+        })?;
+        let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("workspace version selector snapshot is invalid JSON: {error}"),
+            )
+        })?;
+        let version_id = snapshot
+            .get("value")
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "workspace version selector value must be a non-empty string",
+                )
+            })?
+            .to_string();
+
+        let head = self
+            .version_ref
+            .reader(Arc::clone(&self.backend))
+            .load_head_commit_id(&version_id)
+            .await?;
+        if head.is_none() {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("workspace version selector points to missing version ref '{version_id}'"),
+            ));
+        }
+
+        Ok(version_id)
     }
 }
 

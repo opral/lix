@@ -29,6 +29,25 @@ simulation_test2!(created_version_sees_inherited_state, |sim| async move {
 });
 
 simulation_test2!(
+    open_workspace_session_starts_on_seeded_main_version,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let workspace = sim
+            .open_workspace_session(&engine)
+            .await
+            .expect("workspace session should open");
+
+        assert_eq!(
+            workspace
+                .active_version_id()
+                .await
+                .expect("workspace active version should resolve"),
+            sim.main_version_id()
+        );
+    }
+);
+
+simulation_test2!(
     later_main_changes_do_not_appear_in_created_version,
     |sim| async move {
         let (_engine, main, draft) = create_draft_from_main(&sim).await;
@@ -91,7 +110,7 @@ simulation_test2!(
 );
 
 simulation_test2!(
-    switch_version_is_ephemeral_and_does_not_advance_refs,
+    pinned_switch_version_is_ephemeral_and_does_not_advance_refs,
     |sim| async move {
         let (engine, main, _draft) = create_draft_from_main(&sim).await;
         let main_head_before = engine
@@ -102,6 +121,18 @@ simulation_test2!(
             .load_version_head_commit_id("draft-version")
             .await
             .expect("draft head should load");
+        let workspace_before = sim
+            .open_workspace_session(&engine)
+            .await
+            .expect("workspace session should open");
+        assert_eq!(
+            workspace_before
+                .active_version_id()
+                .await
+                .expect("workspace selector should resolve"),
+            sim.main_version_id(),
+            "pinned session setup should not have moved the workspace selector"
+        );
 
         let (_switched, _receipt) = main
             .switch_version(SwitchVersionOptions {
@@ -126,6 +157,147 @@ simulation_test2!(
             draft_head_before,
             "switching must not mutate the target version ref"
         );
+        let workspace_after = sim
+            .open_workspace_session(&engine)
+            .await
+            .expect("workspace session should open");
+        assert_eq!(
+            workspace_after
+                .active_version_id()
+                .await
+                .expect("workspace selector should resolve"),
+            sim.main_version_id(),
+            "pinned switching must not mutate the shared workspace selector"
+        );
+    }
+);
+
+simulation_test2!(
+    workspace_switch_version_updates_shared_workspace_selector,
+    |sim| async move {
+        let (engine, main, draft) = create_draft_from_main(&sim).await;
+        draft
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('workspace-draft-only', 'draft')",
+                &[],
+            )
+            .await
+            .expect("draft write should succeed");
+        let main_head_before = engine
+            .load_version_head_commit_id(sim.main_version_id())
+            .await
+            .expect("main head should load");
+        let draft_head_before = engine
+            .load_version_head_commit_id("draft-version")
+            .await
+            .expect("draft head should load");
+
+        let workspace_a = sim
+            .open_workspace_session(&engine)
+            .await
+            .expect("workspace session should open");
+        let workspace_b = sim
+            .open_workspace_session(&engine)
+            .await
+            .expect("second workspace session should open");
+        assert_eq!(
+            workspace_a
+                .active_version_id()
+                .await
+                .expect("workspace selector should resolve"),
+            sim.main_version_id()
+        );
+
+        let (workspace_switched, receipt) = workspace_a
+            .switch_version(SwitchVersionOptions {
+                version_id: "draft-version".to_string(),
+            })
+            .await
+            .expect("workspace switch should succeed");
+
+        assert_eq!(receipt.version_id, "draft-version");
+        assert_eq!(
+            workspace_switched
+                .active_version_id()
+                .await
+                .expect("switched workspace selector should resolve"),
+            "draft-version"
+        );
+        assert_eq!(
+            workspace_b
+                .active_version_id()
+                .await
+                .expect("other workspace session should observe selector"),
+            "draft-version",
+            "workspace sessions resolve the shared selector on use"
+        );
+        assert_key_value(&workspace_b, "workspace-draft-only", Some("\"draft\"")).await;
+        assert_key_value(&main, "workspace-draft-only", None).await;
+        assert_eq!(
+            engine
+                .load_version_head_commit_id(sim.main_version_id())
+                .await
+                .expect("main head should load"),
+            main_head_before,
+            "workspace switching must not mutate the old version ref"
+        );
+        assert_eq!(
+            engine
+                .load_version_head_commit_id("draft-version")
+                .await
+                .expect("draft head should load"),
+            draft_head_before,
+            "workspace switching must not mutate the new version ref"
+        );
+    }
+);
+
+simulation_test2!(
+    workspace_switch_version_persists_across_reopened_engine,
+    |sim| async move {
+        let (engine, _main, draft) = create_draft_from_main(&sim).await;
+        draft
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('workspace-reopen-draft', 'draft')",
+                &[],
+            )
+            .await
+            .expect("draft write should succeed");
+
+        let workspace = sim
+            .open_workspace_session(&engine)
+            .await
+            .expect("workspace session should open");
+        workspace
+            .switch_version(SwitchVersionOptions {
+                version_id: "draft-version".to_string(),
+            })
+            .await
+            .expect("workspace switch should persist");
+
+        let reopened_engine = sim
+            .reboot_engine_from_current_snapshot()
+            .await
+            .expect("engine should reopen from current snapshot");
+        let reopened_workspace = sim
+            .open_workspace_session(&reopened_engine)
+            .await
+            .expect("reopened workspace session should open");
+
+        assert_eq!(
+            reopened_workspace
+                .active_version_id()
+                .await
+                .expect("workspace selector should resolve after reopen"),
+            "draft-version",
+            "workspace switch should survive reopening the engine"
+        );
+        assert_key_value(
+            &reopened_workspace,
+            "workspace-reopen-draft",
+            Some("\"draft\""),
+        )
+        .await;
     }
 );
 
