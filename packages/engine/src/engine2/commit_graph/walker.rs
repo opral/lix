@@ -44,6 +44,85 @@ where
     Ok(commits)
 }
 
+/// Returns the best common ancestors shared by two commit heads.
+///
+/// This is graph math, not merge policy. A commit is "best" when it is a
+/// common ancestor and no descendant of it is also a common ancestor.
+///
+/// Simple history has one best common ancestor:
+///
+/// ```text
+/// A -- B -- C   left
+///       \
+///        D      right
+/// ```
+///
+/// `best_common_ancestors(C, D)` returns `[B]`.
+///
+/// Commit history is a DAG, not a tree, so criss-cross histories can have
+/// multiple equally good answers. Callers that need one merge base should wrap
+/// this API with an explicit policy instead of pretending the graph always has
+/// a single lowest common ancestor.
+pub(crate) async fn best_common_ancestors<S>(
+    reader: &mut CommitGraphStoreReader<S>,
+    left_commit_id: &str,
+    right_commit_id: &str,
+) -> Result<Vec<CommitGraphCommit>, LixError>
+where
+    S: KvStore,
+{
+    let left_reachable = walk_reachable_commits(reader, left_commit_id).await?;
+    let right_reachable = walk_reachable_commits(reader, right_commit_id).await?;
+    let right_ids = right_reachable
+        .iter()
+        .map(|reachable| reachable.commit.commit_id.clone())
+        .collect::<BTreeSet<_>>();
+    let common_ids = left_reachable
+        .iter()
+        .filter(|reachable| right_ids.contains(&reachable.commit.commit_id))
+        .map(|reachable| reachable.commit.commit_id.clone())
+        .collect::<BTreeSet<_>>();
+
+    let mut best = Vec::new();
+    for reachable in left_reachable {
+        let commit_id = &reachable.commit.commit_id;
+        if !common_ids.contains(commit_id) {
+            continue;
+        }
+
+        if has_descendant_in_set(reader, commit_id, &common_ids).await? {
+            continue;
+        }
+
+        best.push(reachable.commit);
+    }
+    best.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));
+    Ok(best)
+}
+
+async fn has_descendant_in_set<S>(
+    reader: &mut CommitGraphStoreReader<S>,
+    commit_id: &str,
+    candidate_descendant_ids: &BTreeSet<String>,
+) -> Result<bool, LixError>
+where
+    S: KvStore,
+{
+    for candidate_descendant_id in candidate_descendant_ids {
+        if candidate_descendant_id == commit_id {
+            continue;
+        }
+        let reachable = walk_reachable_commits(reader, candidate_descendant_id).await?;
+        if reachable
+            .iter()
+            .any(|reachable| reachable.commit.commit_id == commit_id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 struct CommitTraversalLoader<'a, S>
 where
     S: KvStore,
@@ -366,6 +445,252 @@ mod tests {
             .expect_err("missing head should fail");
 
         assert!(error.description.contains("missing-head"));
+    }
+
+    #[tokio::test]
+    async fn best_common_ancestors_returns_nearest_common_commit_in_simple_graph() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let changelog = ChangelogContext::new();
+        append_changes(
+            Arc::clone(&backend),
+            &changelog,
+            &[
+                commit_change("commit-a-change", "commit-a", &[], &[]),
+                commit_change("commit-b-change", "commit-b", &[], &["commit-a"]),
+                commit_change("commit-c-change", "commit-c", &[], &["commit-b"]),
+                commit_change("commit-d-change", "commit-d", &[], &["commit-b"]),
+            ],
+        )
+        .await;
+
+        let graph = CommitGraphContext::new(changelog);
+        let mut reader = graph.reader(backend);
+        let ancestors = reader
+            .best_common_ancestors("commit-c", "commit-d")
+            .await
+            .expect("best common ancestors should load");
+
+        assert_eq!(
+            ancestors
+                .iter()
+                .map(|commit| commit.commit_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["commit-b"]
+        );
+    }
+
+    #[tokio::test]
+    async fn best_common_ancestors_returns_shared_fork_in_diamond_graph() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let changelog = ChangelogContext::new();
+        append_changes(
+            Arc::clone(&backend),
+            &changelog,
+            &[
+                commit_change("commit-root-change", "commit-root", &[], &[]),
+                commit_change("commit-left-change", "commit-left", &[], &["commit-root"]),
+                commit_change("commit-right-change", "commit-right", &[], &["commit-root"]),
+                commit_change(
+                    "commit-left-head-change",
+                    "commit-left-head",
+                    &[],
+                    &["commit-left"],
+                ),
+                commit_change(
+                    "commit-right-head-change",
+                    "commit-right-head",
+                    &[],
+                    &["commit-right"],
+                ),
+            ],
+        )
+        .await;
+
+        let graph = CommitGraphContext::new(changelog);
+        let mut reader = graph.reader(backend);
+        let ancestors = reader
+            .best_common_ancestors("commit-left-head", "commit-right-head")
+            .await
+            .expect("best common ancestors should load");
+
+        assert_eq!(
+            ancestors
+                .iter()
+                .map(|commit| commit.commit_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["commit-root"]
+        );
+    }
+
+    #[tokio::test]
+    async fn best_common_ancestors_returns_parent_when_one_side_is_ancestor() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let changelog = ChangelogContext::new();
+        append_changes(
+            Arc::clone(&backend),
+            &changelog,
+            &[
+                commit_change("commit-a-change", "commit-a", &[], &[]),
+                commit_change("commit-b-change", "commit-b", &[], &["commit-a"]),
+                commit_change("commit-c-change", "commit-c", &[], &["commit-b"]),
+            ],
+        )
+        .await;
+
+        let graph = CommitGraphContext::new(changelog);
+        let mut reader = graph.reader(backend);
+        let ancestors = reader
+            .best_common_ancestors("commit-b", "commit-c")
+            .await
+            .expect("best common ancestors should load");
+
+        assert_eq!(
+            ancestors
+                .iter()
+                .map(|commit| commit.commit_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["commit-b"]
+        );
+    }
+
+    #[tokio::test]
+    async fn best_common_ancestors_returns_multiple_bases_for_criss_cross_graph() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let changelog = ChangelogContext::new();
+        append_changes(
+            Arc::clone(&backend),
+            &changelog,
+            &[
+                commit_change("commit-root-change", "commit-root", &[], &[]),
+                commit_change("commit-left-change", "commit-left", &[], &["commit-root"]),
+                commit_change(
+                    "commit-right-change",
+                    "commit-right",
+                    &[],
+                    &["commit-root"],
+                ),
+                commit_change(
+                    "commit-head-left-change",
+                    "commit-head-left",
+                    &[],
+                    &["commit-left", "commit-right"],
+                ),
+                commit_change(
+                    "commit-head-right-change",
+                    "commit-head-right",
+                    &[],
+                    &["commit-right", "commit-left"],
+                ),
+            ],
+        )
+        .await;
+
+        let graph = CommitGraphContext::new(changelog);
+        let mut reader = graph.reader(backend);
+        let ancestors = reader
+            .best_common_ancestors("commit-head-left", "commit-head-right")
+            .await
+            .expect("best common ancestors should load");
+
+        assert_eq!(
+            ancestors
+                .iter()
+                .map(|commit| commit.commit_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["commit-left", "commit-right"]
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_base_returns_single_best_common_ancestor() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let changelog = ChangelogContext::new();
+        append_changes(
+            Arc::clone(&backend),
+            &changelog,
+            &[
+                commit_change("commit-a-change", "commit-a", &[], &[]),
+                commit_change("commit-b-change", "commit-b", &[], &["commit-a"]),
+                commit_change("commit-c-change", "commit-c", &[], &["commit-b"]),
+                commit_change("commit-d-change", "commit-d", &[], &["commit-b"]),
+            ],
+        )
+        .await;
+
+        let graph = CommitGraphContext::new(changelog);
+        let mut reader = graph.reader(backend);
+        let base = reader
+            .merge_base("commit-c", "commit-d")
+            .await
+            .expect("single merge base should resolve");
+
+        assert_eq!(base.commit_id, "commit-b");
+    }
+
+    #[tokio::test]
+    async fn merge_base_errors_when_histories_have_no_common_commit() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let changelog = ChangelogContext::new();
+        append_changes(
+            Arc::clone(&backend),
+            &changelog,
+            &[
+                commit_change("commit-left-change", "commit-left", &[], &[]),
+                commit_change("commit-right-change", "commit-right", &[], &[]),
+            ],
+        )
+        .await;
+
+        let graph = CommitGraphContext::new(changelog);
+        let mut reader = graph.reader(backend);
+        let error = reader
+            .merge_base("commit-left", "commit-right")
+            .await
+            .expect_err("unrelated histories should not have a merge base");
+
+        assert!(error.description.contains("no common history"));
+    }
+
+    #[tokio::test]
+    async fn merge_base_errors_when_best_common_ancestor_is_ambiguous() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let changelog = ChangelogContext::new();
+        append_changes(
+            Arc::clone(&backend),
+            &changelog,
+            &[
+                commit_change("commit-root-change", "commit-root", &[], &[]),
+                commit_change("commit-left-change", "commit-left", &[], &["commit-root"]),
+                commit_change(
+                    "commit-right-change",
+                    "commit-right",
+                    &[],
+                    &["commit-root"],
+                ),
+                commit_change(
+                    "commit-head-left-change",
+                    "commit-head-left",
+                    &[],
+                    &["commit-left", "commit-right"],
+                ),
+                commit_change(
+                    "commit-head-right-change",
+                    "commit-head-right",
+                    &[],
+                    &["commit-right", "commit-left"],
+                ),
+            ],
+        )
+        .await;
+
+        let graph = CommitGraphContext::new(changelog);
+        let mut reader = graph.reader(backend);
+        let error = reader
+            .merge_base("commit-head-left", "commit-head-right")
+            .await
+            .expect_err("ambiguous best common ancestors should fail");
+
+        assert!(error.description.contains("ambiguous merge base"));
     }
 
     async fn append_changes(

@@ -81,6 +81,28 @@ pub(crate) trait CommitGraphReader: Send + Sync {
         head_commit_id: &str,
     ) -> Result<Vec<ReachableCommitGraphCommit>, LixError>;
 
+    /// Returns the best common ancestors shared by two commit heads.
+    ///
+    /// This is intentionally not called "lowest common ancestor": commit
+    /// history is a DAG, not a tree, and some histories have multiple equally
+    /// good common ancestors. Merge policy can require exactly one base later.
+    async fn best_common_ancestors(
+        &mut self,
+        left_commit_id: &str,
+        right_commit_id: &str,
+    ) -> Result<Vec<CommitGraphCommit>, LixError>;
+
+    /// Resolves the single commit base to use for a three-way merge.
+    ///
+    /// This is merge policy, not raw graph math: no common history and multiple
+    /// best common ancestors are both errors until merge has explicit support
+    /// for those cases.
+    async fn merge_base(
+        &mut self,
+        left_commit_id: &str,
+        right_commit_id: &str,
+    ) -> Result<CommitGraphCommit, LixError>;
+
     fn commit_edges(&self, commits: &[CommitGraphCommit]) -> Vec<CommitGraphEdge>;
 
     fn change_sets(&self, commits: &[CommitGraphCommit]) -> Vec<CommitGraphChangeSet>;

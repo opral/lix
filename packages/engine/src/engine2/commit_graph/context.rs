@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::backend::KvStore;
 use crate::engine2::changelog::{CanonicalChange, ChangelogContext, ChangelogStoreReader};
-use crate::engine2::commit_graph::walker::walk_reachable_commits;
+use crate::engine2::commit_graph::walker::{
+    best_common_ancestors, walk_reachable_commits,
+};
 use crate::engine2::commit_graph::{
     CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphChangeSet,
     CommitGraphChangeSetElement, CommitGraphCommit, CommitGraphEdge, CommitGraphEntity,
@@ -97,6 +99,49 @@ where
         head_commit_id: &str,
     ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
         walk_reachable_commits(self, head_commit_id).await
+    }
+
+    /// Returns the best common ancestors shared by two commit heads.
+    ///
+    /// This is the commit-DAG primitive. It can return more than one commit in
+    /// criss-cross histories. Merge code should layer an explicit merge-base
+    /// policy on top when it needs exactly one base for a three-way merge.
+    pub(crate) async fn best_common_ancestors(
+        &mut self,
+        left_commit_id: &str,
+        right_commit_id: &str,
+    ) -> Result<Vec<CommitGraphCommit>, LixError> {
+        best_common_ancestors(self, left_commit_id, right_commit_id).await
+    }
+
+    /// Resolves the single commit base to use for a three-way merge.
+    ///
+    /// This is merge policy layered over `best_common_ancestors(...)`. Histories
+    /// with no shared base or multiple equally good bases are rejected for now
+    /// so merge code cannot accidentally hide unsupported graph semantics.
+    pub(crate) async fn merge_base(
+        &mut self,
+        left_commit_id: &str,
+        right_commit_id: &str,
+    ) -> Result<CommitGraphCommit, LixError> {
+        let ancestors = self
+            .best_common_ancestors(left_commit_id, right_commit_id)
+            .await?;
+        match ancestors.as_slice() {
+            [] => Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "commit_graph found no common history between '{left_commit_id}' and '{right_commit_id}'"
+                ),
+            )),
+            [base] => Ok(base.clone()),
+            _ => Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "commit_graph found ambiguous merge base between '{left_commit_id}' and '{right_commit_id}'"
+                ),
+            )),
+        }
     }
 
     /// Derives parent/child edges from parsed commits.
@@ -265,6 +310,22 @@ where
         head_commit_id: &str,
     ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
         CommitGraphStoreReader::reachable_commits(self, head_commit_id).await
+    }
+
+    async fn best_common_ancestors(
+        &mut self,
+        left_commit_id: &str,
+        right_commit_id: &str,
+    ) -> Result<Vec<CommitGraphCommit>, LixError> {
+        CommitGraphStoreReader::best_common_ancestors(self, left_commit_id, right_commit_id).await
+    }
+
+    async fn merge_base(
+        &mut self,
+        left_commit_id: &str,
+        right_commit_id: &str,
+    ) -> Result<CommitGraphCommit, LixError> {
+        CommitGraphStoreReader::merge_base(self, left_commit_id, right_commit_id).await
     }
 
     fn commit_edges(&self, commits: &[CommitGraphCommit]) -> Vec<CommitGraphEdge> {
