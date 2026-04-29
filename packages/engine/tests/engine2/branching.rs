@@ -1,6 +1,7 @@
 use crate::simulation_test2;
 use lix_engine::engine2::{
-    CreateVersionOptions, Engine, ExecuteResult, MergeVersionOptions, SwitchVersionOptions,
+    CreateVersionOptions, Engine, ExecuteResult, MergeVersionOptions, MergeVersionOutcome,
+    SwitchVersionOptions,
 };
 use lix_engine::Value;
 use serde_json::Value as JsonValue;
@@ -342,7 +343,19 @@ simulation_test2!(
             .await
             .expect("merge head resolution should succeed");
 
-        assert_eq!(receipt.merged_changes, 0);
+        assert_eq!(receipt.outcome, MergeVersionOutcome::AlreadyUpToDate);
+        assert_eq!(receipt.applied_change_count, 0);
+        assert_eq!(receipt.created_merge_commit_id, None);
+        assert_eq!(receipt.target_version_id, sim.main_version_id());
+        assert_eq!(receipt.source_version_id, "draft-version");
+        assert_eq!(
+            receipt.target_head_before_commit_id, main_head_before,
+            "receipt should expose the target head before the no-op merge"
+        );
+        assert_eq!(
+            receipt.target_head_after_commit_id, main_head_before,
+            "no-op merge should leave target head unchanged"
+        );
         assert_eq!(
             engine
                 .load_version_head_commit_id(sim.main_version_id())
@@ -382,13 +395,25 @@ simulation_test2!(
             })
             .await
             .expect("merge should apply source change");
-        assert_eq!(receipt.merged_changes, 1);
+        assert_eq!(receipt.outcome, MergeVersionOutcome::MergeCommitted);
+        assert_eq!(receipt.applied_change_count, 1);
+        assert_eq!(receipt.target_head_before_commit_id, target_head_before);
+        assert_eq!(receipt.source_head_before_commit_id, source_head);
 
         let target_head_after = engine
             .load_version_head_commit_id(sim.main_version_id())
             .await
             .expect("main head should load")
             .expect("main head should exist");
+        assert_eq!(
+            receipt.target_head_after_commit_id, target_head_after,
+            "receipt should expose the post-merge target head"
+        );
+        assert_eq!(
+            receipt.created_merge_commit_id.as_deref(),
+            Some(target_head_after.as_str()),
+            "a non-empty merge should report the merge commit it created"
+        );
         assert_ne!(target_head_after, target_head_before);
         assert_eq!(
             engine
@@ -474,6 +499,284 @@ simulation_test2!(
 );
 
 simulation_test2!(
+    merge_version_applies_source_delete_when_target_unchanged,
+    |sim| async move {
+        let (_engine, main, draft) = create_draft_after_shared_write(&sim).await;
+
+        delete_key_value(&draft, "shared-before-branch").await;
+
+        let receipt = main
+            .merge_version(MergeVersionOptions {
+                source_version_id: "draft-version".to_string(),
+            })
+            .await
+            .expect("merge should apply source delete");
+
+        assert_eq!(receipt.outcome, MergeVersionOutcome::MergeCommitted);
+        assert_eq!(receipt.applied_change_count, 1);
+        assert!(receipt.created_merge_commit_id.is_some());
+        assert_key_value(&main, "shared-before-branch", None).await;
+    }
+);
+
+simulation_test2!(
+    merge_version_treats_both_sides_delete_as_noop,
+    |sim| async move {
+        let (engine, main, draft) = create_draft_after_shared_write(&sim).await;
+
+        delete_key_value(&main, "shared-before-branch").await;
+        delete_key_value(&draft, "shared-before-branch").await;
+        let main_head_before = engine
+            .load_version_head_commit_id(sim.main_version_id())
+            .await
+            .expect("main head should load")
+            .expect("main head should exist");
+
+        let receipt = main
+            .merge_version(MergeVersionOptions {
+                source_version_id: "draft-version".to_string(),
+            })
+            .await
+            .expect("convergent delete merge should succeed");
+
+        assert_eq!(receipt.outcome, MergeVersionOutcome::AlreadyUpToDate);
+        assert_eq!(receipt.applied_change_count, 0);
+        assert_eq!(receipt.created_merge_commit_id, None);
+        assert_eq!(
+            engine
+                .load_version_head_commit_id(sim.main_version_id())
+                .await
+                .expect("main head should load"),
+            Some(main_head_before),
+            "convergent delete should not create a new target commit"
+        );
+        assert_key_value(&main, "shared-before-branch", None).await;
+    }
+);
+
+simulation_test2!(
+    merge_version_conflicts_when_target_deletes_source_modifies,
+    |sim| async move {
+        let (engine, main, draft) = create_draft_after_shared_write(&sim).await;
+
+        delete_key_value(&main, "shared-before-branch").await;
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'draft' WHERE key = 'shared-before-branch'",
+                &[],
+            )
+            .await
+            .expect("draft update should succeed");
+        let main_head_before = engine
+            .load_version_head_commit_id(sim.main_version_id())
+            .await
+            .expect("main head should load")
+            .expect("main head should exist");
+
+        let error = main
+            .merge_version(MergeVersionOptions {
+                source_version_id: "draft-version".to_string(),
+            })
+            .await
+            .expect_err("delete/modify should conflict");
+
+        assert!(
+            error.description.contains("tracked-state conflict"),
+            "unexpected merge error: {error:?}"
+        );
+        assert_eq!(
+            engine
+                .load_version_head_commit_id(sim.main_version_id())
+                .await
+                .expect("main head should load"),
+            Some(main_head_before),
+            "failed merge should not advance the target version ref"
+        );
+        assert_key_value(&main, "shared-before-branch", None).await;
+    }
+);
+
+simulation_test2!(
+    merge_version_conflicts_when_target_modifies_source_deletes,
+    |sim| async move {
+        let (engine, main, draft) = create_draft_after_shared_write(&sim).await;
+
+        main.execute(
+            "UPDATE lix_key_value SET value = 'main' WHERE key = 'shared-before-branch'",
+            &[],
+        )
+        .await
+        .expect("main update should succeed");
+        delete_key_value(&draft, "shared-before-branch").await;
+        let main_head_before = engine
+            .load_version_head_commit_id(sim.main_version_id())
+            .await
+            .expect("main head should load")
+            .expect("main head should exist");
+
+        let error = main
+            .merge_version(MergeVersionOptions {
+                source_version_id: "draft-version".to_string(),
+            })
+            .await
+            .expect_err("modify/delete should conflict");
+
+        assert!(
+            error.description.contains("tracked-state conflict"),
+            "unexpected merge error: {error:?}"
+        );
+        assert_eq!(
+            engine
+                .load_version_head_commit_id(sim.main_version_id())
+                .await
+                .expect("main head should load"),
+            Some(main_head_before),
+            "failed merge should not advance the target version ref"
+        );
+        assert_key_value(&main, "shared-before-branch", Some("\"main\"")).await;
+    }
+);
+
+simulation_test2!(
+    merge_version_converges_same_payload_without_new_commit,
+    |sim| async move {
+        let (engine, main, draft) = create_draft_after_shared_write(&sim).await;
+
+        main.execute(
+            "UPDATE lix_key_value SET value = 'same' WHERE key = 'shared-before-branch'",
+            &[],
+        )
+        .await
+        .expect("main update should succeed");
+        draft
+            .execute(
+                "UPDATE lix_key_value SET value = 'same' WHERE key = 'shared-before-branch'",
+                &[],
+            )
+            .await
+            .expect("draft update should succeed");
+        let main_head_before = engine
+            .load_version_head_commit_id(sim.main_version_id())
+            .await
+            .expect("main head should load")
+            .expect("main head should exist");
+
+        let receipt = main
+            .merge_version(MergeVersionOptions {
+                source_version_id: "draft-version".to_string(),
+            })
+            .await
+            .expect("convergent update merge should succeed");
+
+        assert_eq!(receipt.outcome, MergeVersionOutcome::AlreadyUpToDate);
+        assert_eq!(receipt.applied_change_count, 0);
+        assert_eq!(receipt.created_merge_commit_id, None);
+        assert_eq!(
+            engine
+                .load_version_head_commit_id(sim.main_version_id())
+                .await
+                .expect("main head should load"),
+            Some(main_head_before),
+            "convergent update should not create a new target commit"
+        );
+        assert_key_value(&main, "shared-before-branch", Some("\"same\"")).await;
+    }
+);
+
+simulation_test2!(
+    merge_version_conflicts_on_independent_add_same_identity_different_payload,
+    |sim| async move {
+        let (engine, main, draft) = create_draft_from_main(&sim).await;
+
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('merge-independent-add', 'main')",
+            &[],
+        )
+        .await
+        .expect("main insert should succeed");
+        draft
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('merge-independent-add', 'draft')",
+                &[],
+            )
+            .await
+            .expect("draft insert should succeed");
+        let main_head_before = engine
+            .load_version_head_commit_id(sim.main_version_id())
+            .await
+            .expect("main head should load")
+            .expect("main head should exist");
+
+        let error = main
+            .merge_version(MergeVersionOptions {
+                source_version_id: "draft-version".to_string(),
+            })
+            .await
+            .expect_err("independent adds with different payloads should conflict");
+
+        assert!(
+            error.description.contains("tracked-state conflict"),
+            "unexpected merge error: {error:?}"
+        );
+        assert_eq!(
+            engine
+                .load_version_head_commit_id(sim.main_version_id())
+                .await
+                .expect("main head should load"),
+            Some(main_head_before),
+            "failed merge should not advance the target version ref"
+        );
+        assert_key_value(&main, "merge-independent-add", Some("\"main\"")).await;
+    }
+);
+
+simulation_test2!(
+    merge_version_converges_independent_add_same_identity_same_payload,
+    |sim| async move {
+        let (engine, main, draft) = create_draft_from_main(&sim).await;
+
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('merge-independent-same-add', 'same')",
+            &[],
+        )
+        .await
+        .expect("main insert should succeed");
+        draft
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('merge-independent-same-add', 'same')",
+                &[],
+            )
+            .await
+            .expect("draft insert should succeed");
+        let main_head_before = engine
+            .load_version_head_commit_id(sim.main_version_id())
+            .await
+            .expect("main head should load")
+            .expect("main head should exist");
+
+        let receipt = main
+            .merge_version(MergeVersionOptions {
+                source_version_id: "draft-version".to_string(),
+            })
+            .await
+            .expect("convergent independent add merge should succeed");
+
+        assert_eq!(receipt.outcome, MergeVersionOutcome::AlreadyUpToDate);
+        assert_eq!(receipt.applied_change_count, 0);
+        assert_eq!(receipt.created_merge_commit_id, None);
+        assert_eq!(
+            engine
+                .load_version_head_commit_id(sim.main_version_id())
+                .await
+                .expect("main head should load"),
+            Some(main_head_before),
+            "convergent independent add should not create a new target commit"
+        );
+        assert_key_value(&main, "merge-independent-same-add", Some("\"same\"")).await;
+    }
+);
+
+simulation_test2!(
     merge_version_errors_when_source_version_ref_is_missing,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -494,6 +797,19 @@ simulation_test2!(
             .contains("cannot merge from missing source version ref 'missing-version'"));
     }
 );
+
+async fn delete_key_value(
+    session: &crate::support::simulation_test::engine2::SimSession,
+    key: &str,
+) {
+    session
+        .execute(
+            &format!("DELETE FROM lix_key_value WHERE key = '{key}'"),
+            &[],
+        )
+        .await
+        .expect("key-value delete should succeed");
+}
 
 async fn create_draft_after_shared_write(
     sim: &crate::support::simulation_test::engine2::Engine2Simulation,
