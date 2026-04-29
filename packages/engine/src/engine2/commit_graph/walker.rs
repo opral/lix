@@ -563,12 +563,7 @@ mod tests {
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
                 commit_change("commit-left-change", "commit-left", &[], &["commit-root"]),
-                commit_change(
-                    "commit-right-change",
-                    "commit-right",
-                    &[],
-                    &["commit-root"],
-                ),
+                commit_change("commit-right-change", "commit-right", &[], &["commit-root"]),
                 commit_change(
                     "commit-head-left-change",
                     "commit-head-left",
@@ -661,12 +656,7 @@ mod tests {
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
                 commit_change("commit-left-change", "commit-left", &[], &["commit-root"]),
-                commit_change(
-                    "commit-right-change",
-                    "commit-right",
-                    &[],
-                    &["commit-root"],
-                ),
+                commit_change("commit-right-change", "commit-right", &[], &["commit-root"]),
                 commit_change(
                     "commit-head-left-change",
                     "commit-head-left",

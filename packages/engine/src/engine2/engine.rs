@@ -61,7 +61,7 @@ impl Engine {
             *untracked_state,
             commit_graph,
         ));
-        let version_ref = Arc::new(VersionRefContext::new(Arc::clone(&live_state)));
+        let version_ref = Arc::new(VersionRefContext::new(Arc::clone(&untracked_state)));
         assert_initialized(Arc::clone(&backend), live_state.as_ref()).await?;
 
         // SessionContext::execute later projects these stable state contexts into one

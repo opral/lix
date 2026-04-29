@@ -24,9 +24,9 @@ pub(crate) use coordinator::{apply_schema_registrations_in_transaction, Transact
 pub(crate) use live_state_write_state::prepare_materialization_plan;
 #[cfg(test)]
 pub(crate) use live_state_write_state::LiveStateWriteState;
+#[cfg(test)]
+pub(crate) use planned_write::build_direct_mutation_transaction_write_delta;
 pub(crate) use planned_write::{
-    build_direct_mutation_transaction_write_delta,
-    build_direct_mutation_transaction_write_delta_with_filesystem_state,
     build_transaction_write_delta, BufferedWriteJournal, PendingFilesystemOverlay,
     PendingRegisteredSchemaOverlay, PendingSemanticOverlay, PlannedDirectWriteUnit,
     PublicWriteTxnUnit, TransactionWriteDelta, TransactionWriteUnit,

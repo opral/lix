@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use serde_json::json;
+use tokio::sync::Mutex;
 
 use crate::backend::{KvStore, KvWriter};
-use crate::engine2::live_state::{
-    LiveStateContext, LiveStateFilter, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
-    LiveStateStoreReader, LiveStateWriter,
+use crate::engine2::untracked_state::{
+    UntrackedStateContext, UntrackedStateFilter, UntrackedStateRow, UntrackedStateRowRequest,
+    UntrackedStateScanRequest, UntrackedStateWriter,
 };
 use crate::engine2::version_ref::{VersionHead, VersionRefReader};
 use crate::version::GLOBAL_VERSION_ID;
@@ -14,18 +15,19 @@ use crate::{LixError, NullableKeyFilter};
 const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
 const VERSION_REF_SCHEMA_VERSION: &str = "1";
 
-/// Typed access to moving version heads stored in live_state.
+/// Typed access to moving version heads stored in untracked state.
 ///
-/// Version refs are domain state layered over live_state, not their own
-/// storage engine. This context hides the `lix_version_ref` row shape from
-/// transaction, rebuild, and tests.
+/// Version refs are one of the inputs used by live_state visibility, so this
+/// context deliberately bypasses live_state and reads the underlying untracked
+/// rows directly. That keeps the dependency acyclic:
+/// untracked_state -> version_ref -> live_state.
 pub(crate) struct VersionRefContext {
-    live_state: Arc<LiveStateContext>,
+    untracked_state: Arc<UntrackedStateContext>,
 }
 
 impl VersionRefContext {
-    pub(crate) fn new(live_state: Arc<LiveStateContext>) -> Self {
-        Self { live_state }
+    pub(crate) fn new(untracked_state: Arc<UntrackedStateContext>) -> Self {
+        Self { untracked_state }
     }
 
     /// Creates a version-ref reader over a caller-provided KV store.
@@ -34,7 +36,7 @@ impl VersionRefContext {
         S: KvStore,
     {
         VersionRefStoreReader {
-            live_state_reader: self.live_state.reader(store),
+            store: Mutex::new(store),
         }
     }
 
@@ -44,7 +46,7 @@ impl VersionRefContext {
         S: KvWriter,
     {
         VersionRefWriter {
-            live_state_writer: self.live_state.writer(store),
+            untracked_state_writer: self.untracked_state.writer(store),
         }
     }
 }
@@ -54,7 +56,7 @@ pub(crate) struct VersionRefStoreReader<S>
 where
     S: KvStore,
 {
-    live_state_reader: LiveStateStoreReader<S>,
+    store: Mutex<S>,
 }
 
 impl<S> VersionRefStoreReader<S>
@@ -65,15 +67,17 @@ where
         &self,
         version_id: &str,
     ) -> Result<Option<VersionHead>, LixError> {
-        let Some(row) = self
-            .live_state_reader
-            .load_row(&LiveStateRowRequest {
+        let mut store = self.store.lock().await;
+        let Some(row) = crate::engine2::untracked_state::storage::load_row(
+            &mut *store,
+            &UntrackedStateRowRequest {
                 schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
                 entity_id: version_id.to_string(),
                 file_id: NullableKeyFilter::Null,
-            })
-            .await?
+            },
+        )
+        .await?
         else {
             return Ok(None);
         };
@@ -89,17 +93,19 @@ where
     }
 
     pub(crate) async fn scan_heads(&self) -> Result<Vec<VersionHead>, LixError> {
-        let rows = self
-            .live_state_reader
-            .scan_rows(&LiveStateScanRequest {
-                filter: LiveStateFilter {
+        let mut store = self.store.lock().await;
+        let rows = crate::engine2::untracked_state::storage::scan_rows(
+            &mut *store,
+            &UntrackedStateScanRequest {
+                filter: UntrackedStateFilter {
                     schema_keys: vec![VERSION_REF_SCHEMA_KEY.to_string()],
                     version_ids: vec![GLOBAL_VERSION_ID.to_string()],
-                    ..LiveStateFilter::default()
+                    ..UntrackedStateFilter::default()
                 },
-                ..LiveStateScanRequest::default()
-            })
-            .await?;
+                ..UntrackedStateScanRequest::default()
+            },
+        )
+        .await?;
         let mut heads = rows
             .iter()
             .map(|row| decode_version_head(&row.entity_id, row))
@@ -115,7 +121,7 @@ where
 #[async_trait::async_trait]
 impl<S> VersionRefReader for VersionRefStoreReader<S>
 where
-    S: KvStore,
+    S: KvStore + Send,
 {
     async fn load_head(&self, version_id: &str) -> Result<Option<VersionHead>, LixError> {
         VersionRefStoreReader::load_head(self, version_id).await
@@ -135,7 +141,7 @@ pub(crate) struct VersionRefWriter<S>
 where
     S: KvWriter,
 {
-    live_state_writer: LiveStateWriter<S>,
+    untracked_state_writer: UntrackedStateWriter<S>,
 }
 
 impl<S> VersionRefWriter<S>
@@ -153,13 +159,13 @@ where
         timestamp: &str,
     ) -> Result<(), LixError> {
         let row = version_ref_row(version_id, commit_id, timestamp)?;
-        self.live_state_writer.write_rows(&[row]).await
+        self.untracked_state_writer.write_rows(&[row]).await
     }
 }
 
 fn decode_version_head(
     requested_version_id: &str,
-    row: &LiveStateRow,
+    row: &UntrackedStateRow,
 ) -> Result<Option<VersionHead>, LixError> {
     let Some(snapshot_content) = row.snapshot_content.as_deref() else {
         return Ok(None);
@@ -190,7 +196,7 @@ fn version_ref_row(
     version_id: &str,
     commit_id: &str,
     timestamp: &str,
-) -> Result<LiveStateRow, LixError> {
+) -> Result<UntrackedStateRow, LixError> {
     let snapshot_content = serde_json::to_string(&json!({
         "id": version_id,
         "commit_id": commit_id,
@@ -202,7 +208,7 @@ fn version_ref_row(
         )
     })?;
 
-    Ok(LiveStateRow {
+    Ok(UntrackedStateRow {
         entity_id: version_id.to_string(),
         schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
         file_id: None,
@@ -213,9 +219,6 @@ fn version_ref_row(
         created_at: timestamp.to_string(),
         updated_at: timestamp.to_string(),
         global: true,
-        change_id: None,
-        commit_id: None,
-        untracked: true,
         version_id: GLOBAL_VERSION_ID.to_string(),
     })
 }
@@ -225,9 +228,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
-    use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest};
-    use crate::engine2::tracked_state::TrackedStateContext;
-    use crate::engine2::untracked_state::UntrackedStateContext;
+    use crate::engine2::untracked_state::{UntrackedStateContext, UntrackedStateRowRequest};
 
     use super::*;
 
@@ -248,8 +249,7 @@ mod tests {
     #[tokio::test]
     async fn advance_head_writes_untracked_global_ref() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = Arc::new(test_live_state());
-        let version_ref = VersionRefContext::new(Arc::clone(&live_state));
+        let version_ref = VersionRefContext::new(Arc::new(UntrackedStateContext::new()));
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await
@@ -274,9 +274,9 @@ mod tests {
         assert_eq!(head.version_id, "version-a");
         assert_eq!(head.commit_id, "commit-a");
 
-        let row = live_state
-            .reader(backend)
-            .load_row(&LiveStateRowRequest {
+        let mut reader = UntrackedStateContext::new().reader(backend);
+        let row = reader
+            .load_row(&UntrackedStateRowRequest {
                 schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
                 entity_id: "version-a".to_string(),
@@ -286,9 +286,6 @@ mod tests {
             .expect("version-ref row should load")
             .expect("version-ref row should exist");
         assert!(row.global);
-        assert!(row.untracked);
-        assert_eq!(row.change_id, None);
-        assert_eq!(row.commit_id, None);
         assert_eq!(row.created_at, "2026-01-01T00:00:00Z");
         assert_eq!(row.updated_at, "2026-01-01T00:00:00Z");
     }
@@ -341,8 +338,8 @@ mod tests {
     #[tokio::test]
     async fn malformed_snapshot_errors_clearly() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let live_state = Arc::new(test_live_state());
-        let version_ref = VersionRefContext::new(Arc::clone(&live_state));
+        let untracked_state = UntrackedStateContext::new();
+        let version_ref = VersionRefContext::new(Arc::new(UntrackedStateContext::new()));
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await
@@ -350,7 +347,7 @@ mod tests {
         let mut row = version_ref_row("version-b", "commit-b", "2026-01-01T00:00:00Z")
             .expect("version-ref row should plan");
         row.snapshot_content = Some("{not-json".to_string());
-        live_state
+        untracked_state
             .writer(transaction.as_mut())
             .write_rows(&[row])
             .await
@@ -375,16 +372,6 @@ mod tests {
     }
 
     fn test_version_ref() -> VersionRefContext {
-        VersionRefContext::new(Arc::new(test_live_state()))
-    }
-
-    fn test_live_state() -> LiveStateContext {
-        LiveStateContext::new(
-            TrackedStateContext::new(),
-            UntrackedStateContext::new(),
-            crate::engine2::commit_graph::CommitGraphContext::new(
-                crate::engine2::changelog::ChangelogContext::new(),
-            ),
-        )
+        VersionRefContext::new(Arc::new(UntrackedStateContext::new()))
     }
 }

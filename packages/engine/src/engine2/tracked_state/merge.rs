@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::engine2::tracked_state::{
-    TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
-    TrackedStateRow,
+    TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateRow,
 };
 use crate::LixError;
 
@@ -146,6 +145,7 @@ fn tracked_row_payload_eq(left: &TrackedStateRow, right: &TrackedStateRow) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine2::tracked_state::TrackedStateDiffKind;
 
     #[test]
     fn source_add_applies() {
@@ -334,9 +334,7 @@ mod tests {
         )
         .expect_err("merge should reject impossible source removal");
 
-        assert!(error
-            .description
-            .contains("without a tombstone row"));
+        assert!(error.description.contains("without a tombstone row"));
     }
 
     #[test]

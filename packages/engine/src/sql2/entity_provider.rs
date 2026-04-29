@@ -32,21 +32,21 @@ use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
+use crate::engine2::transaction::types::StageRow;
 use crate::engine2::version_ref::VersionRefReader;
 use crate::sql2::version_scope::resolve_provider_version_ids;
-use crate::sql2::StateWriteRow;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
 use super::entity_history_provider::EntityHistoryProvider;
-use super::execute::{SqlWriteIntent, SqlWriteStager};
+use crate::engine2::transaction::types::{StageWrite, StageWriteStager};
 
 pub(crate) async fn register_entity_providers(
     ctx: &SessionContext,
     active_version_id: &str,
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
-    write_stager: Option<Arc<dyn SqlWriteStager>>,
+    write_stager: Option<Arc<dyn StageWriteStager>>,
     commit_graph: Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>,
     schema_definitions: &[JsonValue],
 ) -> Result<(), LixError> {
@@ -127,7 +127,7 @@ pub(crate) struct EntityProvider {
     spec: Arc<EntitySurfaceSpec>,
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
-    write_stager: Option<Arc<dyn SqlWriteStager>>,
+    write_stager: Option<Arc<dyn StageWriteStager>>,
     schema: SchemaRef,
     variant: EntityProviderVariant,
     active_version_id: Option<String>,
@@ -147,7 +147,7 @@ impl EntityProvider {
         spec: Arc<EntitySurfaceSpec>,
         live_state: Arc<dyn LiveStateReader>,
         version_ref: Arc<dyn VersionRefReader>,
-        write_stager: Option<Arc<dyn SqlWriteStager>>,
+        write_stager: Option<Arc<dyn StageWriteStager>>,
         active_version_id: String,
     ) -> Self {
         Self {
@@ -165,7 +165,7 @@ impl EntityProvider {
         spec: Arc<EntitySurfaceSpec>,
         live_state: Arc<dyn LiveStateReader>,
         version_ref: Arc<dyn VersionRefReader>,
-        write_stager: Option<Arc<dyn SqlWriteStager>>,
+        write_stager: Option<Arc<dyn StageWriteStager>>,
     ) -> Self {
         Self {
             schema: entity_surface_schema(&spec, EntityProviderVariant::ByVersion),
@@ -367,7 +367,7 @@ impl TableProvider for EntityProvider {
 struct EntityInsertSink {
     spec: Arc<EntitySurfaceSpec>,
     schema: SchemaRef,
-    write_stager: Arc<dyn SqlWriteStager>,
+    write_stager: Arc<dyn StageWriteStager>,
     default_version_id: Option<String>,
 }
 
@@ -383,7 +383,7 @@ impl EntityInsertSink {
     fn new(
         spec: Arc<EntitySurfaceSpec>,
         schema: SchemaRef,
-        write_stager: Arc<dyn SqlWriteStager>,
+        write_stager: Arc<dyn StageWriteStager>,
         default_version_id: Option<String>,
     ) -> Self {
         Self {
@@ -433,7 +433,7 @@ impl DataSink for EntityInsertSink {
             .map_err(|_| DataFusionError::Execution("entity INSERT row count overflow".into()))?;
 
         self.write_stager
-            .stage_write(SqlWriteIntent::WriteRows { rows })
+            .stage_write(StageWrite::Rows { rows })
             .await
             .map_err(lix_error_to_datafusion_error)?;
 
@@ -444,7 +444,7 @@ impl DataSink for EntityInsertSink {
 struct EntityDeleteExec {
     spec: Arc<EntitySurfaceSpec>,
     live_state: Arc<dyn LiveStateReader>,
-    write_stager: Arc<dyn SqlWriteStager>,
+    write_stager: Arc<dyn StageWriteStager>,
     table_schema: SchemaRef,
     default_version_id: Option<String>,
     request: LiveStateScanRequest,
@@ -465,7 +465,7 @@ impl EntityDeleteExec {
     fn new(
         spec: Arc<EntitySurfaceSpec>,
         live_state: Arc<dyn LiveStateReader>,
-        write_stager: Arc<dyn SqlWriteStager>,
+        write_stager: Arc<dyn StageWriteStager>,
         table_schema: SchemaRef,
         default_version_id: Option<String>,
         request: LiveStateScanRequest,
@@ -583,7 +583,7 @@ impl ExecutionPlan for EntityDeleteExec {
 
             if count > 0 {
                 write_stager
-                    .stage_write(SqlWriteIntent::WriteRows { rows: write_rows })
+                    .stage_write(StageWrite::Rows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -604,7 +604,7 @@ impl ExecutionPlan for EntityDeleteExec {
 struct EntityUpdateExec {
     spec: Arc<EntitySurfaceSpec>,
     live_state: Arc<dyn LiveStateReader>,
-    write_stager: Arc<dyn SqlWriteStager>,
+    write_stager: Arc<dyn StageWriteStager>,
     table_schema: SchemaRef,
     default_version_id: Option<String>,
     request: LiveStateScanRequest,
@@ -626,7 +626,7 @@ impl EntityUpdateExec {
     fn new(
         spec: Arc<EntitySurfaceSpec>,
         live_state: Arc<dyn LiveStateReader>,
-        write_stager: Arc<dyn SqlWriteStager>,
+        write_stager: Arc<dyn StageWriteStager>,
         table_schema: SchemaRef,
         default_version_id: Option<String>,
         request: LiveStateScanRequest,
@@ -747,7 +747,7 @@ impl ExecutionPlan for EntityUpdateExec {
 
             if count > 0 {
                 write_stager
-                    .stage_write(SqlWriteIntent::WriteRows { rows: write_rows })
+                    .stage_write(StageWrite::Rows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -879,7 +879,7 @@ fn entity_lix_state_write_rows_from_batch(
     spec: &EntitySurfaceSpec,
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StageRow>> {
     entity_lix_state_write_rows_from_batch_with_options(spec, batch, default_version_id, true)
 }
 
@@ -887,7 +887,7 @@ fn entity_existing_lix_state_write_rows_from_batch(
     spec: &EntitySurfaceSpec,
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StageRow>> {
     entity_lix_state_write_rows_from_batch_with_options(spec, batch, default_version_id, false)
 }
 
@@ -896,7 +896,7 @@ fn entity_lix_state_write_rows_from_batch_with_options(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
     reject_read_only_fields: bool,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StageRow>> {
     (0..batch.num_rows())
         .map(|row_index| {
             let explicit_global = optional_bool_value(batch, row_index, "lixcol_global")?;
@@ -955,7 +955,7 @@ fn entity_lix_state_write_rows_from_batch_with_options(
                 }
             };
 
-            Ok(StateWriteRow {
+            Ok(StageRow {
                 entity_id,
                 schema_key: spec.schema_key.clone(),
                 file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
@@ -1806,15 +1806,17 @@ mod tests {
     use crate::engine2::live_state::{
         LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
+    use crate::engine2::transaction::types::{
+        StageRow, StageWrite, StageWriteOutcome, StageWriteStager,
+    };
     use crate::engine2::version_ref::{VersionHead, VersionRefReader};
-    use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateWriteRow};
     use crate::LixError;
 
     struct EmptyLiveStateReader;
     struct EmptyVersionRefReader;
     #[derive(Default)]
     struct CapturingWriteStager {
-        writes: Mutex<Vec<SqlWriteIntent>>,
+        writes: Mutex<Vec<StageWrite>>,
     }
 
     #[async_trait]
@@ -1850,10 +1852,10 @@ mod tests {
     }
 
     #[async_trait]
-    impl SqlWriteStager for CapturingWriteStager {
-        async fn stage_write(&self, write: SqlWriteIntent) -> Result<SqlWriteOutcome, LixError> {
+    impl StageWriteStager for CapturingWriteStager {
+        async fn stage_write(&self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
             self.writes.lock().expect("writes lock").push(write);
-            Ok(SqlWriteOutcome { count: 0 })
+            Ok(StageWriteOutcome { count: 0 })
         }
     }
 
@@ -2183,7 +2185,7 @@ mod tests {
         let sink = EntityInsertSink::new(
             Arc::clone(&spec),
             batch.schema(),
-            Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
+            Arc::clone(&stager) as Arc<dyn StageWriteStager>,
             None,
         );
         let stream = stream::iter(vec![Ok(batch)]);
@@ -2198,8 +2200,8 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(
             stager.writes.lock().expect("writes lock").as_slice(),
-            &[SqlWriteIntent::WriteRows {
-                rows: vec![StateWriteRow {
+            &[StageWrite::Rows {
+                rows: vec![StageRow {
                     entity_id: "entity-1".to_string(),
                     schema_key: "project_message".to_string(),
                     file_id: None,

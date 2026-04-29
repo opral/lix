@@ -207,6 +207,7 @@ mod tests {
     async fn valid_mode_decodes_flags() {
         let backend = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
+        crate::engine2::test_support::seed_global_version_head(backend.as_ref()).await;
         write_test_key_value(
             Arc::clone(&backend),
             &live_state,
@@ -247,6 +248,7 @@ mod tests {
     async fn valid_sequence_decodes_highest_seen() {
         let backend = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
+        crate::engine2::test_support::seed_global_version_head(backend.as_ref()).await;
         write_test_key_value(
             Arc::clone(&backend),
             &live_state,
@@ -268,6 +270,7 @@ mod tests {
     async fn write_sequence_persists_untracked_global_key_value() {
         let backend = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
+        crate::engine2::test_support::seed_global_version_head(backend.as_ref()).await;
         let mut tx = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await

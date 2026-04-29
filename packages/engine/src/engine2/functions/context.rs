@@ -118,6 +118,7 @@ mod tests {
     async fn prepare_starts_deterministic_functions_at_sequence_zero() {
         let backend = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
+        crate::engine2::test_support::seed_global_version_head(backend.as_ref()).await;
         write_key_value(
             Arc::clone(&backend),
             &live_state,
@@ -151,6 +152,7 @@ mod tests {
     async fn prepare_continues_from_persisted_sequence() {
         let backend = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
+        crate::engine2::test_support::seed_global_version_head(backend.as_ref()).await;
         write_key_value(
             Arc::clone(&backend),
             &live_state,
@@ -190,6 +192,7 @@ mod tests {
     async fn persist_if_needed_writes_sequence_when_deterministic_functions_advanced() {
         let backend = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
+        crate::engine2::test_support::seed_global_version_head(backend.as_ref()).await;
         write_key_value(
             Arc::clone(&backend),
             &live_state,
