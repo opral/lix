@@ -17,10 +17,8 @@ pub(crate) struct TrackedStateRow {
     pub(crate) schema_version: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
-    pub(crate) global: bool,
     pub(crate) change_id: String,
     pub(crate) commit_id: String,
-    pub(crate) version_id: String,
 }
 
 /// Identity-centered filter for tracked-state scans.
@@ -30,8 +28,6 @@ pub(crate) struct TrackedStateFilter {
     pub(crate) schema_keys: Vec<String>,
     #[serde(default)]
     pub(crate) entity_ids: Vec<String>,
-    #[serde(default)]
-    pub(crate) version_ids: Vec<String>,
     #[serde(default)]
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
     #[serde(default)]
@@ -58,21 +54,10 @@ pub(crate) struct TrackedStateScanRequest {
     pub(crate) limit: Option<usize>,
 }
 
-/// Delete request for tracked-state projection rows.
-///
-/// This is a storage-level primitive. Rebuild code can delete a scoped
-/// projection, then write the rows derived from the commit graph.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-pub(crate) struct TrackedStateDeleteRequest {
-    #[serde(default)]
-    pub(crate) filter: TrackedStateFilter,
-}
-
 /// Point lookup request for one tracked-state row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateRowRequest {
     pub(crate) schema_key: String,
-    pub(crate) version_id: String,
     pub(crate) entity_id: String,
     pub(crate) file_id: NullableKeyFilter<String>,
 }

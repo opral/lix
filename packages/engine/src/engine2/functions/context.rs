@@ -86,13 +86,20 @@ mod tests {
 
     use super::*;
 
+    fn live_state_context() -> LiveStateContext {
+        LiveStateContext::new(
+            crate::engine2::tracked_state::TrackedStateContext::new(),
+            crate::engine2::untracked_state::UntrackedStateContext::new(),
+            crate::engine2::commit_graph::CommitGraphContext::new(
+                crate::engine2::changelog::ChangelogContext::new(),
+            ),
+        )
+    }
+
     #[tokio::test]
     async fn prepare_uses_system_functions_when_mode_missing() {
         let backend = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new(
-            crate::engine2::tracked_state::TrackedStateContext::new(),
-            crate::engine2::untracked_state::UntrackedStateContext::new(),
-        );
+        let live_state = live_state_context();
         let reader = live_state.reader(Arc::clone(&backend));
 
         let context = FunctionContext::prepare(&reader)
@@ -110,10 +117,7 @@ mod tests {
     #[tokio::test]
     async fn prepare_starts_deterministic_functions_at_sequence_zero() {
         let backend = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new(
-            crate::engine2::tracked_state::TrackedStateContext::new(),
-            crate::engine2::untracked_state::UntrackedStateContext::new(),
-        );
+        let live_state = live_state_context();
         write_key_value(
             Arc::clone(&backend),
             &live_state,
@@ -146,10 +150,7 @@ mod tests {
     #[tokio::test]
     async fn prepare_continues_from_persisted_sequence() {
         let backend = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new(
-            crate::engine2::tracked_state::TrackedStateContext::new(),
-            crate::engine2::untracked_state::UntrackedStateContext::new(),
-        );
+        let live_state = live_state_context();
         write_key_value(
             Arc::clone(&backend),
             &live_state,
@@ -188,10 +189,7 @@ mod tests {
     #[tokio::test]
     async fn persist_if_needed_writes_sequence_when_deterministic_functions_advanced() {
         let backend = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new(
-            crate::engine2::tracked_state::TrackedStateContext::new(),
-            crate::engine2::untracked_state::UntrackedStateContext::new(),
-        );
+        let live_state = live_state_context();
         write_key_value(
             Arc::clone(&backend),
             &live_state,
@@ -228,10 +226,7 @@ mod tests {
     #[tokio::test]
     async fn persist_if_needed_is_noop_for_system_functions() {
         let backend = Arc::new(UnitTestBackend::new());
-        let live_state = LiveStateContext::new(
-            crate::engine2::tracked_state::TrackedStateContext::new(),
-            crate::engine2::untracked_state::UntrackedStateContext::new(),
-        );
+        let live_state = live_state_context();
         let reader = live_state.reader(Arc::clone(&backend));
         let context = FunctionContext::prepare(&reader)
             .await

@@ -61,7 +61,7 @@ pub(crate) trait SqlExecutionContext {
     fn write_stager(&self) -> Option<Arc<dyn SqlWriteStager>> {
         None
     }
-    fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError>;
+    fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
 }
 
 #[async_trait]
@@ -269,7 +269,7 @@ pub(crate) async fn execute_sql(
     params: &[Value],
 ) -> Result<QueryResult, LixError> {
     let plan = create_logical_plan(ctx, sql).await?;
-    execute_logical_plan(ctx, plan, params).await
+    execute_logical_plan(plan, params).await
 }
 
 pub(crate) async fn create_logical_plan(
@@ -292,7 +292,6 @@ pub(crate) async fn create_logical_plan(
 }
 
 pub(crate) async fn execute_logical_plan(
-    _ctx: &dyn SqlExecutionContext,
     plan: SqlLogicalPlan,
     params: &[Value],
 ) -> Result<QueryResult, LixError> {
@@ -393,7 +392,7 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
         Arc::clone(&version_ref),
         ctx.write_stager(),
         entity_commit_graph,
-        &ctx.list_visible_schemas(ctx.active_version_id())?,
+        &ctx.list_visible_schemas()?,
     )
     .await?;
 
@@ -599,8 +598,7 @@ mod tests {
             self.write_stager.as_ref().map(Arc::clone)
         }
 
-        fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError> {
-            let _ = version_id;
+        fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
             Ok(self.schema_definitions.clone())
         }
     }
@@ -626,8 +624,7 @@ mod tests {
             Box::new(DummyCommitGraphReader)
         }
 
-        fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError> {
-            let _ = version_id;
+        fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
             Ok(self.schema_definitions.clone())
         }
     }
@@ -2359,8 +2356,7 @@ mod tests {
             Box::new(DummyCommitGraphReader)
         }
 
-        fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError> {
-            let _ = version_id;
+        fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
             Ok(self.schema_definitions.clone())
         }
     }
@@ -2440,7 +2436,13 @@ mod tests {
     }
 
     fn test_live_state_context() -> LiveStateContext {
-        LiveStateContext::new(TrackedStateContext::new(), UntrackedStateContext::new())
+        LiveStateContext::new(
+            TrackedStateContext::new(),
+            UntrackedStateContext::new(),
+            crate::engine2::commit_graph::CommitGraphContext::new(
+                crate::engine2::changelog::ChangelogContext::new(),
+            ),
+        )
     }
 
     fn run_async_test_with_large_stack(

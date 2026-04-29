@@ -118,8 +118,7 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
         Arc::new(self.binary_cas.reader(Arc::clone(&self.backend))) as Arc<dyn BlobDataReader>
     }
 
-    fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError> {
-        let _ = version_id;
+    fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
         Ok(self.visible_schemas.clone())
     }
 }

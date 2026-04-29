@@ -16,6 +16,7 @@ const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 ///
 /// This module does not own durable storage. It reads immutable changelog facts
 /// through a caller-provided KV store and applies commit graph rules on top.
+#[derive(Clone)]
 pub(crate) struct CommitGraphContext {
     changelog: ChangelogContext,
 }

@@ -48,7 +48,9 @@ pub(crate) fn project_loaded_row(
     requested_version_id: &str,
     matched_version_id: &str,
 ) -> LiveStateRow {
-    if matched_version_id == GLOBAL_VERSION_ID && requested_version_id != GLOBAL_VERSION_ID {
+    if row.global && requested_version_id != GLOBAL_VERSION_ID {
+        row.version_id = requested_version_id.to_string();
+    } else if matched_version_id == GLOBAL_VERSION_ID && requested_version_id != GLOBAL_VERSION_ID {
         row.version_id = requested_version_id.to_string();
     }
     row

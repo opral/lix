@@ -1,29 +1,24 @@
 use crate::backend::{KvStore, KvWriter};
 use crate::engine2::commit_graph::CommitGraphContext;
 use crate::engine2::commit_graph::CommitGraphEntity;
-use crate::engine2::tracked_state::{
-    TrackedStateContext, TrackedStateDeleteRequest, TrackedStateFilter, TrackedStateRow,
-};
-use crate::version::GLOBAL_VERSION_ID;
+use crate::engine2::tracked_state::{TrackedStateContext, TrackedStateRow};
 use crate::LixError;
 
 /// Summary of a tracked-state rebuild operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TrackedStateRebuildReport {
-    pub(crate) deleted_rows: usize,
     pub(crate) written_rows: usize,
 }
 
-/// Rebuilds tracked-state rows for one version from a commit graph head.
+/// Rebuilds tracked-state rows at one commit from the commit graph.
 ///
 /// The caller provides both stores explicitly so rebuilds can read from the
 /// desired KV snapshot and write through the desired transaction.
-pub(super) async fn rebuild_version_state<R, W>(
+pub(super) async fn rebuild_state_at_commit<R, W>(
     tracked_state: &TrackedStateContext,
     commit_graph: &CommitGraphContext,
     read_store: R,
     write_store: W,
-    version_id: &str,
     head_commit_id: &str,
 ) -> Result<TrackedStateRebuildReport, LixError>
 where
@@ -34,42 +29,28 @@ where
         .reader(read_store)
         .entities_at(head_commit_id)
         .await?;
-    let rows = rows_from_entities(version_id, entities)?;
+    let rows = rows_from_entities(entities);
     let written_rows = rows.len();
 
     let mut writer = tracked_state.writer(write_store);
-    let deleted_rows = writer
-        .delete_rows(&TrackedStateDeleteRequest {
-            filter: TrackedStateFilter {
-                version_ids: vec![version_id.to_string()],
-                include_tombstones: true,
-                ..Default::default()
-            },
-        })
-        .await?;
-    writer.write_rows(&rows).await?;
+    writer.write_root(head_commit_id, None, &rows).await?;
 
-    Ok(TrackedStateRebuildReport {
-        deleted_rows,
-        written_rows,
-    })
+    Ok(TrackedStateRebuildReport { written_rows })
 }
 
-/// Converts commit-graph entities into tracked-state rows for one version.
+/// Converts commit-graph entities into root-local tracked-state rows.
 ///
 /// The commit graph owns history resolution. This function only maps the
 /// effective canonical entities into the storage row shape tracked_state serves.
-pub(crate) fn rows_from_entities(
-    version_id: &str,
-    entities: Vec<CommitGraphEntity>,
-) -> Result<Vec<TrackedStateRow>, LixError> {
-    Ok(entities
+pub(crate) fn rows_from_entities(entities: Vec<CommitGraphEntity>) -> Vec<TrackedStateRow> {
+    entities
         .into_iter()
-        .map(|entity| tracked_row_from_entity(version_id, entity))
-        .collect())
+        .filter(|entity| !is_commit_graph_fact(&entity.change.schema_key))
+        .map(tracked_row_from_entity)
+        .collect()
 }
 
-fn tracked_row_from_entity(version_id: &str, entity: CommitGraphEntity) -> TrackedStateRow {
+fn tracked_row_from_entity(entity: CommitGraphEntity) -> TrackedStateRow {
     let CommitGraphEntity {
         change,
         source_commit_id,
@@ -87,11 +68,13 @@ fn tracked_row_from_entity(version_id: &str, entity: CommitGraphEntity) -> Track
         schema_version: change.schema_version,
         created_at,
         updated_at,
-        global: version_id == GLOBAL_VERSION_ID,
         change_id: change.id,
         commit_id: source_commit_id,
-        version_id: version_id.to_string(),
     }
+}
+
+fn is_commit_graph_fact(schema_key: &str) -> bool {
+    schema_key == "lix_commit"
 }
 
 #[cfg(test)]
@@ -108,8 +91,7 @@ mod tests {
 
     #[test]
     fn rows_from_entities_converts_normal_entity() {
-        let rows = rows_from_entities("version-a", vec![entity("change-1", Some("{}"))])
-            .expect("conversion should succeed");
+        let rows = rows_from_entities(vec![entity("change-1", Some("{}"))]);
 
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
@@ -122,41 +104,40 @@ mod tests {
         assert_eq!(row.schema_version, "1");
         assert_eq!(row.change_id, "change-1");
         assert_eq!(row.commit_id, "commit-1");
-        assert_eq!(row.version_id, "version-a");
-        assert!(!row.global);
     }
 
     #[test]
     fn rows_from_entities_preserves_tombstones() {
-        let rows = rows_from_entities("version-a", vec![entity("change-1", None)])
-            .expect("conversion should succeed");
+        let rows = rows_from_entities(vec![entity("change-1", None)]);
 
         assert_eq!(rows[0].snapshot_content, None);
     }
 
     #[test]
     fn rows_from_entities_uses_commit_graph_timestamps() {
-        let rows = rows_from_entities("version-a", vec![entity("change-1", Some("{}"))])
-            .expect("conversion should succeed");
+        let rows = rows_from_entities(vec![entity("change-1", Some("{}"))]);
 
         assert_eq!(rows[0].created_at, "2026-01-01T00:00:00Z");
         assert_eq!(rows[0].updated_at, "2026-01-02T00:00:00Z");
     }
 
     #[test]
-    fn rows_from_entities_marks_global_for_global_version_only() {
-        let global_rows =
-            rows_from_entities(GLOBAL_VERSION_ID, vec![entity("change-1", Some("{}"))])
-                .expect("global conversion should succeed");
-        let version_rows = rows_from_entities("version-a", vec![entity("change-2", Some("{}"))])
-            .expect("version conversion should succeed");
+    fn rows_from_entities_is_root_local_and_version_independent() {
+        let rows = rows_from_entities(vec![entity("change-1", Some("{}"))]);
 
-        assert!(global_rows[0].global);
-        assert!(!version_rows[0].global);
+        assert_eq!(rows[0].entity_id, "entity-1");
+        assert_eq!(rows[0].schema_key, "test_schema");
+    }
+
+    #[test]
+    fn rows_from_entities_excludes_commit_graph_facts() {
+        let rows = rows_from_entities(vec![commit_entity("commit-1")]);
+
+        assert_eq!(rows.len(), 0);
     }
 
     #[tokio::test]
-    async fn rebuild_version_state_writes_rows_from_commit_graph() {
+    async fn rebuild_state_at_commit_writes_rows_from_commit_graph() {
         let backend = Arc::new(UnitTestBackend::new());
         let tracked_state = TrackedStateContext::new();
         let changelog = ChangelogContext::new();
@@ -174,37 +155,27 @@ mod tests {
             .begin_transaction(TransactionBeginMode::Write)
             .await
             .expect("transaction should open");
-        let report = rebuild_version_state(
+        let report = rebuild_state_at_commit(
             &tracked_state,
             &commit_graph,
             Arc::clone(&backend),
             tx.as_mut(),
-            "version-a",
             "commit-1",
         )
         .await
         .expect("rebuild should succeed");
         tx.commit().await.expect("transaction should commit");
 
-        assert_eq!(
-            report,
-            TrackedStateRebuildReport {
-                deleted_rows: 0,
-                written_rows: 2,
-            }
-        );
-        let rows = scan_version_rows(&tracked_state, Arc::clone(&backend), "version-a").await;
-        assert_eq!(rows.len(), 2);
+        assert_eq!(report, TrackedStateRebuildReport { written_rows: 1 });
+        let rows = scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "commit-1").await;
+        assert_eq!(rows.len(), 1);
         assert!(rows
             .iter()
             .any(|row| row.schema_key == "test_schema" && row.entity_id == "entity-1"));
-        assert!(rows
-            .iter()
-            .any(|row| row.schema_key == "lix_commit" && row.entity_id == "commit-1"));
     }
 
     #[tokio::test]
-    async fn rebuild_version_state_deletes_stale_rows_for_target_version_only() {
+    async fn rebuild_state_at_commit_writes_replacement_root_for_head_commit() {
         let backend = Arc::new(UnitTestBackend::new());
         let tracked_state = TrackedStateContext::new();
         let changelog = ChangelogContext::new();
@@ -217,13 +188,11 @@ mod tests {
             ],
         )
         .await;
-        seed_tracked_rows(
+        seed_tracked_root(
             &tracked_state,
             Arc::clone(&backend),
-            &[
-                stale_row("version-a", "stale-target"),
-                stale_row("version-b", "stale-other"),
-            ],
+            "stale-commit",
+            &[stale_row("version-b", "stale-other")],
         )
         .await;
 
@@ -231,23 +200,21 @@ mod tests {
             .begin_transaction(TransactionBeginMode::Write)
             .await
             .expect("transaction should open");
-        let report = rebuild_version_state(
+        let report = rebuild_state_at_commit(
             &tracked_state,
             &commit_graph,
             Arc::clone(&backend),
             tx.as_mut(),
-            "version-a",
             "commit-1",
         )
         .await
         .expect("rebuild should succeed");
         tx.commit().await.expect("transaction should commit");
 
-        assert_eq!(report.deleted_rows, 1);
-        assert_eq!(report.written_rows, 2);
+        assert_eq!(report.written_rows, 1);
 
         let version_a_rows =
-            scan_version_rows(&tracked_state, Arc::clone(&backend), "version-a").await;
+            scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "commit-1").await;
         assert!(!version_a_rows
             .iter()
             .any(|row| row.entity_id == "stale-target"));
@@ -256,13 +223,58 @@ mod tests {
             .any(|row| row.entity_id == "entity-new"));
 
         let version_b_rows =
-            scan_version_rows(&tracked_state, Arc::clone(&backend), "version-b").await;
+            scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "stale-commit").await;
         assert_eq!(version_b_rows.len(), 1);
         assert_eq!(version_b_rows[0].entity_id, "stale-other");
     }
 
     #[tokio::test]
-    async fn rebuild_version_state_uses_latest_change_across_commits() {
+    async fn rebuild_state_at_commit_is_content_address_deterministic() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        let changelog = ChangelogContext::new();
+        let commit_graph = CommitGraphContext::new(changelog);
+        append_changes(
+            Arc::clone(&backend),
+            &[
+                entity_change("change-1", "entity-1", "test_schema", Some("{\"v\":1}")),
+                entity_change("change-2", "entity-2", "test_schema", Some("{\"v\":2}")),
+                commit_change(
+                    "commit-1-change",
+                    "commit-1",
+                    &["change-1", "change-2"],
+                    &[],
+                ),
+            ],
+        )
+        .await;
+
+        rebuild_state_at_commit_for_test(
+            &tracked_state,
+            &commit_graph,
+            Arc::clone(&backend),
+            "commit-1",
+        )
+        .await;
+        let first_root = load_root(&tracked_state, Arc::clone(&backend), "commit-1").await;
+        delete_root(&tracked_state, Arc::clone(&backend), "commit-1").await;
+        rebuild_state_at_commit_for_test(
+            &tracked_state,
+            &commit_graph,
+            Arc::clone(&backend),
+            "commit-1",
+        )
+        .await;
+        let second_root = load_root(&tracked_state, Arc::clone(&backend), "commit-1").await;
+
+        assert_eq!(
+            first_root, second_root,
+            "rebuilding the same changelog head should produce the same prolly root"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_state_at_commit_uses_latest_change_across_commits() {
         let backend = Arc::new(UnitTestBackend::new());
         let tracked_state = TrackedStateContext::new();
         let changelog = ChangelogContext::new();
@@ -295,16 +307,15 @@ mod tests {
         )
         .await;
 
-        rebuild_version(
+        rebuild_state_at_commit_for_test(
             &tracked_state,
             &commit_graph,
             Arc::clone(&backend),
-            "version-a",
             "commit-head",
         )
         .await;
 
-        let rows = scan_version_rows(&tracked_state, Arc::clone(&backend), "version-a").await;
+        let rows = scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "commit-head").await;
         let row = rows
             .iter()
             .find(|row| row.schema_key == "test_schema" && row.entity_id == "entity-1")
@@ -317,7 +328,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_version_state_preserves_tombstone_winner() {
+    async fn rebuild_state_at_commit_preserves_tombstone_winner() {
         let backend = Arc::new(UnitTestBackend::new());
         let tracked_state = TrackedStateContext::new();
         let changelog = ChangelogContext::new();
@@ -355,16 +366,15 @@ mod tests {
         )
         .await;
 
-        rebuild_version(
+        rebuild_state_at_commit_for_test(
             &tracked_state,
             &commit_graph,
             Arc::clone(&backend),
-            "version-a",
             "commit-head",
         )
         .await;
 
-        let rows = scan_version_rows(&tracked_state, Arc::clone(&backend), "version-a").await;
+        let rows = scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "commit-head").await;
         let row = rows
             .iter()
             .find(|row| row.schema_key == "test_schema" && row.entity_id == "entity-1")
@@ -375,7 +385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rebuild_version_state_marks_rows_global_for_global_version() {
+    async fn rebuild_state_at_commit_can_rebuild_global_commit_state() {
         let backend = Arc::new(UnitTestBackend::new());
         let tracked_state = TrackedStateContext::new();
         let changelog = ChangelogContext::new();
@@ -389,21 +399,71 @@ mod tests {
         )
         .await;
 
-        rebuild_version(
+        rebuild_state_at_commit_for_test(
             &tracked_state,
             &commit_graph,
             Arc::clone(&backend),
-            GLOBAL_VERSION_ID,
             "commit-1",
         )
         .await;
 
-        let rows = scan_version_rows(&tracked_state, Arc::clone(&backend), GLOBAL_VERSION_ID).await;
+        let rows = scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "commit-1").await;
         assert!(!rows.is_empty());
-        assert!(rows.iter().all(|row| row.global));
         assert!(rows
             .iter()
             .any(|row| row.schema_key == "test_schema" && row.entity_id == "entity-1"));
+    }
+
+    #[tokio::test]
+    async fn rebuilding_one_commit_state_does_not_rewrite_another_commit_root() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        let changelog = ChangelogContext::new();
+        let commit_graph = CommitGraphContext::new(changelog);
+        append_changes(
+            Arc::clone(&backend),
+            &[
+                entity_change("change-global", "entity-global", "test_schema", Some("{}")),
+                entity_change("change-main", "entity-main", "test_schema", Some("{}")),
+                commit_change(
+                    "commit-global-change",
+                    "commit-global",
+                    &["change-global"],
+                    &[],
+                ),
+                commit_change("commit-main-change", "commit-main", &["change-main"], &[]),
+            ],
+        )
+        .await;
+
+        rebuild_state_at_commit_for_test(
+            &tracked_state,
+            &commit_graph,
+            Arc::clone(&backend),
+            "commit-global",
+        )
+        .await;
+        let global_root_before =
+            load_root(&tracked_state, Arc::clone(&backend), "commit-global").await;
+
+        rebuild_state_at_commit_for_test(
+            &tracked_state,
+            &commit_graph,
+            Arc::clone(&backend),
+            "commit-main",
+        )
+        .await;
+        let global_root_after =
+            load_root(&tracked_state, Arc::clone(&backend), "commit-global").await;
+
+        assert_eq!(
+            global_root_after, global_root_before,
+            "rebuilding one commit state must not rewrite another commit root"
+        );
+        let main_rows =
+            scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "commit-main").await;
+        assert_eq!(main_rows.len(), 1);
+        assert_eq!(main_rows[0].entity_id, "entity-main");
     }
 
     fn entity(change_id: &str, snapshot_content: Option<&str>) -> CommitGraphEntity {
@@ -426,6 +486,21 @@ mod tests {
         }
     }
 
+    fn commit_entity(commit_id: &str) -> CommitGraphEntity {
+        CommitGraphEntity {
+            change: commit_change(
+                &format!("{commit_id}-change"),
+                commit_id,
+                &["change-1"],
+                &[],
+            ),
+            source_commit_id: commit_id.to_string(),
+            depth: 0,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
     async fn append_changes(backend: Arc<UnitTestBackend>, changes: &[CanonicalChange]) {
         let changelog = ChangelogContext::new();
         let mut tx = backend
@@ -440,9 +515,10 @@ mod tests {
         tx.commit().await.expect("transaction should commit");
     }
 
-    async fn seed_tracked_rows(
+    async fn seed_tracked_root(
         tracked_state: &TrackedStateContext,
         backend: Arc<UnitTestBackend>,
+        commit_id: &str,
         rows: &[TrackedStateRow],
     ) {
         let mut tx = backend
@@ -451,29 +527,27 @@ mod tests {
             .expect("transaction should open");
         tracked_state
             .writer(tx.as_mut())
-            .write_rows(rows)
+            .write_root(commit_id, None, rows)
             .await
             .expect("rows should seed");
         tx.commit().await.expect("transaction should commit");
     }
 
-    async fn rebuild_version(
+    async fn rebuild_state_at_commit_for_test(
         tracked_state: &TrackedStateContext,
         commit_graph: &CommitGraphContext,
         backend: Arc<UnitTestBackend>,
-        version_id: &str,
         head_commit_id: &str,
     ) -> TrackedStateRebuildReport {
         let mut tx = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await
             .expect("transaction should open");
-        let report = rebuild_version_state(
+        let report = rebuild_state_at_commit(
             tracked_state,
             commit_graph,
             Arc::clone(&backend),
             tx.as_mut(),
-            version_id,
             head_commit_id,
         )
         .await
@@ -482,23 +556,55 @@ mod tests {
         report
     }
 
-    async fn scan_version_rows(
+    async fn scan_rows_at_commit(
         tracked_state: &TrackedStateContext,
         backend: Arc<UnitTestBackend>,
-        version_id: &str,
+        commit_id: &str,
     ) -> Vec<TrackedStateRow> {
         tracked_state
             .reader(backend)
-            .scan_rows(&TrackedStateScanRequest {
-                filter: TrackedStateFilter {
-                    version_ids: vec![version_id.to_string()],
-                    include_tombstones: true,
+            .scan_rows_at_commit(
+                commit_id,
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        include_tombstones: true,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                ..Default::default()
-            })
+            )
             .await
             .expect("tracked rows should scan")
+    }
+
+    async fn load_root(
+        tracked_state: &TrackedStateContext,
+        backend: Arc<UnitTestBackend>,
+        commit_id: &str,
+    ) -> crate::engine2::tracked_state::tree_types::TrackedStateRootId {
+        let mut reader = tracked_state.reader(backend);
+        reader
+            .load_root_for_test(commit_id)
+            .await
+            .expect("root load should succeed")
+            .expect("root should exist")
+    }
+
+    async fn delete_root(
+        tracked_state: &TrackedStateContext,
+        backend: Arc<UnitTestBackend>,
+        commit_id: &str,
+    ) {
+        let mut tx = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        tracked_state
+            .writer(tx.as_mut())
+            .delete_root_for_rebuild(commit_id)
+            .await
+            .expect("root should delete");
+        tx.commit().await.expect("transaction should commit");
     }
 
     fn entity_change(
@@ -574,10 +680,8 @@ mod tests {
             schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            global: version_id == GLOBAL_VERSION_ID,
             change_id: format!("change-{entity_id}"),
             commit_id: format!("commit-{version_id}"),
-            version_id: version_id.to_string(),
         }
     }
 }

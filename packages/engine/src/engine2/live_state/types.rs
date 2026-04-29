@@ -66,27 +66,6 @@ impl From<UntrackedStateRow> for LiveStateRow {
     }
 }
 
-impl From<TrackedStateRow> for LiveStateRow {
-    fn from(row: TrackedStateRow) -> Self {
-        LiveStateRow {
-            entity_id: row.entity_id,
-            schema_key: row.schema_key,
-            file_id: row.file_id,
-            plugin_key: row.plugin_key,
-            snapshot_content: row.snapshot_content,
-            metadata: row.metadata,
-            schema_version: row.schema_version,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            global: row.global,
-            change_id: Some(row.change_id),
-            commit_id: Some(row.commit_id),
-            untracked: false,
-            version_id: row.version_id,
-        }
-    }
-}
-
 impl TryFrom<&LiveStateRow> for TrackedStateRow {
     type Error = crate::LixError;
 
@@ -120,10 +99,8 @@ impl TryFrom<&LiveStateRow> for TrackedStateRow {
             schema_version: row.schema_version.clone(),
             created_at: row.created_at.clone(),
             updated_at: row.updated_at.clone(),
-            global: row.global,
             change_id,
             commit_id,
-            version_id: row.version_id.clone(),
         })
     }
 }

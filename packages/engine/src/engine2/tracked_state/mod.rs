@@ -1,6 +1,9 @@
+mod codec;
 mod context;
 pub(crate) mod rebuild;
-pub(crate) mod storage;
+mod storage;
+mod tree;
+mod tree_types;
 mod types;
 
 #[allow(unused_imports)]
@@ -9,6 +12,6 @@ pub(crate) use context::{
 };
 #[allow(unused_imports)]
 pub(crate) use types::{
-    TrackedStateDeleteRequest, TrackedStateFilter, TrackedStateProjection, TrackedStateRow,
-    TrackedStateRowRequest, TrackedStateScanRequest,
+    TrackedStateFilter, TrackedStateProjection, TrackedStateRow, TrackedStateRowRequest,
+    TrackedStateScanRequest,
 };
