@@ -14,19 +14,24 @@ use crate::LixError;
 /// - `base -> target`: what the destination version changed.
 /// - `base -> source`: what the incoming version changed.
 ///
-/// The planner returns source rows that can be applied to the target root plus
-/// first-class conflicts for identities changed differently on both sides.
+/// The planner returns source-side patches that can be applied to the target
+/// root plus first-class conflicts for identities changed differently on both
+/// sides.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TrackedStateMergePlan {
-    pub(crate) apply: Vec<TrackedStateMergeApply>,
+    pub(crate) patches: Vec<TrackedStateMergePatch>,
     pub(crate) conflicts: Vec<TrackedStateMergeConflict>,
 }
 
-/// One source-side tracked row to apply to the target root.
+/// One source-side patch to apply to the target root.
+///
+/// The patch carries the full source row, including tombstones. That keeps
+/// delete application explicit while leaving transaction hydration to the
+/// session/transaction layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrackedStateMergeApply {
+pub(crate) struct TrackedStateMergePatch {
     pub(crate) identity: TrackedStateDiffIdentity,
-    pub(crate) row: TrackedStateRow,
+    pub(crate) source_row: TrackedStateRow,
 }
 
 /// One identity that both sides changed incompatibly.
@@ -40,9 +45,9 @@ pub(crate) struct TrackedStateMergeConflict {
 /// Plans a three-way tracked-state merge from two base-relative diffs.
 ///
 /// This follows the same shape as prolly-tree merge systems: compare
-/// `base -> target` and `base -> source` by identity, apply source-only changes
-/// onto target, ignore target-only changes, collapse convergent changes, and
-/// report divergent same-identity changes as conflicts.
+/// `base -> target` and `base -> source` by identity, emit source-only patches
+/// for the target root, ignore target-only changes, collapse convergent
+/// changes, and report divergent same-identity changes as conflicts.
 pub(crate) fn plan_merge(
     target_diff: &TrackedStateDiff,
     source_diff: &TrackedStateDiff,
@@ -67,9 +72,9 @@ pub(crate) fn plan_merge(
                 // there is nothing to apply.
             }
             (None, Some(source)) => {
-                plan.apply.push(TrackedStateMergeApply {
+                plan.patches.push(TrackedStateMergePatch {
                     identity,
-                    row: source_row_to_apply(source)?,
+                    source_row: source_row_for_patch(source)?,
                 });
             }
             (Some(target), Some(source)) if same_final_state(target, source) => {
@@ -107,7 +112,7 @@ fn diff_by_identity(
     Ok(entries)
 }
 
-fn source_row_to_apply(entry: &TrackedStateDiffEntry) -> Result<TrackedStateRow, LixError> {
+fn source_row_for_patch(entry: &TrackedStateDiffEntry) -> Result<TrackedStateRow, LixError> {
     let Some(row) = entry.after.clone() else {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -160,7 +165,7 @@ mod tests {
         )
         .expect("merge should plan");
 
-        assert_eq!(apply_ids(&plan), vec!["entity-a"]);
+        assert_eq!(patch_ids(&plan), vec!["entity-a"]);
         assert!(plan.conflicts.is_empty());
     }
 
@@ -177,9 +182,9 @@ mod tests {
         )
         .expect("merge should plan");
 
-        assert_eq!(apply_ids(&plan), vec!["entity-a"]);
+        assert_eq!(patch_ids(&plan), vec!["entity-a"]);
         assert_eq!(
-            plan.apply[0].row.snapshot_content.as_deref(),
+            plan.patches[0].source_row.snapshot_content.as_deref(),
             Some("{\"value\":\"source\"}")
         );
     }
@@ -197,8 +202,8 @@ mod tests {
         )
         .expect("merge should plan");
 
-        assert_eq!(apply_ids(&plan), vec!["entity-a"]);
-        assert_eq!(plan.apply[0].row.snapshot_content, None);
+        assert_eq!(patch_ids(&plan), vec!["entity-a"]);
+        assert_eq!(plan.patches[0].source_row.snapshot_content, None);
     }
 
     #[test]
@@ -214,7 +219,7 @@ mod tests {
         )
         .expect("merge should plan");
 
-        assert!(plan.apply.is_empty());
+        assert!(plan.patches.is_empty());
         assert!(plan.conflicts.is_empty());
     }
 
@@ -235,7 +240,7 @@ mod tests {
 
         let plan = plan_merge(&diff(vec![target]), &diff(vec![source])).expect("merge should plan");
 
-        assert!(plan.apply.is_empty());
+        assert!(plan.patches.is_empty());
         assert!(plan.conflicts.is_empty());
     }
 
@@ -256,7 +261,7 @@ mod tests {
 
         let plan = plan_merge(&diff(vec![target]), &diff(vec![source])).expect("merge should plan");
 
-        assert!(plan.apply.is_empty());
+        assert!(plan.patches.is_empty());
         assert!(plan.conflicts.is_empty());
     }
 
@@ -277,7 +282,7 @@ mod tests {
 
         let plan = plan_merge(&diff(vec![target]), &diff(vec![source])).expect("merge should plan");
 
-        assert!(plan.apply.is_empty());
+        assert!(plan.patches.is_empty());
         assert_eq!(conflict_ids(&plan), vec!["entity-a"]);
     }
 
@@ -338,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_and_conflict_order_is_deterministic_by_identity() {
+    fn patch_and_conflict_order_is_deterministic_by_identity() {
         let target = diff(vec![entry(
             "entity-b",
             TrackedStateDiffKind::Modified,
@@ -368,7 +373,7 @@ mod tests {
 
         let plan = plan_merge(&target, &source).expect("merge should plan");
 
-        assert_eq!(apply_ids(&plan), vec!["entity-a", "entity-c"]);
+        assert_eq!(patch_ids(&plan), vec!["entity-a", "entity-c"]);
         assert_eq!(conflict_ids(&plan), vec!["entity-b"]);
     }
 
@@ -394,8 +399,8 @@ mod tests {
         }
     }
 
-    fn apply_ids(plan: &TrackedStateMergePlan) -> Vec<&str> {
-        plan.apply
+    fn patch_ids(plan: &TrackedStateMergePlan) -> Vec<&str> {
+        plan.patches
             .iter()
             .map(|entry| entry.identity.entity_id.as_str())
             .collect()

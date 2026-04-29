@@ -19,7 +19,7 @@ pub(crate) use diff::{
 };
 #[allow(unused_imports)]
 pub(crate) use merge::{
-    plan_merge, TrackedStateMergeApply, TrackedStateMergeConflict, TrackedStateMergePlan,
+    plan_merge, TrackedStateMergeConflict, TrackedStateMergePatch, TrackedStateMergePlan,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{

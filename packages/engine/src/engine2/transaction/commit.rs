@@ -46,6 +46,7 @@ pub(crate) async fn commit_staged_writes(
         .partition(|row| !row.untracked);
     let finalized = finalize_commit_rows(
         staged_writes.commit_members_by_version,
+        staged_writes.extra_commit_parents_by_version,
         version_ref,
         transaction,
     )
@@ -144,6 +145,7 @@ struct PendingVersionHead {
 
 async fn finalize_commit_rows(
     commit_members_by_version: BTreeMap<String, StagedCommitMembers>,
+    extra_commit_parents_by_version: BTreeMap<String, Vec<String>>,
     version_ref: &VersionRefContext,
     transaction: &mut dyn LixBackendTransaction,
 ) -> Result<FinalizedCommitRows, LixError> {
@@ -166,6 +168,13 @@ async fn finalize_commit_rows(
             .await?
             .into_iter()
             .collect::<Vec<_>>();
+        let parent_commit_ids = merge_parent_commit_ids(
+            parent_commit_ids,
+            extra_commit_parents_by_version
+                .get(&version_id)
+                .cloned()
+                .unwrap_or_default(),
+        );
         let snapshot_content = serde_json::to_string(&serde_json::json!({
             "id": commit_id,
             "change_set_id": change_set_id,
@@ -206,6 +215,15 @@ async fn finalize_commit_rows(
         commit_rows,
         version_heads,
     })
+}
+
+fn merge_parent_commit_ids(mut base: Vec<String>, extra: Vec<String>) -> Vec<String> {
+    for parent in extra {
+        if !base.contains(&parent) {
+            base.push(parent);
+        }
+    }
+    base
 }
 
 #[cfg(test)]
@@ -259,6 +277,7 @@ mod tests {
                     GLOBAL_VERSION_ID.to_string(),
                     members(["change-1"]),
                 )]),
+                extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -318,6 +337,7 @@ mod tests {
             StagedWriteSet {
                 state_rows: vec![untracked_global_row("change-untracked")],
                 commit_members_by_version: BTreeMap::new(),
+                extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -397,6 +417,7 @@ mod tests {
                     GLOBAL_VERSION_ID.to_string(),
                     members(["change-tracked"]),
                 )]),
+                extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -461,6 +482,7 @@ mod tests {
                     "version-a".to_string(),
                     members(["change-version-a"]),
                 )]),
+                extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -525,6 +547,7 @@ mod tests {
                 GLOBAL_VERSION_ID.to_string(),
                 members(["change-a", "change-b"]),
             )]),
+            BTreeMap::new(),
             &version_ref,
             transaction.as_mut(),
         )
@@ -594,6 +617,7 @@ mod tests {
                 GLOBAL_VERSION_ID.to_string(),
                 StagedCommitMembers::default(),
             )]),
+            BTreeMap::new(),
             &version_ref,
             transaction.as_mut(),
         )
@@ -627,6 +651,7 @@ mod tests {
             .expect("transaction should open");
         let rows = finalize_commit_rows(
             BTreeMap::from([("version-a".to_string(), members(["change-a"]))]),
+            BTreeMap::new(),
             &version_ref,
             transaction.as_mut(),
         )
@@ -651,6 +676,49 @@ mod tests {
             vec!["previous-commit"]
         );
         assert_eq!(rows.version_heads[0].version_id, "version-a");
+    }
+
+    #[tokio::test]
+    async fn finalize_commit_rows_appends_extra_merge_parent_after_target_head() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let version_ref = VersionRefContext::new(Arc::new(UntrackedStateContext::new()));
+        crate::engine2::test_support::seed_version_head(
+            backend.as_ref(),
+            "version-a",
+            "target-head",
+        )
+        .await;
+
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        let rows = finalize_commit_rows(
+            BTreeMap::from([("version-a".to_string(), members(["change-a"]))]),
+            BTreeMap::from([("version-a".to_string(), vec!["source-head".to_string()])]),
+            &version_ref,
+            transaction.as_mut(),
+        )
+        .await
+        .expect("merge commit finalization should resolve parents");
+
+        let snapshot = serde_json::from_str::<JsonValue>(
+            rows.commit_rows[0]
+                .snapshot_content
+                .as_deref()
+                .expect("commit row should have snapshot"),
+        )
+        .expect("commit snapshot should be JSON");
+        assert_eq!(
+            snapshot
+                .get("parent_commit_ids")
+                .and_then(JsonValue::as_array)
+                .expect("parent_commit_ids should be array")
+                .iter()
+                .map(|value| value.as_str().expect("parent id should be text"))
+                .collect::<Vec<_>>(),
+            vec!["target-head", "source-head"]
+        );
     }
 
     fn members<const N: usize>(change_ids: [&str; N]) -> StagedCommitMembers {

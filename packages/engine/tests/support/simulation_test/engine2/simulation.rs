@@ -1,4 +1,8 @@
-use lix_engine::engine2::{Engine, ExecuteResult, InitReceipt, SessionContext};
+use lix_engine::engine2::{
+    CreateVersionOptions, CreateVersionReceipt, Engine, ExecuteResult, InitReceipt,
+    MergeVersionOptions, MergeVersionReceipt, SessionContext, SwitchVersionOptions,
+    SwitchVersionReceipt,
+};
 use lix_engine::{LixBackend, LixError, Value};
 
 use super::expect_same::Engine2SimulationAssertions;
@@ -54,6 +58,23 @@ impl Engine2Simulation {
         Ok(SimSession {
             sim: self.clone(),
             engine: engine.clone(),
+            active_version_id: self.receipt.main_version_id.clone(),
+            session,
+        })
+    }
+
+    /// Opens a session on an arbitrary version id.
+    pub async fn open_session(
+        &self,
+        engine: &Engine,
+        active_version_id: impl Into<String>,
+    ) -> Result<SimSession, LixError> {
+        let active_version_id = active_version_id.into();
+        let session = engine.open_session(active_version_id.clone()).await?;
+        Ok(SimSession {
+            sim: self.clone(),
+            engine: engine.clone(),
+            active_version_id,
             session,
         })
     }
@@ -64,6 +85,7 @@ impl Engine2Simulation {
         Ok(SimSession {
             sim: self.clone(),
             engine: engine.clone(),
+            active_version_id: "global".to_string(),
             session,
         })
     }
@@ -106,6 +128,7 @@ impl Engine2Simulation {
 pub struct SimSession {
     sim: Engine2Simulation,
     engine: Engine,
+    active_version_id: String,
     session: SessionContext,
 }
 
@@ -115,7 +138,7 @@ impl SimSession {
             StatementKind::Read => {
                 self.sim
                     .rebuild_tracked_state
-                    .before_read(&self.engine, self.sim.main_version_id())
+                    .before_read(&self.engine, &self.active_version_id)
                     .await?;
                 self.session.execute(sql, params).await
             }
@@ -128,6 +151,44 @@ impl SimSession {
             }
             StatementKind::Utility => self.session.execute(sql, params).await,
         }
+    }
+
+    pub async fn create_version(
+        &self,
+        options: CreateVersionOptions,
+    ) -> Result<CreateVersionReceipt, LixError> {
+        let result = self.session.create_version(options).await;
+        if result.is_ok() {
+            self.sim.rebuild_tracked_state.after_successful_write();
+        }
+        result
+    }
+
+    pub async fn merge_version(
+        &self,
+        options: MergeVersionOptions,
+    ) -> Result<MergeVersionReceipt, LixError> {
+        let result = self.session.merge_version(options).await;
+        if result.is_ok() {
+            self.sim.rebuild_tracked_state.after_successful_write();
+        }
+        result
+    }
+
+    pub async fn switch_version(
+        &self,
+        options: SwitchVersionOptions,
+    ) -> Result<(SimSession, SwitchVersionReceipt), LixError> {
+        let (session, receipt) = self.session.switch_version(options).await?;
+        Ok((
+            SimSession {
+                sim: self.sim.clone(),
+                engine: self.engine.clone(),
+                active_version_id: receipt.version_id.clone(),
+                session,
+            },
+            receipt,
+        ))
     }
 }
 

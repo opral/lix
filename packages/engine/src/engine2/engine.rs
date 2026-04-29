@@ -115,6 +115,7 @@ impl Engine {
             active_version_id.into(),
             self.backend(),
             Arc::clone(&self.live_state),
+            Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.changelog),
             Arc::clone(&self.version_ref),

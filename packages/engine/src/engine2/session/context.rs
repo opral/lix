@@ -8,6 +8,7 @@ use crate::engine2::commit_graph::{CommitGraphContext, CommitGraphReader};
 use crate::engine2::functions::FunctionProviderHandle;
 use crate::engine2::live_state::{LiveStateContext, LiveStateReader};
 use crate::engine2::schema_registry::SchemaRegistry;
+use crate::engine2::tracked_state::TrackedStateContext;
 use crate::engine2::version_ref::{VersionRefContext, VersionRefReader};
 use crate::sql2::SqlExecutionContext;
 use crate::{LixBackend, LixError};
@@ -22,6 +23,7 @@ pub struct SessionContext {
     pub(super) active_version_id: String,
     pub(super) backend: Arc<dyn LixBackend + Send + Sync>,
     pub(super) live_state: Arc<LiveStateContext>,
+    pub(super) tracked_state: Arc<TrackedStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) changelog: Arc<ChangelogContext>,
     pub(super) version_ref: Arc<VersionRefContext>,
@@ -33,6 +35,7 @@ impl SessionContext {
         active_version_id: String,
         backend: Arc<dyn LixBackend + Send + Sync>,
         live_state: Arc<LiveStateContext>,
+        tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
         version_ref: Arc<VersionRefContext>,
@@ -42,6 +45,7 @@ impl SessionContext {
             active_version_id,
             backend,
             live_state,
+            tracked_state,
             binary_cas,
             changelog,
             version_ref,
@@ -53,6 +57,7 @@ impl SessionContext {
         active_version_id: String,
         backend: Arc<dyn LixBackend + Send + Sync>,
         live_state: Arc<LiveStateContext>,
+        tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
         version_ref: Arc<VersionRefContext>,
@@ -62,6 +67,7 @@ impl SessionContext {
             active_version_id,
             backend,
             live_state,
+            tracked_state,
             binary_cas,
             changelog,
             version_ref,

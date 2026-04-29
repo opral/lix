@@ -126,6 +126,30 @@ impl<'a> Transaction<'a> {
     pub(crate) fn stage_rows(&self, rows: Vec<StageRow>) -> Result<(), LixError> {
         self.stage_write(StageWrite::Rows { rows })
     }
+
+    /// Adds an extra parent to the commit generated for `version_id`.
+    ///
+    /// Merge uses this to preserve source-branch ancestry. Ordinary writes do
+    /// not call this because commit finalization already parents to the
+    /// version's previous head.
+    pub(crate) fn add_commit_parent(
+        &self,
+        version_id: String,
+        parent_commit_id: String,
+    ) -> Result<(), LixError> {
+        self.staged_writes
+            .add_commit_parent(version_id, parent_commit_id)
+    }
+
+    /// Exposes this transaction's KV snapshot to engine2 storage readers.
+    ///
+    /// Programmatic write APIs use this when a read influences staged writes,
+    /// for example reading the current version head before creating a new
+    /// version ref. Keeping that read inside the same backend transaction
+    /// avoids a stale read/write split.
+    pub(crate) fn kv_store(&mut self) -> &mut dyn LixBackendTransaction {
+        self.backend_transaction.as_mut()
+    }
 }
 
 impl SqlExecutionContext for Transaction<'_> {
