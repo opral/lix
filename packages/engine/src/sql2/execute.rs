@@ -649,6 +649,25 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn best_common_ancestors(
+            &mut self,
+            _left_commit_id: &str,
+            _right_commit_id: &str,
+        ) -> Result<Vec<CommitGraphCommit>, LixError> {
+            Ok(Vec::new())
+        }
+
+        async fn merge_base(
+            &mut self,
+            _left_commit_id: &str,
+            _right_commit_id: &str,
+        ) -> Result<CommitGraphCommit, LixError> {
+            Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "dummy commit graph reader cannot resolve merge base",
+            ))
+        }
+
         fn commit_edges(&self, _commits: &[CommitGraphCommit]) -> Vec<CommitGraphEdge> {
             Vec::new()
         }

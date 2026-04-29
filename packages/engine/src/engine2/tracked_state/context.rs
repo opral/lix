@@ -1,5 +1,9 @@
 use crate::backend::{KvStore, KvWriter};
 use crate::engine2::commit_graph::CommitGraphContext;
+use crate::engine2::tracked_state::diff::{
+    diff_commits, TrackedStateDiff, TrackedStateDiffRequest,
+};
+use crate::engine2::tracked_state::merge::{self, TrackedStateMergePlan};
 use crate::engine2::tracked_state::rebuild::TrackedStateRebuildReport;
 use crate::engine2::tracked_state::storage;
 use crate::engine2::tracked_state::tree::TrackedStateTree;
@@ -86,6 +90,21 @@ pub(crate) trait TrackedStateReader {
         commit_id: &str,
         request: &TrackedStateRowRequest,
     ) -> Result<Option<TrackedStateRow>, LixError>;
+
+    async fn diff_commits(
+        &mut self,
+        left_commit_id: &str,
+        right_commit_id: &str,
+        request: &TrackedStateDiffRequest,
+    ) -> Result<TrackedStateDiff, LixError>;
+
+    async fn plan_merge(
+        &mut self,
+        base_commit_id: &str,
+        target_commit_id: &str,
+        source_commit_id: &str,
+        request: &TrackedStateDiffRequest,
+    ) -> Result<TrackedStateMergePlan, LixError>;
 }
 
 /// Store-backed tracked-state reader created by `TrackedStateContext`.
@@ -144,6 +163,41 @@ where
             .is_some())
     }
 
+    /// Diffs two commit roots and returns changed tracked-state identities.
+    ///
+    /// This first pass scans both roots and merge-joins rows by identity. The
+    /// public shape matches a prolly cursor diff so the internals can later
+    /// switch to chunk-skipping without changing merge callers.
+    pub(crate) async fn diff_commits(
+        &mut self,
+        left_commit_id: &str,
+        right_commit_id: &str,
+        request: &TrackedStateDiffRequest,
+    ) -> Result<TrackedStateDiff, LixError> {
+        diff_commits(self, left_commit_id, right_commit_id, request).await
+    }
+
+    /// Plans a three-way merge by diffing both heads against the same base.
+    ///
+    /// `target_commit_id` is the destination root that should keep its own
+    /// changes. `source_commit_id` is the incoming root whose non-conflicting
+    /// changes should be applied.
+    pub(crate) async fn plan_merge(
+        &mut self,
+        base_commit_id: &str,
+        target_commit_id: &str,
+        source_commit_id: &str,
+        request: &TrackedStateDiffRequest,
+    ) -> Result<TrackedStateMergePlan, LixError> {
+        let target_diff = self
+            .diff_commits(base_commit_id, target_commit_id, request)
+            .await?;
+        let source_diff = self
+            .diff_commits(base_commit_id, source_commit_id, request)
+            .await?;
+        merge::plan_merge(&target_diff, &source_diff)
+    }
+
     #[cfg(test)]
     pub(crate) async fn load_root_for_test(
         &mut self,
@@ -173,6 +227,32 @@ where
         request: &TrackedStateRowRequest,
     ) -> Result<Option<TrackedStateRow>, LixError> {
         TrackedStateStoreReader::load_row_at_commit(self, commit_id, request).await
+    }
+
+    async fn diff_commits(
+        &mut self,
+        left_commit_id: &str,
+        right_commit_id: &str,
+        request: &TrackedStateDiffRequest,
+    ) -> Result<TrackedStateDiff, LixError> {
+        TrackedStateStoreReader::diff_commits(self, left_commit_id, right_commit_id, request).await
+    }
+
+    async fn plan_merge(
+        &mut self,
+        base_commit_id: &str,
+        target_commit_id: &str,
+        source_commit_id: &str,
+        request: &TrackedStateDiffRequest,
+    ) -> Result<TrackedStateMergePlan, LixError> {
+        TrackedStateStoreReader::plan_merge(
+            self,
+            base_commit_id,
+            target_commit_id,
+            source_commit_id,
+            request,
+        )
+        .await
     }
 }
 
@@ -321,13 +401,151 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn plan_merge_from_roots_applies_source_only_change() {
+        let (backend, tracked_state) = seed_merge_roots(
+            &[row_with_value("entity-a", "change-base", "base", "base")],
+            &[row_with_value("entity-a", "change-base", "base", "base")],
+            &[row_with_value("entity-a", "change-source", "source", "source")],
+        )
+        .await;
+
+        let plan = tracked_state
+            .reader(Arc::clone(&backend))
+            .plan_merge("base", "target", "source", &TrackedStateDiffRequest::default())
+            .await
+            .expect("merge should plan");
+
+        assert_eq!(merge_apply_ids(&plan), vec!["entity-a"]);
+        assert!(plan.conflicts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_merge_from_roots_keeps_target_only_change() {
+        let (backend, tracked_state) = seed_merge_roots(
+            &[row("entity-a", "change-base", "base")],
+            &[row("entity-a", "change-target", "target")],
+            &[row("entity-a", "change-base", "base")],
+        )
+        .await;
+
+        let plan = tracked_state
+            .reader(Arc::clone(&backend))
+            .plan_merge("base", "target", "source", &TrackedStateDiffRequest::default())
+            .await
+            .expect("merge should plan");
+
+        assert!(plan.apply.is_empty());
+        assert!(plan.conflicts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_merge_from_roots_reports_divergent_modification_conflict() {
+        let (backend, tracked_state) = seed_merge_roots(
+            &[row_with_value("entity-a", "change-base", "base", "base")],
+            &[row_with_value("entity-a", "change-target", "target", "target")],
+            &[row_with_value("entity-a", "change-source", "source", "source")],
+        )
+        .await;
+
+        let plan = tracked_state
+            .reader(Arc::clone(&backend))
+            .plan_merge("base", "target", "source", &TrackedStateDiffRequest::default())
+            .await
+            .expect("merge should plan");
+
+        assert!(plan.apply.is_empty());
+        assert_eq!(merge_conflict_ids(&plan), vec!["entity-a"]);
+    }
+
+    #[tokio::test]
+    async fn plan_merge_from_roots_applies_source_tombstone() {
+        let (backend, tracked_state) = seed_merge_roots(
+            &[row("entity-a", "change-base", "base")],
+            &[row("entity-a", "change-base", "base")],
+            &[tombstone("entity-a", "change-source-delete", "source")],
+        )
+        .await;
+
+        let plan = tracked_state
+            .reader(Arc::clone(&backend))
+            .plan_merge("base", "target", "source", &TrackedStateDiffRequest::default())
+            .await
+            .expect("merge should plan");
+
+        assert_eq!(merge_apply_ids(&plan), vec!["entity-a"]);
+        assert_eq!(plan.apply[0].row.snapshot_content, None);
+    }
+
+    async fn seed_merge_roots(
+        base_rows: &[TrackedStateRow],
+        target_rows: &[TrackedStateRow],
+        source_rows: &[TrackedStateRow],
+    ) -> (Arc<UnitTestBackend>, TrackedStateContext) {
+        let backend = Arc::new(UnitTestBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        tracked_state
+            .writer(transaction.as_mut())
+            .write_root("base", None, base_rows)
+            .await
+            .expect("base root should write");
+        tracked_state
+            .writer(transaction.as_mut())
+            .write_root("target", None, target_rows)
+            .await
+            .expect("target root should write");
+        tracked_state
+            .writer(transaction.as_mut())
+            .write_root("source", None, source_rows)
+            .await
+            .expect("source root should write");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+        (backend, tracked_state)
+    }
+
+    fn merge_apply_ids(plan: &TrackedStateMergePlan) -> Vec<&str> {
+        plan.apply
+            .iter()
+            .map(|entry| entry.identity.entity_id.as_str())
+            .collect()
+    }
+
+    fn merge_conflict_ids(plan: &TrackedStateMergePlan) -> Vec<&str> {
+        plan.conflicts
+            .iter()
+            .map(|entry| entry.identity.entity_id.as_str())
+            .collect()
+    }
+
+    fn tombstone(entity_id: &str, change_id: &str, commit_id: &str) -> TrackedStateRow {
+        let mut row = row(entity_id, change_id, commit_id);
+        row.snapshot_content = None;
+        row
+    }
+
     fn row(entity_id: &str, change_id: &str, commit_id: &str) -> TrackedStateRow {
+        row_with_value(entity_id, change_id, commit_id, "value")
+    }
+
+    fn row_with_value(
+        entity_id: &str,
+        change_id: &str,
+        commit_id: &str,
+        value: &str,
+    ) -> TrackedStateRow {
         TrackedStateRow {
             entity_id: entity_id.to_string(),
             schema_key: "test_schema".to_string(),
             file_id: None,
             plugin_key: None,
-            snapshot_content: Some("{}".to_string()),
+            snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
             metadata: None,
             schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
