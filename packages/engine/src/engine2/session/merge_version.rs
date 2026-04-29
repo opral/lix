@@ -20,10 +20,24 @@ pub struct MergeVersionOptions {
 }
 
 /// Receipt returned after merging a version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeVersionReceipt {
-    /// Number of source-side changes merged into the target version.
-    pub merged_changes: usize,
+    pub outcome: MergeVersionOutcome,
+    pub target_version_id: String,
+    pub source_version_id: String,
+    pub merge_base_commit_id: Option<String>,
+    pub target_head_before_commit_id: String,
+    pub source_head_before_commit_id: String,
+    pub target_head_after_commit_id: String,
+    pub created_merge_commit_id: Option<String>,
+    /// Number of source-side changes applied into the target version.
+    pub applied_change_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeVersionOutcome {
+    AlreadyUpToDate,
+    MergeCommitted,
 }
 
 impl SessionContext {
@@ -44,6 +58,7 @@ impl SessionContext {
         let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
         let functions = runtime_functions.provider();
         let active_version_id = self.active_version_id().await?;
+        let source_version_id = options.source_version_id;
 
         let mut transaction = Transaction::open(
             active_version_id.clone(),
@@ -72,14 +87,14 @@ impl SessionContext {
                     )
                 })?;
             let source_head = reader
-                .load_head_commit_id(&options.source_version_id)
+                .load_head_commit_id(&source_version_id)
                 .await?
                 .ok_or_else(|| {
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!(
                             "cannot merge from missing source version ref '{}'",
-                            options.source_version_id
+                            source_version_id
                         ),
                     )
                 })?;
@@ -116,14 +131,48 @@ impl SessionContext {
         let rows = stage_rows_from_merge_plan(&merge_plan, &active_version_id);
         if rows.is_empty() {
             transaction.rollback().await?;
-            return Ok(MergeVersionReceipt { merged_changes: 0 });
+            return Ok(MergeVersionReceipt {
+                outcome: MergeVersionOutcome::AlreadyUpToDate,
+                target_version_id: active_version_id,
+                source_version_id,
+                merge_base_commit_id: Some(merge_base.commit_id),
+                target_head_after_commit_id: target_head.clone(),
+                target_head_before_commit_id: target_head,
+                source_head_before_commit_id: source_head,
+                created_merge_commit_id: None,
+                applied_change_count: 0,
+            });
         }
 
-        let merged_changes = rows.len();
+        let applied_change_count = rows.len();
         transaction.stage_rows(rows)?;
-        transaction.add_commit_parent(active_version_id, source_head)?;
+        transaction.add_commit_parent(active_version_id.clone(), source_head.clone())?;
         transaction.commit(&runtime_functions).await?;
-        Ok(MergeVersionReceipt { merged_changes })
+        let target_head_after = self
+            .version_ref
+            .reader(Arc::clone(&self.backend))
+            .load_head_commit_id(&active_version_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "merge_version committed but target version ref '{}' is missing",
+                        active_version_id
+                    ),
+                )
+            })?;
+        Ok(MergeVersionReceipt {
+            outcome: MergeVersionOutcome::MergeCommitted,
+            target_version_id: active_version_id,
+            source_version_id,
+            merge_base_commit_id: Some(merge_base.commit_id),
+            target_head_before_commit_id: target_head,
+            source_head_before_commit_id: source_head,
+            created_merge_commit_id: Some(target_head_after.clone()),
+            target_head_after_commit_id: target_head_after,
+            applied_change_count,
+        })
     }
 }
 
