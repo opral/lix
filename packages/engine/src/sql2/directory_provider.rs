@@ -1029,7 +1029,6 @@ fn directory_row_context_from_batch(
         global,
         untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
-        plugin_key: optional_string_value(batch, row_index, "lixcol_plugin_key")?,
         metadata: optional_string_value(batch, row_index, "lixcol_metadata")?,
     })
 }
@@ -1148,7 +1147,6 @@ fn lix_directory_record_batch(
     let mut entity_ids = Vec::new();
     let mut schema_keys = Vec::new();
     let mut file_ids = Vec::new();
-    let mut plugin_keys = Vec::new();
     let mut schema_versions = Vec::new();
     let mut globals = Vec::new();
     let mut change_ids = Vec::new();
@@ -1172,7 +1170,6 @@ fn lix_directory_record_batch(
         entity_ids.push(Some(directory.live.entity_id.as_string()?));
         schema_keys.push(Some(directory.live.schema_key));
         file_ids.push(directory.live.file_id);
-        plugin_keys.push(directory.live.plugin_key);
         schema_versions.push(directory.live.schema_version);
         globals.push(Some(directory.live.global));
         change_ids.push(directory.live.change_id);
@@ -1195,7 +1192,6 @@ fn lix_directory_record_batch(
             "lixcol_entity_id" => Arc::new(StringArray::from(entity_ids.clone())),
             "lixcol_schema_key" => Arc::new(StringArray::from(schema_keys.clone())),
             "lixcol_file_id" => Arc::new(StringArray::from(file_ids.clone())),
-            "lixcol_plugin_key" => Arc::new(StringArray::from(plugin_keys.clone())),
             "lixcol_schema_version" => Arc::new(StringArray::from(schema_versions.clone())),
             "lixcol_global" => Arc::new(BooleanArray::from(globals.clone())),
             "lixcol_change_id" => Arc::new(StringArray::from(change_ids.clone())),
@@ -1515,7 +1511,6 @@ fn lix_directory_schema() -> SchemaRef {
         Field::new("lixcol_entity_id", DataType::Utf8, false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
-        Field::new("lixcol_plugin_key", DataType::Utf8, true),
         Field::new("lixcol_schema_version", DataType::Utf8, false),
         Field::new("lixcol_global", DataType::Boolean, false),
         Field::new("lixcol_change_id", DataType::Utf8, true),
@@ -1651,7 +1646,6 @@ mod tests {
                 .expect("entity id should decode"),
             schema_key: schema_key.to_string(),
             file_id: file_id.map(ToOwned::to_owned),
-            plugin_key: None,
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: Some("{\"source\":\"test\"}".to_string()),
             schema_version: "1".to_string(),
@@ -1855,7 +1849,6 @@ mod tests {
                 )),
                 schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                 file_id: None,
-                plugin_key: None,
                 snapshot_content: Some(
                     "{\"hidden\":false,\"id\":\"dir-docs\",\"name\":\"docs\",\"parent_id\":null}"
                         .to_string()
@@ -2027,7 +2020,6 @@ mod tests {
                     entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single("dir-docs")),
                     schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                     file_id: None,
-                    plugin_key: None,
                     snapshot_content: Some(
                         "{\"hidden\":false,\"id\":\"dir-docs\",\"name\":\"docs\",\"parent_id\":null}"
                             .to_string()

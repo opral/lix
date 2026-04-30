@@ -229,14 +229,14 @@ simulation_test2!(
             "01920000-0000-7000-8000-000000000002",
         );
         let write_result = second_session
-            .execute(
-                "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version, global, untracked\
-                 ) VALUES (\
-                 'det-write', 'lix_key_value', NULL, NULL, lix_json('{\"key\":\"det-write\",\"value\":\"ok\"}'), '1', false, false\
-                 )",
-                &[],
-            )
+			.execute(
+				"INSERT INTO lix_state (\
+				 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+				 ) VALUES (\
+				 'det-write', 'lix_key_value', NULL, lix_json('{\"key\":\"det-write\",\"value\":\"ok\"}'), '1', false, false\
+				 )",
+				&[],
+			)
             .await
             .expect("deterministic write should succeed");
         assert_eq!(write_result, ExecuteResult::AffectedRows(1));

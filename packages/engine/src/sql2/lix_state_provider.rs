@@ -826,7 +826,6 @@ fn lix_state_write_rows_from_batch(
                 ),
                 schema_key: required_string_value(batch, row_index, "schema_key")?,
                 file_id: optional_string_value(batch, row_index, "file_id")?,
-                plugin_key: optional_string_value(batch, row_index, "plugin_key")?,
                 snapshot_content: optional_string_value(batch, row_index, "snapshot_content")?,
                 metadata: optional_string_value(batch, row_index, "metadata")?,
                 schema_version: required_string_value(batch, row_index, "schema_version")?,
@@ -1029,7 +1028,6 @@ fn lix_state_schema() -> SchemaRef {
         Field::new("entity_id", DataType::Utf8, false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
-        Field::new("plugin_key", DataType::Utf8, true),
         Field::new("snapshot_content", DataType::Utf8, true),
         Field::new("metadata", DataType::Utf8, true),
         Field::new("schema_version", DataType::Utf8, true),
@@ -1047,7 +1045,6 @@ fn lix_state_by_version_schema() -> SchemaRef {
         Field::new("entity_id", DataType::Utf8, false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
-        Field::new("plugin_key", DataType::Utf8, true),
         Field::new("snapshot_content", DataType::Utf8, true),
         Field::new("metadata", DataType::Utf8, true),
         Field::new("schema_version", DataType::Utf8, true),
@@ -1067,7 +1064,6 @@ struct LixStateByVersionRoute {
     version_ids: Option<BTreeSet<String>>,
     entity_ids: Option<BTreeSet<String>>,
     file_id: Option<NullableKeyFilter<String>>,
-    plugin_key: Option<NullableKeyFilter<String>>,
     contradictory: bool,
 }
 
@@ -1108,13 +1104,6 @@ impl LixStateByVersionRoute {
                             &mut route.contradictory,
                         );
                     }
-                    LixStateFilterPredicate::PluginKey(filter) => {
-                        merge_nullable_key_route_slot(
-                            &mut route.plugin_key,
-                            filter,
-                            &mut route.contradictory,
-                        );
-                    }
                 }
             }
         }
@@ -1128,7 +1117,6 @@ enum LixStateFilterPredicate {
     VersionIds(BTreeSet<String>),
     EntityIds(BTreeSet<String>),
     FileId(NullableKeyFilter<String>),
-    PluginKey(NullableKeyFilter<String>),
 }
 
 fn lix_state_scan_request(
@@ -1170,9 +1158,6 @@ fn lix_state_scan_request(
     };
     if let Some(file_id) = route.file_id.clone() {
         filter.file_ids.push(file_id);
-    }
-    if let Some(plugin_key) = route.plugin_key.clone() {
-        filter.plugin_keys.push(plugin_key);
     }
 
     LiveStateScanRequest {
@@ -1290,7 +1275,6 @@ fn parse_lix_state_null_filter(expr: &Expr) -> Option<LixStateFilterPredicate> {
 
     match column.name.as_str() {
         "file_id" => Some(LixStateFilterPredicate::FileId(NullableKeyFilter::Null)),
-        "plugin_key" => Some(LixStateFilterPredicate::PluginKey(NullableKeyFilter::Null)),
         _ => None,
     }
 }
@@ -1311,7 +1295,6 @@ fn parse_lix_state_column_literal_filter(
         "entity_id" => string_expr_literal(literal_expr)
             .map(|value| LixStateFilterPredicate::EntityIds(BTreeSet::from([value]))),
         "file_id" => nullable_key_literal(literal_expr).map(LixStateFilterPredicate::FileId),
-        "plugin_key" => nullable_key_literal(literal_expr).map(LixStateFilterPredicate::PluginKey),
         _ => None,
     }
 }
@@ -1365,7 +1348,6 @@ fn lix_state_record_batch(
                 )) as ArrayRef,
                 "schema_key" => string_array(rows.iter().map(|row| Some(row.schema_key.as_str()))),
                 "file_id" => string_array(rows.iter().map(|row| row.file_id.as_deref())),
-                "plugin_key" => string_array(rows.iter().map(|row| row.plugin_key.as_deref())),
                 "snapshot_content" => {
                     string_array(rows.iter().map(|row| row.snapshot_content.as_deref()))
                 }
@@ -1692,7 +1674,6 @@ mod tests {
             entity_id: EntityIdentity::from_string(entity_id).expect("entity id should decode"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
             metadata: metadata.map(ToOwned::to_owned),
             schema_version: "1".to_string(),
@@ -2040,7 +2021,6 @@ mod tests {
                 )),
                 schema_key: "lix_key_value".to_string(),
                 file_id: None,
-                plugin_key: Some("plugin-a".to_string()),
                 snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
                 metadata: Some("{\"source\":\"test\"}".to_string()),
                 schema_version: "1".to_string(),
@@ -2092,7 +2072,6 @@ mod tests {
                     )),
                     schema_key: "lix_key_value".to_string(),
                     file_id: None,
-                    plugin_key: Some("plugin-a".to_string()),
                     snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
                     metadata: Some("{\"source\":\"test\"}".to_string()),
                     schema_version: "1".to_string(),
@@ -2204,7 +2183,6 @@ mod tests {
                     )),
                     schema_key: "lix_key_value".to_string(),
                     file_id: None,
-                    plugin_key: None,
                     snapshot_content: Some("{\"key\":\"hello\",\"value\":\"updated\"}".to_string()),
                     metadata: Some("lix_key_value".to_string()),
                     schema_version: "1".to_string(),
@@ -2265,7 +2243,6 @@ mod tests {
                         )),
                         schema_key: "lix_key_value".to_string(),
                         file_id: None,
-                        plugin_key: None,
                         snapshot_content: None,
                         metadata: Some("{\"source\":\"one\"}".to_string()),
                         schema_version: "1".to_string(),
@@ -2283,7 +2260,6 @@ mod tests {
                         )),
                         schema_key: "lix_key_value".to_string(),
                         file_id: None,
-                        plugin_key: None,
                         snapshot_content: None,
                         metadata: Some("{\"source\":\"two\"}".to_string()),
                         schema_version: "1".to_string(),

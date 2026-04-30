@@ -143,8 +143,7 @@ fn row_is_live(row: &TrackedStateRow) -> bool {
 }
 
 fn tracked_row_payload_eq(left: &TrackedStateRow, right: &TrackedStateRow) -> bool {
-    left.plugin_key == right.plugin_key
-        && left.snapshot_content == right.snapshot_content
+    left.snapshot_content == right.snapshot_content
         && left.metadata == right.metadata
         && left.schema_version == right.schema_version
 }
@@ -431,7 +430,6 @@ mod tests {
             entity_id: EntityIdentity::single(entity_id),
             schema_key: "test_schema".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
             metadata: None,
             schema_version: "1".to_string(),

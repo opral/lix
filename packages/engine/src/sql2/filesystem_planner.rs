@@ -51,7 +51,6 @@ pub(crate) struct FilesystemRowContext {
     pub(crate) global: bool,
     pub(crate) untracked: bool,
     pub(crate) file_id: Option<String>,
-    pub(crate) plugin_key: Option<String>,
     pub(crate) metadata: Option<String>,
 }
 
@@ -62,7 +61,6 @@ impl FilesystemRowContext {
             global: false,
             untracked: false,
             file_id: None,
-            plugin_key: None,
             metadata: None,
         }
     }
@@ -335,7 +333,6 @@ pub(crate) fn plan_file_path_write(
             data: data.clone(),
             context: FilesystemRowContext {
                 file_id: None,
-                plugin_key: None,
                 metadata: None,
                 ..input.context.clone()
             },
@@ -418,7 +415,6 @@ pub(crate) fn plan_file_delete(input: FileDeleteInput) -> FilesystemDeletePlan {
             BLOB_REF_SCHEMA_VERSION.to_string(),
             FilesystemRowContext {
                 file_id: Some(input.file_id),
-                plugin_key: None,
                 metadata: None,
                 ..input.context
             },
@@ -546,7 +542,6 @@ fn state_row(
         ),
         schema_key: schema_key.to_string(),
         file_id: context.file_id,
-        plugin_key: context.plugin_key,
         snapshot_content,
         metadata: context.metadata,
         schema_version,
@@ -1221,7 +1216,6 @@ mod tests {
             entity_id: EntityIdentity::from_string(entity_id).expect("entity id should decode"),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             schema_version: "1".to_string(),

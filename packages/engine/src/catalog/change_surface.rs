@@ -17,7 +17,6 @@ pub enum ChangeSurfaceColumn {
     SchemaKey,
     SchemaVersion,
     FileId,
-    PluginKey,
     Metadata,
     CreatedAt,
     Untracked,
@@ -36,7 +35,6 @@ pub struct ChangeSurfaceRow {
     pub schema_key: String,
     pub schema_version: String,
     pub file_id: Option<String>,
-    pub plugin_key: Option<String>,
     pub metadata: Option<String>,
     pub created_at: String,
     pub untracked: bool,
@@ -210,7 +208,6 @@ struct ChangeSurfaceRoute {
     entity_id: Option<String>,
     schema_key: Option<String>,
     file_id: Option<String>,
-    plugin_key: Option<String>,
     untracked: Option<bool>,
     contradictory: bool,
 }
@@ -239,13 +236,6 @@ impl ChangeSurfaceRoute {
                 }
                 ChangeSurfaceFilter::Eq(ChangeSurfaceColumn::FileId, Value::Text(value)) => {
                     assign_route_slot(&mut route.file_id, value.clone(), &mut route.contradictory);
-                }
-                ChangeSurfaceFilter::Eq(ChangeSurfaceColumn::PluginKey, Value::Text(value)) => {
-                    assign_route_slot(
-                        &mut route.plugin_key,
-                        value.clone(),
-                        &mut route.contradictory,
-                    );
                 }
                 ChangeSurfaceFilter::Eq(ChangeSurfaceColumn::Untracked, Value::Boolean(value)) => {
                     assign_route_slot(&mut route.untracked, *value, &mut route.contradictory);
@@ -305,12 +295,6 @@ fn build_change_surface_scan_sql(route: &ChangeSurfaceRoute, limit: Option<usize
     if let Some(file_id) = &route.file_id {
         predicates.push(format!("ch.file_id = '{}'", escape_sql_string(file_id)));
     }
-    if let Some(plugin_key) = &route.plugin_key {
-        predicates.push(format!(
-            "ch.plugin_key = '{}'",
-            escape_sql_string(plugin_key)
-        ));
-    }
     if let Some(untracked) = route.untracked {
         predicates.push(format!(
             "EXISTS (SELECT 1 FROM lix_internal_untracked_change_visibility uv WHERE uv.change_id = ch.id) = {}",
@@ -333,7 +317,6 @@ fn build_change_surface_scan_sql(route: &ChangeSurfaceRoute, limit: Option<usize
             ch.schema_key, \
             ch.schema_version, \
             ch.file_id, \
-            ch.plugin_key, \
             ch.metadata, \
             ch.created_at, \
             EXISTS ( \
@@ -387,12 +370,6 @@ fn change_surface_column_value(
         ChangeSurfaceColumn::FileId => {
             Some(row.file_id.clone().map(Value::Text).unwrap_or(Value::Null))
         }
-        ChangeSurfaceColumn::PluginKey => Some(
-            row.plugin_key
-                .clone()
-                .map(Value::Text)
-                .unwrap_or(Value::Null),
-        ),
         ChangeSurfaceColumn::Metadata => {
             Some(row.metadata.clone().map(Value::Text).unwrap_or(Value::Null))
         }
@@ -414,11 +391,10 @@ fn change_surface_row_from_values(row: &[Value]) -> Result<ChangeSurfaceRow, Lix
         schema_key: required_text_value(row, 2, "schema_key")?,
         schema_version: required_text_value(row, 3, "schema_version")?,
         file_id: optional_text_value(row.get(4)),
-        plugin_key: optional_text_value(row.get(5)),
-        metadata: optional_text_value(row.get(6)),
-        created_at: required_text_value(row, 7, "created_at")?,
-        untracked: row.get(8).and_then(value_as_bool).unwrap_or(false),
-        snapshot_content: optional_text_value(row.get(9)),
+        metadata: optional_text_value(row.get(5)),
+        created_at: required_text_value(row, 6, "created_at")?,
+        untracked: row.get(7).and_then(value_as_bool).unwrap_or(false),
+        snapshot_content: optional_text_value(row.get(8)),
     })
 }
 

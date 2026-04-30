@@ -341,7 +341,6 @@ fn tracked_scan_request_from_live(request: &LiveStateScanRequest) -> TrackedStat
             schema_keys: request.filter.schema_keys.clone(),
             entity_ids: request.filter.entity_ids.clone(),
             file_ids: request.filter.file_ids.clone(),
-            plugin_keys: request.filter.plugin_keys.clone(),
             // Scan tombstones internally so version-local tombstones can hide
             // global fallback rows before the serving facade filters them.
             include_tombstones: true,
@@ -476,7 +475,6 @@ fn live_state_row_from_commit(commit: CommitGraphCommit) -> LiveStateRow {
         entity_id: change.entity_id,
         schema_key: change.schema_key,
         file_id: change.file_id,
-        plugin_key: change.plugin_key,
         snapshot_content: change.snapshot_content,
         metadata: change.metadata,
         schema_version: change.schema_version,
@@ -513,7 +511,6 @@ fn project_tracked_row(
         entity_id: row.entity_id,
         schema_key: row.schema_key,
         file_id: row.file_id,
-        plugin_key: row.plugin_key,
         snapshot_content: row.snapshot_content,
         metadata: row.metadata,
         schema_version: row.schema_version,
@@ -539,14 +536,6 @@ fn live_state_row_matches_filter(row: &LiveStateRow, filter: &LiveStateFilter) -
             .file_ids
             .iter()
             .any(|filter| nullable_filter_matches(filter, &row.file_id))
-    {
-        return false;
-    }
-    if !filter.plugin_keys.is_empty()
-        && !filter
-            .plugin_keys
-            .iter()
-            .any(|filter| nullable_filter_matches(filter, &row.plugin_key))
     {
         return false;
     }
@@ -1818,7 +1807,6 @@ mod tests {
             entity_id: identity("selected-tab"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
             metadata: None,
             schema_version: "1".to_string(),
@@ -1856,7 +1844,6 @@ mod tests {
             entity_id: identity("selected-tab"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
             metadata: None,
             schema_version: "1".to_string(),
@@ -1872,7 +1859,6 @@ mod tests {
             entity_id: identity(version_id),
             schema_key: "lix_version_ref".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(
                 serde_json::to_string(&json!({
                     "id": version_id,
@@ -1935,7 +1921,6 @@ mod tests {
             entity_id: identity(commit_id),
             schema_key: COMMIT_SCHEMA_KEY.to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(
                 serde_json::to_string(&snapshot).expect("commit snapshot should serialize"),
             ),
@@ -1965,7 +1950,6 @@ mod tests {
                 schema_key: COMMIT_SCHEMA_KEY.to_string(),
                 schema_version: "1".to_string(),
                 file_id: None,
-                plugin_key: None,
                 snapshot_content: Some(
                     serde_json::to_string(&json!({
                         "id": commit_id,

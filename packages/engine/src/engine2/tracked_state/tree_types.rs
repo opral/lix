@@ -62,7 +62,6 @@ impl TrackedStateKey {
 /// selected by the version ref.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateValue {
-    pub(crate) plugin_key: Option<String>,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
     pub(crate) schema_version: String,
@@ -75,7 +74,6 @@ pub(crate) struct TrackedStateValue {
 impl TrackedStateValue {
     pub(crate) fn from_row(row: &TrackedStateRow) -> Self {
         Self {
-            plugin_key: row.plugin_key.clone(),
             snapshot_content: row.snapshot_content.clone(),
             metadata: row.metadata.clone(),
             schema_version: row.schema_version.clone(),
@@ -91,7 +89,6 @@ impl TrackedStateValue {
             entity_id: key.entity_id,
             schema_key: key.schema_key,
             file_id: key.file_id,
-            plugin_key: self.plugin_key,
             snapshot_content: self.snapshot_content,
             metadata: self.metadata,
             schema_version: self.schema_version,

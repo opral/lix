@@ -780,7 +780,6 @@ mod tests {
 
     fn value(change_id: &str, snapshot_content: Option<&str>) -> TrackedStateValue {
         TrackedStateValue {
-            plugin_key: None,
             snapshot_content: snapshot_content.map(str::to_string),
             metadata: None,
             schema_version: "1".to_string(),

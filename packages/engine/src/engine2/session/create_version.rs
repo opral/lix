@@ -92,7 +92,6 @@ fn version_descriptor_stage_row(version_id: &str, name: &str) -> Result<StageRow
         )),
         schema_key: VERSION_DESCRIPTOR_SCHEMA_KEY.to_string(),
         file_id: None,
-        plugin_key: None,
         snapshot_content: Some(encode_snapshot(json!({
             "id": version_id,
             "name": name,
@@ -117,7 +116,6 @@ fn version_ref_stage_row(version_id: &str, commit_id: &str) -> Result<StageRow, 
         )),
         schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
         file_id: None,
-        plugin_key: None,
         snapshot_content: Some(encode_snapshot(json!({
             "id": version_id,
             "commit_id": commit_id,
