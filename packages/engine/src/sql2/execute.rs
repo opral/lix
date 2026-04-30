@@ -23,7 +23,7 @@ use super::file_history_provider::register_lix_file_history_provider;
 use super::file_provider::register_lix_file_providers;
 use super::history_provider::register_history_providers;
 use super::lix_state_provider::register_lix_state_providers;
-use super::udf::register_sql2_functions;
+use super::udfs::register_sql2_functions;
 use super::version_provider::register_lix_version_provider;
 
 /// Single execution boundary for `sql2::execute_sql(...)`.

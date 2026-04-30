@@ -18,7 +18,7 @@ use self::sql_fragments::{
     filesystem_file_history_path_sql, filesystem_file_history_view_sql, filesystem_file_path_sql,
     filesystem_file_view_sql, filesystem_winner_relation_name,
 };
-use super::udf::{
+use super::udfs::{
     lix_json_extract_text_expr, register_sql2_functions, system_sql2_function_provider,
 };
 use crate::catalog::{SurfaceFamily, SurfaceRegistry, SurfaceVariant};

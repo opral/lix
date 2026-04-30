@@ -15,7 +15,7 @@ mod filesystem_visibility;
 mod history_provider;
 mod history_route;
 mod lix_state_provider;
-mod udf;
+mod udfs;
 mod version_provider;
 mod version_scope;
 
