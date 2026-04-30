@@ -1,3 +1,4 @@
+use crate::engine2::entity_identity::EntityIdentity;
 use crate::engine2::tracked_state::TrackedStateRow;
 use crate::{LixError, NullableKeyFilter};
 
@@ -41,7 +42,7 @@ impl TrackedStateRootId {
 pub(crate) struct TrackedStateKey {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) entity_id: String,
+    pub(crate) entity_id: EntityIdentity,
 }
 
 impl TrackedStateKey {
@@ -125,7 +126,7 @@ impl TrackedStateMutation {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TrackedStateTreeScanRequest {
     pub(crate) schema_keys: Vec<String>,
-    pub(crate) entity_ids: Vec<String>,
+    pub(crate) entity_ids: Vec<EntityIdentity>,
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
     pub(crate) include_tombstones: bool,
     pub(crate) limit: Option<usize>,

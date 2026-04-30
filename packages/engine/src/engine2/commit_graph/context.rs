@@ -8,6 +8,7 @@ use crate::engine2::commit_graph::{
     CommitGraphChangeSetElement, CommitGraphCommit, CommitGraphEdge, CommitGraphEntity,
     CommitGraphReader, ReachableCommitGraphCommit,
 };
+use crate::engine2::entity_identity::EntityIdentity;
 use crate::LixError;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
@@ -407,7 +408,7 @@ struct EntityAccumulator {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct CanonicalEntityIdentity {
-    entity_id: String,
+    entity_id: EntityIdentity,
     schema_key: String,
     file_id: Option<String>,
 }
@@ -432,14 +433,19 @@ where
     let changes = changelog
         .scan_changes(&crate::engine2::changelog::ChangelogScanRequest { limit: None })
         .await?;
-    Ok(changes
-        .into_iter()
-        .find(|change| change.schema_key == COMMIT_SCHEMA_KEY && change.entity_id == commit_id))
+    Ok(changes.into_iter().find(|change| {
+        change.schema_key == COMMIT_SCHEMA_KEY
+            && change
+                .entity_id
+                .as_string()
+                .is_ok_and(|entity_id| entity_id == commit_id)
+    }))
 }
 
 fn parse_commit_change(
     change: crate::engine2::changelog::CanonicalChange,
 ) -> Result<CommitGraphCommit, LixError> {
+    let change_entity_id = change.entity_id.as_string()?;
     if change.schema_key != COMMIT_SCHEMA_KEY {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -455,7 +461,7 @@ fn parse_commit_change(
             "LIX_ERROR_UNKNOWN",
             format!(
                 "commit_graph commit '{}' is missing snapshot_content",
-                change.entity_id
+                change_entity_id
             ),
         )
     })?;
@@ -465,26 +471,26 @@ fn parse_commit_change(
                 "LIX_ERROR_UNKNOWN",
                 format!(
                     "commit_graph commit '{}' snapshot_content is invalid JSON: {error}",
-                    change.entity_id
+                    change_entity_id
                 ),
             )
         })?;
 
-    let commit_id = required_string(&snapshot, "id", &change.entity_id)?;
-    if commit_id != change.entity_id {
+    let commit_id = required_string(&snapshot, "id", &change_entity_id)?;
+    if commit_id != change_entity_id {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
                 "commit_graph commit change entity_id '{}' does not match snapshot id '{}'",
-                change.entity_id, commit_id
+                change_entity_id, commit_id
             ),
         ));
     }
 
-    let change_ids = required_string_array(&snapshot, "change_ids", &change.entity_id)?;
+    let change_ids = required_string_array(&snapshot, "change_ids", &change_entity_id)?;
     let parent_commit_ids =
-        required_string_array(&snapshot, "parent_commit_ids", &change.entity_id)?;
-    let change_set_id = required_string(&snapshot, "change_set_id", &change.entity_id)?;
+        required_string_array(&snapshot, "parent_commit_ids", &change_entity_id)?;
+    let change_set_id = required_string(&snapshot, "change_set_id", &change_entity_id)?;
 
     Ok(CommitGraphCommit {
         change,
@@ -607,7 +613,7 @@ mod tests {
             &changelog,
             &[CanonicalChange {
                 id: "commit-1-change".to_string(),
-                entity_id: "commit-1".to_string(),
+                entity_id: crate::engine2::entity_identity::EntityIdentity::single("commit-1"),
                 schema_key: super::COMMIT_SCHEMA_KEY.to_string(),
                 schema_version: "1".to_string(),
                 file_id: None,
@@ -771,7 +777,14 @@ mod tests {
         assert_eq!(elements.len(), 1);
         assert_eq!(elements[0].change_set_id, "change-set-1");
         assert_eq!(elements[0].change.id, "change-1");
-        assert_eq!(elements[0].change.entity_id, "entity-1");
+        assert_eq!(
+            elements[0]
+                .change
+                .entity_id
+                .as_string()
+                .expect("entity id should project"),
+            "entity-1"
+        );
     }
 
     #[tokio::test]
@@ -868,7 +881,7 @@ mod tests {
             .change_history_from_commit(
                 "commit-head",
                 &CommitGraphChangeHistoryRequest {
-                    entity_ids: vec!["entity-1".to_string()],
+                    entity_ids: vec![crate::engine2::entity_identity::EntityIdentity::single("entity-1")],
                     file_ids: vec!["file-a".to_string()],
                     min_depth: Some(1),
                     max_depth: Some(1),
@@ -1362,7 +1375,7 @@ mod tests {
     ) -> CanonicalChange {
         CanonicalChange {
             id: change_id.to_string(),
-            entity_id: commit_id.to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::single(commit_id),
             schema_key: super::COMMIT_SCHEMA_KEY.to_string(),
             schema_version: "1".to_string(),
             file_id: None,
@@ -1419,7 +1432,7 @@ mod tests {
     ) -> CanonicalChange {
         CanonicalChange {
             id: change_id.to_string(),
-            entity_id: entity_id.to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::single(entity_id),
             schema_key: schema_key.to_string(),
             schema_version: "1".to_string(),
             file_id: None,
@@ -1440,7 +1453,7 @@ mod tests {
     ) -> CanonicalChange {
         CanonicalChange {
             id: change_id.to_string(),
-            entity_id: entity_id.to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::single(entity_id),
             schema_key: schema_key.to_string(),
             schema_version: "1".to_string(),
             file_id: file_id.map(str::to_string),
@@ -1454,7 +1467,7 @@ mod tests {
     fn entity_tombstone(change_id: &str, entity_id: &str, schema_key: &str) -> CanonicalChange {
         CanonicalChange {
             id: change_id.to_string(),
-            entity_id: entity_id.to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::single(entity_id),
             schema_key: schema_key.to_string(),
             schema_version: "1".to_string(),
             file_id: None,

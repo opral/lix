@@ -256,9 +256,18 @@ fn change_record_batch(
         .iter()
         .map(|column| match column {
             ChangeColumn::Id => string_array(changes.iter().map(|row| Some(row.id.as_str()))),
-            ChangeColumn::EntityId => {
-                string_array(changes.iter().map(|row| Some(row.entity_id.as_str())))
-            }
+            ChangeColumn::EntityId => Arc::new(StringArray::from(
+                changes
+                    .iter()
+                    .map(|row| {
+                        Some(
+                            row.entity_id
+                                .as_string()
+                                .expect("canonical change entity identity should project"),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
             ChangeColumn::SchemaKey => {
                 string_array(changes.iter().map(|row| Some(row.schema_key.as_str())))
             }

@@ -355,7 +355,8 @@ mod tests {
         snapshot_content: &str,
     ) -> LiveStateRow {
         LiveStateRow {
-            entity_id: entity_id.to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::from_string(entity_id)
+                .expect("entity id should decode"),
             schema_key: schema_key.to_string(),
             file_id,
             plugin_key: None,

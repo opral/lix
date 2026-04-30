@@ -2,6 +2,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use crate::engine2::changelog::{CanonicalChange, ChangelogContext};
+use crate::engine2::entity_identity::EntityIdentity;
 use crate::engine2::functions::{
     FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
 };
@@ -54,7 +55,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 
     let global_version_descriptor_change = canonical_change(
         GLOBAL_VERSION_ID.to_string(),
-        GLOBAL_VERSION_ID.to_string(),
+        EntityIdentity::single(GLOBAL_VERSION_ID),
         VERSION_DESCRIPTOR_SCHEMA_KEY,
         VERSION_DESCRIPTOR_SCHEMA_VERSION,
         version_descriptor_snapshot(GLOBAL_VERSION_ID, "global", true)?,
@@ -62,7 +63,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     );
     let main_version_descriptor_change = canonical_change(
         functions.call_uuid_v7(),
-        main_version_id.clone(),
+        EntityIdentity::single(&main_version_id),
         VERSION_DESCRIPTOR_SCHEMA_KEY,
         VERSION_DESCRIPTOR_SCHEMA_VERSION,
         version_descriptor_snapshot(&main_version_id, "main", false)?,
@@ -70,7 +71,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     );
     let kv_lix_id_change = canonical_change(
         functions.call_uuid_v7(),
-        LIX_ID_KEY.to_string(),
+        EntityIdentity::single(LIX_ID_KEY),
         KEY_VALUE_SCHEMA_KEY,
         KEY_VALUE_SCHEMA_VERSION,
         key_value_snapshot(LIX_ID_KEY, &lix_id)?,
@@ -79,7 +80,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 
     let initial_commit_change = canonical_change(
         functions.call_uuid_v7(),
-        initial_commit_id.clone(),
+        EntityIdentity::single(&initial_commit_id),
         COMMIT_SCHEMA_KEY,
         COMMIT_SCHEMA_VERSION,
         commit_snapshot(
@@ -94,21 +95,21 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         &timestamp,
     );
     let global_version_ref_row = untracked_row(
-        GLOBAL_VERSION_ID.to_string(),
+        EntityIdentity::single(GLOBAL_VERSION_ID),
         VERSION_REF_SCHEMA_KEY,
         VERSION_REF_SCHEMA_VERSION,
         version_ref_snapshot(GLOBAL_VERSION_ID, &initial_commit_id)?,
         &timestamp,
     );
     let main_version_ref_row = untracked_row(
-        main_version_id.clone(),
+        EntityIdentity::single(&main_version_id),
         VERSION_REF_SCHEMA_KEY,
         VERSION_REF_SCHEMA_VERSION,
         version_ref_snapshot(&main_version_id, &initial_commit_id)?,
         &timestamp,
     );
     let workspace_version_row = untracked_row(
-        WORKSPACE_VERSION_KEY.to_string(),
+        EntityIdentity::single(WORKSPACE_VERSION_KEY),
         KEY_VALUE_SCHEMA_KEY,
         KEY_VALUE_SCHEMA_VERSION,
         key_value_snapshot(WORKSPACE_VERSION_KEY, &main_version_id)?,
@@ -201,7 +202,7 @@ fn live_state_row_from_initial_change(
 }
 
 fn untracked_row(
-    entity_id: String,
+    entity_id: EntityIdentity,
     schema_key: &str,
     schema_version: &str,
     snapshot_content: String,
@@ -224,7 +225,7 @@ fn untracked_row(
 
 fn canonical_change(
     id: String,
-    entity_id: String,
+    entity_id: EntityIdentity,
     schema_key: &str,
     schema_version: &str,
     snapshot_content: String,
@@ -364,7 +365,11 @@ mod tests {
             .untracked_rows
             .iter()
             .find(|row| {
-                row.schema_key == KEY_VALUE_SCHEMA_KEY && row.entity_id == WORKSPACE_VERSION_KEY
+                row.schema_key == KEY_VALUE_SCHEMA_KEY
+                    && row.entity_id
+                        == crate::engine2::entity_identity::EntityIdentity::single(
+                            WORKSPACE_VERSION_KEY,
+                        )
             })
             .expect("workspace version row should exist");
 

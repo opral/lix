@@ -29,7 +29,7 @@ pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError
 
     let validator = lix_schema_validator()?;
     if let Err(errors) = validator.validate(schema) {
-        let details = format_validation_errors(errors);
+        let details = format_lix_schema_validation_errors(errors);
         return Err(LixError {
             code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
             description: format!("Invalid Lix schema definition: {details}"),
@@ -133,9 +133,9 @@ fn detect_missing_pointer_slash(schema: &JsonValue) -> Option<LixError> {
 pub fn validate_lix_schema(schema: &JsonValue, data: &JsonValue) -> Result<(), LixError> {
     validate_lix_schema_definition(schema)?;
 
-    let validator = compile_schema(schema)?;
+    let validator = compile_lix_schema(schema)?;
     if let Err(errors) = validator.validate(data) {
-        let details = format_validation_errors(errors);
+        let details = format_lix_schema_validation_errors(errors);
         return Err(LixError {
             code: LixError::CODE_SCHEMA_VALIDATION.to_string(),
             description: format!("Data validation failed: {details}"),
@@ -147,7 +147,7 @@ pub fn validate_lix_schema(schema: &JsonValue, data: &JsonValue) -> Result<(), L
 }
 
 fn lix_schema_validator() -> Result<&'static JSONSchema, LixError> {
-    let result = LIX_SCHEMA_VALIDATOR.get_or_init(|| compile_schema(lix_schema_definition()));
+    let result = LIX_SCHEMA_VALIDATOR.get_or_init(|| compile_lix_schema(lix_schema_definition()));
     match result {
         Ok(schema) => Ok(schema),
         Err(err) => Err(LixError {
@@ -158,7 +158,7 @@ fn lix_schema_validator() -> Result<&'static JSONSchema, LixError> {
     }
 }
 
-fn compile_schema(schema: &JsonValue) -> Result<JSONSchema, LixError> {
+pub(crate) fn compile_lix_schema(schema: &JsonValue) -> Result<JSONSchema, LixError> {
     let mut options = JSONSchema::options();
     options.with_meta_schemas();
     if schema_uses_draft_2020_12_without_fragment(schema) {
@@ -388,7 +388,7 @@ fn schema_has_property(schema: &JsonValue, segments: &[String]) -> bool {
     true
 }
 
-fn format_validation_errors<'a>(
+pub(crate) fn format_lix_schema_validation_errors<'a>(
     errors: impl Iterator<Item = jsonschema::ValidationError<'a>>,
 ) -> String {
     let mut parts = Vec::new();
@@ -556,7 +556,7 @@ mod pointer_slash_detection_tests {
             }
         });
 
-        let validator = compile_schema(&schema).expect("2020-12 schema should compile");
+        let validator = compile_lix_schema(&schema).expect("2020-12 schema should compile");
 
         assert!(validator.is_valid(&json!({ "pointer": "/id" })));
         assert!(!validator.is_valid(&json!({ "pointer": "id" })));

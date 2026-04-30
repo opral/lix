@@ -104,7 +104,8 @@ fn diff_by_identity(
                 "LIX_ERROR_UNKNOWN",
                 format!(
                     "tracked-state merge received duplicate diff entry for schema '{}' entity '{}'",
-                    entry.identity.schema_key, entry.identity.entity_id
+                    entry.identity.schema_key,
+                    entry.identity.entity_id.as_string()?
                 ),
             ));
         }
@@ -118,7 +119,8 @@ fn source_row_for_patch(entry: &TrackedStateDiffEntry) -> Result<TrackedStateRow
             "LIX_ERROR_UNKNOWN",
             format!(
                 "tracked-state merge cannot apply source removal for schema '{}' entity '{}' without a tombstone row",
-                entry.identity.schema_key, entry.identity.entity_id
+                entry.identity.schema_key,
+                entry.identity.entity_id.as_string()?
             ),
         ));
     };
@@ -150,6 +152,7 @@ fn tracked_row_payload_eq(left: &TrackedStateRow, right: &TrackedStateRow) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine2::entity_identity::EntityIdentity;
     use crate::engine2::tracked_state::TrackedStateDiffKind;
 
     #[test]
@@ -390,7 +393,7 @@ mod tests {
         TrackedStateDiffEntry {
             identity: TrackedStateDiffIdentity {
                 schema_key: "test_schema".to_string(),
-                entity_id: entity_id.to_string(),
+                entity_id: EntityIdentity::single(entity_id),
                 file_id: None,
             },
             kind,
@@ -399,17 +402,17 @@ mod tests {
         }
     }
 
-    fn patch_ids(plan: &TrackedStateMergePlan) -> Vec<&str> {
+    fn patch_ids(plan: &TrackedStateMergePlan) -> Vec<String> {
         plan.patches
             .iter()
-            .map(|entry| entry.identity.entity_id.as_str())
+            .map(|entry| entry.identity.entity_id.as_string().expect("identity"))
             .collect()
     }
 
-    fn conflict_ids(plan: &TrackedStateMergePlan) -> Vec<&str> {
+    fn conflict_ids(plan: &TrackedStateMergePlan) -> Vec<String> {
         plan.conflicts
             .iter()
-            .map(|entry| entry.identity.entity_id.as_str())
+            .map(|entry| entry.identity.entity_id.as_string().expect("identity"))
             .collect()
     }
 
@@ -425,7 +428,7 @@ mod tests {
 
     fn row_with_value(entity_id: &str, change_id: &str, value: &str) -> TrackedStateRow {
         TrackedStateRow {
-            entity_id: entity_id.to_string(),
+            entity_id: EntityIdentity::single(entity_id),
             schema_key: "test_schema".to_string(),
             file_id: None,
             plugin_key: None,

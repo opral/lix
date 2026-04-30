@@ -62,51 +62,13 @@ impl Engine2Simulation {
         .await
     }
 
-    /// Opens a session on the initialized main version.
-    pub async fn open_main_session(&self, engine: &Engine) -> Result<SimSession, LixError> {
-        let session = engine
-            .open_session(self.receipt.main_version_id.clone())
-            .await?;
-        Ok(SimSession {
+    /// Wraps a normal engine session with simulation hooks.
+    pub fn wrap_session(&self, session: SessionContext, engine: &Engine) -> SimSession {
+        SimSession {
             sim: self.clone(),
             engine: engine.clone(),
             session,
-        })
-    }
-
-    /// Opens a session that follows the shared workspace version selector.
-    pub async fn open_workspace_session(&self, engine: &Engine) -> Result<SimSession, LixError> {
-        let session = engine.open_workspace_session().await?;
-        Ok(SimSession {
-            sim: self.clone(),
-            engine: engine.clone(),
-            session,
-        })
-    }
-
-    /// Opens a session on an arbitrary version id.
-    pub async fn open_session(
-        &self,
-        engine: &Engine,
-        active_version_id: impl Into<String>,
-    ) -> Result<SimSession, LixError> {
-        let active_version_id = active_version_id.into();
-        let session = engine.open_session(active_version_id.clone()).await?;
-        Ok(SimSession {
-            sim: self.clone(),
-            engine: engine.clone(),
-            session,
-        })
-    }
-
-    /// Opens a session on the global version.
-    pub async fn open_global_session(&self, engine: &Engine) -> Result<SimSession, LixError> {
-        let session = engine.open_session("global").await?;
-        Ok(SimSession {
-            sim: self.clone(),
-            engine: engine.clone(),
-            session,
-        })
+        }
     }
 
     /// Returns a fresh, empty backend for lifecycle tests.
@@ -151,6 +113,14 @@ pub struct SimSession {
 }
 
 impl SimSession {
+    pub fn wrap_session(&self, session: SessionContext, engine: &Engine) -> SimSession {
+        SimSession {
+            sim: self.sim.clone(),
+            engine: engine.clone(),
+            session,
+        }
+    }
+
     pub async fn active_version_id(&self) -> Result<String, LixError> {
         self.session.active_version_id().await
     }

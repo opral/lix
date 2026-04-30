@@ -1,4 +1,5 @@
 use crate::engine2::changelog::CanonicalChange;
+use crate::engine2::entity_identity::EntityIdentity;
 use crate::engine2::tracked_state::TrackedStateRow;
 use crate::engine2::untracked_state::{
     UntrackedStateFilter, UntrackedStateRow, UntrackedStateRowRequest,
@@ -11,7 +12,7 @@ use crate::{NullableKeyFilter, Value};
 /// generated fields should be caught before this type is constructed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LiveStateRow {
-    pub(crate) entity_id: String,
+    pub(crate) entity_id: EntityIdentity,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) plugin_key: Option<String>,
@@ -163,7 +164,7 @@ pub(crate) struct LiveStateFilter {
     #[serde(default)]
     pub(crate) schema_keys: Vec<String>,
     #[serde(default)]
-    pub(crate) entity_ids: Vec<String>,
+    pub(crate) entity_ids: Vec<EntityIdentity>,
     #[serde(default)]
     pub(crate) version_ids: Vec<String>,
     #[serde(default)]
@@ -211,7 +212,7 @@ pub(crate) struct LiveStateScanRequest {
 pub(crate) struct LiveStateRowRequest {
     pub(crate) schema_key: String,
     pub(crate) version_id: String,
-    pub(crate) entity_id: String,
+    pub(crate) entity_id: EntityIdentity,
     pub(crate) file_id: NullableKeyFilter<String>,
 }
 
@@ -231,7 +232,7 @@ impl From<&LiveStateRowRequest> for UntrackedStateRowRequest {
 pub(crate) struct LiveStateRowIdentity {
     pub(crate) version_id: String,
     pub(crate) schema_key: String,
-    pub(crate) entity_id: String,
+    pub(crate) entity_id: EntityIdentity,
     pub(crate) file_id: Option<String>,
 }
 

@@ -409,7 +409,11 @@ mod tests {
     impl From<StageRow> for CapturedStageRow {
         fn from(row: StageRow) -> Self {
             Self {
-                entity_id: row.entity_id,
+                entity_id: row
+                    .entity_id
+                    .expect("captured staged row should carry entity_id")
+                    .as_string()
+                    .expect("captured staged row should project entity_id"),
                 schema_key: row.schema_key,
                 schema_version: row.schema_version,
                 version_id: row.version_id,
@@ -640,7 +644,8 @@ mod tests {
 
     fn live_lix_state_row(entity_id: &str, metadata: Option<&str>) -> LiveStateRow {
         LiveStateRow {
-            entity_id: entity_id.to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::from_string(entity_id)
+                .expect("entity id should decode"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             plugin_key: None,
@@ -659,7 +664,8 @@ mod tests {
 
     fn live_entity_row(entity_id: &str, version_id: &str, value: &str) -> LiveStateRow {
         LiveStateRow {
-            entity_id: entity_id.to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::from_string(entity_id)
+                .expect("entity id should decode"),
             schema_key: "test_state_schema".to_string(),
             file_id: None,
             plugin_key: None,
@@ -684,7 +690,8 @@ mod tests {
         hidden: bool,
     ) -> LiveStateRow {
         LiveStateRow {
-            entity_id: entity_id.to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::from_string(entity_id)
+                .expect("entity id should decode"),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id: None,
             plugin_key: None,
@@ -718,7 +725,8 @@ mod tests {
         hidden: bool,
     ) -> LiveStateRow {
         LiveStateRow {
-            entity_id: entity_id.to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::from_string(entity_id)
+                .expect("entity id should decode"),
             schema_key: "lix_file_descriptor".to_string(),
             file_id: None,
             plugin_key: None,

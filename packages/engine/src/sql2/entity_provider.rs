@@ -26,8 +26,8 @@ use datafusion::prelude::SessionContext;
 use futures_util::{stream, StreamExt, TryStreamExt};
 use serde_json::Value as JsonValue;
 
-use crate::common::{derive_entity_id_from_json_paths, EntityIdDerivationError};
 use crate::engine2::commit_graph::CommitGraphReader;
+use crate::engine2::entity_identity::{EntityIdentity, EntityIdentityError};
 use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
@@ -947,16 +947,33 @@ fn entity_lix_state_write_rows_from_batch_with_options(
                     spec.schema_key
                 ))
             })?;
-            let entity_id = match optional_string_value(batch, row_index, "lixcol_entity_id")? {
-                Some(entity_id) => entity_id,
-                None => {
-                    derive_entity_id_from_snapshot(spec, &snapshot)
-                        .map_err(DataFusionError::Execution)?
+            let explicit_entity_id = optional_string_value(batch, row_index, "lixcol_entity_id")?;
+            let entity_id = if spec.primary_key_paths.is_empty() {
+                let entity_id = explicit_entity_id.ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "INSERT into entity surface '{}' requires lixcol_entity_id because the schema has no x-lix-primary-key",
+                        spec.schema_key
+                    ))
+                })?;
+                EntityIdentity::from_string(&entity_id).map_err(|error| {
+                    DataFusionError::Execution(format!(
+                        "INSERT into entity surface '{}' has invalid lixcol_entity_id: {error}",
+                        spec.schema_key
+                    ))
+                })?
+            } else {
+                if reject_read_only_fields && explicit_entity_id.is_some() {
+                    return Err(DataFusionError::Execution(format!(
+                        "INSERT into entity surface '{}' cannot stage opaque projection column 'lixcol_entity_id'; use the schema primary-key columns instead",
+                        spec.schema_key
+                    )));
                 }
+                derive_entity_identity_from_snapshot(spec, &snapshot)
+                    .map_err(DataFusionError::Execution)?
             };
 
             Ok(StageRow {
-                entity_id,
+                entity_id: Some(entity_id),
                 schema_key: spec.schema_key.clone(),
                 file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
                 plugin_key: optional_string_value(batch, row_index, "lixcol_plugin_key")?,
@@ -1011,52 +1028,59 @@ fn entity_snapshot_content_from_batch(
     })
 }
 
-fn derive_entity_id_from_snapshot(
+fn derive_entity_identity_from_snapshot(
     spec: &EntitySurfaceSpec,
     snapshot: &JsonValue,
-) -> std::result::Result<String, String> {
-    if spec.primary_key_paths.is_empty() {
-        return Err(format!(
-            "INSERT into entity surface '{}' requires lixcol_entity_id because the schema has no x-lix-primary-key",
-            spec.schema_key
-        ));
-    }
-
-    derive_entity_id_from_json_paths(snapshot, &spec.primary_key_paths)
-        .map(|entity_id| entity_id.into_inner())
+) -> std::result::Result<EntityIdentity, String> {
+    EntityIdentity::from_primary_key_paths(snapshot, &spec.primary_key_paths)
         .map_err(|error| entity_id_derivation_error_message(spec, error))
 }
 
 fn entity_id_derivation_error_message(
     spec: &EntitySurfaceSpec,
-    error: EntityIdDerivationError,
+    error: EntityIdentityError,
 ) -> String {
     match error {
-        EntityIdDerivationError::EmptyPrimaryKeyPath { index } => format!(
+        EntityIdentityError::EmptyPrimaryKey => format!(
+            "INSERT into entity surface '{}' has empty x-lix-primary-key",
+            spec.schema_key
+        ),
+        EntityIdentityError::EmptyPrimaryKeyPath { index } => format!(
             "INSERT into entity surface '{}' has empty x-lix-primary-key pointer at index {index}",
             spec.schema_key
         ),
-        EntityIdDerivationError::MissingPrimaryKeyValue { index } => {
+        EntityIdentityError::MissingPrimaryKeyValue { index } => {
             let pointer = format_json_pointer(&spec.primary_key_paths[index]);
             format!(
                 "INSERT into entity surface '{}' requires value at primary-key pointer '{pointer}'",
                 spec.schema_key
             )
         }
-        EntityIdDerivationError::NullPrimaryKeyValue { index } => {
+        EntityIdentityError::NullPrimaryKeyValue { index } => {
             let pointer = format_json_pointer(&spec.primary_key_paths[index]);
             format!(
                 "INSERT into entity surface '{}' requires non-null value at primary-key pointer '{pointer}'",
                 spec.schema_key
             )
         }
-        EntityIdDerivationError::EmptyPrimaryKeyValue { index } => {
+        EntityIdentityError::EmptyPrimaryKeyValue { index } => {
             let pointer = format_json_pointer(&spec.primary_key_paths[index]);
             format!(
                 "INSERT into entity surface '{}' requires non-empty value at primary-key pointer '{pointer}'",
                 spec.schema_key
             )
         }
+        EntityIdentityError::UnsupportedPrimaryKeyValue { index } => {
+            let pointer = format_json_pointer(&spec.primary_key_paths[index]);
+            format!(
+                "INSERT into entity surface '{}' requires scalar value at primary-key pointer '{pointer}'",
+                spec.schema_key
+            )
+        }
+        EntityIdentityError::InvalidEncodedEntityIdentity => format!(
+            "INSERT into entity surface '{}' derived invalid entity identity",
+            spec.schema_key
+        ),
     }
 }
 
@@ -1418,7 +1442,16 @@ fn entity_column_array(
 
 fn entity_system_column_array(column_name: &str, rows: &[LiveStateRow]) -> Result<ArrayRef> {
     Ok(match column_name {
-        "entity_id" => string_array(rows.iter().map(|row| Some(row.entity_id.as_str()))),
+        "entity_id" => Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| {
+                    row.entity_id
+                        .as_string()
+                        .map(Some)
+                        .map_err(lix_error_to_datafusion_error)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )) as ArrayRef,
         "schema_key" => string_array(rows.iter().map(|row| Some(row.schema_key.as_str()))),
         "file_id" => string_array(rows.iter().map(|row| row.file_id.as_deref())),
         "plugin_key" => string_array(rows.iter().map(|row| row.plugin_key.as_deref())),
@@ -1861,7 +1894,7 @@ mod tests {
 
     fn live_row() -> LiveStateRow {
         LiveStateRow {
-            entity_id: "entity-1".to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::single("entity-1"),
             schema_key: "project_message".to_string(),
             file_id: None,
             plugin_key: None,
@@ -1894,6 +1927,23 @@ mod tests {
                     "meta": { "type": "object" },
                     "rating": { "type": "number" }
                 }
+            }))
+            .expect("schema should derive entity surface spec"),
+        )
+    }
+
+    fn entity_insert_spec_with_primary_key() -> Arc<super::EntitySurfaceSpec> {
+        Arc::new(
+            derive_entity_surface_spec_from_schema(&json!({
+                "x-lix-key": "project_message",
+                "x-lix-version": "1",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "body": { "type": "string" }
+                },
+                "required": ["id", "body"]
             }))
             .expect("schema should derive entity surface spec"),
         )
@@ -1933,6 +1983,26 @@ mod tests {
 
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .expect("entity insert batch should build")
+    }
+
+    fn primary_key_entity_insert_batch(include_entity_id: bool) -> RecordBatch {
+        let mut fields = vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, true),
+            Field::new("lixcol_version_id", DataType::Utf8, false),
+        ];
+        let mut columns = vec![
+            string_column(vec![Some("message-1")]),
+            string_column(vec![Some("hello")]),
+            string_column(vec![Some("version-a")]),
+        ];
+        if include_entity_id {
+            fields.push(Field::new("lixcol_entity_id", DataType::Utf8, false));
+            columns.push(string_column(vec![Some("message-1")]));
+        }
+
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("primary-key entity insert batch should build")
     }
 
     #[test]
@@ -2113,7 +2183,7 @@ mod tests {
                 .expect("entity batch should decode");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "entity-1");
+        assert_eq!(rows[0].entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("entity-1")));
         assert_eq!(rows[0].schema_key, "project_message");
         assert_eq!(rows[0].schema_version.as_str(), "1");
         assert_eq!(rows[0].version_id, "version-a");
@@ -2134,6 +2204,49 @@ mod tests {
                 "meta": {"x": 1},
                 "rating": 4.5
             })
+        );
+    }
+
+    #[test]
+    fn primary_key_entity_insert_derives_opaque_projection_from_normal_columns() {
+        let spec = entity_insert_spec_with_primary_key();
+        let rows = entity_lix_state_write_rows_from_batch(
+            &spec,
+            &primary_key_entity_insert_batch(false),
+            None,
+        )
+        .expect("entity batch should decode");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("message-1")));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                rows[0]
+                    .snapshot_content
+                    .as_deref()
+                    .expect("snapshot_content")
+            )
+            .expect("snapshot_content JSON"),
+            json!({
+                "body": "hello",
+                "id": "message-1"
+            })
+        );
+    }
+
+    #[test]
+    fn primary_key_entity_insert_rejects_explicit_opaque_projection() {
+        let spec = entity_insert_spec_with_primary_key();
+        let error = entity_lix_state_write_rows_from_batch(
+            &spec,
+            &primary_key_entity_insert_batch(true),
+            None,
+        )
+        .expect_err("primary-key entity insert should reject lixcol_entity_id");
+
+        assert!(
+            error.to_string().contains("primary-key columns"),
+            "unexpected error: {error}"
         );
     }
 
@@ -2202,7 +2315,7 @@ mod tests {
             stager.writes.lock().expect("writes lock").as_slice(),
             &[StageWrite::Rows {
                 rows: vec![StageRow {
-                    entity_id: "entity-1".to_string(),
+                    entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single("entity-1")),
                     schema_key: "project_message".to_string(),
                     file_id: None,
                     plugin_key: None,

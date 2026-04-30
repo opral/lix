@@ -7,10 +7,13 @@ simulation_test2!(
     lix_directory_history_reads_paths_from_commit_graph,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("main session should open");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
         session
             .execute(
@@ -86,10 +89,13 @@ simulation_test2!(
     lix_directory_history_requires_start_commit_id,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("main session should open");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
         let error = session
             .execute("SELECT id FROM lix_directory_history", &[])
@@ -109,10 +115,13 @@ simulation_test2!(
     lix_directory_history_records_recursive_delete,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("main session should open");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
         session
             .execute(

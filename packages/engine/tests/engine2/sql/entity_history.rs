@@ -7,10 +7,13 @@ simulation_test2!(
     entity_history_reads_typed_rows_from_commit_graph,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("main session should open");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
         session
             .execute(

@@ -350,21 +350,23 @@ async fn load_state_history_rows(
     let entries = load_history_entries(commit_graph, route, Vec::new()).await?;
     let mut rows = entries
         .into_iter()
-        .map(|entry| StateHistorySqlRow {
-            entity_id: entry.change.entity_id,
-            schema_key: entry.change.schema_key,
-            file_id: entry.change.file_id,
-            plugin_key: entry.change.plugin_key,
-            snapshot_content: entry.change.snapshot_content,
-            metadata: entry.change.metadata,
-            schema_version: entry.change.schema_version,
-            change_id: entry.change.id,
-            commit_id: entry.commit_id,
-            commit_created_at: entry.commit_created_at,
-            start_commit_id: entry.start_commit_id,
-            depth: i64::from(entry.depth),
+        .map(|entry| -> Result<StateHistorySqlRow, LixError> {
+            Ok(StateHistorySqlRow {
+                entity_id: entry.change.entity_id.as_string()?,
+                schema_key: entry.change.schema_key,
+                file_id: entry.change.file_id,
+                plugin_key: entry.change.plugin_key,
+                snapshot_content: entry.change.snapshot_content,
+                metadata: entry.change.metadata,
+                schema_version: entry.change.schema_version,
+                change_id: entry.change.id,
+                commit_id: entry.commit_id,
+                commit_created_at: entry.commit_created_at,
+                start_commit_id: entry.start_commit_id,
+                depth: i64::from(entry.depth),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
 
     rows.sort_by(|left, right| {
         left.entity_id

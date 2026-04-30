@@ -215,7 +215,7 @@ mod tests {
 
     fn registered_schema_row(schema_key: &str, schema_version: &str) -> LiveStateRow {
         LiveStateRow {
-            entity_id: format!("{schema_key}~{schema_version}"),
+            entity_id: registered_schema_entity_id(schema_key, schema_version),
             file_id: None,
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
             schema_version: "1".to_string(),
@@ -244,5 +244,24 @@ mod tests {
                 .to_string(),
             ),
         }
+    }
+
+    fn registered_schema_entity_id(
+        schema_key: &str,
+        schema_version: &str,
+    ) -> crate::engine2::entity_identity::EntityIdentity {
+        crate::engine2::entity_identity::EntityIdentity::from_primary_key_paths(
+            &json!({
+                "value": {
+                    "x-lix-key": schema_key,
+                    "x-lix-version": schema_version,
+                }
+            }),
+            &[
+                vec!["value".to_string(), "x-lix-key".to_string()],
+                vec!["value".to_string(), "x-lix-version".to_string()],
+            ],
+        )
+        .expect("registered schema identity should derive")
     }
 }

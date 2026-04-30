@@ -1,19 +1,18 @@
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::cel::CelEvaluator;
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::cel::{CelEvaluator, CelFunctionProvider};
 use crate::LixError;
 
 pub(crate) fn apply_schema_defaults<P>(
     snapshot: &mut JsonMap<String, JsonValue>,
     schema: &JsonValue,
     evaluator: &CelEvaluator,
-    functions: SharedFunctionProvider<P>,
+    functions: P,
     schema_key: &str,
     schema_version: &str,
 ) -> Result<bool, LixError>
 where
-    P: LixFunctionProvider + Send + 'static,
+    P: CelFunctionProvider,
 {
     apply_schema_defaults_with_context(
         snapshot,
@@ -29,12 +28,12 @@ where
 pub(crate) fn apply_schema_defaults_with_shared_runtime<P>(
     snapshot: &mut JsonMap<String, JsonValue>,
     schema: &JsonValue,
-    functions: SharedFunctionProvider<P>,
+    functions: P,
     schema_key: &str,
     schema_version: &str,
 ) -> Result<bool, LixError>
 where
-    P: LixFunctionProvider + Send + 'static,
+    P: CelFunctionProvider,
 {
     apply_schema_defaults(
         snapshot,
@@ -51,12 +50,12 @@ pub(crate) fn apply_schema_defaults_with_context<P>(
     schema: &JsonValue,
     context: &JsonMap<String, JsonValue>,
     evaluator: &CelEvaluator,
-    functions: SharedFunctionProvider<P>,
+    functions: P,
     schema_key: &str,
     schema_version: &str,
 ) -> Result<bool, LixError>
 where
-    P: LixFunctionProvider + Send + 'static,
+    P: CelFunctionProvider,
 {
     let Some(properties) = schema.get("properties").and_then(|value| value.as_object()) else {
         return Ok(false);
@@ -102,15 +101,9 @@ where
 mod tests {
     use serde_json::{json, Map as JsonMap, Value as JsonValue};
 
-    use crate::cel::CelEvaluator;
-    use crate::functions::SystemFunctionProvider;
-    use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+    use crate::cel::{CelEvaluator, CelFunctionProvider};
 
     use super::apply_schema_defaults_with_context;
-
-    fn system_functions() -> SharedFunctionProvider<SystemFunctionProvider> {
-        SharedFunctionProvider::new(SystemFunctionProvider)
-    }
 
     #[test]
     fn applies_x_lix_default_for_missing_fields() {
@@ -132,7 +125,7 @@ mod tests {
             &schema,
             &context,
             &evaluator,
-            system_functions(),
+            fixed_functions(),
             "test_schema",
             "1",
         )
@@ -165,7 +158,7 @@ mod tests {
             &schema,
             &context,
             &evaluator,
-            system_functions(),
+            fixed_functions(),
             "test_schema",
             "1",
         )
@@ -198,7 +191,7 @@ mod tests {
             &schema,
             &context,
             &evaluator,
-            system_functions(),
+            fixed_functions(),
             "test_schema",
             "1",
         )
@@ -210,20 +203,19 @@ mod tests {
 
     #[test]
     fn applies_cel_defaults_in_stable_sorted_field_order() {
+        #[derive(Clone)]
         struct CountingFunctions {
-            next: i64,
+            next: std::sync::Arc<std::sync::atomic::AtomicI64>,
         }
 
-        impl LixFunctionProvider for CountingFunctions {
-            fn uuid_v7(&mut self) -> String {
-                let current = self.next;
-                self.next += 1;
+        impl CelFunctionProvider for CountingFunctions {
+            fn call_uuid_v7(&self) -> String {
+                let current = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 format!("uuid-{current}")
             }
 
-            fn timestamp(&mut self) -> String {
-                let current = self.next;
-                self.next += 1;
+            fn call_timestamp(&self) -> String {
+                let current = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 format!("ts-{current}")
             }
         }
@@ -249,7 +241,9 @@ mod tests {
             &schema,
             &context,
             &evaluator,
-            SharedFunctionProvider::new(CountingFunctions { next: 0 }),
+            CountingFunctions {
+                next: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            },
             "test_schema",
             "1",
         )
@@ -264,5 +258,22 @@ mod tests {
             snapshot.get("z_uuid"),
             Some(&JsonValue::String("uuid-1".to_string()))
         );
+    }
+
+    #[derive(Clone)]
+    struct FixedFunctions;
+
+    impl CelFunctionProvider for FixedFunctions {
+        fn call_uuid_v7(&self) -> String {
+            "uuid-fixed".to_string()
+        }
+
+        fn call_timestamp(&self) -> String {
+            "1970-01-01T00:00:00.000Z".to_string()
+        }
+    }
+
+    fn fixed_functions() -> FixedFunctions {
+        FixedFunctions
     }
 }

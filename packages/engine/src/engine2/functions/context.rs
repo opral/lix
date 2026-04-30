@@ -268,7 +268,7 @@ mod tests {
         }))
         .expect("snapshot should serialize");
         let row = LiveStateRow {
-            entity_id: key.to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::single(key),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             plugin_key: None,

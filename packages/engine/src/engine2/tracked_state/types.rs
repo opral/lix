@@ -1,3 +1,4 @@
+use crate::engine2::entity_identity::EntityIdentity;
 use crate::NullableKeyFilter;
 
 /// Rebuildable tracked state row.
@@ -8,7 +9,7 @@ use crate::NullableKeyFilter;
 /// responsible for combining both sources.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TrackedStateRow {
-    pub(crate) entity_id: String,
+    pub(crate) entity_id: EntityIdentity,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) plugin_key: Option<String>,
@@ -27,7 +28,7 @@ pub(crate) struct TrackedStateFilter {
     #[serde(default)]
     pub(crate) schema_keys: Vec<String>,
     #[serde(default)]
-    pub(crate) entity_ids: Vec<String>,
+    pub(crate) entity_ids: Vec<EntityIdentity>,
     #[serde(default)]
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
     #[serde(default)]
@@ -58,6 +59,6 @@ pub(crate) struct TrackedStateScanRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateRowRequest {
     pub(crate) schema_key: String,
-    pub(crate) entity_id: String,
+    pub(crate) entity_id: EntityIdentity,
     pub(crate) file_id: NullableKeyFilter<String>,
 }

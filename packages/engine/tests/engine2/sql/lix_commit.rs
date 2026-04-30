@@ -7,10 +7,13 @@ simulation_test2!(
     lix_commit_surfaces_expose_commits_edges_and_change_sets,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("main session should open");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
         let initial_head = engine
             .load_version_head_commit_id(sim.main_version_id())

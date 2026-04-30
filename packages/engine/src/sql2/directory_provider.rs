@@ -909,7 +909,12 @@ struct StateRowDedupeKey {
 impl From<&StageRow> for StateRowDedupeKey {
     fn from(row: &StageRow) -> Self {
         Self {
-            entity_id: row.entity_id.clone(),
+            entity_id: row
+                .entity_id
+                .as_ref()
+                .expect("directory provider staged row should carry entity_id")
+                .as_string()
+                .expect("directory provider staged row entity identity should project"),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
             version_id: row.version_id.clone(),
@@ -1164,7 +1169,7 @@ fn lix_directory_record_batch(
         parent_ids.push(directory.parent_id);
         names.push(Some(directory.name));
         hiddens.push(Some(directory.hidden));
-        entity_ids.push(Some(directory.live.entity_id));
+        entity_ids.push(Some(directory.live.entity_id.as_string()?));
         schema_keys.push(Some(directory.live.schema_key));
         file_ids.push(directory.live.file_id);
         plugin_keys.push(directory.live.plugin_key);
@@ -1642,7 +1647,8 @@ mod tests {
         snapshot_content: &str,
     ) -> LiveStateRow {
         LiveStateRow {
-            entity_id: entity_id.to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::from_string(entity_id)
+                .expect("entity id should decode"),
             schema_key: schema_key.to_string(),
             file_id: file_id.map(ToOwned::to_owned),
             plugin_key: None,
@@ -1844,7 +1850,7 @@ mod tests {
         assert_eq!(
             rows,
             vec![StageRow {
-                entity_id: "dir-docs".to_string(),
+                entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single("dir-docs")),
                 schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                 file_id: None,
                 plugin_key: None,
@@ -1939,14 +1945,23 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(
             rows.iter()
-                .map(|row| (row.schema_key.as_str(), row.entity_id.as_str()))
+                .map(|row| {
+                    (
+                        row.schema_key.as_str(),
+                        row.entity_id
+                            .as_ref()
+                            .expect("planned delete row should carry entity_id")
+                            .as_string()
+                            .expect("planned delete row should project entity_id"),
+                    )
+                })
                 .collect::<Vec<_>>(),
             vec![
-                ("lix_file_descriptor", "file-readme"),
-                ("lix_binary_blob_ref", "file-readme"),
-                ("lix_directory_descriptor", "dir-guides"),
-                ("lix_file_descriptor", "file-index"),
-                ("lix_directory_descriptor", "dir-docs"),
+                ("lix_file_descriptor", "file-readme".to_string()),
+                ("lix_binary_blob_ref", "file-readme".to_string()),
+                ("lix_directory_descriptor", "dir-guides".to_string()),
+                ("lix_file_descriptor", "file-index".to_string()),
+                ("lix_directory_descriptor", "dir-docs".to_string()),
             ]
         );
         assert!(rows.iter().all(|row| row.snapshot_content.is_none()));
@@ -2007,7 +2022,7 @@ mod tests {
             stager.writes.lock().expect("writes lock").as_slice(),
             &[StageWrite::Rows {
                 rows: vec![StageRow {
-                    entity_id: "dir-docs".to_string(),
+                    entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single("dir-docs")),
                     schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                     file_id: None,
                     plugin_key: None,

@@ -1,4 +1,4 @@
-use crate::engine2::changelog::CanonicalChange;
+use crate::engine2::{changelog::CanonicalChange, entity_identity::EntityIdentity};
 use crate::LixError;
 
 /// Parsed `lix_commit` entity from the changelog.
@@ -45,7 +45,7 @@ pub(crate) struct CommitGraphChangeSetElement {
 /// Filter for canonical change history from a chosen traversal start commit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CommitGraphChangeHistoryRequest {
-    pub(crate) entity_ids: Vec<String>,
+    pub(crate) entity_ids: Vec<EntityIdentity>,
     pub(crate) schema_keys: Vec<String>,
     pub(crate) file_ids: Vec<String>,
     pub(crate) min_depth: Option<u32>,
