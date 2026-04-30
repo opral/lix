@@ -185,7 +185,7 @@ fn state_pushdown_column<'a>(
             _ => None,
         },
         SurfaceVariant::History => match column.to_ascii_lowercase().as_str() {
-            "root_commit_id" | "lixcol_root_commit_id" => Some(column),
+            "start_commit_id" | "lixcol_start_commit_id" => Some(column),
             _ => None,
         },
         SurfaceVariant::WorkingChanges => None,

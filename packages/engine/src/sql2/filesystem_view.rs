@@ -19,8 +19,7 @@ use self::sql_fragments::{
     filesystem_file_view_sql, filesystem_winner_relation_name,
 };
 use super::udf::{
-    lix_json_extract_boolean_expr, lix_json_extract_text_expr, register_sql2_udfs,
-    system_sql2_function_provider,
+    lix_json_extract_text_expr, register_sql2_functions, system_sql2_function_provider,
 };
 use crate::catalog::{SurfaceFamily, SurfaceRegistry, SurfaceVariant};
 use crate::common::escape_sql_string;
@@ -909,7 +908,7 @@ fn filesystem_base_relation_columns(
             ("updated_at", "updated_at"),
             ("commit_id", "commit_id"),
             ("untracked", "untracked"),
-            ("lixcol_metadata", "metadata"),
+            ("metadata", "metadata"),
             ("id", "id"),
             ("directory_id", "directory_id"),
             ("name", "name"),
@@ -927,7 +926,7 @@ fn filesystem_base_relation_columns(
             ("commit_created_at", "commit_created_at"),
             ("start_commit_id", "start_commit_id"),
             ("depth", "depth"),
-            ("lixcol_metadata", "metadata"),
+            ("metadata", "metadata"),
             ("id", "id"),
             ("directory_id", "directory_id"),
             ("name", "name"),
@@ -946,7 +945,7 @@ fn filesystem_base_relation_columns(
             ("updated_at", "updated_at"),
             ("commit_id", "commit_id"),
             ("untracked", "untracked"),
-            ("lixcol_metadata", "metadata"),
+            ("metadata", "metadata"),
             ("id", "id"),
             ("parent_id", "parent_id"),
             ("name", "name"),
@@ -963,7 +962,7 @@ fn filesystem_base_relation_columns(
             ("commit_created_at", "commit_created_at"),
             ("start_commit_id", "start_commit_id"),
             ("depth", "depth"),
-            ("lixcol_metadata", "metadata"),
+            ("metadata", "metadata"),
             ("id", "id"),
             ("parent_id", "parent_id"),
             ("name", "name"),
@@ -981,7 +980,7 @@ fn filesystem_base_relation_columns(
             ("updated_at", "updated_at"),
             ("commit_id", "commit_id"),
             ("untracked", "untracked"),
-            ("lixcol_metadata", "metadata"),
+            ("metadata", "metadata"),
             ("id", "id"),
             ("blob_hash", "blob_hash"),
             ("size_bytes", "size_bytes"),
@@ -997,7 +996,7 @@ fn filesystem_base_relation_columns(
             ("commit_created_at", "commit_created_at"),
             ("start_commit_id", "start_commit_id"),
             ("depth", "depth"),
-            ("lixcol_metadata", "metadata"),
+            ("metadata", "metadata"),
             ("id", "id"),
             ("blob_hash", "blob_hash"),
             ("size_bytes", "size_bytes"),
@@ -1047,6 +1046,15 @@ fn base_relation_source_column_for_public_column(
     base_relation: Sql2FilesystemViewBaseRelation,
     public_column_name: &str,
 ) -> Option<&str> {
+    if let Some(source_name) = filesystem_base_relation_columns(base_relation)
+        .iter()
+        .find_map(|(public_name, source_name)| {
+            (*public_name == public_column_name).then_some(*source_name)
+        })
+    {
+        return Some(source_name);
+    }
+
     let source_column_name = public_column_name
         .strip_prefix("lixcol_")
         .unwrap_or(public_column_name);
@@ -1140,9 +1148,10 @@ fn filesystem_base_relation_projection_expr(
                 Sql2FilesystemProjectionType::Text => {
                     lix_json_extract_text_expr(snapshot_content, property_name)
                 }
-                Sql2FilesystemProjectionType::Boolean => {
-                    lix_json_extract_boolean_expr(snapshot_content, property_name)
-                }
+                Sql2FilesystemProjectionType::Boolean => try_cast(
+                    lix_json_extract_text_expr(snapshot_content, property_name),
+                    datafusion::arrow::datatypes::DataType::Boolean,
+                ),
                 Sql2FilesystemProjectionType::Integer => try_cast(
                     lix_json_extract_text_expr(snapshot_content, property_name),
                     datafusion::arrow::datatypes::DataType::Int64,
@@ -1162,7 +1171,7 @@ fn datafusion_error_to_lix_error(error: datafusion::common::DataFusionError) -> 
 
 fn new_filesystem_compile_ctx() -> SessionContext {
     let ctx = SessionContext::new();
-    register_sql2_udfs(&ctx, system_sql2_function_provider());
+    register_sql2_functions(&ctx, system_sql2_function_provider());
     ctx
 }
 
@@ -1679,7 +1688,7 @@ mod sql_fragments {
            schema_key, \
            version_id, \
            schema_version, \
-           lixcol_metadata, \
+           metadata, \
            directory_id, \
            name, \
            extension, \
@@ -1699,7 +1708,7 @@ mod sql_fragments {
              fd.schema_key, \
              fd.version_id, \
              fd.schema_version, \
-             fd.lixcol_metadata, \
+             fd.metadata, \
              fd.directory_id, \
              fd.name, \
              fd.extension, \
@@ -2298,9 +2307,6 @@ mod tests {
                 "created_at".to_string(),
                 "updated_at".to_string(),
                 "commit_id".to_string(),
-                "commit_created_at".to_string(),
-                "start_commit_id".to_string(),
-                "depth".to_string(),
                 "untracked".to_string(),
                 "metadata".to_string(),
                 "id".to_string(),
@@ -2522,6 +2528,7 @@ mod tests {
         let provider = Arc::new(
             MemTable::try_new(
                 Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Utf8, true),
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
@@ -2990,6 +2997,7 @@ mod tests {
                 Arc::new(Schema::new(vec![
                     Field::new("id", DataType::Utf8, false),
                     Field::new("version_id", DataType::Utf8, false),
+                    Field::new("data", DataType::Binary, true),
                     Field::new("blob_hash", DataType::Utf8, true),
                     Field::new("size_bytes", DataType::Int64, true),
                 ])),

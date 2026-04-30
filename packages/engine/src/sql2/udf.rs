@@ -22,22 +22,14 @@ pub(crate) fn system_sql2_function_provider() -> FunctionProviderHandle {
     SharedFunctionProvider::new(Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>)
 }
 
-pub(crate) fn register_sql2_udfs(ctx: &SessionContext, functions: FunctionProviderHandle) {
+pub(crate) fn register_sql2_functions(ctx: &SessionContext, functions: FunctionProviderHandle) {
     ctx.register_udf(ScalarUDF::from(LixJsonExtract::new(
         "lix_json_extract",
-        JsonExtractMode::Text,
-    )));
-    ctx.register_udf(ScalarUDF::from(LixJsonExtract::new(
-        "lix_json_extract_json",
         JsonExtractMode::Json,
     )));
     ctx.register_udf(ScalarUDF::from(LixJsonExtract::new(
-        "lix_json_extract_variant",
-        JsonExtractMode::Variant,
-    )));
-    ctx.register_udf(ScalarUDF::from(LixJsonExtract::new(
-        "lix_json_extract_boolean",
-        JsonExtractMode::Boolean,
+        "lix_json_extract_text",
+        JsonExtractMode::Text,
     )));
     ctx.register_udf(ScalarUDF::from(LixTextCodec::new(
         "lix_text_decode",
@@ -52,44 +44,30 @@ pub(crate) fn register_sql2_udfs(ctx: &SessionContext, functions: FunctionProvid
     ctx.register_udf(ScalarUDF::from(LixUuidV7 { functions }));
 }
 
-pub(crate) fn lix_json_extract_text_expr(json_expr: Expr, property_name: &str) -> Expr {
+pub(crate) fn lix_json_extract_expr(json_expr: Expr, property_name: &str) -> Expr {
     ScalarUDF::from(LixJsonExtract::new(
         "lix_json_extract",
-        JsonExtractMode::Text,
-    ))
-    .call(vec![json_expr, lit(property_name.to_string())])
-}
-
-pub(crate) fn lix_json_extract_json_expr(json_expr: Expr, property_name: &str) -> Expr {
-    ScalarUDF::from(LixJsonExtract::new(
-        "lix_json_extract_json",
         JsonExtractMode::Json,
     ))
     .call(vec![json_expr, lit(property_name.to_string())])
 }
 
-pub(crate) fn lix_json_extract_variant_expr(json_expr: Expr, property_name: &str) -> Expr {
+pub(crate) fn lix_json_extract_text_expr(json_expr: Expr, property_name: &str) -> Expr {
     ScalarUDF::from(LixJsonExtract::new(
-        "lix_json_extract_variant",
-        JsonExtractMode::Variant,
+        "lix_json_extract_text",
+        JsonExtractMode::Text,
     ))
     .call(vec![json_expr, lit(property_name.to_string())])
 }
 
-pub(crate) fn lix_json_extract_boolean_expr(json_expr: Expr, property_name: &str) -> Expr {
-    ScalarUDF::from(LixJsonExtract::new(
-        "lix_json_extract_boolean",
-        JsonExtractMode::Boolean,
-    ))
-    .call(vec![json_expr, lit(property_name.to_string())])
+pub(crate) fn lix_text_encode_expr(expr: Expr) -> Expr {
+    ScalarUDF::from(LixTextCodec::new("lix_text_encode", TextCodecMode::Encode)).call(vec![expr])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum JsonExtractMode {
     Text,
     Json,
-    Variant,
-    Boolean,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -124,9 +102,7 @@ impl ScalarUDFImpl for LixJsonExtract {
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(match self.mode {
-            JsonExtractMode::Boolean => DataType::Boolean,
             JsonExtractMode::Text | JsonExtractMode::Json => DataType::Utf8,
-            JsonExtractMode::Variant => DataType::Binary,
         })
     }
 
@@ -142,73 +118,28 @@ impl ScalarUDFImpl for LixJsonExtract {
         let arrays = ColumnarValue::values_to_arrays(&args.args)?;
         let len = arrays.first().map(ArrayRef::len).unwrap_or(1);
 
-        match self.mode {
-            JsonExtractMode::Boolean => {
-                let mut values = Vec::with_capacity(len);
-                for row in 0..len {
-                    let extracted = extract_json_path(&arrays, row)?;
-                    values.push(match extracted {
-                        Some(JsonValue::Bool(value)) => Some(value),
-                        _ => None,
-                    });
-                }
-                if scalar_inputs {
-                    Ok(ColumnarValue::Scalar(ScalarValue::Boolean(
-                        values.into_iter().next().flatten(),
-                    )))
+        let mut values = Vec::with_capacity(len);
+        for row in 0..len {
+            let extracted = extract_json_path(&arrays, row)?;
+            values.push(match (self.mode, extracted) {
+                (_, None) => None,
+                (_, Some(JsonValue::Null)) => None,
+                (JsonExtractMode::Text, Some(JsonValue::Bool(value))) => Some(if value {
+                    "true".to_string()
                 } else {
-                    Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(values))))
-                }
-            }
-            JsonExtractMode::Text | JsonExtractMode::Json => {
-                let mut values = Vec::with_capacity(len);
-                for row in 0..len {
-                    let extracted = extract_json_path(&arrays, row)?;
-                    values.push(match (self.mode, extracted) {
-                        (_, None) => None,
-                        (_, Some(JsonValue::Null)) => None,
-                        (JsonExtractMode::Text, Some(JsonValue::Bool(value))) => Some(if value {
-                            "true".to_string()
-                        } else {
-                            "false".to_string()
-                        }),
-                        (JsonExtractMode::Text, Some(JsonValue::String(value))) => Some(value),
-                        (JsonExtractMode::Text, Some(other)) => Some(json_text_value(&other)?),
-                        (JsonExtractMode::Json, Some(other)) => Some(json_json_value(&other)?),
-                        (JsonExtractMode::Variant, _) | (JsonExtractMode::Boolean, _) => {
-                            unreachable!()
-                        }
-                    });
-                }
-                if scalar_inputs {
-                    Ok(ColumnarValue::Scalar(ScalarValue::Utf8(
-                        values.into_iter().next().flatten(),
-                    )))
-                } else {
-                    Ok(ColumnarValue::Array(Arc::new(StringArray::from(values))))
-                }
-            }
-            JsonExtractMode::Variant => {
-                let mut values = Vec::with_capacity(len);
-                for row in 0..len {
-                    let extracted = extract_json_path(&arrays, row)?;
-                    values.push(match extracted {
-                        None => None,
-                        Some(other) => Some(json_variant_value(&other)?),
-                    });
-                }
-                if scalar_inputs {
-                    Ok(ColumnarValue::Scalar(ScalarValue::Binary(
-                        values.into_iter().next().flatten(),
-                    )))
-                } else {
-                    let refs = values
-                        .iter()
-                        .map(|value| value.as_deref())
-                        .collect::<Vec<_>>();
-                    Ok(ColumnarValue::Array(Arc::new(BinaryArray::from(refs))))
-                }
-            }
+                    "false".to_string()
+                }),
+                (JsonExtractMode::Text, Some(JsonValue::String(value))) => Some(value),
+                (JsonExtractMode::Text, Some(other)) => Some(json_text_value(&other)?),
+                (JsonExtractMode::Json, Some(other)) => Some(json_json_value(&other)?),
+            });
+        }
+        if scalar_inputs {
+            Ok(ColumnarValue::Scalar(ScalarValue::Utf8(
+                values.into_iter().next().flatten(),
+            )))
+        } else {
+            Ok(ColumnarValue::Array(Arc::new(StringArray::from(values))))
         }
     }
 }
@@ -638,15 +569,7 @@ fn json_text_value(value: &JsonValue) -> Result<String> {
 fn json_json_value(value: &JsonValue) -> Result<String> {
     serde_json::to_string(value).map_err(|error| {
         DataFusionError::Execution(format!(
-            "lix_json_extract_json() could not render JSON value: {error}"
-        ))
-    })
-}
-
-fn json_variant_value(value: &JsonValue) -> Result<Vec<u8>> {
-    serde_json::to_vec(value).map_err(|error| {
-        DataFusionError::Execution(format!(
-            "lix_json_extract_variant() could not render JSON value: {error}"
+            "lix_json_extract() could not render JSON value: {error}"
         ))
     })
 }
@@ -695,4 +618,65 @@ fn json_path_segment(array: &dyn Array, row: usize) -> Result<Option<JsonPathSeg
         "lix_json_extract() path arguments must be strings or non-negative integers, got {:?}",
         array.data_type()
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{register_sql2_functions, system_sql2_function_provider};
+    use datafusion::arrow::array::{Array, StringArray};
+    use datafusion::prelude::SessionContext;
+
+    async fn single_text(sql: &str) -> Option<String> {
+        let ctx = SessionContext::new();
+        register_sql2_functions(&ctx, system_sql2_function_provider());
+        let batches = ctx
+            .sql(sql)
+            .await
+            .expect("query should plan")
+            .collect()
+            .await
+            .expect("query should execute");
+        let array = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("first column should be utf8");
+        (!array.is_null(0)).then(|| array.value(0).to_string())
+    }
+
+    #[tokio::test]
+    async fn lix_json_extract_returns_json_representation() {
+        assert_eq!(
+            single_text("SELECT lix_json_extract('{\"name\":\"Ada\"}', 'name')").await,
+            Some("\"Ada\"".to_string())
+        );
+        assert_eq!(
+            single_text("SELECT lix_json_extract('{\"tags\":[\"db\"]}', 'tags')").await,
+            Some("[\"db\"]".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn lix_json_extract_text_returns_unwrapped_text() {
+        assert_eq!(
+            single_text("SELECT lix_json_extract_text('{\"name\":\"Ada\"}', 'name')").await,
+            Some("Ada".to_string())
+        );
+        assert_eq!(
+            single_text("SELECT lix_json_extract_text('{\"active\":true}', 'active')").await,
+            Some("true".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn lix_json_extract_missing_path_returns_null() {
+        assert_eq!(
+            single_text("SELECT lix_json_extract('{\"name\":\"Ada\"}', 'missing')").await,
+            None
+        );
+        assert_eq!(
+            single_text("SELECT lix_json_extract_text('{\"name\":\"Ada\"}', 'missing')").await,
+            None
+        );
+    }
 }

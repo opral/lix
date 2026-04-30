@@ -1632,7 +1632,6 @@ mod tests {
                 string_column(vec![Some("entity-1")]),
                 string_column(vec![Some("lix_key_value")]),
                 string_column(vec![None]),
-                string_column(vec![Some("plugin-a")]),
                 string_column(vec![Some("{\"key\":\"hello\",\"value\":\"world\"}")]),
                 string_column(vec![Some("{\"source\":\"test\"}")]),
                 string_column(vec![Some("1")]),
@@ -1653,7 +1652,6 @@ mod tests {
             vec![
                 string_column(vec![Some("entity-1")]),
                 string_column(vec![Some("lix_key_value")]),
-                string_column(vec![None]),
                 string_column(vec![None]),
                 string_column(vec![Some("{\"key\":\"hello\",\"value\":\"world\"}")]),
                 string_column(vec![None]),
@@ -1738,7 +1736,7 @@ mod tests {
         ]);
 
         let request =
-            lix_state_scan_request(&schema, None, Some(&vec![0, 1, 13]), &route, Some(10));
+            lix_state_scan_request(&schema, None, Some(&vec![0, 1, 12]), &route, Some(10));
 
         assert_eq!(request.filter.schema_keys, vec!["profile".to_string()]);
         assert_eq!(request.filter.version_ids, vec!["v1".to_string()]);
