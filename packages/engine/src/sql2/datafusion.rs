@@ -44,7 +44,7 @@ use super::filesystem_view::{
     prepared_filesystem_view_plans_for_registry, PreparedSql2FilesystemViewPlan,
     Sql2FilesystemViewBaseRelation,
 };
-use super::udf::{register_sql2_functions, system_sql2_function_provider};
+use super::udfs::{register_sql2_functions, system_sql2_function_provider};
 use crate::catalog::{build_builtin_surface_registry, SurfaceColumnType};
 use crate::catalog::{
     open_change_surface_snapshot, open_change_surface_snapshot_with_shared_backend,

@@ -11,7 +11,7 @@ use datafusion::logical_expr::expr_fn::{col, try_cast};
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::prelude::SessionContext;
 
-use super::udf::{lix_json_extract_expr, lix_json_extract_text_expr, lix_text_encode_expr};
+use super::udfs::{lix_json_extract_expr, lix_json_extract_text_expr, lix_text_encode_expr};
 use crate::catalog::{
     state_relation_column_is_nullable_for_variant, state_relation_columns_for_variant,
     SurfaceColumnType, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
