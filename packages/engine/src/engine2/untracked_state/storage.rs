@@ -158,7 +158,13 @@ fn encode_untracked_state_row_key(identity: &UntrackedStateIdentity) -> Vec<u8> 
     let mut out = Vec::new();
     push_component(&mut out, &identity.version_id);
     push_component(&mut out, &identity.schema_key);
-    push_component(&mut out, &identity.entity_id);
+    push_component(
+        &mut out,
+        &identity
+            .entity_id
+            .as_string()
+            .expect("untracked-state identity should project"),
+    );
     match &identity.file_id {
         Some(file_id) => {
             out.push(1);
@@ -206,7 +212,7 @@ mod tests {
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
                     version_id: "global".to_string(),
-                    entity_id: "ui-tab".to_string(),
+                    entity_id: crate::engine2::entity_identity::EntityIdentity::single("ui-tab"),
                     file_id: NullableKeyFilter::Null,
                 })
                 .await
@@ -250,7 +256,7 @@ mod tests {
         .expect("scan should succeed");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "version-ui");
+        assert_eq!(rows[0].entity_id, crate::engine2::entity_identity::EntityIdentity::single("version-ui"));
     }
 
     #[tokio::test]
@@ -281,7 +287,7 @@ mod tests {
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
                     version_id: "global".to_string(),
-                    entity_id: "ui-tab".to_string(),
+                    entity_id: crate::engine2::entity_identity::EntityIdentity::single("ui-tab"),
                     file_id: NullableKeyFilter::Null,
                 })
                 .await
@@ -292,7 +298,7 @@ mod tests {
 
     fn untracked_row(version_id: &str, schema_key: &str, entity_id: &str) -> UntrackedStateRow {
         UntrackedStateRow {
-            entity_id: entity_id.to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::single(entity_id),
             schema_key: schema_key.to_string(),
             file_id: None,
             plugin_key: None,

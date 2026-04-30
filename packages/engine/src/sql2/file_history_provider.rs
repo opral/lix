@@ -516,7 +516,7 @@ fn parse_file_history_descriptors(
         .map(|entry| {
             let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
                 return Ok(FileHistoryDescriptorRecord {
-                    id: entry.change.entity_id.clone(),
+                    id: entry.change.entity_id.as_string()?,
                     directory_id: None,
                     name: None,
                     extension: None,
@@ -580,11 +580,13 @@ fn parse_file_history_blobs(
         .map(|entry| {
             let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
                 return Ok(FileHistoryBlobRecord {
-                    file_id: entry
-                        .change
-                        .file_id
-                        .clone()
-                        .unwrap_or_else(|| entry.change.entity_id.clone()),
+                    file_id: entry.change.file_id.clone().unwrap_or_else(|| {
+                        entry
+                            .change
+                            .entity_id
+                            .as_string()
+                            .expect("canonical change entity identity should project")
+                    }),
                     blob_hash: None,
                     entry: entry.clone(),
                 });

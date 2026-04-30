@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use async_trait::async_trait;
 
+use crate::engine2::entity_identity::EntityIdentity;
 use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::untracked_state::UntrackedStateRow;
 use crate::LixError;
@@ -13,7 +14,7 @@ use crate::LixError;
 /// `StagedStateRow`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct StageRow {
-    pub(crate) entity_id: String,
+    pub(crate) entity_id: Option<EntityIdentity>,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) plugin_key: Option<String>,
@@ -73,7 +74,7 @@ pub(crate) trait StageWriteStager: Send + Sync {
 /// have been assigned but before the rows are durably flushed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StagedStateRow {
-    pub(crate) entity_id: String,
+    pub(crate) entity_id: EntityIdentity,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) plugin_key: Option<String>,

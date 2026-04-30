@@ -1,8 +1,9 @@
+use crate::engine2::entity_identity::EntityIdentity;
 /// Immutable canonical change fact stored in the changelog.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CanonicalChange {
     pub(crate) id: String,
-    pub(crate) entity_id: String,
+    pub(crate) entity_id: EntityIdentity,
     pub(crate) schema_key: String,
     pub(crate) schema_version: String,
     pub(crate) file_id: Option<String>,

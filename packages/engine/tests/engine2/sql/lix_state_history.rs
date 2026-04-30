@@ -6,10 +6,13 @@ simulation_test2!(
     lix_state_history_requires_start_commit_id,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("main session should open");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
         session
             .execute(
@@ -37,10 +40,13 @@ simulation_test2!(
     lix_state_history_reads_from_explicit_historical_commit,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("main session should open");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
         session
             .execute(
@@ -170,10 +176,13 @@ simulation_test2!(
     lix_state_history_routes_schema_entity_file_and_depth_filters,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("main session should open");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
         session
             .execute(
@@ -280,10 +289,13 @@ simulation_test2!(
     lix_state_history_shows_tombstone_at_ancestor_depth,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("main session should open");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
         session
             .execute(
@@ -348,10 +360,13 @@ simulation_test2!(
     lix_state_history_supports_multiple_start_commit_filters,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("main session should open");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
         session
             .execute(
@@ -436,10 +451,13 @@ simulation_test2!(
     lix_state_history_intersects_conjunctive_value_filters,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("main session should open");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
         session
             .execute(

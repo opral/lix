@@ -188,7 +188,7 @@ fn stage_rows_from_merge_plan(
 
 fn stage_row_from_tracked_row(row: &TrackedStateRow, target_version_id: &str) -> StageRow {
     StageRow {
-        entity_id: row.entity_id.clone(),
+        entity_id: Some(row.entity_id.clone()),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
         plugin_key: row.plugin_key.clone(),

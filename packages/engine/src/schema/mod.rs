@@ -13,6 +13,7 @@ pub(crate) use builtin::{
     LixVersionRef,
 };
 pub use compiled_cache::CompiledSchemaCache;
+pub(crate) use definition::{compile_lix_schema, format_lix_schema_validation_errors};
 pub use definition::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,
     validate_lix_schema_definition,

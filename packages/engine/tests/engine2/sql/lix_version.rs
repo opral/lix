@@ -4,10 +4,13 @@ use lix_engine::Value;
 
 simulation_test2!(lix_version_lists_descriptors_with_refs, |sim| async move {
     let engine = sim.boot_engine().await;
-    let session = sim
-        .open_global_session(&engine)
-        .await
-        .expect("global session should open");
+    let session = sim.wrap_session(
+        engine
+            .open_session("global")
+            .await
+            .expect("global session should open"),
+        &engine,
+    );
 
     let result = session
         .execute(

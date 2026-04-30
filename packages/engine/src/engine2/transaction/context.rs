@@ -11,8 +11,10 @@ use crate::engine2::live_state::{LiveStateContext, LiveStateReader};
 use crate::engine2::schema_registry::SchemaRegistry;
 use crate::engine2::transaction::commit;
 use crate::engine2::transaction::live_state_overlay::TransactionLiveStateContext;
+use crate::engine2::transaction::normalization::TransactionSchemaCatalog;
 use crate::engine2::transaction::staging::TransactionStagedWrites;
 use crate::engine2::transaction::types::{StageRow, StageWrite, StageWriteStager};
+use crate::engine2::transaction::validation::{validate_staged_writes, TransactionValidationInput};
 use crate::engine2::version_ref::{VersionRefContext, VersionRefReader};
 use crate::sql2::SqlExecutionContext;
 use crate::transaction::TransactionCommitOutcome;
@@ -50,12 +52,16 @@ impl<'a> Transaction<'a> {
         schema_registry: Arc<SchemaRegistry>,
         functions: FunctionProviderHandle,
     ) -> Result<Self, LixError> {
-        let staged_writes = Arc::new(TransactionStagedWrites::new(functions.clone()));
-        let visible_live_state =
-            transaction_live_state(backend, Arc::clone(&live_state), Arc::clone(&staged_writes))?;
+        let visible_live_state: Arc<dyn LiveStateReader> =
+            Arc::new(live_state.reader(Arc::clone(backend)));
         let visible_schemas = schema_registry
             .visible_schemas(visible_live_state, &active_version_id)
             .await?;
+        let schema_catalog = TransactionSchemaCatalog::from_visible_schemas(&visible_schemas)?;
+        let staged_writes = Arc::new(TransactionStagedWrites::new(
+            functions.clone(),
+            schema_catalog,
+        ));
         let backend_transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await?;
@@ -83,6 +89,11 @@ impl<'a> Transaction<'a> {
         runtime_functions: &FunctionContext,
     ) -> Result<TransactionCommitOutcome, LixError> {
         let staged_writes = self.staged_writes.drain()?;
+        validate_staged_writes(TransactionValidationInput::new(
+            &staged_writes,
+            &self.visible_schemas,
+        ))
+        .await?;
         commit::commit_staged_writes(
             &self.binary_cas,
             &self.changelog,
@@ -284,13 +295,14 @@ mod tests {
         assert!(
             changes
                 .iter()
-                .any(|change| change.entity_id == "tracked-programmatic"),
+                .any(|change| change.entity_id.as_string().as_deref() == Ok("tracked-programmatic")),
             "tracked staged row should be appended to changelog"
         );
         assert!(
             !changes
                 .iter()
-                .any(|change| change.entity_id == "untracked-programmatic"),
+                .any(|change| change.entity_id.as_string().as_deref()
+                    == Ok("untracked-programmatic")),
             "untracked staged row must not be appended to changelog"
         );
 
@@ -307,7 +319,7 @@ mod tests {
                 &head_commit_id,
                 &TrackedStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
-                    entity_id: "tracked-programmatic".to_string(),
+                    entity_id: crate::engine2::entity_identity::EntityIdentity::single("tracked-programmatic"),
                     file_id: NullableKeyFilter::Null,
                 },
             )
@@ -325,7 +337,7 @@ mod tests {
             .load_row(&UntrackedStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: "untracked-programmatic".to_string(),
+                entity_id: crate::engine2::entity_identity::EntityIdentity::single("untracked-programmatic"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -341,7 +353,7 @@ mod tests {
             .load_row(&crate::engine2::live_state::LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: "untracked-programmatic".to_string(),
+                entity_id: crate::engine2::entity_identity::EntityIdentity::single("untracked-programmatic"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -359,14 +371,81 @@ mod tests {
         assert!(
             tracked_rows
                 .iter()
-                .all(|row| row.entity_id != "untracked-programmatic"),
+                .all(|row| row.entity_id.as_string().as_deref() != Ok("untracked-programmatic")),
             "untracked staged rows should not be written into tracked state"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_validates_staged_rows_before_persistence() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let live_state = Arc::new(live_state_context());
+        let binary_cas = Arc::new(BinaryCasContext::new());
+        let changelog = Arc::new(ChangelogContext::new());
+        let version_ref = Arc::new(VersionRefContext::new(Arc::new(
+            UntrackedStateContext::new(),
+        )));
+        let schema_registry = Arc::new(SchemaRegistry::new());
+        let runtime_live_state = live_state.reader(Arc::clone(&backend));
+        let runtime_functions = FunctionContext::prepare(&runtime_live_state)
+            .await
+            .expect("runtime functions should prepare");
+
+        let transaction = Transaction::open(
+            GLOBAL_VERSION_ID.to_string(),
+            &backend,
+            Arc::clone(&live_state),
+            Arc::clone(&binary_cas),
+            Arc::clone(&changelog),
+            Arc::clone(&version_ref),
+            Arc::clone(&schema_registry),
+            runtime_functions.provider(),
+        )
+        .await
+        .expect("transaction should open");
+
+        let mut invalid_row = key_value_stage_row("invalid-programmatic", "invalid", false);
+        invalid_row.snapshot_content = Some("{\"key\":\"invalid-programmatic\"}".to_string());
+        transaction
+            .stage_rows(vec![invalid_row])
+            .expect("invalid row should still reach commit validation");
+
+        let error = transaction
+            .commit(&runtime_functions)
+            .await
+            .expect_err("validation should reject before persistence");
+        assert!(
+            error
+                .description
+                .contains("snapshot_content validation failed"),
+            "validation error should explain the rejected schema data: {error:?}"
+        );
+
+        let changes = changelog
+            .reader(Arc::clone(&backend))
+            .scan_changes(&ChangelogScanRequest::default())
+            .await
+            .expect("changelog should scan after failed commit");
+        assert!(
+            changes.is_empty(),
+            "validation failure must happen before changelog persistence"
+        );
+        let head = version_ref
+            .reader(Arc::clone(&backend))
+            .load_head_commit_id(GLOBAL_VERSION_ID)
+            .await
+            .expect("version ref should load after failed commit");
+        assert_eq!(
+            head, None,
+            "validation failure must happen before version-ref persistence"
         );
     }
 
     fn key_value_stage_row(key: &str, value: &str, untracked: bool) -> StageRow {
         StageRow {
-            entity_id: key.to_string(),
+            entity_id: Some(
+                crate::engine2::entity_identity::EntityIdentity::single(key),
+            ),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             plugin_key: None,

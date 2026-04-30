@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex};
 
+use crate::cel::CelFunctionProvider;
+
 /// Engine2-owned runtime function provider trait.
 pub(crate) trait FunctionProvider: Send {
     fn uuid_v7(&mut self) -> String;
@@ -63,6 +65,19 @@ where
 
     pub(crate) fn deterministic_sequence_persist_highest_seen(&self) -> Option<i64> {
         self.with_lock(|provider| provider.deterministic_sequence_persist_highest_seen())
+    }
+}
+
+impl<P> CelFunctionProvider for SharedFunctionProvider<P>
+where
+    P: FunctionProvider + Send + 'static,
+{
+    fn call_uuid_v7(&self) -> String {
+        SharedFunctionProvider::call_uuid_v7(self)
+    }
+
+    fn call_timestamp(&self) -> String {
+        SharedFunctionProvider::call_timestamp(self)
     }
 }
 

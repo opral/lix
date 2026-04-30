@@ -108,7 +108,9 @@ impl SessionContext {
 
 fn workspace_version_stage_row(version_id: &str) -> Result<StageRow, LixError> {
     Ok(StageRow {
-        entity_id: WORKSPACE_VERSION_KEY.to_string(),
+        entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single(
+            WORKSPACE_VERSION_KEY,
+        )),
         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
         file_id: None,
         plugin_key: None,

@@ -20,14 +20,20 @@ simulation_test2!(
     engine_initialize_seeds_repository_bootstrap_state,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_global_session(&engine)
-            .await
-            .expect("initialized backend should open global session");
-        let main_session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("initialized backend should open main session");
+        let session = sim.wrap_session(
+            engine
+                .open_session("global")
+                .await
+                .expect("initialized backend should open global session"),
+            &engine,
+        );
+        let main_session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("initialized backend should open main session"),
+            &engine,
+        );
 
         let version_result = session
             .execute(
@@ -113,10 +119,13 @@ simulation_test2!(
     session_execute_inserts_key_value_then_reads_it_back,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("backend should open a session");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("backend should open a session"),
+            &engine,
+        );
 
         let uuid_result = session
             .execute("SELECT lix_uuid_v7()", &[])
@@ -171,10 +180,13 @@ simulation_test2!(
     },
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("backend should open first session");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("backend should open first session"),
+            &engine,
+        );
 
         let mode_result = session
             .execute(
@@ -202,10 +214,13 @@ simulation_test2!(
             "01920000-0000-7000-8000-000000000001",
         );
 
-        let second_session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("backend should open second session");
+        let second_session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("backend should open second session"),
+            &engine,
+        );
         assert_single_text(
             second_session
                 .execute("SELECT lix_uuid_v7()", &[])
@@ -218,7 +233,7 @@ simulation_test2!(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version, global, untracked\
                  ) VALUES (\
-                 lix_uuid_v7(), 'lix_key_value', NULL, NULL, lix_json('{\"key\":\"det-write\",\"value\":\"ok\"}'), '1', false, false\
+                 'det-write', 'lix_key_value', NULL, NULL, lix_json('{\"key\":\"det-write\",\"value\":\"ok\"}'), '1', false, false\
                  )",
                 &[],
             )
@@ -230,10 +245,9 @@ simulation_test2!(
                 .execute("SELECT lix_uuid_v7()", &[])
                 .await
                 .expect("uuid after deterministic write should continue"),
-            // The tracked write consumes deterministic values for the
-            // SQL-provided entity id, row metadata, commit metadata, and the
-            // derived change-set id.
-            "01920000-0000-7000-8000-00000000000a",
+            // The tracked write consumes deterministic values for row
+            // metadata, commit metadata, and the derived change-set id.
+            "01920000-0000-7000-8000-000000000009",
         );
     }
 );
@@ -245,10 +259,13 @@ simulation_test2!(
     },
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("backend should open a session");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("backend should open a session"),
+            &engine,
+        );
 
         let mode_result = session
             .execute(

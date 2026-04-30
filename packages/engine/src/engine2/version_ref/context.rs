@@ -4,6 +4,7 @@ use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::backend::{KvStore, KvWriter};
+use crate::engine2::entity_identity::EntityIdentity;
 use crate::engine2::untracked_state::{
     UntrackedStateContext, UntrackedStateFilter, UntrackedStateRow, UntrackedStateRowRequest,
     UntrackedStateScanRequest, UntrackedStateWriter,
@@ -73,7 +74,7 @@ where
             &UntrackedStateRowRequest {
                 schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: version_id.to_string(),
+                entity_id: EntityIdentity::single(version_id),
                 file_id: NullableKeyFilter::Null,
             },
         )
@@ -108,7 +109,10 @@ where
         .await?;
         let mut heads = rows
             .iter()
-            .map(|row| decode_version_head(&row.entity_id, row))
+            .map(|row| {
+                let version_id = row.entity_id.as_string()?;
+                decode_version_head(&version_id, row)
+            })
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .flatten()
@@ -209,7 +213,7 @@ fn version_ref_row(
     })?;
 
     Ok(UntrackedStateRow {
-        entity_id: version_id.to_string(),
+        entity_id: crate::engine2::entity_identity::EntityIdentity::single(version_id),
         schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
         file_id: None,
         plugin_key: None,
@@ -279,7 +283,7 @@ mod tests {
             .load_row(&UntrackedStateRowRequest {
                 schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: "version-a".to_string(),
+                entity_id: crate::engine2::entity_identity::EntityIdentity::single("version-a"),
                 file_id: NullableKeyFilter::Null,
             })
             .await

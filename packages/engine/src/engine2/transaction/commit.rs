@@ -189,7 +189,7 @@ async fn finalize_commit_rows(
         })?;
 
         commit_rows.push(StagedStateRow {
-            entity_id: commit_id.clone(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::single(&commit_id),
             schema_key: "lix_commit".to_string(),
             file_id: None,
             plugin_key: None,
@@ -363,7 +363,7 @@ mod tests {
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "test_schema".to_string(),
                     version_id: GLOBAL_VERSION_ID.to_string(),
-                    entity_id: "entity-1".to_string(),
+                    entity_id: crate::engine2::entity_identity::EntityIdentity::single("entity-1"),
                     file_id: NullableKeyFilter::Null,
                 })
                 .await
@@ -507,7 +507,13 @@ mod tests {
             1,
             "a write to one non-global version must create exactly one commit"
         );
-        assert_eq!(commit_changes[0].entity_id, "test-uuid-1");
+        assert_eq!(
+            commit_changes[0]
+                .entity_id
+                .as_string()
+                .expect("commit entity id should project"),
+            "test-uuid-1"
+        );
         assert!(changes.iter().any(|change| change.id == "change-version-a"));
         assert!(!changes
             .iter()
@@ -557,7 +563,7 @@ mod tests {
         assert_eq!(rows.commit_rows.len(), 1);
         assert_eq!(rows.version_heads.len(), 1);
         let row = &rows.commit_rows[0];
-        assert_eq!(row.entity_id, "test-uuid-1");
+        assert_eq!(row.entity_id.as_string().as_deref(), Ok("test-uuid-1"));
         assert_eq!(row.schema_key, "lix_commit");
         assert_eq!(row.schema_version, "1");
         assert_eq!(row.change_id.as_deref(), Some("test-uuid-2"));
@@ -740,7 +746,7 @@ mod tests {
 
     fn tracked_version_row(version_id: &str, change_id: &str) -> StagedStateRow {
         StagedStateRow {
-            entity_id: "entity-1".to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::single("entity-1"),
             schema_key: "test_schema".to_string(),
             file_id: None,
             plugin_key: None,
@@ -771,7 +777,7 @@ mod tests {
         UntrackedStateRowRequest {
             schema_key: "test_schema".to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: "entity-1".to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::single("entity-1"),
             file_id: NullableKeyFilter::Null,
         }
     }
@@ -780,7 +786,7 @@ mod tests {
         LiveStateRowRequest {
             schema_key: "test_schema".to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: "entity-1".to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::single("entity-1"),
             file_id: NullableKeyFilter::Null,
         }
     }

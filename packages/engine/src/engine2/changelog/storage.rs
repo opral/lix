@@ -138,7 +138,7 @@ mod tests {
     fn test_change(id: &str) -> CanonicalChange {
         CanonicalChange {
             id: id.to_string(),
-            entity_id: "entity-1".to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::single("entity-1"),
             schema_key: "test_schema".to_string(),
             schema_version: "1".to_string(),
             file_id: None,

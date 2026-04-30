@@ -5,6 +5,7 @@ use async_trait::async_trait;
 
 use crate::engine2::functions::{FunctionProvider, FunctionProviderHandle};
 use crate::engine2::live_state::{LiveStateRow, LiveStateRowRequest, LiveStateScanRequest};
+use crate::engine2::transaction::normalization::{normalize_stage_row, TransactionSchemaCatalog};
 use crate::engine2::transaction::types::{
     StageFileData, StageRow, StageWrite, StageWriteOutcome, StageWriteStager,
 };
@@ -20,6 +21,7 @@ use crate::{LixError, NullableKeyFilter};
 /// and commit later drains the same rows.
 pub(crate) struct TransactionStagedWrites {
     functions: FunctionProviderHandle,
+    schema_catalog: Mutex<TransactionSchemaCatalog>,
     rows: Mutex<BTreeMap<StagedStateRowIdentity, StagedStateRow>>,
     commit_members_by_version: Mutex<BTreeMap<String, StagedCommitMembers>>,
     extra_commit_parents_by_version: Mutex<BTreeMap<String, Vec<String>>>,
@@ -35,9 +37,13 @@ pub(crate) struct StagedWriteSet {
 }
 
 impl TransactionStagedWrites {
-    pub(crate) fn new(functions: FunctionProviderHandle) -> Self {
+    pub(crate) fn new(
+        functions: FunctionProviderHandle,
+        schema_catalog: TransactionSchemaCatalog,
+    ) -> Self {
         Self {
             functions,
+            schema_catalog: Mutex::new(schema_catalog),
             rows: Mutex::new(BTreeMap::new()),
             commit_members_by_version: Mutex::new(BTreeMap::new()),
             extra_commit_parents_by_version: Mutex::new(BTreeMap::new()),
@@ -127,7 +133,7 @@ impl TransactionStagedWrites {
             StageWrite::RowsWithFileData { count, .. } => *count,
         };
         let mut functions = self.functions.clone();
-        let (rows, file_data_writes) = state_rows_from_stage_write(write, &mut functions)?;
+        let (rows, file_data_writes) = self.state_rows_from_stage_write(write, &mut functions)?;
         for row in &rows {
             validate_commit_membership_support(row)?;
         }
@@ -167,6 +173,47 @@ impl TransactionStagedWrites {
                 .extend(file_data_writes);
         }
         Ok(StageWriteOutcome { count })
+    }
+
+    fn state_rows_from_stage_write(
+        &self,
+        write: StageWrite,
+        functions: &mut dyn FunctionProvider,
+    ) -> Result<(Vec<StagedStateRow>, Vec<StageFileData>), LixError> {
+        let mut state_rows = Vec::new();
+        let mut file_data_writes = Vec::new();
+        match write {
+            StageWrite::Rows { rows } => {
+                self.push_state_rows(&mut state_rows, rows, functions)?;
+            }
+            StageWrite::RowsWithFileData {
+                rows, file_data, ..
+            } => {
+                self.push_state_rows(&mut state_rows, rows, functions)?;
+                file_data_writes.extend(file_data);
+            }
+        }
+        Ok((state_rows, file_data_writes))
+    }
+
+    fn push_state_rows(
+        &self,
+        state_rows: &mut Vec<StagedStateRow>,
+        rows: Vec<StageRow>,
+        functions: &mut dyn FunctionProvider,
+    ) -> Result<(), LixError> {
+        state_rows.reserve(rows.len());
+        let mut schema_catalog = self.schema_catalog.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction schema catalog lock",
+            )
+        })?;
+        for row in rows {
+            let row = normalize_stage_row(row, &mut schema_catalog, self.functions.clone())?;
+            state_rows.push(hydrate_state_write_row(row, functions)?);
+        }
+        Ok(())
     }
 }
 
@@ -242,7 +289,7 @@ pub(crate) enum StagedExactRow {
 pub(crate) struct StagedStateRowIdentity {
     untracked: bool,
     schema_key: String,
-    entity_id: String,
+    entity_id: crate::engine2::entity_identity::EntityIdentity,
     file_id: Option<String>,
     version_id: String,
 }
@@ -303,45 +350,18 @@ impl From<&LiveStateRow> for StagedStateRowIdentity {
     }
 }
 
-fn state_rows_from_stage_write(
-    write: StageWrite,
-    functions: &mut dyn FunctionProvider,
-) -> Result<(Vec<StagedStateRow>, Vec<StageFileData>), LixError> {
-    let mut state_rows = Vec::new();
-    let mut file_data_writes = Vec::new();
-    match write {
-        StageWrite::Rows { rows } => {
-            push_state_rows(&mut state_rows, rows, functions)?;
-        }
-        StageWrite::RowsWithFileData {
-            rows, file_data, ..
-        } => {
-            push_state_rows(&mut state_rows, rows, functions)?;
-            file_data_writes.extend(file_data);
-        }
-    }
-    Ok((state_rows, file_data_writes))
-}
-
-fn push_state_rows(
-    state_rows: &mut Vec<StagedStateRow>,
-    rows: Vec<StageRow>,
-    functions: &mut dyn FunctionProvider,
-) -> Result<(), LixError> {
-    state_rows.reserve(rows.len());
-    for row in rows {
-        state_rows.push(hydrate_state_write_row(row, functions)?);
-    }
-    Ok(())
-}
-
 fn hydrate_state_write_row(
     row: StageRow,
     functions: &mut dyn FunctionProvider,
 ) -> Result<StagedStateRow, LixError> {
     let updated_at = row.updated_at.unwrap_or_else(|| functions.timestamp());
     Ok(StagedStateRow {
-        entity_id: row.entity_id,
+        entity_id: row.entity_id.ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "normalized staged row is missing entity_id",
+            )
+        })?,
         schema_key: row.schema_key,
         file_id: row.file_id,
         plugin_key: row.plugin_key,
@@ -464,6 +484,7 @@ mod tests {
     use super::*;
     use crate::engine2::functions::SharedFunctionProvider;
     use crate::engine2::live_state::{LiveStateFilter, LiveStateRowRequest};
+    use crate::schema::builtin_schema_definition;
 
     #[tokio::test]
     async fn staging_overlay_uses_last_staged_row_for_exact_load() {
@@ -485,7 +506,7 @@ mod tests {
             .load_exact(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: "global".to_string(),
-                entity_id: "sql2-duplicate-key".to_string(),
+                entity_id: crate::engine2::entity_identity::EntityIdentity::single("sql2-duplicate-key"),
                 file_id: NullableKeyFilter::Null,
             })
             .expect("staged row should be visible");
@@ -606,12 +627,12 @@ mod tests {
 
         assert_eq!(drained.state_rows.len(), 2);
         assert!(drained.state_rows.iter().any(|row| {
-            row.entity_id == "sql2-key-a"
+            row.entity_id == crate::engine2::entity_identity::EntityIdentity::single("sql2-key-a")
                 && row.snapshot_content.as_deref()
                     == Some("{\"key\":\"sql2-key-a\",\"value\":\"second\"}")
         }));
         assert!(drained.state_rows.iter().any(|row| {
-            row.entity_id == "sql2-key-b"
+            row.entity_id == crate::engine2::entity_identity::EntityIdentity::single("sql2-key-b")
                 && row.snapshot_content.as_deref()
                     == Some("{\"key\":\"sql2-key-b\",\"value\":\"only\"}")
         }));
@@ -795,7 +816,7 @@ mod tests {
             .expect("overlay should build from staged rows");
         let rows = overlay.scan(&LiveStateScanRequest {
             filter: LiveStateFilter {
-                entity_ids: vec!["shared-entity".to_string()],
+                entity_ids: vec![crate::engine2::entity_identity::EntityIdentity::single("shared-entity")],
                 include_tombstones: true,
                 ..LiveStateFilter::default()
             },
@@ -862,10 +883,21 @@ mod tests {
     }
 
     fn test_staged_writes() -> TransactionStagedWrites {
-        TransactionStagedWrites::new(SharedFunctionProvider::new(Box::new(
-            TestFunctionProvider::default(),
+        let visible_schemas = vec![
+            builtin_schema_definition("lix_key_value")
+                .expect("lix_key_value schema")
+                .clone(),
+            test_schema_definition("other_schema", "1"),
+            test_schema_definition("lix_key_value", "2"),
+        ];
+        let schema_catalog = TransactionSchemaCatalog::from_visible_schemas(&visible_schemas)
+            .expect("schema catalog should build");
+        TransactionStagedWrites::new(
+            SharedFunctionProvider::new(
+                Box::new(TestFunctionProvider::default()) as Box<dyn FunctionProvider + Send>
+            ),
+            schema_catalog,
         )
-            as Box<dyn FunctionProvider + Send>))
     }
 
     #[derive(Default)]
@@ -888,7 +920,7 @@ mod tests {
 
     fn state_row(key: &str, value: &str) -> StageRow {
         StageRow {
-            entity_id: key.to_string(),
+            entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single(key)),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             plugin_key: None,
@@ -905,6 +937,20 @@ mod tests {
         }
     }
 
+    fn test_schema_definition(schema_key: &str, schema_version: &str) -> serde_json::Value {
+        serde_json::json!({
+            "x-lix-key": schema_key,
+            "x-lix-version": schema_version,
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+                "key": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "x-lix-primary-key": ["/key"]
+        })
+    }
+
     fn tombstone_row(key: &str) -> StageRow {
         StageRow {
             snapshot_content: None,
@@ -916,7 +962,7 @@ mod tests {
         LiveStateRowRequest {
             schema_key: "lix_key_value".to_string(),
             version_id: "global".to_string(),
-            entity_id: key.to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::single(key),
             file_id: NullableKeyFilter::Null,
         }
     }
@@ -925,7 +971,7 @@ mod tests {
         LiveStateScanRequest {
             filter: LiveStateFilter {
                 schema_keys: vec!["lix_key_value".to_string()],
-                entity_ids: vec![key.to_string()],
+                entity_ids: vec![crate::engine2::entity_identity::EntityIdentity::single(key)],
                 version_ids: vec!["global".to_string()],
                 file_ids: vec![NullableKeyFilter::Null],
                 include_tombstones,

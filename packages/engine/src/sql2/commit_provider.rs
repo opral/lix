@@ -411,8 +411,8 @@ async fn rows_for_surface(
                         rows.push(SurfaceRow::ChangeSetElement {
                             version_id: surface.by_version().then(|| version_id.clone()),
                             change_set_id: element.change_set_id,
+                            entity_id: element.change.entity_id.as_string()?,
                             change_id: element.change.id,
-                            entity_id: element.change.entity_id,
                             schema_key: element.change.schema_key,
                             file_id: element.change.file_id,
                         });

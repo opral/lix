@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex};
 
+use crate::cel::CelFunctionProvider;
+
 pub trait LixFunctionProvider: Send {
     fn uuid_v7(&mut self) -> String;
     fn timestamp(&mut self) -> String;
@@ -62,6 +64,19 @@ impl<P: LixFunctionProvider> SharedFunctionProvider<P> {
 
     pub fn call_timestamp(&self) -> String {
         self.with_lock_mut(|provider| provider.timestamp())
+    }
+}
+
+impl<P> CelFunctionProvider for SharedFunctionProvider<P>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
+    fn call_uuid_v7(&self) -> String {
+        SharedFunctionProvider::call_uuid_v7(self)
+    }
+
+    fn call_timestamp(&self) -> String {
+        SharedFunctionProvider::call_timestamp(self)
     }
 }
 

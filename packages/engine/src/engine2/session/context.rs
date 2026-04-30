@@ -5,6 +5,7 @@ use serde_json::Value as JsonValue;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::engine2::changelog::{ChangelogContext, ChangelogReader};
 use crate::engine2::commit_graph::{CommitGraphContext, CommitGraphReader};
+use crate::engine2::entity_identity::EntityIdentity;
 use crate::engine2::functions::FunctionProviderHandle;
 use crate::engine2::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
 use crate::engine2::schema_registry::SchemaRegistry;
@@ -129,7 +130,7 @@ impl SessionContext {
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: WORKSPACE_VERSION_KEY.to_string(),
+                entity_id: EntityIdentity::single(WORKSPACE_VERSION_KEY),
                 file_id: NullableKeyFilter::Null,
             })
             .await?

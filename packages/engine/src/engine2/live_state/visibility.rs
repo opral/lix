@@ -191,7 +191,7 @@ mod tests {
         change_id: Option<&str>,
     ) -> LiveStateRow {
         LiveStateRow {
-            entity_id: "entity".to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::single("entity"),
             schema_key: "schema".to_string(),
             file_id: None,
             plugin_key: None,

@@ -432,6 +432,7 @@ mod tests {
 
     use super::*;
     use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::engine2::entity_identity::EntityIdentity;
 
     #[tokio::test]
     async fn exact_read_roundtrips_from_stored_root() {
@@ -556,7 +557,10 @@ mod tests {
             .await
             .expect("scan should succeed");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0.entity_id, "visible");
+        assert_eq!(
+            rows[0].0.entity_id.as_string().expect("identity"),
+            "visible"
+        );
     }
 
     #[tokio::test]
@@ -606,7 +610,7 @@ mod tests {
                 &result.root_id,
                 &TrackedStateTreeScanRequest {
                     schema_keys: vec!["schema-a".to_string()],
-                    entity_ids: vec!["entity-a".to_string()],
+                    entity_ids: vec![crate::engine2::entity_identity::EntityIdentity::single("entity-a")],
                     file_ids: vec![crate::NullableKeyFilter::Value("file-a".to_string())],
                     ..Default::default()
                 },
@@ -616,7 +620,10 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0.schema_key, "schema-a");
-        assert_eq!(rows[0].0.entity_id, "entity-a");
+        assert_eq!(
+            rows[0].0.entity_id.as_string().expect("identity"),
+            "entity-a"
+        );
         assert_eq!(rows[0].0.file_id.as_deref(), Some("file-a"));
     }
 
@@ -765,7 +772,7 @@ mod tests {
         TrackedStateKey {
             schema_key: schema_key.to_string(),
             file_id: file_id.map(str::to_string),
-            entity_id: entity_id.to_string(),
+            entity_id: EntityIdentity::single(entity_id),
         }
     }
 

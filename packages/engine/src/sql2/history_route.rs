@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::engine2::changelog::CanonicalChange;
 use crate::engine2::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
+use crate::engine2::entity_identity::EntityIdentity;
 use crate::LixError;
 
 /// Shared routing state for commit-shaped history SQL surfaces.
@@ -147,7 +148,11 @@ pub(crate) fn commit_graph_history_request(
 ) -> Option<CommitGraphChangeHistoryRequest> {
     let schema_keys = effective_schema_keys(route, schema_keys)?;
     Some(CommitGraphChangeHistoryRequest {
-        entity_ids: route.entity_ids.clone(),
+        entity_ids: route
+            .entity_ids
+            .iter()
+            .map(|entity_id| EntityIdentity::single(entity_id))
+            .collect(),
         schema_keys,
         file_ids: route.file_ids.clone(),
         min_depth: route.min_depth.and_then(nonnegative_u32),

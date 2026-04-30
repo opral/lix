@@ -344,7 +344,18 @@ fn entity_history_system_column_array(
     rows: &[EntityHistoryRow],
 ) -> Result<ArrayRef> {
     Ok(match column_name {
-        "entity_id" => string_array(rows.iter().map(|row| Some(row.change.entity_id.as_str()))),
+        "entity_id" => Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| {
+                    Some(
+                        row.change
+                            .entity_id
+                            .as_string()
+                            .expect("canonical change entity identity should project"),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )) as ArrayRef,
         "schema_key" => string_array(rows.iter().map(|row| Some(row.change.schema_key.as_str()))),
         "file_id" => string_array(rows.iter().map(|row| row.change.file_id.as_deref())),
         "plugin_key" => string_array(rows.iter().map(|row| row.change.plugin_key.as_deref())),

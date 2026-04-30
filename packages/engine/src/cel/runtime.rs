@@ -4,11 +4,11 @@ use std::sync::{Arc, OnceLock, RwLock};
 use cel::Program;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::LixError;
 
 use super::context::build_context_with_functions;
 use super::error::{cel_parse_error, cel_runtime_error};
+use super::provider::CelFunctionProvider;
 use super::value::cel_to_json;
 
 #[derive(Debug)]
@@ -30,10 +30,10 @@ impl CelEvaluator {
         &self,
         expression: &str,
         variables: &JsonMap<String, JsonValue>,
-        functions: SharedFunctionProvider<P>,
+        functions: P,
     ) -> Result<JsonValue, LixError>
     where
-        P: LixFunctionProvider + Send + 'static,
+        P: CelFunctionProvider,
     {
         let compiled = self.compile(expression)?;
         let context = build_context_with_functions(variables, functions)?;
@@ -70,23 +70,24 @@ pub(crate) fn shared_runtime() -> &'static CelEvaluator {
 #[cfg(test)]
 mod tests {
     use super::CelEvaluator;
-    use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+    use crate::cel::CelFunctionProvider;
     use serde_json::{json, Map as JsonMap, Value as JsonValue};
 
+    #[derive(Clone)]
     struct FixedFunctions;
 
-    impl LixFunctionProvider for FixedFunctions {
-        fn uuid_v7(&mut self) -> String {
+    impl CelFunctionProvider for FixedFunctions {
+        fn call_uuid_v7(&self) -> String {
             "uuid-fixed".to_string()
         }
 
-        fn timestamp(&mut self) -> String {
+        fn call_timestamp(&self) -> String {
             "1970-01-01T00:00:00.000Z".to_string()
         }
     }
 
-    fn fixed_functions() -> SharedFunctionProvider<FixedFunctions> {
-        SharedFunctionProvider::new(FixedFunctions)
+    fn fixed_functions() -> FixedFunctions {
+        FixedFunctions
     }
 
     #[test]

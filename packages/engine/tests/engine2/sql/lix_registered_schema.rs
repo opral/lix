@@ -8,16 +8,19 @@ simulation_test2!(
     lix_registered_schema_insert_makes_schema_visible_to_lix_state,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("main session should open");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
         let register_schema_result = session
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine2_dummy_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             lix_json('{\"x-lix-key\":\"engine2_dummy_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              true,\
              true\
              )",
@@ -26,6 +29,39 @@ simulation_test2!(
         .await
         .expect("registered schema insert should succeed");
         assert_eq!(register_schema_result, ExecuteResult::AffectedRows(1));
+
+        let registered_schema_row = session
+            .execute(
+                "SELECT lixcol_entity_id, value \
+                 FROM lix_registered_schema",
+                &[],
+            )
+            .await
+            .expect("registered schema read should succeed");
+        let ExecuteResult::Rows(registered_schema_rows) = registered_schema_row else {
+            panic!("SELECT should return rows");
+        };
+        let registered_schema_entity_id = registered_schema_rows
+            .rows()
+            .iter()
+            .find_map(|row| match row.values() {
+                [Value::Text(entity_id), Value::Json(value)]
+                    if value.get("x-lix-key").and_then(serde_json::Value::as_str)
+                        == Some("engine2_dummy_schema") =>
+                {
+                    Some(entity_id)
+                }
+                [Value::Text(entity_id), Value::Text(value)] => {
+                    let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
+                    (value.get("x-lix-key").and_then(serde_json::Value::as_str)
+                        == Some("engine2_dummy_schema"))
+                    .then_some(entity_id)
+                }
+                _ => None,
+            })
+            .expect("registered schema row should be visible");
+        assert!(registered_schema_entity_id.starts_with("pk:v1:"));
+        assert_ne!(registered_schema_entity_id, "engine2_dummy_schema~1");
 
         let insert_state_result = session
         .execute(
@@ -66,16 +102,19 @@ simulation_test2!(
 
 simulation_test2!(entity_by_version_expands_global_rows, |sim| async move {
     let engine = sim.boot_engine().await;
-    let session = sim
-        .open_main_session(&engine)
-        .await
-        .expect("main session should open");
+    let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
     session
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine2_overlay_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             lix_json('{\"x-lix-key\":\"engine2_overlay_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              true,\
              true\
              )",
@@ -87,8 +126,8 @@ simulation_test2!(entity_by_version_expands_global_rows, |sim| async move {
     session
             .execute(
                 "INSERT INTO engine2_overlay_schema \
-                 (lixcol_entity_id, id, name, lixcol_global, lixcol_untracked) \
-                 VALUES ('entity-global-overlay', 'entity-global-overlay', 'Global Entity', true, false)",
+                 (id, name, lixcol_global, lixcol_untracked) \
+                 VALUES ('entity-global-overlay', 'Global Entity', true, false)",
                 &[],
             )
             .await
@@ -124,3 +163,60 @@ simulation_test2!(entity_by_version_expands_global_rows, |sim| async move {
         ],
     );
 });
+
+simulation_test2!(
+    registered_typed_entity_surface_uses_primary_key_columns,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine2_typed_entity_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"count\":{\"type\":\"number\"}},\"required\":[\"id\",\"name\",\"count\"],\"additionalProperties\":false}'),\
+                 true,\
+                 true\
+                 )",
+                &[],
+            )
+            .await
+            .expect("registered schema insert should succeed");
+
+        let insert_result = session
+            .execute(
+                "INSERT INTO engine2_typed_entity_schema \
+                 (id, name, count, lixcol_global, lixcol_untracked) \
+                 VALUES ('typed-entity-1', 'Typed Entity', 7, false, false)",
+                &[],
+            )
+            .await
+            .expect("typed entity insert should succeed");
+        assert_eq!(insert_result, ExecuteResult::AffectedRows(1));
+
+        let result = session
+            .execute(
+                "SELECT id, name, count, lixcol_entity_id \
+                 FROM engine2_typed_entity_schema \
+                 WHERE id = 'typed-entity-1'",
+                &[],
+            )
+            .await
+            .expect("typed entity query by primary-key column should succeed");
+        assert_rows_eq(
+            result,
+            vec![vec![
+                Value::Text("typed-entity-1".to_string()),
+                Value::Text("Typed Entity".to_string()),
+                Value::Real(7.0),
+                Value::Text("typed-entity-1".to_string()),
+            ]],
+        );
+    }
+);

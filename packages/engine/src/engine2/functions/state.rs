@@ -1,6 +1,7 @@
 use serde_json::Value as JsonValue;
 
 use crate::engine2::functions::{DeterministicMode, DeterministicSequence};
+use crate::engine2::entity_identity::EntityIdentity;
 use crate::engine2::live_state::{
     LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateWriter,
 };
@@ -79,7 +80,7 @@ async fn load_key_value_row(
         .load_row(&LiveStateRowRequest {
             schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: key.to_string(),
+            entity_id: EntityIdentity::single(key),
             file_id: NullableKeyFilter::Null,
         })
         .await
@@ -154,7 +155,7 @@ fn deterministic_key_value_row(
     timestamp: String,
 ) -> LiveStateRow {
     LiveStateRow {
-        entity_id: key.to_string(),
+        entity_id: crate::engine2::entity_identity::EntityIdentity::single(key),
         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
         file_id: None,
         plugin_key: None,
@@ -291,7 +292,9 @@ mod tests {
             .load_row(&LiveStateRowRequest {
                 schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: DETERMINISTIC_SEQUENCE_KEY.to_string(),
+                entity_id: crate::engine2::entity_identity::EntityIdentity::single(
+                    DETERMINISTIC_SEQUENCE_KEY,
+                ),
                 file_id: NullableKeyFilter::Null,
             })
             .await

@@ -7,10 +7,13 @@ simulation_test2!(
     version_ref_advances_after_tracked_commit,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("main session should open");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
         let initial_head = engine
             .load_version_head_commit_id(sim.main_version_id())
             .await
@@ -40,14 +43,20 @@ simulation_test2!(
     tracked_write_creates_one_commit_without_advancing_global_ref,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("main session should open");
-        let global_session = sim
-            .open_global_session(&engine)
-            .await
-            .expect("global session should open");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let global_session = sim.wrap_session(
+            engine
+                .open_session("global")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
         let global_head_before = engine
             .load_version_head_commit_id("global")
             .await
@@ -100,14 +109,20 @@ simulation_test2!(
     second_commit_parents_previous_version_head,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let session = sim
-            .open_main_session(&engine)
-            .await
-            .expect("main session should open");
-        let global_session = sim
-            .open_global_session(&engine)
-            .await
-            .expect("global session should open");
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let global_session = sim.wrap_session(
+            engine
+                .open_session("global")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
 
         session
             .execute(

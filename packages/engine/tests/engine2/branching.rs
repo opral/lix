@@ -33,10 +33,13 @@ simulation_test2!(
     open_workspace_session_starts_on_seeded_main_version,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let workspace = sim
-            .open_workspace_session(&engine)
-            .await
-            .expect("workspace session should open");
+        let workspace = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
 
         assert_eq!(
             workspace
@@ -122,10 +125,13 @@ simulation_test2!(
             .load_version_head_commit_id("draft-version")
             .await
             .expect("draft head should load");
-        let workspace_before = sim
-            .open_workspace_session(&engine)
-            .await
-            .expect("workspace session should open");
+        let workspace_before = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
         assert_eq!(
             workspace_before
                 .active_version_id()
@@ -158,10 +164,13 @@ simulation_test2!(
             draft_head_before,
             "switching must not mutate the target version ref"
         );
-        let workspace_after = sim
-            .open_workspace_session(&engine)
-            .await
-            .expect("workspace session should open");
+        let workspace_after = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
         assert_eq!(
             workspace_after
                 .active_version_id()
@@ -193,14 +202,20 @@ simulation_test2!(
             .await
             .expect("draft head should load");
 
-        let workspace_a = sim
-            .open_workspace_session(&engine)
-            .await
-            .expect("workspace session should open");
-        let workspace_b = sim
-            .open_workspace_session(&engine)
-            .await
-            .expect("second workspace session should open");
+        let workspace_a = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+        let workspace_b = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("second workspace session should open"),
+            &engine,
+        );
         assert_eq!(
             workspace_a
                 .active_version_id()
@@ -265,10 +280,13 @@ simulation_test2!(
             .await
             .expect("draft write should succeed");
 
-        let workspace = sim
-            .open_workspace_session(&engine)
-            .await
-            .expect("workspace session should open");
+        let workspace = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
         workspace
             .switch_version(SwitchVersionOptions {
                 version_id: "draft-version".to_string(),
@@ -280,10 +298,13 @@ simulation_test2!(
             .reboot_engine_from_current_snapshot()
             .await
             .expect("engine should reopen from current snapshot");
-        let reopened_workspace = sim
-            .open_workspace_session(&reopened_engine)
-            .await
-            .expect("reopened workspace session should open");
+        let reopened_workspace = sim.wrap_session(
+            reopened_engine
+                .open_workspace_session()
+                .await
+                .expect("reopened workspace session should open"),
+            &reopened_engine,
+        );
 
         assert_eq!(
             reopened_workspace
@@ -306,10 +327,13 @@ simulation_test2!(
     switch_version_errors_when_target_ref_is_missing,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let main = sim
-            .open_main_session(&engine)
-            .await
-            .expect("main session should open");
+        let main = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
         let result = main
             .switch_version(SwitchVersionOptions {
@@ -427,10 +451,13 @@ simulation_test2!(
 
         assert_key_value(&main, "draft-merge-source", Some("\"draft\"")).await;
 
-        let global = sim
-            .open_global_session(&engine)
-            .await
-            .expect("global session should open");
+        let global = sim.wrap_session(
+            engine
+                .open_session("global")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
         let commit_snapshot = load_commit_snapshot(&global, &target_head_after).await;
         let parent_commit_ids = commit_snapshot
             .get("parent_commit_ids")
@@ -780,10 +807,13 @@ simulation_test2!(
     merge_version_errors_when_source_version_ref_is_missing,
     |sim| async move {
         let engine = sim.boot_engine().await;
-        let main = sim
-            .open_main_session(&engine)
-            .await
-            .expect("main session should open");
+        let main = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
 
         let error = main
             .merge_version(MergeVersionOptions {
@@ -819,10 +849,13 @@ async fn create_draft_after_shared_write(
     crate::support::simulation_test::engine2::SimSession,
 ) {
     let engine = sim.boot_engine().await;
-    let main = sim
-        .open_main_session(&engine)
-        .await
-        .expect("main session should open");
+    let main = sim.wrap_session(
+        engine
+            .open_session(sim.main_version_id())
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
     main.execute(
         "INSERT INTO lix_key_value (key, value) VALUES ('shared-before-branch', 'shared')",
         &[],
@@ -830,7 +863,7 @@ async fn create_draft_after_shared_write(
     .await
     .expect("source write should succeed");
 
-    let draft = create_draft(&engine, sim, &main).await;
+    let draft = create_draft(&engine, &main).await;
     (engine, main, draft)
 }
 
@@ -842,17 +875,19 @@ async fn create_draft_from_main(
     crate::support::simulation_test::engine2::SimSession,
 ) {
     let engine = sim.boot_engine().await;
-    let main = sim
-        .open_main_session(&engine)
-        .await
-        .expect("main session should open");
-    let draft = create_draft(&engine, sim, &main).await;
+    let main = sim.wrap_session(
+        engine
+            .open_session(sim.main_version_id())
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
+    let draft = create_draft(&engine, &main).await;
     (engine, main, draft)
 }
 
 async fn create_draft(
     engine: &Engine,
-    sim: &crate::support::simulation_test::engine2::Engine2Simulation,
     main: &crate::support::simulation_test::engine2::SimSession,
 ) -> crate::support::simulation_test::engine2::SimSession {
     let receipt = main
@@ -863,9 +898,13 @@ async fn create_draft(
         .await
         .expect("version should be created");
     assert_eq!(receipt.version_id, "draft-version");
-    sim.open_session(engine, receipt.version_id)
-        .await
-        .expect("draft session should open")
+    main.wrap_session(
+        engine
+            .open_session(receipt.version_id)
+            .await
+            .expect("draft session should open"),
+        engine,
+    )
 }
 
 async fn assert_key_value(

@@ -545,17 +545,17 @@ mod tests {
         (backend, tracked_state)
     }
 
-    fn merge_patch_ids(plan: &TrackedStateMergePlan) -> Vec<&str> {
+    fn merge_patch_ids(plan: &TrackedStateMergePlan) -> Vec<String> {
         plan.patches
             .iter()
-            .map(|entry| entry.identity.entity_id.as_str())
+            .map(|entry| entry.identity.entity_id.as_string().expect("identity"))
             .collect()
     }
 
-    fn merge_conflict_ids(plan: &TrackedStateMergePlan) -> Vec<&str> {
+    fn merge_conflict_ids(plan: &TrackedStateMergePlan) -> Vec<String> {
         plan.conflicts
             .iter()
-            .map(|entry| entry.identity.entity_id.as_str())
+            .map(|entry| entry.identity.entity_id.as_string().expect("identity"))
             .collect()
     }
 
@@ -576,7 +576,7 @@ mod tests {
         value: &str,
     ) -> TrackedStateRow {
         TrackedStateRow {
-            entity_id: entity_id.to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::single(entity_id),
             schema_key: "test_schema".to_string(),
             file_id: None,
             plugin_key: None,

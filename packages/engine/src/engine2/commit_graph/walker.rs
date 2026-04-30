@@ -708,7 +708,7 @@ mod tests {
     ) -> CanonicalChange {
         CanonicalChange {
             id: change_id.to_string(),
-            entity_id: commit_id.to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::single(commit_id),
             schema_key: "lix_commit".to_string(),
             schema_version: "1".to_string(),
             file_id: None,

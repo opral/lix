@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::engine2::entity_identity::EntityIdentity;
 use crate::engine2::tracked_state::{
     TrackedStateFilter, TrackedStateRow, TrackedStateScanRequest, TrackedStateStoreReader,
 };
@@ -41,7 +42,7 @@ pub(crate) struct TrackedStateDiffEntry {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TrackedStateDiffIdentity {
     pub(crate) schema_key: String,
-    pub(crate) entity_id: String,
+    pub(crate) entity_id: EntityIdentity,
     pub(crate) file_id: Option<String>,
 }
 
@@ -73,12 +74,12 @@ where
         reader
             .scan_rows_at_commit(left_commit_id, &scan_request)
             .await?,
-    );
+    )?;
     let right_rows = keyed_rows(
         reader
             .scan_rows_at_commit(right_commit_id, &scan_request)
             .await?,
-    );
+    )?;
     let identities = left_rows
         .keys()
         .chain(right_rows.keys())
@@ -108,10 +109,14 @@ fn scan_request_for_diff(request: &TrackedStateDiffRequest) -> TrackedStateScanR
     }
 }
 
-fn keyed_rows(rows: Vec<TrackedStateRow>) -> BTreeMap<TrackedStateDiffIdentity, TrackedStateRow> {
-    rows.into_iter()
-        .map(|row| (TrackedStateDiffIdentity::from_row(&row), row))
-        .collect()
+fn keyed_rows(
+    rows: Vec<TrackedStateRow>,
+) -> Result<BTreeMap<TrackedStateDiffIdentity, TrackedStateRow>, LixError> {
+    let mut keyed = BTreeMap::new();
+    for row in rows {
+        keyed.insert(TrackedStateDiffIdentity::from_row(&row)?, row);
+    }
+    Ok(keyed)
 }
 
 fn classify_diff(
@@ -155,12 +160,12 @@ fn tracked_row_payload_eq(left: &TrackedStateRow, right: &TrackedStateRow) -> bo
 }
 
 impl TrackedStateDiffIdentity {
-    fn from_row(row: &TrackedStateRow) -> Self {
-        Self {
+    fn from_row(row: &TrackedStateRow) -> Result<Self, LixError> {
+        Ok(Self {
             schema_key: row.schema_key.clone(),
             entity_id: row.entity_id.clone(),
             file_id: row.file_id.clone(),
-        }
+        })
     }
 }
 
@@ -203,7 +208,7 @@ mod tests {
 
         assert_eq!(
             kinds(&diff),
-            vec![("entity-a", TrackedStateDiffKind::Added)]
+            vec![("entity-a".to_string(), TrackedStateDiffKind::Added)]
         );
         assert!(diff.entries[0].before.is_none());
         assert_eq!(
@@ -225,7 +230,7 @@ mod tests {
 
         assert_eq!(
             kinds(&diff),
-            vec![("entity-a", TrackedStateDiffKind::Removed)]
+            vec![("entity-a".to_string(), TrackedStateDiffKind::Removed)]
         );
         assert_eq!(
             diff.entries[0]
@@ -251,7 +256,7 @@ mod tests {
 
         assert_eq!(
             kinds(&diff),
-            vec![("entity-a", TrackedStateDiffKind::Removed)]
+            vec![("entity-a".to_string(), TrackedStateDiffKind::Removed)]
         );
         let entry = &diff.entries[0];
         assert_eq!(
@@ -281,7 +286,7 @@ mod tests {
 
         assert_eq!(
             kinds(&diff),
-            vec![("entity-a", TrackedStateDiffKind::Added)]
+            vec![("entity-a".to_string(), TrackedStateDiffKind::Added)]
         );
         let entry = &diff.entries[0];
         assert_eq!(
@@ -311,7 +316,7 @@ mod tests {
 
         assert_eq!(
             kinds(&diff),
-            vec![("entity-a", TrackedStateDiffKind::Modified)]
+            vec![("entity-a".to_string(), TrackedStateDiffKind::Modified)]
         );
         assert!(diff.entries[0].before_is_live());
         assert!(diff.entries[0].after_is_live());
@@ -366,7 +371,7 @@ mod tests {
                 &TrackedStateDiffRequest {
                     filter: TrackedStateFilter {
                         schema_keys: vec!["schema-b".to_string()],
-                        entity_ids: vec!["entity-b".to_string()],
+                        entity_ids: vec![crate::engine2::entity_identity::EntityIdentity::single("entity-b")],
                         file_ids: vec![NullableKeyFilter::Value("file-b".to_string())],
                         ..Default::default()
                     },
@@ -377,7 +382,7 @@ mod tests {
 
         assert_eq!(
             kinds(&diff),
-            vec![("entity-b", TrackedStateDiffKind::Added)]
+            vec![("entity-b".to_string(), TrackedStateDiffKind::Added)]
         );
     }
 
@@ -416,10 +421,15 @@ mod tests {
         (backend, tracked_state)
     }
 
-    fn kinds(diff: &TrackedStateDiff) -> Vec<(&str, TrackedStateDiffKind)> {
+    fn kinds(diff: &TrackedStateDiff) -> Vec<(String, TrackedStateDiffKind)> {
         diff.entries
             .iter()
-            .map(|entry| (entry.identity.entity_id.as_str(), entry.kind))
+            .map(|entry| {
+                (
+                    entry.identity.entity_id.as_string().expect("identity"),
+                    entry.kind,
+                )
+            })
             .collect()
     }
 
@@ -459,7 +469,7 @@ mod tests {
         value: &str,
     ) -> TrackedStateRow {
         TrackedStateRow {
-            entity_id: entity_id.to_string(),
+            entity_id: EntityIdentity::single(entity_id),
             schema_key: schema_key.to_string(),
             file_id: file_id.map(str::to_string),
             plugin_key: None,

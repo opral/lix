@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::binary_cas::BinaryCasContext;
 use crate::engine2::changelog::ChangelogContext;
 use crate::engine2::commit_graph::CommitGraphContext;
+use crate::engine2::entity_identity::EntityIdentity;
 use crate::engine2::init::InitReceipt;
 use crate::engine2::live_state::LiveStateContext;
 use crate::engine2::live_state::LiveStateRowRequest;
@@ -182,7 +183,7 @@ async fn assert_initialized(
         .load_row(&LiveStateRowRequest {
             schema_key: "lix_key_value".to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: "lix_id".to_string(),
+            entity_id: EntityIdentity::single("lix_id"),
             file_id: NullableKeyFilter::Null,
         })
         .await?

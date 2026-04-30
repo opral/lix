@@ -338,7 +338,7 @@ fn parse_directory_history_records(
         .map(|entry| {
             let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
                 return Ok(DirectoryHistoryRecord {
-                    id: entry.change.entity_id.clone(),
+                    id: entry.change.entity_id.as_string()?,
                     parent_id: None,
                     name: None,
                     hidden: None,

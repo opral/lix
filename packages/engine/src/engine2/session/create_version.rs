@@ -87,7 +87,9 @@ impl SessionContext {
 
 fn version_descriptor_stage_row(version_id: &str, name: &str) -> Result<StageRow, LixError> {
     Ok(StageRow {
-        entity_id: version_id.to_string(),
+        entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single(
+            version_id,
+        )),
         schema_key: VERSION_DESCRIPTOR_SCHEMA_KEY.to_string(),
         file_id: None,
         plugin_key: None,
@@ -110,7 +112,9 @@ fn version_descriptor_stage_row(version_id: &str, name: &str) -> Result<StageRow
 
 fn version_ref_stage_row(version_id: &str, commit_id: &str) -> Result<StageRow, LixError> {
     Ok(StageRow {
-        entity_id: version_id.to_string(),
+        entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single(
+            version_id,
+        )),
         schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
         file_id: None,
         plugin_key: None,

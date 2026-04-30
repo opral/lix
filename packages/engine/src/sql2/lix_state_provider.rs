@@ -25,6 +25,7 @@ use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use futures_util::{stream, StreamExt, TryStreamExt};
 
+use crate::engine2::entity_identity::EntityIdentity;
 use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
@@ -811,7 +812,18 @@ fn lix_state_write_rows_from_batch(
                 });
 
             Ok(StageRow {
-                entity_id: required_string_value(batch, row_index, "entity_id")?,
+                entity_id: Some(
+                    EntityIdentity::from_string(&required_string_value(
+                        batch,
+                        row_index,
+                        "entity_id",
+                    )?)
+                    .map_err(|error| {
+                        DataFusionError::Execution(format!(
+                            "lix_state INSERT has invalid entity_id: {error}"
+                        ))
+                    })?,
+                ),
                 schema_key: required_string_value(batch, row_index, "schema_key")?,
                 file_id: optional_string_value(batch, row_index, "file_id")?,
                 plugin_key: optional_string_value(batch, row_index, "plugin_key")?,
@@ -1138,7 +1150,7 @@ fn lix_state_scan_request(
         entity_ids: route
             .entity_ids
             .as_ref()
-            .map(|values| values.iter().cloned().collect())
+            .map(|values| values.iter().map(|value| EntityIdentity::single(value)).collect())
             .unwrap_or_default(),
         version_ids: default_version_id
             .map(|value| vec![value.to_string()])
@@ -1341,7 +1353,15 @@ fn lix_state_record_batch(
         .iter()
         .map(|field| {
             Ok(match field.name().as_str() {
-                "entity_id" => string_array(rows.iter().map(|row| Some(row.entity_id.as_str()))),
+                "entity_id" => Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|row| {
+                            row.entity_id
+                                .as_string()
+                                .map(Some)
+                        })
+                        .collect::<std::result::Result<Vec<_>, LixError>>()?,
+                )) as ArrayRef,
                 "schema_key" => string_array(rows.iter().map(|row| Some(row.schema_key.as_str()))),
                 "file_id" => string_array(rows.iter().map(|row| row.file_id.as_deref())),
                 "plugin_key" => string_array(rows.iter().map(|row| row.plugin_key.as_deref())),
@@ -1418,8 +1438,9 @@ mod tests {
         LixStateDeleteExec, LixStateFilterPredicate, LixStateInsertSink, LixStateProvider,
         LixStateUpdateExec,
     };
-    use crate::engine2::live_state::{
-        LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+    use crate::engine2::{
+        entity_identity::EntityIdentity,
+        live_state::{LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest},
     };
     use crate::engine2::transaction::types::{
         StageRow, StageWrite, StageWriteOutcome, StageWriteStager,
@@ -1667,7 +1688,7 @@ mod tests {
 
     fn live_row(entity_id: &str, metadata: Option<&str>) -> LiveStateRow {
         LiveStateRow {
-            entity_id: entity_id.to_string(),
+            entity_id: EntityIdentity::from_string(entity_id).expect("entity id should decode"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             plugin_key: None,
@@ -2013,7 +2034,7 @@ mod tests {
         assert_eq!(
             rows,
             vec![StageRow {
-                entity_id: "entity-1".to_string(),
+                entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single("entity-1")),
                 schema_key: "lix_key_value".to_string(),
                 file_id: None,
                 plugin_key: Some("plugin-a".to_string()),
@@ -2063,7 +2084,7 @@ mod tests {
             stager.writes.lock().expect("writes lock").as_slice(),
             &[StageWrite::Rows {
                 rows: vec![StageRow {
-                    entity_id: "entity-1".to_string(),
+                    entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single("entity-1")),
                     schema_key: "lix_key_value".to_string(),
                     file_id: None,
                     plugin_key: Some("plugin-a".to_string()),
@@ -2173,7 +2194,7 @@ mod tests {
             stager.writes.lock().expect("writes lock").as_slice(),
             &[StageWrite::Rows {
                 rows: vec![StageRow {
-                    entity_id: "entity-1".to_string(),
+                    entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single("entity-1")),
                     schema_key: "lix_key_value".to_string(),
                     file_id: None,
                     plugin_key: None,
@@ -2232,7 +2253,7 @@ mod tests {
             &[StageWrite::Rows {
                 rows: vec![
                     StageRow {
-                        entity_id: "entity-1".to_string(),
+                        entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single("entity-1")),
                         schema_key: "lix_key_value".to_string(),
                         file_id: None,
                         plugin_key: None,
@@ -2248,7 +2269,7 @@ mod tests {
                         version_id: "version-a".to_string(),
                     },
                     StageRow {
-                        entity_id: "entity-2".to_string(),
+                        entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single("entity-2")),
                         schema_key: "lix_key_value".to_string(),
                         file_id: None,
                         plugin_key: None,

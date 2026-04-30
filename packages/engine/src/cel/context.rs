@@ -1,17 +1,17 @@
 use cel::Context;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::LixError;
 
+use super::provider::CelFunctionProvider;
 use super::value::json_to_cel;
 
-pub fn build_context_with_functions<P>(
+pub(crate) fn build_context_with_functions<P>(
     variables: &JsonMap<String, JsonValue>,
-    functions: SharedFunctionProvider<P>,
+    functions: P,
 ) -> Result<Context<'static>, LixError>
 where
-    P: LixFunctionProvider + Send + 'static,
+    P: CelFunctionProvider,
 {
     let mut context = Context::default();
 
@@ -33,13 +33,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::build_context_with_functions;
-    use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+    use crate::cel::CelFunctionProvider;
     use cel::Program;
     use serde_json::Map as JsonMap;
-
-    fn fixed_functions() -> SharedFunctionProvider<FixedFunctions> {
-        SharedFunctionProvider::new(FixedFunctions)
-    }
 
     #[test]
     fn registers_lix_uuid_v7_function() {
@@ -62,23 +58,27 @@ mod tests {
         assert!(err.to_string().contains("Undeclared reference"));
     }
 
+    #[derive(Clone)]
     struct FixedFunctions;
 
-    impl LixFunctionProvider for FixedFunctions {
-        fn uuid_v7(&mut self) -> String {
+    impl CelFunctionProvider for FixedFunctions {
+        fn call_uuid_v7(&self) -> String {
             "uuid-fixed".to_string()
         }
 
-        fn timestamp(&mut self) -> String {
+        fn call_timestamp(&self) -> String {
             "1970-01-01T00:00:00.000Z".to_string()
         }
     }
 
+    fn fixed_functions() -> FixedFunctions {
+        FixedFunctions
+    }
+
     #[test]
     fn uses_supplied_function_provider() {
-        let functions = SharedFunctionProvider::new(FixedFunctions);
-        let context =
-            build_context_with_functions(&JsonMap::new(), functions).expect("build context");
+        let context = build_context_with_functions(&JsonMap::new(), fixed_functions())
+            .expect("build context");
         let program = Program::compile("lix_uuid_v7()").expect("compile CEL");
         let value = program.execute(&context).expect("execute CEL");
         assert_eq!(value.json().expect("to json").as_str(), Some("uuid-fixed"));

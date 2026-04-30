@@ -226,7 +226,7 @@ where
         let Some(commit) = self
             .commit_graph
             .reader(store)
-            .load_commit(&request.entity_id)
+            .load_commit(&request.entity_id.as_string()?)
             .await?
         else {
             return Ok(None);
@@ -293,13 +293,15 @@ where
 
         let identities = tracked_rows
             .iter()
-            .map(|row| UntrackedStateIdentity {
-                version_id: row.version_id.clone(),
-                schema_key: row.schema_key.clone(),
-                entity_id: row.entity_id.clone(),
-                file_id: row.file_id.clone(),
+            .map(|row| {
+                Ok(UntrackedStateIdentity {
+                    version_id: row.version_id.clone(),
+                    schema_key: row.schema_key.clone(),
+                    entity_id: row.entity_id.clone(),
+                    file_id: row.file_id.clone(),
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, LixError>>()?;
         {
             let store: &mut dyn KvWriter = &mut self.store;
             self.untracked_state
@@ -415,7 +417,9 @@ async fn all_version_ref_ids(
             ..Default::default()
         })
         .await?;
-    Ok(rows.into_iter().map(|row| row.entity_id).collect())
+    rows.into_iter()
+        .map(|row| row.entity_id.as_string())
+        .collect()
 }
 
 async fn load_version_ref_commit_id(
@@ -428,7 +432,7 @@ async fn load_version_ref_commit_id(
         .load_row(&UntrackedStateRowRequest {
             schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: version_id.to_string(),
+            entity_id: crate::engine2::entity_identity::EntityIdentity::single(version_id),
             file_id: crate::NullableKeyFilter::Null,
         })
         .await?
@@ -634,7 +638,13 @@ fn parent_commit_id_for_commit_rows(
 ) -> Result<Option<String>, LixError> {
     let Some(row) = rows
         .iter()
-        .find(|row| row.schema_key == COMMIT_SCHEMA_KEY && row.entity_id == commit_id)
+        .find(|row| {
+            row.schema_key == COMMIT_SCHEMA_KEY
+                && row
+                    .entity_id
+                    .as_string()
+                    .is_ok_and(|entity_id| entity_id == commit_id)
+        })
     else {
         return Ok(None);
     };
@@ -752,6 +762,7 @@ mod tests {
 
     use super::*;
     use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::engine2::entity_identity::EntityIdentity;
     use crate::engine2::live_state::LiveStateFilter;
     use crate::engine2::tracked_state::TrackedStateScanRequest;
     use crate::engine2::untracked_state::{UntrackedStateContext, UntrackedStateRow};
@@ -813,7 +824,7 @@ mod tests {
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: "global".to_string(),
-                entity_id: "selected-tab".to_string(),
+                entity_id: crate::engine2::entity_identity::EntityIdentity::single("selected-tab"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -894,7 +905,7 @@ mod tests {
             .delete_rows(&[crate::engine2::untracked_state::UntrackedStateIdentity {
                 version_id: "global".to_string(),
                 schema_key: "lix_key_value".to_string(),
-                entity_id: "selected-tab".to_string(),
+                entity_id: EntityIdentity::single("selected-tab"),
                 file_id: None,
             }])
             .await
@@ -1385,7 +1396,7 @@ mod tests {
             .expect("commit rows should scan");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, "commit-a");
+        assert_eq!(rows[0].entity_id.as_string().as_deref(), Ok("commit-a"));
         assert_eq!(rows[0].schema_key, COMMIT_SCHEMA_KEY);
         assert_eq!(rows[0].version_id, "version-a");
         assert!(rows[0].global);
@@ -1410,14 +1421,14 @@ mod tests {
             .load_row(&LiveStateRowRequest {
                 schema_key: COMMIT_SCHEMA_KEY.to_string(),
                 version_id: "version-a".to_string(),
-                entity_id: "commit-a".to_string(),
+                entity_id: crate::engine2::entity_identity::EntityIdentity::single("commit-a"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
             .expect("commit row should load")
             .expect("commit row should exist");
 
-        assert_eq!(row.entity_id, "commit-a");
+        assert_eq!(row.entity_id.as_string().as_deref(), Ok("commit-a"));
         assert_eq!(row.version_id, "version-a");
         assert!(row.global);
         assert_eq!(row.change_id.as_deref(), Some("change-commit-a"));
@@ -1435,7 +1446,7 @@ mod tests {
             .load_row(&LiveStateRowRequest {
                 schema_key: COMMIT_SCHEMA_KEY.to_string(),
                 version_id: "missing-version".to_string(),
-                entity_id: "commit-a".to_string(),
+                entity_id: crate::engine2::entity_identity::EntityIdentity::single("commit-a"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -1717,7 +1728,7 @@ mod tests {
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: "global".to_string(),
-                entity_id: "selected-tab".to_string(),
+                entity_id: crate::engine2::entity_identity::EntityIdentity::single("selected-tab"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -1733,7 +1744,7 @@ mod tests {
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: version_id.to_string(),
-                entity_id: "selected-tab".to_string(),
+                entity_id: crate::engine2::entity_identity::EntityIdentity::single("selected-tab"),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -1750,7 +1761,7 @@ mod tests {
             .scan_rows(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec!["lix_key_value".to_string()],
-                    entity_ids: vec!["selected-tab".to_string()],
+                    entity_ids: vec![crate::engine2::entity_identity::EntityIdentity::single("selected-tab")],
                     version_ids: vec![version_id.to_string()],
                     file_ids: vec![NullableKeyFilter::Null],
                     include_tombstones,
@@ -1805,7 +1816,7 @@ mod tests {
         commit_id: &str,
     ) -> LiveStateRow {
         LiveStateRow {
-            entity_id: "selected-tab".to_string(),
+            entity_id: identity("selected-tab"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             plugin_key: None,
@@ -1843,7 +1854,7 @@ mod tests {
 
     fn untracked_row_at(version_id: &str, value: &str) -> UntrackedStateRow {
         UntrackedStateRow {
-            entity_id: "selected-tab".to_string(),
+            entity_id: identity("selected-tab"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             plugin_key: None,
@@ -1859,7 +1870,7 @@ mod tests {
 
     fn version_ref_row(version_id: &str, commit_id: &str) -> UntrackedStateRow {
         UntrackedStateRow {
-            entity_id: version_id.to_string(),
+            entity_id: identity(version_id),
             schema_key: "lix_version_ref".to_string(),
             file_id: None,
             plugin_key: None,
@@ -1922,7 +1933,7 @@ mod tests {
         snapshot: serde_json::Value,
     ) -> LiveStateRow {
         LiveStateRow {
-            entity_id: commit_id.to_string(),
+            entity_id: identity(commit_id),
             schema_key: COMMIT_SCHEMA_KEY.to_string(),
             file_id: None,
             plugin_key: None,
@@ -1951,7 +1962,7 @@ mod tests {
             .writer(transaction.as_mut())
             .append_changes(&[crate::engine2::changelog::CanonicalChange {
                 id: format!("change-{commit_id}"),
-                entity_id: commit_id.to_string(),
+                entity_id: crate::engine2::entity_identity::EntityIdentity::single(commit_id),
                 schema_key: COMMIT_SCHEMA_KEY.to_string(),
                 schema_version: "1".to_string(),
                 file_id: None,
@@ -1974,5 +1985,9 @@ mod tests {
             .commit()
             .await
             .expect("transaction should commit");
+    }
+
+    fn identity(entity_id: &str) -> EntityIdentity {
+        EntityIdentity::single(entity_id)
     }
 }
