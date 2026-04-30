@@ -19,6 +19,7 @@ use crate::schema::{
 use crate::{LixError, NullableKeyFilter};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
+const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const STATE_SURFACE_SCHEMA_KEY: &str = "lix_state";
 
 /// Immutable view of the final transaction write set before persistence.
@@ -61,6 +62,8 @@ pub(crate) async fn validate_staged_writes(
     input: TransactionValidationInput<'_>,
 ) -> Result<(), LixError> {
     let schema_catalog = SchemaCatalogSnapshot::from_transaction_input(&input)?;
+    let pending_file_descriptors =
+        PendingFileDescriptorIndex::from_staged_writes(input.staged_writes);
     let mut compiled_schemas = CompiledSchemaCatalog::new(&schema_catalog);
     let mut pending_constraints = PendingConstraintIndexes::default();
     let mut staged_snapshots = Vec::new();
@@ -80,6 +83,7 @@ pub(crate) async fn validate_staged_writes(
                         ),
                     )
                 })?;
+            validate_file_owner_reference(&input, &pending_file_descriptors, row).await?;
             validate_primary_key_identity(row, schema, snapshot)?;
             pending_constraints.remember_row(row, schema, snapshot)?;
             pending_constraints.remember_foreign_key_references(
@@ -103,6 +107,123 @@ pub(crate) async fn validate_staged_writes(
     validate_committed_delete_restrictions(&input, &schema_catalog, &pending_constraints).await?;
     validate_committed_unique_constraints(&input, &pending_constraints).await?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingFileDescriptorState {
+    Present,
+    Tombstone,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PendingFileDescriptorIndex {
+    by_version_and_file_id: BTreeMap<(String, String), PendingFileDescriptorState>,
+}
+
+impl PendingFileDescriptorIndex {
+    fn from_staged_writes(staged_writes: &StagedWriteSet) -> Self {
+        let mut index = Self::default();
+        for row in &staged_writes.state_rows {
+            if row.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || row.file_id.is_some() {
+                continue;
+            }
+            if let Ok(file_id) = row.entity_id.as_string() {
+                let state = if row.snapshot_content.is_some() {
+                    PendingFileDescriptorState::Present
+                } else {
+                    PendingFileDescriptorState::Tombstone
+                };
+                index
+                    .by_version_and_file_id
+                    .insert((row.version_id.clone(), file_id), state);
+            }
+        }
+        index
+    }
+
+    fn state(&self, version_id: &str, file_id: &str) -> Option<PendingFileDescriptorState> {
+        self.by_version_and_file_id
+            .get(&(version_id.to_string(), file_id.to_string()))
+            .copied()
+    }
+}
+
+async fn validate_file_owner_reference(
+    input: &TransactionValidationInput<'_>,
+    pending_file_descriptors: &PendingFileDescriptorIndex,
+    row: &StagedStateRow,
+) -> Result<(), LixError> {
+    let Some(file_id) = row.file_id.as_deref() else {
+        return Ok(());
+    };
+
+    if pending_file_descriptor_exists(pending_file_descriptors, &row.version_id, file_id) {
+        return Ok(());
+    }
+
+    if committed_file_descriptor_exists(input.live_state, &row.version_id, file_id).await? {
+        return Ok(());
+    }
+
+    Err(missing_file_owner_reference_error(row, file_id)?)
+}
+
+fn pending_file_descriptor_exists(
+    pending_file_descriptors: &PendingFileDescriptorIndex,
+    version_id: &str,
+    file_id: &str,
+) -> bool {
+    matches!(
+        pending_file_descriptors.state(version_id, file_id),
+        Some(PendingFileDescriptorState::Present)
+    )
+}
+
+async fn committed_file_descriptor_exists(
+    live_state: &dyn LiveStateReader,
+    version_id: &str,
+    file_id: &str,
+) -> Result<bool, LixError> {
+    committed_file_descriptor_exists_in_exact_version(live_state, version_id, file_id).await
+}
+
+async fn committed_file_descriptor_exists_in_exact_version(
+    live_state: &dyn LiveStateReader,
+    version_id: &str,
+    file_id: &str,
+) -> Result<bool, LixError> {
+    let Some(row) = live_state
+        .load_row(&LiveStateRowRequest {
+            schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+            version_id: version_id.to_string(),
+            entity_id: EntityIdentity::single(file_id),
+            file_id: NullableKeyFilter::Null,
+        })
+        .await?
+    else {
+        return Ok(false);
+    };
+    Ok(row.snapshot_content.is_some()
+        && row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+        && row.entity_id == EntityIdentity::single(file_id)
+        && row.file_id.is_none()
+        && committed_row_is_exact_version_scoped(&row, version_id))
+}
+
+fn missing_file_owner_reference_error(
+    row: &StagedStateRow,
+    file_id: &str,
+) -> Result<LixError, LixError> {
+    Ok(LixError::new(
+        LixError::CODE_UNKNOWN,
+        format!(
+            "file ownership validation failed for schema '{}': entity '{}' references missing file_id '{}' in effective file scope for version '{}'",
+            row.schema_key,
+            row.entity_id.as_string()?,
+            file_id,
+            row.version_id
+        ),
+    ))
 }
 
 fn validate_staged_row_shape(row: &StagedStateRow) -> Result<(), LixError> {
@@ -1876,16 +1997,21 @@ mod tests {
     impl LiveStateReader for EmptyLiveStateReader {
         async fn scan_rows(
             &self,
-            _request: &LiveStateScanRequest,
+            request: &LiveStateScanRequest,
         ) -> Result<Vec<LiveStateRow>, LixError> {
-            Ok(Vec::new())
+            Ok(test_file_descriptor_rows()
+                .into_iter()
+                .filter(|row| live_state_row_matches_scan(row, request))
+                .collect())
         }
 
         async fn load_row(
             &self,
-            _request: &LiveStateRowRequest,
+            request: &LiveStateRowRequest,
         ) -> Result<Option<LiveStateRow>, LixError> {
-            Ok(None)
+            Ok(test_file_descriptor_rows()
+                .into_iter()
+                .find(|row| live_state_row_matches_load(row, request)))
         }
     }
 
@@ -1909,6 +2035,8 @@ mod tests {
             Ok(self
                 .rows
                 .iter()
+                .cloned()
+                .chain(test_file_descriptor_rows())
                 .filter(|row| {
                     request.filter.schema_keys.is_empty()
                         || request.filter.schema_keys.contains(&row.schema_key)
@@ -1925,6 +2053,60 @@ mod tests {
                             .iter()
                             .any(|filter| filter.matches(row.file_id.as_ref()))
                 })
+                .collect())
+        }
+
+        async fn load_row(
+            &self,
+            request: &LiveStateRowRequest,
+        ) -> Result<Option<LiveStateRow>, LixError> {
+            Ok(self
+                .rows
+                .iter()
+                .cloned()
+                .chain(test_file_descriptor_rows())
+                .find(|row| {
+                    row.schema_key == request.schema_key
+                        && row.version_id == request.version_id
+                        && row.entity_id == request.entity_id
+                        && request.file_id.matches(row.file_id.as_ref())
+                }))
+        }
+    }
+
+    struct StrictEmptyLiveStateReader;
+
+    #[async_trait]
+    impl LiveStateReader for StrictEmptyLiveStateReader {
+        async fn scan_rows(
+            &self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<Vec<LiveStateRow>, LixError> {
+            Ok(Vec::new())
+        }
+
+        async fn load_row(
+            &self,
+            _request: &LiveStateRowRequest,
+        ) -> Result<Option<LiveStateRow>, LixError> {
+            Ok(None)
+        }
+    }
+
+    struct StrictStaticLiveStateReader {
+        rows: Vec<LiveStateRow>,
+    }
+
+    #[async_trait]
+    impl LiveStateReader for StrictStaticLiveStateReader {
+        async fn scan_rows(
+            &self,
+            request: &LiveStateScanRequest,
+        ) -> Result<Vec<LiveStateRow>, LixError> {
+            Ok(self
+                .rows
+                .iter()
+                .filter(|row| live_state_row_matches_scan(row, request))
                 .cloned()
                 .collect())
         }
@@ -1936,12 +2118,7 @@ mod tests {
             Ok(self
                 .rows
                 .iter()
-                .find(|row| {
-                    row.schema_key == request.schema_key
-                        && row.version_id == request.version_id
-                        && row.entity_id == request.entity_id
-                        && request.file_id.matches(row.file_id.as_ref())
-                })
+                .find(|row| live_state_row_matches_load(row, request))
                 .cloned())
         }
     }
@@ -2353,6 +2530,97 @@ mod tests {
         validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect("tombstone should only require schema existence");
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_missing_file_owner_reference() {
+        let visible_schemas = vec![unique_schema()];
+        let staged_writes = StagedWriteSet {
+            state_rows: vec![unique_row("post-1", "hello-world", "first")],
+            ..empty_staged_write_set()
+        };
+
+        let error = validate_staged_writes(TransactionValidationInput::new(
+            &staged_writes,
+            &visible_schemas,
+            &StrictEmptyLiveStateReader,
+        ))
+        .await
+        .expect_err("non-null file_id should require a file descriptor");
+
+        assert_eq!(error.code, LixError::CODE_UNKNOWN);
+        assert!(error
+            .description
+            .contains("file ownership validation failed"));
+        assert!(error.description.contains("file-a"));
+    }
+
+    #[tokio::test]
+    async fn validation_allows_pending_file_owner_reference() {
+        let visible_schemas = vec![unique_schema(), file_descriptor_schema()];
+        let staged_writes = StagedWriteSet {
+            state_rows: vec![
+                staged_file_descriptor_row("file-a", "version-a"),
+                unique_row("post-1", "hello-world", "first"),
+            ],
+            ..empty_staged_write_set()
+        };
+
+        validate_staged_writes(TransactionValidationInput::new(
+            &staged_writes,
+            &visible_schemas,
+            &StrictEmptyLiveStateReader,
+        ))
+        .await
+        .expect("same-transaction file descriptor should satisfy file ownership");
+    }
+
+    #[tokio::test]
+    async fn validation_allows_committed_file_owner_reference() {
+        let visible_schemas = vec![unique_schema()];
+        let staged_writes = StagedWriteSet {
+            state_rows: vec![unique_row("post-1", "hello-world", "first")],
+            ..empty_staged_write_set()
+        };
+        let live_state = StaticLiveStateReader {
+            rows: vec![committed_file_descriptor_row("file-a", "version-a")],
+        };
+
+        validate_staged_writes(TransactionValidationInput::new(
+            &staged_writes,
+            &visible_schemas,
+            &live_state,
+        ))
+        .await
+        .expect("committed file descriptor should satisfy file ownership");
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_file_owner_reference_that_exists_only_in_global() {
+        let visible_schemas = vec![unique_schema()];
+        let staged_writes = StagedWriteSet {
+            state_rows: vec![unique_row("post-1", "hello-world", "first")],
+            ..empty_staged_write_set()
+        };
+        let live_state = StrictStaticLiveStateReader {
+            rows: vec![committed_file_descriptor_row(
+                "file-a",
+                crate::version::GLOBAL_VERSION_ID,
+            )],
+        };
+
+        let error = validate_staged_writes(TransactionValidationInput::new(
+            &staged_writes,
+            &visible_schemas,
+            &live_state,
+        ))
+        .await
+        .expect_err("global file descriptor should not satisfy a version-local row");
+
+        assert_eq!(error.code, LixError::CODE_UNKNOWN);
+        assert!(error
+            .description
+            .contains("file ownership validation failed"));
     }
 
     #[tokio::test]
@@ -3428,6 +3696,35 @@ mod tests {
         }
     }
 
+    fn live_state_row_matches_scan(row: &LiveStateRow, request: &LiveStateScanRequest) -> bool {
+        (request.filter.schema_keys.is_empty()
+            || request.filter.schema_keys.contains(&row.schema_key))
+            && (request.filter.version_ids.is_empty()
+                || request.filter.version_ids.contains(&row.version_id))
+            && (request.filter.file_ids.is_empty()
+                || request
+                    .filter
+                    .file_ids
+                    .iter()
+                    .any(|filter| filter.matches(row.file_id.as_ref())))
+    }
+
+    fn live_state_row_matches_load(row: &LiveStateRow, request: &LiveStateRowRequest) -> bool {
+        row.schema_key == request.schema_key
+            && row.version_id == request.version_id
+            && row.entity_id == request.entity_id
+            && request.file_id.matches(row.file_id.as_ref())
+    }
+
+    fn test_file_descriptor_rows() -> Vec<LiveStateRow> {
+        vec![
+            committed_file_descriptor_row("file-a", "version-a"),
+            committed_file_descriptor_row("file-a", "version-b"),
+            committed_file_descriptor_row("file-b", "version-a"),
+            committed_file_descriptor_row("file-b", "version-b"),
+        ]
+    }
+
     fn pending_registered_schema_row(schema_key: &str, schema_version: &str) -> StagedStateRow {
         pending_registered_schema_from_definition(json!({
             "x-lix-key": schema_key,
@@ -3489,6 +3786,12 @@ mod tests {
     fn registered_schema() -> JsonValue {
         builtin_schema_definition(REGISTERED_SCHEMA_KEY)
             .expect("lix_registered_schema builtin schema should exist")
+            .clone()
+    }
+
+    fn file_descriptor_schema() -> JsonValue {
+        builtin_schema_definition(FILE_DESCRIPTOR_SCHEMA_KEY)
+            .expect("lix_file_descriptor builtin schema should exist")
             .clone()
     }
 
@@ -3639,6 +3942,32 @@ mod tests {
         row.version_id = "version-a".to_string();
         row.global = false;
         row
+    }
+
+    fn staged_file_descriptor_row(file_id: &str, version_id: &str) -> StagedStateRow {
+        let mut row = staged_row(
+            FILE_DESCRIPTOR_SCHEMA_KEY,
+            "1",
+            Some(
+                json!({
+                    "id": file_id,
+                    "directory_id": null,
+                    "name": file_id,
+                    "extension": null,
+                    "hidden": false,
+                })
+                .to_string(),
+            ),
+        );
+        row.entity_id = crate::engine2::entity_identity::EntityIdentity::single(file_id);
+        row.file_id = None;
+        row.version_id = version_id.to_string();
+        row.global = version_id == crate::version::GLOBAL_VERSION_ID;
+        row
+    }
+
+    fn committed_file_descriptor_row(file_id: &str, version_id: &str) -> LiveStateRow {
+        LiveStateRow::from(staged_file_descriptor_row(file_id, version_id))
     }
 
     fn committed_unique_row(entity_id: &str, slug: &str, title: &str) -> LiveStateRow {
