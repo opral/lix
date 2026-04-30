@@ -506,7 +506,9 @@ mod tests {
             .load_exact(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: "global".to_string(),
-                entity_id: crate::engine2::entity_identity::EntityIdentity::single("sql2-duplicate-key"),
+                entity_id: crate::engine2::entity_identity::EntityIdentity::single(
+                    "sql2-duplicate-key",
+                ),
                 file_id: NullableKeyFilter::Null,
             })
             .expect("staged row should be visible");
@@ -816,7 +818,9 @@ mod tests {
             .expect("overlay should build from staged rows");
         let rows = overlay.scan(&LiveStateScanRequest {
             filter: LiveStateFilter {
-                entity_ids: vec![crate::engine2::entity_identity::EntityIdentity::single("shared-entity")],
+                entity_ids: vec![crate::engine2::entity_identity::EntityIdentity::single(
+                    "shared-entity",
+                )],
                 include_tombstones: true,
                 ..LiveStateFilter::default()
             },

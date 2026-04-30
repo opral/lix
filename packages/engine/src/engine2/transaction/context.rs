@@ -89,9 +89,11 @@ impl<'a> Transaction<'a> {
         runtime_functions: &FunctionContext,
     ) -> Result<TransactionCommitOutcome, LixError> {
         let staged_writes = self.staged_writes.drain()?;
+        let live_state_reader = self.live_state.reader(Arc::clone(self.backend));
         validate_staged_writes(TransactionValidationInput::new(
             &staged_writes,
             &self.visible_schemas,
+            &live_state_reader,
         ))
         .await?;
         commit::commit_staged_writes(
@@ -319,7 +321,9 @@ mod tests {
                 &head_commit_id,
                 &TrackedStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
-                    entity_id: crate::engine2::entity_identity::EntityIdentity::single("tracked-programmatic"),
+                    entity_id: crate::engine2::entity_identity::EntityIdentity::single(
+                        "tracked-programmatic",
+                    ),
                     file_id: NullableKeyFilter::Null,
                 },
             )
@@ -337,7 +341,9 @@ mod tests {
             .load_row(&UntrackedStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: crate::engine2::entity_identity::EntityIdentity::single("untracked-programmatic"),
+                entity_id: crate::engine2::entity_identity::EntityIdentity::single(
+                    "untracked-programmatic",
+                ),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -353,7 +359,9 @@ mod tests {
             .load_row(&crate::engine2::live_state::LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: crate::engine2::entity_identity::EntityIdentity::single("untracked-programmatic"),
+                entity_id: crate::engine2::entity_identity::EntityIdentity::single(
+                    "untracked-programmatic",
+                ),
                 file_id: NullableKeyFilter::Null,
             })
             .await
@@ -441,11 +449,247 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stage_rows_rejects_unknown_schema_key_without_sql() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let (_live_state, _binary_cas, _changelog, _version_ref, _runtime_functions, transaction) =
+            open_test_transaction(&backend).await;
+
+        let mut row = key_value_stage_row("unknown-schema", "value", false);
+        row.schema_key = "missing_schema".to_string();
+
+        let error = transaction
+            .stage_rows(vec![row])
+            .expect_err("unknown schema should be rejected while staging");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            error
+                .description
+                .contains("schema 'missing_schema' version '1' is not visible"),
+            "error should explain missing schema visibility: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_rows_rejects_unknown_schema_version_without_sql() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let (_live_state, _binary_cas, _changelog, _version_ref, _runtime_functions, transaction) =
+            open_test_transaction(&backend).await;
+
+        let mut row = key_value_stage_row("unknown-version", "value", false);
+        row.schema_version = "999".to_string();
+
+        let error = transaction
+            .stage_rows(vec![row])
+            .expect_err("unknown schema version should be rejected while staging");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            error
+                .description
+                .contains("schema 'lix_key_value' version '999' is not visible"),
+            "error should explain missing schema version visibility: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_rows_rejects_invalid_snapshot_json_without_sql() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let (_live_state, _binary_cas, _changelog, _version_ref, _runtime_functions, transaction) =
+            open_test_transaction(&backend).await;
+
+        let mut row = key_value_stage_row("invalid-json", "value", false);
+        row.snapshot_content = Some("{".to_string());
+
+        let error = transaction
+            .stage_rows(vec![row])
+            .expect_err("invalid JSON should be rejected while staging");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        assert!(
+            error.description.contains("invalid JSON"),
+            "error should explain invalid JSON: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_snapshot_that_violates_json_schema_without_sql() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let (live_state, _binary_cas, changelog, version_ref, runtime_functions, transaction) =
+            open_test_transaction(&backend).await;
+
+        let mut row = key_value_stage_row("schema-mismatch", "value", false);
+        row.snapshot_content = Some(r#"{"key":"schema-mismatch"}"#.to_string());
+        transaction
+            .stage_rows(vec![row])
+            .expect("row should stage before JSON Schema validation");
+
+        let error = transaction
+            .commit(&runtime_functions)
+            .await
+            .expect_err("JSON Schema mismatch should fail commit validation");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        assert!(
+            error
+                .description
+                .contains("snapshot_content validation failed"),
+            "error should explain JSON Schema validation: {error:?}"
+        );
+        assert_no_persistence_after_validation_failure(
+            &backend,
+            &live_state,
+            &changelog,
+            &version_ref,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stage_rows_rejects_malformed_registered_schema_without_sql() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let (_live_state, _binary_cas, _changelog, _version_ref, _runtime_functions, transaction) =
+            open_test_transaction(&backend).await;
+
+        let mut row = key_value_stage_row("malformed-registered-schema", "value", false);
+        row.schema_key = "lix_registered_schema".to_string();
+        row.snapshot_content = Some(
+            json!({
+                "value": {
+                    "x-lix-key": "malformed_registered_schema"
+                }
+            })
+            .to_string(),
+        );
+        row.entity_id = None;
+
+        let error = transaction
+            .stage_rows(vec![row])
+            .expect_err("malformed registered schema should be rejected while staging");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        assert!(
+            error.description.contains("x-lix-version")
+                || error.description.contains("primary-key pointer"),
+            "error should explain malformed registered schema: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_rows_rejects_primary_key_entity_id_mismatch_without_sql() {
+        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let (_live_state, _binary_cas, _changelog, _version_ref, _runtime_functions, transaction) =
+            open_test_transaction(&backend).await;
+
+        let mut row = key_value_stage_row("right-id", "value", false);
+        row.entity_id = Some(crate::engine2::entity_identity::EntityIdentity::single(
+            "wrong-id",
+        ));
+
+        let error = transaction
+            .stage_rows(vec![row])
+            .expect_err("entity id mismatch should be rejected while staging");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        assert!(
+            error
+                .description
+                .contains("does not match x-lix-primary-key derived entity_id"),
+            "error should explain entity id mismatch: {error:?}"
+        );
+    }
+
+    async fn open_test_transaction<'a>(
+        backend: &'a Arc<dyn LixBackend + Send + Sync>,
+    ) -> (
+        Arc<LiveStateContext>,
+        Arc<BinaryCasContext>,
+        Arc<ChangelogContext>,
+        Arc<VersionRefContext>,
+        FunctionContext,
+        Transaction<'a>,
+    ) {
+        let live_state = Arc::new(live_state_context());
+        let binary_cas = Arc::new(BinaryCasContext::new());
+        let changelog = Arc::new(ChangelogContext::new());
+        let version_ref = Arc::new(VersionRefContext::new(Arc::new(
+            UntrackedStateContext::new(),
+        )));
+        let schema_registry = Arc::new(SchemaRegistry::new());
+        let runtime_live_state = live_state.reader(Arc::clone(backend));
+        let runtime_functions = FunctionContext::prepare(&runtime_live_state)
+            .await
+            .expect("runtime functions should prepare");
+
+        let transaction = Transaction::open(
+            GLOBAL_VERSION_ID.to_string(),
+            backend,
+            Arc::clone(&live_state),
+            Arc::clone(&binary_cas),
+            Arc::clone(&changelog),
+            Arc::clone(&version_ref),
+            schema_registry,
+            runtime_functions.provider(),
+        )
+        .await
+        .expect("transaction should open");
+
+        (
+            live_state,
+            binary_cas,
+            changelog,
+            version_ref,
+            runtime_functions,
+            transaction,
+        )
+    }
+
+    async fn assert_no_persistence_after_validation_failure(
+        backend: &Arc<dyn LixBackend + Send + Sync>,
+        live_state: &LiveStateContext,
+        changelog: &ChangelogContext,
+        version_ref: &VersionRefContext,
+    ) {
+        let changes = changelog
+            .reader(Arc::clone(backend))
+            .scan_changes(&ChangelogScanRequest::default())
+            .await
+            .expect("changelog should scan after failed commit");
+        assert!(
+            changes.is_empty(),
+            "validation failure must happen before changelog persistence"
+        );
+        let head = version_ref
+            .reader(Arc::clone(backend))
+            .load_head_commit_id(GLOBAL_VERSION_ID)
+            .await
+            .expect("version ref should load after failed commit");
+        assert_eq!(
+            head, None,
+            "validation failure must happen before version-ref persistence"
+        );
+        let row = live_state
+            .reader(Arc::clone(backend))
+            .load_row(&crate::engine2::live_state::LiveStateRowRequest {
+                schema_key: "lix_key_value".to_string(),
+                version_id: GLOBAL_VERSION_ID.to_string(),
+                entity_id: crate::engine2::entity_identity::EntityIdentity::single(
+                    "schema-mismatch",
+                ),
+                file_id: NullableKeyFilter::Null,
+            })
+            .await
+            .expect("live state should load after failed commit");
+        assert_eq!(
+            row, None,
+            "validation failure must happen before live-state persistence"
+        );
+    }
+
     fn key_value_stage_row(key: &str, value: &str, untracked: bool) -> StageRow {
         StageRow {
-            entity_id: Some(
-                crate::engine2::entity_identity::EntityIdentity::single(key),
-            ),
+            entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single(key)),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             plugin_key: None,

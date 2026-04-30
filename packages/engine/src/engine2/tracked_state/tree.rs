@@ -610,7 +610,9 @@ mod tests {
                 &result.root_id,
                 &TrackedStateTreeScanRequest {
                     schema_keys: vec!["schema-a".to_string()],
-                    entity_ids: vec![crate::engine2::entity_identity::EntityIdentity::single("entity-a")],
+                    entity_ids: vec![crate::engine2::entity_identity::EntityIdentity::single(
+                        "entity-a",
+                    )],
                     file_ids: vec![crate::NullableKeyFilter::Value("file-a".to_string())],
                     ..Default::default()
                 },

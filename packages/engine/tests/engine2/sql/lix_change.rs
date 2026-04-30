@@ -5,12 +5,12 @@ use lix_engine::Value;
 simulation_test2!(lix_change_queries_tracked_changes, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
+        engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
 
     session
         .execute(

@@ -256,7 +256,10 @@ mod tests {
         .expect("scan should succeed");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id, crate::engine2::entity_identity::EntityIdentity::single("version-ui"));
+        assert_eq!(
+            rows[0].entity_id,
+            crate::engine2::entity_identity::EntityIdentity::single("version-ui")
+        );
     }
 
     #[tokio::test]

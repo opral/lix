@@ -7,12 +7,12 @@ use super::assert_rows_eq;
 simulation_test2!(lix_state_latest_update_wins, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
+        engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
 
     session
         .execute(
@@ -50,12 +50,12 @@ simulation_test2!(lix_state_latest_update_wins, |sim| async move {
 simulation_test2!(lix_state_delete_hides_row, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
+        engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
 
     session
         .execute(

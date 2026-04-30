@@ -1,7 +1,7 @@
 use serde_json::Value as JsonValue;
 
-use crate::engine2::functions::{DeterministicMode, DeterministicSequence};
 use crate::engine2::entity_identity::EntityIdentity;
+use crate::engine2::functions::{DeterministicMode, DeterministicSequence};
 use crate::engine2::live_state::{
     LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateWriter,
 };

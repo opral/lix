@@ -636,16 +636,13 @@ fn parent_commit_id_for_commit_rows(
     commit_id: &str,
     rows: &[&LiveStateRow],
 ) -> Result<Option<String>, LixError> {
-    let Some(row) = rows
-        .iter()
-        .find(|row| {
-            row.schema_key == COMMIT_SCHEMA_KEY
-                && row
-                    .entity_id
-                    .as_string()
-                    .is_ok_and(|entity_id| entity_id == commit_id)
-        })
-    else {
+    let Some(row) = rows.iter().find(|row| {
+        row.schema_key == COMMIT_SCHEMA_KEY
+            && row
+                .entity_id
+                .as_string()
+                .is_ok_and(|entity_id| entity_id == commit_id)
+    }) else {
         return Ok(None);
     };
     parent_commit_id_from_commit_row(row)
@@ -1761,7 +1758,9 @@ mod tests {
             .scan_rows(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec!["lix_key_value".to_string()],
-                    entity_ids: vec![crate::engine2::entity_identity::EntityIdentity::single("selected-tab")],
+                    entity_ids: vec![crate::engine2::entity_identity::EntityIdentity::single(
+                        "selected-tab",
+                    )],
                     version_ids: vec![version_id.to_string()],
                     file_ids: vec![NullableKeyFilter::Null],
                     include_tombstones,

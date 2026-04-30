@@ -2183,7 +2183,12 @@ mod tests {
                 .expect("entity batch should decode");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("entity-1")));
+        assert_eq!(
+            rows[0].entity_id.as_ref(),
+            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+                "entity-1"
+            ))
+        );
         assert_eq!(rows[0].schema_key, "project_message");
         assert_eq!(rows[0].schema_version.as_str(), "1");
         assert_eq!(rows[0].version_id, "version-a");
@@ -2218,7 +2223,12 @@ mod tests {
         .expect("entity batch should decode");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("message-1")));
+        assert_eq!(
+            rows[0].entity_id.as_ref(),
+            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+                "message-1"
+            ))
+        );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(
                 rows[0]

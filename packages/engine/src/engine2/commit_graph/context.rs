@@ -881,7 +881,9 @@ mod tests {
             .change_history_from_commit(
                 "commit-head",
                 &CommitGraphChangeHistoryRequest {
-                    entity_ids: vec![crate::engine2::entity_identity::EntityIdentity::single("entity-1")],
+                    entity_ids: vec![crate::engine2::entity_identity::EntityIdentity::single(
+                        "entity-1",
+                    )],
                     file_ids: vec!["file-a".to_string()],
                     min_depth: Some(1),
                     max_depth: Some(1),

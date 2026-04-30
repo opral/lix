@@ -384,7 +384,12 @@ mod tests {
 
         let row = normalize_stage_row(row, &mut catalog, functions()).expect("normalize row");
 
-        assert_eq!(row.entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("entity-from-snapshot")));
+        assert_eq!(
+            row.entity_id.as_ref(),
+            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+                "entity-from-snapshot"
+            ))
+        );
     }
 
     #[test]
@@ -402,16 +407,117 @@ mod tests {
         let snapshot: JsonValue =
             serde_json::from_str(row.snapshot_content.as_deref().unwrap()).unwrap();
 
-        assert_eq!(row.entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("uuid-default")));
+        assert_eq!(
+            row.entity_id.as_ref(),
+            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+                "uuid-default"
+            ))
+        );
         assert_eq!(snapshot["id"], "uuid-default");
         assert_eq!(snapshot["value"], "literal-default");
+    }
+
+    #[test]
+    fn normalization_applies_cel_defaults_from_snapshot_context() {
+        let mut catalog = catalog_with(vec![schema_with_cel_field_default()]);
+        let row = StageRow {
+            entity_id: None,
+            schema_key: "cel_field_default_schema".to_string(),
+            schema_version: "1".to_string(),
+            snapshot_content: Some(r#"{"id":"entity-1","name":"Sample"}"#.to_string()),
+            ..base_stage_row()
+        };
+
+        let row = normalize_stage_row(row, &mut catalog, functions()).expect("normalize row");
+        let snapshot: JsonValue =
+            serde_json::from_str(row.snapshot_content.as_deref().unwrap()).unwrap();
+
+        assert_eq!(snapshot["slug"], "Sample-slug");
+    }
+
+    #[test]
+    fn normalization_x_lix_default_overrides_json_default() {
+        let mut catalog = catalog_with(vec![schema_with_overridden_default()]);
+        let row = StageRow {
+            entity_id: None,
+            schema_key: "overridden_default_schema".to_string(),
+            schema_version: "1".to_string(),
+            snapshot_content: Some(r#"{"id":"entity-1"}"#.to_string()),
+            ..base_stage_row()
+        };
+
+        let row = normalize_stage_row(row, &mut catalog, functions()).expect("normalize row");
+        let snapshot: JsonValue =
+            serde_json::from_str(row.snapshot_content.as_deref().unwrap()).unwrap();
+
+        assert_eq!(snapshot["status"], "computed");
+    }
+
+    #[test]
+    fn normalization_does_not_overwrite_explicit_null_with_default() {
+        let mut catalog = catalog_with(vec![schema_with_nullable_default()]);
+        let row = StageRow {
+            entity_id: None,
+            schema_key: "nullable_default_schema".to_string(),
+            schema_version: "1".to_string(),
+            snapshot_content: Some(r#"{"id":"entity-1","status":null}"#.to_string()),
+            ..base_stage_row()
+        };
+
+        let row = normalize_stage_row(row, &mut catalog, functions()).expect("normalize row");
+        let snapshot: JsonValue =
+            serde_json::from_str(row.snapshot_content.as_deref().unwrap()).unwrap();
+
+        assert_eq!(snapshot["status"], JsonValue::Null);
+    }
+
+    #[test]
+    fn normalization_applies_timestamp_function_default() {
+        let mut catalog = catalog_with(vec![schema_with_timestamp_default()]);
+        let row = StageRow {
+            entity_id: None,
+            schema_key: "timestamp_default_schema".to_string(),
+            schema_version: "1".to_string(),
+            snapshot_content: Some(r#"{"id":"entity-1"}"#.to_string()),
+            ..base_stage_row()
+        };
+
+        let row = normalize_stage_row(row, &mut catalog, functions()).expect("normalize row");
+        let snapshot: JsonValue =
+            serde_json::from_str(row.snapshot_content.as_deref().unwrap()).unwrap();
+
+        assert_eq!(snapshot["created_at"], "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn normalization_surfaces_cel_default_errors() {
+        let mut catalog = catalog_with(vec![schema_with_unknown_cel_default()]);
+        let row = StageRow {
+            entity_id: None,
+            schema_key: "unknown_cel_default_schema".to_string(),
+            schema_version: "1".to_string(),
+            snapshot_content: Some(r#"{"id":"entity-1"}"#.to_string()),
+            ..base_stage_row()
+        };
+
+        let error =
+            normalize_stage_row(row, &mut catalog, functions()).expect_err("default should fail");
+
+        assert!(error
+            .description
+            .contains("failed to evaluate x-lix-default"));
+        assert!(error
+            .description
+            .contains("unknown_cel_default_schema.slug"));
     }
 
     #[test]
     fn normalization_rejects_entity_id_that_disagrees_with_primary_key() {
         let mut catalog = catalog_with(vec![schema_with_default_id()]);
         let row = StageRow {
-            entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single("wrong-id")),
+            entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single(
+                "wrong-id",
+            )),
             schema_key: "normalization_schema".to_string(),
             schema_version: "1".to_string(),
             snapshot_content: Some(r#"{"id":"right-id","value":"hello"}"#.to_string()),
@@ -499,7 +605,12 @@ mod tests {
         };
         let dynamic = normalize_stage_row(dynamic, &mut catalog, functions()).expect("dynamic row");
 
-        assert_eq!(dynamic.entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("dynamic-1")));
+        assert_eq!(
+            dynamic.entity_id.as_ref(),
+            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+                "dynamic-1"
+            ))
+        );
     }
 
     fn catalog_with(schemas: Vec<JsonValue>) -> TransactionSchemaCatalog {
@@ -508,7 +619,9 @@ mod tests {
 
     fn base_stage_row() -> StageRow {
         StageRow {
-            entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single("entity-1")),
+            entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single(
+                "entity-1",
+            )),
             schema_key: "normalization_schema".to_string(),
             file_id: None,
             plugin_key: None,
@@ -536,6 +649,89 @@ mod tests {
                 "value": { "type": "string", "default": "literal-default" }
             },
             "required": ["id", "value"],
+            "additionalProperties": false
+        })
+    }
+
+    fn schema_with_cel_field_default() -> JsonValue {
+        json!({
+            "x-lix-key": "cel_field_default_schema",
+            "x-lix-version": "1",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "name": { "type": "string" },
+                "slug": { "type": "string", "x-lix-default": "name + '-slug'" }
+            },
+            "required": ["id", "name"],
+            "additionalProperties": false
+        })
+    }
+
+    fn schema_with_overridden_default() -> JsonValue {
+        json!({
+            "x-lix-key": "overridden_default_schema",
+            "x-lix-version": "1",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "status": {
+                    "type": "string",
+                    "default": "literal",
+                    "x-lix-default": "'computed'"
+                }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        })
+    }
+
+    fn schema_with_nullable_default() -> JsonValue {
+        json!({
+            "x-lix-key": "nullable_default_schema",
+            "x-lix-version": "1",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "status": {
+                    "anyOf": [{ "type": "string" }, { "type": "null" }],
+                    "x-lix-default": "'computed'"
+                }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        })
+    }
+
+    fn schema_with_timestamp_default() -> JsonValue {
+        json!({
+            "x-lix-key": "timestamp_default_schema",
+            "x-lix-version": "1",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "created_at": { "type": "string", "x-lix-default": "lix_timestamp()" }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        })
+    }
+
+    fn schema_with_unknown_cel_default() -> JsonValue {
+        json!({
+            "x-lix-key": "unknown_cel_default_schema",
+            "x-lix-version": "1",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "slug": { "type": "string", "x-lix-default": "missing_var + '-slug'" }
+            },
+            "required": ["id"],
             "additionalProperties": false
         })
     }

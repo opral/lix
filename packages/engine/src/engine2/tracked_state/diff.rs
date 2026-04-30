@@ -371,7 +371,9 @@ mod tests {
                 &TrackedStateDiffRequest {
                     filter: TrackedStateFilter {
                         schema_keys: vec!["schema-b".to_string()],
-                        entity_ids: vec![crate::engine2::entity_identity::EntityIdentity::single("entity-b")],
+                        entity_ids: vec![crate::engine2::entity_identity::EntityIdentity::single(
+                            "entity-b",
+                        )],
                         file_ids: vec![NullableKeyFilter::Value("file-b".to_string())],
                         ..Default::default()
                     },

@@ -2131,7 +2131,12 @@ mod tests {
         let rows = lix_file_write_rows_from_batch(&batch, None).expect("decode file insert");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("file-readme")));
+        assert_eq!(
+            rows[0].entity_id.as_ref(),
+            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+                "file-readme"
+            ))
+        );
         assert_eq!(rows[0].schema_key, "lix_file_descriptor");
         assert_eq!(rows[0].version_id, "version-b");
         assert_eq!(rows[0].schema_version.as_str(), "1");
@@ -2341,7 +2346,12 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_directory_descriptor")
             .expect("missing /docs/ directory should be staged");
-        assert_eq!(directory.entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("dir-generated-docs")));
+        assert_eq!(
+            directory.entity_id.as_ref(),
+            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+                "dir-generated-docs"
+            ))
+        );
 
         let descriptor = staged
             .state_rows
@@ -2432,7 +2442,12 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_binary_blob_ref")
             .expect("data insert should stage blob ref row");
-        assert_eq!(blob_ref_row.entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("file-readme")));
+        assert_eq!(
+            blob_ref_row.entity_id.as_ref(),
+            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+                "file-readme"
+            ))
+        );
         assert_eq!(blob_ref_row.file_id.as_deref(), Some("file-readme"));
         assert_eq!(staged.file_data_writes.len(), 1);
         assert_eq!(staged.file_data_writes[0].file_id, "file-readme");
@@ -2457,7 +2472,12 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor tombstone should be staged");
-        assert_eq!(descriptor.entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("file-readme")));
+        assert_eq!(
+            descriptor.entity_id.as_ref(),
+            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+                "file-readme"
+            ))
+        );
         assert_eq!(descriptor.file_id, None);
         assert_eq!(descriptor.snapshot_content, None);
 
@@ -2466,7 +2486,12 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_binary_blob_ref")
             .expect("blob ref tombstone should be staged");
-        assert_eq!(blob_ref.entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("file-readme")));
+        assert_eq!(
+            blob_ref.entity_id.as_ref(),
+            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+                "file-readme"
+            ))
+        );
         assert_eq!(blob_ref.file_id.as_deref(), Some("file-readme"));
         assert_eq!(blob_ref.snapshot_content, None);
     }
@@ -2582,7 +2607,12 @@ mod tests {
         match &writes[0] {
             StageWrite::Rows { rows } => {
                 assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("file-readme")));
+                assert_eq!(
+                    rows[0].entity_id.as_ref(),
+                    Some(&crate::engine2::entity_identity::EntityIdentity::single(
+                        "file-readme"
+                    ))
+                );
                 assert_eq!(rows[0].schema_key, "lix_file_descriptor");
             }
             other => panic!("expected insert staged write, got {other:?}"),
