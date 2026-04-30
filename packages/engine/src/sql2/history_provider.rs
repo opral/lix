@@ -254,7 +254,6 @@ fn lix_state_history_schema() -> SchemaRef {
         Field::new("entity_id", DataType::Utf8, false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
-        Field::new("plugin_key", DataType::Utf8, true),
         Field::new("snapshot_content", DataType::Utf8, true),
         Field::new("metadata", DataType::Utf8, true),
         Field::new("schema_version", DataType::Utf8, false),
@@ -286,7 +285,6 @@ struct StateHistorySqlRow {
     entity_id: String,
     schema_key: String,
     file_id: Option<String>,
-    plugin_key: Option<String>,
     snapshot_content: Option<String>,
     metadata: Option<String>,
     schema_version: String,
@@ -309,7 +307,6 @@ fn state_history_record_batch(
                 "entity_id" => string_array(rows.iter().map(|row| Some(row.entity_id.as_str()))),
                 "schema_key" => string_array(rows.iter().map(|row| Some(row.schema_key.as_str()))),
                 "file_id" => string_array(rows.iter().map(|row| row.file_id.as_deref())),
-                "plugin_key" => string_array(rows.iter().map(|row| row.plugin_key.as_deref())),
                 "snapshot_content" => {
                     string_array(rows.iter().map(|row| row.snapshot_content.as_deref()))
                 }
@@ -355,7 +352,6 @@ async fn load_state_history_rows(
                 entity_id: entry.change.entity_id.as_string()?,
                 schema_key: entry.change.schema_key,
                 file_id: entry.change.file_id,
-                plugin_key: entry.change.plugin_key,
                 snapshot_content: entry.change.snapshot_content,
                 metadata: entry.change.metadata,
                 schema_version: entry.change.schema_version,

@@ -358,7 +358,6 @@ fn entity_history_system_column_array(
         )) as ArrayRef,
         "schema_key" => string_array(rows.iter().map(|row| Some(row.change.schema_key.as_str()))),
         "file_id" => string_array(rows.iter().map(|row| row.change.file_id.as_deref())),
-        "plugin_key" => string_array(rows.iter().map(|row| row.change.plugin_key.as_deref())),
         "snapshot_content" => string_array(
             rows.iter()
                 .map(|row| row.change.snapshot_content.as_deref()),

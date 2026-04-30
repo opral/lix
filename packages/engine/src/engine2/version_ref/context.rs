@@ -216,7 +216,6 @@ fn version_ref_row(
         entity_id: crate::engine2::entity_identity::EntityIdentity::single(version_id),
         schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
         file_id: None,
-        plugin_key: None,
         snapshot_content: Some(snapshot_content),
         metadata: None,
         schema_version: VERSION_REF_SCHEMA_VERSION.to_string(),

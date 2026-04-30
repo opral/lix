@@ -142,7 +142,6 @@ mod tests {
             schema_key: "test_schema".to_string(),
             schema_version: "1".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some("{\"value\":1}".to_string()),
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),

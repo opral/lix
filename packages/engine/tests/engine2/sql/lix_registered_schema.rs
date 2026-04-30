@@ -66,9 +66,9 @@ simulation_test2!(
         let insert_state_result = session
         .execute(
             "INSERT INTO lix_state (\
-             entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version, global, untracked\
+             entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
              ) VALUES (\
-             'dummy-1', 'engine2_dummy_schema', NULL, NULL, lix_json('{\"id\":\"dummy-1\",\"name\":\"Dummy\"}'), '1', false, true\
+             'dummy-1', 'engine2_dummy_schema', NULL, lix_json('{\"id\":\"dummy-1\",\"name\":\"Dummy\"}'), '1', false, true\
              )",
             &[],
         )

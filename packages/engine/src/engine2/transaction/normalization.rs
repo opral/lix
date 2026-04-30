@@ -624,7 +624,6 @@ mod tests {
             )),
             schema_key: "normalization_schema".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(r#"{"id":"entity-1","value":"hello"}"#.to_string()),
             metadata: None,
             schema_version: "1".to_string(),

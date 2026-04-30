@@ -113,7 +113,6 @@ fn workspace_version_stage_row(version_id: &str) -> Result<StageRow, LixError> {
         )),
         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
         file_id: None,
-        plugin_key: None,
         snapshot_content: Some(encode_snapshot(json!({
             "key": WORKSPACE_VERSION_KEY,
             "value": version_id,

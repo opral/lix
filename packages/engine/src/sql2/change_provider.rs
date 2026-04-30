@@ -201,7 +201,6 @@ enum ChangeColumn {
     SchemaKey,
     SchemaVersion,
     FileId,
-    PluginKey,
     Metadata,
     CreatedAt,
     SnapshotContent,
@@ -214,7 +213,6 @@ fn lix_change_schema() -> SchemaRef {
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("schema_version", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
-        Field::new("plugin_key", DataType::Utf8, true),
         Field::new("metadata", DataType::Utf8, true),
         Field::new("created_at", DataType::Utf8, false),
         Field::new("snapshot_content", DataType::Utf8, true),
@@ -228,7 +226,6 @@ fn change_projection_for_scan(projection: Option<&Vec<usize>>) -> Vec<ChangeColu
         ChangeColumn::SchemaKey,
         ChangeColumn::SchemaVersion,
         ChangeColumn::FileId,
-        ChangeColumn::PluginKey,
         ChangeColumn::Metadata,
         ChangeColumn::CreatedAt,
         ChangeColumn::SnapshotContent,
@@ -275,9 +272,6 @@ fn change_record_batch(
                 string_array(changes.iter().map(|row| Some(row.schema_version.as_str())))
             }
             ChangeColumn::FileId => string_array(changes.iter().map(|row| row.file_id.as_deref())),
-            ChangeColumn::PluginKey => {
-                string_array(changes.iter().map(|row| row.plugin_key.as_deref()))
-            }
             ChangeColumn::Metadata => {
                 string_array(changes.iter().map(|row| row.metadata.as_deref()))
             }
@@ -304,7 +298,6 @@ fn change_schema(projection: &[ChangeColumn]) -> SchemaRef {
                 ChangeColumn::SchemaKey => Field::new("schema_key", DataType::Utf8, false),
                 ChangeColumn::SchemaVersion => Field::new("schema_version", DataType::Utf8, false),
                 ChangeColumn::FileId => Field::new("file_id", DataType::Utf8, true),
-                ChangeColumn::PluginKey => Field::new("plugin_key", DataType::Utf8, true),
                 ChangeColumn::Metadata => Field::new("metadata", DataType::Utf8, true),
                 ChangeColumn::CreatedAt => Field::new("created_at", DataType::Utf8, false),
                 ChangeColumn::SnapshotContent => {

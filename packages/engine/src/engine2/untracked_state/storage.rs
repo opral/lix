@@ -84,7 +84,6 @@ fn row_matches_scan(row: &UntrackedStateRow, request: &UntrackedStateScanRequest
         && (request.filter.version_ids.is_empty()
             || request.filter.version_ids.contains(&row.version_id))
         && nullable_matches_filters(&row.file_id, &request.filter.file_ids)
-        && nullable_matches_filters(&row.plugin_key, &request.filter.plugin_keys)
 }
 
 fn nullable_matches_filters(value: &Option<String>, filters: &[NullableKeyFilter<String>]) -> bool {
@@ -304,7 +303,6 @@ mod tests {
             entity_id: crate::engine2::entity_identity::EntityIdentity::single(entity_id),
             schema_key: schema_key.to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(format!("{{\"key\":\"{}\",\"value\":\"value\"}}", entity_id)),
             metadata: None,
             schema_version: "1".to_string(),

@@ -648,7 +648,6 @@ mod tests {
                 .expect("entity id should decode"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
             metadata: metadata.map(ToOwned::to_owned),
             schema_version: "1".to_string(),
@@ -668,7 +667,6 @@ mod tests {
                 .expect("entity id should decode"),
             schema_key: "test_state_schema".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
             metadata: Some(format!("{{\"source\":\"{entity_id}\"}}")),
             schema_version: "1".to_string(),
@@ -694,7 +692,6 @@ mod tests {
                 .expect("entity id should decode"),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(
                 json!({
                     "id": entity_id,
@@ -729,7 +726,6 @@ mod tests {
                 .expect("entity id should decode"),
             schema_key: "lix_file_descriptor".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(
                 json!({
                     "id": entity_id,
@@ -1034,9 +1030,9 @@ mod tests {
         let result = execute_sql(
             &ctx,
             "INSERT INTO lix_state (\
-             entity_id, schema_key, file_id, plugin_key, snapshot_content, metadata, schema_version, global, untracked\
+             entity_id, schema_key, file_id, snapshot_content, metadata, schema_version, global, untracked\
              ) VALUES (\
-             'entity-1', 'lix_key_value', NULL, NULL, '{\"key\":\"hello\",\"value\":\"world\"}', '{\"source\":\"sql\"}', '1', false, false\
+             'entity-1', 'lix_key_value', NULL, '{\"key\":\"hello\",\"value\":\"world\"}', '{\"source\":\"sql\"}', '1', false, false\
              )",
             &[],
         )
@@ -1079,13 +1075,12 @@ mod tests {
         let result = execute_sql(
             &ctx,
             "INSERT INTO lix_state (\
-             entity_id, schema_key, file_id, plugin_key, snapshot_content, metadata, schema_version, global, untracked\
+             entity_id, schema_key, file_id, snapshot_content, metadata, schema_version, global, untracked\
              ) \
              SELECT \
              'entity-from-select' AS entity_id, \
              'lix_key_value' AS schema_key, \
              NULL AS file_id, \
-             NULL AS plugin_key, \
              '{\"key\":\"hello\",\"value\":\"from-select\"}' AS snapshot_content, \
              '{\"source\":\"select\"}' AS metadata, \
              '1' AS schema_version, \
@@ -2052,9 +2047,9 @@ mod tests {
         session_a
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version, global, untracked\
+                 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
                  ) VALUES (\
-                 'entity-a', 'test_state_schema', NULL, NULL, '{\"value\":\"A\"}', '1', false, false\
+                 'entity-a', 'test_state_schema', NULL, '{\"value\":\"A\"}', '1', false, false\
                  )",
                 &[],
             )
@@ -2062,9 +2057,9 @@ mod tests {
         session_b
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version, global, untracked\
+                 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
                  ) VALUES (\
-                 'entity-b', 'test_state_schema', NULL, NULL, '{\"value\":\"B\"}', '1', false, false\
+                 'entity-b', 'test_state_schema', NULL, '{\"value\":\"B\"}', '1', false, false\
                  )",
                 &[],
             )
@@ -2072,9 +2067,9 @@ mod tests {
         session_a
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version, global, untracked\
+                 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
                  ) VALUES (\
-                 'dir-docs', 'lix_directory_descriptor', NULL, NULL, '{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}', '1', false, false\
+                 'dir-docs', 'lix_directory_descriptor', NULL, '{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}', '1', false, false\
                  )",
                 &[],
             )

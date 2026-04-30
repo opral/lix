@@ -220,7 +220,6 @@ mod tests {
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
             schema_version: "1".to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
-            plugin_key: None,
             metadata: None,
             change_id: Some("change-registered-schema".to_string()),
             commit_id: None,

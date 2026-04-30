@@ -62,7 +62,6 @@ fn tracked_row_from_entity(entity: CommitGraphEntity) -> TrackedStateRow {
         entity_id: change.entity_id,
         schema_key: change.schema_key,
         file_id: change.file_id,
-        plugin_key: change.plugin_key,
         snapshot_content: change.snapshot_content,
         metadata: change.metadata,
         schema_version: change.schema_version,
@@ -101,7 +100,6 @@ mod tests {
         );
         assert_eq!(row.schema_key, "test_schema");
         assert_eq!(row.file_id.as_deref(), Some("file-1"));
-        assert_eq!(row.plugin_key.as_deref(), Some("plugin-1"));
         assert_eq!(row.snapshot_content.as_deref(), Some("{}"));
         assert_eq!(row.metadata.as_deref(), Some("{\"m\":1}"));
         assert_eq!(row.schema_version, "1");
@@ -492,7 +490,6 @@ mod tests {
                 schema_key: "test_schema".to_string(),
                 schema_version: "1".to_string(),
                 file_id: Some("file-1".to_string()),
-                plugin_key: Some("plugin-1".to_string()),
                 snapshot_content: snapshot_content.map(str::to_string),
                 metadata: Some("{\"m\":1}".to_string()),
                 created_at: "ignored-change-created-at".to_string(),
@@ -653,7 +650,6 @@ mod tests {
             schema_key: schema_key.to_string(),
             schema_version: "1".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: snapshot_content.map(str::to_string),
             metadata: None,
             created_at: created_at.to_string(),
@@ -672,7 +668,6 @@ mod tests {
             schema_key: "lix_commit".to_string(),
             schema_version: "1".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(
                 serde_json::to_string(&json!({
                     "id": commit_id,
@@ -692,7 +687,6 @@ mod tests {
             entity_id: crate::engine2::entity_identity::EntityIdentity::single(entity_id),
             schema_key: "test_schema".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some("{}".to_string()),
             metadata: None,
             schema_version: "1".to_string(),
