@@ -7,12 +7,12 @@ use super::assert_rows_eq;
 simulation_test2!(lix_directory_insert_reads_nested_paths, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
+        engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
 
     let insert_result = session
         .execute(

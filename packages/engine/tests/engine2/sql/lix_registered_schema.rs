@@ -103,12 +103,12 @@ simulation_test2!(
 simulation_test2!(entity_by_version_expands_global_rows, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
+        engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
 
     session
         .execute(
@@ -124,14 +124,14 @@ simulation_test2!(entity_by_version_expands_global_rows, |sim| async move {
         .expect("registered schema insert should succeed");
 
     session
-            .execute(
-                "INSERT INTO engine2_overlay_schema \
+        .execute(
+            "INSERT INTO engine2_overlay_schema \
                  (id, name, lixcol_global, lixcol_untracked) \
                  VALUES ('entity-global-overlay', 'Global Entity', true, false)",
-                &[],
-            )
-            .await
-            .expect("global entity insert should succeed");
+            &[],
+        )
+        .await
+        .expect("global entity insert should succeed");
 
     let result = session
         .execute(

@@ -1850,7 +1850,9 @@ mod tests {
         assert_eq!(
             rows,
             vec![StageRow {
-                entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single("dir-docs")),
+                entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single(
+                    "dir-docs"
+                )),
                 schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                 file_id: None,
                 plugin_key: None,

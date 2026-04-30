@@ -41,18 +41,29 @@ pub(crate) enum EntityIdentityError {
 impl std::fmt::Display for EntityIdentityError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyPrimaryKey => write!(formatter, "primary key must contain at least one path"),
+            Self::EmptyPrimaryKey => {
+                write!(formatter, "primary key must contain at least one path")
+            }
             Self::EmptyPrimaryKeyPath { index } => {
-                write!(formatter, "primary-key path at index {index} must not be empty")
+                write!(
+                    formatter,
+                    "primary-key path at index {index} must not be empty"
+                )
             }
             Self::MissingPrimaryKeyValue { index } => {
                 write!(formatter, "primary-key value at index {index} is missing")
             }
             Self::NullPrimaryKeyValue { index } => {
-                write!(formatter, "primary-key value at index {index} must not be null")
+                write!(
+                    formatter,
+                    "primary-key value at index {index} must not be null"
+                )
             }
             Self::EmptyPrimaryKeyValue { index } => {
-                write!(formatter, "primary-key string value at index {index} must not be empty")
+                write!(
+                    formatter,
+                    "primary-key string value at index {index} must not be empty"
+                )
             }
             Self::UnsupportedPrimaryKeyValue { index } => write!(
                 formatter,
@@ -176,8 +187,8 @@ mod tests {
     #[test]
     fn composite_identity_projects_to_versioned_opaque_entity_id() {
         let identity = EntityIdentity::tuple(vec![
-                EntityIdentityPart::String("namespace".to_string()),
-                EntityIdentityPart::String("key".to_string()),
+            EntityIdentityPart::String("namespace".to_string()),
+            EntityIdentityPart::String("key".to_string()),
         ])
         .expect("tuple identity");
 
@@ -190,9 +201,9 @@ mod tests {
     #[test]
     fn composite_identity_roundtrips_from_string() {
         let identity = EntityIdentity::tuple(vec![
-                EntityIdentityPart::String("namespace".to_string()),
-                EntityIdentityPart::Number("42".to_string()),
-                EntityIdentityPart::Bool(true),
+            EntityIdentityPart::String("namespace".to_string()),
+            EntityIdentityPart::Number("42".to_string()),
+            EntityIdentityPart::Bool(true),
         ])
         .expect("tuple identity");
 
@@ -207,13 +218,13 @@ mod tests {
     #[test]
     fn composite_identity_does_not_collide_on_delimiter_like_values() {
         let left = EntityIdentity::tuple(vec![
-                EntityIdentityPart::String("a~b".to_string()),
-                EntityIdentityPart::String("1".to_string()),
+            EntityIdentityPart::String("a~b".to_string()),
+            EntityIdentityPart::String("1".to_string()),
         ])
         .expect("left tuple identity");
         let right = EntityIdentity::tuple(vec![
-                EntityIdentityPart::String("a".to_string()),
-                EntityIdentityPart::String("b~1".to_string()),
+            EntityIdentityPart::String("a".to_string()),
+            EntityIdentityPart::String("b~1".to_string()),
         ])
         .expect("right tuple identity");
 

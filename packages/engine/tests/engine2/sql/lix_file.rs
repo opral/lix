@@ -93,12 +93,12 @@ simulation_test2!(
 simulation_test2!(lix_file_path_update_preserves_data, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
+        engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
 
     let insert_result = session
         .execute(
@@ -185,12 +185,12 @@ simulation_test2!(lix_file_path_update_preserves_data, |sim| async move {
 simulation_test2!(lix_file_by_version_expands_global_rows, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
-            engine
-                .open_workspace_session()
-                .await
-                .expect("main session should open"),
-            &engine,
-        );
+        engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
 
     session
         .execute(

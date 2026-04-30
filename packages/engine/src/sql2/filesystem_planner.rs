@@ -9,8 +9,8 @@ use crate::common::{
     directory_ancestor_paths, directory_name_from_path, normalize_directory_path,
     parent_directory_path, stable_content_fingerprint_hex, ParsedFilePath,
 };
-use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::entity_identity::EntityIdentity;
+use crate::engine2::live_state::LiveStateRow;
 use crate::LixError;
 
 use super::filesystem_visibility::VisibleFilesystem;
@@ -642,7 +642,12 @@ mod tests {
             context: FilesystemRowContext::active_version("version-a"),
         });
 
-        assert_eq!(row.entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("dir-docs")));
+        assert_eq!(
+            row.entity_id.as_ref(),
+            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+                "dir-docs"
+            ))
+        );
         assert_eq!(row.schema_key, "lix_directory_descriptor");
         assert_eq!(row.schema_version.as_str(), "1");
         assert_eq!(row.version_id, "version-a");
@@ -665,7 +670,12 @@ mod tests {
             context: FilesystemRowContext::active_version("version-a"),
         });
 
-        assert_eq!(row.entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("file-readme")));
+        assert_eq!(
+            row.entity_id.as_ref(),
+            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+                "file-readme"
+            ))
+        );
         assert_eq!(row.schema_key, "lix_file_descriptor");
         assert_eq!(row.schema_version.as_str(), "1");
         let snapshot: JsonValue =
@@ -684,7 +694,12 @@ mod tests {
         })
         .expect("blob ref row should build");
 
-        assert_eq!(row.entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("file-readme")));
+        assert_eq!(
+            row.entity_id.as_ref(),
+            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+                "file-readme"
+            ))
+        );
         assert_eq!(row.file_id.as_deref(), Some("file-readme"));
         assert_eq!(row.schema_key, "lix_binary_blob_ref");
         assert_eq!(row.schema_version.as_str(), "1");
@@ -1023,7 +1038,12 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor tombstone should be planned");
-        assert_eq!(descriptor.entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("file-readme")));
+        assert_eq!(
+            descriptor.entity_id.as_ref(),
+            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+                "file-readme"
+            ))
+        );
         assert_eq!(descriptor.file_id, None);
         assert_eq!(descriptor.snapshot_content, None);
         assert_eq!(descriptor.schema_version.as_str(), "1");
@@ -1033,7 +1053,12 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_binary_blob_ref")
             .expect("blob ref tombstone should be planned");
-        assert_eq!(blob_ref.entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("file-readme")));
+        assert_eq!(
+            blob_ref.entity_id.as_ref(),
+            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+                "file-readme"
+            ))
+        );
         assert_eq!(blob_ref.file_id.as_deref(), Some("file-readme"));
         assert_eq!(blob_ref.snapshot_content, None);
         assert_eq!(blob_ref.schema_version.as_str(), "1");
@@ -1062,7 +1087,12 @@ mod tests {
 
         assert_eq!(plan.count, 1);
         assert_eq!(plan.rows.len(), 1);
-        assert_eq!(plan.rows[0].entity_id.as_ref(), Some(&crate::engine2::entity_identity::EntityIdentity::single("dir-docs")));
+        assert_eq!(
+            plan.rows[0].entity_id.as_ref(),
+            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+                "dir-docs"
+            ))
+        );
         assert_eq!(plan.rows[0].schema_key, "lix_directory_descriptor");
         assert_eq!(plan.rows[0].file_id, None);
         assert_eq!(plan.rows[0].snapshot_content, None);

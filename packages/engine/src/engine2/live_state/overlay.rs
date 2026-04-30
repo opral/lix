@@ -48,8 +48,7 @@ mod tests {
     fn different_identities_are_preserved() {
         let tracked = live_row("tracked", false, Some("change-tracked"));
         let mut untracked = live_row("untracked", true, None);
-        untracked.entity_id =
-            crate::engine2::entity_identity::EntityIdentity::single("other");
+        untracked.entity_id = crate::engine2::entity_identity::EntityIdentity::single("other");
 
         let rows = overlay_untracked_rows(vec![tracked], vec![untracked]);
 

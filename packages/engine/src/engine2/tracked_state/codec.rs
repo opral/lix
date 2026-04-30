@@ -328,10 +328,7 @@ fn push_entity_identity(out: &mut Vec<u8>, identity: &EntityIdentity) {
     out.push(ENTITY_IDENTITY_END);
 }
 
-fn read_entity_identity(
-    bytes: &[u8],
-    cursor: &mut usize,
-) -> Result<EntityIdentity, LixError> {
+fn read_entity_identity(bytes: &[u8], cursor: &mut usize) -> Result<EntityIdentity, LixError> {
     let mut parts = Vec::new();
     loop {
         let tag = read_u8(bytes, cursor, "entity identity part tag")?;
@@ -352,8 +349,8 @@ fn read_entity_identity(
                         return Err(LixError::new(
                             "LIX_ERROR_UNKNOWN",
                             format!(
-                                "tracked-state tree key has invalid entity identity bool byte {other}"
-                            ),
+                            "tracked-state tree key has invalid entity identity bool byte {other}"
+                        ),
                         ))
                     }
                 };
@@ -369,9 +366,7 @@ fn read_entity_identity(
             other => {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "tracked-state tree key has invalid entity identity part tag {other}"
-                    ),
+                    format!("tracked-state tree key has invalid entity identity part tag {other}"),
                 ))
             }
         }

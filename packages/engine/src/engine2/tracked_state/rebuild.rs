@@ -95,7 +95,10 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
-        assert_eq!(row.entity_id, crate::engine2::entity_identity::EntityIdentity::single("entity-1"));
+        assert_eq!(
+            row.entity_id,
+            crate::engine2::entity_identity::EntityIdentity::single("entity-1")
+        );
         assert_eq!(row.schema_key, "test_schema");
         assert_eq!(row.file_id.as_deref(), Some("file-1"));
         assert_eq!(row.plugin_key.as_deref(), Some("plugin-1"));
@@ -125,7 +128,10 @@ mod tests {
     fn rows_from_entities_is_root_local_and_version_independent() {
         let rows = rows_from_entities(vec![entity("change-1", Some("{}"))]);
 
-        assert_eq!(rows[0].entity_id, crate::engine2::entity_identity::EntityIdentity::single("entity-1"));
+        assert_eq!(
+            rows[0].entity_id,
+            crate::engine2::entity_identity::EntityIdentity::single("entity-1")
+        );
         assert_eq!(rows[0].schema_key, "test_schema");
     }
 
@@ -169,9 +175,9 @@ mod tests {
         assert_eq!(report, TrackedStateRebuildReport { written_rows: 1 });
         let rows = scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "commit-1").await;
         assert_eq!(rows.len(), 1);
-        assert!(rows
-            .iter()
-            .any(|row| row.schema_key == "test_schema" && row.entity_id == crate::engine2::entity_identity::EntityIdentity::single("entity-1")));
+        assert!(rows.iter().any(|row| row.schema_key == "test_schema"
+            && row.entity_id
+                == crate::engine2::entity_identity::EntityIdentity::single("entity-1")));
     }
 
     #[tokio::test]
@@ -215,17 +221,18 @@ mod tests {
 
         let version_a_rows =
             scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "commit-1").await;
-        assert!(!version_a_rows
-            .iter()
-            .any(|row| row.entity_id == crate::engine2::entity_identity::EntityIdentity::single("stale-target")));
-        assert!(version_a_rows
-            .iter()
-            .any(|row| row.entity_id == crate::engine2::entity_identity::EntityIdentity::single("entity-new")));
+        assert!(!version_a_rows.iter().any(|row| row.entity_id
+            == crate::engine2::entity_identity::EntityIdentity::single("stale-target")));
+        assert!(version_a_rows.iter().any(|row| row.entity_id
+            == crate::engine2::entity_identity::EntityIdentity::single("entity-new")));
 
         let version_b_rows =
             scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "stale-commit").await;
         assert_eq!(version_b_rows.len(), 1);
-        assert_eq!(version_b_rows[0].entity_id, crate::engine2::entity_identity::EntityIdentity::single("stale-other"));
+        assert_eq!(
+            version_b_rows[0].entity_id,
+            crate::engine2::entity_identity::EntityIdentity::single("stale-other")
+        );
     }
 
     #[tokio::test]
@@ -318,7 +325,11 @@ mod tests {
         let rows = scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "commit-head").await;
         let row = rows
             .iter()
-            .find(|row| row.schema_key == "test_schema" && row.entity_id == crate::engine2::entity_identity::EntityIdentity::single("entity-1"))
+            .find(|row| {
+                row.schema_key == "test_schema"
+                    && row.entity_id
+                        == crate::engine2::entity_identity::EntityIdentity::single("entity-1")
+            })
             .expect("rebuilt entity row should exist");
         assert_eq!(row.snapshot_content.as_deref(), Some("{\"value\":\"new\"}"));
         assert_eq!(row.change_id, "change-new");
@@ -377,7 +388,11 @@ mod tests {
         let rows = scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "commit-head").await;
         let row = rows
             .iter()
-            .find(|row| row.schema_key == "test_schema" && row.entity_id == crate::engine2::entity_identity::EntityIdentity::single("entity-1"))
+            .find(|row| {
+                row.schema_key == "test_schema"
+                    && row.entity_id
+                        == crate::engine2::entity_identity::EntityIdentity::single("entity-1")
+            })
             .expect("rebuilt tombstone row should exist");
         assert_eq!(row.snapshot_content, None);
         assert_eq!(row.change_id, "change-deleted");
@@ -409,9 +424,9 @@ mod tests {
 
         let rows = scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "commit-1").await;
         assert!(!rows.is_empty());
-        assert!(rows
-            .iter()
-            .any(|row| row.schema_key == "test_schema" && row.entity_id == crate::engine2::entity_identity::EntityIdentity::single("entity-1")));
+        assert!(rows.iter().any(|row| row.schema_key == "test_schema"
+            && row.entity_id
+                == crate::engine2::entity_identity::EntityIdentity::single("entity-1")));
     }
 
     #[tokio::test]
@@ -463,7 +478,10 @@ mod tests {
         let main_rows =
             scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "commit-main").await;
         assert_eq!(main_rows.len(), 1);
-        assert_eq!(main_rows[0].entity_id, crate::engine2::entity_identity::EntityIdentity::single("entity-main"));
+        assert_eq!(
+            main_rows[0].entity_id,
+            crate::engine2::entity_identity::EntityIdentity::single("entity-main")
+        );
     }
 
     fn entity(change_id: &str, snapshot_content: Option<&str>) -> CommitGraphEntity {
