@@ -712,7 +712,6 @@ mod tests {
             schema_key: "lix_commit".to_string(),
             schema_version: "1".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(
                 serde_json::to_string(&json!({
                     "id": commit_id,

@@ -7,7 +7,6 @@ pub(crate) struct CanonicalChange {
     pub(crate) schema_key: String,
     pub(crate) schema_version: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) plugin_key: Option<String>,
     /// TODO model as binary for higher performance and avoiding serialization/deserialization?
     pub(crate) snapshot_content: Option<String>,
     /// TODO model as binary for higher performance and avoiding serialization/deserialization?

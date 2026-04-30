@@ -748,10 +748,6 @@ fn file_history_column_array(
         "lixcol_entity_id" => string_array(rows.iter().map(|row| Some(row.id.as_str()))),
         "lixcol_schema_key" => string_array(rows.iter().map(|_| Some(FILE_DESCRIPTOR_SCHEMA_KEY))),
         "lixcol_file_id" => string_array(rows.iter().map(|row| Some(row.id.as_str()))),
-        "lixcol_plugin_key" => string_array(
-            rows.iter()
-                .map(|row| row.descriptor_change.plugin_key.as_deref()),
-        ),
         "lixcol_schema_version" => string_array(
             rows.iter()
                 .map(|row| Some(row.descriptor_change.schema_version.as_str())),
@@ -802,7 +798,6 @@ fn lix_file_history_schema() -> SchemaRef {
         Field::new("lixcol_entity_id", DataType::Utf8, false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
-        Field::new("lixcol_plugin_key", DataType::Utf8, true),
         Field::new("lixcol_schema_version", DataType::Utf8, false),
         Field::new("lixcol_change_id", DataType::Utf8, false),
         Field::new("lixcol_metadata", DataType::Utf8, true),

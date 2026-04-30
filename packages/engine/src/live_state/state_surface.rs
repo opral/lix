@@ -33,7 +33,6 @@ pub enum StateSurfaceColumn {
     EntityId,
     SchemaKey,
     FileId,
-    PluginKey,
     SnapshotContent,
     Metadata,
     SchemaVersion,
@@ -57,7 +56,6 @@ pub struct StateSurfaceRow {
     pub entity_id: String,
     pub schema_key: String,
     pub file_id: Option<String>,
-    pub plugin_key: Option<String>,
     pub snapshot_content: Option<String>,
     pub metadata: Option<String>,
     pub schema_version: Option<String>,
@@ -363,7 +361,6 @@ fn all_state_surface_columns() -> Vec<StateSurfaceColumn> {
         StateSurfaceColumn::EntityId,
         StateSurfaceColumn::SchemaKey,
         StateSurfaceColumn::FileId,
-        StateSurfaceColumn::PluginKey,
         StateSurfaceColumn::SnapshotContent,
         StateSurfaceColumn::Metadata,
         StateSurfaceColumn::SchemaVersion,
@@ -385,7 +382,6 @@ fn state_surface_schema(columns: &[StateSurfaceColumn]) -> SchemaRef {
                 StateSurfaceColumn::EntityId => Field::new("entity_id", DataType::Utf8, false),
                 StateSurfaceColumn::SchemaKey => Field::new("schema_key", DataType::Utf8, false),
                 StateSurfaceColumn::FileId => Field::new("file_id", DataType::Utf8, true),
-                StateSurfaceColumn::PluginKey => Field::new("plugin_key", DataType::Utf8, true),
                 StateSurfaceColumn::SnapshotContent => {
                     Field::new("snapshot_content", DataType::Utf8, true)
                 }
@@ -420,9 +416,6 @@ fn state_surface_record_batch(
             }
             StateSurfaceColumn::FileId => {
                 string_array(rows.iter().map(|row| row.file_id.as_deref()))
-            }
-            StateSurfaceColumn::PluginKey => {
-                string_array(rows.iter().map(|row| row.plugin_key.as_deref()))
             }
             StateSurfaceColumn::SnapshotContent => {
                 string_array(rows.iter().map(|row| row.snapshot_content.as_deref()))
@@ -489,12 +482,6 @@ fn state_surface_column_value(row: &StateSurfaceRow, column: StateSurfaceColumn)
         StateSurfaceColumn::FileId => {
             Some(row.file_id.clone().map(Value::Text).unwrap_or(Value::Null))
         }
-        StateSurfaceColumn::PluginKey => Some(
-            row.plugin_key
-                .clone()
-                .map(Value::Text)
-                .unwrap_or(Value::Null),
-        ),
         StateSurfaceColumn::SnapshotContent => Some(
             row.snapshot_content
                 .clone()
@@ -591,7 +578,6 @@ async fn load_state_by_version_rows_for_version(
             entity_id: row.entity_id,
             schema_key: row.schema_key,
             file_id: row.file_id,
-            plugin_key: row.plugin_key,
             snapshot_content: row.snapshot_content,
             metadata: row.metadata,
             schema_version: Some(row.schema_version),

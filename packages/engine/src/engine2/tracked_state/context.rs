@@ -579,7 +579,6 @@ mod tests {
             entity_id: crate::engine2::entity_identity::EntityIdentity::single(entity_id),
             schema_key: "test_schema".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
             metadata: None,
             schema_version: "1".to_string(),

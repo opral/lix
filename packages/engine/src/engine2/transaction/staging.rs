@@ -364,7 +364,6 @@ fn hydrate_state_write_row(
         })?,
         schema_key: row.schema_key,
         file_id: row.file_id,
-        plugin_key: row.plugin_key,
         snapshot_content: row.snapshot_content,
         metadata: row.metadata,
         schema_version: row.schema_version,
@@ -458,7 +457,6 @@ fn staged_row_identity_matches_scan(row: &StagedStateRow, request: &LiveStateSca
         return false;
     }
     nullable_key_matches_filters(&row.file_id, &request.filter.file_ids)
-        && nullable_key_matches_filters(&row.plugin_key, &request.filter.plugin_keys)
 }
 
 fn nullable_key_matches_filters(
@@ -806,7 +804,6 @@ mod tests {
                     state_row("shared-entity", "other-version").with_version("version-b"),
                     state_row("shared-entity", "other-schema").with_schema("other_schema"),
                     state_row("shared-entity", "other-file").with_file_id("file-a"),
-                    state_row("shared-entity", "other-plugin").with_plugin_key("plugin-a"),
                     state_row("shared-entity", "other-schema-version").with_schema_version("2"),
                     state_row("shared-entity", "tracked").with_tracked(),
                 ],
@@ -927,7 +924,6 @@ mod tests {
             entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single(key)),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(format!("{{\"key\":\"{key}\",\"value\":\"{value}\"}}")),
             metadata: None,
             schema_version: "1".to_string(),
@@ -989,7 +985,6 @@ mod tests {
         fn with_schema(self, schema_key: &str) -> Self;
         fn with_schema_version(self, schema_version: &str) -> Self;
         fn with_file_id(self, file_id: &str) -> Self;
-        fn with_plugin_key(self, plugin_key: &str) -> Self;
         fn with_tracked(self) -> Self;
         fn with_version(self, version_id: &str) -> Self;
         fn with_change_id(self, change_id: &str) -> Self;
@@ -1008,11 +1003,6 @@ mod tests {
 
         fn with_file_id(mut self, file_id: &str) -> Self {
             self.file_id = Some(file_id.to_string());
-            self
-        }
-
-        fn with_plugin_key(mut self, plugin_key: &str) -> Self {
-            self.plugin_key = Some(plugin_key.to_string());
             self
         }
 

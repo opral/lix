@@ -157,20 +157,20 @@ pub(crate) fn state_relation_column_is_nullable_for_variant(
     match entity_base_relation_variant(variant) {
         SurfaceVariant::Default => match column_name {
             "entity_id" | "schema_key" | "global" | "untracked" => Some(false),
-            "file_id" | "plugin_key" | "snapshot_content" | "metadata" | "schema_version"
-            | "created_at" | "updated_at" | "change_id" | "commit_id" => Some(true),
+            "file_id" | "snapshot_content" | "metadata" | "schema_version" | "created_at"
+            | "updated_at" | "change_id" | "commit_id" => Some(true),
             _ => None,
         },
         SurfaceVariant::ByVersion => match column_name {
             "entity_id" | "schema_key" | "global" | "untracked" | "version_id" => Some(false),
-            "file_id" | "plugin_key" | "snapshot_content" | "metadata" | "schema_version"
-            | "created_at" | "updated_at" | "change_id" | "commit_id" => Some(true),
+            "file_id" | "snapshot_content" | "metadata" | "schema_version" | "created_at"
+            | "updated_at" | "change_id" | "commit_id" => Some(true),
             _ => None,
         },
         SurfaceVariant::History => match column_name {
             "entity_id" | "schema_key" | "schema_version" | "change_id" | "commit_id"
             | "commit_created_at" | "start_commit_id" | "depth" => Some(false),
-            "file_id" | "plugin_key" | "snapshot_content" | "metadata" => Some(true),
+            "file_id" | "snapshot_content" | "metadata" => Some(true),
             _ => None,
         },
         SurfaceVariant::WorkingChanges => None,
@@ -190,7 +190,6 @@ fn state_columns() -> Vec<String> {
         "entity_id".to_string(),
         "schema_key".to_string(),
         "file_id".to_string(),
-        "plugin_key".to_string(),
         "snapshot_content".to_string(),
         "metadata".to_string(),
         "schema_version".to_string(),
@@ -214,7 +213,6 @@ fn state_history_columns() -> Vec<String> {
         "entity_id".to_string(),
         "schema_key".to_string(),
         "file_id".to_string(),
-        "plugin_key".to_string(),
         "snapshot_content".to_string(),
         "metadata".to_string(),
         "schema_version".to_string(),
@@ -231,7 +229,6 @@ fn state_column_types() -> BTreeMap<String, SurfaceColumnType> {
         ("entity_id".to_string(), SurfaceColumnType::String),
         ("schema_key".to_string(), SurfaceColumnType::String),
         ("file_id".to_string(), SurfaceColumnType::String),
-        ("plugin_key".to_string(), SurfaceColumnType::String),
         ("snapshot_content".to_string(), SurfaceColumnType::Json),
         ("metadata".to_string(), SurfaceColumnType::Json),
         ("schema_version".to_string(), SurfaceColumnType::String),

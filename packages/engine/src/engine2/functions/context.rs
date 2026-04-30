@@ -271,7 +271,6 @@ mod tests {
             entity_id: crate::engine2::entity_identity::EntityIdentity::single(key),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(snapshot_content),
             metadata: None,
             schema_version: "1".to_string(),

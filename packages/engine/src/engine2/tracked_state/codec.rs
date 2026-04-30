@@ -116,7 +116,6 @@ pub(crate) fn compare_encoded_key_to_key(encoded: &[u8], key: &TrackedStateKey) 
 
 pub(crate) fn encode_value(value: &TrackedStateValue) -> Vec<u8> {
     let mut out = Vec::new();
-    push_optional_string(&mut out, value.plugin_key.as_deref());
     push_optional_string(&mut out, value.snapshot_content.as_deref());
     push_optional_string(&mut out, value.metadata.as_deref());
     push_sized_bytes(&mut out, value.schema_version.as_bytes());
@@ -129,7 +128,6 @@ pub(crate) fn encode_value(value: &TrackedStateValue) -> Vec<u8> {
 
 pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateValue, LixError> {
     let mut cursor = 0usize;
-    let plugin_key = read_optional_string(bytes, &mut cursor, "plugin_key")?;
     let snapshot_content = read_optional_string(bytes, &mut cursor, "snapshot_content")?;
     let metadata = read_optional_string(bytes, &mut cursor, "metadata")?;
     let schema_version = read_sized_string(bytes, &mut cursor, "schema_version")?;
@@ -144,7 +142,6 @@ pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateValue, LixError> 
         ));
     }
     Ok(TrackedStateValue {
-        plugin_key,
         snapshot_content,
         metadata,
         schema_version,
@@ -603,7 +600,6 @@ mod tests {
     #[test]
     fn value_codec_roundtrips_tombstone_value() {
         let value = TrackedStateValue {
-            plugin_key: Some("plugin".to_string()),
             snapshot_content: None,
             metadata: Some("{}".to_string()),
             schema_version: "1".to_string(),

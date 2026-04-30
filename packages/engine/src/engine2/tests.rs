@@ -21,9 +21,9 @@ async fn tracked_state_rebuild_restores_sql_reads_from_changelog() {
     let insert_result = session
         .execute(
             "INSERT INTO lix_state (\
-             entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version, global, untracked\
+             entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
              ) VALUES (\
-             'rebuild-key', 'lix_key_value', NULL, NULL, lix_json('{\"key\":\"rebuild-key\",\"value\":\"before-rebuild\"}'), '1', false, false\
+             'rebuild-key', 'lix_key_value', NULL, lix_json('{\"key\":\"rebuild-key\",\"value\":\"before-rebuild\"}'), '1', false, false\
              )",
             &[],
         )

@@ -1737,7 +1737,6 @@ impl LixStateSurfaceKind {
                 Field::new("entity_id", DataType::Utf8, false),
                 Field::new("schema_key", DataType::Utf8, false),
                 Field::new("file_id", DataType::Utf8, true),
-                Field::new("plugin_key", DataType::Utf8, true),
                 Field::new("snapshot_content", DataType::Utf8, true),
                 Field::new("metadata", DataType::Utf8, true),
                 Field::new("schema_version", DataType::Utf8, true),
@@ -1752,7 +1751,6 @@ impl LixStateSurfaceKind {
                 Field::new("entity_id", DataType::Utf8, false),
                 Field::new("schema_key", DataType::Utf8, false),
                 Field::new("file_id", DataType::Utf8, true),
-                Field::new("plugin_key", DataType::Utf8, true),
                 Field::new("snapshot_content", DataType::Utf8, true),
                 Field::new("metadata", DataType::Utf8, true),
                 Field::new("schema_version", DataType::Utf8, true),
@@ -1796,7 +1794,6 @@ fn lix_state_history_schema() -> SchemaRef {
         Field::new("entity_id", DataType::Utf8, false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
-        Field::new("plugin_key", DataType::Utf8, true),
         Field::new("snapshot_content", DataType::Utf8, true),
         Field::new("metadata", DataType::Utf8, true),
         Field::new("schema_version", DataType::Utf8, false),
@@ -2703,7 +2700,6 @@ fn state_history_record_batch(schema: SchemaRef, rows: &[StateHistoryRow]) -> Re
                 "entity_id" => string_array(rows.iter().map(|row| Some(row.entity_id.as_str()))),
                 "schema_key" => string_array(rows.iter().map(|row| Some(row.schema_key.as_str()))),
                 "file_id" => string_array(rows.iter().map(|row| row.file_id.as_deref())),
-                "plugin_key" => string_array(rows.iter().map(|row| row.plugin_key.as_deref())),
                 "snapshot_content" => {
                     string_array(rows.iter().map(|row| row.snapshot_content.as_deref()))
                 }
@@ -2745,7 +2741,6 @@ fn lix_change_schema() -> SchemaRef {
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("schema_version", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
-        Field::new("plugin_key", DataType::Utf8, true),
         Field::new("metadata", DataType::Utf8, true),
         Field::new("created_at", DataType::Utf8, false),
         Field::new("untracked", DataType::Boolean, false),
@@ -3030,9 +3025,6 @@ fn change_surface_record_batch(
             ChangeSurfaceColumn::FileId => {
                 string_array(rows.iter().map(|row| row.file_id.as_deref()))
             }
-            ChangeSurfaceColumn::PluginKey => {
-                string_array(rows.iter().map(|row| row.plugin_key.as_deref()))
-            }
             ChangeSurfaceColumn::Metadata => {
                 string_array(rows.iter().map(|row| row.metadata.as_deref()))
             }
@@ -3064,7 +3056,6 @@ fn change_surface_schema(projection: &[ChangeSurfaceColumn]) -> SchemaRef {
                     Field::new("schema_version", DataType::Utf8, false)
                 }
                 ChangeSurfaceColumn::FileId => Field::new("file_id", DataType::Utf8, true),
-                ChangeSurfaceColumn::PluginKey => Field::new("plugin_key", DataType::Utf8, true),
                 ChangeSurfaceColumn::Metadata => Field::new("metadata", DataType::Utf8, true),
                 ChangeSurfaceColumn::CreatedAt => Field::new("created_at", DataType::Utf8, false),
                 ChangeSurfaceColumn::Untracked => Field::new("untracked", DataType::Boolean, false),
@@ -3083,7 +3074,6 @@ fn change_projection_for_scan(projection: Option<&Vec<usize>>) -> Vec<ChangeSurf
         ChangeSurfaceColumn::SchemaKey,
         ChangeSurfaceColumn::SchemaVersion,
         ChangeSurfaceColumn::FileId,
-        ChangeSurfaceColumn::PluginKey,
         ChangeSurfaceColumn::Metadata,
         ChangeSurfaceColumn::CreatedAt,
         ChangeSurfaceColumn::Untracked,
@@ -3754,7 +3744,6 @@ struct LixChangeRoute {
     entity_id: Option<String>,
     schema_key: Option<String>,
     file_id: Option<String>,
-    plugin_key: Option<String>,
     untracked: Option<bool>,
     contradictory: bool,
 }
@@ -3781,7 +3770,6 @@ impl LixChangeRoute {
                         RouteStringField::EntityId => &mut route.entity_id,
                         RouteStringField::SchemaKey => &mut route.schema_key,
                         RouteStringField::FileId => &mut route.file_id,
-                        RouteStringField::PluginKey => &mut route.plugin_key,
                         _ => continue,
                     };
                     assign_route_slot(slot, value, &mut route.contradictory);
@@ -3816,12 +3804,6 @@ fn change_filters_for_route(route: &LixChangeRoute) -> Vec<ChangeSurfaceFilter> 
         filters.push(ChangeSurfaceFilter::Eq(
             ChangeSurfaceColumn::FileId,
             Value::Text(file_id.clone()),
-        ));
-    }
-    if let Some(plugin_key) = &route.plugin_key {
-        filters.push(ChangeSurfaceFilter::Eq(
-            ChangeSurfaceColumn::PluginKey,
-            Value::Text(plugin_key.clone()),
         ));
     }
     if let Some(untracked) = route.untracked {
@@ -4077,7 +4059,6 @@ enum RouteStringField {
     SchemaKey,
     EntityId,
     FileId,
-    PluginKey,
     Id,
     #[cfg(test)]
     Path,
@@ -4195,7 +4176,6 @@ fn parse_change_route_column_literal_filter(
         "entity_id" => parse_string_route(literal, RouteStringField::EntityId),
         "schema_key" => parse_string_route(literal, RouteStringField::SchemaKey),
         "file_id" => parse_string_route(literal, RouteStringField::FileId),
-        "plugin_key" => parse_string_route(literal, RouteStringField::PluginKey),
         "untracked" => parse_boolean_route(literal, RouteBooleanField::Untracked),
         _ => None,
     }
@@ -4266,7 +4246,6 @@ fn state_projection_for_scan(
             StateSurfaceColumn::EntityId,
             StateSurfaceColumn::SchemaKey,
             StateSurfaceColumn::FileId,
-            StateSurfaceColumn::PluginKey,
             StateSurfaceColumn::SnapshotContent,
             StateSurfaceColumn::Metadata,
             StateSurfaceColumn::SchemaVersion,
@@ -4281,7 +4260,6 @@ fn state_projection_for_scan(
             StateSurfaceColumn::EntityId,
             StateSurfaceColumn::SchemaKey,
             StateSurfaceColumn::FileId,
-            StateSurfaceColumn::PluginKey,
             StateSurfaceColumn::SnapshotContent,
             StateSurfaceColumn::Metadata,
             StateSurfaceColumn::SchemaVersion,
@@ -4546,7 +4524,6 @@ mod tests {
         session
             .execute(
                 "INSERT INTO lix_state_by_version (\
-                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'entity-a', 'test_state_schema', NULL, 'version-a', NULL, '{\"value\":\"A\"}', '1'\
                  )",
@@ -4556,7 +4533,6 @@ mod tests {
         session
             .execute(
                 "INSERT INTO lix_state_by_version (\
-                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'entity-b', 'test_state_schema', NULL, 'version-b', NULL, '{\"value\":\"B\"}', '1'\
                  )",
@@ -4566,7 +4542,6 @@ mod tests {
         session
             .execute(
                 "INSERT INTO lix_state_by_version (\
-                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'scalar-a', 'stable_scalar_schema', NULL, 'version-a', NULL, '{\"name\":\"alpha\",\"count\":7,\"score\":3.5,\"enabled\":true}', '1'\
                  )",
@@ -5325,7 +5300,6 @@ mod tests {
                 session
                     .execute(
                         "INSERT INTO lix_state (\
-                         entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version\
                          ) VALUES (\
                          'entity-untracked-a', 'test_state_schema', NULL, NULL, '{\"value\":\"UA\"}', '1'\
                          )",
@@ -5336,7 +5310,6 @@ mod tests {
                 session
                     .execute(
                         "INSERT INTO lix_state (\
-                         entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version\
                          ) VALUES (\
                          'entity-untracked-b', 'test_state_schema', NULL, NULL, '{\"value\":\"UB\"}', '1'\
                          )",
@@ -5964,7 +5937,6 @@ mod tests {
                 session
                     .execute(
                         "INSERT INTO lix_state_by_version (\
-                         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                          ) VALUES (\
                          'variant-null', 'lix_key_value', NULL, 'version-a', NULL, '{\"key\":\"variant-null\",\"value\":null}', '1'\
                          )",

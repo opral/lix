@@ -617,7 +617,6 @@ mod tests {
                 schema_key: super::COMMIT_SCHEMA_KEY.to_string(),
                 schema_version: "1".to_string(),
                 file_id: None,
-                plugin_key: None,
                 snapshot_content: Some("{\"id\":\"commit-1\"}".to_string()),
                 metadata: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -847,21 +846,19 @@ mod tests {
             Arc::clone(&backend),
             &changelog,
             &[
-                entity_change_with_file_and_plugin(
+                entity_change_with_file(
                     "change-file-a",
                     "entity-1",
                     "test_schema",
                     Some("file-a"),
-                    None,
                     "{}",
                 ),
                 entity_tombstone("change-tombstone", "entity-1", "test_schema"),
-                entity_change_with_file_and_plugin(
+                entity_change_with_file(
                     "change-file-b",
                     "entity-2",
                     "test_schema",
                     Some("file-b"),
-                    None,
                     "{}",
                 ),
                 commit_change("commit-root-change", "commit-root", &["change-file-a"], &[]),
@@ -1145,20 +1142,18 @@ mod tests {
             Arc::clone(&backend),
             &changelog,
             &[
-                entity_change_with_file_and_plugin(
+                entity_change_with_file(
                     "change-file-a",
                     "entity-1",
                     "test_schema",
                     Some("file-a"),
-                    None,
                     "{\"value\":\"file-a\"}",
                 ),
-                entity_change_with_file_and_plugin(
+                entity_change_with_file(
                     "change-file-b",
                     "entity-1",
                     "test_schema",
                     Some("file-b"),
-                    None,
                     "{\"value\":\"file-b\"}",
                 ),
                 commit_change(
@@ -1188,33 +1183,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn entities_at_does_not_distinguish_same_entity_with_different_plugin_key() {
+    async fn entities_at_uses_latest_change_for_same_entity_identity() {
         let backend = Arc::new(UnitTestBackend::new());
         let changelog = ChangelogContext::new();
         append_changes(
             Arc::clone(&backend),
             &changelog,
             &[
-                entity_change_with_file_and_plugin(
-                    "change-plugin-a",
+                entity_change_with_file(
+                    "change-entity-a",
                     "entity-1",
                     "test_schema",
                     None,
-                    Some("plugin-a"),
-                    "{\"value\":\"plugin-a\"}",
+                    "{\"value\":\"a\"}",
                 ),
-                entity_change_with_file_and_plugin(
-                    "change-plugin-b",
+                entity_change_with_file(
+                    "change-entity-b",
                     "entity-1",
                     "test_schema",
                     None,
-                    Some("plugin-b"),
-                    "{\"value\":\"plugin-b\"}",
+                    "{\"value\":\"b\"}",
                 ),
                 commit_change(
                     "commit-head-change",
                     "commit-head",
-                    &["change-plugin-a", "change-plugin-b"],
+                    &["change-entity-a", "change-entity-b"],
                     &[],
                 ),
             ],
@@ -1230,13 +1223,16 @@ mod tests {
         let entity = entities
             .iter()
             .find(|entity| entity.change.schema_key == "test_schema")
-            .expect("plugin-key entity should resolve");
+            .expect("entity should resolve");
 
         assert_eq!(
             entity_ids_for_schema(&entities, "test_schema"),
-            vec![("change-plugin-b".to_string(), "commit-head".to_string(), 0)]
+            vec![("change-entity-b".to_string(), "commit-head".to_string(), 0)]
         );
-        assert_eq!(entity.change.plugin_key.as_deref(), Some("plugin-b"));
+        assert_eq!(
+            entity.change.snapshot_content.as_deref(),
+            Some("{\"value\":\"b\"}")
+        );
     }
 
     #[tokio::test]
@@ -1381,7 +1377,6 @@ mod tests {
             schema_key: super::COMMIT_SCHEMA_KEY.to_string(),
             schema_version: "1".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(
                 serde_json::to_string(&json!({
                     "id": commit_id,
@@ -1438,19 +1433,17 @@ mod tests {
             schema_key: schema_key.to_string(),
             schema_version: "1".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             created_at: created_at.to_string(),
         }
     }
 
-    fn entity_change_with_file_and_plugin(
+    fn entity_change_with_file(
         change_id: &str,
         entity_id: &str,
         schema_key: &str,
         file_id: Option<&str>,
-        plugin_key: Option<&str>,
         snapshot_content: &str,
     ) -> CanonicalChange {
         CanonicalChange {
@@ -1459,7 +1452,6 @@ mod tests {
             schema_key: schema_key.to_string(),
             schema_version: "1".to_string(),
             file_id: file_id.map(str::to_string),
-            plugin_key: plugin_key.map(str::to_string),
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -1473,7 +1465,6 @@ mod tests {
             schema_key: schema_key.to_string(),
             schema_version: "1".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: None,
             metadata: None,
             created_at: "2026-01-02T00:00:00Z".to_string(),

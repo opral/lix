@@ -11,7 +11,6 @@ pub(crate) struct UntrackedStateRow {
     pub(crate) entity_id: EntityIdentity,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) plugin_key: Option<String>,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
     pub(crate) schema_version: String,
@@ -52,8 +51,6 @@ pub(crate) struct UntrackedStateFilter {
     pub(crate) version_ids: Vec<String>,
     #[serde(default)]
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
-    #[serde(default)]
-    pub(crate) plugin_keys: Vec<NullableKeyFilter<String>>,
 }
 
 /// Requested property set for an untracked-state scan.
