@@ -179,11 +179,11 @@ fn active_history_root_commit_column_name(structured_read: &StructuredPublicRead
     let exposed_columns = &structured_read.resolved_relation.exposed_columns;
     if exposed_columns
         .iter()
-        .any(|column| column.eq_ignore_ascii_case("root_commit_id"))
+        .any(|column| column.eq_ignore_ascii_case("start_commit_id"))
     {
-        "root_commit_id"
+        "start_commit_id"
     } else {
-        "lixcol_root_commit_id"
+        "lixcol_start_commit_id"
     }
 }
 
@@ -209,11 +209,11 @@ fn expr_references_root_commit(expr: &Expr) -> bool {
     match expr {
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => matches!(
             parts[1].value.to_ascii_lowercase().as_str(),
-            "lixcol_root_commit_id" | "root_commit_id"
+            "lixcol_start_commit_id" | "start_commit_id"
         ),
         Expr::Identifier(identifier) => matches!(
             identifier.value.to_ascii_lowercase().as_str(),
-            "lixcol_root_commit_id" | "root_commit_id"
+            "lixcol_start_commit_id" | "start_commit_id"
         ),
         Expr::Nested(inner) => expr_references_root_commit(inner),
         _ => false,

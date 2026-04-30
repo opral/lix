@@ -400,7 +400,7 @@ fn build_directory_history_predicates_and_request(
     request: &mut DirectoryHistoryRequest,
 ) -> Result<Vec<DirectoryHistoryPredicate>, LixError> {
     let mut predicates = Vec::new();
-    let mut root_commit_ids = BTreeSet::new();
+    let mut start_commit_ids = BTreeSet::new();
     let mut version_ids = BTreeSet::new();
     let mut directory_ids = BTreeSet::new();
     let mut placeholder_state = PlaceholderState::new();
@@ -420,16 +420,16 @@ fn build_directory_history_predicates_and_request(
         })?;
         apply_directory_history_pushdown(
             &predicate,
-            &mut root_commit_ids,
+            &mut start_commit_ids,
             &mut version_ids,
             &mut directory_ids,
         );
         predicates.push(predicate);
     }
 
-    if !root_commit_ids.is_empty() {
+    if !start_commit_ids.is_empty() {
         request.root_scope =
-            FileHistoryRootScope::RequestedRoots(root_commit_ids.into_iter().collect());
+            FileHistoryRootScope::RequestedRoots(start_commit_ids.into_iter().collect());
     }
     if !version_ids.is_empty() {
         request.version_scope =
@@ -442,7 +442,7 @@ fn build_directory_history_predicates_and_request(
 
 fn apply_directory_history_pushdown(
     predicate: &DirectoryHistoryPredicate,
-    root_commit_ids: &mut BTreeSet<String>,
+    start_commit_ids: &mut BTreeSet<String>,
     version_ids: &mut BTreeSet<String>,
     directory_ids: &mut BTreeSet<String>,
 ) {
@@ -451,7 +451,7 @@ fn apply_directory_history_pushdown(
             push_text_value_for_directory_history_field(
                 field,
                 value,
-                root_commit_ids,
+                start_commit_ids,
                 version_ids,
                 directory_ids,
             );
@@ -461,7 +461,7 @@ fn apply_directory_history_pushdown(
                 push_text_value_for_directory_history_field(
                     field,
                     value,
-                    root_commit_ids,
+                    start_commit_ids,
                     version_ids,
                     directory_ids,
                 );
@@ -480,7 +480,7 @@ fn apply_directory_history_pushdown(
 fn push_text_value_for_directory_history_field(
     field: &DirectoryHistoryField,
     value: &Value,
-    root_commit_ids: &mut BTreeSet<String>,
+    start_commit_ids: &mut BTreeSet<String>,
     version_ids: &mut BTreeSet<String>,
     directory_ids: &mut BTreeSet<String>,
 ) {
@@ -489,7 +489,7 @@ fn push_text_value_for_directory_history_field(
     };
     match field {
         DirectoryHistoryField::RootCommitId => {
-            root_commit_ids.insert(text.to_string());
+            start_commit_ids.insert(text.to_string());
         }
         DirectoryHistoryField::VersionId => {
             version_ids.insert(text.to_string());
@@ -700,7 +700,7 @@ fn directory_history_field_from_column_name(
         "commit_created_at" | "lixcol_commit_created_at" => {
             Ok(DirectoryHistoryField::CommitCreatedAt)
         }
-        "root_commit_id" | "lixcol_root_commit_id" => Ok(DirectoryHistoryField::RootCommitId),
+        "start_commit_id" | "lixcol_start_commit_id" => Ok(DirectoryHistoryField::RootCommitId),
         "depth" | "lixcol_depth" => Ok(DirectoryHistoryField::Depth),
         _ => Err(crate::sql::diagnostics::sql_unknown_column_error(
             column,
@@ -872,7 +872,7 @@ fn build_file_history_predicates_and_request(
     request: &mut FileHistoryRequest,
 ) -> Result<Vec<FileHistoryPredicate>, LixError> {
     let mut predicates = Vec::new();
-    let mut root_commit_ids = BTreeSet::new();
+    let mut start_commit_ids = BTreeSet::new();
     let mut version_ids = BTreeSet::new();
     let mut placeholder_state = PlaceholderState::new();
 
@@ -889,13 +889,13 @@ fn build_file_history_predicates_and_request(
                 "file-history read execution does not support this predicate shape",
             )
         })?;
-        apply_file_history_pushdown(&predicate, &mut root_commit_ids, &mut version_ids);
+        apply_file_history_pushdown(&predicate, &mut start_commit_ids, &mut version_ids);
         predicates.push(predicate);
     }
 
-    if !root_commit_ids.is_empty() {
+    if !start_commit_ids.is_empty() {
         request.root_scope =
-            FileHistoryRootScope::RequestedRoots(root_commit_ids.into_iter().collect());
+            FileHistoryRootScope::RequestedRoots(start_commit_ids.into_iter().collect());
     }
     if !version_ids.is_empty() {
         request.version_scope =
@@ -907,16 +907,16 @@ fn build_file_history_predicates_and_request(
 
 fn apply_file_history_pushdown(
     predicate: &FileHistoryPredicate,
-    root_commit_ids: &mut BTreeSet<String>,
+    start_commit_ids: &mut BTreeSet<String>,
     version_ids: &mut BTreeSet<String>,
 ) {
     match predicate {
         FileHistoryPredicate::Eq(field, value) => {
-            push_text_value_for_file_history_field(field, value, root_commit_ids, version_ids);
+            push_text_value_for_file_history_field(field, value, start_commit_ids, version_ids);
         }
         FileHistoryPredicate::In(field, values) => {
             for value in values {
-                push_text_value_for_file_history_field(field, value, root_commit_ids, version_ids);
+                push_text_value_for_file_history_field(field, value, start_commit_ids, version_ids);
             }
         }
         FileHistoryPredicate::NotEq(_, _)
@@ -932,7 +932,7 @@ fn apply_file_history_pushdown(
 fn push_text_value_for_file_history_field(
     field: &FileHistoryField,
     value: &Value,
-    root_commit_ids: &mut BTreeSet<String>,
+    start_commit_ids: &mut BTreeSet<String>,
     version_ids: &mut BTreeSet<String>,
 ) {
     let Some(text) = value_as_text(value) else {
@@ -940,7 +940,7 @@ fn push_text_value_for_file_history_field(
     };
     match field {
         FileHistoryField::RootCommitId => {
-            root_commit_ids.insert(text.to_string());
+            start_commit_ids.insert(text.to_string());
         }
         FileHistoryField::VersionId => {
             version_ids.insert(text.to_string());
@@ -1186,7 +1186,7 @@ fn file_history_field_from_column_name(
         "lixcol_metadata" => Ok(FileHistoryField::LixcolMetadata),
         "commit_id" | "lixcol_commit_id" => Ok(FileHistoryField::CommitId),
         "commit_created_at" | "lixcol_commit_created_at" => Ok(FileHistoryField::CommitCreatedAt),
-        "root_commit_id" | "lixcol_root_commit_id" => Ok(FileHistoryField::RootCommitId),
+        "start_commit_id" | "lixcol_start_commit_id" => Ok(FileHistoryField::RootCommitId),
         "depth" | "lixcol_depth" => Ok(FileHistoryField::Depth),
         _ => Err(crate::sql::diagnostics::sql_unknown_column_error(
             column,
@@ -1518,7 +1518,7 @@ fn file_history_field_name(field: &FileHistoryField) -> &'static str {
         FileHistoryField::LixcolMetadata => "lixcol_metadata",
         FileHistoryField::CommitId => "lixcol_commit_id",
         FileHistoryField::CommitCreatedAt => "lixcol_commit_created_at",
-        FileHistoryField::RootCommitId => "lixcol_root_commit_id",
+        FileHistoryField::RootCommitId => "lixcol_start_commit_id",
         FileHistoryField::Depth => "lixcol_depth",
     }
 }
@@ -1540,7 +1540,7 @@ fn directory_history_field_name(field: &DirectoryHistoryField) -> &'static str {
         DirectoryHistoryField::LixcolMetadata => "lixcol_metadata",
         DirectoryHistoryField::CommitId => "lixcol_commit_id",
         DirectoryHistoryField::CommitCreatedAt => "lixcol_commit_created_at",
-        DirectoryHistoryField::RootCommitId => "lixcol_root_commit_id",
+        DirectoryHistoryField::RootCommitId => "lixcol_start_commit_id",
         DirectoryHistoryField::Depth => "lixcol_depth",
     }
 }
@@ -1638,7 +1638,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
     dialect: SqlDialect,
     compiler_metadata: &super::super::SqlCompilerMetadata,
     bound_statement: BoundStatement,
-    active_history_root_commit_id: Option<&str>,
+    active_history_start_commit_id: Option<&str>,
     _origin_key: Option<&str>,
     explain_request: Option<&crate::sql::explain::ExplainRequest>,
     registry: &SurfaceRegistry,
@@ -1665,7 +1665,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
     let analysis = match prepare_structured_public_read_analysis(
         bound_statement,
         registry,
-        active_history_root_commit_id,
+        active_history_start_commit_id,
     )
     .await?
     {
@@ -1906,12 +1906,12 @@ async fn try_prepare_public_read_via_specialized_optimization(
 
 fn file_history_pushdown_decision(plan: &FileHistoryReadPlan) -> Option<PushdownDecision> {
     let mut accepted_predicates = Vec::new();
-    if let FileHistoryRootScope::RequestedRoots(root_commit_ids) = &plan.request.root_scope {
-        for root_commit_id in root_commit_ids {
+    if let FileHistoryRootScope::RequestedRoots(start_commit_ids) = &plan.request.root_scope {
+        for start_commit_id in start_commit_ids {
             accepted_predicates.push(binary_predicate_expr(
-                "root_commit_id",
+                "start_commit_id",
                 BinaryOperator::Eq,
-                &Value::Text(root_commit_id.clone()),
+                &Value::Text(start_commit_id.clone()),
             ));
         }
     }
@@ -1936,12 +1936,12 @@ fn directory_history_pushdown_decision(
     plan: &DirectoryHistoryReadPlan,
 ) -> Option<PushdownDecision> {
     let mut accepted_predicates = Vec::new();
-    if let FileHistoryRootScope::RequestedRoots(root_commit_ids) = &plan.request.root_scope {
-        for root_commit_id in root_commit_ids {
+    if let FileHistoryRootScope::RequestedRoots(start_commit_ids) = &plan.request.root_scope {
+        for start_commit_id in start_commit_ids {
             accepted_predicates.push(binary_predicate_expr(
-                "root_commit_id",
+                "start_commit_id",
                 BinaryOperator::Eq,
-                &Value::Text(root_commit_id.clone()),
+                &Value::Text(start_commit_id.clone()),
             ));
         }
     }
@@ -1982,7 +1982,7 @@ pub(super) async fn try_prepare_public_read(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
-    active_history_root_commit_id: Option<&str>,
+    active_history_start_commit_id: Option<&str>,
     origin_key: Option<&str>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
     let registry =
@@ -1998,7 +1998,7 @@ pub(super) async fn try_prepare_public_read(
         parsed_statements,
         params,
         active_version_id,
-        active_history_root_commit_id,
+        active_history_start_commit_id,
         origin_key,
         None,
     )
@@ -2012,7 +2012,7 @@ pub(super) async fn try_prepare_public_read_with_registry_and_internal_access(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
-    active_history_root_commit_id: Option<&str>,
+    active_history_start_commit_id: Option<&str>,
     origin_key: Option<&str>,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
@@ -2027,7 +2027,7 @@ pub(super) async fn try_prepare_public_read_with_registry_and_internal_access(
         parsed_statements,
         params,
         active_version_id,
-        active_history_root_commit_id,
+        active_history_start_commit_id,
         origin_key,
         parse_duration,
     )
@@ -2041,7 +2041,7 @@ async fn try_prepare_public_read_with_internal_access(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
-    active_history_root_commit_id: Option<&str>,
+    active_history_start_commit_id: Option<&str>,
     origin_key: Option<&str>,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
@@ -2113,7 +2113,7 @@ async fn try_prepare_public_read_with_internal_access(
         dialect,
         compiler_metadata,
         bound_statement,
-        active_history_root_commit_id,
+        active_history_start_commit_id,
         origin_key,
         explain_request.as_ref(),
         &registry,
@@ -2365,7 +2365,7 @@ pub(super) async fn prepare_public_read(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
-    active_history_root_commit_id: Option<&str>,
+    active_history_start_commit_id: Option<&str>,
     origin_key: Option<&str>,
 ) -> Option<PublicReadPlan> {
     try_prepare_public_read(
@@ -2373,7 +2373,7 @@ pub(super) async fn prepare_public_read(
         parsed_statements,
         params,
         active_version_id,
-        active_history_root_commit_id,
+        active_history_start_commit_id,
         origin_key,
     )
     .await
@@ -2387,7 +2387,7 @@ pub(super) async fn prepare_public_read_strict(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
-    active_history_root_commit_id: Option<&str>,
+    active_history_start_commit_id: Option<&str>,
     origin_key: Option<&str>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
     try_prepare_public_read(
@@ -2395,7 +2395,7 @@ pub(super) async fn prepare_public_read_strict(
         parsed_statements,
         params,
         active_version_id,
-        active_history_root_commit_id,
+        active_history_start_commit_id,
         origin_key,
     )
     .await

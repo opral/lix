@@ -1963,7 +1963,7 @@ mod tests {
         let lowered = lowered_batch(
             &registry,
             "SELECT key, lixcol_commit_id, lixcol_commit_created_at, \
-                    lixcol_root_commit_id, lixcol_depth, lixcol_version_id \
+                    lixcol_start_commit_id, lixcol_depth, lixcol_version_id \
              FROM lix_key_value_history \
              WHERE key = 'hello'",
         )
@@ -1977,8 +1977,8 @@ mod tests {
         assert!(lowered_sql.contains("lixcol_commit_id"));
         assert!(lowered_sql.contains("commit_created_at"));
         assert!(lowered_sql.contains("lixcol_commit_created_at"));
-        assert!(lowered_sql.contains("root_commit_id"));
-        assert!(lowered_sql.contains("lixcol_root_commit_id"));
+        assert!(lowered_sql.contains("start_commit_id"));
+        assert!(lowered_sql.contains("lixcol_start_commit_id"));
         assert!(lowered_sql.contains("depth"));
         assert!(lowered_sql.contains("lixcol_depth"));
         assert!(lowered_sql.contains("version_id"));

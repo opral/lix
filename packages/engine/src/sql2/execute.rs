@@ -23,7 +23,7 @@ use super::file_history_provider::register_lix_file_history_provider;
 use super::file_provider::register_lix_file_providers;
 use super::history_provider::register_history_providers;
 use super::lix_state_provider::register_lix_state_providers;
-use super::udf::register_sql2_udfs;
+use super::udf::register_sql2_functions;
 use super::version_provider::register_lix_version_provider;
 
 /// Single execution boundary for `sql2::execute_sql(...)`.
@@ -150,7 +150,7 @@ pub(crate) async fn execute_logical_plan(
 
 async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, LixError> {
     let session = SessionContext::new();
-    register_sql2_udfs(&session, ctx.functions());
+    register_sql2_functions(&session, ctx.functions());
     let version_ref = ctx.version_ref();
     register_lix_state_providers(
         &session,
@@ -2044,6 +2044,17 @@ mod tests {
             "required": ["value"],
             "additionalProperties": false
         });
+        session_a
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}'),\
+                 true,\
+                 true\
+                 )",
+                &[],
+            )
+            .await?;
         session_a
             .execute(
                 "INSERT INTO lix_state (\

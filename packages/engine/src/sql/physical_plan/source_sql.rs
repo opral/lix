@@ -1597,9 +1597,9 @@ fn is_live_state_envelope_column(column: &str) -> bool {
             | "lixcol_metadata"
             | "snapshot_content"
             | "commit_created_at"
-            | "root_commit_id"
+            | "start_commit_id"
             | "depth"
-            | "lixcol_root_commit_id"
+            | "lixcol_start_commit_id"
             | "lixcol_depth"
     )
 }

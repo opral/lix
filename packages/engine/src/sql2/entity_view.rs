@@ -11,10 +11,7 @@ use datafusion::logical_expr::expr_fn::{col, try_cast};
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::prelude::SessionContext;
 
-use super::udf::{
-    lix_json_extract_boolean_expr, lix_json_extract_json_expr, lix_json_extract_text_expr,
-    lix_json_extract_variant_expr,
-};
+use super::udf::{lix_json_extract_expr, lix_json_extract_text_expr, lix_text_encode_expr};
 use crate::catalog::{
     state_relation_column_is_nullable_for_variant, state_relation_columns_for_variant,
     SurfaceColumnType, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
@@ -372,15 +369,16 @@ fn json_payload_projection_expr(property_name: &str, column_type: SurfaceColumnT
     let snapshot_content = col("snapshot_content");
     match column_type {
         SurfaceColumnType::String => lix_json_extract_text_expr(snapshot_content, property_name),
-        SurfaceColumnType::Json => lix_json_extract_json_expr(snapshot_content, property_name),
+        SurfaceColumnType::Json => lix_json_extract_expr(snapshot_content, property_name),
         // Variant remains available for future explicit owner-chosen polymorphic
         // payloads, but schema-derived JSON fields must not route through it.
         SurfaceColumnType::Variant => {
-            lix_json_extract_variant_expr(snapshot_content, property_name)
+            lix_text_encode_expr(lix_json_extract_expr(snapshot_content, property_name))
         }
-        SurfaceColumnType::Boolean => {
-            lix_json_extract_boolean_expr(snapshot_content, property_name)
-        }
+        SurfaceColumnType::Boolean => try_cast(
+            lix_json_extract_text_expr(snapshot_content, property_name),
+            DataType::Boolean,
+        ),
         SurfaceColumnType::Integer => try_cast(
             lix_json_extract_text_expr(snapshot_content, property_name),
             DataType::Int64,
@@ -602,12 +600,12 @@ mod tests {
         let Expr::ScalarFunction(ScalarFunction { func, args }) = inner.as_ref() else {
             panic!("integer payloads should extract from JSON first");
         };
-        assert_eq!(func.name(), "lix_json_extract");
+        assert_eq!(func.name(), "lix_json_extract_text");
         assert_eq!(args.len(), 2);
     }
 
     #[test]
-    fn boolean_payload_projection_uses_boolean_json_extract() {
+    fn boolean_payload_projection_casts_text_json_extract() {
         let mut registry = build_builtin_surface_registry();
         register_dynamic_entity_surface_spec(
             &mut registry,
@@ -630,14 +628,22 @@ mod tests {
         let Expr::Alias(Alias { expr, .. }) = &exprs[0] else {
             panic!("projection should alias the payload expr");
         };
-        let Expr::ScalarFunction(ScalarFunction { func, .. }) = expr.as_ref() else {
-            panic!("boolean payload should compile to a scalar function");
+        let Expr::TryCast(TryCast {
+            expr: inner,
+            data_type,
+        }) = expr.as_ref()
+        else {
+            panic!("boolean payloads should compile to try_cast");
         };
-        assert_eq!(func.name(), "lix_json_extract_boolean");
+        assert_eq!(data_type, &DataType::Boolean);
+        let Expr::ScalarFunction(ScalarFunction { func, .. }) = inner.as_ref() else {
+            panic!("boolean payload should extract from JSON first");
+        };
+        assert_eq!(func.name(), "lix_json_extract_text");
     }
 
     #[test]
-    fn json_payload_projection_uses_json_extract_json_for_lix_key_value() {
+    fn json_payload_projection_uses_json_extract_for_lix_key_value() {
         let registry = build_builtin_surface_registry();
         let plans =
             prepared_entity_view_plans_for_registry(&registry, &["lix_key_value".to_string()]);
@@ -660,7 +666,7 @@ mod tests {
         let Expr::ScalarFunction(ScalarFunction { func, .. }) = expr.as_ref() else {
             panic!("json payload should compile to a scalar function");
         };
-        assert_eq!(func.name(), "lix_json_extract_json");
+        assert_eq!(func.name(), "lix_json_extract");
     }
 
     #[test]
@@ -689,7 +695,7 @@ mod tests {
         let Expr::ScalarFunction(ScalarFunction { func, .. }) = expr.as_ref() else {
             panic!("registered schema JSON payload should compile to a scalar function");
         };
-        assert_eq!(func.name(), "lix_json_extract_json");
+        assert_eq!(func.name(), "lix_json_extract");
 
         let schema = plan
             .projected_schema(&["value".to_string()])
@@ -738,7 +744,7 @@ mod tests {
         let Expr::ScalarFunction(ScalarFunction { func, .. }) = expr.as_ref() else {
             panic!("json payload should compile to a scalar function");
         };
-        assert_eq!(func.name(), "lix_json_extract_json");
+        assert_eq!(func.name(), "lix_json_extract");
 
         let schema = plan
             .projected_schema(&["value".to_string()])
@@ -771,10 +777,14 @@ mod tests {
         assert_eq!(name, "value");
         assert_eq!(metadata.as_ref(), Some(&variant_field_metadata()));
 
-        let Expr::ScalarFunction(ScalarFunction { func, .. }) = expr.as_ref() else {
+        let Expr::ScalarFunction(ScalarFunction { func, args }) = expr.as_ref() else {
             panic!("variant payload should compile to a scalar function");
         };
-        assert_eq!(func.name(), "lix_json_extract_variant");
+        assert_eq!(func.name(), "lix_text_encode");
+        let Expr::ScalarFunction(ScalarFunction { func, .. }) = &args[0] else {
+            panic!("variant payload should encode JSON extraction");
+        };
+        assert_eq!(func.name(), "lix_json_extract");
 
         let field = column.output_field();
         assert_eq!(field.data_type(), &DataType::Binary);

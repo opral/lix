@@ -10,7 +10,10 @@ pub(crate) fn split_effective_state_pushdown_predicates(
     let mut source_predicates = Vec::new();
     for predicate in pushdown_predicates {
         if expr_references_identifier(predicate, &["version_id", "lixcol_version_id"])
-            && !expr_references_identifier(predicate, &["root_commit_id", "lixcol_root_commit_id"])
+            && !expr_references_identifier(
+                predicate,
+                &["start_commit_id", "lixcol_start_commit_id"],
+            )
         {
             target_version_predicates.push(predicate.clone());
         } else {
@@ -120,7 +123,7 @@ pub(crate) fn is_live_state_raw_envelope_column(column: &str) -> bool {
             | "change_id"
             | "commit_id"
             | "untracked"
-            | "root_commit_id"
+            | "start_commit_id"
             | "depth"
     )
 }

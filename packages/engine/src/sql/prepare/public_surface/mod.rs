@@ -163,7 +163,7 @@ struct BoundPublicReadSummary {
     bound_surface_bindings: Vec<crate::catalog::ResolvedRelation>,
     internal_relations: Vec<String>,
     external_relations: Vec<String>,
-    requested_history_root_commit_ids: Vec<String>,
+    requested_history_start_commit_ids: Vec<String>,
 }
 
 pub(crate) mod read;
@@ -178,7 +178,7 @@ pub(crate) async fn prepare_public_plan(
     origin_key: Option<&str>,
 ) -> Result<Option<PublicPlan>, LixError> {
     let mut metadata_reader = backend;
-    let active_history_root_commit_id: Option<String> = metadata_reader
+    let active_history_start_commit_id: Option<String> = metadata_reader
         .load_active_history_root_commit_id_for_preparation(active_version_id)
         .await?;
     prepare_public_plan_with_internal_access(
@@ -186,7 +186,7 @@ pub(crate) async fn prepare_public_plan(
         parsed_statements,
         params,
         active_version_id,
-        active_history_root_commit_id.as_deref(),
+        active_history_start_commit_id.as_deref(),
         active_account_ids,
         origin_key,
     )
@@ -201,7 +201,7 @@ pub(crate) async fn prepare_public_plan_with_registry_context_and_functions(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
-    active_history_root_commit_id: Option<&str>,
+    active_history_start_commit_id: Option<&str>,
     active_account_ids: &[String],
     origin_key: Option<&str>,
     parse_duration: Option<Duration>,
@@ -258,7 +258,7 @@ pub(crate) async fn prepare_public_plan_with_registry_context_and_functions(
                 parsed_statements,
                 params,
                 active_version_id,
-                active_history_root_commit_id,
+                active_history_start_commit_id,
                 origin_key,
                 parse_duration,
             )
@@ -281,7 +281,7 @@ pub(crate) async fn prepare_public_plan_with_internal_access(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
-    active_history_root_commit_id: Option<&str>,
+    active_history_start_commit_id: Option<&str>,
     active_account_ids: &[String],
     origin_key: Option<&str>,
 ) -> Result<Option<PublicPlan>, LixError> {
@@ -302,7 +302,7 @@ pub(crate) async fn prepare_public_plan_with_internal_access(
         parsed_statements,
         params,
         active_version_id,
-        active_history_root_commit_id,
+        active_history_start_commit_id,
         active_account_ids,
         origin_key,
         None,
@@ -317,7 +317,7 @@ pub(crate) async fn try_prepare_public_read_with_registry_and_internal_access(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
-    active_history_root_commit_id: Option<&str>,
+    active_history_start_commit_id: Option<&str>,
     origin_key: Option<&str>,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
@@ -328,7 +328,7 @@ pub(crate) async fn try_prepare_public_read_with_registry_and_internal_access(
         parsed_statements,
         params,
         active_version_id,
-        active_history_root_commit_id,
+        active_history_start_commit_id,
         origin_key,
         parse_duration,
     )
@@ -479,7 +479,7 @@ pub(crate) async fn prepare_public_read(
     origin_key: Option<&str>,
 ) -> Option<PublicReadPlan> {
     let mut metadata_reader = backend;
-    let active_history_root_commit_id: Option<String> = metadata_reader
+    let active_history_start_commit_id: Option<String> = metadata_reader
         .load_active_history_root_commit_id_for_preparation(active_version_id)
         .await
         .ok()
@@ -489,7 +489,7 @@ pub(crate) async fn prepare_public_read(
         parsed_statements,
         params,
         active_version_id,
-        active_history_root_commit_id.as_deref(),
+        active_history_start_commit_id.as_deref(),
         origin_key,
     )
     .await
@@ -504,7 +504,7 @@ pub(crate) async fn prepare_public_read_strict(
     origin_key: Option<&str>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
     let mut metadata_reader = backend;
-    let active_history_root_commit_id: Option<String> = metadata_reader
+    let active_history_start_commit_id: Option<String> = metadata_reader
         .load_active_history_root_commit_id_for_preparation(active_version_id)
         .await?;
     read::prepare_public_read_strict(
@@ -512,7 +512,7 @@ pub(crate) async fn prepare_public_read_strict(
         parsed_statements,
         params,
         active_version_id,
-        active_history_root_commit_id.as_deref(),
+        active_history_start_commit_id.as_deref(),
         origin_key,
     )
     .await
@@ -592,7 +592,7 @@ fn summarize_bound_public_read_statement(
         bound_surface_bindings,
         internal_relations,
         external_relations,
-        requested_history_root_commit_ids: requested_history_root_commit_ids_from_selection(
+        requested_history_start_commit_ids: requested_history_start_commit_ids_from_selection(
             query_selection(query),
         ),
     }
@@ -1050,20 +1050,20 @@ impl Visitor for PublicRelationCollectorVisitor<'_> {
     }
 }
 
-fn requested_history_root_commit_ids_from_selection(selection: Option<&Expr>) -> Vec<String> {
+fn requested_history_start_commit_ids_from_selection(selection: Option<&Expr>) -> Vec<String> {
     let mut roots = std::collections::BTreeSet::new();
     if let Some(selection) = selection {
-        collect_history_root_commit_ids(selection, &mut roots);
+        collect_history_start_commit_ids(selection, &mut roots);
     }
     roots.into_iter().collect()
 }
 
-fn collect_history_root_commit_ids(expr: &Expr, roots: &mut std::collections::BTreeSet<String>) {
+fn collect_history_start_commit_ids(expr: &Expr, roots: &mut std::collections::BTreeSet<String>) {
     match expr {
         Expr::BinaryOp { left, op, right } => {
             if *op == BinaryOperator::And {
-                collect_history_root_commit_ids(left, roots);
-                collect_history_root_commit_ids(right, roots);
+                collect_history_start_commit_ids(left, roots);
+                collect_history_start_commit_ids(right, roots);
                 return;
             }
             if *op == BinaryOperator::Eq {
@@ -1078,7 +1078,7 @@ fn collect_history_root_commit_ids(expr: &Expr, roots: &mut std::collections::BT
                 }
             }
         }
-        Expr::Nested(inner) => collect_history_root_commit_ids(inner, roots),
+        Expr::Nested(inner) => collect_history_start_commit_ids(inner, roots),
         Expr::InList {
             expr,
             list,
@@ -1101,8 +1101,8 @@ fn history_root_identifier(expr: &Expr) -> Option<&str> {
         _ => None,
     }
     .filter(|name| {
-        name.eq_ignore_ascii_case("root_commit_id")
-            || name.eq_ignore_ascii_case("lixcol_root_commit_id")
+        name.eq_ignore_ascii_case("start_commit_id")
+            || name.eq_ignore_ascii_case("lixcol_start_commit_id")
     })
 }
 
@@ -3150,9 +3150,9 @@ mod tests {
                     session
                         .execute(
                             "INSERT INTO lix_state_by_version (\
-                             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                             entity_id, schema_key, file_id, version_id, snapshot_content, schema_version\
                              ) VALUES (\
-                             'm1', 'message', NULL, 'version-a', NULL, '{\"id\":\"m1\",\"body\":\"hello\"}', '1'\
+                             'm1', 'message', NULL, 'version-a', '{\"id\":\"m1\",\"body\":\"hello\"}', '1'\
                              )",
                             &[],
                         )
@@ -4322,9 +4322,9 @@ mod tests {
                     let prepared = prepare_public_read(
                         &backend,
                         &parse_one(&format!(
-                            "SELECT id, path, lixcol_root_commit_id \
+                            "SELECT id, path, lixcol_start_commit_id \
                              FROM lix_file_history \
-                             WHERE id = 'file-1' AND lixcol_root_commit_id = '{}'",
+                             WHERE id = 'file-1' AND lixcol_start_commit_id = '{}'",
                             active_commit_id
                         )),
                         &[],
@@ -4399,11 +4399,11 @@ mod tests {
                     let prepared = prepare_public_read(
                         &backend,
                         &parse_one(&format!(
-                            "SELECT id, path, lixcol_version_id, lixcol_root_commit_id \
+                            "SELECT id, path, lixcol_version_id, lixcol_start_commit_id \
                              FROM lix_file_history_by_version \
                              WHERE id = 'file-1' \
                                AND lixcol_version_id = 'version-a' \
-                               AND lixcol_root_commit_id = '{}'",
+                               AND lixcol_start_commit_id = '{}'",
                             active_commit_id
                         )),
                         &[],
@@ -4482,9 +4482,9 @@ mod tests {
                     let prepared = prepare_public_read(
                         &backend,
                         &parse_one(&format!(
-                            "SELECT id, path, lixcol_root_commit_id \
+                            "SELECT id, path, lixcol_start_commit_id \
                              FROM lix_directory_history \
-                             WHERE id = 'dir-1' AND lixcol_root_commit_id = '{}'",
+                             WHERE id = 'dir-1' AND lixcol_start_commit_id = '{}'",
                             active_commit_id
                         )),
                         &[],
@@ -4601,17 +4601,17 @@ mod tests {
                 .block_on(async move {
                     let (backend, session, active_version_id, active_commit_id) =
                         active_version_fixture().await;
-                    let explicit_root_commit_id = "root-explicit-filesystem-history";
+                    let explicit_start_commit_id = "root-explicit-filesystem-history";
 
                     let prepared = prepare_public_read(
                         &backend,
                         &parse_one(&format!(
-                            "SELECT id, lixcol_root_commit_id, lixcol_depth \
+                            "SELECT id, lixcol_start_commit_id, lixcol_depth \
                              FROM lix_file_history \
                              WHERE id = 'file-1' \
-                               AND lixcol_root_commit_id = '{}' \
+                               AND lixcol_start_commit_id = '{}' \
                              ORDER BY lixcol_depth ASC",
-                            explicit_root_commit_id
+                            explicit_start_commit_id
                         )),
                         &[],
                         &active_version_id,
@@ -4631,7 +4631,7 @@ mod tests {
                         .first()
                         .expect("filesystem history read should lower through sql2");
                     assert!(
-                        lowered_sql.contains(explicit_root_commit_id),
+                        lowered_sql.contains(explicit_start_commit_id),
                         "filesystem history read should preserve the explicit root commit in lowered sql"
                     );
                     assert!(
@@ -4807,7 +4807,7 @@ mod tests {
                         &backend,
                         &parse_one(
                             "EXPLAIN SELECT key FROM lix_key_value_history \
-                             WHERE root_commit_id = 'root-1' AND key = 'hello'",
+                             WHERE start_commit_id = 'root-1' AND key = 'hello'",
                         ),
                         &[],
                         "main",
@@ -5324,9 +5324,9 @@ mod tests {
         let prepared = prepare_public_read(
             &backend,
             &parse_one(
-                "SELECT snapshot_content, root_commit_id, depth \
+                "SELECT snapshot_content, start_commit_id, depth \
                  FROM lix_state_history \
-                 WHERE entity_id = 'entity1' AND root_commit_id = 'commit-1' \
+                 WHERE entity_id = 'entity1' AND start_commit_id = 'commit-1' \
                  ORDER BY depth ASC",
             ),
             &[],
@@ -5359,10 +5359,10 @@ mod tests {
         let prepared = prepare_public_read(
             &backend,
             &parse_one(
-                "SELECT entity_id, root_commit_id, depth, COUNT(*) AS count_rows \
+                "SELECT entity_id, start_commit_id, depth, COUNT(*) AS count_rows \
                  FROM lix_state_history \
-                 WHERE root_commit_id = 'commit-1' \
-                 GROUP BY entity_id, root_commit_id, depth \
+                 WHERE start_commit_id = 'commit-1' \
+                 GROUP BY entity_id, start_commit_id, depth \
                  HAVING COUNT(*) > 0 \
                  ORDER BY entity_id",
             ),
@@ -5402,7 +5402,7 @@ mod tests {
                     let prepared = prepare_public_read_strict(
                         &backend,
                         &parse_one(
-                            "SELECT root_commit_id, depth \
+                            "SELECT start_commit_id, depth \
                              FROM lix_state_history \
                              ORDER BY depth ASC \
                              LIMIT 1",
@@ -5443,7 +5443,7 @@ mod tests {
 
                     assert_eq!(
                         actual.columns,
-                        vec!["root_commit_id".to_string(), "depth".to_string()]
+                        vec!["start_commit_id".to_string(), "depth".to_string()]
                     );
                     assert!(
                         matches!(
@@ -5452,7 +5452,7 @@ mod tests {
                                 if matches!(row.first(), Some(Value::Text(_)))
                                     && matches!(row.get(1), Some(Value::Integer(_)))
                         ),
-                        "expected root_commit_id text and depth integer values, got {:?}",
+                        "expected start_commit_id text and depth integer values, got {:?}",
                         actual.rows
                     );
                 })
@@ -5472,10 +5472,10 @@ mod tests {
                     let prepared = prepare_public_read_strict(
                         &backend,
                         &parse_one(&format!(
-                            "SELECT root_commit_id, version_id, depth \
+                            "SELECT start_commit_id, version_id, depth \
                              FROM lix_state_history \
                              WHERE version_id = '{version_id}' AND depth = 0 \
-                             ORDER BY root_commit_id \
+                             ORDER BY start_commit_id \
                              LIMIT 5",
                             version_id = active_version_id.replace('\'', "''"),
                         )),
@@ -5517,7 +5517,7 @@ mod tests {
                     assert_eq!(
                         actual.columns,
                         vec![
-                            "root_commit_id".to_string(),
+                            "start_commit_id".to_string(),
                             "version_id".to_string(),
                             "depth".to_string(),
                         ]
@@ -5552,12 +5552,12 @@ mod tests {
                     let prepared = prepare_public_read_strict(
                         &backend,
                         &parse_one(&format!(
-                            "SELECT root_commit_id, version_id, COUNT(*) AS count_rows \
+                            "SELECT start_commit_id, version_id, COUNT(*) AS count_rows \
                              FROM lix_state_history \
                              WHERE version_id = '{version_id}' AND depth = 0 \
-                             GROUP BY root_commit_id, version_id \
+                             GROUP BY start_commit_id, version_id \
                              HAVING COUNT(*) > 0 \
-                             ORDER BY root_commit_id ASC \
+                             ORDER BY start_commit_id ASC \
                              LIMIT 5",
                             version_id = active_version_id.replace('\'', "''"),
                         )),
@@ -5599,7 +5599,7 @@ mod tests {
                     assert_eq!(
                         actual.columns,
                         vec![
-                            "root_commit_id".to_string(),
+                            "start_commit_id".to_string(),
                             "version_id".to_string(),
                             "count_rows".to_string(),
                         ]
@@ -5623,14 +5623,14 @@ mod tests {
                         .iter()
                         .map(|row| match &row[0] {
                             Value::Text(value) => value.clone(),
-                            other => panic!("expected root_commit_id text, got {other:?}"),
+                            other => panic!("expected start_commit_id text, got {other:?}"),
                         })
                         .collect::<Vec<_>>();
                     let mut sorted_roots = ordered_roots.clone();
                     sorted_roots.sort();
                     assert_eq!(
                         ordered_roots, sorted_roots,
-                        "expected sql2 result ordering to respect ORDER BY root_commit_id"
+                        "expected sql2 result ordering to respect ORDER BY start_commit_id"
                     );
                 })
         });
