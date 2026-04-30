@@ -902,7 +902,6 @@ fn filesystem_base_relation_columns(
             ("schema_key", "schema_key"),
             ("file_id", "file_id"),
             ("version_id", "version_id"),
-            ("plugin_key", "plugin_key"),
             ("schema_version", "schema_version"),
             ("global", "global"),
             ("change_id", "change_id"),
@@ -922,7 +921,6 @@ fn filesystem_base_relation_columns(
             ("schema_key", "schema_key"),
             ("file_id", "file_id"),
             ("version_id", "version_id"),
-            ("plugin_key", "plugin_key"),
             ("schema_version", "schema_version"),
             ("change_id", "change_id"),
             ("commit_id", "commit_id"),
@@ -941,7 +939,6 @@ fn filesystem_base_relation_columns(
             ("schema_key", "schema_key"),
             ("file_id", "file_id"),
             ("version_id", "version_id"),
-            ("plugin_key", "plugin_key"),
             ("schema_version", "schema_version"),
             ("global", "global"),
             ("change_id", "change_id"),
@@ -960,7 +957,6 @@ fn filesystem_base_relation_columns(
             ("schema_key", "schema_key"),
             ("file_id", "file_id"),
             ("version_id", "version_id"),
-            ("plugin_key", "plugin_key"),
             ("schema_version", "schema_version"),
             ("change_id", "change_id"),
             ("commit_id", "commit_id"),
@@ -978,7 +974,6 @@ fn filesystem_base_relation_columns(
             ("schema_key", "schema_key"),
             ("file_id", "file_id"),
             ("version_id", "version_id"),
-            ("plugin_key", "plugin_key"),
             ("schema_version", "schema_version"),
             ("global", "global"),
             ("change_id", "change_id"),
@@ -996,7 +991,6 @@ fn filesystem_base_relation_columns(
             ("schema_key", "schema_key"),
             ("file_id", "file_id"),
             ("version_id", "version_id"),
-            ("plugin_key", "plugin_key"),
             ("schema_version", "schema_version"),
             ("change_id", "change_id"),
             ("commit_id", "commit_id"),
@@ -1566,7 +1560,6 @@ mod sql_fragments {
            SELECT \
              fd.id, \
              fd.file_id, \
-             fd.plugin_key, \
              fd.start_commit_id, \
              fd.depth AS raw_depth, \
              fd.change_id, \
@@ -1584,7 +1577,6 @@ mod sql_fragments {
            SELECT \
              ddi.id, \
              d.file_id, \
-             d.plugin_key, \
              d.start_commit_id, \
              d.depth AS raw_depth, \
              d.change_id, \
@@ -1605,7 +1597,6 @@ mod sql_fragments {
            SELECT \
              b.file_id AS id, \
              b.file_id, \
-             b.plugin_key, \
              b.start_commit_id, \
              b.depth AS raw_depth, \
              b.change_id, \
@@ -1625,7 +1616,6 @@ mod sql_fragments {
          SELECT \
            id, \
            file_id, \
-           plugin_key, \
            start_commit_id, \
            raw_depth, \
            change_id, \
@@ -1655,7 +1645,6 @@ mod sql_fragments {
             "SELECT \
            id, \
            file_id, \
-           plugin_key, \
            start_commit_id, \
            raw_depth, \
            change_id, \
@@ -1680,7 +1669,6 @@ mod sql_fragments {
             "SELECT \
            id, \
            file_id, \
-           plugin_key, \
            start_commit_id, \
            raw_depth, \
            depth, \
@@ -1701,7 +1689,6 @@ mod sql_fragments {
            SELECT \
              e.id, \
              fd.file_id, \
-             fd.plugin_key, \
              e.start_commit_id, \
              e.raw_depth, \
              e.depth, \
@@ -2305,7 +2292,6 @@ mod tests {
                 "schema_key".to_string(),
                 "file_id".to_string(),
                 "version_id".to_string(),
-                "plugin_key".to_string(),
                 "schema_version".to_string(),
                 "global".to_string(),
                 "change_id".to_string(),
@@ -2540,7 +2526,6 @@ mod tests {
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
                     Field::new("version_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),
@@ -2586,7 +2571,6 @@ mod tests {
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
                     Field::new("version_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),
@@ -2651,7 +2635,6 @@ mod tests {
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
                     Field::new("version_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),
@@ -2709,7 +2692,6 @@ mod tests {
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
                     Field::new("version_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),
@@ -2767,7 +2749,6 @@ mod tests {
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
                     Field::new("version_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),
@@ -2823,7 +2804,6 @@ mod tests {
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),
@@ -2891,7 +2871,6 @@ mod tests {
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
                     Field::new("version_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),
@@ -2916,7 +2895,6 @@ mod tests {
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
                     Field::new("version_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),
@@ -2981,7 +2959,6 @@ mod tests {
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),
@@ -3071,7 +3048,6 @@ mod tests {
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),
@@ -3163,7 +3139,6 @@ mod tests {
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),
@@ -3189,7 +3164,6 @@ mod tests {
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),
@@ -3215,7 +3189,6 @@ mod tests {
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),
@@ -3311,7 +3284,6 @@ mod tests {
             "lixcol_schema_key",
             "lixcol_file_id",
             "lixcol_version_id",
-            "lixcol_plugin_key",
             "lixcol_schema_version",
             "lixcol_metadata",
         ] {
@@ -3353,7 +3325,6 @@ mod tests {
         assert!(rendered.contains("fd.schema_key"));
         assert!(rendered.contains("fd.version_id"));
         assert!(rendered.contains("fd.file_id"));
-        assert!(rendered.contains("fd.plugin_key"));
         assert!(rendered.contains("fd.schema_version"));
     }
 
@@ -3457,7 +3428,6 @@ mod tests {
             "lixcol_schema_key",
             "lixcol_file_id",
             "lixcol_version_id",
-            "lixcol_plugin_key",
             "lixcol_schema_version",
             "lixcol_metadata",
         ] {
@@ -3551,7 +3521,6 @@ mod tests {
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),
@@ -3577,7 +3546,6 @@ mod tests {
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),
@@ -3603,7 +3571,6 @@ mod tests {
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),
@@ -3663,7 +3630,6 @@ mod tests {
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),
@@ -3726,7 +3692,6 @@ mod tests {
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),
@@ -3794,7 +3759,6 @@ mod tests {
                     Field::new("entity_id", DataType::Utf8, false),
                     Field::new("schema_key", DataType::Utf8, false),
                     Field::new("file_id", DataType::Utf8, true),
-                    Field::new("plugin_key", DataType::Utf8, true),
                     Field::new("schema_version", DataType::Utf8, true),
                     Field::new("global", DataType::Boolean, false),
                     Field::new("change_id", DataType::Utf8, true),

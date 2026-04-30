@@ -976,7 +976,6 @@ fn entity_lix_state_write_rows_from_batch_with_options(
                 entity_id: Some(entity_id),
                 schema_key: spec.schema_key.clone(),
                 file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
-                plugin_key: optional_string_value(batch, row_index, "lixcol_plugin_key")?,
                 snapshot_content: Some(snapshot_content),
                 metadata: optional_string_value(batch, row_index, "lixcol_metadata")?,
                 schema_version: schema_version,
@@ -1454,7 +1453,6 @@ fn entity_system_column_array(column_name: &str, rows: &[LiveStateRow]) -> Resul
         )) as ArrayRef,
         "schema_key" => string_array(rows.iter().map(|row| Some(row.schema_key.as_str()))),
         "file_id" => string_array(rows.iter().map(|row| row.file_id.as_deref())),
-        "plugin_key" => string_array(rows.iter().map(|row| row.plugin_key.as_deref())),
         "snapshot_content" => string_array(rows.iter().map(|row| row.snapshot_content.as_deref())),
         "metadata" => string_array(rows.iter().map(|row| row.metadata.as_deref())),
         "schema_version" => string_array(rows.iter().map(|row| Some(row.schema_version.as_str()))),
@@ -1572,7 +1570,6 @@ pub(super) fn entity_system_fields(variant: EntityProviderVariant) -> Vec<Field>
             Field::new("lixcol_entity_id", DataType::Utf8, false),
             Field::new("lixcol_schema_key", DataType::Utf8, false),
             Field::new("lixcol_file_id", DataType::Utf8, true),
-            Field::new("lixcol_plugin_key", DataType::Utf8, true),
             Field::new("lixcol_snapshot_content", DataType::Utf8, true),
             Field::new("lixcol_metadata", DataType::Utf8, true),
             Field::new("lixcol_schema_version", DataType::Utf8, false),
@@ -1588,7 +1585,6 @@ pub(super) fn entity_system_fields(variant: EntityProviderVariant) -> Vec<Field>
         Field::new("lixcol_entity_id", DataType::Utf8, false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
-        Field::new("lixcol_plugin_key", DataType::Utf8, true),
         Field::new("lixcol_snapshot_content", DataType::Utf8, true),
         Field::new("lixcol_metadata", DataType::Utf8, true),
         Field::new("lixcol_schema_version", DataType::Utf8, true),
@@ -1897,7 +1893,6 @@ mod tests {
             entity_id: crate::engine2::entity_identity::EntityIdentity::single("entity-1"),
             schema_key: "project_message".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(
                 "{\"body\":\"hello\",\"rating\":4.5,\"count\":7,\"enabled\":true,\"meta\":{\"x\":1}}"
                     .to_string(),
@@ -2328,7 +2323,6 @@ mod tests {
                     entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single("entity-1")),
                     schema_key: "project_message".to_string(),
                     file_id: None,
-                    plugin_key: None,
                     snapshot_content: Some(
                         "{\"body\":\"hello\",\"count\":7,\"enabled\":true,\"meta\":{\"x\":1},\"rating\":4.5}"
                             .to_string()

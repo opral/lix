@@ -191,7 +191,6 @@ fn stage_row_from_tracked_row(row: &TrackedStateRow, target_version_id: &str) ->
         entity_id: Some(row.entity_id.clone()),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
-        plugin_key: row.plugin_key.clone(),
         snapshot_content: row.snapshot_content.clone(),
         metadata: row.metadata.clone(),
         schema_version: row.schema_version.clone(),

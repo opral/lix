@@ -15,7 +15,6 @@ pub(crate) struct LiveStateRow {
     pub(crate) entity_id: EntityIdentity,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) plugin_key: Option<String>,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
     pub(crate) schema_version: String,
@@ -38,7 +37,6 @@ impl From<LiveStateRow> for CanonicalChange {
             schema_key: row.schema_key,
             schema_version: row.schema_version,
             file_id: row.file_id,
-            plugin_key: row.plugin_key,
             snapshot_content: row.snapshot_content,
             metadata: row.metadata,
             created_at: row.created_at,
@@ -52,7 +50,6 @@ impl From<UntrackedStateRow> for LiveStateRow {
             entity_id: row.entity_id,
             schema_key: row.schema_key,
             file_id: row.file_id,
-            plugin_key: row.plugin_key,
             snapshot_content: row.snapshot_content,
             metadata: row.metadata,
             schema_version: row.schema_version,
@@ -94,7 +91,6 @@ impl TryFrom<&LiveStateRow> for TrackedStateRow {
             entity_id: row.entity_id.clone(),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
-            plugin_key: row.plugin_key.clone(),
             snapshot_content: row.snapshot_content.clone(),
             metadata: row.metadata.clone(),
             schema_version: row.schema_version.clone(),
@@ -112,7 +108,6 @@ impl From<&LiveStateRow> for UntrackedStateRow {
             entity_id: row.entity_id.clone(),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
-            plugin_key: row.plugin_key.clone(),
             snapshot_content: row.snapshot_content.clone(),
             metadata: row.metadata.clone(),
             schema_version: row.schema_version.clone(),
@@ -129,7 +124,6 @@ impl From<&LiveStateRow> for UntrackedStateRow {
 pub(crate) enum ScanField {
     EntityId,
     FileId,
-    PluginKey,
     SchemaVersion,
 }
 
@@ -170,8 +164,6 @@ pub(crate) struct LiveStateFilter {
     #[serde(default)]
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
     #[serde(default)]
-    pub(crate) plugin_keys: Vec<NullableKeyFilter<String>>,
-    #[serde(default)]
     pub(crate) constraints: Vec<ScanConstraint>,
     #[serde(default)]
     pub(crate) include_tombstones: bool,
@@ -184,7 +176,6 @@ impl From<LiveStateFilter> for UntrackedStateFilter {
             entity_ids: filter.entity_ids,
             version_ids: filter.version_ids,
             file_ids: filter.file_ids,
-            plugin_keys: filter.plugin_keys,
         }
     }
 }

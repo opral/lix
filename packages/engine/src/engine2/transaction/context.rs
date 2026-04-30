@@ -692,7 +692,6 @@ mod tests {
             entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single(key)),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
-            plugin_key: None,
             snapshot_content: Some(
                 json!({
                     "key": key,

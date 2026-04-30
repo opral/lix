@@ -190,7 +190,6 @@ fn filesystem_row_context(row: &LiveStateRow) -> FilesystemRowContext {
         global: row.global,
         untracked: row.untracked,
         file_id: row.file_id.clone(),
-        plugin_key: row.plugin_key.clone(),
         metadata: row.metadata.clone(),
     }
 }
@@ -359,7 +358,6 @@ mod tests {
                 .expect("entity id should decode"),
             schema_key: schema_key.to_string(),
             file_id,
-            plugin_key: None,
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             schema_version: "1".to_string(),

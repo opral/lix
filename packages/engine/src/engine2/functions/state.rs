@@ -158,7 +158,6 @@ fn deterministic_key_value_row(
         entity_id: crate::engine2::entity_identity::EntityIdentity::single(key),
         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
         file_id: None,
-        plugin_key: None,
         snapshot_content: Some(snapshot_content),
         metadata: None,
         schema_version: KEY_VALUE_SCHEMA_VERSION.to_string(),
