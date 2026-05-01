@@ -45,7 +45,7 @@ use super::result_metadata::{json_field, mark_json_field};
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
-use crate::transaction::types::StageWrite;
+use crate::transaction::types::{StageWrite, StageWriteMode};
 
 pub(crate) async fn register_entity_providers(
     ctx: &SessionContext,
@@ -518,7 +518,10 @@ impl DataSink for EntityInsertSink {
             .map_err(|_| DataFusionError::Execution("entity INSERT row count overflow".into()))?;
 
         self.write_ctx
-            .stage_write(StageWrite::Rows { rows })
+            .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Insert,
+                rows,
+            })
             .await
             .map_err(lix_error_to_datafusion_error)?;
 
@@ -665,7 +668,10 @@ impl ExecutionPlan for EntityDeleteExec {
 
             if count > 0 {
                 write_ctx
-                    .stage_write(StageWrite::Rows { rows: write_rows })
+                    .stage_write(StageWrite::Rows {
+                        mode: StageWriteMode::Replace,
+                        rows: write_rows,
+                    })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -826,7 +832,10 @@ impl ExecutionPlan for EntityUpdateExec {
 
             if count > 0 {
                 write_ctx
-                    .stage_write(StageWrite::Rows { rows: write_rows })
+                    .stage_write(StageWrite::Rows {
+                        mode: StageWriteMode::Replace,
+                        rows: write_rows,
+                    })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -1871,7 +1880,7 @@ mod tests {
         LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
-    use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
+    use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWriteOutcome};
     use crate::version_ref::{VersionHead, VersionRefReader};
     use crate::LixError;
 
@@ -2423,8 +2432,7 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(
             write_context.writes.as_slice(),
-            &[StageWrite::Rows {
-                rows: vec![StageRow {
+            &[StageWrite::Rows { mode: StageWriteMode::Insert, rows: vec![StageRow {
                     entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-1")),
                     schema_key: "project_message".to_string(),
                     file_id: None,

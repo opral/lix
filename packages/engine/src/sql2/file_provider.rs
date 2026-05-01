@@ -54,7 +54,7 @@ use super::result_metadata::json_field;
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
-use crate::transaction::types::{StageFileData, StageWrite};
+use crate::transaction::types::{StageFileData, StageWrite, StageWriteMode};
 
 pub(crate) async fn register_lix_file_providers(
     session: &SessionContext,
@@ -442,10 +442,12 @@ impl DataSink for LixFileInsertSink {
         if !staged.state_rows.is_empty() || !staged.file_data_writes.is_empty() {
             let intent = if staged.file_data_writes.is_empty() {
                 StageWrite::Rows {
+                    mode: StageWriteMode::Insert,
                     rows: staged.state_rows,
                 }
             } else {
                 StageWrite::RowsWithFileData {
+                    mode: StageWriteMode::Insert,
                     rows: staged.state_rows,
                     file_data: staged.file_data_writes,
                     count: staged.count,
@@ -589,6 +591,7 @@ impl ExecutionPlan for LixFileDeleteExec {
             if count > 0 {
                 write_ctx
                     .stage_write(StageWrite::Rows {
+                        mode: StageWriteMode::Replace,
                         rows: staged.state_rows,
                     })
                     .await
@@ -763,10 +766,12 @@ impl ExecutionPlan for LixFileUpdateExec {
             if count > 0 {
                 let intent = if staged.file_data_writes.is_empty() {
                     StageWrite::Rows {
+                        mode: StageWriteMode::Replace,
                         rows: staged.state_rows,
                     }
                 } else {
                     StageWrite::RowsWithFileData {
+                        mode: StageWriteMode::Replace,
                         rows: staged.state_rows,
                         file_data: staged.file_data_writes,
                         count,
@@ -1986,7 +1991,7 @@ mod tests {
     use crate::live_state::LiveStateRow;
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
-    use crate::transaction::types::{StageWrite, StageWriteOutcome};
+    use crate::transaction::types::{StageWrite, StageWriteMode, StageWriteOutcome};
     use crate::LixError;
 
     use super::{
@@ -2728,7 +2733,8 @@ mod tests {
         let writes = &write_context.writes;
         assert_eq!(writes.len(), 1);
         match &writes[0] {
-            StageWrite::Rows { rows } => {
+            StageWrite::Rows { mode, rows } => {
+                assert_eq!(*mode, StageWriteMode::Insert);
                 assert_eq!(rows.len(), 1);
                 assert_eq!(
                     rows[0].entity_id.as_ref(),
@@ -2764,10 +2770,13 @@ mod tests {
         assert_eq!(writes.len(), 1);
         match &writes[0] {
             StageWrite::RowsWithFileData {
+                mode,
                 rows,
                 file_data,
                 count,
+                ..
             } => {
+                assert_eq!(*mode, StageWriteMode::Insert);
                 assert_eq!(*count, 1);
                 assert_eq!(rows.len(), 2);
                 assert!(rows
@@ -2823,6 +2832,7 @@ mod tests {
                 rows,
                 file_data,
                 count,
+                ..
             } => {
                 assert_eq!(*count, 1);
                 assert_eq!(file_data.len(), 1);

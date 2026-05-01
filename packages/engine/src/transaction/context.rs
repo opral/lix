@@ -20,7 +20,7 @@ use crate::transaction::commit;
 use crate::transaction::live_state_overlay::{overlay_scan_rows, TransactionLiveStateContext};
 use crate::transaction::normalization::TransactionSchemaCatalog;
 use crate::transaction::staging::TransactionStagedWrites;
-use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
+use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWriteOutcome};
 use crate::transaction::validation::{validate_staged_writes, TransactionValidationInput};
 use crate::version_ref::{VersionRefContext, VersionRefReader, VersionRefStoreReader};
 use crate::GLOBAL_VERSION_ID;
@@ -180,7 +180,10 @@ impl<'tx> Transaction<'tx> {
     /// Convenience helper for programmatic APIs that only stage state rows.
     #[allow(dead_code)]
     pub(crate) fn stage_rows(&self, rows: Vec<StageRow>) -> Result<(), LixError> {
-        self.stage_write(StageWrite::Rows { rows })
+        self.stage_write(StageWrite::Rows {
+            mode: StageWriteMode::Replace,
+            rows,
+        })
     }
 
     /// Returns the active version resolved inside this write transaction.

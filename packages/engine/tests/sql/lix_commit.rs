@@ -252,6 +252,46 @@ simulation_test!(
     }
 );
 
+simulation_test!(
+    lix_commit_surfaces_count_handle_empty_projection,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        for table in [
+            "lix_commit",
+            "lix_commit_by_version",
+            "lix_commit_edge",
+            "lix_commit_edge_by_version",
+            "lix_change_set",
+            "lix_change_set_by_version",
+            "lix_change_set_element",
+            "lix_change_set_element_by_version",
+        ] {
+            let rows = select_rows(&session, &format!("SELECT count(*) FROM {table}")).await;
+            assert_single_count(rows, table);
+        }
+    }
+);
+
+fn assert_single_count(rows: Vec<Vec<Value>>, table: &str) {
+    assert_eq!(rows.len(), 1, "{table} should return one count row");
+    assert_eq!(rows[0].len(), 1, "{table} should return one count column");
+    let Value::Integer(count) = rows[0][0] else {
+        panic!(
+            "{table} should return an integer count, got {:?}",
+            rows[0][0]
+        );
+    };
+    assert!(count >= 0, "{table} count should be non-negative");
+}
+
 fn text_value(value: &Value) -> String {
     let Value::Text(value) = value else {
         panic!("expected text value, got {value:?}");

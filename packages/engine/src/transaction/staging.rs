@@ -2,9 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use crate::functions::{FunctionProvider, FunctionProviderHandle};
-use crate::live_state::{LiveStateRow, LiveStateRowRequest, LiveStateScanRequest};
+use crate::live_state::{
+    LiveStateRow, LiveStateRowIdentity, LiveStateRowRequest, LiveStateScanRequest,
+};
 use crate::transaction::normalization::{normalize_stage_row, TransactionSchemaCatalog};
-use crate::transaction::types::{StageFileData, StageRow, StageWrite, StageWriteOutcome};
+use crate::transaction::types::{
+    StageFileData, StageRow, StageWrite, StageWriteMode, StageWriteOutcome,
+};
 use crate::transaction::types::{StagedCommitMembers, StagedStateRow};
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
@@ -19,6 +23,7 @@ pub(crate) struct TransactionStagedWrites {
     functions: FunctionProviderHandle,
     schema_catalog: Mutex<TransactionSchemaCatalog>,
     rows: Mutex<BTreeMap<StagedStateRowIdentity, StagedStateRow>>,
+    insert_identities: Mutex<BTreeSet<LiveStateRowIdentity>>,
     commit_members_by_version: Mutex<BTreeMap<String, StagedCommitMembers>>,
     extra_commit_parents_by_version: Mutex<BTreeMap<String, Vec<String>>>,
     file_data_writes: Mutex<Vec<StageFileData>>,
@@ -27,6 +32,7 @@ pub(crate) struct TransactionStagedWrites {
 /// Drained transaction-local writes ready for commit.
 pub(crate) struct StagedWriteSet {
     pub(crate) state_rows: Vec<StagedStateRow>,
+    pub(crate) insert_identities: BTreeSet<LiveStateRowIdentity>,
     pub(crate) commit_members_by_version: BTreeMap<String, StagedCommitMembers>,
     pub(crate) extra_commit_parents_by_version: BTreeMap<String, Vec<String>>,
     pub(crate) file_data_writes: Vec<StageFileData>,
@@ -41,6 +47,7 @@ impl TransactionStagedWrites {
             functions,
             schema_catalog: Mutex::new(schema_catalog),
             rows: Mutex::new(BTreeMap::new()),
+            insert_identities: Mutex::new(BTreeSet::new()),
             commit_members_by_version: Mutex::new(BTreeMap::new()),
             extra_commit_parents_by_version: Mutex::new(BTreeMap::new()),
             file_data_writes: Mutex::new(Vec::new()),
@@ -61,6 +68,12 @@ impl TransactionStagedWrites {
                 "failed to acquire transaction staged file data lock",
             )
         })?;
+        let mut insert_identities_guard = self.insert_identities.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged insert identity lock",
+            )
+        })?;
         let mut commit_members_guard = self.commit_members_by_version.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -76,6 +89,7 @@ impl TransactionStagedWrites {
             })?;
         Ok(StagedWriteSet {
             state_rows: std::mem::take(&mut *rows_guard).into_values().collect(),
+            insert_identities: std::mem::take(&mut *insert_identities_guard),
             commit_members_by_version: std::mem::take(&mut *commit_members_guard),
             extra_commit_parents_by_version: std::mem::take(&mut *extra_parents_guard),
             file_data_writes: std::mem::take(&mut *file_data_guard),
@@ -136,9 +150,9 @@ impl TransactionStagedWrites {
     /// change ids, commit ids, and commit membership before commit routing ever
     /// sees the rows.
     pub(crate) fn stage_write(&self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
-        let count = match &write {
-            StageWrite::Rows { rows } => rows.len() as u64,
-            StageWrite::RowsWithFileData { count, .. } => *count,
+        let (mode, count) = match &write {
+            StageWrite::Rows { mode, rows } => (*mode, rows.len() as u64),
+            StageWrite::RowsWithFileData { mode, count, .. } => (*mode, *count),
         };
         let mut functions = self.functions.clone();
         let (rows, file_data_writes) = self.state_rows_from_stage_write(write, &mut functions)?;
@@ -158,8 +172,20 @@ impl TransactionStagedWrites {
                 "failed to acquire transaction staged commit membership lock",
             )
         })?;
+        let mut insert_identities_guard = self.insert_identities.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged insert identity lock",
+            )
+        })?;
         for mut row in rows {
             let identity = StagedStateRowIdentity::from(&row);
+            if mode == StageWriteMode::Insert
+                && (guard.contains_key(&identity)
+                    || guard.contains_key(&identity.opposite_untracked()))
+            {
+                return Err(duplicate_insert_identity_error(&row));
+            }
             if let Some(previous) = guard.remove(&identity.opposite_untracked()) {
                 remove_row_from_commit_members(&mut commit_members_guard, &previous);
             }
@@ -168,6 +194,9 @@ impl TransactionStagedWrites {
             }
             add_row_to_commit_members(&mut commit_members_guard, &mut row, &mut functions);
             let identity = StagedStateRowIdentity::from(&row);
+            if mode == StageWriteMode::Insert {
+                insert_identities_guard.insert(live_state_identity_from_staged_row(&row));
+            }
             guard.insert(identity, row);
         }
         if !file_data_writes.is_empty() {
@@ -192,7 +221,7 @@ impl TransactionStagedWrites {
         let mut state_rows = Vec::new();
         let mut file_data_writes = Vec::new();
         match write {
-            StageWrite::Rows { rows } => {
+            StageWrite::Rows { rows, .. } => {
                 self.push_state_rows(&mut state_rows, rows, functions)?;
             }
             StageWrite::RowsWithFileData {
@@ -417,6 +446,30 @@ fn reject_duplicate_present_rows_in_batch(rows: &[StagedStateRow]) -> Result<(),
     Ok(())
 }
 
+fn duplicate_insert_identity_error(row: &StagedStateRow) -> LixError {
+    LixError::new(
+        LixError::CODE_UNIQUE,
+        format!(
+            "primary-key constraint violation on schema '{}' version '{}': INSERT would duplicate entity_id '{}' in version '{}'",
+            row.schema_key,
+            row.schema_version,
+            row.entity_id
+                .as_string()
+                .unwrap_or_else(|_| "<invalid entity_id>".to_string()),
+            row.version_id
+        ),
+    )
+}
+
+fn live_state_identity_from_staged_row(row: &StagedStateRow) -> LiveStateRowIdentity {
+    LiveStateRowIdentity {
+        version_id: row.version_id.clone(),
+        schema_key: row.schema_key.clone(),
+        entity_id: row.entity_id.clone(),
+        file_id: row.file_id.clone(),
+    }
+}
+
 fn add_row_to_commit_members(
     members_by_version: &mut BTreeMap<String, StagedCommitMembers>,
     row: &mut StagedStateRow,
@@ -516,11 +569,13 @@ mod tests {
 
         staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![state_row("sql2-duplicate-key", "first")],
             })
             .expect("initial row should stage");
         staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![state_row("sql2-duplicate-key", "second")],
             })
             .expect("staging rows should succeed");
@@ -552,11 +607,13 @@ mod tests {
 
         staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![state_row("sql2-duplicate-key", "first")],
             })
             .expect("initial row should stage");
         staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![state_row("sql2-duplicate-key", "second")],
             })
             .expect("staging rows should succeed");
@@ -579,6 +636,7 @@ mod tests {
 
         staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![
                     state_row("sql2-delete-key", "visible"),
                     tombstone_row("sql2-delete-key"),
@@ -608,6 +666,7 @@ mod tests {
 
         staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![
                     tombstone_row("sql2-resurrect-key"),
                     state_row("sql2-resurrect-key", "visible-again"),
@@ -643,6 +702,7 @@ mod tests {
 
         staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![
                     state_row("sql2-key-a", "first"),
                     state_row("sql2-key-b", "only"),
@@ -651,6 +711,7 @@ mod tests {
             .expect("initial rows should stage");
         staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![state_row("sql2-key-a", "second")],
             })
             .expect("staging rows should succeed");
@@ -676,6 +737,7 @@ mod tests {
 
         staged_writes
             .stage_write(StageWrite::RowsWithFileData {
+                mode: StageWriteMode::Replace,
                 rows: vec![state_row("file-readme", "descriptor")],
                 file_data: vec![StageFileData {
                     file_id: "file-readme".to_string(),
@@ -701,6 +763,7 @@ mod tests {
 
         staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![state_row("tracked-key", "value").with_tracked()],
             })
             .expect("tracked global row should stage");
@@ -722,6 +785,7 @@ mod tests {
 
         staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![state_row("untracked-key", "value")],
             })
             .expect("untracked row should stage");
@@ -736,6 +800,7 @@ mod tests {
 
         staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![state_row("overwrite-key", "first")
                     .with_tracked()
                     .with_change_id("change-first")],
@@ -743,6 +808,7 @@ mod tests {
             .expect("initial tracked row should stage");
         staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![state_row("overwrite-key", "second")
                     .with_tracked()
                     .with_change_id("change-second")],
@@ -766,6 +832,7 @@ mod tests {
 
         staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![
                     state_row("tracked-to-untracked-key", "tracked")
                         .with_tracked()
@@ -791,6 +858,7 @@ mod tests {
 
         let error = staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![
                     state_row("duplicate-present-key", "first"),
                     state_row("duplicate-present-key", "second"),
@@ -813,6 +881,7 @@ mod tests {
 
         staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![state_row("active-version-key", "value")
                     .with_tracked()
                     .with_version("version-a")],
@@ -836,6 +905,7 @@ mod tests {
 
         let error = staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![{
                     let mut row = state_row("invalid-global-key", "value");
                     row.version_id = "version-a".to_string();
@@ -855,6 +925,7 @@ mod tests {
 
         staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![
                     state_row("shared-entity", "other-schema-version").with_schema_version("2")
                 ],
@@ -862,6 +933,7 @@ mod tests {
             .expect("initial same-identity row should stage");
         staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![
                     state_row("shared-entity", "base"),
                     state_row("shared-entity", "other-version").with_version("version-b"),
@@ -899,6 +971,7 @@ mod tests {
 
         staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![state_row("sql2-functions-key", "value").with_tracked()],
             })
             .expect("staging rows should succeed");
@@ -925,6 +998,7 @@ mod tests {
 
         staged_writes
             .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![state_row("tracked-commit-key", "value").with_tracked()],
             })
             .expect("tracked row should stage");

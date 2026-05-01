@@ -21,6 +21,7 @@ use futures_util::stream;
 use crate::changelog::{CanonicalChange, ChangelogReader, ChangelogScanRequest};
 use crate::LixError;
 
+use super::record_batch::record_batch_with_row_count;
 use super::result_metadata::json_field;
 
 pub(crate) async fn register_lix_change_provider(
@@ -285,7 +286,7 @@ fn change_record_batch(
             }
         })
         .collect::<Vec<_>>();
-    RecordBatch::try_new(change_schema(projection), arrays).map_err(|error| {
+    record_batch_with_row_count(change_schema(projection), arrays, changes.len()).map_err(|error| {
         DataFusionError::Execution(format!("failed to build lix_change batch: {error}"))
     })
 }
