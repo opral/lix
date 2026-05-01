@@ -238,10 +238,31 @@ fn scalar_value_from_lix_value(value: &Value) -> ScalarValue {
 }
 
 fn datafusion_error_to_lix_error(error: datafusion::error::DataFusionError) -> LixError {
+    if let Some(error) = lix_error_from_datafusion_error(&error) {
+        return error;
+    }
+
     LixError::new(
         "LIX_ERROR_UNKNOWN",
         format!("sql2 DataFusion error: {error}"),
     )
+}
+
+fn lix_error_from_datafusion_error(error: &datafusion::error::DataFusionError) -> Option<LixError> {
+    match error {
+        datafusion::error::DataFusionError::External(error) => {
+            error.downcast_ref::<LixError>().cloned()
+        }
+        datafusion::error::DataFusionError::Context(_, error)
+        | datafusion::error::DataFusionError::Diagnostic(_, error) => {
+            lix_error_from_datafusion_error(error)
+        }
+        datafusion::error::DataFusionError::Shared(error) => lix_error_from_datafusion_error(error),
+        datafusion::error::DataFusionError::Collection(errors) => {
+            errors.iter().find_map(lix_error_from_datafusion_error)
+        }
+        _ => None,
+    }
 }
 
 fn query_result_from_batches(

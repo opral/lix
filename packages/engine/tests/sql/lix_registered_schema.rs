@@ -1,4 +1,5 @@
 use lix_engine::ExecuteResult;
+use lix_engine::LixError;
 use lix_engine::Value;
 use serde_json::json;
 
@@ -92,6 +93,52 @@ simulation_test!(
                 Value::Text("engine2_dummy_schema".to_string()),
                 Value::Json(json!({"id": "dummy-1", "name": "Dummy"})),
             ]
+        );
+    }
+);
+
+simulation_test!(
+    lix_registered_schema_insert_rejects_primary_key_without_json_pointer_slash,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine2_bad_pointer_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+                 true,\
+                 true\
+                 )",
+                &[],
+            )
+            .await
+            .expect_err("registered schema insert should reject JSON Pointers without leading slash");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            error.description.contains("must begin with '/'"),
+            "unexpected description: {}",
+            error.description
+        );
+        assert!(
+            error
+                .description
+                .contains("x-lix-primary-key: \"id\" → \"/id\""),
+            "description should show the offending primary key pointer: {}",
+            error.description
+        );
+        let hint = error.hint.as_deref().expect("error should include a hint");
+        assert!(
+            hint.contains("Did you mean [\"/id\"]?"),
+            "hint should suggest the JSON Pointer form: {hint}"
         );
     }
 );

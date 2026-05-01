@@ -10,4 +10,6 @@ pub(crate) struct BinaryBlobWrite<'a> {
     pub data: &'a [u8],
 }
 
+#[cfg(feature = "storage-benches")]
+pub(crate) use codec::binary_blob_hash_hex;
 pub(crate) use context::{BinaryCasContext, BlobDataReader};
