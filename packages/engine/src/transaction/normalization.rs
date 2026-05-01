@@ -615,7 +615,7 @@ mod tests {
             change_id: None,
             commit_id: None,
             untracked: false,
-            version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
+            version_id: crate::GLOBAL_VERSION_ID.to_string(),
         }
     }
 

@@ -8,7 +8,7 @@ use crate::functions::{
 };
 use crate::live_state::{LiveStateContext, LiveStateRow};
 use crate::untracked_state::UntrackedStateRow;
-use crate::version::GLOBAL_VERSION_ID;
+use crate::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, TransactionBeginMode};
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";

@@ -4,9 +4,9 @@ use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::scalar::ScalarValue;
 
-use crate::version::GLOBAL_VERSION_ID;
 use crate::version_ref::VersionRefReader;
 use crate::LixError;
+use crate::GLOBAL_VERSION_ID;
 
 /// Version scope requested by a SQL surface.
 ///

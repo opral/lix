@@ -33,7 +33,7 @@ use crate::transaction::{
     PreparedResolvedWritePartition, PreparedResolvedWritePlan, PreparedWriteArtifact,
     PreparedWriteFunctionBindings, PreparedWriteStatement,
 };
-use crate::version::GLOBAL_VERSION_ID;
+use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, Value};
 
 use crate::transaction::WriteCommand;

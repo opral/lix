@@ -6,7 +6,7 @@ use crate::live_state::{LiveStateRow, LiveStateRowRequest, LiveStateScanRequest}
 use crate::transaction::normalization::{normalize_stage_row, TransactionSchemaCatalog};
 use crate::transaction::types::{StageFileData, StageRow, StageWrite, StageWriteOutcome};
 use crate::transaction::types::{StagedCommitMembers, StagedStateRow};
-use crate::version::GLOBAL_VERSION_ID;
+use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
 /// Transaction-local writes decoded by DataFusion provider hooks.

@@ -11,8 +11,8 @@ use crate::schema_registry::SchemaRegistry;
 use crate::session::SessionContext;
 use crate::tracked_state::TrackedStateContext;
 use crate::untracked_state::UntrackedStateContext;
-use crate::version::GLOBAL_VERSION_ID;
 use crate::version_ref::VersionRefContext;
+use crate::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, NullableKeyFilter, TransactionBeginMode};
 
 #[derive(Clone)]

@@ -5,8 +5,8 @@ use crate::changelog::{CanonicalChange, ChangelogContext};
 use crate::live_state::{LiveStateContext, LiveStateRow};
 use crate::transaction::staging::StagedWriteSet;
 use crate::transaction::types::{StagedCommitMembers, StagedStateRow};
-use crate::version::GLOBAL_VERSION_ID;
 use crate::version_ref::VersionRefContext;
+use crate::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError};
 
 /// Commits transaction-staged rows into durable tracked and untracked stores.

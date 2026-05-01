@@ -129,7 +129,7 @@ mod tests {
 
     use super::*;
     use crate::live_state::LiveStateRowRequest;
-    use crate::version::GLOBAL_VERSION_ID;
+    use crate::GLOBAL_VERSION_ID;
 
     #[tokio::test]
     async fn visible_schemas_include_builtin_registered_schema() {

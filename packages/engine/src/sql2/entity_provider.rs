@@ -36,9 +36,9 @@ use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
 };
 use crate::transaction::types::StageRow;
-use crate::version::GLOBAL_VERSION_ID;
 use crate::version_ref::VersionRefReader;
 use crate::LixError;
+use crate::GLOBAL_VERSION_ID;
 
 use super::entity_history_provider::EntityHistoryProvider;
 use crate::sql2::{
@@ -2414,7 +2414,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert!(rows[0].global);
-        assert_eq!(rows[0].version_id, crate::version::GLOBAL_VERSION_ID);
+        assert_eq!(rows[0].version_id, crate::GLOBAL_VERSION_ID);
     }
 
     #[tokio::test]

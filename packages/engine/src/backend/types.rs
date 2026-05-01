@@ -1,37 +1,13 @@
 use async_trait::async_trait;
 
-use crate::backend::{KvPair, KvScanRange, PreparedBatch, TransactionBeginMode};
-use crate::common::SqlDialect;
-use crate::{LixError, QueryResult, Value};
+use crate::backend::{KvPair, KvScanRange, TransactionBeginMode};
+use crate::LixError;
 
 #[async_trait]
 pub trait LixBackend: Send + Sync {
-    fn dialect(&self) -> SqlDialect;
-
-    /// Execute a single SQL statement on the connection.
-    ///
-    /// No automatic transaction wrapping. If no transaction is active,
-    /// the statement auto-commits (standard SQL behavior). If a transaction
-    /// IS active, the statement participates in it.
-    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError>;
-
-    /// Begin a transaction using the requested mode.
-    ///
-    /// The returned handle holds exclusive access to the connection.
-    /// All SQL must go through the handle until commit/rollback.
     async fn begin_transaction(
         &self,
         mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError>;
-
-    /// Begin a named savepoint within an active transaction.
-    ///
-    /// Returns a handle that commits via `RELEASE SAVEPOINT`
-    /// and rolls back via `ROLLBACK TO SAVEPOINT`.
-    /// The caller provides the name.
-    async fn begin_savepoint(
-        &self,
-        name: &str,
     ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError>;
 
     /// Reads one value from the backend key/value store.
@@ -77,11 +53,7 @@ pub trait LixBackend: Send + Sync {
 
 #[async_trait]
 pub trait LixBackendTransaction: Send + Sync {
-    fn dialect(&self) -> SqlDialect;
     fn mode(&self) -> TransactionBeginMode;
-
-    /// Executes one SQL statement inside the current transaction.
-    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError>;
 
     /// Reads one value from the backend key/value store inside this transaction.
     async fn kv_get(&mut self, _namespace: &str, _key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
@@ -111,18 +83,6 @@ pub trait LixBackendTransaction: Send + Sync {
     /// Deletes one key/value pair inside this transaction.
     async fn kv_delete(&mut self, _namespace: &str, _key: &[u8]) -> Result<(), LixError> {
         Err(kv_not_supported("transaction kv_delete"))
-    }
-
-    /// Executes one parameterized SQL batch inside the current transaction.
-    async fn execute_batch(&mut self, batch: &PreparedBatch) -> Result<QueryResult, LixError> {
-        let mut last_result = QueryResult {
-            rows: Vec::new(),
-            columns: Vec::new(),
-        };
-        for statement in &batch.steps {
-            last_result = self.execute(&statement.sql, &statement.params).await?;
-        }
-        Ok(last_result)
     }
 
     async fn commit(self: Box<Self>) -> Result<(), LixError>;

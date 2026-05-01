@@ -1323,8 +1323,7 @@ fn committed_row_is_in_exact_validation_scope(row: &LiveStateRow, key: &PendingU
 }
 
 fn committed_row_is_exact_version_scoped(row: &LiveStateRow, version_id: &str) -> bool {
-    row.version_id == version_id
-        && row.global == (row.version_id == crate::version::GLOBAL_VERSION_ID)
+    row.version_id == version_id && row.global == (row.version_id == crate::GLOBAL_VERSION_ID)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2605,7 +2604,7 @@ mod tests {
         let live_state = StrictStaticLiveStateReader {
             rows: vec![committed_file_descriptor_row(
                 "file-a",
-                crate::version::GLOBAL_VERSION_ID,
+                crate::GLOBAL_VERSION_ID,
             )],
         };
 
@@ -3753,7 +3752,7 @@ mod tests {
             change_id: Some("change-registered-schema".to_string()),
             commit_id: Some("commit-registered-schema".to_string()),
             untracked: false,
-            version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
+            version_id: crate::GLOBAL_VERSION_ID.to_string(),
         }
     }
 
@@ -3961,7 +3960,7 @@ mod tests {
         row.entity_id = crate::entity_identity::EntityIdentity::single(file_id);
         row.file_id = None;
         row.version_id = version_id.to_string();
-        row.global = version_id == crate::version::GLOBAL_VERSION_ID;
+        row.global = version_id == crate::GLOBAL_VERSION_ID;
         row
     }
 
@@ -4006,7 +4005,7 @@ mod tests {
             change_id: Some("change-1".to_string()),
             commit_id: Some("commit-1".to_string()),
             untracked: false,
-            version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
+            version_id: crate::GLOBAL_VERSION_ID.to_string(),
         }
     }
 }

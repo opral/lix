@@ -6,8 +6,7 @@ use async_trait::async_trait;
 use crate::backend::{
     KvPair, KvScanRange, LixBackend, LixBackendTransaction, TransactionBeginMode,
 };
-use crate::common::SqlDialect;
-use crate::{LixError, QueryResult, Value};
+use crate::LixError;
 
 type KvMap = BTreeMap<(String, Vec<u8>), Vec<u8>>;
 
@@ -28,14 +27,6 @@ impl UnitTestBackend {
 
 #[async_trait]
 impl LixBackend for UnitTestBackend {
-    fn dialect(&self) -> SqlDialect {
-        SqlDialect::Sqlite
-    }
-
-    async fn execute(&self, _sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-        Err(sql_not_supported())
-    }
-
     async fn begin_transaction(
         &self,
         mode: TransactionBeginMode,
@@ -50,16 +41,6 @@ impl LixBackend for UnitTestBackend {
             parent: Arc::clone(&self.kv),
             kv: snapshot,
         }))
-    }
-
-    async fn begin_savepoint(
-        &self,
-        _name: &str,
-    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
-        Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "unit test backend does not support savepoints",
-        ))
     }
 
     async fn kv_get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
@@ -93,16 +74,8 @@ struct UnitTestTransaction {
 
 #[async_trait]
 impl LixBackendTransaction for UnitTestTransaction {
-    fn dialect(&self) -> SqlDialect {
-        SqlDialect::Sqlite
-    }
-
     fn mode(&self) -> TransactionBeginMode {
         self.mode
-    }
-
-    async fn execute(&mut self, _sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-        Err(sql_not_supported())
     }
 
     async fn kv_get(&mut self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
@@ -166,13 +139,6 @@ fn key_matches_range(key: &[u8], range: &KvScanRange) -> bool {
 
 fn lock_error(name: &str) -> LixError {
     LixError::new("LIX_ERROR_UNKNOWN", format!("{name} lock poisoned"))
-}
-
-fn sql_not_supported() -> LixError {
-    LixError::new(
-        "LIX_ERROR_UNKNOWN",
-        "unit test backend does not support SQL execution",
-    )
 }
 
 #[cfg(test)]
