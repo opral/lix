@@ -117,7 +117,7 @@ fn detect_missing_pointer_slash(schema: &JsonValue) -> Option<LixError> {
         "Invalid Lix schema definition: JSON Pointer values must begin with '/'. Offending entries: {examples}"
     );
     let hint = format!(
-        "prefix property names with '/' — e.g. `\"x-lix-primary-key\": [\"/{}\"]` (JSON Pointer, RFC 6901)",
+        "Did you mean [\"/{}\"]? JSON Pointer values must prefix property names with '/' (RFC 6901).",
         offenders[0].1
     );
     Some(

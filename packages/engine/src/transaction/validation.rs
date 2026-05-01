@@ -1971,14 +1971,16 @@ fn validate_pending_registered_schema(
                 "missing builtin lix_registered_schema definition",
             )
         })?;
-    validate_lix_schema(registered_schema_definition, &snapshot)?;
-
+    if !snapshot.get("value").is_some_and(JsonValue::is_object) {
+        validate_lix_schema(registered_schema_definition, &snapshot)?;
+    }
     // A registered-schema row stores the schema definition under `value`.
     // Validate both layers: the outer row must match the builtin
     // `lix_registered_schema` schema, and the inner definition must be a valid
     // Lix schema before it can extend the transaction-visible catalog.
     let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
     validate_lix_schema_definition(&schema)?;
+    validate_lix_schema(registered_schema_definition, &snapshot)?;
     Ok((key, schema))
 }
 
@@ -2240,7 +2242,7 @@ mod tests {
         let error = validate_pending_registered_schema(&row)
             .expect_err("nested Lix schema definition should be rejected");
 
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
         assert!(error.description.contains("x-lix-version"));
     }
 
