@@ -1,8 +1,10 @@
+mod by_file_index;
 mod codec;
 mod context;
 mod diff;
 mod merge;
 pub(crate) mod rebuild;
+mod snapshot_store;
 mod storage;
 mod tree;
 mod tree_types;
