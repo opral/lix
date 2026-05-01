@@ -5,7 +5,7 @@ use datafusion::arrow::array::StringArray;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{plan_err, Result, ScalarValue};
 use datafusion::logical_expr::{
-    lit, ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
 use serde_json::Value as JsonValue;
 
@@ -22,10 +22,6 @@ impl LixJsonExtractText {
             signature: Signature::variadic_any(Volatility::Immutable),
         }
     }
-}
-
-pub(crate) fn lix_json_extract_text_expr(json_expr: Expr, property_name: &str) -> Expr {
-    ScalarUDF::from(LixJsonExtractText::new()).call(vec![json_expr, lit(property_name.to_string())])
 }
 
 impl ScalarUDFImpl for LixJsonExtractText {

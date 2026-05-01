@@ -1,5 +1,4 @@
 pub mod simulation_test;
-pub mod simulations;
 
 #[macro_export]
 macro_rules! simulation_test {

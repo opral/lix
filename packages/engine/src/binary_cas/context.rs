@@ -78,10 +78,6 @@ where
     ) -> Result<Option<Vec<u8>>, LixError> {
         crate::binary_cas::kv::load_blob_data_by_hash(&mut self.store, blob_hash).await
     }
-
-    pub(crate) async fn blob_exists(&mut self, blob_hash: &str) -> Result<bool, LixError> {
-        crate::binary_cas::kv::blob_exists(&mut self.store, blob_hash).await
-    }
 }
 
 #[async_trait]

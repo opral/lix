@@ -2,10 +2,8 @@ use std::borrow::Borrow;
 use std::fmt;
 use std::ops::Deref;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::Value as JsonValue;
-
 use crate::LixError;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 macro_rules! canonical_identity_type {
     ($name:ident, $label:literal) => {
@@ -118,63 +116,15 @@ canonical_identity_type!(CanonicalSchemaKey, "schema_key");
 canonical_identity_type!(CanonicalSchemaVersion, "schema_version");
 canonical_identity_type!(CanonicalPluginKey, "plugin_key");
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum EntityIdDerivationError {
-    EmptyPrimaryKeyPath { index: usize },
-    MissingPrimaryKeyValue { index: usize },
-    NullPrimaryKeyValue { index: usize },
-    EmptyPrimaryKeyValue { index: usize },
-}
-
-pub(crate) fn derive_entity_id_from_json_paths(
-    snapshot: &JsonValue,
-    primary_key_paths: &[Vec<String>],
-) -> Result<EntityId, EntityIdDerivationError> {
-    let mut parts = Vec::with_capacity(primary_key_paths.len());
-    for (index, path) in primary_key_paths.iter().enumerate() {
-        if path.is_empty() {
-            return Err(EntityIdDerivationError::EmptyPrimaryKeyPath { index });
-        }
-        let Some(value) = json_pointer_get(snapshot, path) else {
-            return Err(EntityIdDerivationError::MissingPrimaryKeyValue { index });
-        };
-        parts.push(entity_id_component_from_json_value(value, index)?);
-    }
-
-    if parts.len() == 1 {
-        EntityId::new(parts.pop().expect("single primary-key part"))
-            .map_err(|_| EntityIdDerivationError::EmptyPrimaryKeyValue { index: 0 })
-    } else {
-        EntityId::new(parts.join("~"))
-            .map_err(|_| EntityIdDerivationError::EmptyPrimaryKeyValue { index: 0 })
-    }
-}
-
-fn entity_id_component_from_json_value(
-    value: &JsonValue,
-    index: usize,
-) -> Result<String, EntityIdDerivationError> {
-    match value {
-        JsonValue::Null => Err(EntityIdDerivationError::NullPrimaryKeyValue { index }),
-        JsonValue::String(text) if text.is_empty() => {
-            Err(EntityIdDerivationError::EmptyPrimaryKeyValue { index })
-        }
-        JsonValue::String(text) => Ok(text.clone()),
-        JsonValue::Bool(flag) => Ok(flag.to_string()),
-        JsonValue::Number(number) => Ok(number.to_string()),
-        JsonValue::Array(_) | JsonValue::Object(_) => Ok(value.to_string()),
-    }
-}
-
 pub(crate) fn json_pointer_get<'a>(
-    value: &'a JsonValue,
+    value: &'a serde_json::Value,
     pointer: &[String],
-) -> Option<&'a JsonValue> {
+) -> Option<&'a serde_json::Value> {
     let mut current = value;
     for segment in pointer {
         match current {
-            JsonValue::Object(object) => current = object.get(segment)?,
-            JsonValue::Array(array) => {
+            serde_json::Value::Object(object) => current = object.get(segment)?,
+            serde_json::Value::Array(array) => {
                 let index = segment.parse::<usize>().ok()?;
                 current = array.get(index)?;
             }
