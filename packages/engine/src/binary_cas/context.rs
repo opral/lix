@@ -79,6 +79,11 @@ where
     ) -> Result<Option<Vec<u8>>, LixError> {
         crate::binary_cas::kv::load_blob_data_by_hash(&mut self.store, blob_hash).await
     }
+
+    #[cfg(feature = "storage-benches")]
+    pub(crate) async fn count_blob_manifests(&mut self) -> Result<usize, LixError> {
+        crate::binary_cas::kv::count_manifests(&mut self.store).await
+    }
 }
 
 #[async_trait]
