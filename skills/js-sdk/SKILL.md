@@ -43,6 +43,14 @@ const lix = await openLix({
 });
 ```
 
+`better-sqlite3` is an optional peer dependency of `@lix-js/sdk`; install it in any project that imports `@lix-js/sdk/sqlite`:
+
+```sh
+npm i @lix-js/sdk@0.6.0-preview.0 better-sqlite3
+```
+
+Use the explicit preview version (`0.6.0-preview.0`) for now; do not rely on `latest` until the stable package is published.
+
 The default `openLix()` (no `backend`) is in-memory and dies with the process. For anything that needs to persist — demos, scripts, tests, real apps — pass a `better-sqlite3` backend with a real file path. Each successful `execute()` is durable; `lix.close()` releases the backend handle. Reopening with the same path picks up where you left off.
 
 For tests and demos, use an isolated temp dir per run:
@@ -75,10 +83,11 @@ Use the public `@lix-js/sdk` API only. Do not import from `engine-wasm`, do not 
 
 If behavior is unclear, read source before guessing:
 
-- `packages/js-sdk/src/open-lix.ts` — current JS API.
-- `packages/js-sdk/src/open-lix.test.ts` — canonical end-to-end flow.
-- `packages/engine/src/schema/builtin/*.json` — built-in entity table shapes.
-- `packages/engine/src/sql2/udfs/` — registered SQL functions.
+- [packages/js-sdk/src/open-lix.ts](https://github.com/opral/lix/blob/561f92b5bc3fa68e48a863ed3a02129645a57011/packages/js-sdk/src/open-lix.ts) — current JS API.
+- [packages/js-sdk/src/open-lix.test.ts](https://github.com/opral/lix/blob/561f92b5bc3fa68e48a863ed3a02129645a57011/packages/js-sdk/src/open-lix.test.ts) — canonical end-to-end flow.
+- [packages/js-sdk/src/sqlite/index.ts](https://github.com/opral/lix/blob/561f92b5bc3fa68e48a863ed3a02129645a57011/packages/js-sdk/src/sqlite/index.ts) — `better-sqlite3` backend factory.
+- [packages/engine/src/schema/builtin](https://github.com/opral/lix/tree/561f92b5bc3fa68e48a863ed3a02129645a57011/packages/engine/src/schema/builtin) — built-in entity table shapes.
+- [packages/engine/src/sql2/udfs](https://github.com/opral/lix/tree/561f92b5bc3fa68e48a863ed3a02129645a57011/packages/engine/src/sql2/udfs) — registered SQL functions.
 
 ## Canonical End-To-End Example
 
@@ -393,7 +402,7 @@ Use DataFusion-style numbered placeholders. Bare `?` is rejected with `Failed to
 await lix.execute("SELECT * FROM acme_brochure WHERE id = $1", ["spring-2026"]);
 ```
 
-The only UDF the canonical demo uses is `lix_json($1)` — it parses a TEXT parameter as a JSON value, required when writing JSON-typed columns like `lix_registered_schema.value`. Other UDFs (`lix_json_extract`, `lix_uuid_v7`, `lix_text_encode`/`_decode`, `lix_empty_blob`, …) live in `packages/engine/src/sql2/udfs/` — read source when you need them.
+The only UDF the canonical demo uses is `lix_json($1)` — it parses a TEXT parameter as a JSON value, required when writing JSON-typed columns like `lix_registered_schema.value`. Other UDFs (`lix_json_extract`, `lix_uuid_v7`, `lix_text_encode`/`_decode`, `lix_empty_blob`, …) live in [packages/engine/src/sql2/udfs](https://github.com/opral/lix/tree/561f92b5bc3fa68e48a863ed3a02129645a57011/packages/engine/src/sql2/udfs) — read source when you need them.
 
 ## Built-in Queryable Tables
 
@@ -406,7 +415,7 @@ The four tables demos actually touch:
 | `lix_file` | Built-in file storage (covered above). |
 | `lix_registered_schema` | Your registered schemas (and built-ins). |
 
-The engine ships ~20 more built-ins (commit graph, change sets, key-value, labels, file/directory descriptors, low-level state, etc.) — see `packages/engine/src/schema/builtin/*.json` when you need them. `lix_account` / `lix_change_author` are declared but **not yet implemented; don't rely on them.**
+The engine ships ~20 more built-ins (commit graph, change sets, key-value, labels, file/directory descriptors, low-level state, etc.) — see [packages/engine/src/schema/builtin](https://github.com/opral/lix/tree/561f92b5bc3fa68e48a863ed3a02129645a57011/packages/engine/src/schema/builtin) when you need them. `lix_account` / `lix_change_author` are declared but **not yet implemented; don't rely on them.**
 
 ## The Change Journal (`lix_change`)
 
@@ -460,7 +469,7 @@ A short list of things that will burn a fresh agent on the first run.
 
 ## Safety Rules
 
-- Never use `sqlite3`, `better-sqlite3`, `sql.js`, or raw database access against a `.lix`.
+- Never use `sqlite3`, `sql.js`, or raw database access against a `.lix`; use `createBetterSqlite3Backend()` instead of opening the file yourself.
 - Never import from `@lix-js/sdk/engine-wasm` or other private internals.
 - Use `$1`, `$2`, `$3` placeholders, never bare `?`.
 - Schema keys: stable, namespaced, lowercase-snake-case, domain-shaped (`acme_brochure`, not `task`).
@@ -468,3 +477,7 @@ A short list of things that will burn a fresh agent on the first run.
 - Name versions in the end-user's vocabulary (`"Marketing edit"`, `"Q3 pricing draft"`), never developer jargon (`"Draft"`, `"branch-1"`).
 - Wrap `mergeVersion` in `try/catch` if there is any chance of a conflicting edit.
 - Close handles in scripts/tests with `await lix.close()`.
+
+## Reporting SDK Friction
+
+If you encounter an SDK bug, missing API, confusing error, documentation gap, or large implementation friction while using this skill, pause and ask the user whether they want you to open a GitHub issue via the `gh` CLI installed on their computer. Do not file the issue without confirmation. If they approve, include a minimal reproduction, expected behavior, actual behavior, package version (`@lix-js/sdk@0.6.0-preview.0`), runtime/version details, and any relevant error output.
