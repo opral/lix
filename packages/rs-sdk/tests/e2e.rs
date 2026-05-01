@@ -1,6 +1,6 @@
 use lix_rs_sdk::{
-    open_lix, CreateVersionOptions, ExecuteResult, MergeVersionOptions, MergeVersionOutcome,
-    OpenLixOptions, SwitchVersionOptions, Value,
+    open_lix, CreateVersionOptions, MergeVersionOptions, MergeVersionOutcome, OpenLixOptions,
+    SwitchVersionOptions, Value,
 };
 
 #[tokio::test]
@@ -102,9 +102,7 @@ async fn task_done(lix: &lix_rs_sdk::Lix, task_id: &str) -> bool {
         .await
         .unwrap();
 
-    let ExecuteResult::Rows(rows) = result else {
-        panic!("expected query rows");
-    };
+    let rows = result;
     assert_eq!(rows.len(), 1);
 
     match rows.rows()[0].values().first() {

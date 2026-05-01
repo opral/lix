@@ -12,6 +12,7 @@ use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::prelude::SessionContext;
 
 use super::udfs::{lix_json_extract_expr, lix_json_extract_text_expr, lix_text_encode_expr};
+use super::result_metadata::{json_field_metadata, mark_json_field};
 use crate::catalog::{
     state_relation_column_is_nullable_for_variant, state_relation_columns_for_variant,
     SurfaceColumnType, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
@@ -97,6 +98,8 @@ impl PreparedSql2EntityViewColumn {
         // Schema-derived JSON fields should flow through the Json branch below.
         if self.column_type == SurfaceColumnType::Variant {
             expr.alias_with_metadata(self.public_name.clone(), Some(variant_field_metadata()))
+        } else if self.column_type == SurfaceColumnType::Json {
+            expr.alias_with_metadata(self.public_name.clone(), Some(json_field_metadata()))
         } else {
             expr.alias(self.public_name.clone())
         }
@@ -104,11 +107,16 @@ impl PreparedSql2EntityViewColumn {
 
     #[cfg(test)]
     pub(crate) fn output_field(&self) -> Field {
-        Field::new(
+        let field = Field::new(
             self.public_name.clone(),
             arrow_data_type_for_surface_column_type(self.column_type),
             self.nullable,
-        )
+        );
+        if self.column_type == SurfaceColumnType::Json {
+            mark_json_field(field)
+        } else {
+            field
+        }
     }
 }
 

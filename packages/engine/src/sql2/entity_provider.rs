@@ -41,6 +41,7 @@ use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 
 use super::entity_history_provider::EntityHistoryProvider;
+use super::result_metadata::{json_field, mark_json_field};
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
@@ -1620,11 +1621,16 @@ pub(super) fn entity_surface_schema(
         .iter()
         .filter_map(|column_name| {
             let column_type = spec.column_types.get(column_name)?;
-            Some(Field::new(
+            let field = Field::new(
                 column_name,
                 arrow_data_type_for_entity_column_type(*column_type),
                 true,
-            ))
+            );
+            Some(if *column_type == EntityColumnType::Json {
+                mark_json_field(field)
+            } else {
+                field
+            })
         })
         .collect::<Vec<_>>();
 
@@ -1647,8 +1653,8 @@ pub(super) fn entity_system_fields(variant: EntityProviderVariant) -> Vec<Field>
             Field::new("lixcol_entity_id", DataType::Utf8, false),
             Field::new("lixcol_schema_key", DataType::Utf8, false),
             Field::new("lixcol_file_id", DataType::Utf8, true),
-            Field::new("lixcol_snapshot_content", DataType::Utf8, true),
-            Field::new("lixcol_metadata", DataType::Utf8, true),
+            json_field("lixcol_snapshot_content", true),
+            json_field("lixcol_metadata", true),
             Field::new("lixcol_schema_version", DataType::Utf8, false),
             Field::new("lixcol_change_id", DataType::Utf8, false),
             Field::new("lixcol_commit_id", DataType::Utf8, false),
@@ -1662,8 +1668,8 @@ pub(super) fn entity_system_fields(variant: EntityProviderVariant) -> Vec<Field>
         Field::new("lixcol_entity_id", DataType::Utf8, false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
-        Field::new("lixcol_snapshot_content", DataType::Utf8, true),
-        Field::new("lixcol_metadata", DataType::Utf8, true),
+        json_field("lixcol_snapshot_content", true),
+        json_field("lixcol_metadata", true),
         Field::new("lixcol_schema_version", DataType::Utf8, true),
         Field::new("lixcol_created_at", DataType::Utf8, true),
         Field::new("lixcol_updated_at", DataType::Utf8, true),

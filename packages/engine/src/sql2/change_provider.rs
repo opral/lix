@@ -21,6 +21,8 @@ use futures_util::stream;
 use crate::changelog::{CanonicalChange, ChangelogReader, ChangelogScanRequest};
 use crate::LixError;
 
+use super::result_metadata::json_field;
+
 pub(crate) async fn register_lix_change_provider(
     session: &datafusion::prelude::SessionContext,
     changelog: Arc<dyn ChangelogReader>,
@@ -213,9 +215,9 @@ fn lix_change_schema() -> SchemaRef {
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("schema_version", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
-        Field::new("metadata", DataType::Utf8, true),
+        json_field("metadata", true),
         Field::new("created_at", DataType::Utf8, false),
-        Field::new("snapshot_content", DataType::Utf8, true),
+        json_field("snapshot_content", true),
     ]))
 }
 
@@ -298,11 +300,9 @@ fn change_schema(projection: &[ChangeColumn]) -> SchemaRef {
                 ChangeColumn::SchemaKey => Field::new("schema_key", DataType::Utf8, false),
                 ChangeColumn::SchemaVersion => Field::new("schema_version", DataType::Utf8, false),
                 ChangeColumn::FileId => Field::new("file_id", DataType::Utf8, true),
-                ChangeColumn::Metadata => Field::new("metadata", DataType::Utf8, true),
+                ChangeColumn::Metadata => json_field("metadata", true),
                 ChangeColumn::CreatedAt => Field::new("created_at", DataType::Utf8, false),
-                ChangeColumn::SnapshotContent => {
-                    Field::new("snapshot_content", DataType::Utf8, true)
-                }
+                ChangeColumn::SnapshotContent => json_field("snapshot_content", true),
             })
             .collect::<Vec<_>>(),
     ))

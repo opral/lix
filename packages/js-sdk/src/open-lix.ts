@@ -13,15 +13,105 @@ export type JsonValue =
 	| { [key: string]: JsonValue };
 
 export type LixRuntimeValue = JsonValue | Uint8Array | ArrayBuffer | Value;
+export type LixNativeValue = JsonValue | Uint8Array;
 
-export type RowSet = {
+export type ExecuteResult = {
 	columns: string[];
-	rows: Value[][];
+	rows: Row[];
+	rowsAffected: number;
 };
 
-export type ExecuteResult =
-	| { kind: "rows"; rows: RowSet }
-	| { kind: "affectedRows"; affectedRows: number };
+export class Row {
+	readonly columns: string[];
+	private readonly valuesByIndex: Value[];
+
+	constructor(columns: string[], values: Value[]) {
+		this.columns = columns;
+		this.valuesByIndex = values;
+	}
+
+	get(columnName: string): LixNativeValue {
+		return valueToNative(this.value(columnName));
+	}
+
+	tryGet(columnName: string): LixNativeValue | undefined {
+		const value = this.tryValue(columnName);
+		return value === undefined ? undefined : valueToNative(value);
+	}
+
+	value(columnName: string): Value {
+		const index = this.columns.indexOf(columnName);
+		if (index === -1) {
+			throw new Error(
+				`Column "${columnName}" does not exist. Available columns: ${this.availableColumns()}`,
+			);
+		}
+		const value = this.valuesByIndex[index];
+		if (value === undefined) {
+			throw new Error(
+				`Column "${columnName}" is outside row width ${this.valuesByIndex.length}.`,
+			);
+		}
+		return value;
+	}
+
+	tryValue(columnName: string): Value | undefined {
+		const index = this.columns.indexOf(columnName);
+		return index === -1 ? undefined : this.valuesByIndex[index];
+	}
+
+	getAt(index: number): LixNativeValue {
+		return valueToNative(this.valueAt(index));
+	}
+
+	valueAt(index: number): Value {
+		const value = this.valuesByIndex[index];
+		if (value === undefined) {
+			throw new Error(
+				`Column index ${index} is outside row width ${this.valuesByIndex.length}.`,
+			);
+		}
+		return value;
+	}
+
+	values(): Value[] {
+		return [...this.valuesByIndex];
+	}
+
+	toObject(): Record<string, LixNativeValue> {
+		return Object.fromEntries(
+			this.columns.map((column, index) => [
+				column,
+				valueToNative(this.valueAt(index)),
+			]),
+		);
+	}
+
+	toValueMap(): Record<string, Value> {
+		return Object.fromEntries(
+			this.columns.map((column, index) => [column, this.valueAt(index)]),
+		);
+	}
+
+	private availableColumns(): string {
+		return this.columns.length === 0 ? "<none>" : this.columns.join(", ");
+	}
+}
+
+function valueToNative(value: Value): LixNativeValue {
+	switch (value.kind) {
+		case "null":
+			return null;
+		case "boolean":
+		case "integer":
+		case "real":
+		case "text":
+		case "json":
+			return value.value as JsonValue;
+		case "blob":
+			return value.asBlob() ?? new Uint8Array();
+	}
+}
 
 export type TransactionBeginMode = "read" | "write" | "deferred";
 
@@ -111,12 +201,11 @@ export type Lix = {
 
 let wasmReady: Promise<void> | null = null;
 
-type WasmExecuteResult =
-	| {
-			kind: "rows";
-			rows: { columns: string[]; rows: unknown[][] };
-	  }
-	| { kind: "affectedRows"; affectedRows: number };
+type WasmExecuteResult = {
+	columns: string[];
+	rows: unknown[][];
+	rowsAffected: number;
+};
 
 type WasmLix = {
 	execute(sql: string, params: unknown[]): Promise<WasmExecuteResult>;
@@ -234,17 +323,12 @@ function createLixHandle(wasmLix: WasmLix, backend?: LixBackend): Lix {
 }
 
 function normalizeExecuteResult(result: WasmExecuteResult): ExecuteResult {
-	if (result.kind === "rows") {
-		return {
-			kind: "rows",
-			rows: {
-				columns: [...result.rows.columns],
-				rows: result.rows.rows.map((row) => row.map((value) => Value.from(value))),
-			},
-		};
-	}
+	const columns = [...result.columns];
 	return {
-		kind: "affectedRows",
-		affectedRows: result.affectedRows,
+		columns,
+		rows: result.rows.map(
+			(row) => new Row(columns, row.map((value) => Value.from(value))),
+		),
+		rowsAffected: result.rowsAffected,
 	};
 }

@@ -23,7 +23,7 @@ simulation_test!(
             )
             .await
             .expect("file insert should succeed");
-        assert_eq!(file_result, ExecuteResult::AffectedRows(1));
+        assert_eq!(file_result, ExecuteResult::from_rows_affected(1));
 
         let result = session
             .execute(
@@ -34,9 +34,7 @@ simulation_test!(
             )
             .await
             .expect("file read should succeed");
-        let ExecuteResult::Rows(row_set) = result else {
-            panic!("SELECT should return rows");
-        };
+        let row_set = result;
         assert_eq!(row_set.len(), 1);
         assert_eq!(
             row_set.rows()[0].values(),
@@ -59,9 +57,7 @@ simulation_test!(
             )
             .await
             .expect("filesystem state read should succeed");
-        let ExecuteResult::Rows(staged_state_rows) = staged_state_result else {
-            panic!("SELECT should return filesystem state rows");
-        };
+        let staged_state_rows = staged_state_result;
         assert_eq!(
             staged_state_rows.len(),
             2,
@@ -78,9 +74,7 @@ simulation_test!(
             )
             .await
             .expect("directory read after file insert should succeed");
-        let ExecuteResult::Rows(directory_rows) = directory_result else {
-            panic!("SELECT should return directory rows");
-        };
+        let directory_rows = directory_result;
         assert_eq!(
             directory_rows.len(),
             2,
@@ -107,7 +101,7 @@ simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
         )
         .await
         .expect("file insert should succeed");
-    assert_eq!(insert_result, ExecuteResult::AffectedRows(1));
+    assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
 
     let update_result = session
         .execute(
@@ -118,7 +112,7 @@ simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
         )
         .await
         .expect("file path update should succeed");
-    assert_eq!(update_result, ExecuteResult::AffectedRows(1));
+    assert_eq!(update_result, ExecuteResult::from_rows_affected(1));
 
     let file_result = session
         .execute(
@@ -129,9 +123,7 @@ simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
         )
         .await
         .expect("file read after path update should succeed");
-    let ExecuteResult::Rows(file_rows) = file_result else {
-        panic!("SELECT should return file rows");
-    };
+    let file_rows = file_result;
     assert_eq!(file_rows.len(), 1);
     assert_eq!(
         file_rows.rows()[0].values(),
@@ -152,9 +144,7 @@ simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
         )
         .await
         .expect("filesystem state read after path update should succeed");
-    let ExecuteResult::Rows(state_rows) = state_result else {
-        panic!("SELECT should return filesystem state rows");
-    };
+    let state_rows = state_result;
     assert_eq!(
         state_rows.len(),
         2,
@@ -171,9 +161,7 @@ simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
         )
         .await
         .expect("directory read after path update should succeed");
-    let ExecuteResult::Rows(directory_rows) = directory_result else {
-        panic!("SELECT should return directory rows");
-    };
+    let directory_rows = directory_result;
     assert_eq!(
         directory_rows.len(),
         2,

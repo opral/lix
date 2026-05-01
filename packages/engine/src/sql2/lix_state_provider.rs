@@ -41,6 +41,8 @@ use crate::sql2::{
 };
 use crate::transaction::types::StageWrite;
 
+use super::result_metadata::json_field;
+
 pub(crate) async fn register_lix_state_providers(
     session: &SessionContext,
     active_version_id: &str,
@@ -1041,8 +1043,8 @@ fn lix_state_schema() -> SchemaRef {
         Field::new("entity_id", DataType::Utf8, false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
-        Field::new("snapshot_content", DataType::Utf8, true),
-        Field::new("metadata", DataType::Utf8, true),
+        json_field("snapshot_content", true),
+        json_field("metadata", true),
         Field::new("schema_version", DataType::Utf8, true),
         Field::new("created_at", DataType::Utf8, true),
         Field::new("updated_at", DataType::Utf8, true),
@@ -1058,8 +1060,8 @@ fn lix_state_by_version_schema() -> SchemaRef {
         Field::new("entity_id", DataType::Utf8, false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
-        Field::new("snapshot_content", DataType::Utf8, true),
-        Field::new("metadata", DataType::Utf8, true),
+        json_field("snapshot_content", true),
+        json_field("metadata", true),
         Field::new("schema_version", DataType::Utf8, true),
         Field::new("created_at", DataType::Utf8, true),
         Field::new("updated_at", DataType::Utf8, true),

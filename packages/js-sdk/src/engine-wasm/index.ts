@@ -12,18 +12,18 @@ export type JsonValue =
 
 export type ValueKind =
 	| "null"
-	| "bool"
-	| "int"
-	| "float"
+	| "boolean"
+	| "integer"
+	| "real"
 	| "text"
 	| "json"
 	| "blob";
 
 export type LixValue =
 	| { kind: "null"; value: null }
-	| { kind: "bool"; value: boolean }
-	| { kind: "int"; value: number }
-	| { kind: "float"; value: number }
+	| { kind: "boolean"; value: boolean }
+	| { kind: "integer"; value: number }
+	| { kind: "real"; value: number }
 	| { kind: "text"; value: string }
 	| { kind: "json"; value: JsonValue }
 	| { kind: "blob"; base64: string };
@@ -51,18 +51,18 @@ export class Value {
 		if (!Number.isFinite(value) || !Number.isInteger(value)) {
 			throw new TypeError("Value.integer() requires a finite integer number");
 		}
-		return new Value("int", value);
+		return new Value("integer", value);
 	}
 
 	static boolean(value: boolean): Value {
-		return new Value("bool", value);
+		return new Value("boolean", value);
 	}
 
 	static real(value: number): Value {
 		if (!Number.isFinite(value)) {
 			throw new TypeError("Value.real() requires a finite number");
 		}
-		return new Value("float", value);
+		return new Value("real", value);
 	}
 
 	static text(value: string): Value {
@@ -83,16 +83,16 @@ export class Value {
 			switch (raw.kind) {
 				case "null":
 					return Value.null();
-				case "bool":
+				case "boolean":
 					return Value.boolean(raw.value);
-				case "int":
+				case "integer":
 					return Value.integer(raw.value);
-				case "float":
+				case "real":
 					return Value.real(raw.value);
 				case "text":
 					return Value.text(raw.value);
 				case "json":
-					return Value.json(raw.value);
+					return Value.json(normalizeJsonValue(raw.value));
 				case "blob":
 					return new Value("blob", undefined, raw.base64);
 			}
@@ -116,20 +116,16 @@ export class Value {
 	);
 	}
 
-	kindValue(): ValueKind {
-		return this.kind;
-	}
-
 	asInteger(): number | undefined {
-		return this.kind === "int" ? (this.value as number) : undefined;
+		return this.kind === "integer" ? (this.value as number) : undefined;
 	}
 
 	asBoolean(): boolean | undefined {
-		return this.kind === "bool" ? (this.value as boolean) : undefined;
+		return this.kind === "boolean" ? (this.value as boolean) : undefined;
 	}
 
 	asReal(): number | undefined {
-		return this.kind === "float" ? (this.value as number) : undefined;
+		return this.kind === "real" ? (this.value as number) : undefined;
 	}
 
 	asText(): string | undefined {
@@ -137,7 +133,7 @@ export class Value {
 	}
 
 	asJson(): JsonValue | undefined {
-		return this.kind === "json" ? (this.value as JsonValue) : undefined;
+		return this.kind === "json" ? normalizeJsonValue(this.value) : undefined;
 	}
 
 	asBlob(): Uint8Array | undefined {
@@ -150,12 +146,12 @@ export class Value {
 		switch (this.kind) {
 			case "null":
 				return { kind: "null", value: null };
-			case "bool":
-				return { kind: "bool", value: this.asBoolean() ?? false };
-			case "int":
-				return { kind: "int", value: this.asInteger() ?? 0 };
-			case "float":
-				return { kind: "float", value: this.asReal() ?? 0 };
+			case "boolean":
+				return { kind: "boolean", value: this.asBoolean() ?? false };
+			case "integer":
+				return { kind: "integer", value: this.asInteger() ?? 0 };
+			case "real":
+				return { kind: "real", value: this.asReal() ?? 0 };
 			case "text":
 				return { kind: "text", value: this.asText() ?? "" };
 			case "json":
@@ -166,13 +162,10 @@ export class Value {
 	}
 }
 
-export type QueryResult = {
-	rows: LixValue[][];
-	columns: string[];
-};
-
 export type ExecuteResult = {
-	statements: QueryResult[];
+	columns: string[];
+	rows: LixValue[][];
+	rowsAffected: number;
 };
 
 /**
@@ -209,15 +202,15 @@ function isLixValue(value: unknown): value is LixValue {
 	if (kind === "null") {
 		return (value as { value?: unknown }).value === null;
 	}
-	if (kind === "bool") {
+	if (kind === "boolean") {
 		return typeof (value as { value?: unknown }).value === "boolean";
 	}
-	if (kind === "int" || kind === "float") {
+	if (kind === "integer" || kind === "real") {
 		const raw = (value as { value?: unknown }).value;
 		if (typeof raw !== "number" || !Number.isFinite(raw)) {
 			return false;
 		}
-		if (kind === "int" && !Number.isInteger(raw)) {
+		if (kind === "integer" && !Number.isInteger(raw)) {
 			return false;
 		}
 		return true;
@@ -252,6 +245,37 @@ function isJsonValue(value: unknown): value is JsonValue {
 		return false;
 	}
 	return Object.values(value).every((entry) => isJsonValue(entry));
+}
+
+function normalizeJsonValue(value: unknown): JsonValue {
+	if (value === null) return null;
+	if (
+		typeof value === "boolean" ||
+		typeof value === "number" ||
+		typeof value === "string"
+	) {
+		return value;
+	}
+	if (Array.isArray(value)) {
+		return value.map((item) => normalizeJsonValue(item));
+	}
+	if (value instanceof Map) {
+		return Object.fromEntries(
+			Array.from(value.entries()).map(([key, entry]) => [
+				String(key),
+				normalizeJsonValue(entry),
+			]),
+		);
+	}
+	if (value && typeof value === "object") {
+		return Object.fromEntries(
+			Object.entries(value).map(([key, entry]) => [
+				key,
+				normalizeJsonValue(entry),
+			]),
+		);
+	}
+	throw new TypeError("expected a JSON-compatible value");
 }
 
 function bytesToBase64(bytes: Uint8Array): string {

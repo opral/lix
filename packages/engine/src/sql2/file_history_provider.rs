@@ -29,6 +29,7 @@ use crate::LixError;
 use super::history_route::{
     load_history_entries, parse_history_filter, HistoryEntry, HistoryRoute,
 };
+use super::result_metadata::json_field;
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -800,7 +801,7 @@ fn lix_file_history_schema() -> SchemaRef {
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_schema_version", DataType::Utf8, false),
         Field::new("lixcol_change_id", DataType::Utf8, false),
-        Field::new("lixcol_metadata", DataType::Utf8, true),
+        json_field("lixcol_metadata", true),
         Field::new("lixcol_commit_id", DataType::Utf8, false),
         Field::new("lixcol_commit_created_at", DataType::Utf8, false),
         Field::new("lixcol_start_commit_id", DataType::Utf8, false),

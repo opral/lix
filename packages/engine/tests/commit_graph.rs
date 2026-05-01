@@ -1,7 +1,6 @@
 #[macro_use]
 #[path = "support/mod.rs"]
 mod support;
-use lix_engine::ExecuteResult;
 use lix_engine::Value;
 use serde_json::Value as JsonValue;
 
@@ -182,12 +181,10 @@ async fn load_commit_snapshot(
         )
         .await
         .expect("commit row should read");
-    let ExecuteResult::Rows(rows) = result else {
-        panic!("SELECT should return rows");
-    };
+    let rows = result;
     assert_eq!(rows.len(), 1);
-    let Value::Text(snapshot_content) = &rows.rows()[0].values()[0] else {
-        panic!("commit snapshot should be text");
+    let Value::Json(snapshot_content) = &rows.rows()[0].values()[0] else {
+        panic!("commit snapshot should be JSON");
     };
-    serde_json::from_str::<JsonValue>(snapshot_content).expect("commit snapshot should be JSON")
+    snapshot_content.clone()
 }
