@@ -279,6 +279,7 @@ impl RowRef<'_> {
 
 impl SessionContext {
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
+        self.ensure_open()?;
         let kind = sql2::classify_statement(sql)?;
         if kind == sql2::SqlStatementKind::Write {
             let sql = sql.to_string();

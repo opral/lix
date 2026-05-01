@@ -25,6 +25,17 @@ pub trait LixBackend: Send + Sync {
         Err(kv_not_supported("kv_scan"))
     }
 
+    /// Releases physical resources held by this backend handle.
+    ///
+    /// This is a resource lifecycle operation, not a durability boundary and
+    /// not a destructive operation. Successful write transactions are durable
+    /// when their commit returns; callers should not rely on `close` to save
+    /// data. Implementations that do not own external resources may keep the
+    /// default no-op behavior.
+    async fn close(&self) -> Result<(), LixError> {
+        Ok(())
+    }
+
     /// Destroys the physical storage target represented by this backend.
     ///
     /// This is a persistence lifecycle operation, not a logical SQL operation.

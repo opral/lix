@@ -95,7 +95,13 @@ test("openLix exposes the rs-sdk e2e flow", async () => {
 	expect(await taskDone(lix, "task-1")).toBe(true);
 
 	await lix.close();
-	await expect(lix.activeVersionId()).rejects.toThrow("lix is closed");
+	await lix.close();
+	await expect(lix.activeVersionId()).rejects.toMatchObject({
+		code: "LIX_ERROR_CLOSED",
+	});
+	await expect(lix.execute("SELECT 1")).rejects.toMatchObject({
+		code: "LIX_ERROR_CLOSED",
+	});
 });
 
 test("openLix accepts an explicit backend", async () => {
@@ -117,6 +123,22 @@ test("openLix accepts an explicit backend", async () => {
 	const second = await openLix({ backend });
 	expect(await taskDone(second, "backend-task")).toBe(false);
 	await second.close();
+});
+
+test("lix.close delegates backend close through the engine bridge", async () => {
+	let closeCount = 0;
+	const backend = {
+		...createMemoryBackend(),
+		close() {
+			closeCount += 1;
+		},
+	};
+
+	const lix = await openLix({ backend });
+	await lix.close();
+	await lix.close();
+
+	expect(closeCount).toBe(1);
 });
 
 async function registerCrmTaskSchema(lix: Lix) {

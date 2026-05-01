@@ -2,7 +2,7 @@
 mod support;
 
 use lix_engine::ExecuteResult;
-use lix_engine::{Engine, Value};
+use lix_engine::{CreateVersionOptions, Engine, MergeVersionOptions, SwitchVersionOptions, Value};
 use serde_json::json;
 
 simulation_test!(engine_new_rejects_uninitialized_backend, |sim| async move {
@@ -147,6 +147,86 @@ simulation_test!(
                 Value::Text("sql2-key".to_string()),
                 Value::Json(json!("sql2-value")),
             ]
+        );
+    }
+);
+
+simulation_test!(
+    session_close_is_idempotent_and_rejects_later_operations,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("backend should open a session");
+
+        session.close().await.expect("first close should succeed");
+        session.close().await.expect("second close should succeed");
+        assert!(session.is_closed());
+
+        assert_closed(
+            session
+                .execute("SELECT value FROM lix_key_value WHERE key = 'lix_id'", &[])
+                .await
+                .expect_err("execute after close should fail"),
+        );
+        assert_closed(
+            session
+                .active_version_id()
+                .await
+                .expect_err("active_version_id after close should fail"),
+        );
+        assert_closed(
+            session
+                .create_version(CreateVersionOptions {
+                    id: Some("closed-version".to_string()),
+                    name: "Closed".to_string(),
+                })
+                .await
+                .expect_err("create_version after close should fail"),
+        );
+        match session
+            .switch_version(SwitchVersionOptions {
+                version_id: sim.main_version_id().to_string(),
+            })
+            .await
+        {
+            Ok(_) => panic!("switch_version after close should fail"),
+            Err(error) => assert_closed(error),
+        }
+        assert_closed(
+            session
+                .merge_version(MergeVersionOptions {
+                    source_version_id: sim.main_version_id().to_string(),
+                })
+                .await
+                .expect_err("merge_version after close should fail"),
+        );
+    }
+);
+
+simulation_test!(
+    session_close_state_is_shared_with_switched_session,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("backend should open a session");
+        let (switched_session, _) = session
+            .switch_version(SwitchVersionOptions {
+                version_id: sim.main_version_id().to_string(),
+            })
+            .await
+            .expect("switch_version should succeed before close");
+
+        session.close().await.expect("close should succeed");
+
+        assert_closed(
+            switched_session
+                .active_version_id()
+                .await
+                .expect_err("derived session should observe closed state"),
         );
     }
 );
@@ -306,4 +386,13 @@ fn assert_single_json(result: ExecuteResult, expected: &str) {
     let expected_json = serde_json::from_str::<serde_json::Value>(expected)
         .expect("expected JSON value should parse");
     assert_eq!(row_set.rows()[0].values(), &[Value::Json(expected_json)]);
+}
+
+fn assert_closed(error: lix_engine::LixError) {
+    assert_eq!(error.code, lix_engine::LixError::CODE_CLOSED);
+    assert_eq!(error.description, "Lix handle is closed");
+    assert_eq!(
+        error.hint.as_deref(),
+        Some("Open a new Lix handle before calling this method.")
+    );
 }

@@ -233,7 +233,7 @@ export async function openLix(
 		const wasmLix = (await (wasmModule as unknown as {
 			openLix(options: OpenLixOptions): Promise<WasmLix>;
 		}).openLix(options)) as WasmLix;
-		return createLixHandle(wasmLix, options.backend);
+		return createLixHandle(wasmLix);
 	} catch (error) {
 		try {
 			options.backend?.close?.();
@@ -244,15 +244,8 @@ export async function openLix(
 	}
 }
 
-function createLixHandle(wasmLix: WasmLix, backend?: LixBackend): Lix {
-	let closed = false;
+function createLixHandle(wasmLix: WasmLix): Lix {
 	let operationQueue: Promise<void> = Promise.resolve();
-
-	const ensureOpen = (methodName: string): void => {
-		if (closed) {
-			throw new Error(`lix is closed; ${methodName}() is unavailable`);
-		}
-	};
 
 	const acquireOperationSlot = async (): Promise<() => void> => {
 		const previous = operationQueue;
@@ -279,7 +272,6 @@ function createLixHandle(wasmLix: WasmLix, backend?: LixBackend): Lix {
 			sql: string,
 			params: ReadonlyArray<LixRuntimeValue> = [],
 		): Promise<ExecuteResult> {
-			ensureOpen("execute");
 			const result = await runQueued(() =>
 				wasmLix.execute(sql, params.map((param) => Value.from(param))),
 			);
@@ -287,37 +279,27 @@ function createLixHandle(wasmLix: WasmLix, backend?: LixBackend): Lix {
 		},
 
 		async activeVersionId(): Promise<string> {
-			ensureOpen("activeVersionId");
 			return await runQueued(() => wasmLix.activeVersionId());
 		},
 
 		async createVersion(
 			options: CreateVersionOptions,
 		): Promise<CreateVersionResult> {
-			ensureOpen("createVersion");
 			return await runQueued(() => wasmLix.createVersion(options));
 		},
 
 		async switchVersion(
 			options: SwitchVersionOptions,
 		): Promise<SwitchVersionResult> {
-			ensureOpen("switchVersion");
 			return await runQueued(() => wasmLix.switchVersion(options));
 		},
 
 		async mergeVersion(options: MergeVersionOptions): Promise<MergeVersionResult> {
-			ensureOpen("mergeVersion");
 			return await runQueued(() => wasmLix.mergeVersion(options));
 		},
 
 		async close(): Promise<void> {
-			if (closed) return;
-			try {
-				await runQueued(() => wasmLix.close());
-			} finally {
-				backend?.close?.();
-				closed = true;
-			}
+			await runQueued(() => wasmLix.close());
 		},
 	};
 }

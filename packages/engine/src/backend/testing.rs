@@ -115,6 +115,29 @@ impl LixBackendTransaction for UnitTestTransaction {
     }
 }
 
+#[async_trait]
+impl LixBackend for Arc<UnitTestBackend> {
+    async fn begin_transaction(
+        &self,
+        mode: TransactionBeginMode,
+    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
+        self.as_ref().begin_transaction(mode).await
+    }
+
+    async fn kv_get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
+        self.as_ref().kv_get(namespace, key).await
+    }
+
+    async fn kv_scan(
+        &self,
+        namespace: &str,
+        range: KvScanRange,
+        limit: Option<usize>,
+    ) -> Result<Vec<KvPair>, LixError> {
+        self.as_ref().kv_scan(namespace, range, limit).await
+    }
+}
+
 fn scan_map(kv: &KvMap, namespace: &str, range: &KvScanRange, limit: Option<usize>) -> Vec<KvPair> {
     let mut pairs = kv
         .iter()
@@ -189,6 +212,31 @@ mod tests {
                 .await
                 .expect("get should succeed"),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn close_is_idempotent_and_does_not_destroy_data() {
+        let backend = UnitTestBackend::new();
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        transaction
+            .kv_put("live_state", b"key", b"value")
+            .await
+            .expect("put should succeed");
+        transaction.commit().await.expect("commit should succeed");
+
+        backend.close().await.expect("first close should succeed");
+        backend.close().await.expect("second close should succeed");
+
+        assert_eq!(
+            backend
+                .kv_get("live_state", b"key")
+                .await
+                .expect("get should succeed"),
+            Some(b"value".to_vec())
         );
     }
 

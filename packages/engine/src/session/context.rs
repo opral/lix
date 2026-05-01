@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
@@ -46,6 +47,7 @@ pub struct SessionContext {
     pub(super) changelog: Arc<ChangelogContext>,
     pub(super) version_ref: Arc<VersionRefContext>,
     pub(super) schema_registry: Arc<SchemaRegistry>,
+    closed: Arc<AtomicBool>,
 }
 
 impl SessionContext {
@@ -106,6 +108,30 @@ impl SessionContext {
         version_ref: Arc<VersionRefContext>,
         schema_registry: Arc<SchemaRegistry>,
     ) -> Self {
+        Self::new_with_closed(
+            mode,
+            backend,
+            live_state,
+            tracked_state,
+            binary_cas,
+            changelog,
+            version_ref,
+            schema_registry,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    pub(super) fn new_with_closed(
+        mode: SessionMode,
+        backend: Arc<dyn LixBackend + Send + Sync>,
+        live_state: Arc<LiveStateContext>,
+        tracked_state: Arc<TrackedStateContext>,
+        binary_cas: Arc<BinaryCasContext>,
+        changelog: Arc<ChangelogContext>,
+        version_ref: Arc<VersionRefContext>,
+        schema_registry: Arc<SchemaRegistry>,
+        closed: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             mode,
             backend,
@@ -115,7 +141,30 @@ impl SessionContext {
             changelog,
             version_ref,
             schema_registry,
+            closed,
         }
+    }
+
+    /// Releases this logical session handle. This is a lifecycle boundary only:
+    /// successful writes are committed before their operation returns.
+    pub async fn close(&self) -> Result<(), LixError> {
+        self.closed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn closed_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.closed)
+    }
+
+    pub(crate) fn ensure_open(&self) -> Result<(), LixError> {
+        if self.is_closed() {
+            return Err(closed_error());
+        }
+        Ok(())
     }
 
     /// Resolves the version this session should operate on right now.
@@ -129,6 +178,7 @@ impl SessionContext {
     /// `lix_key_value` state so multiple open app sessions can observe the same
     /// active workspace version.
     pub async fn active_version_id(&self) -> Result<String, LixError> {
+        self.ensure_open()?;
         match &self.mode {
             SessionMode::Pinned { version_id } => Ok(version_id.clone()),
             SessionMode::Workspace => self.load_workspace_version_id().await,
@@ -197,6 +247,7 @@ impl SessionContext {
             &'tx mut Transaction<'_>,
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
+        self.ensure_open()?;
         let live_state: Arc<dyn LiveStateReader> =
             Arc::new(self.live_state.reader(Arc::clone(&self.backend)));
         let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
@@ -224,6 +275,11 @@ impl SessionContext {
             }
         }
     }
+}
+
+fn closed_error() -> LixError {
+    LixError::new(LixError::CODE_CLOSED, "Lix handle is closed")
+        .with_hint("Open a new Lix handle before calling this method.")
 }
 
 /// Read-only SQL execution context derived from a session.

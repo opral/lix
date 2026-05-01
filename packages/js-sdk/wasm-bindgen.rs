@@ -104,35 +104,32 @@ export type MergeVersionResult = {
 
     #[wasm_bindgen]
     pub struct Lix {
-        inner: Option<RsLix>,
+        inner: RsLix,
     }
 
     #[wasm_bindgen]
     impl Lix {
         #[wasm_bindgen(js_name = execute)]
         pub async fn execute(&self, sql: String, params: JsValue) -> Result<JsValue, JsValue> {
-            let lix = self.inner.as_ref().ok_or_else(closed_error)?;
             let params = Array::from(&params);
             let values = params
                 .iter()
                 .map(value_from_js)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(js_error)?;
-            let result = lix.execute(&sql, &values).await.map_err(js_error)?;
+            let result = self.inner.execute(&sql, &values).await.map_err(js_error)?;
             execute_result_to_js(result).map_err(js_error)
         }
 
         #[wasm_bindgen(js_name = activeVersionId)]
         pub async fn active_version_id(&self) -> Result<String, JsValue> {
-            let lix = self.inner.as_ref().ok_or_else(closed_error)?;
-            lix.active_version_id().await.map_err(js_error)
+            self.inner.active_version_id().await.map_err(js_error)
         }
 
         #[wasm_bindgen(js_name = createVersion)]
         pub async fn create_version(&self, args: JsValue) -> Result<JsValue, JsValue> {
-            let lix = self.inner.as_ref().ok_or_else(closed_error)?;
             let options = parse_create_version_options(args).map_err(js_error)?;
-            let result = lix.create_version(options).await.map_err(js_error)?;
+            let result = self.inner.create_version(options).await.map_err(js_error)?;
             let object = Object::new();
             set_string(&object, "versionId", &result.version_id).map_err(js_error)?;
             Ok(object.into())
@@ -140,9 +137,8 @@ export type MergeVersionResult = {
 
         #[wasm_bindgen(js_name = switchVersion)]
         pub async fn switch_version(&self, args: JsValue) -> Result<JsValue, JsValue> {
-            let lix = self.inner.as_ref().ok_or_else(closed_error)?;
             let options = parse_switch_version_options(args).map_err(js_error)?;
-            let result = lix.switch_version(options).await.map_err(js_error)?;
+            let result = self.inner.switch_version(options).await.map_err(js_error)?;
             let object = Object::new();
             set_string(&object, "versionId", &result.version_id).map_err(js_error)?;
             Ok(object.into())
@@ -150,9 +146,8 @@ export type MergeVersionResult = {
 
         #[wasm_bindgen(js_name = mergeVersion)]
         pub async fn merge_version(&self, args: JsValue) -> Result<JsValue, JsValue> {
-            let lix = self.inner.as_ref().ok_or_else(closed_error)?;
             let options = parse_merge_version_options(args).map_err(js_error)?;
-            let result = lix.merge_version(options).await.map_err(js_error)?;
+            let result = self.inner.merge_version(options).await.map_err(js_error)?;
             let object = Object::new();
             let outcome = match result.outcome {
                 lix_rs_sdk::MergeVersionOutcome::AlreadyUpToDate => "alreadyUpToDate",
@@ -201,11 +196,8 @@ export type MergeVersionResult = {
         }
 
         #[wasm_bindgen(js_name = close)]
-        pub async fn close(&mut self) -> Result<(), JsValue> {
-            let Some(lix) = self.inner.take() else {
-                return Ok(());
-            };
-            lix.close().await.map_err(js_error)
+        pub async fn close(&self) -> Result<(), JsValue> {
+            self.inner.close().await.map_err(js_error)
         }
     }
 
@@ -213,7 +205,7 @@ export type MergeVersionResult = {
     pub async fn open_lix(args: Option<JsValue>) -> Result<Lix, JsValue> {
         let options = parse_open_lix_options(args).map_err(js_error)?;
         let inner = open_lix_rs(options).await.map_err(js_error)?;
-        Ok(Lix { inner: Some(inner) })
+        Ok(Lix { inner })
     }
 
     fn parse_open_lix_options(args: Option<JsValue>) -> Result<OpenLixOptions, LixError> {
@@ -330,6 +322,16 @@ export type MergeVersionResult = {
             let rows = tx.kv_scan(namespace, range, limit).await;
             tx.rollback().await?;
             rows
+        }
+
+        async fn close(&self) -> Result<(), LixError> {
+            let method = Reflect::get(&self.inner, &JsValue::from_str("close"))
+                .map_err(|_| js_sdk_error("backend.close could not be read"))?;
+            if method.is_undefined() || method.is_null() {
+                return Ok(());
+            }
+            call_function0(&method, &self.inner)?;
+            Ok(())
         }
     }
 
@@ -866,10 +868,6 @@ export type MergeVersionResult = {
 
     fn js_sdk_error(message: impl Into<String>) -> LixError {
         LixError::new("LIX_ERROR_JS_SDK", message.into())
-    }
-
-    fn closed_error() -> JsValue {
-        js_error(LixError::new("LIX_ERROR_JS_SDK", "lix is closed"))
     }
 
     fn js_error(error: LixError) -> JsValue {
