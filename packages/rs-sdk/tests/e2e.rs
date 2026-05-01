@@ -16,15 +16,25 @@ async fn rs_sdk_open_register_write_query_version_and_merge_flow() {
     register_crm_task_schema(&lix).await;
 
     lix.execute(
-        "INSERT INTO crm_task (id, title, done) VALUES ($1, $2, $3)",
+        "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
         &[
             Value::Text("task-1".to_string()),
             Value::Text("Draft RS SDK flow".to_string()),
             Value::Boolean(false),
+            Value::Text(r#"{"priority":"high","tags":["sdk","json"]}"#.to_string()),
         ],
     )
     .await
     .unwrap();
+
+    let projected = lix
+        .execute(
+            "SELECT title, done, meta, lixcol_snapshot_content FROM crm_task WHERE id = $1",
+            &[Value::Text("task-1".to_string())],
+        )
+        .await
+        .unwrap();
+    assert_crm_task_projection(&projected);
 
     assert_eq!(task_done(&lix, "task-1").await, false);
 
@@ -154,6 +164,55 @@ async fn rs_sdk_close_does_not_destroy_committed_data() {
     second.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn failed_write_validation_does_not_poison_backend_transaction() {
+    let backend = SharedTestBackend::rejecting_nested_transactions();
+    let rollback_count = backend.rollback_count();
+    let lix = open_lix(OpenLixOptions {
+        backend: Some(Box::new(backend)),
+    })
+    .await
+    .unwrap();
+
+    register_poison_task_schema(&lix).await;
+
+    let error = lix
+        .execute(
+            "INSERT INTO poison_task (id, title) VALUES ($1, $2)",
+            &[
+                Value::Text("bad-task".to_string()),
+                Value::Text("missing meta".to_string()),
+            ],
+        )
+        .await
+        .expect_err("schema validation should reject missing required field");
+    assert_eq!(error.code, "LIX_ERROR_SCHEMA_VALIDATION");
+
+    let result = lix.execute("SELECT 1 AS ok", &[]).await.unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows()[0].values(), &[Value::Integer(1)]);
+    assert!(
+        *rollback_count
+            .lock()
+            .expect("rollback count lock should be available")
+            > 0,
+        "failed commit validation should rollback the backend transaction"
+    );
+
+    lix.execute(
+        "INSERT INTO poison_task (id, title, meta) VALUES ($1, $2, lix_json($3))",
+        &[
+            Value::Text("good-task".to_string()),
+            Value::Text("valid".to_string()),
+            Value::Text(r#"{"priority":"high"}"#.to_string()),
+        ],
+    )
+    .await
+    .expect("valid write after failed write should succeed");
+
+    lix.close().await.unwrap();
+}
+
 async fn register_crm_task_schema(lix: &lix_rs_sdk::Lix) {
     let schema = r#"{
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -161,11 +220,82 @@ async fn register_crm_task_schema(lix: &lix_rs_sdk::Lix) {
         "x-lix-version": "1",
         "x-lix-primary-key": ["/id"],
         "type": "object",
-        "required": ["id", "title", "done"],
+        "required": ["id", "title", "done", "meta"],
         "properties": {
             "id": { "type": "string" },
             "title": { "type": "string" },
-            "done": { "type": "boolean" }
+            "done": { "type": "boolean" },
+            "meta": { "type": "object" }
+        },
+        "additionalProperties": false
+    }"#;
+
+    lix.execute(
+        "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+        &[Value::Text(schema.to_string())],
+    )
+    .await
+    .unwrap();
+}
+
+fn assert_crm_task_projection(result: &lix_rs_sdk::ExecuteResult) {
+    assert_eq!(result.len(), 1);
+    let row = &result.rows()[0];
+    assert_eq!(
+        row.get::<String>("title").unwrap(),
+        "Draft RS SDK flow".to_string()
+    );
+    assert_eq!(row.get::<bool>("done").unwrap(), false);
+
+    let meta = row.get::<Value>("meta").unwrap();
+    let Value::Json(meta) = meta else {
+        panic!("expected meta JSON value, got {meta:?}");
+    };
+    assert_eq!(
+        meta.get("priority").and_then(|value| value.as_str()),
+        Some("high")
+    );
+    assert_eq!(
+        meta.get("tags")
+            .and_then(|value| value.as_array())
+            .map(|tags| tags.len()),
+        Some(2)
+    );
+
+    let snapshot = row.get::<Value>("lixcol_snapshot_content").unwrap();
+    let Value::Json(snapshot) = snapshot else {
+        panic!("expected snapshot JSON value, got {snapshot:?}");
+    };
+    assert_eq!(
+        snapshot.get("id").and_then(|value| value.as_str()),
+        Some("task-1")
+    );
+    assert_eq!(
+        snapshot
+            .get("meta")
+            .and_then(|value| value.get("priority"))
+            .and_then(|value| value.as_str()),
+        Some("high")
+    );
+
+    let missing = row
+        .value("missing")
+        .expect_err("missing column should return a structured error");
+    assert_eq!(missing.code, "LIX_ERROR_COLUMN_NOT_FOUND");
+}
+
+async fn register_poison_task_schema(lix: &lix_rs_sdk::Lix) {
+    let schema = r#"{
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "x-lix-key": "poison_task",
+        "x-lix-version": "1",
+        "x-lix-primary-key": ["/id"],
+        "type": "object",
+        "required": ["id", "title", "meta"],
+        "properties": {
+            "id": { "type": "string" },
+            "title": { "type": "string" },
+            "meta": { "type": "object" }
         },
         "additionalProperties": false
     }"#;
@@ -211,6 +341,9 @@ type KvMap = BTreeMap<(String, Vec<u8>), Vec<u8>>;
 struct SharedTestBackend {
     kv: Arc<Mutex<KvMap>>,
     close_count: Arc<Mutex<usize>>,
+    rollback_count: Arc<Mutex<usize>>,
+    active_transaction: Arc<Mutex<bool>>,
+    reject_nested_transactions: bool,
 }
 
 impl SharedTestBackend {
@@ -218,8 +351,19 @@ impl SharedTestBackend {
         Self::default()
     }
 
+    fn rejecting_nested_transactions() -> Self {
+        Self {
+            reject_nested_transactions: true,
+            ..Self::default()
+        }
+    }
+
     fn close_count(&self) -> Arc<Mutex<usize>> {
         Arc::clone(&self.close_count)
+    }
+
+    fn rollback_count(&self) -> Arc<Mutex<usize>> {
+        Arc::clone(&self.rollback_count)
     }
 }
 
@@ -229,6 +373,18 @@ impl LixBackend for SharedTestBackend {
         &self,
         mode: TransactionBeginMode,
     ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
+        let mut active_transaction = self
+            .active_transaction
+            .lock()
+            .map_err(|_| LixError::unknown("test backend active transaction lock poisoned"))?;
+        if *active_transaction && self.reject_nested_transactions {
+            return Err(LixError::unknown(
+                "cannot open nested Lix backend transaction",
+            ));
+        }
+        *active_transaction = true;
+        drop(active_transaction);
+
         let snapshot = self
             .kv
             .lock()
@@ -238,6 +394,8 @@ impl LixBackend for SharedTestBackend {
             mode,
             parent: Arc::clone(&self.kv),
             kv: snapshot,
+            active_transaction: Arc::clone(&self.active_transaction),
+            rollback_count: Arc::clone(&self.rollback_count),
         }))
     }
 
@@ -276,6 +434,8 @@ struct SharedTestTransaction {
     mode: TransactionBeginMode,
     parent: Arc<Mutex<KvMap>>,
     kv: KvMap,
+    active_transaction: Arc<Mutex<bool>>,
+    rollback_count: Arc<Mutex<usize>>,
 }
 
 #[async_trait]
@@ -313,10 +473,24 @@ impl LixBackendTransaction for SharedTestTransaction {
             .parent
             .lock()
             .map_err(|_| LixError::unknown("test backend lock poisoned"))? = self.kv;
+        *self
+            .active_transaction
+            .lock()
+            .map_err(|_| LixError::unknown("test backend active transaction lock poisoned"))? =
+            false;
         Ok(())
     }
 
     async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+        *self
+            .rollback_count
+            .lock()
+            .map_err(|_| LixError::unknown("test backend rollback count lock poisoned"))? += 1;
+        *self
+            .active_transaction
+            .lock()
+            .map_err(|_| LixError::unknown("test backend active transaction lock poisoned"))? =
+            false;
         Ok(())
     }
 }
