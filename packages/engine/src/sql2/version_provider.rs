@@ -19,11 +19,9 @@ use datafusion::physical_plan::{
 use futures_util::stream;
 use serde_json::Value as JsonValue;
 
-use crate::engine2::live_state::{
-    LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateScanRequest,
-};
-use crate::engine2::version_ref::VersionRefReader;
+use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateScanRequest};
 use crate::version::GLOBAL_VERSION_ID;
+use crate::version_ref::VersionRefReader;
 use crate::LixError;
 
 pub(crate) async fn register_lix_version_provider(

@@ -6,7 +6,7 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
 
-use crate::engine2::functions::FunctionProviderHandle;
+use crate::functions::FunctionProviderHandle;
 
 #[derive(Clone)]
 pub(super) struct LixUuidV7 {

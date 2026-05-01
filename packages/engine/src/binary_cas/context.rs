@@ -1,10 +1,8 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
 
 use crate::backend::{KvStore, KvWriter};
 use crate::binary_cas::BinaryBlobWrite;
-use crate::{LixBackend, LixError};
+use crate::LixError;
 
 #[async_trait]
 pub(crate) trait BlobDataReader: Send + Sync {
@@ -44,10 +42,13 @@ impl BinaryCasContext {
 }
 
 #[async_trait]
-impl BlobDataReader for BinaryCasStoreReader<Arc<dyn LixBackend + Send + Sync>> {
+impl<S> BlobDataReader for BinaryCasStoreReader<S>
+where
+    S: KvStore + Clone + Send + Sync,
+{
     async fn load_blob_data_by_hash(&self, blob_hash: &str) -> Result<Option<Vec<u8>>, LixError> {
         let mut reader = BinaryCasStoreReader {
-            store: Arc::clone(&self.store),
+            store: self.store.clone(),
         };
         let reader: &mut dyn BinaryCasReader = &mut reader;
         reader.load_blob_data_by_hash(blob_hash).await

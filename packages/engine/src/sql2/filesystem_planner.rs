@@ -9,12 +9,12 @@ use crate::common::{
     directory_ancestor_paths, directory_name_from_path, normalize_directory_path,
     parent_directory_path, stable_content_fingerprint_hex, ParsedFilePath,
 };
-use crate::engine2::entity_identity::EntityIdentity;
-use crate::engine2::live_state::LiveStateRow;
+use crate::entity_identity::EntityIdentity;
+use crate::live_state::LiveStateRow;
 use crate::LixError;
 
 use super::filesystem_visibility::VisibleFilesystem;
-use crate::engine2::transaction::types::{StageFileData, StageRow};
+use crate::transaction::types::{StageFileData, StageRow};
 
 pub(crate) const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 pub(crate) const FILE_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
@@ -617,10 +617,10 @@ mod tests {
         DirectoryPathResolver, FileDeleteInput, FileDescriptorRowInput, FilePathWriteInput,
         FilesystemRowContext,
     };
-    use crate::engine2::{entity_identity::EntityIdentity, live_state::LiveStateRow};
     use crate::sql2::filesystem_visibility::{
         VisibleBlobRef, VisibleDirectory, VisibleFile, VisibleFilesystem,
     };
+    use crate::{entity_identity::EntityIdentity, live_state::LiveStateRow};
 
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
         let mut ids = ids.iter();
@@ -639,9 +639,7 @@ mod tests {
 
         assert_eq!(
             row.entity_id.as_ref(),
-            Some(&crate::engine2::entity_identity::EntityIdentity::single(
-                "dir-docs"
-            ))
+            Some(&crate::entity_identity::EntityIdentity::single("dir-docs"))
         );
         assert_eq!(row.schema_key, "lix_directory_descriptor");
         assert_eq!(row.schema_version.as_str(), "1");
@@ -667,7 +665,7 @@ mod tests {
 
         assert_eq!(
             row.entity_id.as_ref(),
-            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+            Some(&crate::entity_identity::EntityIdentity::single(
                 "file-readme"
             ))
         );
@@ -691,7 +689,7 @@ mod tests {
 
         assert_eq!(
             row.entity_id.as_ref(),
-            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+            Some(&crate::entity_identity::EntityIdentity::single(
                 "file-readme"
             ))
         );
@@ -1035,7 +1033,7 @@ mod tests {
             .expect("file descriptor tombstone should be planned");
         assert_eq!(
             descriptor.entity_id.as_ref(),
-            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+            Some(&crate::entity_identity::EntityIdentity::single(
                 "file-readme"
             ))
         );
@@ -1050,7 +1048,7 @@ mod tests {
             .expect("blob ref tombstone should be planned");
         assert_eq!(
             blob_ref.entity_id.as_ref(),
-            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+            Some(&crate::entity_identity::EntityIdentity::single(
                 "file-readme"
             ))
         );
@@ -1084,9 +1082,7 @@ mod tests {
         assert_eq!(plan.rows.len(), 1);
         assert_eq!(
             plan.rows[0].entity_id.as_ref(),
-            Some(&crate::engine2::entity_identity::EntityIdentity::single(
-                "dir-docs"
-            ))
+            Some(&crate::entity_identity::EntityIdentity::single("dir-docs"))
         );
         assert_eq!(plan.rows[0].schema_key, "lix_directory_descriptor");
         assert_eq!(plan.rows[0].file_id, None);

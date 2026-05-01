@@ -6,9 +6,9 @@ use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{Expr, Operator};
 use tokio::sync::Mutex;
 
-use crate::engine2::changelog::CanonicalChange;
-use crate::engine2::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
-use crate::engine2::entity_identity::EntityIdentity;
+use crate::changelog::CanonicalChange;
+use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
+use crate::entity_identity::EntityIdentity;
 use crate::LixError;
 
 /// Shared routing state for commit-shaped history SQL surfaces.

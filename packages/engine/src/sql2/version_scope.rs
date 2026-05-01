@@ -1,7 +1,11 @@
 use std::collections::BTreeSet;
 
-use crate::engine2::version_ref::VersionRefReader;
+use datafusion::logical_expr::expr::InList;
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+use datafusion::scalar::ScalarValue;
+
 use crate::version::GLOBAL_VERSION_ID;
+use crate::version_ref::VersionRefReader;
 use crate::LixError;
 
 /// Version scope requested by a SQL surface.
@@ -86,6 +90,86 @@ pub(crate) async fn resolve_provider_version_ids(
     .await
 }
 
+pub(crate) fn explicit_version_ids_from_dml_filters(filters: &[Expr]) -> Vec<String> {
+    filters
+        .iter()
+        .flat_map(version_ids_from_filter)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn version_ids_from_filter(expr: &Expr) -> Vec<String> {
+    match expr {
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
+            let mut values = version_ids_from_filter(&binary_expr.left);
+            values.extend(version_ids_from_filter(&binary_expr.right));
+            values
+        }
+        Expr::BinaryExpr(binary_expr) => version_id_from_binary_filter(binary_expr)
+            .map(|value| vec![value])
+            .unwrap_or_default(),
+        Expr::InList(in_list) => version_ids_from_in_list_filter(in_list).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn version_id_from_binary_filter(binary_expr: &BinaryExpr) -> Option<String> {
+    if binary_expr.op != Operator::Eq {
+        return None;
+    }
+
+    version_id_from_column_literal_filter(&binary_expr.left, &binary_expr.right)
+        .or_else(|| version_id_from_column_literal_filter(&binary_expr.right, &binary_expr.left))
+}
+
+fn version_ids_from_in_list_filter(in_list: &InList) -> Option<Vec<String>> {
+    if in_list.negated {
+        return None;
+    }
+    let Expr::Column(column) = in_list.expr.as_ref() else {
+        return None;
+    };
+    if column.name != "lixcol_version_id" {
+        return None;
+    }
+
+    let values = in_list
+        .list
+        .iter()
+        .map(string_expr_literal)
+        .collect::<Option<Vec<_>>>()?;
+    if values.is_empty() {
+        return None;
+    }
+    Some(values)
+}
+
+fn version_id_from_column_literal_filter(
+    column_expr: &Expr,
+    literal_expr: &Expr,
+) -> Option<String> {
+    let Expr::Column(column) = column_expr else {
+        return None;
+    };
+    if column.name != "lixcol_version_id" {
+        return None;
+    }
+    string_expr_literal(literal_expr)
+}
+
+fn string_expr_literal(expr: &Expr) -> Option<String> {
+    let Expr::Literal(literal, _) = expr else {
+        return None;
+    };
+    match literal {
+        ScalarValue::Utf8(Some(value))
+        | ScalarValue::Utf8View(Some(value))
+        | ScalarValue::LargeUtf8(Some(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
 async fn visible_version_ids(version_ref: &dyn VersionRefReader) -> Result<Vec<String>, LixError> {
     let mut version_ids = version_ref
         .scan_heads()
@@ -102,7 +186,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::engine2::version_ref::VersionHead;
+    use crate::version_ref::VersionHead;
 
     #[tokio::test]
     async fn active_scope_uses_session_version() {

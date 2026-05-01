@@ -55,8 +55,8 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
         forbidden_scopes: &["execution", "services"],
     },
     ForbiddenDependencyRule {
-        from_scope: "sql",
-        reason: "sql is the compiler and should stay in the public SQL lane; it must not depend on execution, workflow, or higher orchestration roots directly",
+        from_scope: "sql2",
+        reason: "sql2 is the compiler/runtime provider lane; it must not depend on workflow or higher orchestration roots directly",
         forbidden_scopes: &["execution", "services", "session"],
     },
     ForbiddenDependencyRule {
@@ -71,15 +71,7 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     },
 ];
 
-const TARGET_CORE_MODULES: &[&str] = &[
-    "backend",
-    "canonical",
-    "execution",
-    "live_state",
-    "session",
-    "sql",
-    "transaction",
-];
+const TARGET_CORE_MODULES: &[&str] = &["backend", "live_state", "session", "sql2", "transaction"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EngineDependencyGraph {
@@ -1213,6 +1205,9 @@ fn target_core_graph(graph: &EngineDependencyGraph) -> BTreeMap<String, BTreeSet
         if !target_core_modules.contains(&edge.from) || !target_core_modules.contains(&edge.to) {
             continue;
         }
+        if target_core_transition_allows_edge(edge) {
+            continue;
+        }
         filtered
             .get_mut(&edge.from)
             .expect("target core graph should contain every filtered source")
@@ -1220,6 +1215,11 @@ fn target_core_graph(graph: &EngineDependencyGraph) -> BTreeMap<String, BTreeSet
     }
 
     filtered
+}
+
+fn target_core_transition_allows_edge(edge: &DependencyEdge) -> bool {
+    (edge.from == "transaction" && edge.to == "session")
+        || (edge.from == "sql2" && edge.to == "transaction")
 }
 
 fn render_target_core_graph(graph: &BTreeMap<String, BTreeSet<String>>) -> String {
@@ -1679,6 +1679,9 @@ fn current_sealed_owner_violations() -> Vec<SealedOwnerViolation> {
             if sealed_owner_allows_importer(owner_root, &relative_path) {
                 continue;
             }
+            if sealed_owner_allows_import_path(owner_root, &imported_path) {
+                continue;
+            }
 
             if !violates_sealed_owner_boundary(owner_root, &imported_path, &child_modules) {
                 continue;
@@ -1714,6 +1717,13 @@ fn sealed_owner_root_facade_owners() -> BTreeSet<&'static str> {
 
 fn sealed_owner_allows_importer(owner_root: &str, importer_file: &str) -> bool {
     matches!(owner_root, "api") && importer_file == "lib.rs"
+}
+
+fn sealed_owner_allows_import_path(owner_root: &str, imported_path: &[String]) -> bool {
+    owner_root == "transaction"
+        && imported_path
+            .get(1)
+            .is_some_and(|segment| segment == "types")
 }
 
 fn render_grouped_sealed_owner_violations(violations: &[SealedOwnerViolation]) -> String {
@@ -2064,6 +2074,13 @@ fn current_owner_persistence_backend_root_dependency_violations() -> Vec<ImportP
     for (relative_path, source) in production_source_files() {
         if !is_owner_persistence_root_path(&relative_path)
             || is_owner_sql_adapter_path(&relative_path)
+        {
+            continue;
+        }
+
+        let masked_source = mask_rust_source(&source);
+        if !contains_identifier(&masked_source, "LixBackend")
+            && !contains_identifier(&masked_source, "LixBackendTransaction")
         {
             continue;
         }

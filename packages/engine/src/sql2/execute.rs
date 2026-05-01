@@ -320,23 +320,23 @@ mod tests {
         SqlWriteExecutionContext,
     };
     use crate::binary_cas::BlobDataReader;
-    use crate::engine2::changelog::{CanonicalChange, ChangelogReader, ChangelogScanRequest};
-    use crate::engine2::commit_graph::{
+    use crate::changelog::{CanonicalChange, ChangelogReader, ChangelogScanRequest};
+    use crate::commit_graph::{
         CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphChangeSet,
         CommitGraphChangeSetElement, CommitGraphCommit, CommitGraphEdge, CommitGraphReader,
         ReachableCommitGraphCommit,
     };
-    use crate::engine2::functions::{
+    use crate::functions::{
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
-    use crate::engine2::live_state::{
+    use crate::live_state::{
         LiveStateContext, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
-    use crate::engine2::tracked_state::TrackedStateContext;
-    use crate::engine2::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
-    use crate::engine2::untracked_state::UntrackedStateContext;
-    use crate::engine2::version_ref::VersionRefReader;
-    use crate::engine2::{Engine, ExecuteResult, SessionContext};
+    use crate::tracked_state::TrackedStateContext;
+    use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
+    use crate::untracked_state::UntrackedStateContext;
+    use crate::version_ref::VersionRefReader;
+    use crate::{Engine, ExecuteResult, SessionContext};
     use crate::{LixError, Value};
 
     struct DummyBlobReader;
@@ -557,13 +557,11 @@ mod tests {
         async fn load_head(
             &self,
             _version_id: &str,
-        ) -> Result<Option<crate::engine2::version_ref::VersionHead>, LixError> {
+        ) -> Result<Option<crate::version_ref::VersionHead>, LixError> {
             Ok(None)
         }
 
-        async fn scan_heads(
-            &self,
-        ) -> Result<Vec<crate::engine2::version_ref::VersionHead>, LixError> {
+        async fn scan_heads(&self) -> Result<Vec<crate::version_ref::VersionHead>, LixError> {
             Ok(Vec::new())
         }
     }
@@ -682,14 +680,14 @@ mod tests {
             blob_hash: &str,
         ) -> Result<Option<Vec<u8>>, LixError> {
             let binary_cas = crate::binary_cas::BinaryCasContext::new();
-            let mut reader = binary_cas.reader(self.0.as_ref());
+            let reader = binary_cas.reader(self.0.as_ref());
             reader.load_blob_data_by_hash(blob_hash).await
         }
     }
 
     fn live_lix_state_row(entity_id: &str, metadata: Option<&str>) -> LiveStateRow {
         LiveStateRow {
-            entity_id: crate::engine2::entity_identity::EntityIdentity::from_string(entity_id)
+            entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
@@ -708,7 +706,7 @@ mod tests {
 
     fn live_entity_row(entity_id: &str, version_id: &str, value: &str) -> LiveStateRow {
         LiveStateRow {
-            entity_id: crate::engine2::entity_identity::EntityIdentity::from_string(entity_id)
+            entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: "test_state_schema".to_string(),
             file_id: None,
@@ -733,7 +731,7 @@ mod tests {
         hidden: bool,
     ) -> LiveStateRow {
         LiveStateRow {
-            entity_id: crate::engine2::entity_identity::EntityIdentity::from_string(entity_id)
+            entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id: None,
@@ -767,7 +765,7 @@ mod tests {
         hidden: bool,
     ) -> LiveStateRow {
         LiveStateRow {
-            entity_id: crate::engine2::entity_identity::EntityIdentity::from_string(entity_id)
+            entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: "lix_file_descriptor".to_string(),
             file_id: None,
@@ -2038,10 +2036,7 @@ mod tests {
         }
 
         fn changelog(&self) -> Arc<dyn ChangelogReader> {
-            Arc::new(
-                crate::engine2::changelog::ChangelogContext::new()
-                    .reader(Arc::clone(&self.backend)),
-            )
+            Arc::new(crate::changelog::ChangelogContext::new().reader(Arc::clone(&self.backend)))
         }
 
         fn commit_graph(&self) -> Box<dyn CommitGraphReader> {
@@ -2050,10 +2045,8 @@ mod tests {
 
         fn version_ref(&self) -> Arc<dyn VersionRefReader> {
             Arc::new(
-                crate::engine2::version_ref::VersionRefContext::new(Arc::new(
-                    UntrackedStateContext::new(),
-                ))
-                .reader(Arc::clone(&self.backend)),
+                crate::version_ref::VersionRefContext::new(Arc::new(UntrackedStateContext::new()))
+                    .reader(Arc::clone(&self.backend)),
             )
         }
 
@@ -2066,13 +2059,13 @@ mod tests {
     ) -> Result<(crate::backend::testing::UnitTestBackend, JsonValue), crate::LixError> {
         let backend = crate::backend::testing::UnitTestBackend::new();
         let init_receipt = Engine::initialize(Box::new(backend.clone())).await?;
-        crate::engine2::test_support::seed_version_head(
+        crate::test_support::seed_version_head(
             &backend,
             "version-a",
             &format!("{}-version-a-root", init_receipt.initial_commit_id),
         )
         .await;
-        crate::engine2::test_support::seed_version_head(
+        crate::test_support::seed_version_head(
             &backend,
             "version-b",
             &format!("{}-version-b-root", init_receipt.initial_commit_id),
@@ -2146,9 +2139,7 @@ mod tests {
         LiveStateContext::new(
             TrackedStateContext::new(),
             UntrackedStateContext::new(),
-            crate::engine2::commit_graph::CommitGraphContext::new(
-                crate::engine2::changelog::ChangelogContext::new(),
-            ),
+            crate::commit_graph::CommitGraphContext::new(crate::changelog::ChangelogContext::new()),
         )
     }
 

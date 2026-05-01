@@ -132,11 +132,6 @@ impl ParsedFilePath {
     pub(crate) fn try_from_path(path: &str) -> Result<Self, LixError> {
         parse_file_path(path)
     }
-
-    #[cfg(test)]
-    pub(crate) fn from_normalized_path(path: String) -> Result<Self, LixError> {
-        parse_file_path(&path)
-    }
 }
 
 type PathResult<T> = Result<T, PathError>;

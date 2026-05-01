@@ -1,7 +1,3 @@
-use crate::live_state::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
-use crate::live_state::{
-    key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
-};
 use crate::{validate_lix_schema, validate_lix_schema_definition};
 use serde_json::json;
 
@@ -238,63 +234,6 @@ fn x_lix_key_must_be_snake_case() {
         schema["x-lix-key"] = json!(key);
         assert!(validate_lix_schema_definition(&schema).is_ok());
     }
-}
-
-#[test]
-fn builtin_storage_metadata_treats_lix_account_as_local_under_owner_policy() {
-    let metadata = builtin_schema_storage_metadata("lix_account")
-        .expect("lix_account builtin storage metadata should exist");
-
-    assert_eq!(metadata.schema_key, "lix_account");
-    assert_eq!(metadata.schema_version, "1");
-    assert_eq!(metadata.file_id, None);
-    assert_eq!(metadata.plugin_key, None);
-    assert_eq!(metadata.storage_lane, BuiltinSchemaStorageLane::Local);
-}
-
-#[test]
-fn builtin_storage_metadata_marks_non_global_builtins_as_local() {
-    let metadata = builtin_schema_storage_metadata("lix_key_value")
-        .expect("lix_key_value builtin storage metadata should exist");
-
-    assert_eq!(metadata.schema_key, "lix_key_value");
-    assert_eq!(metadata.file_id, None);
-    assert_eq!(metadata.plugin_key, None);
-    assert_eq!(metadata.storage_lane, BuiltinSchemaStorageLane::Local);
-}
-
-#[test]
-fn builtin_storage_metadata_keeps_version_runtime_builtins_global() {
-    for schema_key in [
-        "lix_version_ref",
-        "lix_version_descriptor",
-        "lix_active_version",
-        "lix_active_account",
-    ] {
-        let metadata = builtin_schema_storage_metadata(schema_key)
-            .unwrap_or_else(|| panic!("{schema_key} builtin storage metadata should exist"));
-        assert_eq!(
-            metadata.storage_lane,
-            BuiltinSchemaStorageLane::Global,
-            "{schema_key} should stay owner-global"
-        );
-    }
-}
-
-#[test]
-fn builtin_storage_metadata_treats_registered_schema_as_global() {
-    let metadata = builtin_schema_storage_metadata("lix_registered_schema")
-        .expect("lix_registered_schema builtin storage metadata should exist");
-
-    assert_eq!(metadata.storage_lane, BuiltinSchemaStorageLane::Global);
-}
-
-#[test]
-fn key_value_storage_accessors_are_schema_owned() {
-    assert_eq!(key_value_schema_key(), "lix_key_value");
-    assert_eq!(key_value_schema_version(), "1");
-    assert_eq!(key_value_file_id(), None);
-    assert_eq!(key_value_plugin_key(), None);
 }
 
 #[test]

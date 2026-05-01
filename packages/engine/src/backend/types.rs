@@ -1,8 +1,6 @@
 use async_trait::async_trait;
 
-use crate::backend::{
-    ImageChunkReader, ImageChunkWriter, KvPair, KvScanRange, PreparedBatch, TransactionBeginMode,
-};
+use crate::backend::{KvPair, KvScanRange, PreparedBatch, TransactionBeginMode};
 use crate::common::SqlDialect;
 use crate::{LixError, QueryResult, Value};
 
@@ -49,24 +47,6 @@ pub trait LixBackend: Send + Sync {
         _limit: Option<usize>,
     ) -> Result<Vec<KvPair>, LixError> {
         Err(kv_not_supported("kv_scan"))
-    }
-
-    /// Exports the current Lix database snapshot as a SQLite database file payload.
-    async fn export_image(&self, _writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {
-        Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "export_image is not supported by this backend".to_string(),
-            hint: None,
-        })
-    }
-
-    /// Restores backend state from a SQLite database file payload stream.
-    async fn restore_from_image(&self, _reader: &mut dyn ImageChunkReader) -> Result<(), LixError> {
-        Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "restore_from_image is not supported by this backend".to_string(),
-            hint: None,
-        })
     }
 
     /// Destroys the physical storage target represented by this backend.
