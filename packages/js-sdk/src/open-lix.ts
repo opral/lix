@@ -23,7 +23,44 @@ export type ExecuteResult =
 	| { kind: "rows"; rows: RowSet }
 	| { kind: "affectedRows"; affectedRows: number };
 
-export type OpenLixOptions = Record<string, never>;
+export type TransactionBeginMode = "read" | "write" | "deferred";
+
+export type KvScanRange =
+	| { kind: "prefix"; prefix: Uint8Array }
+	| { kind: "range"; start: Uint8Array; end: Uint8Array };
+
+export type KvPair = {
+	key: Uint8Array;
+	value: Uint8Array;
+};
+
+export type LixBackendTransaction = {
+	kvGet(namespace: string, key: Uint8Array): Uint8Array | null | undefined;
+	kvScan(
+		namespace: string,
+		range: KvScanRange,
+		limit?: number | null,
+	): KvPair[];
+	kvPut(namespace: string, key: Uint8Array, value: Uint8Array): void;
+	kvDelete(namespace: string, key: Uint8Array): void;
+	commit(): void;
+	rollback(): void;
+};
+
+export type LixBackend = {
+	beginTransaction(mode: TransactionBeginMode): LixBackendTransaction;
+	kvGet?(namespace: string, key: Uint8Array): Uint8Array | null | undefined;
+	kvScan?(
+		namespace: string,
+		range: KvScanRange,
+		limit?: number | null,
+	): KvPair[];
+	close?(): void;
+};
+
+export type OpenLixOptions = {
+	backend?: LixBackend;
+};
 
 export type CreateVersionOptions = {
 	id?: string;
@@ -103,13 +140,22 @@ export async function openLix(
 	options: OpenLixOptions = {},
 ): Promise<Lix> {
 	await ensureWasmReady();
-	const wasmLix = (await (wasmModule as unknown as {
-		openLix(options: OpenLixOptions): Promise<WasmLix>;
-	}).openLix(options)) as WasmLix;
-	return createLixHandle(wasmLix);
+	try {
+		const wasmLix = (await (wasmModule as unknown as {
+			openLix(options: OpenLixOptions): Promise<WasmLix>;
+		}).openLix(options)) as WasmLix;
+		return createLixHandle(wasmLix, options.backend);
+	} catch (error) {
+		try {
+			options.backend?.close?.();
+		} catch {
+			// Preserve the original open failure.
+		}
+		throw error;
+	}
 }
 
-function createLixHandle(wasmLix: WasmLix): Lix {
+function createLixHandle(wasmLix: WasmLix, backend?: LixBackend): Lix {
 	let closed = false;
 	let operationQueue: Promise<void> = Promise.resolve();
 
@@ -177,8 +223,12 @@ function createLixHandle(wasmLix: WasmLix): Lix {
 
 		async close(): Promise<void> {
 			if (closed) return;
-			await runQueued(() => wasmLix.close());
-			closed = true;
+			try {
+				await runQueued(() => wasmLix.close());
+			} finally {
+				backend?.close?.();
+				closed = true;
+			}
 		},
 	};
 }

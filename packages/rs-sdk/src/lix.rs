@@ -1,14 +1,20 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use lix_engine::{
     CreateVersionOptions, CreateVersionReceipt as CreateVersionResult, Engine, ExecuteResult,
-    LixError, MergeVersionOptions, MergeVersionReceipt as MergeVersionResult, SessionContext,
-    SwitchVersionOptions, SwitchVersionReceipt as SwitchVersionResult, Value,
+    KvPair, KvScanRange, LixBackend, LixBackendTransaction, LixError, MergeVersionOptions,
+    MergeVersionReceipt as MergeVersionResult, SessionContext, SwitchVersionOptions,
+    SwitchVersionReceipt as SwitchVersionResult, TransactionBeginMode, Value,
 };
 
 use crate::in_memory_backend::InMemoryBackend;
 
 /// Options for opening a Lix workspace session.
-#[derive(Debug, Clone, Default)]
-pub struct OpenLixOptions;
+#[derive(Default)]
+pub struct OpenLixOptions {
+    pub backend: Option<Box<dyn LixBackend + Send + Sync>>,
+}
 
 /// Workspace-session handle for a Lix repository.
 pub struct Lix {
@@ -16,11 +22,17 @@ pub struct Lix {
     session: SessionContext,
 }
 
-/// Opens a new in-memory Lix workspace session.
-pub async fn open_lix(_options: OpenLixOptions) -> Result<Lix, LixError> {
-    let backend = InMemoryBackend::new();
-    Engine::initialize(Box::new(backend.clone())).await?;
-    let engine = Engine::new(Box::new(backend)).await?;
+/// Opens a Lix workspace session.
+///
+/// If `options.backend` is omitted, a fresh in-memory backend is used. If a
+/// backend is supplied, it is opened when already initialized and initialized
+/// first when empty.
+pub async fn open_lix(options: OpenLixOptions) -> Result<Lix, LixError> {
+    let backend: Box<dyn LixBackend + Send + Sync> = options
+        .backend
+        .unwrap_or_else(|| Box::new(InMemoryBackend::new()));
+    let backend = SharedBackend::new(backend);
+    let engine = open_or_initialize_engine(&backend).await?;
     let session = engine.open_workspace_session().await?;
     Ok(Lix {
         _engine: engine,
@@ -61,5 +73,56 @@ impl Lix {
 
     pub async fn close(self) -> Result<(), LixError> {
         Ok(())
+    }
+}
+
+async fn open_or_initialize_engine(backend: &SharedBackend) -> Result<Engine, LixError> {
+    match Engine::new(Box::new(backend.clone())).await {
+        Ok(engine) => Ok(engine),
+        Err(error) if error.code == "LIX_ERROR_NOT_INITIALIZED" => {
+            Engine::initialize(Box::new(backend.clone())).await?;
+            Engine::new(Box::new(backend.clone())).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[derive(Clone)]
+struct SharedBackend {
+    inner: Arc<dyn LixBackend + Send + Sync>,
+}
+
+impl SharedBackend {
+    fn new(backend: Box<dyn LixBackend + Send + Sync>) -> Self {
+        Self {
+            inner: Arc::from(backend),
+        }
+    }
+}
+
+#[async_trait]
+impl LixBackend for SharedBackend {
+    async fn begin_transaction(
+        &self,
+        mode: TransactionBeginMode,
+    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
+        self.inner.begin_transaction(mode).await
+    }
+
+    async fn kv_get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
+        self.inner.kv_get(namespace, key).await
+    }
+
+    async fn kv_scan(
+        &self,
+        namespace: &str,
+        range: KvScanRange,
+        limit: Option<usize>,
+    ) -> Result<Vec<KvPair>, LixError> {
+        self.inner.kv_scan(namespace, range, limit).await
+    }
+
+    async fn destroy(&self) -> Result<(), LixError> {
+        self.inner.destroy().await
     }
 }

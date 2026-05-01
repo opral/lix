@@ -39,10 +39,7 @@ async fn rs_sdk_open_register_write_query_version_and_merge_flow() {
 
     lix.execute(
         "UPDATE crm_task SET done = $1 WHERE id = $2",
-        &[
-            Value::Boolean(true),
-            Value::Text("task-1".to_string()),
-        ],
+        &[Value::Boolean(true), Value::Text("task-1".to_string())],
     )
     .await
     .unwrap();

@@ -1,11 +1,14 @@
 #[cfg(target_arch = "wasm32")]
 mod wasm {
+    use async_trait::async_trait;
     use js_sys::{Array, Object, Reflect};
     use lix_rs_sdk::{
-        open_lix as open_lix_rs, CreateVersionOptions, ExecuteResult, Lix as RsLix, LixError,
-        MergeVersionOptions, OpenLixOptions, SwitchVersionOptions, Value,
+        open_lix as open_lix_rs, CreateVersionOptions, ExecuteResult, KvPair, KvScanRange,
+        Lix as RsLix, LixBackend, LixBackendTransaction, LixError, MergeVersionOptions,
+        OpenLixOptions, SwitchVersionOptions, TransactionBeginMode, Value,
     };
     use wasm_bindgen::prelude::*;
+    use wasm_bindgen::JsCast;
 
     #[wasm_bindgen(typescript_custom_section)]
     const LIX_TYPES: &str = r#"
@@ -35,7 +38,36 @@ export type ExecuteResult =
   | { kind: "rows"; rows: RowSet }
   | { kind: "affectedRows"; affectedRows: number };
 
-export type OpenLixOptions = Record<string, never>;
+export type TransactionBeginMode = "read" | "write" | "deferred";
+
+export type KvScanRange =
+  | { kind: "prefix"; prefix: Uint8Array }
+  | { kind: "range"; start: Uint8Array; end: Uint8Array };
+
+export type KvPair = {
+  key: Uint8Array;
+  value: Uint8Array;
+};
+
+export type LixBackendTransaction = {
+  kvGet(namespace: string, key: Uint8Array): Uint8Array | null | undefined;
+  kvScan(namespace: string, range: KvScanRange, limit?: number | null): KvPair[];
+  kvPut(namespace: string, key: Uint8Array, value: Uint8Array): void;
+  kvDelete(namespace: string, key: Uint8Array): void;
+  commit(): void;
+  rollback(): void;
+};
+
+export type LixBackend = {
+  beginTransaction(mode: TransactionBeginMode): LixBackendTransaction;
+  kvGet?(namespace: string, key: Uint8Array): Uint8Array | null | undefined;
+  kvScan?(namespace: string, range: KvScanRange, limit?: number | null): KvPair[];
+  close?(): void;
+};
+
+export type OpenLixOptions = {
+  backend?: LixBackend;
+};
 
 export type CreateVersionOptions = {
   id?: string;
@@ -132,8 +164,12 @@ export type MergeVersionResult = {
             set_string(&object, "outcome", outcome).map_err(js_error)?;
             set_string(&object, "targetVersionId", &result.target_version_id).map_err(js_error)?;
             set_string(&object, "sourceVersionId", &result.source_version_id).map_err(js_error)?;
-            set_optional_string(&object, "mergeBaseCommitId", result.merge_base_commit_id.as_deref())
-                .map_err(js_error)?;
+            set_optional_string(
+                &object,
+                "mergeBaseCommitId",
+                result.merge_base_commit_id.as_deref(),
+            )
+            .map_err(js_error)?;
             set_string(
                 &object,
                 "targetHeadBeforeCommitId",
@@ -178,23 +214,397 @@ export type MergeVersionResult = {
 
     #[wasm_bindgen(js_name = openLix)]
     pub async fn open_lix(args: Option<JsValue>) -> Result<Lix, JsValue> {
-        parse_open_lix_options(args).map_err(js_error)?;
-        let inner = open_lix_rs(OpenLixOptions::default())
-            .await
-            .map_err(js_error)?;
+        let options = parse_open_lix_options(args).map_err(js_error)?;
+        let inner = open_lix_rs(options).await.map_err(js_error)?;
         Ok(Lix { inner: Some(inner) })
     }
 
-    fn parse_open_lix_options(args: Option<JsValue>) -> Result<(), LixError> {
-        if let Some(value) = args {
-            if !value.is_undefined() && !value.is_null() && !value.is_object() {
-                return Err(LixError::new(
-                    "LIX_ERROR_JS_SDK",
-                    "openLix() options must be an object",
+    fn parse_open_lix_options(args: Option<JsValue>) -> Result<OpenLixOptions, LixError> {
+        let Some(value) = args else {
+            return Ok(OpenLixOptions::default());
+        };
+        if value.is_undefined() || value.is_null() {
+            return Ok(OpenLixOptions::default());
+        }
+        if !value.is_object() {
+            return Err(LixError::new(
+                "LIX_ERROR_JS_SDK",
+                "openLix() options must be an object",
+            ));
+        }
+        let backend = Reflect::get(&value, &JsValue::from_str("backend"))
+            .map_err(|_| js_sdk_error("openLix() could not read backend"))?;
+        if backend.is_undefined() || backend.is_null() {
+            return Ok(OpenLixOptions::default());
+        }
+        if !backend.is_object() {
+            return Err(LixError::new(
+                "LIX_ERROR_JS_SDK",
+                "openLix() backend must be an object",
+            ));
+        }
+        Ok(OpenLixOptions {
+            backend: Some(Box::new(JsBackend::new(backend))),
+        })
+    }
+
+    struct JsBackend {
+        inner: JsValue,
+    }
+
+    impl JsBackend {
+        fn new(inner: JsValue) -> Self {
+            Self { inner }
+        }
+    }
+
+    unsafe impl Send for JsBackend {}
+    unsafe impl Sync for JsBackend {}
+
+    #[async_trait]
+    impl LixBackend for JsBackend {
+        async fn begin_transaction(
+            &self,
+            mode: TransactionBeginMode,
+        ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
+            let transaction = call_method1(
+                &self.inner,
+                "beginTransaction",
+                &JsValue::from_str(transaction_mode_to_js(mode)),
+            )?;
+            if transaction.is_null() || transaction.is_undefined() || !transaction.is_object() {
+                return Err(js_sdk_error(
+                    "backend.beginTransaction() must return a transaction object",
                 ));
             }
+            Ok(Box::new(JsBackendTransaction {
+                mode,
+                inner: transaction,
+            }))
         }
-        Ok(())
+
+        async fn kv_get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
+            {
+                let method = Reflect::get(&self.inner, &JsValue::from_str("kvGet"))
+                    .map_err(|_| js_sdk_error("backend.kvGet could not be read"))?;
+                if !method.is_undefined() && !method.is_null() {
+                    return js_value_to_optional_bytes(
+                        call_function2(
+                            &method,
+                            &self.inner,
+                            &JsValue::from_str(namespace),
+                            &bytes_to_js(key),
+                        )?,
+                        "backend.kvGet",
+                    );
+                }
+            }
+
+            let mut tx = self.begin_transaction(TransactionBeginMode::Read).await?;
+            let value = tx.kv_get(namespace, key).await;
+            tx.rollback().await?;
+            value
+        }
+
+        async fn kv_scan(
+            &self,
+            namespace: &str,
+            range: KvScanRange,
+            limit: Option<usize>,
+        ) -> Result<Vec<KvPair>, LixError> {
+            {
+                let method = Reflect::get(&self.inner, &JsValue::from_str("kvScan"))
+                    .map_err(|_| js_sdk_error("backend.kvScan could not be read"))?;
+                if !method.is_undefined() && !method.is_null() {
+                    return js_value_to_kv_pairs(
+                        call_function3(
+                            &method,
+                            &self.inner,
+                            &JsValue::from_str(namespace),
+                            &kv_scan_range_to_js(&range)?,
+                            &optional_usize_to_js(limit),
+                        )?,
+                        "backend.kvScan",
+                    );
+                }
+            }
+
+            let mut tx = self.begin_transaction(TransactionBeginMode::Read).await?;
+            let rows = tx.kv_scan(namespace, range, limit).await;
+            tx.rollback().await?;
+            rows
+        }
+    }
+
+    struct JsBackendTransaction {
+        mode: TransactionBeginMode,
+        inner: JsValue,
+    }
+
+    unsafe impl Send for JsBackendTransaction {}
+    unsafe impl Sync for JsBackendTransaction {}
+
+    #[async_trait]
+    impl LixBackendTransaction for JsBackendTransaction {
+        fn mode(&self) -> TransactionBeginMode {
+            self.mode
+        }
+
+        async fn kv_get(
+            &mut self,
+            namespace: &str,
+            key: &[u8],
+        ) -> Result<Option<Vec<u8>>, LixError> {
+            js_value_to_optional_bytes(
+                call_method2(
+                    &self.inner,
+                    "kvGet",
+                    &JsValue::from_str(namespace),
+                    &bytes_to_js(key),
+                )?,
+                "transaction.kvGet",
+            )
+        }
+
+        async fn kv_scan(
+            &mut self,
+            namespace: &str,
+            range: KvScanRange,
+            limit: Option<usize>,
+        ) -> Result<Vec<KvPair>, LixError> {
+            js_value_to_kv_pairs(
+                call_method3(
+                    &self.inner,
+                    "kvScan",
+                    &JsValue::from_str(namespace),
+                    &kv_scan_range_to_js(&range)?,
+                    &optional_usize_to_js(limit),
+                )?,
+                "transaction.kvScan",
+            )
+        }
+
+        async fn kv_put(
+            &mut self,
+            namespace: &str,
+            key: &[u8],
+            value: &[u8],
+        ) -> Result<(), LixError> {
+            call_method3(
+                &self.inner,
+                "kvPut",
+                &JsValue::from_str(namespace),
+                &bytes_to_js(key),
+                &bytes_to_js(value),
+            )?;
+            Ok(())
+        }
+
+        async fn kv_delete(&mut self, namespace: &str, key: &[u8]) -> Result<(), LixError> {
+            call_method2(
+                &self.inner,
+                "kvDelete",
+                &JsValue::from_str(namespace),
+                &bytes_to_js(key),
+            )?;
+            Ok(())
+        }
+
+        async fn commit(self: Box<Self>) -> Result<(), LixError> {
+            call_method0(&self.inner, "commit")?;
+            Ok(())
+        }
+
+        async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+            call_method0(&self.inner, "rollback")?;
+            Ok(())
+        }
+    }
+
+    fn transaction_mode_to_js(mode: TransactionBeginMode) -> &'static str {
+        match mode {
+            TransactionBeginMode::Read => "read",
+            TransactionBeginMode::Write => "write",
+            TransactionBeginMode::Deferred => "deferred",
+        }
+    }
+
+    fn call_method0(receiver: &JsValue, method_name: &str) -> Result<JsValue, LixError> {
+        let method = Reflect::get(receiver, &JsValue::from_str(method_name))
+            .map_err(|_| js_sdk_error(format!("{method_name} could not be read")))?;
+        call_function0(&method, receiver)
+    }
+
+    fn call_method1(
+        receiver: &JsValue,
+        method_name: &str,
+        arg1: &JsValue,
+    ) -> Result<JsValue, LixError> {
+        let method = Reflect::get(receiver, &JsValue::from_str(method_name))
+            .map_err(|_| js_sdk_error(format!("{method_name} could not be read")))?;
+        call_function1(&method, receiver, arg1)
+    }
+
+    fn call_method2(
+        receiver: &JsValue,
+        method_name: &str,
+        arg1: &JsValue,
+        arg2: &JsValue,
+    ) -> Result<JsValue, LixError> {
+        let method = Reflect::get(receiver, &JsValue::from_str(method_name))
+            .map_err(|_| js_sdk_error(format!("{method_name} could not be read")))?;
+        call_function2(&method, receiver, arg1, arg2)
+    }
+
+    fn call_method3(
+        receiver: &JsValue,
+        method_name: &str,
+        arg1: &JsValue,
+        arg2: &JsValue,
+        arg3: &JsValue,
+    ) -> Result<JsValue, LixError> {
+        let method = Reflect::get(receiver, &JsValue::from_str(method_name))
+            .map_err(|_| js_sdk_error(format!("{method_name} could not be read")))?;
+        call_function3(&method, receiver, arg1, arg2, arg3)
+    }
+
+    fn call_function0(function: &JsValue, receiver: &JsValue) -> Result<JsValue, LixError> {
+        let function = function
+            .dyn_ref::<js_sys::Function>()
+            .ok_or_else(|| js_sdk_error("backend method must be a function"))?;
+        reject_promise(function.call0(receiver).map_err(js_to_lix_error)?)
+    }
+
+    fn call_function1(
+        function: &JsValue,
+        receiver: &JsValue,
+        arg1: &JsValue,
+    ) -> Result<JsValue, LixError> {
+        let function = function
+            .dyn_ref::<js_sys::Function>()
+            .ok_or_else(|| js_sdk_error("backend method must be a function"))?;
+        reject_promise(function.call1(receiver, arg1).map_err(js_to_lix_error)?)
+    }
+
+    fn call_function2(
+        function: &JsValue,
+        receiver: &JsValue,
+        arg1: &JsValue,
+        arg2: &JsValue,
+    ) -> Result<JsValue, LixError> {
+        let function = function
+            .dyn_ref::<js_sys::Function>()
+            .ok_or_else(|| js_sdk_error("backend method must be a function"))?;
+        reject_promise(
+            function
+                .call2(receiver, arg1, arg2)
+                .map_err(js_to_lix_error)?,
+        )
+    }
+
+    fn call_function3(
+        function: &JsValue,
+        receiver: &JsValue,
+        arg1: &JsValue,
+        arg2: &JsValue,
+        arg3: &JsValue,
+    ) -> Result<JsValue, LixError> {
+        let function = function
+            .dyn_ref::<js_sys::Function>()
+            .ok_or_else(|| js_sdk_error("backend method must be a function"))?;
+        reject_promise(
+            function
+                .call3(receiver, arg1, arg2, arg3)
+                .map_err(js_to_lix_error)?,
+        )
+    }
+
+    fn reject_promise(value: JsValue) -> Result<JsValue, LixError> {
+        if value.is_instance_of::<js_sys::Promise>() {
+            return Err(js_sdk_error(
+                "JavaScript LixBackend methods must return synchronously",
+            ));
+        }
+        Ok(value)
+    }
+
+    fn bytes_to_js(bytes: &[u8]) -> JsValue {
+        js_sys::Uint8Array::from(bytes).into()
+    }
+
+    fn js_value_to_optional_bytes(
+        value: JsValue,
+        context: &str,
+    ) -> Result<Option<Vec<u8>>, LixError> {
+        if value.is_null() || value.is_undefined() {
+            return Ok(None);
+        }
+        Ok(Some(js_value_to_bytes(value, context)?))
+    }
+
+    fn js_value_to_bytes(value: JsValue, context: &str) -> Result<Vec<u8>, LixError> {
+        if !value.is_instance_of::<js_sys::Uint8Array>() {
+            return Err(js_sdk_error(format!("{context} must return Uint8Array")));
+        }
+        Ok(js_sys::Uint8Array::from(value).to_vec())
+    }
+
+    fn optional_usize_to_js(value: Option<usize>) -> JsValue {
+        value
+            .map(|value| JsValue::from_f64(value as f64))
+            .unwrap_or(JsValue::NULL)
+    }
+
+    fn kv_scan_range_to_js(range: &KvScanRange) -> Result<JsValue, LixError> {
+        let object = Object::new();
+        match range {
+            KvScanRange::Prefix(prefix) => {
+                set_string(&object, "kind", "prefix")?;
+                Reflect::set(&object, &JsValue::from_str("prefix"), &bytes_to_js(prefix))
+                    .map_err(|_| js_sdk_error("could not set range.prefix"))?;
+            }
+            KvScanRange::Range { start, end } => {
+                set_string(&object, "kind", "range")?;
+                Reflect::set(&object, &JsValue::from_str("start"), &bytes_to_js(start))
+                    .map_err(|_| js_sdk_error("could not set range.start"))?;
+                Reflect::set(&object, &JsValue::from_str("end"), &bytes_to_js(end))
+                    .map_err(|_| js_sdk_error("could not set range.end"))?;
+            }
+        }
+        Ok(object.into())
+    }
+
+    fn js_value_to_kv_pairs(value: JsValue, context: &str) -> Result<Vec<KvPair>, LixError> {
+        if !Array::is_array(&value) {
+            return Err(js_sdk_error(format!("{context} must return an array")));
+        }
+        Array::from(&value)
+            .iter()
+            .map(|row| {
+                if row.is_null() || row.is_undefined() || !row.is_object() {
+                    return Err(js_sdk_error(format!("{context} rows must be objects")));
+                }
+                let key = Reflect::get(&row, &JsValue::from_str("key"))
+                    .map_err(|_| js_sdk_error(format!("{context} row key could not be read")))?;
+                let value = Reflect::get(&row, &JsValue::from_str("value"))
+                    .map_err(|_| js_sdk_error(format!("{context} row value could not be read")))?;
+                Ok(KvPair::new(
+                    js_value_to_bytes(key, "kv pair key")?,
+                    js_value_to_bytes(value, "kv pair value")?,
+                ))
+            })
+            .collect()
+    }
+
+    fn js_to_lix_error(value: JsValue) -> LixError {
+        if let Some(message) = value.as_string() {
+            return js_sdk_error(message);
+        }
+        let message = Reflect::get(&value, &JsValue::from_str("message"))
+            .ok()
+            .and_then(|message| message.as_string())
+            .unwrap_or_else(|| "JavaScript backend error".to_string());
+        js_sdk_error(message)
     }
 
     fn parse_create_version_options(value: JsValue) -> Result<CreateVersionOptions, LixError> {
@@ -228,7 +638,10 @@ export type MergeVersionResult = {
 
     fn required_string(object: &Object, key: &str, method: &str) -> Result<String, LixError> {
         let value = Reflect::get(object, &JsValue::from_str(key)).map_err(|_| {
-            LixError::new("LIX_ERROR_JS_SDK", format!("{method}() could not read {key}"))
+            LixError::new(
+                "LIX_ERROR_JS_SDK",
+                format!("{method}() could not read {key}"),
+            )
         })?;
         if let Some(value) = value.as_string() {
             if !value.is_empty() {
@@ -247,7 +660,10 @@ export type MergeVersionResult = {
         method: &str,
     ) -> Result<Option<String>, LixError> {
         let value = Reflect::get(object, &JsValue::from_str(key)).map_err(|_| {
-            LixError::new("LIX_ERROR_JS_SDK", format!("{method}() could not read {key}"))
+            LixError::new(
+                "LIX_ERROR_JS_SDK",
+                format!("{method}() could not read {key}"),
+            )
         })?;
         if value.is_undefined() || value.is_null() {
             return Ok(None);
@@ -328,13 +744,14 @@ export type MergeVersionResult = {
                     .ok()
                     .and_then(|value| value.as_string())
                     .ok_or_else(|| invalid_value("blob base64 must be string"))?;
-                let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64)
-                    .map_err(|error| {
-                        LixError::new(
-                            "LIX_ERROR_JS_SDK",
-                            format!("blob base64 must be valid base64: {error}"),
-                        )
-                    })?;
+                let bytes =
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64)
+                        .map_err(|error| {
+                            LixError::new(
+                                "LIX_ERROR_JS_SDK",
+                                format!("blob base64 must be valid base64: {error}"),
+                            )
+                        })?;
                 Ok(Value::Blob(bytes))
             }
             _ => {
@@ -427,10 +844,7 @@ export type MergeVersionResult = {
                 set_string(
                     &object,
                     "base64",
-                    &base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        value,
-                    ),
+                    &base64::Engine::encode(&base64::engine::general_purpose::STANDARD, value),
                 )?;
             }
         }
@@ -481,7 +895,11 @@ export type MergeVersionResult = {
             &JsValue::from_str(&error.code),
         );
         if let Some(hint) = error.hint {
-            let _ = Reflect::set(object, &JsValue::from_str("hint"), &JsValue::from_str(&hint));
+            let _ = Reflect::set(
+                object,
+                &JsValue::from_str("hint"),
+                &JsValue::from_str(&hint),
+            );
         }
         js_error.into()
     }
