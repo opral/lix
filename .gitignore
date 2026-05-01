@@ -13,6 +13,10 @@ examples/sveltekit/package-lock.json
 .dev.vars
 .nx
 
+# Benchmark reports and scratch databases
+benchmarks/engine2-json-pointer/output*/
+packages/engine/benches/storage/output*/
+
 # Playwright
 **/test-results/
 **/playwright-report/
