@@ -1886,7 +1886,7 @@ fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
 }
 
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
-    DataFusionError::Execution(format!("sql2 entity provider error: {error}"))
+    DataFusionError::External(Box::new(error))
 }
 
 #[cfg(test)]

@@ -329,9 +329,12 @@ fn remember_pending_registered_schema(
                 "missing builtin lix_registered_schema definition",
             )
         })?;
-    validate_lix_schema(registered_schema_definition, &snapshot)?;
+    if !snapshot.get("value").is_some_and(JsonValue::is_object) {
+        validate_lix_schema(registered_schema_definition, &snapshot)?;
+    }
     let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
     validate_lix_schema_definition(&schema)?;
+    validate_lix_schema(registered_schema_definition, &snapshot)?;
     schema_catalog.insert_schema(key, schema);
     Ok(())
 }
