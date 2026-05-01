@@ -1,7 +1,7 @@
 {
 	"name": "@lix-js/sdk",
 	"type": "module",
-	"version": "0.6.0",
+	"version": "0.6.0-preview.0",
 	"private": true,
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
@@ -9,6 +9,10 @@
 		".": {
 			"types": "./dist/index.d.ts",
 			"default": "./dist/index.js"
+		},
+		"./sqlite": {
+			"types": "./dist/sqlite/index.d.ts",
+			"default": "./dist/sqlite/index.js"
 		}
 	},
 	"description": "WASM-backed JS SDK wrapper for Lix",
@@ -19,8 +23,16 @@
 		"test": "node ./scripts/build.js && vitest run",
 		"test:watch": "node ./scripts/build.js && vitest"
 	},
-	"dependencies": {},
+	"peerDependencies": {
+		"better-sqlite3": "^12.9.0"
+	},
+	"peerDependenciesMeta": {
+		"better-sqlite3": {
+			"optional": true
+		}
+	},
 	"devDependencies": {
+		"better-sqlite3": "^12.9.0",
 		"typescript": "^5.5.4",
 		"vitest": "^4.0.18"
 	},

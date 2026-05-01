@@ -145,6 +145,7 @@ impl TransactionStagedWrites {
         for row in &rows {
             validate_commit_membership_support(row)?;
         }
+        reject_duplicate_present_rows_in_batch(&rows)?;
         let mut guard = self.rows.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -392,6 +393,30 @@ fn validate_commit_membership_support(row: &StagedStateRow) -> Result<(), LixErr
     Ok(())
 }
 
+fn reject_duplicate_present_rows_in_batch(rows: &[StagedStateRow]) -> Result<(), LixError> {
+    let mut pending_present_rows = BTreeMap::<StagedStateRowIdentity, &StagedStateRow>::new();
+    for row in rows {
+        let identity = StagedStateRowIdentity::from(row);
+        if row.snapshot_content.is_none() {
+            pending_present_rows.remove(&identity);
+            continue;
+        }
+        if let Some(previous) = pending_present_rows.insert(identity, row) {
+            return Err(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!(
+                    "primary-key constraint violation on schema '{}' version '{}': duplicate staged rows for entity_id '{}' in version '{}'",
+                    row.schema_key,
+                    row.schema_version,
+                    previous.entity_id.as_string()?,
+                    row.version_id
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn add_row_to_commit_members(
     members_by_version: &mut BTreeMap<String, StagedCommitMembers>,
     row: &mut StagedStateRow,
@@ -491,10 +516,12 @@ mod tests {
 
         staged_writes
             .stage_write(StageWrite::Rows {
-                rows: vec![
-                    state_row("sql2-duplicate-key", "first"),
-                    state_row("sql2-duplicate-key", "second"),
-                ],
+                rows: vec![state_row("sql2-duplicate-key", "first")],
+            })
+            .expect("initial row should stage");
+        staged_writes
+            .stage_write(StageWrite::Rows {
+                rows: vec![state_row("sql2-duplicate-key", "second")],
             })
             .expect("staging rows should succeed");
 
@@ -525,10 +552,12 @@ mod tests {
 
         staged_writes
             .stage_write(StageWrite::Rows {
-                rows: vec![
-                    state_row("sql2-duplicate-key", "first"),
-                    state_row("sql2-duplicate-key", "second"),
-                ],
+                rows: vec![state_row("sql2-duplicate-key", "first")],
+            })
+            .expect("initial row should stage");
+        staged_writes
+            .stage_write(StageWrite::Rows {
+                rows: vec![state_row("sql2-duplicate-key", "second")],
             })
             .expect("staging rows should succeed");
 
@@ -616,9 +645,13 @@ mod tests {
             .stage_write(StageWrite::Rows {
                 rows: vec![
                     state_row("sql2-key-a", "first"),
-                    state_row("sql2-key-a", "second"),
                     state_row("sql2-key-b", "only"),
                 ],
+            })
+            .expect("initial rows should stage");
+        staged_writes
+            .stage_write(StageWrite::Rows {
+                rows: vec![state_row("sql2-key-a", "second")],
             })
             .expect("staging rows should succeed");
 
@@ -703,14 +736,16 @@ mod tests {
 
         staged_writes
             .stage_write(StageWrite::Rows {
-                rows: vec![
-                    state_row("overwrite-key", "first")
-                        .with_tracked()
-                        .with_change_id("change-first"),
-                    state_row("overwrite-key", "second")
-                        .with_tracked()
-                        .with_change_id("change-second"),
-                ],
+                rows: vec![state_row("overwrite-key", "first")
+                    .with_tracked()
+                    .with_change_id("change-first")],
+            })
+            .expect("initial tracked row should stage");
+        staged_writes
+            .stage_write(StageWrite::Rows {
+                rows: vec![state_row("overwrite-key", "second")
+                    .with_tracked()
+                    .with_change_id("change-second")],
             })
             .expect("tracked overwrite should stage");
 
@@ -748,6 +783,28 @@ mod tests {
             Some("change-untracked")
         );
         assert!(drained.commit_members_by_version.is_empty());
+    }
+
+    #[tokio::test]
+    async fn staged_writes_reject_duplicate_present_rows_in_one_batch() {
+        let staged_writes = test_staged_writes();
+
+        let error = staged_writes
+            .stage_write(StageWrite::Rows {
+                rows: vec![
+                    state_row("duplicate-present-key", "first"),
+                    state_row("duplicate-present-key", "second"),
+                ],
+            })
+            .expect_err("same-batch duplicate present rows should fail");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert!(
+            error
+                .description
+                .contains("primary-key constraint violation"),
+            "error should explain the duplicate primary key: {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -799,11 +856,17 @@ mod tests {
         staged_writes
             .stage_write(StageWrite::Rows {
                 rows: vec![
+                    state_row("shared-entity", "other-schema-version").with_schema_version("2")
+                ],
+            })
+            .expect("initial same-identity row should stage");
+        staged_writes
+            .stage_write(StageWrite::Rows {
+                rows: vec![
                     state_row("shared-entity", "base"),
                     state_row("shared-entity", "other-version").with_version("version-b"),
                     state_row("shared-entity", "other-schema").with_schema("other_schema"),
                     state_row("shared-entity", "other-file").with_file_id("file-a"),
-                    state_row("shared-entity", "other-schema-version").with_schema_version("2"),
                     state_row("shared-entity", "tracked").with_tracked(),
                 ],
             })
