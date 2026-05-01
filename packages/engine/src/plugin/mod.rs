@@ -6,18 +6,12 @@
 
 mod archive;
 pub(crate) mod component;
-mod install;
 mod manifest;
 mod materializer;
 mod storage;
 
 pub(crate) use archive::{
     load_installed_plugin_from_archive_bytes, parse_plugin_archive_for_install, ParsedPluginArchive,
-};
-pub(crate) use component::{CachedPluginComponent, PluginComponentHost};
-pub(crate) use install::{
-    install_plugin_archive_with_writer, prepare_registered_schema_write_statement,
-    PluginInstallWriteContext, PluginInstallWriteExecutor,
 };
 #[allow(unused_imports)]
 pub(crate) use manifest::{

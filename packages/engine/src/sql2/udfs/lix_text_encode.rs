@@ -3,7 +3,7 @@ use std::any::Any;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{plan_err, Result, ScalarValue};
 use datafusion::logical_expr::{
-    ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
 
 use super::common::{
@@ -25,10 +25,6 @@ impl LixTextEncode {
             ),
         }
     }
-}
-
-pub(crate) fn lix_text_encode_expr(expr: Expr) -> Expr {
-    ScalarUDF::from(LixTextEncode::new()).call(vec![expr])
 }
 
 impl ScalarUDFImpl for LixTextEncode {

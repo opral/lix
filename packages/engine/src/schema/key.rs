@@ -16,10 +16,6 @@ impl SchemaKey {
         }
     }
 
-    pub fn entity_id(&self) -> String {
-        format!("{}~{}", self.schema_key, self.schema_version)
-    }
-
     pub fn version_number(&self) -> Option<u64> {
         self.schema_version.parse::<u64>().ok()
     }
@@ -101,7 +97,6 @@ mod tests {
     fn schema_key_entity_id_and_numeric_version() {
         let key = SchemaKey::new("users", "42");
 
-        assert_eq!(key.entity_id(), "users~42");
         assert_eq!(key.version_number(), Some(42));
     }
 

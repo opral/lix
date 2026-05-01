@@ -10,15 +10,14 @@ mod lix_uuid_v7;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::ScalarUDF;
 
-pub(crate) use lix_json_extract::lix_json_extract_expr;
-pub(crate) use lix_json_extract_text::lix_json_extract_text_expr;
-pub(crate) use lix_text_encode::lix_text_encode_expr;
+use crate::engine2::functions::FunctionProviderHandle;
 
-use crate::engine2::functions::{
-    FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
-};
-
+#[cfg(test)]
 pub(crate) fn system_sql2_function_provider() -> FunctionProviderHandle {
+    use crate::engine2::functions::{
+        FunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
+    };
+
     SharedFunctionProvider::new(Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>)
 }
 
