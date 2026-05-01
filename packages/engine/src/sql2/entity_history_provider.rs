@@ -20,8 +20,8 @@ use futures_util::stream;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
-use crate::engine2::changelog::CanonicalChange;
-use crate::engine2::commit_graph::CommitGraphReader;
+use crate::changelog::CanonicalChange;
+use crate::commit_graph::CommitGraphReader;
 use crate::LixError;
 
 use super::entity_provider::{

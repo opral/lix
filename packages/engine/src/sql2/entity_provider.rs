@@ -26,23 +26,25 @@ use datafusion::prelude::SessionContext;
 use futures_util::{stream, StreamExt, TryStreamExt};
 use serde_json::Value as JsonValue;
 
-use crate::engine2::commit_graph::CommitGraphReader;
-use crate::engine2::entity_identity::{EntityIdentity, EntityIdentityError};
-use crate::engine2::live_state::LiveStateRow;
-use crate::engine2::live_state::{
+use crate::commit_graph::CommitGraphReader;
+use crate::entity_identity::{EntityIdentity, EntityIdentityError};
+use crate::live_state::LiveStateRow;
+use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
-use crate::engine2::transaction::types::StageRow;
-use crate::engine2::version_ref::VersionRefReader;
-use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
+use crate::sql2::version_scope::{
+    explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
+};
+use crate::transaction::types::StageRow;
 use crate::version::GLOBAL_VERSION_ID;
+use crate::version_ref::VersionRefReader;
 use crate::LixError;
 
 use super::entity_history_provider::EntityHistoryProvider;
-use crate::engine2::transaction::types::StageWrite;
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
+use crate::transaction::types::StageWrite;
 
 pub(crate) async fn register_entity_providers(
     ctx: &SessionContext,
@@ -262,17 +264,23 @@ impl TableProvider for EntityProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        Ok(filters
+            .iter()
+            .map(|filter| {
+                if explicit_version_ids_from_dml_filters(&[(*filter).clone()]).is_empty() {
+                    TableProviderFilterPushDown::Unsupported
+                } else {
+                    TableProviderFilterPushDown::Inexact
+                }
+            })
+            .collect())
     }
 
     async fn scan(
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let projected_schema = projected_schema(&self.schema, projection)?;
@@ -281,6 +289,16 @@ impl TableProvider for EntityProvider {
             self.version_binding.active_version_id(),
             limit,
         );
+        if self.write_access.is_write() && matches!(self.version_binding, VersionBinding::Explicit)
+        {
+            request.filter.version_ids = explicit_version_ids_from_dml_filters(filters);
+            if request.filter.version_ids.is_empty() {
+                return Err(DataFusionError::Plan(format!(
+                    "DELETE FROM {}_by_version requires an explicit lixcol_version_id predicate",
+                    self.spec.schema_key
+                )));
+            }
+        }
         request.filter.version_ids = resolve_provider_version_ids(
             self.version_ref.as_ref(),
             &self.version_binding,
@@ -352,11 +370,20 @@ impl TableProvider for EntityProvider {
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
             .collect::<Result<Vec<_>>>()?;
-        let request = entity_live_state_scan_request(
+        let mut request = entity_live_state_scan_request(
             &self.spec.schema_key,
             version_binding.active_version_id(),
             None,
         );
+        if matches!(version_binding, VersionBinding::Explicit) {
+            request.filter.version_ids = explicit_version_ids_from_dml_filters(&filters);
+            if request.filter.version_ids.is_empty() {
+                return Err(DataFusionError::Plan(format!(
+                    "DELETE FROM {}_by_version requires an explicit lixcol_version_id predicate",
+                    self.spec.schema_key
+                )));
+            }
+        }
 
         Ok(Arc::new(EntityDeleteExec::new(
             Arc::clone(&self.spec),
@@ -1883,15 +1910,15 @@ mod tests {
         EntityColumnType, EntityInsertSink, EntityProviderVariant,
     };
     use crate::binary_cas::BlobDataReader;
-    use crate::engine2::functions::{
+    use crate::functions::{
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
-    use crate::engine2::live_state::{
+    use crate::live_state::{
         LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
-    use crate::engine2::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
-    use crate::engine2::version_ref::{VersionHead, VersionRefReader};
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
+    use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
+    use crate::version_ref::{VersionHead, VersionRefReader};
     use crate::LixError;
 
     struct EmptyLiveStateReader;
@@ -1990,7 +2017,7 @@ mod tests {
 
     fn live_row() -> LiveStateRow {
         LiveStateRow {
-            entity_id: crate::engine2::entity_identity::EntityIdentity::single("entity-1"),
+            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
             schema_key: "project_message".to_string(),
             file_id: None,
             snapshot_content: Some(
@@ -2264,7 +2291,6 @@ mod tests {
             spec,
             Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
             empty_version_ref(),
-            None,
         );
 
         assert!(provider.schema.field_with_name("lixcol_version_id").is_ok());
@@ -2280,9 +2306,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].entity_id.as_ref(),
-            Some(&crate::engine2::entity_identity::EntityIdentity::single(
-                "entity-1"
-            ))
+            Some(&crate::entity_identity::EntityIdentity::single("entity-1"))
         );
         assert_eq!(rows[0].schema_key, "project_message");
         assert_eq!(rows[0].schema_version.as_str(), "1");
@@ -2320,9 +2344,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].entity_id.as_ref(),
-            Some(&crate::engine2::entity_identity::EntityIdentity::single(
-                "message-1"
-            ))
+            Some(&crate::entity_identity::EntityIdentity::single("message-1"))
         );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(
@@ -2421,7 +2443,7 @@ mod tests {
             write_context.writes.as_slice(),
             &[StageWrite::Rows {
                 rows: vec![StageRow {
-                    entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single("entity-1")),
+                    entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-1")),
                     schema_key: "project_message".to_string(),
                     file_id: None,
                     snapshot_content: Some(

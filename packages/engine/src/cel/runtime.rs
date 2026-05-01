@@ -164,27 +164,4 @@ mod tests {
             .expect_err("expected unknown variable error");
         assert!(err.to_string().contains("Undeclared reference"));
     }
-
-    #[test]
-    fn production_consumers_use_shared_runtime() {
-        for (path, source) in [
-            (
-                "packages/engine/src/catalog/registry.rs",
-                include_str!("../catalog/registry.rs"),
-            ),
-            (
-                "packages/engine/src/sql/semantic_ir/semantics/state_assignments.rs",
-                include_str!("../sql/semantic_ir/semantics/state_assignments.rs"),
-            ),
-            (
-                "packages/engine/src/transaction/pipeline/resolution/state_backed_writes.rs",
-                include_str!("../transaction/pipeline/resolution/state_backed_writes.rs"),
-            ),
-        ] {
-            assert!(
-                !source.contains("CelEvaluator::new()"),
-                "{path} should use the shared CEL runtime owner",
-            );
-        }
-    }
 }

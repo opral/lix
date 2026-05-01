@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::engine2::live_state::LiveStateRow;
-use crate::engine2::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
+use crate::live_state::LiveStateRow;
+use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
 use crate::LixError;
 
 use super::filesystem_planner::{
@@ -198,8 +198,8 @@ fn filesystem_row_context(row: &LiveStateRow) -> FilesystemRowContext {
 mod tests {
     use async_trait::async_trait;
 
-    use crate::engine2::live_state::LiveStateRow;
-    use crate::engine2::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
+    use crate::live_state::LiveStateRow;
+    use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
     use crate::LixError;
 
     use super::{
@@ -354,7 +354,7 @@ mod tests {
         snapshot_content: &str,
     ) -> LiveStateRow {
         LiveStateRow {
-            entity_id: crate::engine2::entity_identity::EntityIdentity::from_string(entity_id)
+            entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: schema_key.to_string(),
             file_id,

@@ -25,21 +25,21 @@ use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use futures_util::{stream, StreamExt, TryStreamExt};
 
-use crate::engine2::entity_identity::EntityIdentity;
-use crate::engine2::live_state::LiveStateRow;
-use crate::engine2::live_state::{
+use crate::entity_identity::EntityIdentity;
+use crate::live_state::LiveStateRow;
+use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
-use crate::engine2::transaction::types::StageRow;
-use crate::engine2::version_ref::VersionRefReader;
 use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
+use crate::transaction::types::StageRow;
 use crate::version::GLOBAL_VERSION_ID;
+use crate::version_ref::VersionRefReader;
 use crate::{LixError, NullableKeyFilter};
 
-use crate::engine2::transaction::types::StageWrite;
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
+use crate::transaction::types::StageWrite;
 
 pub(crate) async fn register_lix_state_providers(
     session: &SessionContext,
@@ -1435,16 +1435,16 @@ mod tests {
         LixStateUpdateExec,
     };
     use crate::binary_cas::BlobDataReader;
-    use crate::engine2::functions::{
+    use crate::functions::{
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
-    use crate::engine2::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
-    use crate::engine2::version_ref::{VersionHead, VersionRefReader};
-    use crate::engine2::{
+    use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
+    use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
+    use crate::version_ref::{VersionHead, VersionRefReader};
+    use crate::{
         entity_identity::EntityIdentity,
         live_state::{LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest},
     };
-    use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
     use crate::{LixError, NullableKeyFilter};
     use async_trait::async_trait;
     use datafusion::arrow::array::{ArrayRef, BooleanArray, StringArray, UInt64Array};
@@ -1472,6 +1472,7 @@ mod tests {
 
     struct EmptyLiveStateReader;
     struct EmptyVersionRefReader;
+    #[allow(dead_code)]
     struct RowsLiveStateReader {
         rows: Vec<LiveStateRow>,
     }
@@ -2086,9 +2087,7 @@ mod tests {
         assert_eq!(
             rows,
             vec![StageRow {
-                entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single(
-                    "entity-1"
-                )),
+                entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-1")),
                 schema_key: "lix_key_value".to_string(),
                 file_id: None,
                 snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
@@ -2134,9 +2133,7 @@ mod tests {
             write_context.writes.as_slice(),
             &[StageWrite::Rows {
                 rows: vec![StageRow {
-                    entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single(
-                        "entity-1"
-                    )),
+                    entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-1")),
                     schema_key: "lix_key_value".to_string(),
                     file_id: None,
                     snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
@@ -2236,9 +2233,7 @@ mod tests {
             write_context.writes.as_slice(),
             &[StageWrite::Rows {
                 rows: vec![StageRow {
-                    entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single(
-                        "entity-1"
-                    )),
+                    entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-1")),
                     schema_key: "lix_key_value".to_string(),
                     file_id: None,
                     snapshot_content: Some("{\"key\":\"hello\",\"value\":\"updated\"}".to_string()),
@@ -2292,9 +2287,7 @@ mod tests {
             &[StageWrite::Rows {
                 rows: vec![
                     StageRow {
-                        entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single(
-                            "entity-1"
-                        )),
+                        entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-1")),
                         schema_key: "lix_key_value".to_string(),
                         file_id: None,
                         snapshot_content: None,
@@ -2309,9 +2302,7 @@ mod tests {
                         version_id: "version-a".to_string(),
                     },
                     StageRow {
-                        entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single(
-                            "entity-2"
-                        )),
+                        entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-2")),
                         schema_key: "lix_key_value".to_string(),
                         file_id: None,
                         snapshot_content: None,

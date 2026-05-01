@@ -18,7 +18,7 @@ use datafusion::physical_plan::{
 };
 use futures_util::stream;
 
-use crate::engine2::changelog::{CanonicalChange, ChangelogReader, ChangelogScanRequest};
+use crate::changelog::{CanonicalChange, ChangelogReader, ChangelogScanRequest};
 use crate::LixError;
 
 pub(crate) async fn register_lix_change_provider(

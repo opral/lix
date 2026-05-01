@@ -27,15 +27,17 @@ use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 
 use crate::binary_cas::BlobDataReader;
-use crate::engine2::functions::FunctionProviderHandle;
-use crate::engine2::live_state::LiveStateRow;
-use crate::engine2::live_state::{
+use crate::functions::FunctionProviderHandle;
+use crate::live_state::LiveStateRow;
+use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
-use crate::engine2::transaction::types::StageRow;
-use crate::engine2::version_ref::VersionRefReader;
-use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
+use crate::sql2::version_scope::{
+    explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
+};
+use crate::transaction::types::StageRow;
 use crate::version::GLOBAL_VERSION_ID;
+use crate::version_ref::VersionRefReader;
 use crate::LixError;
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -47,10 +49,10 @@ use super::filesystem_planner::{
     plan_file_path_update, BlobRefRowInput, DirectoryPathResolver, FileDeleteInput,
     FileDescriptorRowInput, FilePathWriteInput, FilesystemDeletePlan, FilesystemRowContext,
 };
-use crate::engine2::transaction::types::{StageFileData, StageWrite};
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
+use crate::transaction::types::{StageFileData, StageWrite};
 
 pub(crate) async fn register_lix_file_providers(
     session: &SessionContext,
@@ -209,21 +211,37 @@ impl TableProvider for LixFileProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        Ok(filters
+            .iter()
+            .map(|filter| {
+                if explicit_version_ids_from_dml_filters(&[(*filter).clone()]).is_empty() {
+                    TableProviderFilterPushDown::Unsupported
+                } else {
+                    TableProviderFilterPushDown::Inexact
+                }
+            })
+            .collect())
     }
 
     async fn scan(
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let projected_schema = projected_schema(&self.schema, projection)?;
         let mut request = lix_file_scan_request(self.version_binding.active_version_id(), limit);
+        if self.write_access.is_write() && matches!(self.version_binding, VersionBinding::Explicit)
+        {
+            request.filter.version_ids = explicit_version_ids_from_dml_filters(filters);
+            if request.filter.version_ids.is_empty() {
+                return Err(DataFusionError::Plan(
+                    "DELETE FROM lix_file_by_version requires an explicit lixcol_version_id predicate"
+                        .to_string(),
+                ));
+            }
+        }
         request.filter.version_ids = resolve_provider_version_ids(
             self.version_ref.as_ref(),
             &self.version_binding,
@@ -272,7 +290,16 @@ impl TableProvider for LixFileProvider {
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
             .collect::<Result<Vec<_>>>()?;
-        let request = lix_file_scan_request(self.version_binding.active_version_id(), None);
+        let mut request = lix_file_scan_request(self.version_binding.active_version_id(), None);
+        if matches!(self.version_binding, VersionBinding::Explicit) {
+            request.filter.version_ids = explicit_version_ids_from_dml_filters(&filters);
+            if request.filter.version_ids.is_empty() {
+                return Err(DataFusionError::Plan(
+                    "DELETE FROM lix_file_by_version requires an explicit lixcol_version_id predicate"
+                        .to_string(),
+                ));
+            }
+        }
 
         Ok(Arc::new(LixFileDeleteExec::new(
             Arc::clone(&self.blob_reader),
@@ -1916,13 +1943,13 @@ mod tests {
     use serde_json::Value as JsonValue;
 
     use crate::binary_cas::BlobDataReader;
-    use crate::engine2::functions::{
+    use crate::functions::{
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
-    use crate::engine2::live_state::LiveStateRow;
-    use crate::engine2::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
-    use crate::engine2::transaction::types::{StageWrite, StageWriteOutcome};
+    use crate::live_state::LiveStateRow;
+    use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
+    use crate::transaction::types::{StageWrite, StageWriteOutcome};
     use crate::LixError;
 
     use super::{
@@ -2025,7 +2052,7 @@ mod tests {
         snapshot_content: &str,
     ) -> LiveStateRow {
         LiveStateRow {
-            entity_id: crate::engine2::entity_identity::EntityIdentity::from_string(entity_id)
+            entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
             file_id: None,
@@ -2192,7 +2219,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].entity_id.as_ref(),
-            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+            Some(&crate::entity_identity::EntityIdentity::single(
                 "file-readme"
             ))
         );
@@ -2407,7 +2434,7 @@ mod tests {
             .expect("missing /docs/ directory should be staged");
         assert_eq!(
             directory.entity_id.as_ref(),
-            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+            Some(&crate::entity_identity::EntityIdentity::single(
                 "dir-generated-docs"
             ))
         );
@@ -2503,7 +2530,7 @@ mod tests {
             .expect("data insert should stage blob ref row");
         assert_eq!(
             blob_ref_row.entity_id.as_ref(),
-            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+            Some(&crate::entity_identity::EntityIdentity::single(
                 "file-readme"
             ))
         );
@@ -2533,7 +2560,7 @@ mod tests {
             .expect("file descriptor tombstone should be staged");
         assert_eq!(
             descriptor.entity_id.as_ref(),
-            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+            Some(&crate::entity_identity::EntityIdentity::single(
                 "file-readme"
             ))
         );
@@ -2547,7 +2574,7 @@ mod tests {
             .expect("blob ref tombstone should be staged");
         assert_eq!(
             blob_ref.entity_id.as_ref(),
-            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+            Some(&crate::entity_identity::EntityIdentity::single(
                 "file-readme"
             ))
         );
@@ -2566,7 +2593,7 @@ mod tests {
         assert_eq!(staged.state_rows[0].schema_key, "lix_file_descriptor");
         assert_eq!(
             staged.state_rows[0].entity_id.as_ref(),
-            Some(&crate::engine2::entity_identity::EntityIdentity::single(
+            Some(&crate::entity_identity::EntityIdentity::single(
                 "file-readme"
             ))
         );
@@ -2668,7 +2695,7 @@ mod tests {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(
                     rows[0].entity_id.as_ref(),
-                    Some(&crate::engine2::entity_identity::EntityIdentity::single(
+                    Some(&crate::entity_identity::EntityIdentity::single(
                         "file-readme"
                     ))
                 );

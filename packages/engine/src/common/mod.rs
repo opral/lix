@@ -17,5 +17,5 @@ pub(crate) use identity::json_pointer_get;
 pub use identity::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
 };
-pub use types::{ExecuteResult, NullableKeyFilter, QueryResult, Value, WriteReceipt};
+pub use types::{NullableKeyFilter, QueryResult, Value, WriteReceipt};
 pub use wire::{WireQueryResult, WireValue};

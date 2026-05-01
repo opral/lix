@@ -10,13 +10,11 @@ mod lix_uuid_v7;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::ScalarUDF;
 
-use crate::engine2::functions::FunctionProviderHandle;
+use crate::functions::FunctionProviderHandle;
 
 #[cfg(test)]
 pub(crate) fn system_sql2_function_provider() -> FunctionProviderHandle {
-    use crate::engine2::functions::{
-        FunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
-    };
+    use crate::functions::{FunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
 
     SharedFunctionProvider::new(Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>)
 }

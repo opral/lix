@@ -20,7 +20,7 @@ use datafusion::prelude::SessionContext;
 use futures_util::{stream, TryStreamExt};
 use tokio::sync::Mutex;
 
-use crate::engine2::commit_graph::CommitGraphReader;
+use crate::commit_graph::CommitGraphReader;
 use crate::LixError;
 
 use super::history_route::{load_history_entries, parse_history_filter, HistoryRoute};

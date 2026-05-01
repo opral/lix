@@ -26,15 +26,17 @@ use datafusion::prelude::SessionContext;
 use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 
-use crate::engine2::functions::FunctionProviderHandle;
-use crate::engine2::live_state::LiveStateRow;
-use crate::engine2::live_state::{
+use crate::functions::FunctionProviderHandle;
+use crate::live_state::LiveStateRow;
+use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
-use crate::engine2::transaction::types::StageRow;
-use crate::engine2::version_ref::VersionRefReader;
-use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
+use crate::sql2::version_scope::{
+    explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
+};
+use crate::transaction::types::StageRow;
 use crate::version::GLOBAL_VERSION_ID;
+use crate::version_ref::VersionRefReader;
 use crate::LixError;
 
 use super::filesystem_planner::{
@@ -42,10 +44,10 @@ use super::filesystem_planner::{
     DirectoryPathResolver, FilesystemDeletePlan, FilesystemRowContext,
 };
 use super::filesystem_visibility::VisibleFilesystem;
-use crate::engine2::transaction::types::StageWrite;
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
+use crate::transaction::types::StageWrite;
 
 const DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
@@ -196,22 +198,38 @@ impl TableProvider for LixDirectoryProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        Ok(filters
+            .iter()
+            .map(|filter| {
+                if explicit_version_ids_from_dml_filters(&[(*filter).clone()]).is_empty() {
+                    TableProviderFilterPushDown::Unsupported
+                } else {
+                    TableProviderFilterPushDown::Inexact
+                }
+            })
+            .collect())
     }
 
     async fn scan(
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let projected_schema = projected_schema(&self.schema, projection)?;
         let mut request =
             lix_directory_scan_request(self.version_binding.active_version_id(), limit);
+        if self.write_access.is_write() && matches!(self.version_binding, VersionBinding::Explicit)
+        {
+            request.filter.version_ids = explicit_version_ids_from_dml_filters(filters);
+            if request.filter.version_ids.is_empty() {
+                return Err(DataFusionError::Plan(
+                    "DELETE FROM lix_directory_by_version requires an explicit lixcol_version_id predicate"
+                        .to_string(),
+                ));
+            }
+        }
         request.filter.version_ids = resolve_provider_version_ids(
             self.version_ref.as_ref(),
             &self.version_binding,
@@ -263,7 +281,17 @@ impl TableProvider for LixDirectoryProvider {
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
             .collect::<Result<Vec<_>>>()?;
-        let request = lix_directory_scan_request(self.version_binding.active_version_id(), None);
+        let mut request =
+            lix_directory_scan_request(self.version_binding.active_version_id(), None);
+        if matches!(self.version_binding, VersionBinding::Explicit) {
+            request.filter.version_ids = explicit_version_ids_from_dml_filters(&filters);
+            if request.filter.version_ids.is_empty() {
+                return Err(DataFusionError::Plan(
+                    "DELETE FROM lix_directory_by_version requires an explicit lixcol_version_id predicate"
+                        .to_string(),
+                ));
+            }
+        }
 
         Ok(Arc::new(LixDirectoryDeleteExec::new(
             write_ctx.clone(),
@@ -1588,14 +1616,14 @@ mod tests {
     use futures_util::stream;
 
     use crate::binary_cas::BlobDataReader;
-    use crate::engine2::functions::{
+    use crate::functions::{
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
-    use crate::engine2::live_state::{
+    use crate::live_state::{
         LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
-    use crate::engine2::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
+    use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
     use crate::LixError;
 
     use super::{
@@ -1673,6 +1701,7 @@ mod tests {
     }
 
     #[derive(Default)]
+    #[allow(dead_code)]
     struct RowsLiveStateReader {
         rows: Vec<LiveStateRow>,
     }
@@ -1712,7 +1741,7 @@ mod tests {
         snapshot_content: &str,
     ) -> LiveStateRow {
         LiveStateRow {
-            entity_id: crate::engine2::entity_identity::EntityIdentity::from_string(entity_id)
+            entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: schema_key.to_string(),
             file_id: file_id.map(ToOwned::to_owned),
@@ -1914,9 +1943,7 @@ mod tests {
         assert_eq!(
             rows,
             vec![StageRow {
-                entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single(
-                    "dir-docs"
-                )),
+                entity_id: Some(crate::entity_identity::EntityIdentity::single("dir-docs")),
                 schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                 file_id: None,
                 snapshot_content: Some(
@@ -2087,7 +2114,7 @@ mod tests {
             write_context.writes.as_slice(),
             &[StageWrite::Rows {
                 rows: vec![StageRow {
-                    entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single("dir-docs")),
+                    entity_id: Some(crate::entity_identity::EntityIdentity::single("dir-docs")),
                     schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                     file_id: None,
                     snapshot_content: Some(

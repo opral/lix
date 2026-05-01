@@ -20,10 +20,10 @@ use datafusion::physical_plan::{
 use futures_util::stream;
 use tokio::sync::Mutex;
 
-use crate::engine2::commit_graph::{CommitGraphCommit, CommitGraphReader};
-use crate::engine2::version_ref::VersionRefReader;
+use crate::commit_graph::{CommitGraphCommit, CommitGraphReader};
 use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
 use crate::version::GLOBAL_VERSION_ID;
+use crate::version_ref::VersionRefReader;
 use crate::LixError;
 
 pub(crate) async fn register_commit_providers(

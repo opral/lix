@@ -247,22 +247,12 @@ fn parse_registered_schema_with_inlined_definition() -> JsonValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{builtin_schema_definition, builtin_schema_storage_defaults, BUILTIN_SCHEMA_KEYS};
+    use super::{builtin_schema_definition, BUILTIN_SCHEMA_KEYS};
 
     #[test]
     fn builtin_schemas_load_without_extra_override_metadata() {
         for schema_key in BUILTIN_SCHEMA_KEYS {
             builtin_schema_definition(schema_key).expect("schema should exist");
-        }
-    }
-
-    #[test]
-    fn builtin_storage_defaults_are_owned_by_code() {
-        for schema_key in BUILTIN_SCHEMA_KEYS {
-            let defaults =
-                builtin_schema_storage_defaults(schema_key).expect("builtin defaults should exist");
-            assert_eq!(defaults.file_id, None);
-            assert_eq!(defaults.plugin_key, None);
         }
     }
 

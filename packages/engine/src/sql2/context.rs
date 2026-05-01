@@ -6,14 +6,14 @@ use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
 use crate::binary_cas::BlobDataReader;
-use crate::engine2::changelog::ChangelogReader;
-use crate::engine2::commit_graph::CommitGraphReader;
-use crate::engine2::functions::FunctionProviderHandle;
-use crate::engine2::live_state::{
+use crate::changelog::ChangelogReader;
+use crate::commit_graph::CommitGraphReader;
+use crate::functions::FunctionProviderHandle;
+use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
 };
-use crate::engine2::transaction::types::{StageWrite, StageWriteOutcome};
-use crate::engine2::version_ref::{VersionHead, VersionRefReader};
+use crate::transaction::types::{StageWrite, StageWriteOutcome};
+use crate::version_ref::{VersionHead, VersionRefReader};
 use crate::LixError;
 
 /// Single execution boundary for `sql2::execute_sql(...)`.

@@ -93,11 +93,3 @@ impl WriteReceipt {
         self.state_commit_sequence.is_none()
     }
 }
-
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
-pub struct ExecuteResult {
-    #[serde(default)]
-    pub statements: Vec<QueryResult>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub write_receipt: Option<WriteReceipt>,
-}
