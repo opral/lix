@@ -11,35 +11,6 @@ use super::mode::{Engine2SimulationMode, Engine2SimulationOptions};
 use super::rebuild_tracked_state::deterministic_timestamp_shuffle_for;
 use super::simulation::Engine2Simulation;
 
-/// Runs one test body against the engine2 simulation matrix.
-pub async fn run_simulation_test<F, Fut>(options: Engine2SimulationOptions, test_fn: F)
-where
-    F: Fn(Engine2Simulation) -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let bootstrap = Engine2Bootstrap::create()
-        .await
-        .expect("engine2 simulation bootstrap should initialize");
-    let assertions = Engine2SimulationAssertions::new_local();
-
-    for mode in [
-        Engine2SimulationMode::Base,
-        Engine2SimulationMode::TrackedStateRebuild,
-    ] {
-        let sim = Engine2Simulation::from_bootstrap(
-            mode,
-            options,
-            bootstrap.snapshot.clone(),
-            bootstrap.receipt.clone(),
-            assertions.clone(),
-        )
-        .await
-        .expect("engine2 simulation mode should boot");
-        test_fn(sim.clone()).await;
-        sim.finish();
-    }
-}
-
 /// Runs one matrix entry for `simulation_test2!`.
 ///
 /// The macro generates one Rust test per mode. `assert_same` coordinates across

@@ -91,15 +91,6 @@ impl Engine2Simulation {
         &self.receipt.main_version_id
     }
 
-    /// Asserts that every simulation mode observes the exact same value.
-    pub fn assert_same<T>(&self, label: &str, value: &T)
-    where
-        T: std::fmt::Debug,
-    {
-        let rendered = format!("{value:?}");
-        self.assertions.assert_same(self.mode, label, rendered);
-    }
-
     pub(crate) fn finish(&self) {
         self.assertions.finish_mode(self.mode);
     }

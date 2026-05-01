@@ -1,8 +1,5 @@
 use std::ops::Deref;
 
-pub(crate) const ENGINE_STORAGE_SCOPE_KEY: &str = "engine";
-pub(crate) const STORAGE_SCOPE_KEY_COLUMN: &str = "storage_scope_key";
-
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     Null,
@@ -78,13 +75,6 @@ impl<T: PartialEq> NullableKeyFilter<T> {
     }
 }
 
-pub(crate) fn storage_scope_key_for_file_id(file_id: Option<&str>) -> String {
-    match file_id {
-        Some(file_id) => format!("file:{file_id}"),
-        None => ENGINE_STORAGE_SCOPE_KEY.to_string(),
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QueryResult {
     pub rows: Vec<Vec<Value>>,
@@ -96,13 +86,11 @@ pub struct QueryResult {
 pub struct WriteReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_commit_sequence: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub canonical_commit: Option<crate::canonical::CanonicalCommitReceipt>,
 }
 
 impl WriteReceipt {
     pub fn is_empty(&self) -> bool {
-        self.state_commit_sequence.is_none() && self.canonical_commit.is_none()
+        self.state_commit_sequence.is_none()
     }
 }
 

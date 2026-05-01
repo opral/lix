@@ -3,16 +3,6 @@ use std::sync::OnceLock;
 
 use crate::schema::lix_schema_definition;
 
-mod types;
-
-pub(crate) use types::{LixActiveVersion, LixCommit, LixVersionDescriptor, LixVersionRef};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BuiltinSchemaStorageDefaults {
-    pub(crate) file_id: Option<&'static str>,
-    pub(crate) plugin_key: Option<&'static str>,
-}
-
 const LIX_REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const LIX_KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const LIX_ACCOUNT_SCHEMA_KEY: &str = "lix_account";
@@ -95,17 +85,6 @@ const BUILTIN_SCHEMA_KEYS: &[&str] = &[
 
 pub(crate) fn builtin_schema_keys() -> &'static [&'static str] {
     BUILTIN_SCHEMA_KEYS
-}
-
-pub(crate) fn builtin_schema_storage_defaults(
-    schema_key: &str,
-) -> Option<BuiltinSchemaStorageDefaults> {
-    builtin_schema_definition(schema_key)?;
-    let _ = schema_key;
-    Some(BuiltinSchemaStorageDefaults {
-        file_id: None,
-        plugin_key: None,
-    })
 }
 
 // `lix_state` is a public SQL surface, not a stored builtin schema row, but

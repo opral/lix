@@ -66,6 +66,7 @@ use std::ops::Deref;
 pub(crate) struct NormalizedDirectoryPath(String);
 
 impl NormalizedDirectoryPath {
+    #[cfg(test)]
     pub(crate) fn try_from_path(path: &str) -> Result<Self, LixError> {
         normalize_directory_path(path).map(Self)
     }
@@ -132,6 +133,7 @@ impl ParsedFilePath {
         parse_file_path(path)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_normalized_path(path: String) -> Result<Self, LixError> {
         parse_file_path(&path)
     }
@@ -145,6 +147,7 @@ enum PathError {
     UnexpectedTrailingSlashOnFilePath,
     MissingTrailingSlashOnDirectoryPath,
     EmptySegment,
+    #[cfg(test)]
     DotSegment,
     SlashInSegment,
     Backslash,
@@ -152,6 +155,7 @@ enum PathError {
     InvalidIriCodePoint,
     NulByte,
     InvalidRootUsage,
+    #[cfg(test)]
     InvalidDirectoryParentPath,
 }
 
@@ -178,6 +182,7 @@ impl PathError {
                 "path must not contain empty segments",
                 Some("remove duplicate slashes like '//'"),
             ),
+            #[cfg(test)]
             Self::DotSegment => (
                 "LIX_ERROR_PATH_DOT_SEGMENT",
                 "path segment cannot be '.' or '..'",
@@ -213,6 +218,7 @@ impl PathError {
                 "root '/' is only valid as a directory path",
                 Some("use '/' as a directory path, never as a file path"),
             ),
+            #[cfg(test)]
             Self::InvalidDirectoryParentPath => (
                 "LIX_ERROR_PATH_INVALID_DIRECTORY_PARENT",
                 "directory parent path must be a normalized directory path",
@@ -228,10 +234,12 @@ impl PathError {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn normalize_path_segment(raw: &str) -> Result<String, LixError> {
     normalize_path_segment_impl(raw).map_err(PathError::into_lix_error)
 }
 
+#[cfg(test)]
 fn normalize_path_segment_impl(raw: &str) -> PathResult<String> {
     let normalized = raw.nfc().collect::<String>();
     let canonical = normalize_validated_path_segment(&normalized)?;
@@ -556,6 +564,7 @@ pub(crate) fn directory_name_from_path(path: &str) -> Option<String> {
         .map(|segment| segment.to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn compose_directory_path(parent_path: &str, name: &str) -> Result<String, LixError> {
     let normalized_name = normalize_path_segment_impl(name).map_err(PathError::into_lix_error)?;
     if parent_path == "/" {

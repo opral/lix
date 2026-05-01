@@ -17,8 +17,10 @@ use crate::engine2::transaction::types::{StageRow, StageWrite, StageWriteStager}
 use crate::engine2::transaction::validation::{validate_staged_writes, TransactionValidationInput};
 use crate::engine2::version_ref::{VersionRefContext, VersionRefReader};
 use crate::sql2::SqlExecutionContext;
-use crate::transaction::TransactionCommitOutcome;
 use crate::{LixBackend, LixBackendTransaction, LixError};
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct TransactionCommitOutcome;
 
 /// One execution-scoped write transaction for the engine2 SQL path.
 ///

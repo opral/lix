@@ -16,9 +16,24 @@ use crate::catalog::{
     state_relation_column_is_nullable_for_variant, state_relation_columns_for_variant,
     SurfaceColumnType, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
 };
-#[cfg(test)]
-use crate::live_state::StateSurfaceColumn;
 use crate::LixError;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateSurfaceColumn {
+    EntityId,
+    SchemaKey,
+    FileId,
+    SnapshotContent,
+    Metadata,
+    SchemaVersion,
+    CreatedAt,
+    UpdatedAt,
+    Global,
+    ChangeId,
+    CommitId,
+    Untracked,
+    VersionId,
+}
 
 pub(crate) const VARIANT_FIELD_METADATA_KEY: &str = "lix.surface_type";
 pub(crate) const VARIANT_FIELD_METADATA_VALUE: &str = "variant";
@@ -415,7 +430,6 @@ mod tests {
         build_builtin_surface_registry, dynamic_entity_surface_spec_from_schema,
         register_dynamic_entity_surface_spec, SurfaceColumnType,
     };
-    use crate::live_state::StateSurfaceColumn;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::datasource::MemTable;
     use datafusion::logical_expr::expr::{Alias, ScalarFunction, TryCast};
