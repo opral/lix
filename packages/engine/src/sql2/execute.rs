@@ -2,7 +2,7 @@ use datafusion::arrow::datatypes::Field;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use std::sync::Arc;
 
 use crate::{LixError, SqlQueryResult, Value};
@@ -136,7 +136,7 @@ pub(crate) async fn execute_logical_plan(
 }
 
 async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, LixError> {
-    let session = SessionContext::new();
+    let session = new_lix_session_context();
     register_sql2_functions(&session, ctx.functions());
     let version_ref = ctx.version_ref();
     register_lix_state_providers(
@@ -197,7 +197,7 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
 async fn build_write_session(
     ctx: &mut dyn SqlWriteExecutionContext,
 ) -> Result<SessionContext, LixError> {
-    let session = SessionContext::new();
+    let session = new_lix_session_context();
     let write_ctx = SqlWriteContext::new(ctx);
     register_sql2_functions(&session, write_ctx.functions());
 
@@ -213,6 +213,10 @@ async fn build_write_session(
     .await?;
 
     Ok(session)
+}
+
+fn new_lix_session_context() -> SessionContext {
+    SessionContext::new_with_config(SessionConfig::new().with_information_schema(true))
 }
 
 fn classify_logical_plan(plan: &LogicalPlan) -> SqlStatementKind {
@@ -878,6 +882,38 @@ mod tests {
             .await
             .expect("sql2 execute should support literal-only queries");
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_exposes_datafusion_information_schema() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            schema_definitions: vec![],
+        };
+
+        let information_schema_result = execute_sql(
+            &ctx,
+            "SELECT table_name FROM information_schema.tables WHERE table_name = 'lix_state'",
+            &[],
+        )
+        .await
+        .expect("information_schema.tables should be enabled");
+        assert_eq!(
+            information_schema_result.rows,
+            vec![vec![Value::Text("lix_state".to_string())]]
+        );
+
+        let show_tables_result = execute_sql(&ctx, "SHOW TABLES", &[])
+            .await
+            .expect("SHOW TABLES should use information_schema");
+        assert!(show_tables_result.rows.iter().any(|row| {
+            row.iter()
+                .any(|value| matches!(value, Value::Text(value) if value == "lix_state"))
+        }));
     }
 
     async fn setup_engine2_history_fixture() -> Result<(SessionContext, String), LixError> {
