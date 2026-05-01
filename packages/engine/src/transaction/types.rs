@@ -9,6 +9,14 @@ use crate::untracked_state::UntrackedStateRow;
 /// Write frontends produce this shape after decoding their own surface. The
 /// transaction later assigns generated fields and turns it into a
 /// `StagedStateRow`.
+///
+/// SQL providers stage semantic rows, not final storage rows. INSERT providers
+/// may omit defaulted snapshot fields and leave `entity_id` unset when the
+/// target schema has an `x-lix-primary-key`; transaction normalization applies
+/// schema defaults and derives the final identity. Typed UPDATE providers must
+/// stage full rewritten snapshots after applying column assignments to the
+/// existing row. Raw `lix_state` snapshot updates are replacement writes, not
+/// implicit patches.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct StageRow {
     pub(crate) entity_id: Option<EntityIdentity>,
