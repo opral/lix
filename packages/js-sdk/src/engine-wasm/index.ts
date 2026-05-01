@@ -1,9 +1,14 @@
-export { default } from "./wasm/lix_engine_wasm_bindgen.js";
-export * from "./wasm/lix_engine_wasm_bindgen.js";
-import type { InitInput } from "./wasm/lix_engine_wasm_bindgen.js";
-import type { LixJsonValue } from "../canonical-json.js";
+export { default } from "./wasm/lix_engine.js";
+export * from "./wasm/lix_engine.js";
+import type { InitInput } from "./wasm/lix_engine.js";
 
-export type JsonValue = LixJsonValue;
+export type JsonValue =
+	| null
+	| boolean
+	| number
+	| string
+	| JsonValue[]
+	| { [key: string]: JsonValue };
 
 export type ValueKind =
 	| "null"
@@ -99,16 +104,16 @@ export class Value {
 		if (typeof raw === "boolean") return Value.boolean(raw);
 		if (typeof raw === "string") return Value.text(raw);
 		if (raw instanceof Uint8Array) return Value.blob(raw);
-		if (raw instanceof ArrayBuffer) return Value.blob(new Uint8Array(raw));
+	if (raw instanceof ArrayBuffer) return Value.blob(new Uint8Array(raw));
 		if (ArrayBuffer.isView(raw)) {
 			return Value.blob(
 				new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength),
 			);
 		}
-		if (isJsonValue(raw)) return Value.json(raw);
-		throw new TypeError(
-			"Value.from() requires a canonical LixValue or scalar primitive",
-		);
+	if (isJsonValue(raw)) return Value.json(raw);
+	throw new TypeError(
+			"Value.from() requires a LixValue, JSON value, or binary value",
+	);
 	}
 
 	kindValue(): ValueKind {
@@ -291,7 +296,7 @@ function base64ToBytes(base64: string): Uint8Array {
 }
 
 const engineWasmUrl = new URL(
-	"./wasm/lix_engine_wasm_bindgen_bg.wasm",
+	"./wasm/lix_engine.wasm",
 	import.meta.url,
 );
 

@@ -19,11 +19,7 @@
 		"test": "node ./scripts/build.js && vitest run",
 		"test:watch": "node ./scripts/build.js && vitest"
 	},
-	"dependencies": {
-		"@bytecodealliance/jco": "^1.17.0",
-		"@bytecodealliance/preview2-shim": "^0.17.8",
-		"@sqlite.org/sqlite-wasm": "^3.50.4-build1"
-	},
+	"dependencies": {},
 	"devDependencies": {
 		"typescript": "^5.5.4",
 		"vitest": "^4.0.18"
@@ -40,6 +36,7 @@
 					"{workspaceRoot}/Cargo.toml",
 					"{workspaceRoot}/Cargo.lock",
 					"{workspaceRoot}/packages/engine/**/*",
+					"{workspaceRoot}/packages/rs-sdk/**/*",
 					"{workspaceRoot}/packages/js-sdk/Cargo.toml",
 					"{workspaceRoot}/packages/js-sdk/wasm-bindgen.rs"
 				],

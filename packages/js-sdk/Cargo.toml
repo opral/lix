@@ -8,12 +8,11 @@ path = "wasm-bindgen.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-lix_engine = { path = "../engine" }
+lix_rs_sdk = { path = "../rs-sdk" }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-async-trait = "0.1"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 serde_json = "1"
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
+serde-wasm-bindgen = "0.6"
 base64 = "0.22"
