@@ -816,7 +816,7 @@ fn lix_state_write_rows_from_batch(
 ) -> Result<Vec<StageRow>> {
     (0..batch.num_rows())
         .map(|row_index| {
-            let global = required_bool_value(batch, row_index, "global")?;
+            let global = optional_bool_value(batch, row_index, "global")?.unwrap_or(false);
             let version_id =
                 optional_string_value(batch, row_index, "version_id")?.unwrap_or_else(|| {
                     if global {
@@ -849,7 +849,7 @@ fn lix_state_write_rows_from_batch(
                 global,
                 change_id: optional_string_value(batch, row_index, "change_id")?,
                 commit_id: optional_string_value(batch, row_index, "commit_id")?,
-                untracked: required_bool_value(batch, row_index, "untracked")?,
+                untracked: optional_bool_value(batch, row_index, "untracked")?.unwrap_or(false),
                 version_id,
             })
         })
@@ -888,14 +888,14 @@ fn optional_string_value(
     }
 }
 
-fn required_bool_value(batch: &RecordBatch, row_index: usize, column_name: &str) -> Result<bool> {
+fn optional_bool_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+) -> Result<Option<bool>> {
     match optional_scalar_value(batch, row_index, column_name)? {
-        Some(ScalarValue::Boolean(Some(value))) => Ok(value),
-        None | Some(ScalarValue::Null) | Some(ScalarValue::Boolean(None)) => {
-            Err(DataFusionError::Execution(format!(
-                "INSERT into lix_state requires non-null boolean column '{column_name}'"
-            )))
-        }
+        Some(ScalarValue::Boolean(Some(value))) => Ok(Some(value)),
+        None | Some(ScalarValue::Null) | Some(ScalarValue::Boolean(None)) => Ok(None),
         Some(other) => Err(DataFusionError::Execution(format!(
             "INSERT into lix_state expected boolean column '{column_name}', got {other:?}"
         ))),
@@ -1048,10 +1048,10 @@ fn lix_state_schema() -> SchemaRef {
         Field::new("schema_version", DataType::Utf8, true),
         Field::new("created_at", DataType::Utf8, true),
         Field::new("updated_at", DataType::Utf8, true),
-        Field::new("global", DataType::Boolean, false),
+        Field::new("global", DataType::Boolean, true),
         Field::new("change_id", DataType::Utf8, true),
         Field::new("commit_id", DataType::Utf8, true),
-        Field::new("untracked", DataType::Boolean, false),
+        Field::new("untracked", DataType::Boolean, true),
     ]))
 }
 
@@ -1065,10 +1065,10 @@ fn lix_state_by_version_schema() -> SchemaRef {
         Field::new("schema_version", DataType::Utf8, true),
         Field::new("created_at", DataType::Utf8, true),
         Field::new("updated_at", DataType::Utf8, true),
-        Field::new("global", DataType::Boolean, false),
+        Field::new("global", DataType::Boolean, true),
         Field::new("change_id", DataType::Utf8, true),
         Field::new("commit_id", DataType::Utf8, true),
-        Field::new("untracked", DataType::Boolean, false),
+        Field::new("untracked", DataType::Boolean, true),
         Field::new("version_id", DataType::Utf8, false),
     ]))
 }

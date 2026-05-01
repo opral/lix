@@ -458,6 +458,8 @@ mod tests {
         file_id: Option<String>,
         snapshot_content: Option<String>,
         metadata: Option<String>,
+        global: bool,
+        untracked: bool,
         tombstone: bool,
     }
 
@@ -473,6 +475,8 @@ mod tests {
                 schema_version: row.schema_version,
                 version_id: row.version_id,
                 file_id: row.file_id,
+                global: row.global,
+                untracked: row.untracked,
                 tombstone: row.snapshot_content.is_none(),
                 snapshot_content: row.snapshot_content,
                 metadata: row.metadata,
@@ -1135,11 +1139,54 @@ mod tests {
         assert_eq!(rows[0].entity_id, "entity-1");
         assert_eq!(rows[0].schema_version, "1");
         assert_eq!(rows[0].version_id, "version-a");
+        assert!(!rows[0].global);
+        assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"key\":\"hello\",\"value\":\"world\"}")
         );
         assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"sql\"}"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_lix_state_defaults_global_and_untracked_to_false() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_write_sql(
+            &mut ctx,
+            "INSERT INTO lix_state (\
+             entity_id, schema_key, file_id, snapshot_content, metadata, schema_version\
+             ) VALUES (\
+             'entity-defaults', 'lix_key_value', NULL, '{\"key\":\"hello\",\"value\":\"defaults\"}', NULL, '1'\
+             )",
+            &[],
+        )
+        .await
+        .expect("INSERT INTO lix_state should default bookkeeping flags");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_key_value");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "entity-defaults");
+        assert_eq!(rows[0].version_id, "version-a");
+        assert!(!rows[0].global);
+        assert!(!rows[0].untracked);
     }
 
     #[tokio::test]
@@ -1237,6 +1284,8 @@ mod tests {
         assert_eq!(rows[0].entity_id, "entity-c");
         assert_eq!(rows[0].schema_version, "1");
         assert_eq!(rows[0].version_id, "version-b");
+        assert!(!rows[0].global);
+        assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"value\":\"C\"}")
@@ -1284,6 +1333,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_id, "entity-c");
         assert_eq!(rows[0].version_id, "version-a");
+        assert!(!rows[0].global);
+        assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"value\":\"C\"}")
@@ -1326,6 +1377,8 @@ mod tests {
         assert_eq!(rows[0].entity_id, "dir-docs");
         assert_eq!(rows[0].schema_version, "1");
         assert_eq!(rows[0].version_id, "version-b");
+        assert!(!rows[0].global);
+        assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"hidden\":false,\"id\":\"dir-docs\",\"name\":\"docs\",\"parent_id\":null}")
@@ -1366,6 +1419,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_id, "dir-docs");
         assert_eq!(rows[0].version_id, "version-a");
+        assert!(!rows[0].global);
+        assert!(!rows[0].untracked);
     }
 
     #[tokio::test]
@@ -1537,6 +1592,8 @@ mod tests {
         assert_eq!(rows[0].entity_id, "file-readme");
         assert_eq!(rows[0].schema_version, "1");
         assert_eq!(rows[0].version_id, "version-b");
+        assert!(!rows[0].global);
+        assert!(!rows[0].untracked);
         let snapshot: JsonValue =
             serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap())
                 .expect("descriptor snapshot JSON");
@@ -1581,6 +1638,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_id, "file-readme");
         assert_eq!(rows[0].version_id, "version-a");
+        assert!(!rows[0].global);
+        assert!(!rows[0].untracked);
     }
 
     #[tokio::test]

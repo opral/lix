@@ -1673,10 +1673,10 @@ pub(super) fn entity_system_fields(variant: EntityProviderVariant) -> Vec<Field>
         Field::new("lixcol_schema_version", DataType::Utf8, true),
         Field::new("lixcol_created_at", DataType::Utf8, true),
         Field::new("lixcol_updated_at", DataType::Utf8, true),
-        Field::new("lixcol_global", DataType::Boolean, false),
+        Field::new("lixcol_global", DataType::Boolean, true),
         Field::new("lixcol_change_id", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
-        Field::new("lixcol_untracked", DataType::Boolean, false),
+        Field::new("lixcol_untracked", DataType::Boolean, true),
     ];
     if variant == EntityProviderVariant::ByVersion {
         fields.push(Field::new("lixcol_version_id", DataType::Utf8, false));
