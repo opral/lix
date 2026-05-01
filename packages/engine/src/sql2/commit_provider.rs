@@ -26,6 +26,8 @@ use crate::version_ref::VersionRefReader;
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 
+use super::record_batch::record_batch_with_row_count;
+
 pub(crate) async fn register_commit_providers(
     session: &datafusion::prelude::SessionContext,
     active_version_id: &str,
@@ -456,7 +458,7 @@ fn surface_record_batch(
         .iter()
         .map(|column| column.array(rows))
         .collect::<Vec<_>>();
-    RecordBatch::try_new(surface_schema(&columns), arrays).map_err(|error| {
+    record_batch_with_row_count(surface_schema(&columns), arrays, rows.len()).map_err(|error| {
         DataFusionError::Execution(format!(
             "failed to build {} batch: {error}",
             surface.table_name()
