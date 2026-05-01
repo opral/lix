@@ -7,6 +7,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "..", "..", "..");
 const jsSdkDir = join(repoRoot, "packages", "js-sdk");
 const wasmProfile = process.env.LIX_WASM_PROFILE ?? "release";
+const useWasmSizeOptimizations =
+	wasmProfile === "release" && process.env.LIX_WASM_SIZE_OPT !== "0";
 const targetDir = join(
 	repoRoot,
 	"target",
@@ -32,8 +34,11 @@ function run(cmd, args, opts = {}) {
 
 async function buildEngineWasm() {
 	const existingRustFlags = process.env.RUSTFLAGS ?? "";
+	const wasmSizeRustFlags = useWasmSizeOptimizations
+		? " -C opt-level=z -C lto=fat -C embed-bitcode=yes -C codegen-units=1 -C panic=abort"
+		: "";
 	const wasmRustFlags =
-		`${existingRustFlags} --cfg getrandom_backend="wasm_js"`.trim();
+		`${existingRustFlags} --cfg getrandom_backend="wasm_js"${wasmSizeRustFlags}`.trim();
 	const cargoArgs = [
 		"build",
 		"-p",
@@ -62,6 +67,7 @@ async function buildEngineWasm() {
 		wasmBindgenOutName,
 	]);
 	await normalizeWasmBindgenOutput(engineOutDir);
+	await stripWasmCustomSections(engineOutDir);
 	await mkdir(engineDistOutDir, { recursive: true });
 	await cp(engineOutDir, engineDistOutDir, { recursive: true, force: true });
 }
@@ -80,6 +86,13 @@ async function normalizeWasmBindgenOutput(outputDir) {
 		jsPath,
 		js.replaceAll(`${wasmBindgenOutName}_bg.wasm`, `${wasmBindgenOutName}.wasm`),
 	);
+}
+
+async function stripWasmCustomSections(outputDir) {
+	const wasmPath = join(outputDir, `${wasmBindgenOutName}.wasm`);
+	const strippedWasmPath = join(outputDir, `${wasmBindgenOutName}.stripped.wasm`);
+	await run("wasm-tools", ["strip", "--all", wasmPath, "-o", strippedWasmPath]);
+	await rename(strippedWasmPath, wasmPath);
 }
 
 async function syncBuiltinSchemas() {
