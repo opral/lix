@@ -32,8 +32,8 @@ use crate::live_state::{
 };
 use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
 use crate::transaction::types::StageRow;
-use crate::version::GLOBAL_VERSION_ID;
 use crate::version_ref::VersionRefReader;
+use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
 use crate::sql2::{

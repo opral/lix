@@ -36,9 +36,9 @@ use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
 };
 use crate::transaction::types::StageRow;
-use crate::version::GLOBAL_VERSION_ID;
 use crate::version_ref::VersionRefReader;
 use crate::LixError;
+use crate::GLOBAL_VERSION_ID;
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";

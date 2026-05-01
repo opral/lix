@@ -15,8 +15,8 @@ use crate::untracked_state::{
     UntrackedStateContext, UntrackedStateIdentity, UntrackedStateRow, UntrackedStateRowRequest,
     UntrackedStateScanRequest,
 };
-use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
+use crate::GLOBAL_VERSION_ID;
 
 /// Serving facade for visible live-state readers and writers.
 ///

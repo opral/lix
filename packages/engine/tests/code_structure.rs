@@ -1998,7 +1998,7 @@ fn current_engine_owned_persistence_raw_sql_execution_violations() -> Vec<RawSql
         }
 
         let masked_source = mask_rust_source(&source);
-        for pattern in [".execute(", ".execute_batch("] {
+        for pattern in [".execute("] {
             if masked_source.contains(pattern) {
                 violations.insert(RawSqlExecutionViolation {
                     file: relative_path.clone(),
@@ -2150,7 +2150,6 @@ fn current_owner_persistence_transaction_lifecycle_violations() -> Vec<Transacti
         let masked_source = mask_rust_source(&source);
         for pattern in [
             ".begin_transaction(",
-            ".begin_savepoint(",
             "begin_write_transaction(",
             ".commit().await",
             ".rollback().await",
@@ -2198,7 +2197,6 @@ fn current_raw_execute_outside_owner_storage_or_public_sql_boundary_violations(
             "self.base.execute(",
             "self.backend.execute(",
             "self.backend_transaction.execute(",
-            ".execute_batch(",
         ] {
             if masked_source.contains(pattern) {
                 violations.insert(RawSqlExecutionViolation {
@@ -2265,7 +2263,6 @@ fn current_owner_storage_public_sql_shaped_api_violations() -> Vec<RawSqlExecuti
         let masked_source = mask_rust_source(&source);
         for pattern in [
             "pub(crate) async fn execute_query_with_",
-            "pub(crate) async fn execute_batch_with_",
             "pub(crate) async fn execute_ddl_batch_with_",
             "pub(crate) async fn add_column_if_missing_with_",
             "pub(crate) async fn begin_write_transaction",

@@ -35,9 +35,9 @@ use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
 };
 use crate::transaction::types::StageRow;
-use crate::version::GLOBAL_VERSION_ID;
 use crate::version_ref::VersionRefReader;
 use crate::LixError;
+use crate::GLOBAL_VERSION_ID;
 
 use super::filesystem_planner::{
     directory_descriptor_row, plan_recursive_directory_delete, DirectoryDescriptorRowInput,

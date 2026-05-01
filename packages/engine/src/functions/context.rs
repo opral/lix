@@ -82,7 +82,7 @@ mod tests {
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
     use crate::functions::{state::load_sequence, DeterministicSequence};
     use crate::live_state::{LiveStateContext, LiveStateRow};
-    use crate::version::GLOBAL_VERSION_ID;
+    use crate::GLOBAL_VERSION_ID;
 
     use super::*;
 

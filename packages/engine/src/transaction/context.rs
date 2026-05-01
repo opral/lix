@@ -22,8 +22,8 @@ use crate::transaction::normalization::TransactionSchemaCatalog;
 use crate::transaction::staging::TransactionStagedWrites;
 use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
 use crate::transaction::validation::{validate_staged_writes, TransactionValidationInput};
-use crate::version::GLOBAL_VERSION_ID;
 use crate::version_ref::{VersionRefContext, VersionRefReader, VersionRefStoreReader};
+use crate::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixBackendTransaction, LixError, NullableKeyFilter};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -420,9 +420,9 @@ mod tests {
     use crate::changelog::ChangelogScanRequest;
     use crate::tracked_state::{TrackedStateRowRequest, TrackedStateScanRequest};
     use crate::untracked_state::{UntrackedStateContext, UntrackedStateRowRequest};
-    use crate::version::GLOBAL_VERSION_ID;
     use crate::version_ref::VersionRefContext;
     use crate::NullableKeyFilter;
+    use crate::GLOBAL_VERSION_ID;
 
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(

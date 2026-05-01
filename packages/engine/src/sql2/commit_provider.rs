@@ -22,9 +22,9 @@ use tokio::sync::Mutex;
 
 use crate::commit_graph::{CommitGraphCommit, CommitGraphReader};
 use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
-use crate::version::GLOBAL_VERSION_ID;
 use crate::version_ref::VersionRefReader;
 use crate::LixError;
+use crate::GLOBAL_VERSION_ID;
 
 pub(crate) async fn register_commit_providers(
     session: &datafusion::prelude::SessionContext,

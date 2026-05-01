@@ -3,8 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lix_engine::{
-    KvPair, KvScanRange, LixBackend, LixBackendTransaction, LixError, PreparedBatch, QueryResult,
-    SqlDialect, TransactionBeginMode, Value,
+    KvPair, KvScanRange, LixBackend, LixBackendTransaction, LixError, TransactionBeginMode,
 };
 
 pub(crate) type KvKey = (String, Vec<u8>);
@@ -37,17 +36,6 @@ impl InMemoryKvBackend {
 
 #[async_trait]
 impl LixBackend for InMemoryKvBackend {
-    fn dialect(&self) -> SqlDialect {
-        SqlDialect::Sqlite
-    }
-
-    async fn execute(&self, _sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-        Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "simulation_test backend does not support raw SQL execution",
-        ))
-    }
-
     async fn begin_transaction(
         &self,
         mode: TransactionBeginMode,
@@ -58,16 +46,6 @@ impl LixBackend for InMemoryKvBackend {
             mode,
             closed: false,
         }))
-    }
-
-    async fn begin_savepoint(
-        &self,
-        _name: &str,
-    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
-        Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "simulation_test backend does not support savepoints",
-        ))
     }
 
     async fn kv_get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
@@ -99,19 +77,8 @@ struct InMemoryKvTransaction {
 
 #[async_trait]
 impl LixBackendTransaction for InMemoryKvTransaction {
-    fn dialect(&self) -> SqlDialect {
-        SqlDialect::Sqlite
-    }
-
     fn mode(&self) -> TransactionBeginMode {
         self.mode
-    }
-
-    async fn execute(&mut self, _sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-        Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "simulation_test transaction does not support raw SQL execution",
-        ))
     }
 
     async fn kv_get(&mut self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
@@ -161,14 +128,6 @@ impl LixBackendTransaction for InMemoryKvTransaction {
         self.pending
             .insert((namespace.to_string(), key.to_vec()), None);
         Ok(())
-    }
-
-    async fn execute_batch(&mut self, batch: &PreparedBatch) -> Result<QueryResult, LixError> {
-        let _ = batch;
-        Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "simulation_test transaction does not support SQL batches",
-        ))
     }
 
     async fn commit(mut self: Box<Self>) -> Result<(), LixError> {

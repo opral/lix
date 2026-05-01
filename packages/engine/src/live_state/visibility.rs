@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::live_state::{LiveStateRow, LiveStateRowIdentity};
-use crate::version::GLOBAL_VERSION_ID;
+use crate::GLOBAL_VERSION_ID;
 
 /// Expands a version-scoped storage read so global candidates are available for
 /// the visibility overlay.

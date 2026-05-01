@@ -3,7 +3,7 @@ use serde_json::Value as JsonValue;
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::live_state::{LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateWriter};
-use crate::version::GLOBAL_VERSION_ID;
+use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
 pub(crate) const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";

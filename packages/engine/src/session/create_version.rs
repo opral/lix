@@ -1,8 +1,8 @@
 use serde_json::json;
 
 use crate::transaction::types::StageRow;
-use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
+use crate::GLOBAL_VERSION_ID;
 
 use super::context::SessionContext;
 

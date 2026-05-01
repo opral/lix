@@ -1,4 +1,3 @@
-pub(crate) mod dialect;
 pub(crate) mod error;
 pub(crate) mod fingerprint;
 pub(crate) mod fs_path;
@@ -6,7 +5,6 @@ pub(crate) mod identity;
 pub(crate) mod types;
 pub(crate) mod wire;
 
-pub use dialect::SqlDialect;
 pub use error::LixError;
 pub(crate) use fingerprint::stable_content_fingerprint_hex;
 pub(crate) use fs_path::{

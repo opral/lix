@@ -14,8 +14,8 @@ use crate::schema_registry::SchemaRegistry;
 use crate::sql2::SqlExecutionContext;
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{open_transaction, Transaction};
-use crate::version::GLOBAL_VERSION_ID;
 use crate::version_ref::{VersionRefContext, VersionRefReader};
+use crate::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, NullableKeyFilter};
 
 pub(crate) const WORKSPACE_VERSION_KEY: &str = "lix_workspace_version_id";

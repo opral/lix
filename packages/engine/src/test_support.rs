@@ -1,8 +1,8 @@
 use crate::backend::{LixBackend, TransactionBeginMode};
 use crate::tracked_state::{TrackedStateContext, TrackedStateRow};
 use crate::untracked_state::UntrackedStateContext;
-use crate::version::GLOBAL_VERSION_ID;
 use crate::version_ref::VersionRefContext;
+use crate::GLOBAL_VERSION_ID;
 
 pub(crate) const TEST_EMPTY_ROOT_COMMIT_ID: &str = "test-empty-root";
 const TEST_TIMESTAMP: &str = "1970-01-01T00:00:00.000Z";

@@ -9,8 +9,8 @@ use crate::untracked_state::{
     UntrackedStateContext, UntrackedStateFilter, UntrackedStateRow, UntrackedStateRowRequest,
     UntrackedStateScanRequest, UntrackedStateWriter,
 };
-use crate::version::GLOBAL_VERSION_ID;
 use crate::version_ref::{VersionHead, VersionRefReader};
+use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
 const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";

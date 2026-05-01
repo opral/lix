@@ -20,9 +20,9 @@ use futures_util::stream;
 use serde_json::Value as JsonValue;
 
 use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateScanRequest};
-use crate::version::GLOBAL_VERSION_ID;
 use crate::version_ref::VersionRefReader;
 use crate::LixError;
+use crate::GLOBAL_VERSION_ID;
 
 pub(crate) async fn register_lix_version_provider(
     session: &datafusion::prelude::SessionContext,
