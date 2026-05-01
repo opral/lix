@@ -2,59 +2,24 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
-use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
-use crate::binary_cas::BlobDataReader;
-use crate::engine2::changelog::ChangelogReader;
-use crate::engine2::commit_graph::CommitGraphReader;
-use crate::engine2::functions::FunctionProviderHandle;
-use crate::engine2::live_state::LiveStateReader;
-use crate::engine2::transaction::types::StageWriteStager;
-use crate::engine2::version_ref::VersionRefReader;
 use crate::{LixError, QueryResult, Value};
 
 use super::change_provider::register_lix_change_provider;
 use super::commit_provider::register_commit_providers;
 use super::directory_history_provider::register_lix_directory_history_provider;
-use super::directory_provider::register_lix_directory_providers;
-use super::entity_provider::register_entity_providers;
+use super::directory_provider::{
+    register_lix_directory_providers, register_lix_directory_write_providers,
+};
+use super::entity_provider::{register_entity_providers, register_entity_write_providers};
 use super::file_history_provider::register_lix_file_history_provider;
-use super::file_provider::register_lix_file_providers;
+use super::file_provider::{register_lix_file_providers, register_lix_file_write_providers};
 use super::history_provider::register_history_providers;
-use super::lix_state_provider::register_lix_state_providers;
+use super::lix_state_provider::{register_lix_state_providers, register_lix_state_write_providers};
 use super::udfs::register_sql2_functions;
 use super::version_provider::register_lix_version_provider;
-
-/// Single execution boundary for `sql2::execute_sql(...)`.
-///
-/// Session and transaction orchestration stay above `sql2`. They provide the
-/// execution-scoped visible live-state context for each call.
-///
-/// Catalog lookup/registration will likely join this boundary later, but we
-/// are intentionally not carrying it yet until the new DataFusion-owned path
-/// actually needs it.
-#[allow(dead_code)]
-pub(crate) trait SqlExecutionContext {
-    fn active_version_id(&self) -> &str;
-    fn live_state(&self) -> Arc<dyn LiveStateReader>;
-    fn functions(&self) -> FunctionProviderHandle;
-    fn changelog(&self) -> Arc<dyn ChangelogReader>;
-    fn commit_graph(&self) -> Box<dyn CommitGraphReader>;
-    fn version_ref(&self) -> Arc<dyn VersionRefReader>;
-    fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
-    fn write_stager(&self) -> Option<Arc<dyn StageWriteStager>> {
-        None
-    }
-    fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SqlStatementKind {
-    Read,
-    Write,
-    Other,
-}
+use super::{SqlExecutionContext, SqlStatementKind, SqlWriteContext, SqlWriteExecutionContext};
 
 #[allow(dead_code)]
 pub(crate) struct SqlLogicalPlan {
@@ -96,6 +61,26 @@ pub(crate) async fn create_logical_plan(
     sql: &str,
 ) -> Result<SqlLogicalPlan, LixError> {
     let session = build_session(ctx).await?;
+    let plan = session
+        .state()
+        .create_logical_plan(sql)
+        .await
+        .map_err(datafusion_error_to_lix_error)?;
+    let kind = classify_logical_plan(&plan);
+
+    Ok(SqlLogicalPlan {
+        session,
+        plan,
+        kind,
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) async fn create_write_logical_plan(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    sql: &str,
+) -> Result<SqlLogicalPlan, LixError> {
+    let session = build_write_session(ctx).await?;
     let plan = session
         .state()
         .create_logical_plan(sql)
@@ -157,7 +142,6 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
         ctx.active_version_id(),
         ctx.live_state(),
         Arc::clone(&version_ref),
-        ctx.write_stager(),
     )
     .await?;
     register_lix_version_provider(&session, ctx.live_state(), Arc::clone(&version_ref)).await?;
@@ -183,7 +167,6 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
         ctx.active_version_id(),
         ctx.live_state(),
         Arc::clone(&version_ref),
-        ctx.write_stager(),
         ctx.functions(),
     )
     .await?;
@@ -193,7 +176,6 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
         ctx.live_state(),
         Arc::clone(&version_ref),
         ctx.blob_reader(),
-        ctx.write_stager(),
         ctx.functions(),
     )
     .await?;
@@ -202,9 +184,29 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
         ctx.active_version_id(),
         ctx.live_state(),
         Arc::clone(&version_ref),
-        ctx.write_stager(),
         entity_commit_graph,
         &ctx.list_visible_schemas()?,
+    )
+    .await?;
+
+    Ok(session)
+}
+
+async fn build_write_session(
+    ctx: &mut dyn SqlWriteExecutionContext,
+) -> Result<SessionContext, LixError> {
+    let session = SessionContext::new();
+    let write_ctx = SqlWriteContext::new(ctx);
+    register_sql2_functions(&session, write_ctx.functions());
+
+    register_lix_state_write_providers(&session, write_ctx.clone()).await?;
+
+    register_lix_directory_write_providers(&session, write_ctx.clone()).await?;
+    register_lix_file_write_providers(&session, write_ctx.clone()).await?;
+    register_entity_write_providers(
+        &session,
+        write_ctx.clone(),
+        &write_ctx.list_visible_schemas()?,
     )
     .await?;
 
@@ -313,7 +315,10 @@ mod tests {
     use serde_json::json;
     use serde_json::Value as JsonValue;
 
-    use super::{execute_sql, SqlExecutionContext};
+    use super::{
+        create_write_logical_plan, execute_logical_plan, execute_sql, SqlExecutionContext,
+        SqlWriteExecutionContext,
+    };
     use crate::binary_cas::BlobDataReader;
     use crate::engine2::changelog::{CanonicalChange, ChangelogReader, ChangelogScanRequest};
     use crate::engine2::commit_graph::{
@@ -328,7 +333,7 @@ mod tests {
         LiveStateContext, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
     use crate::engine2::tracked_state::TrackedStateContext;
-    use crate::engine2::transaction::types::{StageRow, StageWrite, StageWriteStager};
+    use crate::engine2::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
     use crate::engine2::untracked_state::UntrackedStateContext;
     use crate::engine2::version_ref::VersionRefReader;
     use crate::engine2::{Engine, ExecuteResult, SessionContext};
@@ -352,7 +357,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct CapturingStageWriteStager {
+    struct CapturingStagedWrites {
         deltas: Vec<CapturedStageWrite>,
     }
 
@@ -425,33 +430,10 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl StageWriteStager for Mutex<CapturingStageWriteStager> {
-        async fn stage_write(
-            &self,
-            write: StageWrite,
-        ) -> Result<crate::engine2::transaction::types::StageWriteOutcome, LixError> {
-            let count = match &write {
-                StageWrite::Rows { rows } => rows.len() as u64,
-                StageWrite::RowsWithFileData { count, .. } => *count,
-            };
-            let rows = match write {
-                StageWrite::Rows { rows } => rows,
-                StageWrite::RowsWithFileData { rows, .. } => rows,
-            };
-            self.lock()
-                .expect("stager lock")
-                .deltas
-                .push(CapturedStageWrite { rows });
-            Ok(crate::engine2::transaction::types::StageWriteOutcome { count })
-        }
-    }
-
     struct DummySqlExecutionContext<'a> {
         active_version_id: &'a str,
         blob_reader: Arc<dyn BlobDataReader>,
         live_state: Arc<dyn LiveStateReader>,
-        write_stager: Option<Arc<dyn StageWriteStager>>,
         schema_definitions: Vec<JsonValue>,
     }
 
@@ -484,13 +466,76 @@ mod tests {
             Arc::new(DummyVersionRefReader)
         }
 
-        fn write_stager(&self) -> Option<Arc<dyn StageWriteStager>> {
-            self.write_stager.as_ref().map(Arc::clone)
+        fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
+            Ok(self.schema_definitions.clone())
+        }
+    }
+
+    struct DummySqlWriteExecutionContext<'a> {
+        active_version_id: &'a str,
+        blob_reader: Arc<dyn BlobDataReader>,
+        live_state: Arc<dyn LiveStateReader>,
+        staged_writes: Arc<Mutex<CapturingStagedWrites>>,
+        schema_definitions: Vec<JsonValue>,
+    }
+
+    #[async_trait]
+    impl SqlWriteExecutionContext for DummySqlWriteExecutionContext<'_> {
+        fn active_version_id(&self) -> &str {
+            self.active_version_id
+        }
+
+        fn functions(&self) -> FunctionProviderHandle {
+            test_functions()
+        }
+
+        fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
+            Arc::clone(&self.blob_reader)
         }
 
         fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
             Ok(self.schema_definitions.clone())
         }
+
+        async fn scan_live_state(
+            &mut self,
+            request: &LiveStateScanRequest,
+        ) -> Result<Vec<LiveStateRow>, LixError> {
+            self.live_state.scan_rows(request).await
+        }
+
+        async fn load_version_head(
+            &mut self,
+            version_id: &str,
+        ) -> Result<Option<String>, LixError> {
+            Ok(Some(format!("commit-{version_id}")))
+        }
+
+        async fn stage_write(&mut self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
+            let count = match &write {
+                StageWrite::Rows { rows } => rows.len() as u64,
+                StageWrite::RowsWithFileData { count, .. } => *count,
+            };
+            let rows = match write {
+                StageWrite::Rows { rows } => rows,
+                StageWrite::RowsWithFileData { rows, .. } => rows,
+            };
+            self.staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .push(CapturedStageWrite { rows });
+            Ok(StageWriteOutcome { count })
+        }
+    }
+
+    async fn execute_write_sql(
+        ctx: &mut dyn SqlWriteExecutionContext,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<crate::QueryResult, LixError> {
+        let plan = create_write_logical_plan(ctx, sql).await?;
+        execute_logical_plan(plan, params).await
     }
 
     #[async_trait]
@@ -756,7 +801,6 @@ mod tests {
             active_version_id: "version-a",
             blob_reader: Arc::clone(&blob_reader),
             live_state: Arc::clone(&live_state) as Arc<dyn LiveStateReader>,
-            write_stager: None,
             schema_definitions: vec![],
         };
 
@@ -775,7 +819,6 @@ mod tests {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: None,
             schema_definitions: vec![],
         };
 
@@ -1018,17 +1061,17 @@ mod tests {
     async fn execute_sql_insert_into_lix_state_values_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
 
-        let result = execute_sql(
-            &ctx,
+        let result = execute_write_sql(
+            &mut ctx,
             "INSERT INTO lix_state (\
              entity_id, schema_key, file_id, snapshot_content, metadata, schema_version, global, untracked\
              ) VALUES (\
@@ -1042,9 +1085,9 @@ mod tests {
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
@@ -1063,17 +1106,17 @@ mod tests {
     async fn execute_sql_insert_into_lix_state_select_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
 
-        let result = execute_sql(
-            &ctx,
+        let result = execute_write_sql(
+            &mut ctx,
             "INSERT INTO lix_state (\
              entity_id, schema_key, file_id, snapshot_content, metadata, schema_version, global, untracked\
              ) \
@@ -1094,9 +1137,9 @@ mod tests {
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
@@ -1115,12 +1158,12 @@ mod tests {
     async fn execute_sql_insert_into_entity_by_version_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
                 "x-lix-version": "1",
@@ -1131,8 +1174,8 @@ mod tests {
             })],
         };
 
-        let result = execute_sql(
-            &ctx,
+        let result = execute_write_sql(
+            &mut ctx,
             "INSERT INTO test_state_schema_by_version (\
              lixcol_entity_id, lixcol_version_id, value\
              ) VALUES ('entity-c', 'version-b', 'C')",
@@ -1144,9 +1187,9 @@ mod tests {
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
@@ -1164,12 +1207,12 @@ mod tests {
     async fn execute_sql_insert_into_active_entity_defaults_active_version() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
                 "x-lix-version": "1",
@@ -1180,8 +1223,8 @@ mod tests {
             })],
         };
 
-        let result = execute_sql(
-            &ctx,
+        let result = execute_write_sql(
+            &mut ctx,
             "INSERT INTO test_state_schema (lixcol_entity_id, value) \
              VALUES ('entity-c', 'C')",
             &[],
@@ -1192,9 +1235,9 @@ mod tests {
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
@@ -1211,17 +1254,17 @@ mod tests {
     async fn execute_sql_insert_into_directory_by_version_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
 
-        let result = execute_sql(
-            &ctx,
+        let result = execute_write_sql(
+            &mut ctx,
             "INSERT INTO lix_directory_by_version (\
              id, parent_id, name, hidden, lixcol_version_id\
              ) VALUES ('dir-docs', NULL, 'docs', false, 'version-b')",
@@ -1233,9 +1276,9 @@ mod tests {
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
@@ -1253,17 +1296,17 @@ mod tests {
     async fn execute_sql_insert_into_active_directory_defaults_active_version() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
 
-        let result = execute_sql(
-            &ctx,
+        let result = execute_write_sql(
+            &mut ctx,
             "INSERT INTO lix_directory (id, parent_id, name, hidden) \
              VALUES ('dir-docs', NULL, 'docs', false)",
             &[],
@@ -1274,9 +1317,9 @@ mod tests {
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
@@ -1294,17 +1337,17 @@ mod tests {
                 live_directory_row("dir-guides", "version-a", Some("dir-docs"), "guides", false),
             ],
         });
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
 
-        let result = execute_sql(
-            &ctx,
+        let result = execute_write_sql(
+            &mut ctx,
             "UPDATE lix_directory \
              SET hidden = true, lixcol_metadata = '{\"source\":\"directory-update\"}' \
              WHERE id = 'dir-docs'",
@@ -1316,9 +1359,9 @@ mod tests {
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
@@ -1347,17 +1390,17 @@ mod tests {
                 false,
             )],
         });
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
 
-        let error = execute_sql(
-            &ctx,
+        let error = execute_write_sql(
+            &mut ctx,
             "UPDATE lix_directory SET path = '/renamed/' WHERE id = 'dir-docs'",
             &[],
         )
@@ -1368,7 +1411,11 @@ mod tests {
             error.description.contains("read-only column 'path'"),
             "unexpected error: {error:?}"
         );
-        assert!(stager.lock().expect("stager lock").deltas.is_empty());
+        assert!(staged_writes
+            .lock()
+            .expect("staged writes lock")
+            .deltas
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1380,17 +1427,17 @@ mod tests {
                 live_directory_row("dir-guides", "version-b", Some("dir-docs"), "guides", false),
             ],
         });
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
 
-        let result = execute_sql(
-            &ctx,
+        let result = execute_write_sql(
+            &mut ctx,
             "DELETE FROM lix_directory_by_version \
              WHERE id = 'dir-guides' AND lixcol_version_id = 'version-b'",
             &[],
@@ -1401,9 +1448,9 @@ mod tests {
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_all_semantic_rows();
@@ -1418,17 +1465,17 @@ mod tests {
     async fn execute_sql_insert_into_file_by_version_stages_descriptor_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
 
-        let result = execute_sql(
-            &ctx,
+        let result = execute_write_sql(
+            &mut ctx,
             "INSERT INTO lix_file_by_version (\
              id, directory_id, name, extension, hidden, lixcol_version_id\
              ) VALUES ('file-readme', 'dir-docs', 'readme', 'md', false, 'version-b')",
@@ -1440,9 +1487,9 @@ mod tests {
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
@@ -1464,17 +1511,17 @@ mod tests {
     async fn execute_sql_insert_into_active_file_defaults_active_version() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
 
-        let result = execute_sql(
-            &ctx,
+        let result = execute_write_sql(
+            &mut ctx,
             "INSERT INTO lix_file (id, directory_id, name, extension, hidden) \
              VALUES ('file-readme', 'dir-docs', 'readme', 'md', false)",
             &[],
@@ -1485,9 +1532,9 @@ mod tests {
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
@@ -1500,17 +1547,17 @@ mod tests {
     async fn execute_sql_insert_into_file_with_data_stages_blob_ref() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
 
-        let result = execute_sql(
-            &ctx,
+        let result = execute_write_sql(
+            &mut ctx,
             "INSERT INTO lix_file_by_version (\
              id, directory_id, name, extension, hidden, data, lixcol_version_id\
              ) VALUES ('file-readme', 'dir-docs', 'readme', 'md', false, X'4142', 'version-b')",
@@ -1522,9 +1569,9 @@ mod tests {
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         let descriptor_rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
@@ -1568,17 +1615,17 @@ mod tests {
                 ),
             ],
         });
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
 
-        let result = execute_sql(
-            &ctx,
+        let result = execute_write_sql(
+            &mut ctx,
             "UPDATE lix_file \
              SET name = 'readme-updated', extension = 'txt', hidden = true, lixcol_metadata = '{\"source\":\"file-update\"}' \
              WHERE id = 'file-readme'",
@@ -1590,9 +1637,9 @@ mod tests {
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
@@ -1626,17 +1673,17 @@ mod tests {
                 false,
             )],
         });
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
 
-        let result = execute_sql(
-            &ctx,
+        let result = execute_write_sql(
+            &mut ctx,
             "UPDATE lix_file SET data = X'4142' WHERE id = 'file-readme'",
             &[],
         )
@@ -1646,9 +1693,9 @@ mod tests {
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         assert!(overlay
@@ -1680,17 +1727,17 @@ mod tests {
                 ),
             ],
         });
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
 
-        let result = execute_sql(
-            &ctx,
+        let result = execute_write_sql(
+            &mut ctx,
             "UPDATE lix_file SET path = '/docs/renamed.md' WHERE id = 'file-readme'",
             &[],
         )
@@ -1700,9 +1747,9 @@ mod tests {
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
@@ -1738,17 +1785,17 @@ mod tests {
                 ),
             ],
         });
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
 
-        let result = execute_sql(
-            &ctx,
+        let result = execute_write_sql(
+            &mut ctx,
             "DELETE FROM lix_file_by_version \
              WHERE id = 'file-guide' AND lixcol_version_id = 'version-b'",
             &[],
@@ -1759,9 +1806,9 @@ mod tests {
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_all_semantic_rows();
@@ -1781,12 +1828,12 @@ mod tests {
                 live_entity_row("entity-b", "version-a", "B"),
             ],
         });
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
                 "x-lix-version": "1",
@@ -1797,8 +1844,8 @@ mod tests {
             })],
         };
 
-        let result = execute_sql(
-            &ctx,
+        let result = execute_write_sql(
+            &mut ctx,
             "UPDATE test_state_schema \
              SET value = 'updated', lixcol_metadata = '{\"source\":\"entity-update\"}' \
              WHERE value = 'A'",
@@ -1810,9 +1857,9 @@ mod tests {
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
@@ -1838,12 +1885,12 @@ mod tests {
                 live_entity_row("entity-b", "version-b", "B"),
             ],
         });
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
                 "x-lix-version": "1",
@@ -1854,8 +1901,8 @@ mod tests {
             })],
         };
 
-        let result = execute_sql(
-            &ctx,
+        let result = execute_write_sql(
+            &mut ctx,
             "DELETE FROM test_state_schema_by_version \
              WHERE lixcol_version_id = 'version-b'",
             &[],
@@ -1866,9 +1913,9 @@ mod tests {
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_all_semantic_rows();
@@ -1888,17 +1935,17 @@ mod tests {
                 live_lix_state_row("entity-2", Some("{\"source\":\"skip\"}")),
             ],
         });
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
 
-        let result = execute_sql(
-            &ctx,
+        let result = execute_write_sql(
+            &mut ctx,
             "UPDATE lix_state \
              SET snapshot_content = '{\"key\":\"hello\",\"value\":\"updated\"}', \
                  metadata = schema_key \
@@ -1911,9 +1958,9 @@ mod tests {
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
@@ -1936,25 +1983,25 @@ mod tests {
                 live_lix_state_row("entity-2", Some("{\"source\":\"two\"}")),
             ],
         });
-        let stager = Arc::new(Mutex::new(CapturingStageWriteStager::default()));
-        let ctx = DummySqlExecutionContext {
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
             active_version_id: "version-a",
             blob_reader,
             live_state,
-            write_stager: Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
+            staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![],
         };
 
-        let result = execute_sql(&ctx, "DELETE FROM lix_state", &[])
+        let result = execute_write_sql(&mut ctx, "DELETE FROM lix_state", &[])
             .await
             .expect("DELETE FROM lix_state should follow DataFusion delete-all semantics");
 
         assert_eq!(result.columns, vec!["count"]);
         assert_eq!(result.rows, vec![vec![Value::Integer(2)]]);
 
-        let stager = stager.lock().expect("stager lock");
-        assert_eq!(stager.deltas.len(), 1);
-        let overlay = stager.deltas[0]
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");
         let rows = overlay.visible_all_semantic_rows();

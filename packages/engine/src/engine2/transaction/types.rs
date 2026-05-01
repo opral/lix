@@ -1,11 +1,8 @@
 use std::collections::BTreeSet;
 
-use async_trait::async_trait;
-
 use crate::engine2::entity_identity::EntityIdentity;
 use crate::engine2::live_state::LiveStateRow;
 use crate::engine2::untracked_state::UntrackedStateRow;
-use crate::LixError;
 
 /// Incoming state row before transaction hydration.
 ///
@@ -55,16 +52,6 @@ pub(crate) enum StageWrite {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StageWriteOutcome {
     pub(crate) count: u64,
-}
-
-/// Execution-scoped authority for staging decoded writes into a transaction.
-///
-/// SQL providers, session APIs, and future write frontends should all target
-/// this boundary instead of depending on concrete transaction internals.
-#[async_trait]
-#[allow(dead_code)]
-pub(crate) trait StageWriteStager: Send + Sync {
-    async fn stage_write(&self, write: StageWrite) -> Result<StageWriteOutcome, LixError>;
 }
 
 /// Transaction-hydrated state row.

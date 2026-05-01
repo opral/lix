@@ -1,12 +1,7 @@
-use std::sync::Arc;
-
-use crate::engine2::commit_graph::CommitGraphContext;
-use crate::engine2::functions::FunctionContext;
 use crate::engine2::tracked_state::{
     TrackedStateDiffRequest, TrackedStateMergePlan, TrackedStateRow,
 };
 use crate::engine2::transaction::types::StageRow;
-use crate::engine2::transaction::Transaction;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
@@ -53,126 +48,109 @@ impl SessionContext {
         &self,
         options: MergeVersionOptions,
     ) -> Result<MergeVersionReceipt, LixError> {
-        let live_state: Arc<dyn crate::engine2::live_state::LiveStateReader> =
-            Arc::new(self.live_state.reader(Arc::clone(&self.backend)));
-        let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
-        let functions = runtime_functions.provider();
-        let active_version_id = self.active_version_id().await?;
         let source_version_id = options.source_version_id;
 
-        let mut transaction = Transaction::open(
-            active_version_id.clone(),
-            &self.backend,
-            Arc::clone(&self.live_state),
-            Arc::clone(&self.binary_cas),
-            Arc::clone(&self.changelog),
-            Arc::clone(&self.version_ref),
-            Arc::clone(&self.schema_registry),
-            functions,
-        )
-        .await?;
+        self.with_write_transaction(|transaction| {
+            Box::pin(async move {
+                let active_version_id = transaction.active_version_id().to_string();
 
-        let (target_head, source_head) = {
-            let reader = self.version_ref.reader(transaction.kv_store());
-            let target_head = reader
-                .load_head_commit_id(&active_version_id)
-                .await?
-                .ok_or_else(|| {
-                    LixError::new(
+                let (target_head, source_head) = {
+                    let reader = transaction.version_ref_reader();
+                    let target_head = reader
+                        .load_head_commit_id(&active_version_id)
+                        .await?
+                        .ok_or_else(|| {
+                            LixError::new(
+                                "LIX_ERROR_UNKNOWN",
+                                format!(
+                                    "cannot merge into missing active version ref '{}'",
+                                    active_version_id
+                                ),
+                            )
+                        })?;
+                    let source_head = reader
+                        .load_head_commit_id(&source_version_id)
+                        .await?
+                        .ok_or_else(|| {
+                            LixError::new(
+                                "LIX_ERROR_UNKNOWN",
+                                format!(
+                                    "cannot merge from missing source version ref '{}'",
+                                    source_version_id
+                                ),
+                            )
+                        })?;
+                    (target_head, source_head)
+                };
+
+                let merge_base = {
+                    let mut reader = transaction.commit_graph_reader();
+                    reader.merge_base(&target_head, &source_head).await?
+                };
+
+                let merge_plan = {
+                    let mut reader = transaction.tracked_state_reader();
+                    reader
+                        .plan_merge(
+                            &merge_base.commit_id,
+                            &target_head,
+                            &source_head,
+                            &TrackedStateDiffRequest::default(),
+                        )
+                        .await?
+                };
+
+                if !merge_plan.conflicts.is_empty() {
+                    let conflict_count = merge_plan.conflicts.len();
+                    return Err(LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!(
-                            "cannot merge into missing active version ref '{}'",
-                            active_version_id
+                            "engine2 merge_version found {conflict_count} tracked-state conflict(s)"
                         ),
-                    )
-                })?;
-            let source_head = reader
-                .load_head_commit_id(&source_version_id)
-                .await?
-                .ok_or_else(|| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!(
-                            "cannot merge from missing source version ref '{}'",
-                            source_version_id
-                        ),
-                    )
-                })?;
-            (target_head, source_head)
-        };
+                    ));
+                }
 
-        let merge_base = {
-            let commit_graph = CommitGraphContext::new(self.changelog.as_ref().clone());
-            let mut reader = commit_graph.reader(transaction.kv_store());
-            reader.merge_base(&target_head, &source_head).await?
-        };
+                let rows = stage_rows_from_merge_plan(&merge_plan, &active_version_id);
+                if rows.is_empty() {
+                    return Ok(MergeVersionReceipt {
+                        outcome: MergeVersionOutcome::AlreadyUpToDate,
+                        target_version_id: active_version_id,
+                        source_version_id,
+                        merge_base_commit_id: Some(merge_base.commit_id),
+                        target_head_after_commit_id: target_head.clone(),
+                        target_head_before_commit_id: target_head,
+                        source_head_before_commit_id: source_head,
+                        created_merge_commit_id: None,
+                        applied_change_count: 0,
+                    });
+                }
 
-        let merge_plan = {
-            let mut reader = self.tracked_state.reader(transaction.kv_store());
-            reader
-                .plan_merge(
-                    &merge_base.commit_id,
-                    &target_head,
-                    &source_head,
-                    &TrackedStateDiffRequest::default(),
-                )
-                .await?
-        };
+                let applied_change_count = rows.len();
+                transaction.stage_rows(rows)?;
+                let created_merge_commit_id = transaction
+                    .staged_commit_id(&active_version_id)?
+                    .ok_or_else(|| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            "merge_version staged tracked rows without a commit id",
+                        )
+                    })?;
+                transaction.add_commit_parent(active_version_id.clone(), source_head.clone())?;
 
-        if !merge_plan.conflicts.is_empty() {
-            let conflict_count = merge_plan.conflicts.len();
-            transaction.rollback().await?;
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("engine2 merge_version found {conflict_count} tracked-state conflict(s)"),
-            ));
-        }
-
-        let rows = stage_rows_from_merge_plan(&merge_plan, &active_version_id);
-        if rows.is_empty() {
-            transaction.rollback().await?;
-            return Ok(MergeVersionReceipt {
-                outcome: MergeVersionOutcome::AlreadyUpToDate,
-                target_version_id: active_version_id,
-                source_version_id,
-                merge_base_commit_id: Some(merge_base.commit_id),
-                target_head_after_commit_id: target_head.clone(),
-                target_head_before_commit_id: target_head,
-                source_head_before_commit_id: source_head,
-                created_merge_commit_id: None,
-                applied_change_count: 0,
-            });
-        }
-
-        let applied_change_count = rows.len();
-        transaction.stage_rows(rows)?;
-        transaction.add_commit_parent(active_version_id.clone(), source_head.clone())?;
-        transaction.commit(&runtime_functions).await?;
-        let target_head_after = self
-            .version_ref
-            .reader(Arc::clone(&self.backend))
-            .load_head_commit_id(&active_version_id)
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "merge_version committed but target version ref '{}' is missing",
-                        active_version_id
-                    ),
-                )
-            })?;
-        Ok(MergeVersionReceipt {
-            outcome: MergeVersionOutcome::MergeCommitted,
-            target_version_id: active_version_id,
-            source_version_id,
-            merge_base_commit_id: Some(merge_base.commit_id),
-            target_head_before_commit_id: target_head,
-            source_head_before_commit_id: source_head,
-            created_merge_commit_id: Some(target_head_after.clone()),
-            target_head_after_commit_id: target_head_after,
-            applied_change_count,
+                Ok(MergeVersionReceipt {
+                    outcome: MergeVersionOutcome::MergeCommitted,
+                    target_version_id: active_version_id,
+                    source_version_id,
+                    merge_base_commit_id: Some(merge_base.commit_id),
+                    target_head_before_commit_id: target_head,
+                    source_head_before_commit_id: source_head,
+                    created_merge_commit_id: Some(created_merge_commit_id.clone()),
+                    target_head_after_commit_id: created_merge_commit_id,
+                    applied_change_count,
+                })
+            })
         })
+        .await
     }
 }
 

@@ -34,19 +34,21 @@ use crate::engine2::live_state::{
 };
 use crate::engine2::transaction::types::StageRow;
 use crate::engine2::version_ref::VersionRefReader;
-use crate::sql2::version_scope::resolve_provider_version_ids;
+use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
 use super::entity_history_provider::EntityHistoryProvider;
-use crate::engine2::transaction::types::{StageWrite, StageWriteStager};
+use crate::engine2::transaction::types::StageWrite;
+use crate::sql2::{
+    SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
+};
 
 pub(crate) async fn register_entity_providers(
     ctx: &SessionContext,
     active_version_id: &str,
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
-    write_stager: Option<Arc<dyn StageWriteStager>>,
     commit_graph: Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>,
     schema_definitions: &[JsonValue],
 ) -> Result<(), LixError> {
@@ -67,7 +69,6 @@ pub(crate) async fn register_entity_providers(
                 Arc::clone(&spec),
                 Arc::clone(&live_state),
                 Arc::clone(&version_ref),
-                write_stager.as_ref().map(Arc::clone),
             )),
         )
         .map_err(datafusion_error_to_lix_error)?;
@@ -78,7 +79,6 @@ pub(crate) async fn register_entity_providers(
                 Arc::clone(&spec),
                 Arc::clone(&live_state),
                 Arc::clone(&version_ref),
-                write_stager.as_ref().map(Arc::clone),
                 active_version_id.to_string(),
             )),
         )
@@ -90,6 +90,44 @@ pub(crate) async fn register_entity_providers(
             Arc::new(EntityHistoryProvider::new(
                 Arc::clone(&spec),
                 Arc::clone(&commit_graph),
+            )),
+        )
+        .map_err(datafusion_error_to_lix_error)?;
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn register_entity_write_providers(
+    ctx: &SessionContext,
+    write_ctx: SqlWriteContext,
+    schema_definitions: &[JsonValue],
+) -> Result<(), LixError> {
+    for schema in schema_definitions {
+        let spec = match derive_entity_surface_spec_from_schema(schema) {
+            Ok(spec) => Arc::new(spec),
+            Err(_) => continue,
+        };
+
+        if !schema_exposed_as_entity_surface(&spec.schema_key) {
+            continue;
+        }
+
+        let by_version_name = format!("{}_by_version", spec.schema_key);
+        ctx.register_table(
+            &by_version_name,
+            Arc::new(EntityProvider::by_version_with_write(
+                Arc::clone(&spec),
+                write_ctx.clone(),
+            )),
+        )
+        .map_err(datafusion_error_to_lix_error)?;
+
+        ctx.register_table(
+            &spec.schema_key,
+            Arc::new(EntityProvider::active_with_write(
+                Arc::clone(&spec),
+                write_ctx.clone(),
             )),
         )
         .map_err(datafusion_error_to_lix_error)?;
@@ -127,10 +165,10 @@ pub(crate) struct EntityProvider {
     spec: Arc<EntitySurfaceSpec>,
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
-    write_stager: Option<Arc<dyn StageWriteStager>>,
+    write_access: WriteAccess,
     schema: SchemaRef,
     variant: EntityProviderVariant,
-    active_version_id: Option<String>,
+    version_binding: VersionBinding,
 }
 
 impl std::fmt::Debug for EntityProvider {
@@ -147,7 +185,6 @@ impl EntityProvider {
         spec: Arc<EntitySurfaceSpec>,
         live_state: Arc<dyn LiveStateReader>,
         version_ref: Arc<dyn VersionRefReader>,
-        write_stager: Option<Arc<dyn StageWriteStager>>,
         active_version_id: String,
     ) -> Self {
         Self {
@@ -155,9 +192,24 @@ impl EntityProvider {
             spec,
             live_state,
             version_ref,
-            write_stager,
+            write_access: WriteAccess::read_only(),
             variant: EntityProviderVariant::Active,
-            active_version_id: Some(active_version_id),
+            version_binding: VersionBinding::active(active_version_id),
+        }
+    }
+
+    fn active_with_write(spec: Arc<EntitySurfaceSpec>, write_ctx: SqlWriteContext) -> Self {
+        let active_version_id = write_ctx.active_version_id();
+        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let version_ref = Arc::new(WriteContextVersionRefReader::new(write_ctx.clone()));
+        Self {
+            schema: entity_surface_schema(&spec, EntityProviderVariant::Active),
+            spec,
+            live_state,
+            version_ref,
+            write_access: WriteAccess::write(write_ctx),
+            variant: EntityProviderVariant::Active,
+            version_binding: VersionBinding::active(active_version_id),
         }
     }
 
@@ -165,16 +217,29 @@ impl EntityProvider {
         spec: Arc<EntitySurfaceSpec>,
         live_state: Arc<dyn LiveStateReader>,
         version_ref: Arc<dyn VersionRefReader>,
-        write_stager: Option<Arc<dyn StageWriteStager>>,
     ) -> Self {
         Self {
             schema: entity_surface_schema(&spec, EntityProviderVariant::ByVersion),
             spec,
             live_state,
             version_ref,
-            write_stager,
+            write_access: WriteAccess::read_only(),
             variant: EntityProviderVariant::ByVersion,
-            active_version_id: None,
+            version_binding: VersionBinding::explicit(),
+        }
+    }
+
+    fn by_version_with_write(spec: Arc<EntitySurfaceSpec>, write_ctx: SqlWriteContext) -> Self {
+        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let version_ref = Arc::new(WriteContextVersionRefReader::new(write_ctx.clone()));
+        Self {
+            schema: entity_surface_schema(&spec, EntityProviderVariant::ByVersion),
+            spec,
+            live_state,
+            version_ref,
+            write_access: WriteAccess::write(write_ctx),
+            variant: EntityProviderVariant::ByVersion,
+            version_binding: VersionBinding::explicit(),
         }
     }
 }
@@ -213,12 +278,12 @@ impl TableProvider for EntityProvider {
         let projected_schema = projected_schema(&self.schema, projection)?;
         let mut request = entity_live_state_scan_request(
             &self.spec.schema_key,
-            self.active_version_id.as_deref(),
+            self.version_binding.active_version_id(),
             limit,
         );
         request.filter.version_ids = resolve_provider_version_ids(
             self.version_ref.as_ref(),
-            self.active_version_id.as_deref(),
+            &self.version_binding,
             request.filter.version_ids,
         )
         .await
@@ -242,16 +307,14 @@ impl TableProvider for EntityProvider {
             return not_impl_err!("{insert_op} not implemented for entity surfaces yet");
         }
 
-        let Some(write_stager) = &self.write_stager else {
-            return Err(DataFusionError::Execution(format!(
-                "INSERT into {} entity surface requires a write transaction",
-                self.spec.schema_key
-            )));
-        };
+        let write_ctx = self.write_access.require_write(&format!(
+            "INSERT into {} entity surface",
+            self.spec.schema_key
+        ))?;
 
-        let insert_default_version = match self.variant {
-            EntityProviderVariant::Active => self.active_version_id.clone(),
-            EntityProviderVariant::ByVersion => None,
+        let insert_version_binding = match self.variant {
+            EntityProviderVariant::Active => self.version_binding.clone(),
+            EntityProviderVariant::ByVersion => VersionBinding::explicit(),
             EntityProviderVariant::History => {
                 return not_impl_err!("INSERT is not implemented for entity history surfaces");
             }
@@ -260,8 +323,8 @@ impl TableProvider for EntityProvider {
         let sink = EntityInsertSink::new(
             Arc::clone(&self.spec),
             input.schema(),
-            Arc::clone(write_stager),
-            insert_default_version,
+            write_ctx.clone(),
+            insert_version_binding,
         );
         Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
     }
@@ -271,16 +334,14 @@ impl TableProvider for EntityProvider {
         state: &dyn Session,
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let Some(write_stager) = &self.write_stager else {
-            return Err(DataFusionError::Execution(format!(
-                "DELETE FROM {} entity surface requires a write transaction",
-                self.spec.schema_key
-            )));
-        };
+        let write_ctx = self.write_access.require_write(&format!(
+            "DELETE FROM {} entity surface",
+            self.spec.schema_key
+        ))?;
 
-        let default_version_id = match self.variant {
-            EntityProviderVariant::Active => self.active_version_id.clone(),
-            EntityProviderVariant::ByVersion => None,
+        let version_binding = match self.variant {
+            EntityProviderVariant::Active => self.version_binding.clone(),
+            EntityProviderVariant::ByVersion => VersionBinding::explicit(),
             EntityProviderVariant::History => {
                 return not_impl_err!("DELETE is not implemented for entity history surfaces");
             }
@@ -293,16 +354,15 @@ impl TableProvider for EntityProvider {
             .collect::<Result<Vec<_>>>()?;
         let request = entity_live_state_scan_request(
             &self.spec.schema_key,
-            default_version_id.as_deref(),
+            version_binding.active_version_id(),
             None,
         );
 
         Ok(Arc::new(EntityDeleteExec::new(
             Arc::clone(&self.spec),
-            Arc::clone(&self.live_state),
-            Arc::clone(write_stager),
+            write_ctx.clone(),
             Arc::clone(&self.schema),
-            default_version_id,
+            version_binding,
             request,
             physical_filters,
         )))
@@ -314,18 +374,15 @@ impl TableProvider for EntityProvider {
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let Some(write_stager) = &self.write_stager else {
-            return Err(DataFusionError::Execution(format!(
-                "UPDATE {} entity surface requires a write transaction",
-                self.spec.schema_key
-            )));
-        };
+        let write_ctx = self
+            .write_access
+            .require_write(&format!("UPDATE {} entity surface", self.spec.schema_key))?;
 
         validate_entity_update_assignments(&self.spec, &self.schema, &assignments)?;
 
-        let default_version_id = match self.variant {
-            EntityProviderVariant::Active => self.active_version_id.clone(),
-            EntityProviderVariant::ByVersion => None,
+        let version_binding = match self.variant {
+            EntityProviderVariant::Active => self.version_binding.clone(),
+            EntityProviderVariant::ByVersion => VersionBinding::explicit(),
             EntityProviderVariant::History => {
                 return not_impl_err!("UPDATE is not implemented for entity history surfaces");
             }
@@ -347,16 +404,15 @@ impl TableProvider for EntityProvider {
             .collect::<Result<Vec<_>>>()?;
         let request = entity_live_state_scan_request(
             &self.spec.schema_key,
-            default_version_id.as_deref(),
+            version_binding.active_version_id(),
             None,
         );
 
         Ok(Arc::new(EntityUpdateExec::new(
             Arc::clone(&self.spec),
-            Arc::clone(&self.live_state),
-            Arc::clone(write_stager),
+            write_ctx.clone(),
             Arc::clone(&self.schema),
-            default_version_id,
+            version_binding,
             request,
             physical_assignments,
             physical_filters,
@@ -367,8 +423,8 @@ impl TableProvider for EntityProvider {
 struct EntityInsertSink {
     spec: Arc<EntitySurfaceSpec>,
     schema: SchemaRef,
-    write_stager: Arc<dyn StageWriteStager>,
-    default_version_id: Option<String>,
+    write_ctx: SqlWriteContext,
+    version_binding: VersionBinding,
 }
 
 impl std::fmt::Debug for EntityInsertSink {
@@ -383,14 +439,14 @@ impl EntityInsertSink {
     fn new(
         spec: Arc<EntitySurfaceSpec>,
         schema: SchemaRef,
-        write_stager: Arc<dyn StageWriteStager>,
-        default_version_id: Option<String>,
+        write_ctx: SqlWriteContext,
+        version_binding: VersionBinding,
     ) -> Self {
         Self {
             spec,
             schema,
-            write_stager,
-            default_version_id,
+            write_ctx,
+            version_binding,
         }
     }
 }
@@ -426,13 +482,13 @@ impl DataSink for EntityInsertSink {
             rows.extend(entity_lix_state_write_rows_from_batch(
                 &self.spec,
                 &batch,
-                self.default_version_id.as_deref(),
+                self.version_binding.active_version_id(),
             )?);
         }
         let count = u64::try_from(rows.len())
             .map_err(|_| DataFusionError::Execution("entity INSERT row count overflow".into()))?;
 
-        self.write_stager
+        self.write_ctx
             .stage_write(StageWrite::Rows { rows })
             .await
             .map_err(lix_error_to_datafusion_error)?;
@@ -441,12 +497,12 @@ impl DataSink for EntityInsertSink {
     }
 }
 
+#[allow(dead_code)]
 struct EntityDeleteExec {
     spec: Arc<EntitySurfaceSpec>,
-    live_state: Arc<dyn LiveStateReader>,
-    write_stager: Arc<dyn StageWriteStager>,
+    write_ctx: SqlWriteContext,
     table_schema: SchemaRef,
-    default_version_id: Option<String>,
+    version_binding: VersionBinding,
     request: LiveStateScanRequest,
     filters: Vec<Arc<dyn PhysicalExpr>>,
     result_schema: SchemaRef,
@@ -464,10 +520,9 @@ impl std::fmt::Debug for EntityDeleteExec {
 impl EntityDeleteExec {
     fn new(
         spec: Arc<EntitySurfaceSpec>,
-        live_state: Arc<dyn LiveStateReader>,
-        write_stager: Arc<dyn StageWriteStager>,
+        write_ctx: SqlWriteContext,
         table_schema: SchemaRef,
-        default_version_id: Option<String>,
+        version_binding: VersionBinding,
         request: LiveStateScanRequest,
         filters: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Self {
@@ -480,10 +535,9 @@ impl EntityDeleteExec {
         );
         Self {
             spec,
-            live_state,
-            write_stager,
+            write_ctx,
             table_schema,
-            default_version_id,
+            version_binding,
             request,
             filters,
             result_schema,
@@ -549,10 +603,9 @@ impl ExecutionPlan for EntityDeleteExec {
         }
 
         let spec = Arc::clone(&self.spec);
-        let live_state = Arc::clone(&self.live_state);
-        let write_stager = Arc::clone(&self.write_stager);
+        let write_ctx = self.write_ctx.clone();
         let table_schema = Arc::clone(&self.table_schema);
-        let default_version_id = self.default_version_id.clone();
+        let version_binding = self.version_binding.clone();
         let request = self.request.clone();
         let filters = self.filters.clone();
         let result_schema = Arc::clone(&self.result_schema);
@@ -562,8 +615,8 @@ impl ExecutionPlan for EntityDeleteExec {
             let rows = if request.limit == Some(0) {
                 Vec::new()
             } else {
-                live_state
-                    .scan_rows(&request)
+                write_ctx
+                    .scan_live_state(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?
             };
@@ -572,7 +625,7 @@ impl ExecutionPlan for EntityDeleteExec {
             let mut write_rows = entity_existing_lix_state_write_rows_from_batch(
                 &spec,
                 &matched_batch,
-                default_version_id.as_deref(),
+                version_binding.active_version_id(),
             )?;
             for row in &mut write_rows {
                 row.snapshot_content = None;
@@ -582,7 +635,7 @@ impl ExecutionPlan for EntityDeleteExec {
             })?;
 
             if count > 0 {
-                write_stager
+                write_ctx
                     .stage_write(StageWrite::Rows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
@@ -601,12 +654,12 @@ impl ExecutionPlan for EntityDeleteExec {
     }
 }
 
+#[allow(dead_code)]
 struct EntityUpdateExec {
     spec: Arc<EntitySurfaceSpec>,
-    live_state: Arc<dyn LiveStateReader>,
-    write_stager: Arc<dyn StageWriteStager>,
+    write_ctx: SqlWriteContext,
     table_schema: SchemaRef,
-    default_version_id: Option<String>,
+    version_binding: VersionBinding,
     request: LiveStateScanRequest,
     assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
     filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -625,10 +678,9 @@ impl std::fmt::Debug for EntityUpdateExec {
 impl EntityUpdateExec {
     fn new(
         spec: Arc<EntitySurfaceSpec>,
-        live_state: Arc<dyn LiveStateReader>,
-        write_stager: Arc<dyn StageWriteStager>,
+        write_ctx: SqlWriteContext,
         table_schema: SchemaRef,
-        default_version_id: Option<String>,
+        version_binding: VersionBinding,
         request: LiveStateScanRequest,
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -642,10 +694,9 @@ impl EntityUpdateExec {
         );
         Self {
             spec,
-            live_state,
-            write_stager,
+            write_ctx,
             table_schema,
-            default_version_id,
+            version_binding,
             request,
             assignments,
             filters,
@@ -713,10 +764,9 @@ impl ExecutionPlan for EntityUpdateExec {
         }
 
         let spec = Arc::clone(&self.spec);
-        let live_state = Arc::clone(&self.live_state);
-        let write_stager = Arc::clone(&self.write_stager);
+        let write_ctx = self.write_ctx.clone();
         let table_schema = Arc::clone(&self.table_schema);
-        let default_version_id = self.default_version_id.clone();
+        let version_binding = self.version_binding.clone();
         let request = self.request.clone();
         let assignments = self.assignments.clone();
         let filters = self.filters.clone();
@@ -727,8 +777,8 @@ impl ExecutionPlan for EntityUpdateExec {
             let rows = if request.limit == Some(0) {
                 Vec::new()
             } else {
-                live_state
-                    .scan_rows(&request)
+                write_ctx
+                    .scan_live_state(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?
             };
@@ -739,14 +789,14 @@ impl ExecutionPlan for EntityUpdateExec {
             let write_rows = entity_existing_lix_state_write_rows_from_batch(
                 &spec,
                 &updated_batch,
-                default_version_id.as_deref(),
+                version_binding.active_version_id(),
             )?;
             let count = u64::try_from(write_rows.len()).map_err(|_| {
                 DataFusionError::Execution("entity UPDATE row count overflow".to_string())
             })?;
 
             if count > 0 {
-                write_stager
+                write_ctx
                     .stage_write(StageWrite::Rows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
@@ -878,23 +928,23 @@ fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
 fn entity_lix_state_write_rows_from_batch(
     spec: &EntitySurfaceSpec,
     batch: &RecordBatch,
-    default_version_id: Option<&str>,
+    version_binding: Option<&str>,
 ) -> Result<Vec<StageRow>> {
-    entity_lix_state_write_rows_from_batch_with_options(spec, batch, default_version_id, true)
+    entity_lix_state_write_rows_from_batch_with_options(spec, batch, version_binding, true)
 }
 
 fn entity_existing_lix_state_write_rows_from_batch(
     spec: &EntitySurfaceSpec,
     batch: &RecordBatch,
-    default_version_id: Option<&str>,
+    version_binding: Option<&str>,
 ) -> Result<Vec<StageRow>> {
-    entity_lix_state_write_rows_from_batch_with_options(spec, batch, default_version_id, false)
+    entity_lix_state_write_rows_from_batch_with_options(spec, batch, version_binding, false)
 }
 
 fn entity_lix_state_write_rows_from_batch_with_options(
     spec: &EntitySurfaceSpec,
     batch: &RecordBatch,
-    default_version_id: Option<&str>,
+    version_binding: Option<&str>,
     reject_read_only_fields: bool,
 ) -> Result<Vec<StageRow>> {
     (0..batch.num_rows())
@@ -904,7 +954,7 @@ fn entity_lix_state_write_rows_from_batch_with_options(
                 GLOBAL_VERSION_ID.to_string()
             } else {
                 optional_string_value(batch, row_index, "lixcol_version_id")?
-                    .or_else(|| default_version_id.map(ToOwned::to_owned))
+                    .or_else(|| version_binding.map(ToOwned::to_owned))
                     .ok_or_else(|| {
                         DataFusionError::Execution(format!(
                             "INSERT into {}_by_version requires lixcol_version_id",
@@ -1814,7 +1864,7 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use async_trait::async_trait;
     use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
@@ -1832,20 +1882,24 @@ mod tests {
         entity_record_batch, entity_surface_schema, schema_exposed_as_entity_surface,
         EntityColumnType, EntityInsertSink, EntityProviderVariant,
     };
+    use crate::binary_cas::BlobDataReader;
+    use crate::engine2::functions::{
+        FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
+    };
     use crate::engine2::live_state::{
         LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
-    use crate::engine2::transaction::types::{
-        StageRow, StageWrite, StageWriteOutcome, StageWriteStager,
-    };
+    use crate::engine2::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
     use crate::engine2::version_ref::{VersionHead, VersionRefReader};
+    use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
     use crate::LixError;
 
     struct EmptyLiveStateReader;
     struct EmptyVersionRefReader;
     #[derive(Default)]
-    struct CapturingWriteStager {
-        writes: Mutex<Vec<StageWrite>>,
+    struct CapturingWriteContext {
+        rows: Vec<LiveStateRow>,
+        writes: Vec<StageWrite>,
     }
 
     #[async_trait]
@@ -1880,10 +1934,56 @@ mod tests {
         Arc::new(EmptyVersionRefReader)
     }
 
+    fn test_functions() -> FunctionProviderHandle {
+        SharedFunctionProvider::new(
+            Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>
+        )
+    }
+
     #[async_trait]
-    impl StageWriteStager for CapturingWriteStager {
-        async fn stage_write(&self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
-            self.writes.lock().expect("writes lock").push(write);
+    impl BlobDataReader for CapturingWriteContext {
+        async fn load_blob_data_by_hash(
+            &self,
+            _blob_hash: &str,
+        ) -> Result<Option<Vec<u8>>, LixError> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait]
+    impl SqlWriteExecutionContext for CapturingWriteContext {
+        fn active_version_id(&self) -> &str {
+            "version-a"
+        }
+
+        fn functions(&self) -> FunctionProviderHandle {
+            test_functions()
+        }
+
+        fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
+            Arc::new(CapturingWriteContext::default())
+        }
+
+        fn list_visible_schemas(&self) -> Result<Vec<serde_json::Value>, LixError> {
+            Ok(Vec::new())
+        }
+
+        async fn scan_live_state(
+            &mut self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<Vec<LiveStateRow>, LixError> {
+            Ok(self.rows.clone())
+        }
+
+        async fn load_version_head(
+            &mut self,
+            _version_id: &str,
+        ) -> Result<Option<String>, LixError> {
+            Ok(None)
+        }
+
+        async fn stage_write(&mut self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
+            self.writes.push(write);
             Ok(StageWriteOutcome { count: 0 })
         }
     }
@@ -2298,13 +2398,14 @@ mod tests {
     #[tokio::test]
     async fn entity_insert_sink_stages_decoded_lix_state_rows() {
         let spec = entity_insert_spec();
-        let stager = Arc::new(CapturingWriteStager::default());
+        let mut write_context = CapturingWriteContext::default();
+        let write_ctx = SqlWriteContext::new(&mut write_context);
         let batch = entity_insert_batch(true, false);
         let sink = EntityInsertSink::new(
             Arc::clone(&spec),
             batch.schema(),
-            Arc::clone(&stager) as Arc<dyn StageWriteStager>,
-            None,
+            write_ctx,
+            super::VersionBinding::explicit(),
         );
         let stream = stream::iter(vec![Ok(batch)]);
         let stream: SendableRecordBatchStream =
@@ -2317,7 +2418,7 @@ mod tests {
 
         assert_eq!(count, 1);
         assert_eq!(
-            stager.writes.lock().expect("writes lock").as_slice(),
+            write_context.writes.as_slice(),
             &[StageWrite::Rows {
                 rows: vec![StageRow {
                     entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single("entity-1")),

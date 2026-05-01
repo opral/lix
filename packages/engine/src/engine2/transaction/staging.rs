@@ -1,14 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
-use async_trait::async_trait;
-
 use crate::engine2::functions::{FunctionProvider, FunctionProviderHandle};
 use crate::engine2::live_state::{LiveStateRow, LiveStateRowRequest, LiveStateScanRequest};
 use crate::engine2::transaction::normalization::{normalize_stage_row, TransactionSchemaCatalog};
-use crate::engine2::transaction::types::{
-    StageFileData, StageRow, StageWrite, StageWriteOutcome, StageWriteStager,
-};
+use crate::engine2::transaction::types::{StageFileData, StageRow, StageWrite, StageWriteOutcome};
 use crate::engine2::transaction::types::{StagedCommitMembers, StagedStateRow};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
@@ -108,6 +104,18 @@ impl TransactionStagedWrites {
             parents.push(parent_commit_id);
         }
         Ok(())
+    }
+
+    pub(crate) fn staged_commit_id(&self, version_id: &str) -> Result<Option<String>, LixError> {
+        let guard = self.commit_members_by_version.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged commit membership lock",
+            )
+        })?;
+        Ok(guard
+            .get(version_id)
+            .map(|members| members.commit_id.clone()))
     }
 
     /// Builds the transaction-local read overlay from currently staged writes.
@@ -214,13 +222,6 @@ impl TransactionStagedWrites {
             state_rows.push(hydrate_state_write_row(row, functions)?);
         }
         Ok(())
-    }
-}
-
-#[async_trait]
-impl StageWriteStager for TransactionStagedWrites {
-    async fn stage_write(&self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
-        TransactionStagedWrites::stage_write(self, write)
     }
 }
 

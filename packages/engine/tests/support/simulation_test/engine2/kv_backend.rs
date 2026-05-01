@@ -51,7 +51,7 @@ impl LixBackend for InMemoryKvBackend {
     async fn begin_transaction(
         &self,
         mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
         Ok(Box::new(InMemoryKvTransaction {
             data: Arc::clone(&self.data),
             pending: BTreeMap::new(),
@@ -63,7 +63,7 @@ impl LixBackend for InMemoryKvBackend {
     async fn begin_savepoint(
         &self,
         _name: &str,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
         Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             "simulation_test2 backend does not support savepoints",

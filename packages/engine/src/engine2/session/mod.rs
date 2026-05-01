@@ -1,3 +1,12 @@
+//! Engine2 session boundary.
+//!
+//! Transaction invariant:
+//! any engine2 operation that may write must enter through
+//! `SessionContext::with_write_transaction`. Reads that influence writes are
+//! only available from the transaction capability. Session APIs must not
+//! open `Transaction` directly or use session-level read helpers inside write
+//! flows.
+
 mod context;
 mod create_version;
 mod execute;
@@ -5,6 +14,7 @@ mod merge_version;
 mod switch_version;
 
 pub use context::SessionContext;
+pub(crate) use context::{SessionMode, WORKSPACE_VERSION_KEY};
 pub use create_version::{CreateVersionOptions, CreateVersionReceipt};
 pub use execute::{ExecuteResult, Row, RowRef, RowSet};
 pub use merge_version::{MergeVersionOptions, MergeVersionOutcome, MergeVersionReceipt};

@@ -32,18 +32,20 @@ use crate::engine2::live_state::{
 };
 use crate::engine2::transaction::types::StageRow;
 use crate::engine2::version_ref::VersionRefReader;
-use crate::sql2::version_scope::resolve_provider_version_ids;
+use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
-use crate::engine2::transaction::types::{StageWrite, StageWriteStager};
+use crate::engine2::transaction::types::StageWrite;
+use crate::sql2::{
+    SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
+};
 
 pub(crate) async fn register_lix_state_providers(
     session: &SessionContext,
     active_version_id: &str,
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
-    write_stager: Option<Arc<dyn StageWriteStager>>,
 ) -> Result<(), LixError> {
     session
         .register_table(
@@ -51,7 +53,6 @@ pub(crate) async fn register_lix_state_providers(
             Arc::new(LixStateProvider::by_version(
                 Arc::clone(&live_state),
                 Arc::clone(&version_ref),
-                None,
             )),
         )
         .map_err(datafusion_error_to_lix_error)?;
@@ -62,8 +63,26 @@ pub(crate) async fn register_lix_state_providers(
                 active_version_id,
                 live_state,
                 version_ref,
-                write_stager,
             )),
+        )
+        .map_err(datafusion_error_to_lix_error)?;
+    Ok(())
+}
+
+pub(crate) async fn register_lix_state_write_providers(
+    session: &SessionContext,
+    write_ctx: SqlWriteContext,
+) -> Result<(), LixError> {
+    session
+        .register_table(
+            "lix_state_by_version",
+            Arc::new(LixStateProvider::by_version_with_write(write_ctx.clone())),
+        )
+        .map_err(datafusion_error_to_lix_error)?;
+    session
+        .register_table(
+            "lix_state",
+            Arc::new(LixStateProvider::active_version_with_write(write_ctx)),
         )
         .map_err(datafusion_error_to_lix_error)?;
     Ok(())
@@ -73,14 +92,14 @@ pub(crate) struct LixStateProvider {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
-    write_stager: Option<Arc<dyn StageWriteStager>>,
-    default_version_id: Option<String>,
+    write_access: WriteAccess,
+    version_binding: VersionBinding,
 }
 
 impl std::fmt::Debug for LixStateProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LixStateProvider")
-            .field("has_write_stager", &self.write_stager.is_some())
+            .field("write_access", &self.write_access.is_write())
             .finish()
     }
 }
@@ -90,28 +109,51 @@ impl LixStateProvider {
         active_version_id: impl Into<String>,
         live_state: Arc<dyn LiveStateReader>,
         version_ref: Arc<dyn VersionRefReader>,
-        write_stager: Option<Arc<dyn StageWriteStager>>,
     ) -> Self {
         Self {
             schema: lix_state_schema(),
             live_state,
             version_ref,
-            write_stager,
-            default_version_id: Some(active_version_id.into()),
+            write_access: WriteAccess::read_only(),
+            version_binding: VersionBinding::active(active_version_id),
+        }
+    }
+
+    pub(crate) fn active_version_with_write(write_ctx: SqlWriteContext) -> Self {
+        let active_version_id = write_ctx.active_version_id();
+        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let version_ref = Arc::new(WriteContextVersionRefReader::new(write_ctx.clone()));
+        Self {
+            schema: lix_state_schema(),
+            live_state,
+            version_ref,
+            write_access: WriteAccess::write(write_ctx),
+            version_binding: VersionBinding::active(active_version_id),
         }
     }
 
     pub(crate) fn by_version(
         live_state: Arc<dyn LiveStateReader>,
         version_ref: Arc<dyn VersionRefReader>,
-        write_stager: Option<Arc<dyn StageWriteStager>>,
     ) -> Self {
         Self {
             schema: lix_state_by_version_schema(),
             live_state,
             version_ref,
-            write_stager,
-            default_version_id: None,
+            write_access: WriteAccess::read_only(),
+            version_binding: VersionBinding::explicit(),
+        }
+    }
+
+    pub(crate) fn by_version_with_write(write_ctx: SqlWriteContext) -> Self {
+        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let version_ref = Arc::new(WriteContextVersionRefReader::new(write_ctx.clone()));
+        Self {
+            schema: lix_state_by_version_schema(),
+            live_state,
+            version_ref,
+            write_access: WriteAccess::write(write_ctx),
+            version_binding: VersionBinding::explicit(),
         }
     }
 }
@@ -157,7 +199,7 @@ impl TableProvider for LixStateProvider {
         let projected_schema = projected_schema(&self.schema, projection)?;
         let mut request = lix_state_scan_request(
             &self.schema,
-            self.default_version_id.as_deref(),
+            self.version_binding.active_version_id(),
             projection,
             &route,
             limit,
@@ -165,7 +207,7 @@ impl TableProvider for LixStateProvider {
         if !route.contradictory {
             request.filter.version_ids = resolve_provider_version_ids(
                 self.version_ref.as_ref(),
-                self.default_version_id.as_deref(),
+                &self.version_binding,
                 request.filter.version_ids,
             )
             .await
@@ -188,25 +230,20 @@ impl TableProvider for LixStateProvider {
             return not_impl_err!("{insert_op} not implemented for lix_state yet");
         }
 
-        let Some(default_version_id) = &self.default_version_id else {
-            return Err(DataFusionError::Execution(
-                "INSERT is only supported for active lix_state".to_string(),
-            ));
-        };
+        let active_version_id = self
+            .version_binding
+            .require_active_version_id("INSERT")
+            .map_err(lix_error_to_datafusion_error)?;
 
-        let Some(write_stager) = &self.write_stager else {
-            return Err(DataFusionError::Execution(
-                "INSERT into lix_state requires a write transaction".to_string(),
-            ));
-        };
+        let write_ctx = self.write_access.require_write("INSERT into lix_state")?;
 
         self.schema
             .logically_equivalent_names_and_types(&input.schema())?;
 
         let sink = LixStateInsertSink::new(
             Arc::clone(&self.schema),
-            Arc::clone(write_stager),
-            default_version_id.clone(),
+            write_ctx.clone(),
+            active_version_id,
         );
         Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
     }
@@ -216,17 +253,12 @@ impl TableProvider for LixStateProvider {
         state: &dyn Session,
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let Some(default_version_id) = &self.default_version_id else {
-            return Err(DataFusionError::Execution(
-                "DELETE is only supported for active lix_state".to_string(),
-            ));
-        };
+        let active_version_id = self
+            .version_binding
+            .require_active_version_id("DELETE")
+            .map_err(lix_error_to_datafusion_error)?;
 
-        let Some(write_stager) = &self.write_stager else {
-            return Err(DataFusionError::Execution(
-                "DELETE FROM lix_state requires a write transaction".to_string(),
-            ));
-        };
+        let write_ctx = self.write_access.require_write("DELETE FROM lix_state")?;
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
         let physical_filters = filters
@@ -236,13 +268,12 @@ impl TableProvider for LixStateProvider {
 
         let route = LixStateByVersionRoute::from_filters(&filters);
         let request =
-            lix_state_scan_request(&self.schema, Some(default_version_id), None, &route, None);
+            lix_state_scan_request(&self.schema, Some(&active_version_id), None, &route, None);
 
         Ok(Arc::new(LixStateDeleteExec::new(
-            Arc::clone(&self.live_state),
-            Arc::clone(write_stager),
+            write_ctx.clone(),
             Arc::clone(&self.schema),
-            default_version_id.clone(),
+            active_version_id,
             request,
             physical_filters,
         )))
@@ -254,17 +285,12 @@ impl TableProvider for LixStateProvider {
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let Some(default_version_id) = &self.default_version_id else {
-            return Err(DataFusionError::Execution(
-                "UPDATE is only supported for active lix_state".to_string(),
-            ));
-        };
+        let active_version_id = self
+            .version_binding
+            .require_active_version_id("UPDATE")
+            .map_err(lix_error_to_datafusion_error)?;
 
-        let Some(write_stager) = &self.write_stager else {
-            return Err(DataFusionError::Execution(
-                "UPDATE lix_state requires a write transaction".to_string(),
-            ));
-        };
+        let write_ctx = self.write_access.require_write("UPDATE lix_state")?;
 
         validate_lix_state_update_assignments(&self.schema, &assignments)?;
 
@@ -285,13 +311,12 @@ impl TableProvider for LixStateProvider {
 
         let route = LixStateByVersionRoute::from_filters(&filters);
         let request =
-            lix_state_scan_request(&self.schema, Some(default_version_id), None, &route, None);
+            lix_state_scan_request(&self.schema, Some(&active_version_id), None, &route, None);
 
         Ok(Arc::new(LixStateUpdateExec::new(
-            Arc::clone(&self.live_state),
-            Arc::clone(write_stager),
+            write_ctx.clone(),
             Arc::clone(&self.schema),
-            default_version_id.clone(),
+            active_version_id,
             request,
             physical_assignments,
             physical_filters,
@@ -301,8 +326,8 @@ impl TableProvider for LixStateProvider {
 
 struct LixStateInsertSink {
     schema: SchemaRef,
-    write_stager: Arc<dyn StageWriteStager>,
-    default_version_id: String,
+    write_ctx: SqlWriteContext,
+    version_binding: String,
 }
 
 impl std::fmt::Debug for LixStateInsertSink {
@@ -312,15 +337,11 @@ impl std::fmt::Debug for LixStateInsertSink {
 }
 
 impl LixStateInsertSink {
-    fn new(
-        schema: SchemaRef,
-        write_stager: Arc<dyn StageWriteStager>,
-        default_version_id: String,
-    ) -> Self {
+    fn new(schema: SchemaRef, write_ctx: SqlWriteContext, version_binding: String) -> Self {
         Self {
             schema,
-            write_stager,
-            default_version_id,
+            write_ctx,
+            version_binding,
         }
     }
 }
@@ -355,13 +376,13 @@ impl DataSink for LixStateInsertSink {
         while let Some(batch) = data.next().await.transpose()? {
             rows.extend(lix_state_write_rows_from_batch(
                 &batch,
-                &self.default_version_id,
+                &self.version_binding,
             )?);
         }
         let count = u64::try_from(rows.len())
             .map_err(|_| DataFusionError::Execution("INSERT row count overflow".into()))?;
 
-        self.write_stager
+        self.write_ctx
             .stage_write(StageWrite::Rows { rows })
             .await
             .map_err(lix_error_to_datafusion_error)?;
@@ -370,11 +391,11 @@ impl DataSink for LixStateInsertSink {
     }
 }
 
+#[allow(dead_code)]
 struct LixStateDeleteExec {
-    live_state: Arc<dyn LiveStateReader>,
-    write_stager: Arc<dyn StageWriteStager>,
+    write_ctx: SqlWriteContext,
     table_schema: SchemaRef,
-    default_version_id: String,
+    version_binding: String,
     request: LiveStateScanRequest,
     filters: Vec<Arc<dyn PhysicalExpr>>,
     result_schema: SchemaRef,
@@ -389,10 +410,9 @@ impl std::fmt::Debug for LixStateDeleteExec {
 
 impl LixStateDeleteExec {
     fn new(
-        live_state: Arc<dyn LiveStateReader>,
-        write_stager: Arc<dyn StageWriteStager>,
+        write_ctx: SqlWriteContext,
         table_schema: SchemaRef,
-        default_version_id: String,
+        version_binding: String,
         request: LiveStateScanRequest,
         filters: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Self {
@@ -404,10 +424,9 @@ impl LixStateDeleteExec {
             Boundedness::Bounded,
         );
         Self {
-            live_state,
-            write_stager,
+            write_ctx,
             table_schema,
-            default_version_id,
+            version_binding,
             request,
             filters,
             result_schema,
@@ -466,11 +485,9 @@ impl ExecutionPlan for LixStateDeleteExec {
                 "LixStateDeleteExec only exposes one partition, got {partition}"
             )));
         }
-
-        let live_state = Arc::clone(&self.live_state);
-        let write_stager = Arc::clone(&self.write_stager);
+        let write_ctx = self.write_ctx.clone();
         let table_schema = Arc::clone(&self.table_schema);
-        let default_version_id = self.default_version_id.clone();
+        let version_binding = self.version_binding.clone();
         let request = self.request.clone();
         let filters = self.filters.clone();
         let result_schema = Arc::clone(&self.result_schema);
@@ -480,8 +497,8 @@ impl ExecutionPlan for LixStateDeleteExec {
             let rows = if request.limit == Some(0) {
                 Vec::new()
             } else {
-                live_state
-                    .scan_rows(&request)
+                write_ctx
+                    .scan_live_state(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?
             };
@@ -489,12 +506,12 @@ impl ExecutionPlan for LixStateDeleteExec {
                 .map_err(lix_error_to_datafusion_error)?;
             let matched_batch = filter_lix_state_batch(source_batch, &filters)?;
             let write_rows =
-                lix_state_deletable_write_rows_from_batch(&matched_batch, &default_version_id)?;
+                lix_state_deletable_write_rows_from_batch(&matched_batch, &version_binding)?;
             let count = u64::try_from(write_rows.len())
                 .map_err(|_| DataFusionError::Execution("DELETE row count overflow".to_string()))?;
 
             if count > 0 {
-                write_stager
+                write_ctx
                     .stage_write(StageWrite::Rows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
@@ -512,11 +529,11 @@ impl ExecutionPlan for LixStateDeleteExec {
     }
 }
 
+#[allow(dead_code)]
 struct LixStateUpdateExec {
-    live_state: Arc<dyn LiveStateReader>,
-    write_stager: Arc<dyn StageWriteStager>,
+    write_ctx: SqlWriteContext,
     table_schema: SchemaRef,
-    default_version_id: String,
+    version_binding: String,
     request: LiveStateScanRequest,
     assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
     filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -532,10 +549,9 @@ impl std::fmt::Debug for LixStateUpdateExec {
 
 impl LixStateUpdateExec {
     fn new(
-        live_state: Arc<dyn LiveStateReader>,
-        write_stager: Arc<dyn StageWriteStager>,
+        write_ctx: SqlWriteContext,
         table_schema: SchemaRef,
-        default_version_id: String,
+        version_binding: String,
         request: LiveStateScanRequest,
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -548,10 +564,9 @@ impl LixStateUpdateExec {
             Boundedness::Bounded,
         );
         Self {
-            live_state,
-            write_stager,
+            write_ctx,
             table_schema,
-            default_version_id,
+            version_binding,
             request,
             assignments,
             filters,
@@ -616,11 +631,9 @@ impl ExecutionPlan for LixStateUpdateExec {
                 "LixStateUpdateExec only exposes one partition, got {partition}"
             )));
         }
-
-        let live_state = Arc::clone(&self.live_state);
-        let write_stager = Arc::clone(&self.write_stager);
+        let write_ctx = self.write_ctx.clone();
         let table_schema = Arc::clone(&self.table_schema);
-        let default_version_id = self.default_version_id.clone();
+        let version_binding = self.version_binding.clone();
         let request = self.request.clone();
         let assignments = self.assignments.clone();
         let filters = self.filters.clone();
@@ -631,8 +644,8 @@ impl ExecutionPlan for LixStateUpdateExec {
             let rows = if request.limit == Some(0) {
                 Vec::new()
             } else {
-                live_state
-                    .scan_rows(&request)
+                write_ctx
+                    .scan_live_state(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?
             };
@@ -642,12 +655,12 @@ impl ExecutionPlan for LixStateUpdateExec {
             let updated_batch =
                 apply_lix_state_update_assignments(&table_schema, matched_batch, &assignments)?;
             let write_rows =
-                lix_state_stageable_write_rows_from_batch(&updated_batch, &default_version_id)?;
+                lix_state_stageable_write_rows_from_batch(&updated_batch, &version_binding)?;
             let count = u64::try_from(write_rows.len())
                 .map_err(|_| DataFusionError::Execution("UPDATE row count overflow".to_string()))?;
 
             if count > 0 {
-                write_stager
+                write_ctx
                     .stage_write(StageWrite::Rows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
@@ -756,9 +769,9 @@ fn apply_lix_state_update_assignments(
 
 fn lix_state_stageable_write_rows_from_batch(
     batch: &RecordBatch,
-    default_version_id: &str,
+    version_binding: &str,
 ) -> Result<Vec<StageRow>> {
-    let mut rows = lix_state_write_rows_from_batch(batch, default_version_id)?;
+    let mut rows = lix_state_write_rows_from_batch(batch, version_binding)?;
     for row in &mut rows {
         row.created_at = None;
         row.updated_at = None;
@@ -770,9 +783,9 @@ fn lix_state_stageable_write_rows_from_batch(
 
 fn lix_state_deletable_write_rows_from_batch(
     batch: &RecordBatch,
-    default_version_id: &str,
+    version_binding: &str,
 ) -> Result<Vec<StageRow>> {
-    let mut rows = lix_state_stageable_write_rows_from_batch(batch, default_version_id)?;
+    let mut rows = lix_state_stageable_write_rows_from_batch(batch, version_binding)?;
     for row in &mut rows {
         row.snapshot_content = None;
     }
@@ -797,7 +810,7 @@ fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
 
 fn lix_state_write_rows_from_batch(
     batch: &RecordBatch,
-    default_version_id: &str,
+    version_binding: &str,
 ) -> Result<Vec<StageRow>> {
     (0..batch.num_rows())
         .map(|row_index| {
@@ -807,7 +820,7 @@ fn lix_state_write_rows_from_batch(
                     if global {
                         GLOBAL_VERSION_ID.to_string()
                     } else {
-                        default_version_id.to_string()
+                        version_binding.to_string()
                     }
                 });
 
@@ -1121,7 +1134,7 @@ enum LixStateFilterPredicate {
 
 fn lix_state_scan_request(
     schema: &SchemaRef,
-    default_version_id: Option<&str>,
+    version_binding: Option<&str>,
     projection: Option<&Vec<usize>>,
     route: &LixStateByVersionRoute,
     limit: Option<usize>,
@@ -1145,7 +1158,7 @@ fn lix_state_scan_request(
                     .collect()
             })
             .unwrap_or_default(),
-        version_ids: default_version_id
+        version_ids: version_binding
             .map(|value| vec![value.to_string()])
             .or_else(|| {
                 route
@@ -1417,18 +1430,21 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
 mod tests {
     use super::{
         lix_state_scan_request, lix_state_schema, lix_state_write_rows_from_batch,
-        parse_lix_state_filter, register_lix_state_providers, LixStateByVersionRoute,
+        parse_lix_state_filter, register_lix_state_write_providers, LixStateByVersionRoute,
         LixStateDeleteExec, LixStateFilterPredicate, LixStateInsertSink, LixStateProvider,
         LixStateUpdateExec,
     };
-    use crate::engine2::transaction::types::{
-        StageRow, StageWrite, StageWriteOutcome, StageWriteStager,
+    use crate::binary_cas::BlobDataReader;
+    use crate::engine2::functions::{
+        FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
+    use crate::engine2::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
     use crate::engine2::version_ref::{VersionHead, VersionRefReader};
     use crate::engine2::{
         entity_identity::EntityIdentity,
         live_state::{LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest},
     };
+    use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
     use crate::{LixError, NullableKeyFilter};
     use async_trait::async_trait;
     use datafusion::arrow::array::{ArrayRef, BooleanArray, StringArray, UInt64Array};
@@ -1453,17 +1469,23 @@ mod tests {
     use futures_util::stream;
     use std::collections::BTreeSet;
     use std::sync::Arc;
-    use std::sync::Mutex;
 
     struct EmptyLiveStateReader;
     struct EmptyVersionRefReader;
     struct RowsLiveStateReader {
         rows: Vec<LiveStateRow>,
     }
-    struct DummyWriteStager;
+    struct DummyBlobReader;
+
     #[derive(Default)]
-    struct CapturingWriteStager {
-        writes: Mutex<Vec<StageWrite>>,
+    struct DummyWriteContext {
+        rows: Vec<LiveStateRow>,
+    }
+
+    #[derive(Default)]
+    struct CapturingWriteContext {
+        rows: Vec<LiveStateRow>,
+        writes: Vec<StageWrite>,
     }
 
     struct SingleBatchExec {
@@ -1598,17 +1620,93 @@ mod tests {
         }
     }
 
+    fn test_functions() -> FunctionProviderHandle {
+        SharedFunctionProvider::new(
+            Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>
+        )
+    }
+
     #[async_trait]
-    impl StageWriteStager for DummyWriteStager {
-        async fn stage_write(&self, _write: StageWrite) -> Result<StageWriteOutcome, LixError> {
+    impl BlobDataReader for DummyBlobReader {
+        async fn load_blob_data_by_hash(
+            &self,
+            _blob_hash: &str,
+        ) -> Result<Option<Vec<u8>>, LixError> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait]
+    impl SqlWriteExecutionContext for DummyWriteContext {
+        fn active_version_id(&self) -> &str {
+            "version-a"
+        }
+
+        fn functions(&self) -> FunctionProviderHandle {
+            test_functions()
+        }
+
+        fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
+            Arc::new(DummyBlobReader)
+        }
+
+        fn list_visible_schemas(&self) -> Result<Vec<serde_json::Value>, LixError> {
+            Ok(Vec::new())
+        }
+
+        async fn scan_live_state(
+            &mut self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<Vec<LiveStateRow>, LixError> {
+            Ok(self.rows.clone())
+        }
+
+        async fn load_version_head(
+            &mut self,
+            _version_id: &str,
+        ) -> Result<Option<String>, LixError> {
+            Ok(None)
+        }
+
+        async fn stage_write(&mut self, _write: StageWrite) -> Result<StageWriteOutcome, LixError> {
             Ok(StageWriteOutcome { count: 0 })
         }
     }
 
     #[async_trait]
-    impl StageWriteStager for CapturingWriteStager {
-        async fn stage_write(&self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
-            self.writes.lock().expect("writes lock").push(write);
+    impl SqlWriteExecutionContext for CapturingWriteContext {
+        fn active_version_id(&self) -> &str {
+            "version-a"
+        }
+
+        fn functions(&self) -> FunctionProviderHandle {
+            test_functions()
+        }
+
+        fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
+            Arc::new(DummyBlobReader)
+        }
+
+        fn list_visible_schemas(&self) -> Result<Vec<serde_json::Value>, LixError> {
+            Ok(Vec::new())
+        }
+
+        async fn scan_live_state(
+            &mut self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<Vec<LiveStateRow>, LixError> {
+            Ok(self.rows.clone())
+        }
+
+        async fn load_version_head(
+            &mut self,
+            _version_id: &str,
+        ) -> Result<Option<String>, LixError> {
+            Ok(None)
+        }
+
+        async fn stage_write(&mut self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
+            self.writes.push(write);
             Ok(StageWriteOutcome { count: 0 })
         }
     }
@@ -1821,18 +1919,12 @@ mod tests {
     #[tokio::test]
     async fn registers_active_lix_state_with_write_context_only() {
         let session = SessionContext::new();
-        let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
-        let write_stager = Arc::new(DummyWriteStager) as Arc<dyn StageWriteStager>;
+        let mut write_context = DummyWriteContext::default();
+        let write_ctx = SqlWriteContext::new(&mut write_context);
 
-        register_lix_state_providers(
-            &session,
-            "version-a",
-            live_state,
-            empty_version_ref(),
-            Some(Arc::clone(&write_stager)),
-        )
-        .await
-        .expect("lix_state providers should register");
+        register_lix_state_write_providers(&session, write_ctx)
+            .await
+            .expect("lix_state providers should register");
 
         let lix_state = session
             .table_provider("lix_state")
@@ -1842,7 +1934,7 @@ mod tests {
             .as_any()
             .downcast_ref::<LixStateProvider>()
             .expect("lix_state should be a LixStateProvider");
-        assert!(lix_state.write_stager.is_some());
+        assert!(lix_state.write_access.is_write());
 
         let by_version = session
             .table_provider("lix_state_by_version")
@@ -1852,7 +1944,7 @@ mod tests {
             .as_any()
             .downcast_ref::<LixStateProvider>()
             .expect("lix_state_by_version should be a LixStateProvider");
-        assert!(by_version.write_stager.is_none());
+        assert!(by_version.write_access.is_write());
     }
 
     #[tokio::test]
@@ -1860,13 +1952,13 @@ mod tests {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
         let provider =
-            LixStateProvider::active_version("version-a", live_state, empty_version_ref(), None);
+            LixStateProvider::active_version("version-a", live_state, empty_version_ref());
         let input = Arc::new(EmptyExec::new(provider.schema())) as Arc<dyn ExecutionPlan>;
 
         let error = provider
             .insert_into(&session.state(), input, InsertOp::Append)
             .await
-            .expect_err("insert without a write stager should fail");
+            .expect_err("insert without a write context should fail");
 
         assert!(
             error.to_string().contains("requires a write transaction"),
@@ -1879,7 +1971,7 @@ mod tests {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
         let provider =
-            LixStateProvider::active_version("version-a", live_state, empty_version_ref(), None);
+            LixStateProvider::active_version("version-a", live_state, empty_version_ref());
 
         let error = provider
             .update(
@@ -1888,7 +1980,7 @@ mod tests {
                 vec![],
             )
             .await
-            .expect_err("update without a write stager should fail");
+            .expect_err("update without a write context should fail");
 
         assert!(
             error.to_string().contains("requires a write transaction"),
@@ -1901,12 +1993,12 @@ mod tests {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
         let provider =
-            LixStateProvider::active_version("version-a", live_state, empty_version_ref(), None);
+            LixStateProvider::active_version("version-a", live_state, empty_version_ref());
 
         let error = provider
             .delete_from(&session.state(), vec![])
             .await
-            .expect_err("delete without a write stager should fail");
+            .expect_err("delete without a write context should fail");
 
         assert!(
             error.to_string().contains("requires a write transaction"),
@@ -1915,16 +2007,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_returns_lix_state_delete_exec_with_write_stager() {
+    async fn delete_returns_lix_state_delete_exec_with_write_ctx() {
         let session = SessionContext::new();
-        let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
-        let write_stager = Arc::new(DummyWriteStager) as Arc<dyn StageWriteStager>;
-        let provider = LixStateProvider::active_version(
-            "version-a",
-            live_state,
-            empty_version_ref(),
-            Some(write_stager),
-        );
+        let mut write_context = DummyWriteContext::default();
+        let write_ctx = SqlWriteContext::new(&mut write_context);
+        let provider = LixStateProvider::active_version_with_write(write_ctx);
 
         let plan = provider
             .delete_from(&session.state(), vec![])
@@ -1937,14 +2024,9 @@ mod tests {
     #[tokio::test]
     async fn update_rejects_read_only_lix_state_columns() {
         let session = SessionContext::new();
-        let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
-        let write_stager = Arc::new(DummyWriteStager) as Arc<dyn StageWriteStager>;
-        let provider = LixStateProvider::active_version(
-            "version-a",
-            live_state,
-            empty_version_ref(),
-            Some(write_stager),
-        );
+        let mut write_context = DummyWriteContext::default();
+        let write_ctx = SqlWriteContext::new(&mut write_context);
+        let provider = LixStateProvider::active_version_with_write(write_ctx);
 
         let error = provider
             .update(
@@ -1962,16 +2044,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_returns_lix_state_update_exec_with_write_stager() {
+    async fn update_returns_lix_state_update_exec_with_write_ctx() {
         let session = SessionContext::new();
-        let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
-        let write_stager = Arc::new(DummyWriteStager) as Arc<dyn StageWriteStager>;
-        let provider = LixStateProvider::active_version(
-            "version-a",
-            live_state,
-            empty_version_ref(),
-            Some(write_stager),
-        );
+        let mut write_context = DummyWriteContext::default();
+        let write_ctx = SqlWriteContext::new(&mut write_context);
+        let provider = LixStateProvider::active_version_with_write(write_ctx);
 
         let plan = provider
             .update(
@@ -1986,16 +2063,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_into_returns_data_sink_exec_with_write_stager() {
+    async fn insert_into_returns_data_sink_exec_with_write_ctx() {
         let session = SessionContext::new();
-        let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
-        let write_stager = Arc::new(DummyWriteStager) as Arc<dyn StageWriteStager>;
-        let provider = LixStateProvider::active_version(
-            "version-a",
-            live_state,
-            empty_version_ref(),
-            Some(write_stager),
-        );
+        let mut write_context = DummyWriteContext::default();
+        let write_ctx = SqlWriteContext::new(&mut write_context);
+        let provider = LixStateProvider::active_version_with_write(write_ctx);
         let input = Arc::new(EmptyExec::new(provider.schema())) as Arc<dyn ExecutionPlan>;
 
         let plan = provider
@@ -2044,12 +2116,9 @@ mod tests {
 
     #[tokio::test]
     async fn insert_sink_stages_decoded_lix_state_rows() {
-        let stager = Arc::new(CapturingWriteStager::default());
-        let sink = LixStateInsertSink::new(
-            lix_state_schema(),
-            Arc::clone(&stager) as Arc<dyn StageWriteStager>,
-            "version-a".to_string(),
-        );
+        let mut write_context = CapturingWriteContext::default();
+        let write_ctx = SqlWriteContext::new(&mut write_context);
+        let sink = LixStateInsertSink::new(lix_state_schema(), write_ctx, "version-a".to_string());
         let batch = one_row_lix_state_batch(false);
         let stream = stream::iter(vec![Ok(batch)]);
         let stream: SendableRecordBatchStream =
@@ -2062,7 +2131,7 @@ mod tests {
 
         assert_eq!(count, 1);
         assert_eq!(
-            stager.writes.lock().expect("writes lock").as_slice(),
+            write_context.writes.as_slice(),
             &[StageWrite::Rows {
                 rows: vec![StageRow {
                     entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single(
@@ -2088,14 +2157,9 @@ mod tests {
     #[tokio::test]
     async fn insert_plan_returns_datafusion_count_uint64() {
         let session = SessionContext::new();
-        let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
-        let stager = Arc::new(CapturingWriteStager::default());
-        let provider = LixStateProvider::active_version(
-            "version-a",
-            live_state,
-            empty_version_ref(),
-            Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
-        );
+        let mut write_context = CapturingWriteContext::default();
+        let write_ctx = SqlWriteContext::new(&mut write_context);
+        let provider = LixStateProvider::active_version_with_write(write_ctx);
         let input = Arc::new(SingleBatchExec::new(one_row_stageable_lix_state_batch()))
             as Arc<dyn ExecutionPlan>;
 
@@ -2120,25 +2184,21 @@ mod tests {
             .downcast_ref::<UInt64Array>()
             .expect("count should be UInt64");
         assert_eq!(count.value(0), 1);
-        assert_eq!(stager.writes.lock().expect("writes lock").len(), 1);
+        assert_eq!(write_context.writes.len(), 1);
     }
 
     #[tokio::test]
     async fn update_plan_evaluates_filters_assignments_and_stages_rows() {
         let session = SessionContext::new();
-        let live_state = Arc::new(RowsLiveStateReader {
+        let mut write_context = CapturingWriteContext {
             rows: vec![
                 live_row("entity-1", Some("{\"source\":\"match\"}")),
                 live_row("entity-2", Some("{\"source\":\"skip\"}")),
             ],
-        }) as Arc<dyn LiveStateReader>;
-        let stager = Arc::new(CapturingWriteStager::default());
-        let provider = LixStateProvider::active_version(
-            "version-a",
-            live_state,
-            empty_version_ref(),
-            Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
-        );
+            writes: Vec::new(),
+        };
+        let write_ctx = SqlWriteContext::new(&mut write_context);
+        let provider = LixStateProvider::active_version_with_write(write_ctx);
 
         let plan = provider
             .update(
@@ -2173,7 +2233,7 @@ mod tests {
         assert_eq!(count.value(0), 1);
 
         assert_eq!(
-            stager.writes.lock().expect("writes lock").as_slice(),
+            write_context.writes.as_slice(),
             &[StageWrite::Rows {
                 rows: vec![StageRow {
                     entity_id: Some(crate::engine2::entity_identity::EntityIdentity::single(
@@ -2199,19 +2259,15 @@ mod tests {
     #[tokio::test]
     async fn delete_plan_with_empty_filters_stages_all_visible_rows() {
         let session = SessionContext::new();
-        let live_state = Arc::new(RowsLiveStateReader {
+        let mut write_context = CapturingWriteContext {
             rows: vec![
                 live_row("entity-1", Some("{\"source\":\"one\"}")),
                 live_row("entity-2", Some("{\"source\":\"two\"}")),
             ],
-        }) as Arc<dyn LiveStateReader>;
-        let stager = Arc::new(CapturingWriteStager::default());
-        let provider = LixStateProvider::active_version(
-            "version-a",
-            live_state,
-            empty_version_ref(),
-            Some(Arc::clone(&stager) as Arc<dyn StageWriteStager>),
-        );
+            writes: Vec::new(),
+        };
+        let write_ctx = SqlWriteContext::new(&mut write_context);
+        let provider = LixStateProvider::active_version_with_write(write_ctx);
 
         let plan = provider
             .delete_from(&session.state(), vec![])
@@ -2232,7 +2288,7 @@ mod tests {
         assert_eq!(count.value(0), 2);
 
         assert_eq!(
-            stager.writes.lock().expect("writes lock").as_slice(),
+            write_context.writes.as_slice(),
             &[StageWrite::Rows {
                 rows: vec![
                     StageRow {

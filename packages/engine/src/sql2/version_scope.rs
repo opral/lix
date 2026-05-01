@@ -15,15 +15,50 @@ pub(crate) enum SqlVersionScope {
     AllVisible,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VersionBinding {
+    Active { version_id: String },
+    Explicit,
+}
+
+impl VersionBinding {
+    pub(crate) fn active(version_id: impl Into<String>) -> Self {
+        Self::Active {
+            version_id: version_id.into(),
+        }
+    }
+
+    pub(crate) fn explicit() -> Self {
+        Self::Explicit
+    }
+
+    pub(crate) fn active_version_id(&self) -> Option<&str> {
+        match self {
+            Self::Active { version_id } => Some(version_id),
+            Self::Explicit => None,
+        }
+    }
+
+    pub(crate) fn require_active_version_id(&self, operation: &str) -> Result<String, LixError> {
+        match self {
+            Self::Active { version_id } => Ok(version_id.clone()),
+            Self::Explicit => Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("{operation} is only supported for active-version SQL surfaces"),
+            )),
+        }
+    }
+}
+
 impl SqlVersionScope {
     pub(crate) fn from_provider(
-        default_version_id: Option<&str>,
+        binding: &VersionBinding,
         requested_version_ids: Vec<String>,
     ) -> Self {
-        match default_version_id {
-            Some(version_id) => Self::Active(version_id.to_string()),
-            None if requested_version_ids.is_empty() => Self::AllVisible,
-            None => Self::Explicit(requested_version_ids),
+        match binding {
+            VersionBinding::Active { version_id } => Self::Active(version_id.clone()),
+            VersionBinding::Explicit if requested_version_ids.is_empty() => Self::AllVisible,
+            VersionBinding::Explicit => Self::Explicit(requested_version_ids),
         }
     }
 }
@@ -41,12 +76,12 @@ pub(crate) async fn resolve_sql_version_scope(
 
 pub(crate) async fn resolve_provider_version_ids(
     version_ref: &dyn VersionRefReader,
-    default_version_id: Option<&str>,
+    binding: &VersionBinding,
     requested_version_ids: Vec<String>,
 ) -> Result<Vec<String>, LixError> {
     resolve_sql_version_scope(
         version_ref,
-        SqlVersionScope::from_provider(default_version_id, requested_version_ids),
+        SqlVersionScope::from_provider(binding, requested_version_ids),
     )
     .await
 }
@@ -72,9 +107,10 @@ mod tests {
     #[tokio::test]
     async fn active_scope_uses_session_version() {
         let version_ref = RowsVersionRefReader::new(Vec::new());
-        let ids = resolve_provider_version_ids(&version_ref, Some("main"), Vec::new())
-            .await
-            .expect("scope should resolve");
+        let ids =
+            resolve_provider_version_ids(&version_ref, &VersionBinding::active("main"), Vec::new())
+                .await
+                .expect("scope should resolve");
 
         assert_eq!(ids, vec!["main".to_string()]);
     }
@@ -84,7 +120,7 @@ mod tests {
         let version_ref = RowsVersionRefReader::new(Vec::new());
         let ids = resolve_provider_version_ids(
             &version_ref,
-            None,
+            &VersionBinding::explicit(),
             vec!["version-a".to_string(), "global".to_string()],
         )
         .await
@@ -105,9 +141,10 @@ mod tests {
                 commit_id: "commit-version-a".to_string(),
             },
         ]);
-        let ids = resolve_provider_version_ids(&version_ref, None, Vec::new())
-            .await
-            .expect("scope should resolve");
+        let ids =
+            resolve_provider_version_ids(&version_ref, &VersionBinding::explicit(), Vec::new())
+                .await
+                .expect("scope should resolve");
 
         assert_eq!(
             ids,

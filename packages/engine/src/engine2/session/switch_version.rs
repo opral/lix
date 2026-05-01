@@ -2,9 +2,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::engine2::functions::FunctionContext;
 use crate::engine2::transaction::types::StageRow;
-use crate::engine2::transaction::Transaction;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
@@ -35,18 +33,36 @@ impl SessionContext {
         &self,
         options: SwitchVersionOptions,
     ) -> Result<(SessionContext, SwitchVersionReceipt), LixError> {
-        self.ensure_version_ref_exists(&options.version_id).await?;
+        let version_id = options.version_id;
+        let receipt_version_id = version_id.clone();
+        let current_mode = self.mode.clone();
+        let next_mode = self
+            .with_write_transaction(|transaction| {
+                Box::pin(async move {
+                    let head = {
+                        let reader = transaction.version_ref_reader();
+                        reader.load_head_commit_id(&version_id).await?
+                    };
+                    if head.is_none() {
+                        return Err(LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!("cannot switch to missing version ref '{version_id}'"),
+                        ));
+                    }
 
-        let next_mode = match &self.mode {
-            SessionMode::Pinned { .. } => SessionMode::Pinned {
-                version_id: options.version_id.clone(),
-            },
-            SessionMode::Workspace => {
-                self.write_workspace_version_selector(&options.version_id)
-                    .await?;
-                SessionMode::Workspace
-            }
-        };
+                    match current_mode {
+                        SessionMode::Pinned { .. } => Ok(SessionMode::Pinned {
+                            version_id: version_id.clone(),
+                        }),
+                        SessionMode::Workspace => {
+                            transaction
+                                .stage_rows(vec![workspace_version_stage_row(&version_id)?])?;
+                            Ok(SessionMode::Workspace)
+                        }
+                    }
+                })
+            })
+            .await?;
 
         let session = SessionContext::new(
             next_mode,
@@ -61,48 +77,9 @@ impl SessionContext {
         Ok((
             session,
             SwitchVersionReceipt {
-                version_id: options.version_id,
+                version_id: receipt_version_id,
             },
         ))
-    }
-
-    async fn ensure_version_ref_exists(&self, version_id: &str) -> Result<(), LixError> {
-        let head = self
-            .version_ref
-            .reader(Arc::clone(&self.backend))
-            .load_head_commit_id(version_id)
-            .await?;
-        if head.is_none() {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("cannot switch to missing version ref '{version_id}'"),
-            ));
-        }
-        Ok(())
-    }
-
-    async fn write_workspace_version_selector(&self, version_id: &str) -> Result<(), LixError> {
-        let live_state: Arc<dyn crate::engine2::live_state::LiveStateReader> =
-            Arc::new(self.live_state.reader(Arc::clone(&self.backend)));
-        let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
-        let functions = runtime_functions.provider();
-        let active_version_id = self.active_version_id().await?;
-
-        let transaction = Transaction::open(
-            active_version_id,
-            &self.backend,
-            Arc::clone(&self.live_state),
-            Arc::clone(&self.binary_cas),
-            Arc::clone(&self.changelog),
-            Arc::clone(&self.version_ref),
-            Arc::clone(&self.schema_registry),
-            functions,
-        )
-        .await?;
-
-        transaction.stage_rows(vec![workspace_version_stage_row(version_id)?])?;
-        transaction.commit(&runtime_functions).await?;
-        Ok(())
     }
 }
 

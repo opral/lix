@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
@@ -6,28 +8,34 @@ use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::engine2::changelog::{ChangelogContext, ChangelogReader};
 use crate::engine2::commit_graph::{CommitGraphContext, CommitGraphReader};
 use crate::engine2::entity_identity::EntityIdentity;
-use crate::engine2::functions::FunctionProviderHandle;
+use crate::engine2::functions::{FunctionContext, FunctionProviderHandle};
 use crate::engine2::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
 use crate::engine2::schema_registry::SchemaRegistry;
 use crate::engine2::tracked_state::TrackedStateContext;
+use crate::engine2::transaction::{open_transaction, Transaction};
 use crate::engine2::version_ref::{VersionRefContext, VersionRefReader};
 use crate::sql2::SqlExecutionContext;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, NullableKeyFilter};
 
-pub(super) const WORKSPACE_VERSION_KEY: &str = "lix_workspace_version_id";
+pub(crate) const WORKSPACE_VERSION_KEY: &str = "lix_workspace_version_id";
 
 #[derive(Clone)]
-pub(super) enum SessionMode {
+pub(crate) enum SessionMode {
     Pinned { version_id: String },
     Workspace,
 }
 
-/// Session-context state for engine2 SQL execution.
+/// Session-context state for engine2 execution.
 ///
 /// A session context pins the active version selector and shared execution
 /// services. Each call to `execute(...)` projects this state into a read-only
 /// SQL context or a transaction-owned write context.
+///
+/// Write transaction invariant: any engine2 operation that may write must enter
+/// through `SessionContext::with_write_transaction`. Reads that influence writes
+/// are only available from that transaction capability, not from session-level
+/// helpers.
 #[derive(Clone)]
 pub struct SessionContext {
     pub(super) mode: SessionMode,
@@ -112,6 +120,10 @@ impl SessionContext {
 
     /// Resolves the version this session should operate on right now.
     ///
+    /// This is a read-path helper. Write flows must resolve the active version
+    /// through the transaction capability so the read is scoped to the
+    /// same backend transaction as the writes it influences.
+    ///
     /// Pinned sessions are pure in-memory views over one version. Workspace
     /// sessions read the shared workspace selector from untracked global
     /// `lix_key_value` state so multiple open app sessions can observe the same
@@ -177,6 +189,40 @@ impl SessionContext {
         }
 
         Ok(version_id)
+    }
+
+    pub(crate) async fn with_write_transaction<T, F>(&self, f: F) -> Result<T, LixError>
+    where
+        F: for<'tx> FnOnce(
+            &'tx mut Transaction<'_>,
+        ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
+    {
+        let live_state: Arc<dyn LiveStateReader> =
+            Arc::new(self.live_state.reader(Arc::clone(&self.backend)));
+        let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
+        let mut transaction = open_transaction(
+            &self.mode,
+            &self.backend,
+            Arc::clone(&self.live_state),
+            Arc::clone(&self.tracked_state),
+            Arc::clone(&self.binary_cas),
+            Arc::clone(&self.changelog),
+            Arc::clone(&self.version_ref),
+            Arc::clone(&self.schema_registry),
+            runtime_functions.provider(),
+        )
+        .await?;
+
+        match f(&mut transaction).await {
+            Ok(value) => {
+                transaction.commit(&runtime_functions).await?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
     }
 }
 
