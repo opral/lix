@@ -137,7 +137,7 @@ impl LixBackend for TracingBenchBackend {
     async fn begin_transaction(
         &self,
         mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
         let started = std::time::Instant::now();
         let tx = self.inner.begin_transaction(mode).await?;
         self.collector.push(
@@ -158,7 +158,7 @@ impl LixBackend for TracingBenchBackend {
     async fn begin_savepoint(
         &self,
         name: &str,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
         let started = std::time::Instant::now();
         let tx = self.inner.begin_savepoint(name).await?;
         self.collector.push(

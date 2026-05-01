@@ -67,7 +67,7 @@ impl LixBackend for BenchSqliteBackend {
     async fn begin_transaction(
         &self,
         mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
         let conn = self.lock_conn()?;
         let savepoint_name = if conn.is_autocommit() {
             conn.execute_batch(match mode {
@@ -104,7 +104,7 @@ impl LixBackend for BenchSqliteBackend {
     async fn begin_savepoint(
         &self,
         name: &str,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
         let conn = self.lock_conn()?;
         conn.execute_batch(&format!("SAVEPOINT {}", quote_savepoint_name(name)))
             .map_err(sqlite_error)?;

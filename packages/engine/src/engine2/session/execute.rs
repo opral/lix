@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use crate::backend::TransactionBeginMode;
 use crate::engine2::functions::FunctionContext;
-use crate::engine2::transaction::Transaction;
 use crate::sql2;
 use crate::{LixError, QueryResult, Value};
 
@@ -138,6 +137,25 @@ impl RowRef<'_> {
 
 impl SessionContext {
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
+        let kind = sql2::classify_statement(sql)?;
+        if kind == sql2::SqlStatementKind::Write {
+            let sql = sql.to_string();
+            let params = params.to_vec();
+            return self
+                .with_write_transaction(|transaction| {
+                    Box::pin(async move {
+                        // Re-plan against the transaction-backed write
+                        // session so provider hooks read and stage through the
+                        // transaction-owned SQL write context.
+                        let tx_plan = sql2::create_write_logical_plan(transaction, &sql).await?;
+                        let result = sql2::execute_logical_plan(tx_plan, &params).await?;
+                        let affected_rows = affected_rows_from_query_result(result)?;
+                        Ok(ExecuteResult::AffectedRows(affected_rows))
+                    })
+                })
+                .await;
+        }
+
         let live_state: Arc<dyn crate::engine2::live_state::LiveStateReader> =
             Arc::new(self.live_state.reader(Arc::clone(&self.backend)));
         let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
@@ -145,7 +163,7 @@ impl SessionContext {
         let active_version_id = self.active_version_id().await?;
         let visible_schemas = self
             .schema_registry
-            .visible_schemas(live_state, &active_version_id)
+            .visible_schemas(live_state.as_ref(), &active_version_id)
             .await?;
         let ctx = SessionSqlExecutionContext {
             active_version_id: &active_version_id,
@@ -159,39 +177,7 @@ impl SessionContext {
         };
 
         let plan = sql2::create_logical_plan(&ctx, sql).await?;
-        let result = if plan.is_write() {
-            // Open an autocommit write transaction for this statement, execute
-            // through a transaction-aware SQL context, then commit on success
-            // or rollback on error.
-            let transaction = Transaction::open(
-                active_version_id.clone(),
-                &self.backend,
-                Arc::clone(&self.live_state),
-                Arc::clone(&self.binary_cas),
-                Arc::clone(&self.changelog),
-                Arc::clone(&self.version_ref),
-                Arc::clone(&self.schema_registry),
-                functions,
-            )
-            .await?;
-            // Re-plan against the transaction so DataFusion provider hooks
-            // stage writes through the transaction-owned write stager.
-            let tx_plan = sql2::create_logical_plan(&transaction, sql).await?;
-            let result = sql2::execute_logical_plan(tx_plan, params).await;
-            match result {
-                Ok(result) => {
-                    let affected_rows = affected_rows_from_query_result(result)?;
-                    transaction.commit(&runtime_functions).await?;
-                    return Ok(ExecuteResult::AffectedRows(affected_rows));
-                }
-                Err(error) => {
-                    let _ = transaction.rollback().await;
-                    return Err(error);
-                }
-            }
-        } else {
-            sql2::execute_logical_plan(plan, params).await?
-        };
+        let result = sql2::execute_logical_plan(plan, params).await?;
         self.persist_runtime_functions_if_needed(&runtime_functions)
             .await?;
         Ok(ExecuteResult::Rows(RowSet::from_query_result(result)))

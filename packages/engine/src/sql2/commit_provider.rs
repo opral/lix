@@ -22,7 +22,7 @@ use tokio::sync::Mutex;
 
 use crate::engine2::commit_graph::{CommitGraphCommit, CommitGraphReader};
 use crate::engine2::version_ref::VersionRefReader;
-use crate::sql2::version_scope::resolve_provider_version_ids;
+use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
@@ -293,13 +293,15 @@ impl ExecutionPlan for CommitSurfaceScanExec {
         let limit = self.limit;
         let schema = Arc::clone(&self.schema);
         let stream = stream::once(async move {
-            let version_ids = resolve_provider_version_ids(
-                version_ref.as_ref(),
-                (!surface.by_version()).then_some(active_version_id.as_str()),
-                Vec::new(),
-            )
-            .await
-            .map_err(lix_error_to_datafusion_error)?;
+            let version_binding = if surface.by_version() {
+                VersionBinding::explicit()
+            } else {
+                VersionBinding::active(active_version_id)
+            };
+            let version_ids =
+                resolve_provider_version_ids(version_ref.as_ref(), &version_binding, Vec::new())
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
             let rows = rows_for_surface(
                 surface,
                 &version_ids,

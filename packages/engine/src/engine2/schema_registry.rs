@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
@@ -24,11 +23,14 @@ impl SchemaRegistry {
     }
 
     /// Loads schema definitions visible for SQL planning at `version_id`.
-    pub(crate) async fn visible_schemas(
+    pub(crate) async fn visible_schemas<R>(
         &self,
-        live_state: Arc<dyn LiveStateReader>,
+        live_state: &R,
         version_id: &str,
-    ) -> Result<Vec<JsonValue>, LixError> {
+    ) -> Result<Vec<JsonValue>, LixError>
+    where
+        R: LiveStateReader + ?Sized,
+    {
         let mut schemas = builtin_schema_definitions()?;
         for row in live_state
             .scan_rows(&LiveStateScanRequest {
@@ -134,7 +136,7 @@ mod tests {
         let registry = SchemaRegistry::new();
 
         let schemas = registry
-            .visible_schemas(Arc::new(RowsLiveStateReader::new(Vec::new())), "global")
+            .visible_schemas(&RowsLiveStateReader::new(Vec::new()), "global")
             .await
             .expect("schema visibility should load");
 
@@ -152,10 +154,10 @@ mod tests {
 
         let schemas = registry
             .visible_schemas(
-                Arc::new(RowsLiveStateReader::new(vec![registered_schema_row(
+                &RowsLiveStateReader::new(vec![registered_schema_row(
                     "engine2_dynamic_schema",
                     "1",
-                )])),
+                )]),
                 "global",
             )
             .await

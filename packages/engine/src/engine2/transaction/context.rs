@@ -1,74 +1,99 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use crate::backend::TransactionBeginMode;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::engine2::changelog::{ChangelogContext, ChangelogReader};
-use crate::engine2::commit_graph::{CommitGraphContext, CommitGraphReader};
+use crate::engine2::commit_graph::{CommitGraphContext, CommitGraphReader, CommitGraphStoreReader};
+use crate::engine2::entity_identity::EntityIdentity;
 use crate::engine2::functions::{FunctionContext, FunctionProviderHandle};
-use crate::engine2::live_state::{LiveStateContext, LiveStateReader};
+use crate::engine2::live_state::{
+    LiveStateContext, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+};
 use crate::engine2::schema_registry::SchemaRegistry;
+use crate::engine2::session::{SessionMode, WORKSPACE_VERSION_KEY};
+use crate::engine2::tracked_state::{TrackedStateContext, TrackedStateStoreReader};
 use crate::engine2::transaction::commit;
-use crate::engine2::transaction::live_state_overlay::TransactionLiveStateContext;
+use crate::engine2::transaction::live_state_overlay::{
+    overlay_scan_rows, TransactionLiveStateContext,
+};
 use crate::engine2::transaction::normalization::TransactionSchemaCatalog;
 use crate::engine2::transaction::staging::TransactionStagedWrites;
-use crate::engine2::transaction::types::{StageRow, StageWrite, StageWriteStager};
+use crate::engine2::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
 use crate::engine2::transaction::validation::{validate_staged_writes, TransactionValidationInput};
-use crate::engine2::version_ref::{VersionRefContext, VersionRefReader};
-use crate::sql2::SqlExecutionContext;
+use crate::engine2::version_ref::{VersionRefContext, VersionRefReader, VersionRefStoreReader};
+use crate::sql2::{SqlExecutionContext, SqlWriteExecutionContext};
 use crate::transaction::TransactionCommitOutcome;
-use crate::{LixBackend, LixBackendTransaction, LixError};
+use crate::version::GLOBAL_VERSION_ID;
+use crate::{LixBackend, LixBackendTransaction, LixError, NullableKeyFilter};
 
-/// One execution-scoped write transaction for the engine2 SQL path.
+/// One execution-scoped transaction capability for engine2 write paths.
 ///
 /// This is intentionally not a session-wide kitchen sink. It owns the backend
 /// write transaction for one `SessionContext::execute(...)` call and projects
 /// staged SQL writes back into the SQL DAG through an engine2-local live-state
 /// overlay.
-pub(crate) struct Transaction<'a> {
+///
+/// Transaction invariant: this is the capability for engine2 operations
+/// that may write. Write-relevant reads must be exposed from this transaction,
+/// after the backend write transaction has begun, rather than from session-level
+/// helpers.
+pub(crate) struct Transaction<'tx> {
     active_version_id: String,
-    backend: &'a Arc<dyn LixBackend + Send + Sync>,
+    backend: &'tx Arc<dyn LixBackend + Send + Sync>,
     live_state: Arc<LiveStateContext>,
+    tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
     changelog: Arc<ChangelogContext>,
     version_ref: Arc<VersionRefContext>,
     staged_writes: Arc<TransactionStagedWrites>,
-    backend_transaction: Box<dyn LixBackendTransaction + 'a>,
+    backend_transaction: Box<dyn LixBackendTransaction + Send + Sync + 'static>,
     visible_schemas: Vec<JsonValue>,
     functions: FunctionProviderHandle,
 }
 
-impl<'a> Transaction<'a> {
+impl<'tx> Transaction<'tx> {
     /// Opens a backend write transaction and creates an execution-scoped
-    /// staging area for SQL provider hooks.
-    pub(crate) async fn open(
-        active_version_id: String,
-        backend: &'a Arc<dyn LixBackend + Send + Sync>,
+    /// staging area for SQL/provider hooks.
+    async fn open(
+        mode: &SessionMode,
+        backend: &'tx Arc<dyn LixBackend + Send + Sync>,
         live_state: Arc<LiveStateContext>,
+        tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
         version_ref: Arc<VersionRefContext>,
         schema_registry: Arc<SchemaRegistry>,
         functions: FunctionProviderHandle,
     ) -> Result<Self, LixError> {
-        let visible_live_state: Arc<dyn LiveStateReader> =
-            Arc::new(live_state.reader(Arc::clone(backend)));
-        let visible_schemas = schema_registry
-            .visible_schemas(visible_live_state, &active_version_id)
+        let mut backend_transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
             .await?;
+        let active_version_id = resolve_active_version_id(
+            mode,
+            live_state.as_ref(),
+            version_ref.as_ref(),
+            backend_transaction.as_mut(),
+        )
+        .await?;
+        let visible_schemas = {
+            let visible_live_state = live_state.reader(backend_transaction.as_mut());
+            schema_registry
+                .visible_schemas(&visible_live_state, &active_version_id)
+                .await?
+        };
         let schema_catalog = TransactionSchemaCatalog::from_visible_schemas(&visible_schemas)?;
         let staged_writes = Arc::new(TransactionStagedWrites::new(
             functions.clone(),
             schema_catalog,
         ));
-        let backend_transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
-            .await?;
         Ok(Self {
             active_version_id,
             backend,
             live_state,
+            tracked_state,
             binary_cas,
             changelog,
             version_ref,
@@ -140,6 +165,16 @@ impl<'a> Transaction<'a> {
         self.stage_write(StageWrite::Rows { rows })
     }
 
+    /// Returns the active version resolved inside this write transaction.
+    pub(crate) fn active_version_id(&self) -> &str {
+        &self.active_version_id
+    }
+
+    /// Returns this transaction's prepared runtime functions.
+    pub(crate) fn functions(&self) -> FunctionProviderHandle {
+        self.functions.clone()
+    }
+
     /// Adds an extra parent to the commit generated for `version_id`.
     ///
     /// Merge uses this to preserve source-branch ancestry. Ordinary writes do
@@ -154,15 +189,58 @@ impl<'a> Transaction<'a> {
             .add_commit_parent(version_id, parent_commit_id)
     }
 
-    /// Exposes this transaction's KV snapshot to engine2 storage readers.
-    ///
-    /// Programmatic write APIs use this when a read influences staged writes,
-    /// for example reading the current version head before creating a new
-    /// version ref. Keeping that read inside the same backend transaction
-    /// avoids a stale read/write split.
-    pub(crate) fn kv_store(&mut self) -> &mut dyn LixBackendTransaction {
-        self.backend_transaction.as_mut()
+    /// Returns the commit id currently staged for `version_id`, if tracked rows
+    /// have been staged for that version.
+    pub(crate) fn staged_commit_id(&self, version_id: &str) -> Result<Option<String>, LixError> {
+        self.staged_writes.staged_commit_id(version_id)
     }
+
+    /// Creates a version-ref reader scoped to this write transaction.
+    pub(crate) fn version_ref_reader(
+        &mut self,
+    ) -> VersionRefStoreReader<&mut dyn LixBackendTransaction> {
+        self.version_ref.reader(self.backend_transaction.as_mut())
+    }
+
+    /// Creates a tracked-state reader scoped to this write transaction.
+    pub(crate) fn tracked_state_reader(
+        &mut self,
+    ) -> TrackedStateStoreReader<&mut dyn LixBackendTransaction> {
+        self.tracked_state.reader(self.backend_transaction.as_mut())
+    }
+
+    /// Creates a commit-graph reader scoped to this write transaction.
+    pub(crate) fn commit_graph_reader(
+        &mut self,
+    ) -> CommitGraphStoreReader<&mut dyn LixBackendTransaction> {
+        CommitGraphContext::new(self.changelog.as_ref().clone())
+            .reader(self.backend_transaction.as_mut())
+    }
+}
+
+pub(in crate::engine2) async fn open_transaction<'tx>(
+    mode: &SessionMode,
+    backend: &'tx Arc<dyn LixBackend + Send + Sync>,
+    live_state: Arc<LiveStateContext>,
+    tracked_state: Arc<TrackedStateContext>,
+    binary_cas: Arc<BinaryCasContext>,
+    changelog: Arc<ChangelogContext>,
+    version_ref: Arc<VersionRefContext>,
+    schema_registry: Arc<SchemaRegistry>,
+    functions: FunctionProviderHandle,
+) -> Result<Transaction<'tx>, LixError> {
+    Transaction::open(
+        mode,
+        backend,
+        live_state,
+        tracked_state,
+        binary_cas,
+        changelog,
+        version_ref,
+        schema_registry,
+        functions,
+    )
+    .await
 }
 
 impl SqlExecutionContext for Transaction<'_> {
@@ -203,17 +281,122 @@ impl SqlExecutionContext for Transaction<'_> {
         Arc::new(self.binary_cas.reader(Arc::clone(self.backend))) as Arc<dyn BlobDataReader>
     }
 
-    /// Provides the transaction-scoped write stager used by DataFusion provider
-    /// hooks while this statement executes.
-    fn write_stager(&self) -> Option<Arc<dyn StageWriteStager>> {
-        Some(Arc::clone(&self.staged_writes) as Arc<dyn StageWriteStager>)
-    }
-
     /// Returns the transaction-scoped schema snapshot for SQL surface
     /// registration.
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
         Ok(self.visible_schemas.clone())
     }
+}
+
+#[async_trait]
+impl SqlWriteExecutionContext for Transaction<'_> {
+    fn active_version_id(&self) -> &str {
+        &self.active_version_id
+    }
+
+    fn functions(&self) -> FunctionProviderHandle {
+        self.functions.clone()
+    }
+
+    fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
+        Arc::new(self.binary_cas.reader(Arc::clone(self.backend))) as Arc<dyn BlobDataReader>
+    }
+
+    fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
+        Ok(self.visible_schemas.clone())
+    }
+
+    async fn scan_live_state(
+        &mut self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<LiveStateRow>, LixError> {
+        let staged = self.staged_writes.staging_overlay()?;
+        let base = self.live_state.reader(self.backend_transaction.as_mut());
+        overlay_scan_rows(&base, &staged, request).await
+    }
+
+    async fn load_version_head(&mut self, version_id: &str) -> Result<Option<String>, LixError> {
+        self.version_ref
+            .reader(self.backend_transaction.as_mut())
+            .load_head_commit_id(version_id)
+            .await
+    }
+
+    async fn stage_write(&mut self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
+        self.staged_writes.stage_write(write)
+    }
+}
+
+async fn resolve_active_version_id(
+    mode: &SessionMode,
+    live_state: &LiveStateContext,
+    version_ref: &VersionRefContext,
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<String, LixError> {
+    match mode {
+        SessionMode::Pinned { version_id } => Ok(version_id.clone()),
+        SessionMode::Workspace => {
+            load_workspace_version_id(live_state, version_ref, transaction).await
+        }
+    }
+}
+
+async fn load_workspace_version_id(
+    live_state: &LiveStateContext,
+    version_ref: &VersionRefContext,
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<String, LixError> {
+    let row = live_state
+        .reader(&mut *transaction)
+        .load_row(&LiveStateRowRequest {
+            schema_key: "lix_key_value".to_string(),
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            entity_id: EntityIdentity::single(WORKSPACE_VERSION_KEY),
+            file_id: NullableKeyFilter::Null,
+        })
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "workspace version selector is missing lix_key_value:lix_workspace_version_id",
+            )
+        })?;
+    let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "workspace version selector is missing snapshot_content",
+        )
+    })?;
+    let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("workspace version selector snapshot is invalid JSON: {error}"),
+        )
+    })?;
+    let version_id = snapshot
+        .get("value")
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "workspace version selector value must be a non-empty string",
+            )
+        })?
+        .to_string();
+
+    let head = version_ref
+        .reader(transaction)
+        .load_head_commit_id(&version_id)
+        .await?;
+    if head.is_none() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("workspace version selector points to missing version ref '{version_id}'"),
+        ));
+    }
+
+    Ok(version_id)
 }
 
 fn transaction_live_state(
@@ -265,10 +448,13 @@ mod tests {
         let runtime_functions = FunctionContext::prepare(&runtime_live_state).await;
         let runtime_functions = runtime_functions.expect("runtime functions should prepare");
 
-        let transaction = Transaction::open(
-            GLOBAL_VERSION_ID.to_string(),
+        let transaction = open_transaction(
+            &SessionMode::Pinned {
+                version_id: GLOBAL_VERSION_ID.to_string(),
+            },
             &backend,
             Arc::clone(&live_state),
+            Arc::new(crate::engine2::tracked_state::TrackedStateContext::new()),
             Arc::clone(&binary_cas),
             Arc::clone(&changelog),
             Arc::clone(&version_ref),
@@ -399,10 +585,13 @@ mod tests {
             .await
             .expect("runtime functions should prepare");
 
-        let transaction = Transaction::open(
-            GLOBAL_VERSION_ID.to_string(),
+        let transaction = open_transaction(
+            &SessionMode::Pinned {
+                version_id: GLOBAL_VERSION_ID.to_string(),
+            },
             &backend,
             Arc::clone(&live_state),
+            Arc::new(crate::engine2::tracked_state::TrackedStateContext::new()),
             Arc::clone(&binary_cas),
             Arc::clone(&changelog),
             Arc::clone(&version_ref),
@@ -622,10 +811,13 @@ mod tests {
             .await
             .expect("runtime functions should prepare");
 
-        let transaction = Transaction::open(
-            GLOBAL_VERSION_ID.to_string(),
+        let transaction = open_transaction(
+            &SessionMode::Pinned {
+                version_id: GLOBAL_VERSION_ID.to_string(),
+            },
             backend,
             Arc::clone(&live_state),
+            Arc::new(crate::engine2::tracked_state::TrackedStateContext::new()),
             Arc::clone(&binary_cas),
             Arc::clone(&changelog),
             Arc::clone(&version_ref),

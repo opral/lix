@@ -45,7 +45,7 @@ impl<'a> LixBackend for TransactionBackendAdapter<'a> {
     async fn begin_transaction(
         &self,
         _mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "nested transactions are not supported via TransactionBackendAdapter"
@@ -57,7 +57,7 @@ impl<'a> LixBackend for TransactionBackendAdapter<'a> {
     async fn begin_savepoint(
         &self,
         _name: &str,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "savepoints are not supported via TransactionBackendAdapter".to_string(),

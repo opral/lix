@@ -25,7 +25,7 @@ pub trait LixBackend: Send + Sync {
     async fn begin_transaction(
         &self,
         mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError>;
+    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError>;
 
     /// Begin a named savepoint within an active transaction.
     ///
@@ -35,7 +35,7 @@ pub trait LixBackend: Send + Sync {
     async fn begin_savepoint(
         &self,
         name: &str,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError>;
+    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError>;
 
     /// Reads one value from the backend key/value store.
     async fn kv_get(&self, _namespace: &str, _key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
@@ -117,7 +117,7 @@ where
 }
 
 #[async_trait]
-impl QueryExecutor for Box<dyn LixBackendTransaction + '_> {
+impl QueryExecutor for Box<dyn LixBackendTransaction + Send + Sync + 'static> {
     fn dialect(&self) -> SqlDialect {
         self.as_ref().dialect()
     }

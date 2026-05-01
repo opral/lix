@@ -32,27 +32,7 @@ impl LiveStateReader for TransactionLiveStateContext {
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<LiveStateRow>, LixError> {
-        let mut rows = self.staged.scan(request);
-        let hidden_identities = self.staged.identities_matching_scan(request);
-        let mut visible_identities = rows
-            .iter()
-            .map(StagedStateRowIdentity::from)
-            .collect::<BTreeSet<_>>();
-
-        for row in self.base.scan_rows(request).await? {
-            let identity = StagedStateRowIdentity::from(&row);
-            if hidden_identities.contains(&identity) {
-                continue;
-            }
-            if visible_identities.insert(identity) {
-                rows.push(row);
-            }
-        }
-
-        if let Some(limit) = request.limit {
-            rows.truncate(limit);
-        }
-        Ok(rows)
+        overlay_scan_rows(self.base.as_ref(), &self.staged, request).await
     }
 
     async fn load_row(
@@ -65,4 +45,32 @@ impl LiveStateReader for TransactionLiveStateContext {
             None => self.base.load_row(request).await,
         }
     }
+}
+
+pub(crate) async fn overlay_scan_rows(
+    base: &dyn LiveStateReader,
+    staged: &StagedStateRowOverlay,
+    request: &LiveStateScanRequest,
+) -> Result<Vec<LiveStateRow>, LixError> {
+    let mut rows = staged.scan(request);
+    let hidden_identities = staged.identities_matching_scan(request);
+    let mut visible_identities = rows
+        .iter()
+        .map(StagedStateRowIdentity::from)
+        .collect::<BTreeSet<_>>();
+
+    for row in base.scan_rows(request).await? {
+        let identity = StagedStateRowIdentity::from(&row);
+        if hidden_identities.contains(&identity) {
+            continue;
+        }
+        if visible_identities.insert(identity) {
+            rows.push(row);
+        }
+    }
+
+    if let Some(limit) = request.limit {
+        rows.truncate(limit);
+    }
+    Ok(rows)
 }

@@ -1,10 +1,6 @@
-use std::sync::Arc;
-
 use serde_json::json;
 
-use crate::engine2::functions::FunctionContext;
 use crate::engine2::transaction::types::StageRow;
-use crate::engine2::transaction::Transaction;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
@@ -40,48 +36,38 @@ impl SessionContext {
         &self,
         options: CreateVersionOptions,
     ) -> Result<CreateVersionReceipt, LixError> {
-        let live_state: Arc<dyn crate::engine2::live_state::LiveStateReader> =
-            Arc::new(self.live_state.reader(Arc::clone(&self.backend)));
-        let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
-        let functions = runtime_functions.provider();
-        let active_version_id = self.active_version_id().await?;
-        let version_id = options.id.unwrap_or_else(|| functions.call_uuid_v7());
+        self.with_write_transaction(|transaction| {
+            Box::pin(async move {
+                let version_id = options
+                    .id
+                    .unwrap_or_else(|| transaction.functions().call_uuid_v7());
+                let active_version_id = transaction.active_version_id().to_string();
 
-        let mut transaction = Transaction::open(
-            active_version_id.clone(),
-            &self.backend,
-            Arc::clone(&self.live_state),
-            Arc::clone(&self.binary_cas),
-            Arc::clone(&self.changelog),
-            Arc::clone(&self.version_ref),
-            Arc::clone(&self.schema_registry),
-            functions.clone(),
-        )
-        .await?;
+                let source_head = {
+                    let reader = transaction.version_ref_reader();
+                    reader
+                        .load_head_commit_id(&active_version_id)
+                        .await?
+                        .ok_or_else(|| {
+                            LixError::new(
+                                "LIX_ERROR_UNKNOWN",
+                                format!(
+                                    "cannot create version from missing active version ref '{}'",
+                                    active_version_id
+                                ),
+                            )
+                        })?
+                };
 
-        let source_head = {
-            let reader = self.version_ref.reader(transaction.kv_store());
-            reader
-                .load_head_commit_id(&active_version_id)
-                .await?
-                .ok_or_else(|| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!(
-                            "cannot create version from missing active version ref '{}'",
-                            active_version_id
-                        ),
-                    )
-                })?
-        };
+                transaction.stage_rows(vec![
+                    version_descriptor_stage_row(&version_id, &options.name)?,
+                    version_ref_stage_row(&version_id, &source_head)?,
+                ])?;
 
-        transaction.stage_rows(vec![
-            version_descriptor_stage_row(&version_id, &options.name)?,
-            version_ref_stage_row(&version_id, &source_head)?,
-        ])?;
-        transaction.commit(&runtime_functions).await?;
-
-        Ok(CreateVersionReceipt { version_id })
+                Ok(CreateVersionReceipt { version_id })
+            })
+        })
+        .await
     }
 }
 

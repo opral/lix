@@ -39,7 +39,7 @@ impl LixBackend for UnitTestBackend {
     async fn begin_transaction(
         &self,
         mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
         let snapshot = self
             .kv
             .lock()
@@ -55,7 +55,7 @@ impl LixBackend for UnitTestBackend {
     async fn begin_savepoint(
         &self,
         _name: &str,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
         Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             "unit test backend does not support savepoints",
