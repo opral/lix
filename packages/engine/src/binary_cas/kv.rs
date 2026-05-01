@@ -47,6 +47,18 @@ pub(crate) async fn load_manifest(
     decode_json(&bytes, "binary CAS manifest").map(Some)
 }
 
+#[cfg(feature = "storage-benches")]
+pub(crate) async fn count_manifests(store: &mut impl KvStore) -> Result<usize, LixError> {
+    Ok(store
+        .kv_scan(
+            BINARY_CAS_MANIFEST_NAMESPACE,
+            KvScanRange::Prefix(Vec::new()),
+            None,
+        )
+        .await?
+        .len())
+}
+
 pub(crate) async fn put_manifest(
     writer: &mut impl KvWriter,
     blob_hash: &str,
