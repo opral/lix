@@ -39,13 +39,21 @@ pub(crate) struct StageFileData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StageWrite {
     Rows {
+        mode: StageWriteMode,
         rows: Vec<StageRow>,
     },
     RowsWithFileData {
+        mode: StageWriteMode,
         rows: Vec<StageRow>,
         file_data: Vec<StageFileData>,
         count: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StageWriteMode {
+    Insert,
+    Replace,
 }
 
 /// Result returned after staging a decoded write batch.

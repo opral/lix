@@ -105,7 +105,44 @@ pub(crate) async fn validate_staged_writes(
             .await?;
     reject_unresolved_foreign_keys(&unresolved_foreign_keys)?;
     validate_committed_delete_restrictions(&input, &schema_catalog, &pending_constraints).await?;
+    validate_committed_insert_identities(&input, &pending_constraints).await?;
     validate_committed_unique_constraints(&input, &pending_constraints).await?;
+    Ok(())
+}
+
+async fn validate_committed_insert_identities(
+    input: &TransactionValidationInput<'_>,
+    pending_constraints: &PendingConstraintIndexes,
+) -> Result<(), LixError> {
+    for identity in &input.staged_writes.insert_identities {
+        let Some(committed_row) = input
+            .live_state
+            .load_row(&LiveStateRowRequest {
+                schema_key: identity.schema_key.clone(),
+                version_id: identity.version_id.clone(),
+                entity_id: identity.entity_id.clone(),
+                file_id: nullable_filter_from_option(&identity.file_id),
+            })
+            .await?
+        else {
+            continue;
+        };
+        if committed_row.snapshot_content.is_none()
+            || !committed_row_is_exact_version_scoped(&committed_row, &identity.version_id)
+            || pending_constraints.tombstones_identity(&committed_row)
+        {
+            continue;
+        }
+        return Err(LixError::new(
+            LixError::CODE_UNIQUE,
+            format!(
+                "primary-key constraint violation on schema '{}' version '{}': INSERT would duplicate entity_id '{}'",
+                identity.schema_key,
+                committed_row.schema_version,
+                identity.entity_id.as_string()?
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -1987,6 +2024,8 @@ fn validate_pending_registered_schema(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use async_trait::async_trait;
     use serde_json::json;
 
@@ -3638,6 +3677,7 @@ mod tests {
     fn empty_staged_write_set() -> StagedWriteSet {
         StagedWriteSet {
             state_rows: Vec::new(),
+            insert_identities: BTreeSet::new(),
             commit_members_by_version: BTreeMap::new(),
             extra_commit_parents_by_version: BTreeMap::new(),
             file_data_writes: Vec::new(),
