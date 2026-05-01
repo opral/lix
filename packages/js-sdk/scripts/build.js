@@ -2,12 +2,10 @@
 import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { cp, mkdir } from "node:fs/promises";
-import { createRequire } from "node:module";
+import { cp, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, "..", "..", "..");
 const jsSdkDir = join(repoRoot, "packages", "js-sdk");
-const requireFromJsSdk = createRequire(join(jsSdkDir, "package.json"));
 const wasmProfile = process.env.LIX_WASM_PROFILE ?? "release";
 const targetDir = join(
 	repoRoot,
@@ -18,14 +16,8 @@ const targetDir = join(
 const engineWasmPath = join(targetDir, "lix_engine_wasm_bindgen.wasm");
 const engineOutDir = join(jsSdkDir, "src", "engine-wasm", "wasm");
 const engineDistOutDir = join(jsSdkDir, "dist", "engine-wasm", "wasm");
-const sqliteWasmSourcePath = join(
-	dirname(requireFromJsSdk.resolve("@sqlite.org/sqlite-wasm/package.json")),
-	"sqlite-wasm",
-	"jswasm",
-	"sqlite3.wasm",
-);
-const sqliteWasmSrcOutPath = join(jsSdkDir, "src", "backend", "sqlite3.wasm");
-const sqliteWasmDistOutPath = join(jsSdkDir, "dist", "backend", "sqlite3.wasm");
+const distDir = join(jsSdkDir, "dist");
+const wasmBindgenOutName = "lix_engine";
 
 function run(cmd, args, opts = {}) {
 	return new Promise((resolve, reject) => {
@@ -59,15 +51,35 @@ async function buildEngineWasm() {
 		},
 	});
 
+	await rm(engineOutDir, { recursive: true, force: true });
 	await run("wasm-bindgen", [
 		engineWasmPath,
 		"--target",
 		"web",
 		"--out-dir",
 		engineOutDir,
+		"--out-name",
+		wasmBindgenOutName,
 	]);
+	await normalizeWasmBindgenOutput(engineOutDir);
 	await mkdir(engineDistOutDir, { recursive: true });
 	await cp(engineOutDir, engineDistOutDir, { recursive: true, force: true });
+}
+
+async function normalizeWasmBindgenOutput(outputDir) {
+	const generatedWasm = join(outputDir, `${wasmBindgenOutName}_bg.wasm`);
+	const generatedWasmTypes = join(outputDir, `${wasmBindgenOutName}_bg.wasm.d.ts`);
+	const normalizedWasm = join(outputDir, `${wasmBindgenOutName}.wasm`);
+	const normalizedWasmTypes = join(outputDir, `${wasmBindgenOutName}.wasm.d.ts`);
+	await rename(generatedWasm, normalizedWasm);
+	await rename(generatedWasmTypes, normalizedWasmTypes);
+
+	const jsPath = join(outputDir, `${wasmBindgenOutName}.js`);
+	const js = await readFile(jsPath, "utf8");
+	await writeFile(
+		jsPath,
+		js.replaceAll(`${wasmBindgenOutName}_bg.wasm`, `${wasmBindgenOutName}.wasm`),
+	);
 }
 
 async function syncBuiltinSchemas() {
@@ -78,17 +90,11 @@ async function buildTypescriptDist() {
 	await run("tsc", ["-p", "tsconfig.json"], { cwd: jsSdkDir });
 }
 
-async function copySqliteWasmAsset() {
-	await cp(sqliteWasmSourcePath, sqliteWasmSrcOutPath, { force: true });
-	await mkdir(dirname(sqliteWasmDistOutPath), { recursive: true });
-	await cp(sqliteWasmSourcePath, sqliteWasmDistOutPath, { force: true });
-}
-
 async function main() {
+	await rm(distDir, { recursive: true, force: true });
 	await syncBuiltinSchemas();
 	await buildEngineWasm();
 	await buildTypescriptDist();
-	await copySqliteWasmAsset();
 }
 
 main().catch((error) => {
