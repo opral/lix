@@ -42,6 +42,10 @@ impl LixError {
     /// "still referenced" (restrict) failure.
     pub const CODE_FOREIGN_KEY: &'static str = "LIX_ERROR_FOREIGN_KEY";
 
+    /// A row references a non-null `file_id` that has no matching `lix_file`
+    /// descriptor in the same effective version scope.
+    pub const CODE_FILE_NOT_FOUND: &'static str = "LIX_ERROR_FILE_NOT_FOUND";
+
     /// A primary-key or `x-lix-unique` constraint was violated — another
     /// row already owns the value(s) for the declared pointer group.
     pub const CODE_UNIQUE: &'static str = "LIX_ERROR_UNIQUE";

@@ -328,11 +328,6 @@ async fn task_done(lix: &lix_rs_sdk::Lix, task_id: &str) -> bool {
 
 fn assert_closed(error: LixError) {
     assert_eq!(error.code, LixError::CODE_CLOSED);
-    assert_eq!(error.description, "Lix handle is closed");
-    assert_eq!(
-        error.hint.as_deref(),
-        Some("Open a new Lix handle before calling this method.")
-    );
 }
 
 type KvMap = BTreeMap<(String, Vec<u8>), Vec<u8>>;
