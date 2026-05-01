@@ -16,6 +16,6 @@ mod switch_version;
 pub use context::SessionContext;
 pub(crate) use context::{SessionMode, WORKSPACE_VERSION_KEY};
 pub use create_version::{CreateVersionOptions, CreateVersionReceipt};
-pub use execute::{ExecuteResult, Row, RowRef, RowSet};
+pub use execute::{ExecuteResult, Row, RowRef, TryFromValue};
 pub use merge_version::{MergeVersionOptions, MergeVersionOutcome, MergeVersionReceipt};
 pub use switch_version::{SwitchVersionOptions, SwitchVersionReceipt};

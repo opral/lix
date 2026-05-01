@@ -1,5 +1,6 @@
 use lix_engine::ExecuteResult;
 use lix_engine::Value;
+use serde_json::json;
 
 use super::assert_rows_eq;
 
@@ -27,7 +28,7 @@ simulation_test!(
         )
         .await
         .expect("registered schema insert should succeed");
-        assert_eq!(register_schema_result, ExecuteResult::AffectedRows(1));
+        assert_eq!(register_schema_result, ExecuteResult::from_rows_affected(1));
 
         let registered_schema_row = session
             .execute(
@@ -37,9 +38,7 @@ simulation_test!(
             )
             .await
             .expect("registered schema read should succeed");
-        let ExecuteResult::Rows(registered_schema_rows) = registered_schema_row else {
-            panic!("SELECT should return rows");
-        };
+        let registered_schema_rows = registered_schema_row;
         let registered_schema_entity_id = registered_schema_rows
             .rows()
             .iter()
@@ -73,7 +72,7 @@ simulation_test!(
         )
         .await
         .expect("lix_state insert for registered schema should succeed");
-        assert_eq!(insert_state_result, ExecuteResult::AffectedRows(1));
+        assert_eq!(insert_state_result, ExecuteResult::from_rows_affected(1));
 
         let result = session
             .execute(
@@ -84,16 +83,14 @@ simulation_test!(
             )
             .await
             .expect("lix_state read should succeed");
-        let ExecuteResult::Rows(row_set) = result else {
-            panic!("SELECT should return rows");
-        };
+        let row_set = result;
         assert_eq!(row_set.len(), 1);
         assert_eq!(
             row_set.rows()[0].values(),
             &[
                 Value::Text("dummy-1".to_string()),
                 Value::Text("engine2_dummy_schema".to_string()),
-                Value::Text("{\"id\":\"dummy-1\",\"name\":\"Dummy\"}".to_string()),
+                Value::Json(json!({"id": "dummy-1", "name": "Dummy"})),
             ]
         );
     }
@@ -197,7 +194,7 @@ simulation_test!(
             )
             .await
             .expect("typed entity insert should succeed");
-        assert_eq!(insert_result, ExecuteResult::AffectedRows(1));
+        assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
 
         let result = session
             .execute(

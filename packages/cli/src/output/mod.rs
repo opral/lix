@@ -1,22 +1,39 @@
 use base64::Engine as _;
 use comfy_table::{presets::UTF8_BORDERS_ONLY, Cell, ContentArrangement, Row, Table};
-use lix_rs_sdk::{ExecuteResult, QueryResult, Value};
+use lix_rs_sdk::{ExecuteResult, Value};
 use serde_json::Value as JsonValue;
 
 pub fn print_execute_result_table(result: &ExecuteResult) {
-    if result.statements.is_empty() {
+    if result.columns().is_empty() && result.rows().is_empty() {
         println!("OK");
+        if result.rows_affected() > 0 {
+            println!("({} rows affected)", result.rows_affected());
+        }
         return;
     }
 
-    let total = result.statements.len();
-    for (index, statement) in result.statements.iter().enumerate() {
-        println!("Statement {}/{}:", index + 1, total);
-        print_query_result_table(statement);
-        if index + 1 < total {
-            println!();
-        }
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_BORDERS_ONLY)
+        .set_content_arrangement(ContentArrangement::Dynamic);
+
+    if !result.columns().is_empty() {
+        let header = Row::from(result.columns().iter().map(Cell::new).collect::<Vec<_>>());
+        table.set_header(header);
     }
+
+    for row in result.rows() {
+        let rendered = Row::from(
+            row.values()
+                .iter()
+                .map(|value| Cell::new(value_to_text(value)))
+                .collect::<Vec<_>>(),
+        );
+        table.add_row(rendered);
+    }
+
+    println!("{table}");
+    println!("({} rows)", result.rows().len());
 }
 
 pub fn print_execute_result_json(result: &ExecuteResult) {
@@ -29,44 +46,22 @@ pub fn print_execute_result_json(result: &ExecuteResult) {
 
 fn execute_result_to_json(result: &ExecuteResult) -> JsonValue {
     serde_json::json!({
-        "statements": result.statements.iter().map(query_result_to_json).collect::<Vec<_>>(),
+        "columns": result.columns(),
+        "rows": result.rows().iter().map(|row| row_to_json(result.columns(), row)).collect::<Vec<_>>(),
+        "rowsAffected": result.rows_affected(),
     })
 }
 
-fn print_query_result_table(result: &QueryResult) {
-    if result.columns.is_empty() && result.rows.is_empty() {
-        println!("OK");
-        return;
+fn row_to_json(columns: &[String], row: &lix_rs_sdk::Row) -> JsonValue {
+    let mut object = serde_json::Map::new();
+    for (index, column) in columns.iter().enumerate() {
+        let value = row
+            .get_index(index)
+            .map(value_to_json)
+            .unwrap_or(JsonValue::Null);
+        object.insert(column.clone(), value);
     }
-
-    let mut table = Table::new();
-    table
-        .load_preset(UTF8_BORDERS_ONLY)
-        .set_content_arrangement(ContentArrangement::Dynamic);
-
-    if !result.columns.is_empty() {
-        let header = Row::from(result.columns.iter().map(Cell::new).collect::<Vec<_>>());
-        table.set_header(header);
-    }
-
-    for row in &result.rows {
-        let rendered = Row::from(
-            row.iter()
-                .map(|value| Cell::new(value_to_text(value)))
-                .collect::<Vec<_>>(),
-        );
-        table.add_row(rendered);
-    }
-
-    println!("{table}");
-    println!("({} rows)", result.rows.len());
-}
-
-fn query_result_to_json(result: &QueryResult) -> JsonValue {
-    serde_json::json!({
-        "columns": result.columns,
-        "rows": result.rows.iter().map(|row| row.iter().map(value_to_json).collect::<Vec<_>>()).collect::<Vec<_>>(),
-    })
+    JsonValue::Object(object)
 }
 
 fn value_to_text(value: &Value) -> String {
@@ -149,39 +144,23 @@ mod tests {
 
     #[test]
     fn execute_result_to_json_preserves_envelope_and_order() {
-        let result = ExecuteResult {
-            statements: vec![
-                QueryResult {
-                    columns: vec!["n".to_string(), "payload".to_string()],
-                    rows: vec![
-                        vec![Value::Integer(1), Value::Text("a".to_string())],
-                        vec![Value::Integer(2), Value::Blob(vec![0x01, 0x02])],
-                    ],
-                },
-                QueryResult {
-                    columns: vec![],
-                    rows: vec![],
-                },
+        let result = ExecuteResult::from_rows(
+            vec!["n".to_string(), "payload".to_string()],
+            vec![
+                vec![Value::Integer(1), Value::Text("a".to_string())],
+                vec![Value::Integer(2), Value::Blob(vec![0x01, 0x02])],
             ],
-            write_receipt: None,
-        };
+        );
 
         assert_eq!(
             execute_result_to_json(&result),
             serde_json::json!({
-                "statements": [
-                    {
-                        "columns": ["n", "payload"],
-                        "rows": [
-                            [1, "a"],
-                            [2, {"$blob": "AQI="}],
-                        ],
-                    },
-                    {
-                        "columns": [],
-                        "rows": [],
-                    },
+                "columns": ["n", "payload"],
+                "rows": [
+                    {"n": 1, "payload": "a"},
+                    {"n": 2, "payload": {"$blob": "AQI="}},
                 ],
+                "rowsAffected": 0,
             })
         );
     }

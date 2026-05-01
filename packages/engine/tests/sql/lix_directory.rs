@@ -21,7 +21,7 @@ simulation_test!(lix_directory_insert_reads_nested_paths, |sim| async move {
         )
         .await
         .expect("directory insert should succeed");
-    assert_eq!(insert_result, ExecuteResult::AffectedRows(1));
+    assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
 
     let nested_insert_result = session
         .execute(
@@ -31,7 +31,7 @@ simulation_test!(lix_directory_insert_reads_nested_paths, |sim| async move {
         )
         .await
         .expect("nested directory path insert should succeed");
-    assert_eq!(nested_insert_result, ExecuteResult::AffectedRows(1));
+    assert_eq!(nested_insert_result, ExecuteResult::from_rows_affected(1));
 
     let result = session
         .execute(
@@ -43,9 +43,7 @@ simulation_test!(lix_directory_insert_reads_nested_paths, |sim| async move {
         )
         .await
         .expect("directory read should succeed");
-    let ExecuteResult::Rows(row_set) = result else {
-        panic!("SELECT should return rows");
-    };
+    let row_set = result;
     assert_eq!(row_set.len(), 2);
     assert_eq!(
         row_set.rows()[0].values(),
@@ -89,7 +87,7 @@ simulation_test!(
             )
             .await
             .expect("file insert should succeed");
-        assert_eq!(file_result, ExecuteResult::AffectedRows(1));
+        assert_eq!(file_result, ExecuteResult::from_rows_affected(1));
 
         let directory_ids_result = session
             .execute(
@@ -101,9 +99,7 @@ simulation_test!(
             )
             .await
             .expect("directory id read before delete should succeed");
-        let ExecuteResult::Rows(directory_id_rows) = directory_ids_result else {
-            panic!("SELECT should return directory id rows");
-        };
+        let directory_id_rows = directory_ids_result;
         assert_eq!(directory_id_rows.len(), 2);
         let directory_ids = directory_id_rows
             .rows()
@@ -120,7 +116,7 @@ simulation_test!(
             .execute("DELETE FROM lix_directory WHERE path = '/docs/'", &[])
             .await
             .expect("recursive directory delete should succeed");
-        assert_eq!(delete_result, ExecuteResult::AffectedRows(1));
+        assert_eq!(delete_result, ExecuteResult::from_rows_affected(1));
 
         let directories_result = session
             .execute(
@@ -132,9 +128,7 @@ simulation_test!(
             )
             .await
             .expect("directory read after delete should succeed");
-        let ExecuteResult::Rows(directory_rows) = directories_result else {
-            panic!("SELECT should return directory rows");
-        };
+        let directory_rows = directories_result;
         assert_eq!(
             directory_rows.len(),
             0,
@@ -150,9 +144,7 @@ simulation_test!(
             )
             .await
             .expect("file read after delete should succeed");
-        let ExecuteResult::Rows(file_rows) = file_result else {
-            panic!("SELECT should return file rows");
-        };
+        let file_rows = file_result;
         assert_eq!(
             file_rows.len(),
             0,
@@ -172,9 +164,7 @@ simulation_test!(
             )
             .await
             .expect("state read after delete should succeed");
-        let ExecuteResult::Rows(state_rows) = state_result else {
-            panic!("SELECT should return state rows");
-        };
+        let state_rows = state_result;
         assert_eq!(
             state_rows.len(),
             0,

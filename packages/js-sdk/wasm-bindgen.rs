@@ -22,21 +22,18 @@ export type JsonValue =
 
 export type LixValue =
   | { kind: "null"; value: null }
-  | { kind: "bool"; value: boolean }
-  | { kind: "int"; value: number }
-  | { kind: "float"; value: number }
+  | { kind: "boolean"; value: boolean }
+  | { kind: "integer"; value: number }
+  | { kind: "real"; value: number }
   | { kind: "text"; value: string }
   | { kind: "json"; value: JsonValue }
   | { kind: "blob"; base64: string };
 
-export type RowSet = {
+export type ExecuteResult = {
   columns: string[];
   rows: LixValue[][];
+  rowsAffected: number;
 };
-
-export type ExecuteResult =
-  | { kind: "rows"; rows: RowSet }
-  | { kind: "affectedRows"; affectedRows: number };
 
 export type TransactionBeginMode = "read" | "write" | "deferred";
 
@@ -702,24 +699,24 @@ export type MergeVersionResult = {
             .and_then(|value| value.as_string());
         match kind.as_deref() {
             Some("null") => Ok(Value::Null),
-            Some("bool") => Ok(Value::Boolean(
+            Some("boolean") => Ok(Value::Boolean(
                 Reflect::get(&object, &JsValue::from_str("value"))
                     .ok()
                     .and_then(|value| value.as_bool())
-                    .ok_or_else(|| invalid_value("bool value must be boolean"))?,
+                    .ok_or_else(|| invalid_value("boolean value must be boolean"))?,
             )),
-            Some("int") => {
+            Some("integer") => {
                 let value = Reflect::get(&object, &JsValue::from_str("value"))
                     .ok()
                     .and_then(|value| value.as_f64())
-                    .ok_or_else(|| invalid_value("int value must be number"))?;
+                    .ok_or_else(|| invalid_value("integer value must be number"))?;
                 Ok(Value::Integer(value as i64))
             }
-            Some("float") => {
+            Some("real") => {
                 let value = Reflect::get(&object, &JsValue::from_str("value"))
                     .ok()
                     .and_then(|value| value.as_f64())
-                    .ok_or_else(|| invalid_value("float value must be number"))?;
+                    .ok_or_else(|| invalid_value("real value must be number"))?;
                 Ok(Value::Real(value))
             }
             Some("text") => Ok(Value::Text(
@@ -768,34 +765,23 @@ export type MergeVersionResult = {
 
     fn execute_result_to_js(result: ExecuteResult) -> Result<JsValue, LixError> {
         let object = Object::new();
-        match result {
-            ExecuteResult::Rows(rows) => {
-                set_string(&object, "kind", "rows")?;
-                let rows_object = Object::new();
-                let columns = Array::new();
-                for column in rows.columns() {
-                    columns.push(&JsValue::from_str(column));
-                }
-                Reflect::set(&rows_object, &JsValue::from_str("columns"), &columns)
-                    .map_err(|_| js_sdk_error("could not set columns"))?;
-                let values = Array::new();
-                for row in rows.rows() {
-                    let row_values = Array::new();
-                    for value in row.values() {
-                        row_values.push(&value_to_js(value)?);
-                    }
-                    values.push(&row_values);
-                }
-                Reflect::set(&rows_object, &JsValue::from_str("rows"), &values)
-                    .map_err(|_| js_sdk_error("could not set rows"))?;
-                Reflect::set(&object, &JsValue::from_str("rows"), &rows_object)
-                    .map_err(|_| js_sdk_error("could not set result rows"))?;
-            }
-            ExecuteResult::AffectedRows(count) => {
-                set_string(&object, "kind", "affectedRows")?;
-                set_number(&object, "affectedRows", count as f64)?;
-            }
+        let columns = Array::new();
+        for column in result.columns() {
+            columns.push(&JsValue::from_str(column));
         }
+        Reflect::set(&object, &JsValue::from_str("columns"), &columns)
+            .map_err(|_| js_sdk_error("could not set columns"))?;
+        let values = Array::new();
+        for row in result.rows() {
+            let row_values = Array::new();
+            for value in row.values() {
+                row_values.push(&value_to_js(value)?);
+            }
+            values.push(&row_values);
+        }
+        Reflect::set(&object, &JsValue::from_str("rows"), &values)
+            .map_err(|_| js_sdk_error("could not set rows"))?;
+        set_number(&object, "rowsAffected", result.rows_affected() as f64)?;
         Ok(object.into())
     }
 
@@ -808,20 +794,20 @@ export type MergeVersionResult = {
                     .map_err(|_| js_sdk_error("could not set null value"))?;
             }
             Value::Boolean(value) => {
-                set_string(&object, "kind", "bool")?;
+                set_string(&object, "kind", "boolean")?;
                 Reflect::set(
                     &object,
                     &JsValue::from_str("value"),
                     &JsValue::from_bool(*value),
                 )
-                .map_err(|_| js_sdk_error("could not set bool value"))?;
+                .map_err(|_| js_sdk_error("could not set boolean value"))?;
             }
             Value::Integer(value) => {
-                set_string(&object, "kind", "int")?;
+                set_string(&object, "kind", "integer")?;
                 set_number(&object, "value", *value as f64)?;
             }
             Value::Real(value) => {
-                set_string(&object, "kind", "float")?;
+                set_string(&object, "kind", "real")?;
                 set_number(&object, "value", *value)?;
             }
             Value::Text(value) => {

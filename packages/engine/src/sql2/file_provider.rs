@@ -49,6 +49,7 @@ use super::filesystem_planner::{
     plan_file_path_update, BlobRefRowInput, DirectoryPathResolver, FileDeleteInput,
     FileDescriptorRowInput, FilePathWriteInput, FilesystemDeletePlan, FilesystemRowContext,
 };
+use super::result_metadata::json_field;
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
@@ -1900,7 +1901,7 @@ fn lix_file_schema() -> SchemaRef {
         Field::new("lixcol_updated_at", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
         Field::new("lixcol_untracked", DataType::Boolean, false),
-        Field::new("lixcol_metadata", DataType::Utf8, true),
+        json_field("lixcol_metadata", true),
     ]))
 }
 

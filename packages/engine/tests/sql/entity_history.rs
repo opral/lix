@@ -1,4 +1,5 @@
 use lix_engine::Value;
+use serde_json::json;
 
 use super::assert_rows_eq;
 
@@ -79,7 +80,7 @@ simulation_test!(
                     Value::Text("history-entity".to_string()),
                     Value::Integer(2),
                     Value::Boolean(false),
-                    Value::Text("{\"source\":\"update\"}".to_string()),
+                    Value::Json(json!({"source": "update"})),
                     Value::Text("history-entity".to_string()),
                     Value::Text(second_commit_id.clone()),
                     Value::Text(second_commit_id.clone()),
@@ -89,7 +90,7 @@ simulation_test!(
                     Value::Text("history-entity".to_string()),
                     Value::Integer(1),
                     Value::Boolean(true),
-                    Value::Text("{\"source\":\"insert\"}".to_string()),
+                    Value::Json(json!({"source": "insert"})),
                     Value::Text("history-entity".to_string()),
                     Value::Text(first_commit_id),
                     Value::Text(second_commit_id),

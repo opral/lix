@@ -75,10 +75,9 @@ async function taskTitle(lix: Lix, taskId: string): Promise<string> {
 	);
 	const rows = expectRows(result);
 	expect(rows.rows).toHaveLength(1);
-	const title = rows.rows[0]?.[0];
-	expect(title).toBeInstanceOf(Value);
-	expect(title?.asText()).not.toBeUndefined();
-	return title!.asText()!;
+	const title = rows.rows[0]?.get("title");
+	expect(typeof title).toBe("string");
+	return title as string;
 }
 
 function tempLixPath(): string {
@@ -88,9 +87,5 @@ function tempLixPath(): string {
 }
 
 function expectRows(result: ExecuteResult) {
-	expect(result.kind).toBe("rows");
-	if (result.kind !== "rows") {
-		throw new Error("expected rows");
-	}
-	return result.rows;
+	return result;
 }

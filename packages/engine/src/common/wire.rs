@@ -1,4 +1,4 @@
-use crate::{LixError, QueryResult, Value};
+use crate::{LixError, SqlQueryResult, Value};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
@@ -83,7 +83,7 @@ impl WireValue {
 }
 
 impl WireQueryResult {
-    pub fn try_from_engine(result: &QueryResult) -> Result<Self, LixError> {
+    pub fn try_from_engine(result: &SqlQueryResult) -> Result<Self, LixError> {
         let mut rows = Vec::with_capacity(result.rows.len());
         for row in &result.rows {
             let mut wire_row = Vec::with_capacity(row.len());
@@ -98,7 +98,7 @@ impl WireQueryResult {
         })
     }
 
-    pub fn try_into_engine(self) -> Result<QueryResult, LixError> {
+    pub fn try_into_engine(self) -> Result<SqlQueryResult, LixError> {
         let mut rows = Vec::with_capacity(self.rows.len());
         for row in self.rows {
             let mut engine_row = Vec::with_capacity(row.len());
@@ -107,7 +107,7 @@ impl WireQueryResult {
             }
             rows.push(engine_row);
         }
-        Ok(QueryResult {
+        Ok(SqlQueryResult {
             rows,
             columns: self.columns,
         })
@@ -117,7 +117,7 @@ impl WireQueryResult {
 #[cfg(test)]
 mod tests {
     use super::{WireQueryResult, WireValue};
-    use crate::{QueryResult, Value};
+    use crate::{SqlQueryResult, Value};
     use serde_json::json;
 
     #[test]
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn query_result_roundtrip_preserves_rows_and_columns() {
-        let original = QueryResult {
+        let original = SqlQueryResult {
             rows: vec![
                 vec![
                     Value::Integer(1),

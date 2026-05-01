@@ -1,5 +1,5 @@
-use lix_engine::ExecuteResult;
 use lix_engine::Value;
+use serde_json::json;
 
 simulation_test!(lix_change_queries_tracked_changes, |sim| async move {
     let engine = sim.boot_engine().await;
@@ -28,16 +28,14 @@ simulation_test!(lix_change_queries_tracked_changes, |sim| async move {
         )
         .await
         .expect("lix_change should read");
-    let ExecuteResult::Rows(rows) = result else {
-        panic!("SELECT should return rows");
-    };
+    let rows = result;
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows.rows()[0].values(),
         &[
             Value::Text("change-query".to_string()),
             Value::Text("lix_key_value".to_string()),
-            Value::Text("{\"key\":\"change-query\",\"value\":\"one\"}".to_string()),
+            Value::Json(json!({"key": "change-query", "value": "one"})),
         ]
     );
 });

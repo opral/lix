@@ -6,7 +6,7 @@ use crate::app::AppContext;
 use crate::cli::version::{VersionCommand, VersionSubcommand};
 use crate::error::CliError;
 use crate::hints::CommandOutput;
-use lix_rs_sdk::{ExecuteResult, Lix, Value};
+use lix_rs_sdk::{ExecuteResult, Lix, Row as LixRow, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum VersionLookup<'a> {
@@ -39,28 +39,13 @@ pub(super) fn resolve_version_ref(
 }
 
 pub(super) fn resolve_active_version_ref(lix: &Lix) -> Result<ResolvedVersionRef, CliError> {
-    let result = pollster::block_on(lix.execute(
-        "SELECT v.id, v.name \
-         FROM lix_active_version av \
-         JOIN lix_version v ON v.id = av.version_id \
-         ORDER BY av.id \
-         LIMIT 1",
-        &[],
-    ))
-    .map_err(|error| CliError::msg(error.to_string()))?;
-    let rows = statement_rows(&result)?;
-    let Some(row) = rows.first() else {
-        return Err(CliError::msg("active version row is missing"));
-    };
-
-    Ok(ResolvedVersionRef {
-        id: text_at(row, 0, "lix_version.id")?,
-        name: text_at(row, 1, "lix_version.name")?,
-    })
+    let active_id = crate::db::block_on(lix.active_version_id())
+        .map_err(|error| CliError::msg(error.to_string()))?;
+    resolve_version_by_id(lix, &active_id)
 }
 
 fn resolve_version_by_id(lix: &Lix, id: &str) -> Result<ResolvedVersionRef, CliError> {
-    let result = pollster::block_on(lix.execute(
+    let result = crate::db::block_on(lix.execute(
         "SELECT id, name FROM lix_version WHERE id = $1 LIMIT 1",
         &[Value::Text(id.to_string())],
     ))
@@ -77,7 +62,7 @@ fn resolve_version_by_id(lix: &Lix, id: &str) -> Result<ResolvedVersionRef, CliE
 }
 
 fn resolve_version_by_name(lix: &Lix, name: &str) -> Result<ResolvedVersionRef, CliError> {
-    let result = pollster::block_on(lix.execute(
+    let result = crate::db::block_on(lix.execute(
         "SELECT id, name FROM lix_version WHERE name = $1 ORDER BY id",
         &[Value::Text(name.to_string())],
     ))
@@ -104,18 +89,12 @@ fn resolve_version_by_name(lix: &Lix, name: &str) -> Result<ResolvedVersionRef, 
     }
 }
 
-fn statement_rows(result: &ExecuteResult) -> Result<&[Vec<Value>], CliError> {
-    let [statement] = result.statements.as_slice() else {
-        return Err(CliError::msg(format!(
-            "expected one statement result, got {}",
-            result.statements.len()
-        )));
-    };
-    Ok(statement.rows.as_slice())
+fn statement_rows(result: &ExecuteResult) -> Result<&[LixRow], CliError> {
+    Ok(result.rows())
 }
 
-fn text_at(row: &[Value], index: usize, field: &str) -> Result<String, CliError> {
-    match row.get(index) {
+fn text_at(row: &LixRow, index: usize, field: &str) -> Result<String, CliError> {
+    match row.get_index(index) {
         Some(Value::Text(value)) if !value.is_empty() => Ok(value.clone()),
         Some(Value::Text(_)) => Err(CliError::msg(format!("{field} is empty"))),
         Some(Value::Integer(value)) => Ok(value.to_string()),
@@ -132,7 +111,7 @@ mod tests {
     use crate::app::AppContext;
     use crate::cli::version::{CreateVersionCommand, MergeVersionCommand, SwitchVersionCommand};
     use crate::db::{init_lix_at, open_lix_at};
-    use lix_rs_sdk::{CreateVersionOptions, Value};
+    use lix_rs_sdk::{CreateVersionOptions, ExecuteResult, Value};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -154,9 +133,13 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-journal", path.display()));
     }
 
-    fn text_at(rows: &[Vec<Value>], row: usize, col: usize) -> String {
-        match rows.get(row).and_then(|row| row.get(col)) {
-            Some(Value::Text(value)) => value.clone(),
+    fn text_at(result: &ExecuteResult, row: usize, col: usize) -> String {
+        match result.rows().get(row).and_then(|row| row.get_index(col)) {
+            Some(Value::Text(value)) => {
+                serde_json::from_str::<String>(value).unwrap_or_else(|_| value.clone())
+            }
+            Some(Value::Json(serde_json::Value::String(value))) => value.clone(),
+            Some(Value::Json(value)) => value.to_string(),
             Some(Value::Integer(value)) => value.to_string(),
             other => panic!("expected text-like value, got {other:?}"),
         }
@@ -186,7 +169,7 @@ mod tests {
         };
 
         let lix = open_lix_at(&path).expect("initial open should succeed");
-        pollster::block_on(lix.execute(
+        crate::db::block_on(lix.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('greeting', 'hello')",
             &[],
         ))
@@ -214,19 +197,19 @@ mod tests {
         .expect("version switch should succeed");
 
         let lix = open_lix_at(&path).expect("open on feature should succeed");
-        pollster::block_on(lix.execute(
+        crate::db::block_on(lix.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('feature_key', 'feature_val')",
             &[],
         ))
         .expect("feature insert should succeed");
 
         let lix = open_lix_at(&path).expect("open for id lookup should succeed");
-        let main_id_result = pollster::block_on(lix.execute(
+        let main_id_result = crate::db::block_on(lix.execute(
             "SELECT id FROM lix_version WHERE name = 'main' LIMIT 1",
             &[],
         ))
         .expect("main id lookup should succeed");
-        let main_id = text_at(&main_id_result.statements[0].rows, 0, 0);
+        let main_id = text_at(&main_id_result, 0, 0);
 
         merge::run(
             &context,
@@ -240,9 +223,9 @@ mod tests {
         .expect("fast-forward merge should succeed");
 
         let reopened = open_lix_at(&path).expect("database should reopen after fast-forward merge");
-        let select_result = pollster::block_on(reopened.execute("SELECT 1", &[]))
+        let select_result = crate::db::block_on(reopened.execute("SELECT 1", &[]))
             .expect("reopened query should succeed");
-        assert_eq!(text_at(&select_result.statements[0].rows, 0, 0), "1");
+        assert_eq!(text_at(&select_result, 0, 0), "1");
 
         switch::run(
             &context,
@@ -253,15 +236,12 @@ mod tests {
         )
         .expect("switch back to main should succeed");
         let reopened = open_lix_at(&path).expect("main reopen should succeed");
-        let feature_result = pollster::block_on(reopened.execute(
+        let feature_result = crate::db::block_on(reopened.execute(
             "SELECT value FROM lix_key_value WHERE key = 'feature_key' LIMIT 1",
             &[],
         ))
         .expect("feature key query should succeed");
-        assert_eq!(
-            text_at(&feature_result.statements[0].rows, 0, 0),
-            "feature_val"
-        );
+        assert_eq!(text_at(&feature_result, 0, 0), "feature_val");
 
         cleanup_lix_path(&path);
     }
@@ -283,18 +263,14 @@ mod tests {
 
         init_lix_at(&path).expect("lix init should succeed");
         let lix = open_lix_at(&path).expect("open should succeed");
-        pollster::block_on(lix.create_version(CreateVersionOptions {
+        crate::db::block_on(lix.create_version(CreateVersionOptions {
             id: Some("feature-a".to_string()),
-            name: Some("feature".to_string()),
-            source_version_id: None,
-            hidden: false,
+            name: "feature".to_string(),
         }))
         .expect("first version create should succeed");
-        pollster::block_on(lix.create_version(CreateVersionOptions {
+        crate::db::block_on(lix.create_version(CreateVersionOptions {
             id: Some("feature-b".to_string()),
-            name: Some("feature".to_string()),
-            source_version_id: None,
-            hidden: false,
+            name: "feature".to_string(),
         }))
         .expect("second version create should succeed");
 

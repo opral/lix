@@ -2,12 +2,14 @@ use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::StringArray;
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, FieldRef};
 use datafusion::common::{plan_err, Result, ScalarValue};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
 use serde_json::Value as JsonValue;
+
+use crate::sql2::result_metadata::json_field;
 
 use super::common::{extract_json_path, json_json_value, scalar_inputs};
 
@@ -39,6 +41,10 @@ impl ScalarUDFImpl for LixJsonExtract {
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::Utf8)
+    }
+
+    fn return_field_from_args(&self, _args: ReturnFieldArgs) -> Result<FieldRef> {
+        Ok(Arc::new(json_field(self.name(), true)))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {

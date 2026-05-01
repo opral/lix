@@ -1,22 +1,14 @@
 use crate::cli::exp::ExpGitReplayArgs;
 use crate::db;
 use crate::error::CliError;
-use async_trait::async_trait;
-use lix_rs_sdk::{
-    BootKeyValue, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError,
-    PreparedBatch as EnginePreparedBatch, QueryResult, SqlDialect, SqliteBackend,
-    TransactionBeginMode, Value, WasmtimeRuntime,
-};
+use lix_rs_sdk::{Lix, Value};
 use serde::Serialize;
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const NULL_OID: &str = "0000000000000000000000000000000000000000";
@@ -127,16 +119,6 @@ struct SqlTraceCommitTarget {
     commit_sha: String,
 }
 
-#[derive(Debug, Clone)]
-struct SqlTraceCommitMeta {
-    commit_sha: String,
-    changed_paths: usize,
-    inserts: usize,
-    updates: usize,
-    deletes: usize,
-    statement_count: usize,
-}
-
 #[derive(Debug, Serialize)]
 struct ReplaySqlTraceReport {
     repo_path: String,
@@ -175,278 +157,6 @@ struct ReplaySqlTraceOperation {
     error: Option<String>,
 }
 
-#[derive(Debug)]
-struct InFlightSqlTraceCommit {
-    meta: SqlTraceCommitMeta,
-    operations: Vec<ReplaySqlTraceOperation>,
-}
-
-#[derive(Debug, Default)]
-struct ReplaySqlTraceCollector {
-    next_sequence: AtomicU64,
-    current: Mutex<Option<InFlightSqlTraceCommit>>,
-}
-
-impl ReplaySqlTraceCollector {
-    fn begin_commit(&self, meta: SqlTraceCommitMeta) {
-        let mut guard = self
-            .current
-            .lock()
-            .expect("sql trace mutex should not be poisoned");
-        *guard = Some(InFlightSqlTraceCommit {
-            meta,
-            operations: Vec::new(),
-        });
-    }
-
-    fn record_operation(
-        &self,
-        kind: &'static str,
-        sql: Option<&str>,
-        params: &[Value],
-        duration: Duration,
-        row_count: Option<usize>,
-        column_count: Option<usize>,
-        error: Option<String>,
-    ) {
-        let mut guard = match self.current.lock() {
-            Ok(guard) => guard,
-            Err(_) => return,
-        };
-        let Some(current) = guard.as_mut() else {
-            return;
-        };
-        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
-        current.operations.push(ReplaySqlTraceOperation {
-            sequence,
-            kind,
-            sql: sql.map(ToOwned::to_owned),
-            sql_chars: sql.map(str::len).unwrap_or(0),
-            params_count: params.len(),
-            blob_params: params
-                .iter()
-                .filter(|value| matches!(value, Value::Blob(_)))
-                .count(),
-            blob_param_bytes: params
-                .iter()
-                .map(|value| match value {
-                    Value::Blob(bytes) => bytes.len(),
-                    _ => 0,
-                })
-                .sum(),
-            row_count,
-            column_count,
-            duration_ms: duration_to_ms(duration),
-            error,
-        });
-    }
-
-    fn finish_commit(&self, outer_execute_ms: f64) -> Option<ReplaySqlTraceCommit> {
-        let mut guard = self.current.lock().ok()?;
-        let current = guard.take()?;
-        Some(ReplaySqlTraceCommit {
-            commit_sha: current.meta.commit_sha,
-            changed_paths: current.meta.changed_paths,
-            inserts: current.meta.inserts,
-            updates: current.meta.updates,
-            deletes: current.meta.deletes,
-            statement_count: current.meta.statement_count,
-            outer_execute_ms,
-            operations: current.operations,
-        })
-    }
-}
-
-struct TracingSqliteBackend {
-    inner: SqliteBackend,
-    collector: Arc<ReplaySqlTraceCollector>,
-}
-
-struct TracingSqliteTransaction<'a> {
-    inner: Box<dyn LixBackendTransaction + 'a>,
-    collector: Arc<ReplaySqlTraceCollector>,
-}
-
-impl TracingSqliteBackend {
-    fn new(inner: SqliteBackend, collector: Arc<ReplaySqlTraceCollector>) -> Self {
-        Self { inner, collector }
-    }
-}
-
-#[async_trait(?Send)]
-impl LixBackend for TracingSqliteBackend {
-    fn dialect(&self) -> SqlDialect {
-        self.inner.dialect()
-    }
-
-    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        self.inner.execute(sql, params).await
-    }
-
-    async fn begin_savepoint(
-        &self,
-        name: &str,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-        self.inner.begin_savepoint(name).await
-    }
-
-    async fn begin_transaction(
-        &self,
-        mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-        let started = Instant::now();
-        let result = self.inner.begin_transaction(mode).await;
-        match result {
-            Ok(inner) => {
-                self.collector.record_operation(
-                    "begin_transaction",
-                    Some(match mode {
-                        TransactionBeginMode::Read => "read",
-                        TransactionBeginMode::Write => "write",
-                        TransactionBeginMode::Deferred => "deferred",
-                    }),
-                    &[],
-                    started.elapsed(),
-                    Some(0),
-                    Some(0),
-                    None,
-                );
-                Ok(Box::new(TracingSqliteTransaction {
-                    inner,
-                    collector: Arc::clone(&self.collector),
-                }))
-            }
-            Err(error) => {
-                self.collector.record_operation(
-                    "begin_transaction",
-                    None,
-                    &[],
-                    started.elapsed(),
-                    None,
-                    None,
-                    Some(error.description.clone()),
-                );
-                Err(error)
-            }
-        }
-    }
-
-    async fn destroy(&self) -> Result<(), LixError> {
-        self.inner.destroy().await
-    }
-}
-
-#[async_trait(?Send)]
-impl LixBackendTransaction for TracingSqliteTransaction<'_> {
-    fn dialect(&self) -> SqlDialect {
-        self.inner.dialect()
-    }
-
-    fn mode(&self) -> TransactionBeginMode {
-        self.inner.mode()
-    }
-
-    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        let started = Instant::now();
-        let result = self.inner.execute(sql, params).await;
-        let duration = started.elapsed();
-        match &result {
-            Ok(query) => self.collector.record_operation(
-                "transaction_execute",
-                Some(sql),
-                params,
-                duration,
-                Some(query.rows.len()),
-                Some(query.columns.len()),
-                None,
-            ),
-            Err(error) => self.collector.record_operation(
-                "transaction_execute",
-                Some(sql),
-                params,
-                duration,
-                None,
-                None,
-                Some(error.description.clone()),
-            ),
-        }
-        result
-    }
-
-    async fn execute_batch(
-        &mut self,
-        batch: &EnginePreparedBatch,
-    ) -> Result<QueryResult, LixError> {
-        let started = Instant::now();
-        let result = self.inner.execute_batch(batch).await;
-        let duration = started.elapsed();
-        let sql = batch
-            .steps
-            .iter()
-            .map(|step| step.sql.as_str())
-            .collect::<Vec<_>>()
-            .join("; ");
-        let params = batch
-            .steps
-            .iter()
-            .flat_map(|step| step.params.iter().cloned())
-            .collect::<Vec<_>>();
-        match &result {
-            Ok(query) => self.collector.record_operation(
-                "transaction_execute_batch",
-                Some(&sql),
-                &params,
-                duration,
-                Some(query.rows.len()),
-                Some(query.columns.len()),
-                None,
-            ),
-            Err(error) => self.collector.record_operation(
-                "transaction_execute_batch",
-                Some(&sql),
-                &params,
-                duration,
-                None,
-                None,
-                Some(error.description.clone()),
-            ),
-        }
-        result
-    }
-
-    async fn commit(self: Box<Self>) -> Result<(), LixError> {
-        let Self { inner, collector } = *self;
-        let started = Instant::now();
-        let result = inner.commit().await;
-        collector.record_operation(
-            "transaction_commit",
-            None,
-            &[],
-            started.elapsed(),
-            Some(0),
-            Some(0),
-            result.as_ref().err().map(|error| error.description.clone()),
-        );
-        result
-    }
-
-    async fn rollback(self: Box<Self>) -> Result<(), LixError> {
-        let Self { inner, collector } = *self;
-        let started = Instant::now();
-        let result = inner.rollback().await;
-        collector.record_operation(
-            "transaction_rollback",
-            None,
-            &[],
-            started.elapsed(),
-            Some(0),
-            Some(0),
-            result.as_ref().err().map(|error| error.description.clone()),
-        );
-        result
-    }
-}
-
 pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
     let repo_path = absolutize_from_cwd(&args.repo_path)?;
     validate_repo_dir(&repo_path)?;
@@ -468,6 +178,11 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
         .transpose()?;
     if let Some(path) = &trace_sql_json_path {
         prepare_regular_output_path(path, args.force)?;
+    }
+    if trace_sql_json_path.is_some() {
+        return Err(CliError::msg(
+            "--trace-sql-json is not available with the current rs-sdk backend API",
+        ));
     }
     if args.trace_commit.is_some() && trace_sql_json_path.is_none() {
         return Err(CliError::InvalidArgs(
@@ -496,10 +211,7 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
     }
 
     let trace_commit_target = resolve_trace_commit_target(&commits, args.trace_commit.as_deref())?;
-    let trace_collector = trace_sql_json_path
-        .as_ref()
-        .map(|_| Arc::new(ReplaySqlTraceCollector::default()));
-    let lix = init_and_open_lix_at_path(&output_lix_path, trace_collector.clone())?;
+    let lix = init_and_open_lix_at_path(&output_lix_path)?;
 
     let mut state = ReplayState::default();
     let mut expected_state_by_id = HashMap::<String, ExpectedFile>::new();
@@ -550,28 +262,21 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
             noop += 1;
         } else {
             let should_trace_commit = should_trace_commit(commit_sha, trace_commit_target.as_ref());
-            if should_trace_commit {
-                if let Some(collector) = &trace_collector {
-                    collector.begin_commit(SqlTraceCommitMeta {
-                        commit_sha: commit_sha.clone(),
-                        changed_paths: patch_set.changes.len(),
-                        inserts,
-                        updates,
-                        deletes,
-                        statement_count,
-                    });
-                }
-            }
             let execute_started = Instant::now();
             execute_statements_as_transaction(&lix, &statements, commit_sha)?;
             execute_ms = duration_to_ms(execute_started.elapsed());
             phase_totals.execute_ms += execute_ms;
             if should_trace_commit {
-                if let Some(collector) = &trace_collector {
-                    if let Some(trace_commit) = collector.finish_commit(execute_ms) {
-                        sql_trace_commits.push(trace_commit);
-                    }
-                }
+                sql_trace_commits.push(ReplaySqlTraceCommit {
+                    commit_sha: commit_sha.clone(),
+                    changed_paths: patch_set.changes.len(),
+                    inserts,
+                    updates,
+                    deletes,
+                    statement_count,
+                    outer_execute_ms: execute_ms,
+                    operations: Vec::new(),
+                });
             }
             applied += 1;
         }
@@ -670,34 +375,15 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-fn init_and_open_lix_at_path(
-    path: &Path,
-    trace_collector: Option<Arc<ReplaySqlTraceCollector>>,
-) -> Result<Lix, CliError> {
+fn init_and_open_lix_at_path(path: &Path) -> Result<Lix, CliError> {
     db::init_lix_at(path)?;
-
-    let backend = SqliteBackend::from_path(path).map_err(|err| {
-        CliError::msg(format!(
-            "failed to open sqlite backend at {}: {}",
-            path.display(),
-            err
-        ))
-    })?;
-    let backend: Box<dyn LixBackend + Send + Sync> = match trace_collector {
-        Some(collector) => Box::new(TracingSqliteBackend::new(backend, collector)),
-        None => Box::new(backend),
-    };
-
-    let mut config = LixConfig::new(backend, default_wasm_runtime()?);
-    config.key_values = vec![BootKeyValue {
-        key: "lix_deterministic_mode".to_string(),
-        value: json!({ "enabled": true }),
-        lixcol_global: Some(true),
-        lixcol_untracked: None,
-    }];
-
-    pollster::block_on(Lix::open(config))
-        .map_err(|err| CliError::msg(format!("failed to open lix at {}: {}", path.display(), err)))
+    let lix = db::open_lix_at(path)?;
+    crate::db::block_on(lix.execute(
+        "INSERT INTO lix_key_value (key, value) VALUES ('lix_deterministic_mode', '{\"enabled\":true}')",
+        &[],
+    ))
+    .map_err(|err| CliError::msg(format!("failed to enable deterministic mode: {err}")))?;
+    Ok(lix)
 }
 
 fn execute_statements_as_transaction(
@@ -711,7 +397,7 @@ fn execute_statements_as_transaction(
         .flat_map(|statement| statement.params.iter().cloned())
         .collect::<Vec<_>>();
 
-    pollster::block_on(lix.execute(&script, &params)).map_err(|error| {
+    crate::db::block_on(lix.execute(&script, &params)).map_err(|error| {
         let sql_preview = script.chars().take(160).collect::<String>();
         CliError::msg(format!(
             "failed at commit {commit_sha} while executing replay SQL '{sql_preview}': {error}"
@@ -1338,41 +1024,44 @@ fn verify_commit_state_hashes(
     commit_sha: &str,
 ) -> Result<(), CliError> {
     let result =
-        pollster::block_on(lix.execute("SELECT id, path, data FROM lix_file", &[] as &[Value]))
+        crate::db::block_on(lix.execute("SELECT id, path, data FROM lix_file", &[] as &[Value]))
             .map_err(|err| {
                 CliError::msg(format!(
                     "failed to query replay state for verification: {err}"
                 ))
             })?;
-    let row_result = result.statements.first().ok_or_else(|| {
-        CliError::msg("failed to query replay state for verification: no statement result returned")
-    })?;
-    if result.statements.len() != 1 {
-        return Err(CliError::msg(format!(
-            "failed to query replay state for verification: expected exactly 1 statement result, got {}",
-            result.statements.len()
-        )));
-    }
-
-    if row_result.rows.len() != expected_state_by_id.len() {
+    let rows = result.rows();
+    if rows.len() != expected_state_by_id.len() {
         return Err(CliError::msg(format!(
             "state mismatch at {commit_sha}: row count differs (lix={}, expected={})",
-            row_result.rows.len(),
+            rows.len(),
             expected_state_by_id.len()
         )));
     }
 
     let mut seen = HashSet::<String>::new();
-    for (index, row) in row_result.rows.iter().enumerate() {
-        if row.len() < 3 {
+    for (index, row) in rows.iter().enumerate() {
+        if row.values().len() < 3 {
             return Err(CliError::msg(format!(
                 "state mismatch at {commit_sha}: row {index} has fewer than 3 columns"
             )));
         }
 
-        let id = value_to_string(&row[0], &format!("verify.id[{index}]"))?;
-        let path = value_to_string(&row[1], &format!("verify.path[{index}]"))?;
-        let data = value_to_blob(&row[2], &format!("verify.data[{index}]"))?;
+        let id = value_to_string(
+            row.get_index(0)
+                .ok_or_else(|| CliError::msg(format!("missing verify.id[{index}]")))?,
+            &format!("verify.id[{index}]"),
+        )?;
+        let path = value_to_string(
+            row.get_index(1)
+                .ok_or_else(|| CliError::msg(format!("missing verify.path[{index}]")))?,
+            &format!("verify.path[{index}]"),
+        )?;
+        let data = value_to_blob(
+            row.get_index(2)
+                .ok_or_else(|| CliError::msg(format!("missing verify.data[{index}]")))?,
+            &format!("verify.data[{index}]"),
+        )?;
         let hash = sha256_hex(data);
 
         let expected = expected_state_by_id.get(&id).ok_or_else(|| {
@@ -1557,12 +1246,6 @@ fn run_git_bytes(
         status,
         stderr
     )))
-}
-
-fn default_wasm_runtime() -> Result<Arc<WasmtimeRuntime>, CliError> {
-    WasmtimeRuntime::new()
-        .map(Arc::new)
-        .map_err(|err| CliError::msg(format!("failed to initialize wasmtime runtime: {err}")))
 }
 
 fn prepare_regular_output_path(path: &Path, force: bool) -> Result<(), CliError> {

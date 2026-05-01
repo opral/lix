@@ -24,6 +24,7 @@ use crate::commit_graph::CommitGraphReader;
 use crate::LixError;
 
 use super::history_route::{load_history_entries, parse_history_filter, HistoryRoute};
+use super::result_metadata::json_field;
 
 pub(crate) async fn register_history_providers(
     session: &SessionContext,
@@ -254,8 +255,8 @@ fn lix_state_history_schema() -> SchemaRef {
         Field::new("entity_id", DataType::Utf8, false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
-        Field::new("snapshot_content", DataType::Utf8, true),
-        Field::new("metadata", DataType::Utf8, true),
+        json_field("snapshot_content", true),
+        json_field("metadata", true),
         Field::new("schema_version", DataType::Utf8, false),
         Field::new("change_id", DataType::Utf8, false),
         Field::new("commit_id", DataType::Utf8, false),

@@ -11,6 +11,7 @@ pub use lix::{open_lix, Lix, OpenLixOptions};
 pub use lix_engine::{
     CreateVersionOptions, CreateVersionReceipt as CreateVersionResult, ExecuteResult, KvPair,
     KvScanRange, LixBackend, LixBackendTransaction, LixError, MergeVersionOptions,
-    MergeVersionOutcome, MergeVersionReceipt as MergeVersionResult, QueryResult,
-    SwitchVersionOptions, SwitchVersionReceipt as SwitchVersionResult, TransactionBeginMode, Value,
+    MergeVersionOutcome, MergeVersionReceipt as MergeVersionResult, Row, SqlQueryResult,
+    SwitchVersionOptions, SwitchVersionReceipt as SwitchVersionResult, TransactionBeginMode,
+    TryFromValue, Value,
 };

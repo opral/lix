@@ -85,9 +85,7 @@ simulation_test!(lix_state_delete_hides_row, |sim| async move {
         )
         .await
         .expect("lix_state read should succeed");
-    let ExecuteResult::Rows(rows) = result else {
-        panic!("SELECT should return rows");
-    };
+    let rows = result;
     assert_eq!(rows.len(), 0);
 });
 
@@ -240,12 +238,9 @@ simulation_test!(
 );
 
 fn assert_single_text(result: ExecuteResult, expected: &str) {
-    let ExecuteResult::Rows(row_set) = result else {
-        panic!("SELECT should return rows");
-    };
+    let row_set = result;
     assert_eq!(row_set.len(), 1);
-    assert_eq!(
-        row_set.rows()[0].values(),
-        &[Value::Text(expected.to_string())]
-    );
+    let expected_json = serde_json::from_str::<serde_json::Value>(expected)
+        .expect("expected snapshot_content should be valid JSON");
+    assert_eq!(row_set.rows()[0].values(), &[Value::Json(expected_json)]);
 }

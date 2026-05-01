@@ -26,11 +26,10 @@ pub fn hint_after_init() -> Vec<String> {
 }
 
 pub fn hint_blob_in_result(result: &ExecuteResult) -> Vec<String> {
-    let has_blob = result.statements.iter().any(|stmt| {
-        stmt.rows
-            .iter()
-            .any(|row| row.iter().any(|v| matches!(v, Value::Blob(_))))
-    });
+    let has_blob = result
+        .rows()
+        .iter()
+        .any(|row| row.values().iter().any(|v| matches!(v, Value::Blob(_))));
     if has_blob {
         vec!["Tip: use lix_text_decode(data) to view text content".into()]
     } else {
@@ -51,17 +50,15 @@ pub fn hint_from_error(err: &CliError) -> Vec<String> {
 
 /// Query lix_key_value for 'lix_cli_hints'. Returns true unless value is explicitly "false".
 pub fn are_hints_enabled(lix: &Lix) -> bool {
-    let result = pollster::block_on(lix.execute(
+    let result = crate::db::block_on(lix.execute(
         "SELECT value FROM lix_key_value WHERE key = 'lix_cli_hints'",
         &[],
     ));
     match result {
         Ok(result) => {
-            if let Some(stmt) = result.statements.first() {
-                if let Some(row) = stmt.rows.first() {
-                    if let Some(lix_rs_sdk::Value::Text(value)) = row.first() {
-                        return value != "false";
-                    }
+            if let Some(row) = result.rows().first() {
+                if let Ok(value) = row.get::<String>("value") {
+                    return value != "false";
                 }
             }
             true // key absent = hints ON

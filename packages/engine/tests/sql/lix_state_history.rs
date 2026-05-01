@@ -1,5 +1,5 @@
-use lix_engine::ExecuteResult;
 use lix_engine::Value;
+use serde_json::json;
 
 simulation_test!(
     lix_state_history_requires_start_commit_id,
@@ -105,7 +105,7 @@ simulation_test!(
             &[
                 Value::Text(first_commit_id.clone()),
                 Value::Integer(0),
-                Value::Text("{\"key\":\"history-explicit\",\"value\":\"one\"}".to_string()),
+                Value::Json(json!({"key": "history-explicit", "value": "one"})),
             ],
             "historical commit should be queryable after later commits"
         );
@@ -141,11 +141,11 @@ simulation_test!(
             vec![
                 vec![
                     Value::Integer(0),
-                    Value::Text("{\"key\":\"history-explicit\",\"value\":\"two\"}".to_string()),
+                    Value::Json(json!({"key": "history-explicit", "value": "two"})),
                 ],
                 vec![
                     Value::Integer(1),
-                    Value::Text("{\"key\":\"history-explicit\",\"value\":\"one\"}".to_string()),
+                    Value::Json(json!({"key": "history-explicit", "value": "one"})),
                 ],
             ],
             "depth 0 is the start commit and parent changes appear at depth > 0"
@@ -411,12 +411,12 @@ simulation_test!(
                 vec![
                     Value::Text(first_commit_id.clone()),
                     Value::Integer(0),
-                    Value::Text("{\"key\":\"history-multi-start\",\"value\":\"one\"}".to_string()),
+                    Value::Json(json!({"key": "history-multi-start", "value": "one"})),
                 ],
                 vec![
                     Value::Text(second_commit_id.clone()),
                     Value::Integer(0),
-                    Value::Text("{\"key\":\"history-multi-start\",\"value\":\"two\"}".to_string()),
+                    Value::Json(json!({"key": "history-multi-start", "value": "two"})),
                 ],
             ],
             "IN should allow multiple explicit history starts"
@@ -522,9 +522,7 @@ async fn select_history_rows(
         .execute(sql, &[])
         .await
         .expect("history SELECT should succeed");
-    let ExecuteResult::Rows(row_set) = result else {
-        panic!("SELECT should return rows");
-    };
+    let row_set = result;
     row_set
         .rows()
         .iter()

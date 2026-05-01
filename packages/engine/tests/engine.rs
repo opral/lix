@@ -3,6 +3,7 @@ mod support;
 
 use lix_engine::ExecuteResult;
 use lix_engine::{Engine, Value};
+use serde_json::json;
 
 simulation_test!(engine_new_rejects_uninitialized_backend, |sim| async move {
     match Engine::new(sim.uninitialized_backend()).await {
@@ -40,9 +41,7 @@ simulation_test!(
             )
             .await
             .expect("version descriptors should be readable");
-        let ExecuteResult::Rows(version_rows) = version_result else {
-            panic!("SELECT should return version rows");
-        };
+        let version_rows = version_result;
         assert_eq!(version_rows.len(), 2);
         let version_values = version_rows
             .rows()
@@ -51,21 +50,18 @@ simulation_test!(
             .collect::<Vec<_>>();
         assert!(version_values.contains(&vec![
             Value::Text("global".to_string()),
-            Value::Text("{\"hidden\":true,\"id\":\"global\",\"name\":\"global\"}".to_string()),
+            Value::Json(json!({"hidden": true, "id": "global", "name": "global"})),
         ]));
         assert!(version_values.contains(&vec![
             Value::Text(sim.main_version_id().to_string()),
-            Value::Text(format!(
-                "{{\"hidden\":false,\"id\":\"{}\",\"name\":\"main\"}}",
-                sim.main_version_id()
-            )),
+            Value::Json(json!({"hidden": false, "id": sim.main_version_id(), "name": "main"})),
         ]));
 
         let lix_id_result = session
             .execute("SELECT value FROM lix_key_value WHERE key = 'lix_id'", &[])
             .await
             .expect("lix_id key value should be readable");
-        assert_single_text(lix_id_result, &format!("\"{}\"", sim.lix_id()));
+        assert_single_json(lix_id_result, &format!("\"{}\"", sim.lix_id()));
 
         let refs_result = session
             .execute(
@@ -77,9 +73,7 @@ simulation_test!(
             )
             .await
             .expect("version refs should be readable");
-        let ExecuteResult::Rows(ref_rows) = refs_result else {
-            panic!("SELECT should return version ref rows");
-        };
+        let ref_rows = refs_result;
         assert_eq!(ref_rows.len(), 2);
         let ref_values = ref_rows
             .rows()
@@ -88,19 +82,12 @@ simulation_test!(
             .collect::<Vec<_>>();
         assert!(ref_values.contains(&vec![
             Value::Text("global".to_string()),
-            Value::Text(format!(
-                "{{\"commit_id\":\"{}\",\"id\":\"global\"}}",
-                sim.initial_commit_id()
-            )),
+            Value::Json(json!({"commit_id": sim.initial_commit_id(), "id": "global"})),
             Value::Boolean(true),
         ]));
         assert!(ref_values.contains(&vec![
             Value::Text(sim.main_version_id().to_string()),
-            Value::Text(format!(
-                "{{\"commit_id\":\"{}\",\"id\":\"{}\"}}",
-                sim.initial_commit_id(),
-                sim.main_version_id()
-            )),
+            Value::Json(json!({"commit_id": sim.initial_commit_id(), "id": sim.main_version_id()})),
             Value::Boolean(true),
         ]));
 
@@ -126,9 +113,7 @@ simulation_test!(
             .execute("SELECT lix_uuid_v7()", &[])
             .await
             .expect("session should expose lix_uuid_v7 UDF");
-        let ExecuteResult::Rows(uuid_rows) = uuid_result else {
-            panic!("SELECT should return uuid rows");
-        };
+        let uuid_rows = uuid_result;
         assert_eq!(uuid_rows.len(), 1);
         let Value::Text(uuid) = &uuid_rows.rows()[0].values()[0] else {
             panic!("lix_uuid_v7 should return text");
@@ -145,7 +130,7 @@ simulation_test!(
             )
             .await
             .expect("session insert should succeed");
-        assert_eq!(insert_result, ExecuteResult::AffectedRows(1));
+        assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
 
         let result = session
             .execute(
@@ -154,15 +139,13 @@ simulation_test!(
             )
             .await
             .expect("session read should succeed");
-        let ExecuteResult::Rows(row_set) = result else {
-            panic!("SELECT should return rows");
-        };
+        let row_set = result;
         assert_eq!(row_set.len(), 1);
         assert_eq!(
             row_set.rows()[0].values(),
             &[
                 Value::Text("sql2-key".to_string()),
-                Value::Text("\"sql2-value\"".to_string()),
+                Value::Json(json!("sql2-value")),
             ]
         );
     }
@@ -192,7 +175,7 @@ simulation_test!(
             )
             .await
             .expect("deterministic mode insert should succeed");
-        assert_eq!(mode_result, ExecuteResult::AffectedRows(1));
+        assert_eq!(mode_result, ExecuteResult::from_rows_affected(1));
 
         assert_single_text(
             session
@@ -234,7 +217,7 @@ simulation_test!(
 			)
             .await
             .expect("deterministic write should succeed");
-        assert_eq!(write_result, ExecuteResult::AffectedRows(1));
+        assert_eq!(write_result, ExecuteResult::from_rows_affected(1));
         assert_single_text(
             second_session
                 .execute("SELECT lix_uuid_v7()", &[])
@@ -271,7 +254,7 @@ simulation_test!(
             )
             .await
             .expect("deterministic mode insert should succeed");
-        assert_eq!(mode_result, ExecuteResult::AffectedRows(1));
+        assert_eq!(mode_result, ExecuteResult::from_rows_affected(1));
 
         let failed_read = session
             .execute("SELECT lix_uuid_v7() FROM missing_engine_table", &[])
@@ -309,12 +292,18 @@ simulation_test!(
 );
 
 fn assert_single_text(result: ExecuteResult, expected: &str) {
-    let ExecuteResult::Rows(row_set) = result else {
-        panic!("SELECT should return rows");
-    };
+    let row_set = result;
     assert_eq!(row_set.len(), 1);
     assert_eq!(
         row_set.rows()[0].values(),
         &[Value::Text(expected.to_string())]
     );
+}
+
+fn assert_single_json(result: ExecuteResult, expected: &str) {
+    let row_set = result;
+    assert_eq!(row_set.len(), 1);
+    let expected_json = serde_json::from_str::<serde_json::Value>(expected)
+        .expect("expected JSON value should parse");
+    assert_eq!(row_set.rows()[0].values(), &[Value::Json(expected_json)]);
 }

@@ -196,7 +196,7 @@ mod tests {
         KvBlobManifest, KvBlobManifestChunk, KvChunk, BINARY_CAS_CHUNK_NAMESPACE,
         BINARY_CAS_MANIFEST_CHUNK_NAMESPACE, BINARY_CAS_MANIFEST_NAMESPACE,
     };
-    use crate::{KvPair, KvScanRange, LixBackendTransaction, QueryResult, SqlDialect, Value};
+    use crate::{KvPair, KvScanRange, LixBackendTransaction, SqlDialect, SqlQueryResult, Value};
     use async_trait::async_trait;
     use std::io::{Cursor, Write};
     use zip::write::SimpleFileOptions;
@@ -214,9 +214,9 @@ mod tests {
             SqlDialect::Sqlite
         }
 
-        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<SqlQueryResult, LixError> {
             if sql.contains("LIKE '/.lix/plugins/%.lixplugin'") {
-                return Ok(QueryResult {
+                return Ok(SqlQueryResult {
                     rows: vec![vec![
                         Value::Text("lix_plugin_archive::plugin_json".to_string()),
                         Value::Text("global".to_string()),
@@ -226,7 +226,7 @@ mod tests {
                     columns: Vec::new(),
                 });
             }
-            Ok(QueryResult {
+            Ok(SqlQueryResult {
                 rows: Vec::new(),
                 columns: Vec::new(),
             })
@@ -325,8 +325,8 @@ mod tests {
             &mut self,
             _sql: &str,
             _params: &[Value],
-        ) -> Result<QueryResult, LixError> {
-            Ok(QueryResult {
+        ) -> Result<SqlQueryResult, LixError> {
+            Ok(SqlQueryResult {
                 rows: Vec::new(),
                 columns: Vec::new(),
             })
