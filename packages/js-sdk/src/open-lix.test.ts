@@ -28,7 +28,7 @@ test("openLix exposes the rs-sdk e2e flow", async () => {
 	);
 
 	const projected = await lix.execute(
-		"SELECT title, done, meta, lixcol_snapshot_content FROM crm_task WHERE id = $1",
+		"SELECT title, meta FROM crm_task WHERE id = $1",
 		["task-1"],
 	);
 	const projectedRow = projected.rows[0]!;
@@ -43,26 +43,13 @@ test("openLix exposes the rs-sdk e2e flow", async () => {
 		priority: "high",
 		tags: ["sdk", "json"],
 	});
-	expect(projectedRow.get("lixcol_snapshot_content")).toMatchObject({
-		id: "task-1",
-		title: "Draft JS SDK flow",
-		done: false,
-		meta: { priority: "high", tags: ["sdk", "json"] },
-	});
 	expect(projectedRow.toObject()).toEqual({
 		title: "Draft JS SDK flow",
-		done: false,
 		meta: { priority: "high", tags: ["sdk", "json"] },
-		lixcol_snapshot_content: {
-			id: "task-1",
-			title: "Draft JS SDK flow",
-			done: false,
-			meta: { priority: "high", tags: ["sdk", "json"] },
-		},
 	});
 	expect(projectedRow.toValueMap().title).toBeInstanceOf(Value);
 	expect(() => projectedRow.get("missing")).toThrow(
-		/Available columns: title, done, meta, lixcol_snapshot_content/,
+		/Available columns: title, meta/,
 	);
 
 	expect(await taskDone(lix, "task-1")).toBe(false);

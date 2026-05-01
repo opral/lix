@@ -152,6 +152,46 @@ simulation_test!(
 );
 
 simulation_test!(
+    failed_write_validation_does_not_poison_session_transaction,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("backend should open a session");
+
+        register_poison_task_schema(&session).await;
+
+        let error = session
+            .execute(
+                "INSERT INTO poison_task (id, title) VALUES ('bad-task', 'missing meta')",
+                &[],
+            )
+            .await
+            .expect_err("schema validation should reject missing required field");
+        assert_eq!(error.code, "LIX_ERROR_SCHEMA_VALIDATION");
+
+        assert_single_integer(
+            session
+                .execute("SELECT 1 AS ok", &[])
+                .await
+                .expect("read after failed write should succeed"),
+            1,
+        );
+
+        let insert_result = session
+            .execute(
+                "INSERT INTO poison_task (id, title, meta) \
+                 VALUES ('good-task', 'valid', lix_json('{\"priority\":\"high\"}'))",
+                &[],
+            )
+            .await
+            .expect("valid write after failed write should succeed");
+        assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
+    }
+);
+
+simulation_test!(
     session_close_is_idempotent_and_rejects_later_operations,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -204,6 +244,31 @@ simulation_test!(
         );
     }
 );
+
+async fn register_poison_task_schema(session: &lix_engine::SessionContext) {
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "x-lix-key": "poison_task",
+        "x-lix-version": "1",
+        "x-lix-primary-key": ["/id"],
+        "type": "object",
+        "required": ["id", "title", "meta"],
+        "properties": {
+            "id": { "type": "string" },
+            "title": { "type": "string" },
+            "meta": { "type": "object" }
+        },
+        "additionalProperties": false
+    });
+
+    session
+        .execute(
+            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+            &[Value::Text(schema.to_string())],
+        )
+        .await
+        .expect("schema registration should succeed");
+}
 
 simulation_test!(
     session_close_state_is_shared_with_switched_session,
@@ -378,6 +443,12 @@ fn assert_single_text(result: ExecuteResult, expected: &str) {
         row_set.rows()[0].values(),
         &[Value::Text(expected.to_string())]
     );
+}
+
+fn assert_single_integer(result: ExecuteResult, expected: i64) {
+    let row_set = result;
+    assert_eq!(row_set.len(), 1);
+    assert_eq!(row_set.rows()[0].values(), &[Value::Integer(expected)]);
 }
 
 fn assert_single_json(result: ExecuteResult, expected: &str) {

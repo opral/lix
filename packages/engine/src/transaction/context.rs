@@ -113,15 +113,25 @@ impl<'tx> Transaction<'tx> {
         mut self,
         runtime_functions: &FunctionContext,
     ) -> Result<TransactionCommitOutcome, LixError> {
-        let staged_writes = self.staged_writes.drain()?;
+        let staged_writes = match self.staged_writes.drain() {
+            Ok(staged_writes) => staged_writes,
+            Err(error) => {
+                let _ = self.backend_transaction.rollback().await;
+                return Err(error);
+            }
+        };
         let live_state_reader = self.live_state.reader(Arc::clone(self.backend));
-        validate_staged_writes(TransactionValidationInput::new(
+        if let Err(error) = validate_staged_writes(TransactionValidationInput::new(
             &staged_writes,
             &self.visible_schemas,
             &live_state_reader,
         ))
-        .await?;
-        commit::commit_staged_writes(
+        .await
+        {
+            let _ = self.backend_transaction.rollback().await;
+            return Err(error);
+        }
+        if let Err(error) = commit::commit_staged_writes(
             &self.binary_cas,
             &self.changelog,
             &self.live_state,
@@ -129,10 +139,18 @@ impl<'tx> Transaction<'tx> {
             self.backend_transaction.as_mut(),
             staged_writes,
         )
-        .await?;
-        runtime_functions
+        .await
+        {
+            let _ = self.backend_transaction.rollback().await;
+            return Err(error);
+        }
+        if let Err(error) = runtime_functions
             .persist_if_needed(&mut self.live_state.writer(self.backend_transaction.as_mut()))
-            .await?;
+            .await
+        {
+            let _ = self.backend_transaction.rollback().await;
+            return Err(error);
+        }
         self.backend_transaction.commit().await?;
         Ok(TransactionCommitOutcome::default())
     }
