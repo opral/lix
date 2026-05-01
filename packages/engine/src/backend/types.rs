@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 
 use crate::backend::{
-    ImageChunkReader, ImageChunkWriter, KvPair, KvScanRange, PreparedBatch,
-    TransactionBackendAdapter, TransactionBeginMode,
+    ImageChunkReader, ImageChunkWriter, KvPair, KvScanRange, PreparedBatch, TransactionBeginMode,
 };
 use crate::common::SqlDialect;
 use crate::{LixError, QueryResult, Value};
@@ -97,51 +96,6 @@ pub trait LixBackend: Send + Sync {
 }
 
 #[async_trait]
-pub(crate) trait QueryExecutor: Send + Sync {
-    fn dialect(&self) -> SqlDialect;
-    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError>;
-}
-
-#[async_trait]
-impl<T> QueryExecutor for &T
-where
-    T: LixBackend + ?Sized,
-{
-    fn dialect(&self) -> SqlDialect {
-        (*self).dialect()
-    }
-
-    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        (*self).execute(sql, params).await
-    }
-}
-
-#[async_trait]
-impl QueryExecutor for Box<dyn LixBackendTransaction + Send + Sync + 'static> {
-    fn dialect(&self) -> SqlDialect {
-        self.as_ref().dialect()
-    }
-
-    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        self.as_mut().execute(sql, params).await
-    }
-}
-
-#[async_trait]
-impl<T> QueryExecutor for &mut T
-where
-    T: LixBackendTransaction + ?Sized,
-{
-    fn dialect(&self) -> SqlDialect {
-        (**self).dialect()
-    }
-
-    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        (**self).execute(sql, params).await
-    }
-}
-
-#[async_trait]
 pub trait LixBackendTransaction: Send + Sync {
     fn dialect(&self) -> SqlDialect;
     fn mode(&self) -> TransactionBeginMode;
@@ -194,12 +148,6 @@ pub trait LixBackendTransaction: Send + Sync {
     async fn commit(self: Box<Self>) -> Result<(), LixError>;
 
     async fn rollback(self: Box<Self>) -> Result<(), LixError>;
-}
-
-pub(crate) fn transaction_backend_view(
-    transaction: &mut dyn LixBackendTransaction,
-) -> TransactionBackendAdapter<'_> {
-    TransactionBackendAdapter::new(transaction)
 }
 
 fn kv_not_supported(operation: &str) -> LixError {

@@ -6,112 +6,20 @@ use super::mode::Engine2SimulationMode;
 
 #[derive(Clone)]
 pub(super) struct Engine2SimulationAssertions {
-    inner: Engine2SimulationAssertionsInner,
-}
-
-#[derive(Clone)]
-enum Engine2SimulationAssertionsInner {
-    Local(LocalExpectSameHandle),
-    Shared(SharedExpectSameRun),
+    shared: SharedExpectSameRun,
 }
 
 impl Engine2SimulationAssertions {
-    pub(super) fn new_local() -> Self {
-        Self {
-            inner: Engine2SimulationAssertionsInner::Local(LocalExpectSameHandle::default()),
-        }
-    }
-
     pub(super) fn shared(run: SharedExpectSameRun) -> Self {
-        Self {
-            inner: Engine2SimulationAssertionsInner::Shared(run),
-        }
+        Self { shared: run }
     }
 
-    pub(super) fn start_mode(&self, mode: Engine2SimulationMode) {
-        match &self.inner {
-            Engine2SimulationAssertionsInner::Local(local) => local.lock().start_mode(mode),
-            Engine2SimulationAssertionsInner::Shared(shared) => shared.start_mode(),
-        }
+    pub(super) fn start_mode(&self, _mode: Engine2SimulationMode) {
+        self.shared.start_mode();
     }
 
-    pub(super) fn assert_same(&self, mode: Engine2SimulationMode, label: &str, actual: String) {
-        match &self.inner {
-            Engine2SimulationAssertionsInner::Local(local) => {
-                local.lock().assert_same(mode, label, actual)
-            }
-            Engine2SimulationAssertionsInner::Shared(shared) => shared.assert_same(label, actual),
-        }
-    }
-
-    pub(super) fn finish_mode(&self, mode: Engine2SimulationMode) {
-        match &self.inner {
-            Engine2SimulationAssertionsInner::Local(local) => local.lock().finish_mode(mode),
-            Engine2SimulationAssertionsInner::Shared(shared) => shared.finish_mode(),
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-struct LocalExpectSameHandle {
-    inner: Arc<Mutex<LocalExpectSame>>,
-}
-
-impl LocalExpectSameHandle {
-    fn lock(&self) -> std::sync::MutexGuard<'_, LocalExpectSame> {
-        self.inner
-            .lock()
-            .expect("engine2 simulation assertions lock poisoned")
-    }
-}
-
-#[derive(Default)]
-struct LocalExpectSame {
-    expected: Vec<(String, String)>,
-    current_index: usize,
-}
-
-impl LocalExpectSame {
-    fn start_mode(&mut self, _mode: Engine2SimulationMode) {
-        self.current_index = 0;
-    }
-
-    fn assert_same(&mut self, mode: Engine2SimulationMode, label: &str, actual: String) {
-        match mode {
-            Engine2SimulationMode::Base => {
-                self.expected.push((label.to_string(), actual));
-                self.current_index += 1;
-            }
-            Engine2SimulationMode::TrackedStateRebuild => {
-                let Some((expected_label, expected_value)) = self.expected.get(self.current_index)
-                else {
-                    panic!(
-                        "engine2 simulation assertion '{label}' has no base value at index {}",
-                        self.current_index
-                    );
-                };
-                assert_eq!(
-                    expected_label, label,
-                    "engine2 simulation assertion order changed"
-                );
-                assert_eq!(
-                    expected_value, &actual,
-                    "engine2 simulation assertion '{label}' differed"
-                );
-                self.current_index += 1;
-            }
-        }
-    }
-
-    fn finish_mode(&mut self, mode: Engine2SimulationMode) {
-        if mode == Engine2SimulationMode::Base {
-            return;
-        }
-        assert_eq!(
-            self.current_index,
-            self.expected.len(),
-            "engine2 simulation mode did not execute all assert_same checks"
-        );
+    pub(super) fn finish_mode(&self, _mode: Engine2SimulationMode) {
+        self.shared.finish_mode();
     }
 }
 
@@ -351,38 +259,6 @@ impl Drop for SharedExpectSameRunGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn local_expect_same_compares_rebuild_against_base() {
-        let mut expect = LocalExpectSame::default();
-        expect.start_mode(Engine2SimulationMode::Base);
-        expect.assert_same(Engine2SimulationMode::Base, "value", "1".to_string());
-        expect.finish_mode(Engine2SimulationMode::Base);
-
-        expect.start_mode(Engine2SimulationMode::TrackedStateRebuild);
-        expect.assert_same(
-            Engine2SimulationMode::TrackedStateRebuild,
-            "value",
-            "1".to_string(),
-        );
-        expect.finish_mode(Engine2SimulationMode::TrackedStateRebuild);
-    }
-
-    #[test]
-    #[should_panic(expected = "assertion `left == right` failed")]
-    fn local_expect_same_panics_on_different_value() {
-        let mut expect = LocalExpectSame::default();
-        expect.start_mode(Engine2SimulationMode::Base);
-        expect.assert_same(Engine2SimulationMode::Base, "value", "1".to_string());
-        expect.finish_mode(Engine2SimulationMode::Base);
-
-        expect.start_mode(Engine2SimulationMode::TrackedStateRebuild);
-        expect.assert_same(
-            Engine2SimulationMode::TrackedStateRebuild,
-            "value",
-            "2".to_string(),
-        );
-    }
 
     #[test]
     fn shared_expect_same_compares_against_base_run() {
