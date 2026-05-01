@@ -13,6 +13,8 @@ mod schema;
 pub(crate) mod schema_registry;
 pub mod session;
 pub(crate) mod sql2;
+#[cfg(feature = "storage-benches")]
+pub mod storage_bench;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod tracked_state;
