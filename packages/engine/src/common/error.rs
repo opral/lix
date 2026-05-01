@@ -58,6 +58,11 @@ impl LixError {
     /// meta-schema validation failure.
     pub const CODE_SCHEMA_DEFINITION: &'static str = "LIX_ERROR_SCHEMA_DEFINITION";
 
+    /// The logical Lix handle/session has been closed and cannot run further
+    /// operations. Close is a resource-release lifecycle boundary, not a
+    /// durability boundary.
+    pub const CODE_CLOSED: &'static str = "LIX_ERROR_CLOSED";
+
     pub fn new(code: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
             code: code.into(),
