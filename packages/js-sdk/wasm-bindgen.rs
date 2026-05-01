@@ -109,6 +109,13 @@ export type MergeVersionResult = {
 
     #[wasm_bindgen]
     impl Lix {
+        /// Executes one DataFusion SQL statement against this Lix session.
+        ///
+        /// The SQL dialect is DataFusion SQL, not SQLite SQL. Positional
+        /// placeholders use `$1`, `$2`, and so on. SQLite-specific catalog
+        /// tables and transaction statements such as `sqlite_master`, `BEGIN`,
+        /// and `COMMIT` are not part of this contract; use
+        /// `information_schema` for catalog inspection.
         #[wasm_bindgen(js_name = execute)]
         pub async fn execute(&self, sql: String, params: JsValue) -> Result<JsValue, JsValue> {
             let params = Array::from(&params);
