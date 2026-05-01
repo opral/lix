@@ -31,6 +31,18 @@ cargo codspeed build -p lix_engine --features storage-benches --bench storage
 cargo codspeed run
 ```
 
+Storage accounting report:
+
+```bash
+cargo test -p lix_engine --features storage-benches storage_accounting -- --ignored --nocapture
+```
+
+Max inline encoded value accounting:
+
+```bash
+cargo test -p lix_engine --features storage-benches max_inline_encoded_value_accounting -- --ignored --nocapture
+```
+
 ## Benchmarks
 
 The checked-in baseline size is stable: `10k` logical rows or blobs, with
@@ -71,6 +83,10 @@ Additional high-signal variants are registered for:
 - binary payload sizes: `small/10k`, `1k/10k`, `16k/1k`, `128k/100`
 - key distribution: `sequential_keys`, `random_keys`
 - scan selectivity: `1pct`, `10pct`, `100pct`
+- projection-aware scans: file-selective header scans that omit
+  `snapshot_content`, including `1KiB` out-of-line snapshot variants
+- max inline encoded value variants for `1KiB` payload write and file-scan
+  workloads
 - point-read scaling: `100` point reads over `1k`, `10k`, and `100k` rows
 - update shape: update/overwrite `10pct`, update/overwrite all, append or insert new keys
 - prolly-style tracked-state cases: single-row update in `10k`/`100k` roots,
@@ -79,3 +95,7 @@ Additional high-signal variants are registered for:
 - partial snapshot-content update baselines: one logical field changed in a
   `1KiB` snapshot over `100k` rows and a `16KiB` snapshot over `10k` rows
 - Binary CAS dedupe: unique payloads, all duplicate payloads, half duplicate payloads
+
+The ignored `storage_accounting` test prints deterministic byte/chunk tables
+for the tracked-state physical format: primary tree, header-covering by-file
+tree, and snapshot CAS.

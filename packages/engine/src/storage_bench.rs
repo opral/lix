@@ -2,8 +2,8 @@ use crate::binary_cas::{BinaryBlobWrite, BinaryCasContext};
 use crate::changelog::{CanonicalChange, ChangelogContext, ChangelogScanRequest};
 use crate::entity_identity::EntityIdentity;
 use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDiffRequest, TrackedStateFilter, TrackedStateRow,
-    TrackedStateRowRequest, TrackedStateScanRequest,
+    TrackedStateContext, TrackedStateDiffRequest, TrackedStateFilter, TrackedStateProjection,
+    TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
 };
 use crate::untracked_state::{
     UntrackedStateContext, UntrackedStateFilter, UntrackedStateRow, UntrackedStateRowRequest,
@@ -11,6 +11,8 @@ use crate::untracked_state::{
 };
 use crate::{KvScanRange, LixBackend, LixError, NullableKeyFilter, TransactionBeginMode};
 use std::time::{Duration, Instant};
+
+const DEFAULT_MAX_INLINE_ENCODED_VALUE_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct StorageBenchConfig {
@@ -165,8 +167,21 @@ pub struct BinaryCasReadFixture {
 pub async fn prepare_tracked_state_write_root(
     config: StorageBenchConfig,
 ) -> Result<TrackedStateWriteRootFixture, LixError> {
+    prepare_tracked_state_write_root_with_max_inline_encoded_value_bytes(
+        config,
+        DEFAULT_MAX_INLINE_ENCODED_VALUE_BYTES,
+    )
+    .await
+}
+
+pub async fn prepare_tracked_state_write_root_with_max_inline_encoded_value_bytes(
+    config: StorageBenchConfig,
+    max_inline_encoded_value_bytes: usize,
+) -> Result<TrackedStateWriteRootFixture, LixError> {
     Ok(TrackedStateWriteRootFixture {
-        context: TrackedStateContext::new(),
+        context: TrackedStateContext::with_max_inline_encoded_value_bytes_for_bench(
+            max_inline_encoded_value_bytes,
+        ),
         rows: tracked_rows(config, "bench-tracked-commit"),
     })
 }
@@ -196,6 +211,37 @@ pub async fn prepare_tracked_state_read(
 ) -> Result<TrackedStateReadFixture, LixError> {
     let context = TrackedStateContext::new();
     let rows = tracked_rows(config, "bench-tracked-commit");
+    write_tracked_root(backend, &context, "bench-tracked-commit", None, &rows).await?;
+    Ok(TrackedStateReadFixture {
+        context,
+        rows: config.rows,
+        commit_id: "bench-tracked-commit".to_string(),
+        key_pattern: config.key_pattern,
+        selectivity: config.selectivity,
+    })
+}
+
+pub async fn prepare_tracked_state_read_file_selective(
+    backend: &(dyn LixBackend + Send + Sync),
+    config: StorageBenchConfig,
+) -> Result<TrackedStateReadFixture, LixError> {
+    prepare_tracked_state_read_file_selective_with_max_inline_encoded_value_bytes(
+        backend,
+        config,
+        DEFAULT_MAX_INLINE_ENCODED_VALUE_BYTES,
+    )
+    .await
+}
+
+pub async fn prepare_tracked_state_read_file_selective_with_max_inline_encoded_value_bytes(
+    backend: &(dyn LixBackend + Send + Sync),
+    config: StorageBenchConfig,
+    max_inline_encoded_value_bytes: usize,
+) -> Result<TrackedStateReadFixture, LixError> {
+    let context = TrackedStateContext::with_max_inline_encoded_value_bytes_for_bench(
+        max_inline_encoded_value_bytes,
+    );
+    let rows = tracked_rows_file_selective(config, "bench-tracked-commit");
     write_tracked_root(backend, &context, "bench-tracked-commit", None, &rows).await?;
     Ok(TrackedStateReadFixture {
         context,
@@ -369,6 +415,69 @@ pub async fn tracked_state_scan_file_prepared(
         .await?
         .len();
     Ok(report(fixture.rows, verified_rows, Duration::ZERO))
+}
+
+pub async fn tracked_state_scan_file_selective_prepared(
+    backend: &(dyn LixBackend + Send + Sync),
+    fixture: &TrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let mut reader = fixture.context.reader(backend);
+    let verified_rows = reader
+        .scan_rows_at_commit(
+            &fixture.commit_id,
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    file_ids: vec![NullableKeyFilter::Value("bench-match.json".to_string())],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await?
+        .len();
+    Ok(report(
+        fixture.selectivity.expected_rows(fixture.rows),
+        verified_rows,
+        Duration::ZERO,
+    ))
+}
+
+pub async fn tracked_state_scan_file_header_selective_prepared(
+    backend: &(dyn LixBackend + Send + Sync),
+    fixture: &TrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let mut reader = fixture.context.reader(backend);
+    let verified_rows = reader
+        .scan_rows_at_commit(
+            &fixture.commit_id,
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    file_ids: vec![NullableKeyFilter::Value("bench-match.json".to_string())],
+                    ..Default::default()
+                },
+                projection: TrackedStateProjection {
+                    columns: vec![
+                        "entity_id".to_string(),
+                        "schema_key".to_string(),
+                        "schema_version".to_string(),
+                        "file_id".to_string(),
+                        "metadata".to_string(),
+                        "created_at".to_string(),
+                        "updated_at".to_string(),
+                        "change_id".to_string(),
+                        "commit_id".to_string(),
+                    ],
+                },
+                ..Default::default()
+            },
+        )
+        .await?
+        .len();
+    Ok(report(
+        fixture.selectivity.expected_rows(fixture.rows),
+        verified_rows,
+        Duration::ZERO,
+    ))
 }
 
 pub async fn prepare_tracked_state_update(
@@ -1634,6 +1743,33 @@ fn tracked_rows(config: StorageBenchConfig, commit_id: &str) -> Vec<TrackedState
             entity_id: EntityIdentity::single(entity_id("tracked", index, config.key_pattern)),
             schema_key: tracked_schema_key(index, config.selectivity),
             file_id: Some("bench.json".to_string()),
+            snapshot_content: Some(snapshot_content(index, config.state_payload_bytes)),
+            metadata: None,
+            schema_version: "1".to_string(),
+            created_at: timestamp(index),
+            updated_at: timestamp(index),
+            change_id: format!("tracked-change-{index}"),
+            commit_id: commit_id.to_string(),
+        })
+        .collect()
+}
+
+fn tracked_rows_file_selective(
+    config: StorageBenchConfig,
+    commit_id: &str,
+) -> Vec<TrackedStateRow> {
+    (0..config.rows)
+        .map(|index| TrackedStateRow {
+            entity_id: EntityIdentity::single(entity_id("tracked", index, config.key_pattern)),
+            schema_key: TRACKED_MATCH_SCHEMA_KEY.to_string(),
+            file_id: Some(
+                if config.selectivity.matches(index) {
+                    "bench-match.json"
+                } else {
+                    "bench-other.json"
+                }
+                .to_string(),
+            ),
             snapshot_content: Some(snapshot_content(index, config.state_payload_bytes)),
             metadata: None,
             schema_version: "1".to_string(),

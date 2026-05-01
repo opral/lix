@@ -62,25 +62,52 @@ impl TrackedStateKey {
 /// selected by the version ref.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateValue {
-    pub(crate) snapshot_content: Option<String>,
+    pub(crate) snapshot: StoredSnapshot,
     pub(crate) metadata: Option<String>,
     pub(crate) schema_version: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) change_id: String,
     pub(crate) commit_id: String,
+    pub(crate) deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StoredSnapshot {
+    Missing,
+    Inline(String),
+    Ref(SnapshotRef),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SnapshotRef {
+    pub(crate) codec: SnapshotCodec,
+    pub(crate) hash_hex: String,
+    pub(crate) uncompressed_len: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotCodec {
+    Raw,
+    Zstd,
+    JsonChunks,
 }
 
 impl TrackedStateValue {
     pub(crate) fn from_row(row: &TrackedStateRow) -> Self {
         Self {
-            snapshot_content: row.snapshot_content.clone(),
+            snapshot: row
+                .snapshot_content
+                .clone()
+                .map(StoredSnapshot::Inline)
+                .unwrap_or(StoredSnapshot::Missing),
             metadata: row.metadata.clone(),
             schema_version: row.schema_version.clone(),
             created_at: row.created_at.clone(),
             updated_at: row.updated_at.clone(),
             change_id: row.change_id.clone(),
             commit_id: row.commit_id.clone(),
+            deleted: row.snapshot_content.is_none(),
         }
     }
 
@@ -89,13 +116,29 @@ impl TrackedStateValue {
             entity_id: key.entity_id,
             schema_key: key.schema_key,
             file_id: key.file_id,
-            snapshot_content: self.snapshot_content,
+            snapshot_content: match self.snapshot {
+                StoredSnapshot::Inline(snapshot_content) => Some(snapshot_content),
+                StoredSnapshot::Missing | StoredSnapshot::Ref(_) => None,
+            },
             metadata: self.metadata,
             schema_version: self.schema_version,
             created_at: self.created_at,
             updated_at: self.updated_at,
             change_id: self.change_id,
             commit_id: self.commit_id,
+        }
+    }
+
+    pub(crate) fn without_snapshot_content(mut self) -> Self {
+        self.snapshot = StoredSnapshot::Missing;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inline_snapshot_content(&self) -> Option<&str> {
+        match &self.snapshot {
+            StoredSnapshot::Inline(snapshot_content) => Some(snapshot_content.as_str()),
+            StoredSnapshot::Missing | StoredSnapshot::Ref(_) => None,
         }
     }
 }
@@ -125,7 +168,7 @@ pub(crate) struct TrackedStateTreeScanRequest {
 
 impl TrackedStateTreeScanRequest {
     pub(crate) fn matches(&self, key: &TrackedStateKey, value: &TrackedStateValue) -> bool {
-        if !self.include_tombstones && value.snapshot_content.is_none() {
+        if !self.include_tombstones && value.deleted {
             return false;
         }
         if !self.schema_keys.is_empty() && !self.schema_keys.contains(&key.schema_key) {
@@ -155,4 +198,10 @@ pub(crate) struct TrackedStateApplyResult {
     pub(crate) chunk_count: usize,
     pub(crate) chunk_bytes: usize,
     pub(crate) persisted_root: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrackedStateTreeDiffEntry {
+    pub(crate) before: Option<(TrackedStateKey, TrackedStateValue)>,
+    pub(crate) after: Option<(TrackedStateKey, TrackedStateValue)>,
 }

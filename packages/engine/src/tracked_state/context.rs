@@ -1,9 +1,10 @@
 use crate::backend::{KvStore, KvWriter};
 use crate::commit_graph::CommitGraphContext;
+use crate::tracked_state::by_file_index::ByFileIndex;
 use crate::tracked_state::diff::{diff_commits, TrackedStateDiff, TrackedStateDiffRequest};
 use crate::tracked_state::merge::{self, TrackedStateMergePlan};
 use crate::tracked_state::rebuild::TrackedStateRebuildReport;
-#[cfg(test)]
+use crate::tracked_state::snapshot_store::SnapshotStore;
 use crate::tracked_state::storage;
 use crate::tracked_state::tree::TrackedStateTree;
 use crate::tracked_state::tree_types::{
@@ -19,12 +20,26 @@ use crate::LixError;
 #[derive(Clone)]
 pub(crate) struct TrackedStateContext {
     tree: TrackedStateTree,
+    snapshot_store: SnapshotStore,
 }
 
 impl TrackedStateContext {
     pub(crate) fn new() -> Self {
         Self {
             tree: TrackedStateTree::new(),
+            snapshot_store: SnapshotStore::new(),
+        }
+    }
+
+    #[cfg(feature = "storage-benches")]
+    pub(crate) fn with_max_inline_encoded_value_bytes_for_bench(
+        max_inline_encoded_value_bytes: usize,
+    ) -> Self {
+        Self {
+            tree: TrackedStateTree::new(),
+            snapshot_store: SnapshotStore::with_max_inline_encoded_value_bytes(
+                max_inline_encoded_value_bytes,
+            ),
         }
     }
 
@@ -47,6 +62,7 @@ impl TrackedStateContext {
         TrackedStateWriter {
             store,
             tree: self.tree.clone(),
+            snapshot_store: self.snapshot_store,
         }
     }
 
@@ -91,17 +107,35 @@ where
         let Some(root_id) = self.tree.load_root(&mut self.store, commit_id).await? else {
             return Ok(Vec::new());
         };
-        let rows = self
-            .tree
-            .scan(
-                &mut self.store,
-                &root_id,
-                &tree_scan_request_from_tracked(request),
-            )
-            .await?;
+        let rows = if ByFileIndex::should_use(request) {
+            let Some(by_file_root_id) =
+                storage::load_by_file_root(&mut self.store, commit_id).await?
+            else {
+                return Ok(Vec::new());
+            };
+            self.scan_rows_at_commit_by_file_index(&root_id, &by_file_root_id, request)
+                .await?
+        } else {
+            let rows = self
+                .tree
+                .scan(
+                    &mut self.store,
+                    &root_id,
+                    &tree_scan_request_from_tracked(request),
+                )
+                .await?;
+            SnapshotStore::resolve_rows(&mut self.store, rows, scan_needs_snapshot_content(request))
+                .await?
+        };
+        let needs_snapshot_content = scan_needs_snapshot_content(request);
         Ok(rows
             .into_iter()
-            .map(|(key, value)| value.into_row(key))
+            .map(|(key, mut value)| {
+                if !needs_snapshot_content {
+                    value = value.without_snapshot_content();
+                }
+                value.into_row(key)
+            })
             .collect())
     }
 
@@ -114,18 +148,20 @@ where
         let Some(root_id) = self.tree.load_root(&mut self.store, commit_id).await? else {
             return Ok(None);
         };
-        Ok(self
+        let row = self
             .tree
             .get(&mut self.store, &root_id, &key)
             .await?
-            .map(|value| value.into_row(key)))
+            .map(|value| async {
+                let value = SnapshotStore::resolve_value(&mut self.store, value).await?;
+                Ok::<_, LixError>(value.into_row(key))
+            });
+        match row {
+            Some(row) => row.await.map(Some),
+            None => Ok(None),
+        }
     }
 
-    /// Diffs two commit roots and returns changed tracked-state identities.
-    ///
-    /// This first pass scans both roots and merge-joins rows by identity. The
-    /// public shape matches a prolly cursor diff so the internals can later
-    /// switch to chunk-skipping without changing merge callers.
     pub(crate) async fn diff_commits(
         &mut self,
         left_commit_id: &str,
@@ -133,6 +169,132 @@ where
         request: &TrackedStateDiffRequest,
     ) -> Result<TrackedStateDiff, LixError> {
         diff_commits(self, left_commit_id, right_commit_id, request).await
+    }
+
+    pub(crate) async fn diff_tree_entries_at_commits(
+        &mut self,
+        left_commit_id: &str,
+        right_commit_id: &str,
+        request: &TrackedStateTreeScanRequest,
+    ) -> Result<Vec<crate::tracked_state::tree_types::TrackedStateTreeDiffEntry>, LixError> {
+        let left_root = self.tree.load_root(&mut self.store, left_commit_id).await?;
+        let right_root = self
+            .tree
+            .load_root(&mut self.store, right_commit_id)
+            .await?;
+        let entries = self
+            .tree
+            .diff(
+                &mut self.store,
+                left_root.as_ref(),
+                right_root.as_ref(),
+                request,
+            )
+            .await?;
+        let mut resolved = Vec::with_capacity(entries.len());
+        for entry in entries {
+            resolved.push(
+                crate::tracked_state::tree_types::TrackedStateTreeDiffEntry {
+                    before: match entry.before {
+                        Some((key, value)) => Some((
+                            key,
+                            SnapshotStore::resolve_value(&mut self.store, value).await?,
+                        )),
+                        None => None,
+                    },
+                    after: match entry.after {
+                        Some((key, value)) => Some((
+                            key,
+                            SnapshotStore::resolve_value(&mut self.store, value).await?,
+                        )),
+                        None => None,
+                    },
+                },
+            );
+        }
+        Ok(resolved)
+    }
+
+    async fn scan_rows_at_commit_by_file_index(
+        &mut self,
+        primary_root_id: &crate::tracked_state::tree_types::TrackedStateRootId,
+        by_file_root_id: &crate::tracked_state::tree_types::TrackedStateRootId,
+        request: &TrackedStateScanRequest,
+    ) -> Result<Vec<(TrackedStateKey, TrackedStateValue)>, LixError> {
+        let by_file_request = ByFileIndex::scan_request_from_tracked(request);
+        let index_match_count = self
+            .tree
+            .count_matching_keys(&mut self.store, by_file_root_id, &by_file_request)
+            .await?;
+        let primary_row_count = self
+            .tree
+            .row_count(&mut self.store, primary_root_id)
+            .await?;
+        if index_match_count * 20 > primary_row_count {
+            let rows = self
+                .tree
+                .scan(
+                    &mut self.store,
+                    primary_root_id,
+                    &tree_scan_request_from_tracked(request),
+                )
+                .await?;
+            return SnapshotStore::resolve_rows(
+                &mut self.store,
+                rows,
+                scan_needs_snapshot_content(request),
+            )
+            .await;
+        }
+        let index_rows = self
+            .tree
+            .scan(&mut self.store, by_file_root_id, &by_file_request)
+            .await?;
+        let mut rows = Vec::new();
+        let tree_request = tree_scan_request_from_tracked(request);
+        let needs_snapshot_content = scan_needs_snapshot_content(request);
+        if needs_snapshot_content {
+            let mut primary_keys = Vec::with_capacity(index_rows.len());
+            for (index_key, _) in index_rows {
+                if let Some(primary_key) = ByFileIndex::primary_key_from_index_key(index_key) {
+                    primary_keys.push(primary_key);
+                }
+            }
+            let primary_values = self
+                .tree
+                .get_many(&mut self.store, primary_root_id, &primary_keys)
+                .await?;
+            for (primary_key, value) in primary_keys.into_iter().zip(primary_values) {
+                if request.limit.is_some_and(|limit| rows.len() >= limit) {
+                    break;
+                }
+                let Some(value) = value else {
+                    continue;
+                };
+                if !tree_request.matches(&primary_key, &value) {
+                    continue;
+                }
+                rows.push((
+                    primary_key,
+                    SnapshotStore::resolve_value(&mut self.store, value).await?,
+                ));
+            }
+            return Ok(rows);
+        }
+
+        for (index_key, index_value) in index_rows {
+            if request.limit.is_some_and(|limit| rows.len() >= limit) {
+                break;
+            }
+            let Some(primary_key) = ByFileIndex::primary_key_from_index_key(index_key) else {
+                continue;
+            };
+            let value = index_value;
+            if tree_request.matches(&primary_key, &value) {
+                rows.push((primary_key, value));
+            }
+        }
+        Ok(rows)
     }
 
     /// Plans a three-way merge by diffing both heads against the same base.
@@ -169,6 +331,7 @@ where
 pub(crate) struct TrackedStateWriter<S> {
     store: S,
     tree: TrackedStateTree,
+    snapshot_store: SnapshotStore,
 }
 
 impl<S> TrackedStateWriter<S>
@@ -204,15 +367,19 @@ where
             }
             None => None,
         };
-        let mutations = rows
-            .iter()
-            .map(|row| {
-                TrackedStateMutation::put(
-                    TrackedStateKey::from_row(row),
-                    TrackedStateValue::from_row(row),
-                )
-            })
-            .collect::<Vec<_>>();
+        let mut stored_rows = Vec::with_capacity(rows.len());
+        let mut mutations = Vec::with_capacity(rows.len());
+        for row in rows {
+            let stored_value = self
+                .snapshot_store
+                .store_value(&mut self.store, TrackedStateValue::from_row(row))
+                .await?;
+            mutations.push(TrackedStateMutation::put(
+                TrackedStateKey::from_row(row),
+                stored_value.clone(),
+            ));
+            stored_rows.push((row, stored_value));
+        }
         let result = self
             .tree
             .apply_mutations(
@@ -222,6 +389,38 @@ where
                 Some(commit_id),
             )
             .await?;
+
+        let by_file_base_root = match parent_commit_id {
+            Some(parent_commit_id) => storage::load_by_file_root(&mut self.store, parent_commit_id)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "tracked-state by-file parent root for commit '{parent_commit_id}' is missing"
+                        ),
+                    )
+                })
+                .map(Some)?,
+            None => None,
+        };
+        let mut by_file_mutations = Vec::with_capacity(rows.len());
+        for (row, stored_value) in &stored_rows {
+            by_file_mutations.push(TrackedStateMutation::put(
+                ByFileIndex::key_from_row(row),
+                ByFileIndex::header_value_from_primary(stored_value),
+            ));
+        }
+        let by_file_result = self
+            .tree
+            .apply_mutations(
+                &mut self.store,
+                by_file_base_root.as_ref(),
+                by_file_mutations,
+                None,
+            )
+            .await?;
+        storage::store_by_file_root(&mut self.store, commit_id, &by_file_result.root_id).await?;
         Ok(TrackedStateWriteReceipt {
             commit_id: commit_id.to_string(),
             row_count: result.row_count,
@@ -260,6 +459,15 @@ fn tree_scan_request_from_tracked(
     }
 }
 
+fn scan_needs_snapshot_content(request: &TrackedStateScanRequest) -> bool {
+    request.projection.columns.is_empty()
+        || request
+            .projection
+            .columns
+            .iter()
+            .any(|column| column == "snapshot_content")
+}
+
 fn tracked_key_from_request(request: &TrackedStateRowRequest) -> Result<TrackedStateKey, LixError> {
     let file_id = match &request.file_id {
         crate::NullableKeyFilter::Null => None,
@@ -284,6 +492,8 @@ mod tests {
 
     use super::*;
     use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::tracked_state::snapshot_store::DEFAULT_MAX_INLINE_ENCODED_VALUE_BYTES;
+    use crate::NullableKeyFilter;
 
     #[tokio::test]
     async fn write_root_rejects_missing_parent_root() {
@@ -420,6 +630,239 @@ mod tests {
 
         assert_eq!(merge_patch_ids(&plan), vec!["entity-a"]);
         assert_eq!(plan.patches[0].source_row.snapshot_content, None);
+    }
+
+    #[tokio::test]
+    async fn scan_rows_by_file_uses_file_index_shape() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        let mut file_a = row("entity-a", "change-a", "commit-1");
+        file_a.file_id = Some("file-a.json".to_string());
+        let mut file_b = row("entity-b", "change-b", "commit-1");
+        file_b.file_id = Some("file-b.json".to_string());
+
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        tracked_state
+            .writer(transaction.as_mut())
+            .write_root("commit-1", None, &[file_a, file_b])
+            .await
+            .expect("root should write");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let rows = tracked_state
+            .reader(Arc::clone(&backend))
+            .scan_rows_at_commit(
+                "commit-1",
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("file scan should read through index");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].entity_id.as_string().expect("entity id"),
+            "entity-a"
+        );
+        assert_eq!(rows[0].file_id.as_deref(), Some("file-a.json"));
+    }
+
+    #[tokio::test]
+    async fn by_file_header_index_fetches_primary_payload_only_when_requested() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        let mut row = row("entity-a", "change-a", "commit-1");
+        row.file_id = Some("file-a.json".to_string());
+        let expected_snapshot = row.snapshot_content.clone();
+
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        tracked_state
+            .writer(transaction.as_mut())
+            .write_root("commit-1", None, std::slice::from_ref(&row))
+            .await
+            .expect("root should write");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let mut reader = tracked_state.reader(Arc::clone(&backend));
+        let header_rows = reader
+            .scan_rows_at_commit(
+                "commit-1",
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
+                        ..Default::default()
+                    },
+                    projection: crate::tracked_state::TrackedStateProjection {
+                        columns: vec!["entity_id".to_string()],
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("header scan should read through by-file index");
+        let full_rows = reader
+            .scan_rows_at_commit(
+                "commit-1",
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("full scan should fetch primary payload");
+
+        assert_eq!(header_rows[0].snapshot_content, None);
+        assert_eq!(full_rows[0].snapshot_content, expected_snapshot);
+    }
+
+    #[tokio::test]
+    async fn by_file_header_index_filters_tombstones_without_payload_sentinel() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        let mut live = row("entity-live", "change-live", "commit-1");
+        live.file_id = Some("file-a.json".to_string());
+        let mut deleted = tombstone("entity-deleted", "change-delete", "commit-1");
+        deleted.file_id = Some("file-a.json".to_string());
+
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        tracked_state
+            .writer(transaction.as_mut())
+            .write_root("commit-1", None, &[live, deleted])
+            .await
+            .expect("root should write");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let rows = tracked_state
+            .reader(Arc::clone(&backend))
+            .scan_rows_at_commit(
+                "commit-1",
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
+                        ..Default::default()
+                    },
+                    projection: crate::tracked_state::TrackedStateProjection {
+                        columns: vec!["entity_id".to_string()],
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("file scan should read through index");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].entity_id.as_string().expect("entity id"),
+            "entity-live"
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_resolve_large_snapshot_refs() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        let large_value = "x".repeat(DEFAULT_MAX_INLINE_ENCODED_VALUE_BYTES + 512);
+        let row = row_with_value("entity-a", "change-a", "commit-1", &large_value);
+
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        tracked_state
+            .writer(transaction.as_mut())
+            .write_root("commit-1", None, std::slice::from_ref(&row))
+            .await
+            .expect("root should write");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let mut reader = tracked_state.reader(Arc::clone(&backend));
+        let loaded = reader
+            .load_row_at_commit(
+                "commit-1",
+                &TrackedStateRowRequest {
+                    schema_key: row.schema_key.clone(),
+                    entity_id: row.entity_id.clone(),
+                    file_id: NullableKeyFilter::Null,
+                },
+            )
+            .await
+            .expect("row should load")
+            .expect("row should exist");
+        let scanned = reader
+            .scan_rows_at_commit("commit-1", &TrackedStateScanRequest::default())
+            .await
+            .expect("rows should scan");
+
+        assert_eq!(loaded.snapshot_content, row.snapshot_content);
+        assert_eq!(scanned[0].snapshot_content, row.snapshot_content);
+    }
+
+    #[tokio::test]
+    async fn projected_scans_do_not_return_snapshot_refs_when_snapshot_content_is_omitted() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let tracked_state = TrackedStateContext::new();
+        let large_value = "x".repeat(DEFAULT_MAX_INLINE_ENCODED_VALUE_BYTES + 512);
+        let row = row_with_value("entity-a", "change-a", "commit-1", &large_value);
+
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        tracked_state
+            .writer(transaction.as_mut())
+            .write_root("commit-1", None, std::slice::from_ref(&row))
+            .await
+            .expect("root should write");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let rows = tracked_state
+            .reader(Arc::clone(&backend))
+            .scan_rows_at_commit(
+                "commit-1",
+                &TrackedStateScanRequest {
+                    projection: crate::tracked_state::TrackedStateProjection {
+                        columns: vec!["entity_id".to_string()],
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("rows should scan");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].snapshot_content, None);
     }
 
     async fn seed_merge_roots(

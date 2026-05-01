@@ -2,7 +2,8 @@ use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::entity_identity::{EntityIdentity, EntityIdentityPart};
 use crate::tracked_state::tree_types::{
-    TrackedStateKey, TrackedStateValue, TRACKED_STATE_HASH_BYTES,
+    SnapshotCodec, SnapshotRef, StoredSnapshot, TrackedStateKey, TrackedStateValue,
+    TRACKED_STATE_HASH_BYTES,
 };
 use crate::LixError;
 
@@ -14,6 +15,12 @@ const ENTITY_IDENTITY_END: u8 = 0;
 const ENTITY_IDENTITY_STRING: u8 = 1;
 const ENTITY_IDENTITY_BOOL: u8 = 2;
 const ENTITY_IDENTITY_NUMBER: u8 = 3;
+const SNAPSHOT_MISSING: u8 = 0;
+const SNAPSHOT_INLINE: u8 = 1;
+const SNAPSHOT_REF: u8 = 2;
+const SNAPSHOT_CODEC_RAW: u8 = 0;
+const SNAPSHOT_CODEC_ZSTD: u8 = 1;
+const SNAPSHOT_CODEC_JSON_CHUNKS: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EncodedLeafEntry {
@@ -81,6 +88,24 @@ pub(crate) fn encode_key(key: &TrackedStateKey) -> Vec<u8> {
     out
 }
 
+pub(crate) fn encode_schema_key_prefix(schema_key: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_sized_bytes(&mut out, schema_key.as_bytes());
+    out
+}
+
+pub(crate) fn encode_schema_file_prefix(schema_key: &str, file_id: Option<&str>) -> Vec<u8> {
+    let mut out = encode_schema_key_prefix(schema_key);
+    match file_id {
+        Some(file_id) => {
+            out.push(1);
+            push_sized_bytes(&mut out, file_id.as_bytes());
+        }
+        None => out.push(0),
+    }
+    out
+}
+
 pub(crate) fn decode_key(bytes: &[u8]) -> Result<TrackedStateKey, LixError> {
     let mut cursor = 0usize;
     let schema_key = read_sized_string(bytes, &mut cursor, "schema_key")?;
@@ -110,25 +135,47 @@ pub(crate) fn decode_key(bytes: &[u8]) -> Result<TrackedStateKey, LixError> {
 
 pub(crate) fn encode_value(value: &TrackedStateValue) -> Vec<u8> {
     let mut out = Vec::new();
-    push_optional_string(&mut out, value.snapshot_content.as_deref());
+    push_snapshot(&mut out, &value.snapshot);
     push_optional_string(&mut out, value.metadata.as_deref());
     push_sized_bytes(&mut out, value.schema_version.as_bytes());
     push_sized_bytes(&mut out, value.created_at.as_bytes());
     push_sized_bytes(&mut out, value.updated_at.as_bytes());
     push_sized_bytes(&mut out, value.change_id.as_bytes());
     push_sized_bytes(&mut out, value.commit_id.as_bytes());
+    out.push(u8::from(value.deleted));
     out
+}
+
+pub(crate) fn encoded_value_len(value: &TrackedStateValue) -> usize {
+    snapshot_len(&value.snapshot)
+        + optional_string_len(value.metadata.as_deref())
+        + sized_bytes_len(value.schema_version.as_bytes())
+        + sized_bytes_len(value.created_at.as_bytes())
+        + sized_bytes_len(value.updated_at.as_bytes())
+        + sized_bytes_len(value.change_id.as_bytes())
+        + sized_bytes_len(value.commit_id.as_bytes())
+        + 1
 }
 
 pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateValue, LixError> {
     let mut cursor = 0usize;
-    let snapshot_content = read_optional_string(bytes, &mut cursor, "snapshot_content")?;
+    let snapshot = read_snapshot(bytes, &mut cursor)?;
     let metadata = read_optional_string(bytes, &mut cursor, "metadata")?;
     let schema_version = read_sized_string(bytes, &mut cursor, "schema_version")?;
     let created_at = read_sized_string(bytes, &mut cursor, "created_at")?;
     let updated_at = read_sized_string(bytes, &mut cursor, "updated_at")?;
     let change_id = read_sized_string(bytes, &mut cursor, "change_id")?;
     let commit_id = read_sized_string(bytes, &mut cursor, "commit_id")?;
+    let deleted = match read_u8(bytes, &mut cursor, "deleted")? {
+        0 => false,
+        1 => true,
+        other => {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("tracked-state tree value has invalid deleted byte {other}"),
+            ))
+        }
+    };
     if cursor != bytes.len() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -136,14 +183,97 @@ pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateValue, LixError> 
         ));
     }
     Ok(TrackedStateValue {
-        snapshot_content,
+        snapshot,
         metadata,
         schema_version,
         created_at,
         updated_at,
         change_id,
         commit_id,
+        deleted,
     })
+}
+
+fn push_snapshot(out: &mut Vec<u8>, snapshot: &StoredSnapshot) {
+    match snapshot {
+        StoredSnapshot::Missing => out.push(SNAPSHOT_MISSING),
+        StoredSnapshot::Inline(snapshot_content) => {
+            out.push(SNAPSHOT_INLINE);
+            push_sized_bytes(out, snapshot_content.as_bytes());
+        }
+        StoredSnapshot::Ref(snapshot_ref) => {
+            out.push(SNAPSHOT_REF);
+            out.push(snapshot_codec_byte(snapshot_ref.codec));
+            out.extend_from_slice(&snapshot_ref.uncompressed_len.to_be_bytes());
+            push_sized_bytes(out, snapshot_ref.hash_hex.as_bytes());
+        }
+    }
+}
+
+fn snapshot_len(snapshot: &StoredSnapshot) -> usize {
+    match snapshot {
+        StoredSnapshot::Missing => 1,
+        StoredSnapshot::Inline(snapshot_content) => {
+            1 + sized_bytes_len(snapshot_content.as_bytes())
+        }
+        StoredSnapshot::Ref(snapshot_ref) => {
+            1 + 1 + 8 + sized_bytes_len(snapshot_ref.hash_hex.as_bytes())
+        }
+    }
+}
+
+fn optional_string_len(value: Option<&str>) -> usize {
+    match value {
+        Some(value) => 1 + sized_bytes_len(value.as_bytes()),
+        None => 1,
+    }
+}
+
+fn sized_bytes_len(bytes: &[u8]) -> usize {
+    4 + bytes.len()
+}
+
+fn read_snapshot(bytes: &[u8], cursor: &mut usize) -> Result<StoredSnapshot, LixError> {
+    match read_u8(bytes, cursor, "snapshot kind")? {
+        SNAPSHOT_MISSING => Ok(StoredSnapshot::Missing),
+        SNAPSHOT_INLINE => {
+            read_sized_string(bytes, cursor, "snapshot_content").map(StoredSnapshot::Inline)
+        }
+        SNAPSHOT_REF => {
+            let codec = read_snapshot_codec(bytes, cursor)?;
+            let uncompressed_len = read_u64(bytes, cursor, "snapshot_ref uncompressed_len")?;
+            let hash_hex = read_sized_string(bytes, cursor, "snapshot_ref hash")?;
+            Ok(StoredSnapshot::Ref(SnapshotRef {
+                codec,
+                hash_hex,
+                uncompressed_len,
+            }))
+        }
+        other => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("tracked-state tree value has invalid snapshot kind byte {other}"),
+        )),
+    }
+}
+
+fn snapshot_codec_byte(codec: SnapshotCodec) -> u8 {
+    match codec {
+        SnapshotCodec::Raw => SNAPSHOT_CODEC_RAW,
+        SnapshotCodec::Zstd => SNAPSHOT_CODEC_ZSTD,
+        SnapshotCodec::JsonChunks => SNAPSHOT_CODEC_JSON_CHUNKS,
+    }
+}
+
+fn read_snapshot_codec(bytes: &[u8], cursor: &mut usize) -> Result<SnapshotCodec, LixError> {
+    match read_u8(bytes, cursor, "snapshot_ref codec")? {
+        SNAPSHOT_CODEC_RAW => Ok(SnapshotCodec::Raw),
+        SNAPSHOT_CODEC_ZSTD => Ok(SnapshotCodec::Zstd),
+        SNAPSHOT_CODEC_JSON_CHUNKS => Ok(SnapshotCodec::JsonChunks),
+        other => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("tracked-state tree value has invalid snapshot codec byte {other}"),
+        )),
+    }
 }
 
 pub(crate) fn encode_leaf_node(entries: &[EncodedLeafEntry]) -> Vec<u8> {
@@ -594,17 +724,83 @@ mod tests {
     #[test]
     fn value_codec_roundtrips_tombstone_value() {
         let value = TrackedStateValue {
-            snapshot_content: None,
+            snapshot: StoredSnapshot::Missing,
             metadata: Some("{}".to_string()),
             schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
             change_id: "change".to_string(),
             commit_id: "commit".to_string(),
+            deleted: true,
         };
 
         let encoded = encode_value(&value);
         assert_eq!(decode_value(&encoded).expect("value"), value);
+    }
+
+    #[test]
+    fn value_codec_roundtrips_snapshot_ref() {
+        let value = TrackedStateValue {
+            snapshot: StoredSnapshot::Ref(SnapshotRef {
+                codec: SnapshotCodec::Zstd,
+                hash_hex: "abc123".to_string(),
+                uncompressed_len: 2048,
+            }),
+            metadata: None,
+            schema_version: "1".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            change_id: "change".to_string(),
+            commit_id: "commit".to_string(),
+            deleted: false,
+        };
+
+        let encoded = encode_value(&value);
+        assert_eq!(decode_value(&encoded).expect("value"), value);
+    }
+
+    #[test]
+    fn encoded_value_len_matches_encoded_value_bytes() {
+        let values = [
+            TrackedStateValue {
+                snapshot: StoredSnapshot::Missing,
+                metadata: None,
+                schema_version: "1".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-02T00:00:00Z".to_string(),
+                change_id: "change".to_string(),
+                commit_id: "commit".to_string(),
+                deleted: true,
+            },
+            TrackedStateValue {
+                snapshot: StoredSnapshot::Inline("{\"value\":\"inline\"}".to_string()),
+                metadata: Some("{}".to_string()),
+                schema_version: "1".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-02T00:00:00Z".to_string(),
+                change_id: "change".to_string(),
+                commit_id: "commit".to_string(),
+                deleted: false,
+            },
+            TrackedStateValue {
+                snapshot: StoredSnapshot::Ref(SnapshotRef {
+                    codec: SnapshotCodec::Raw,
+                    hash_hex: "abc123".to_string(),
+                    uncompressed_len: 12,
+                }),
+                metadata: None,
+                schema_version: "1".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-02T00:00:00Z".to_string(),
+                change_id: "change".to_string(),
+                commit_id: "commit".to_string(),
+                deleted: false,
+            },
+        ];
+
+        for value in values {
+            assert_eq!(encoded_value_len(&value), encode_value(&value).len());
+        }
     }
 
     #[test]
