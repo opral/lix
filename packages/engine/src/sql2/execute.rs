@@ -571,11 +571,11 @@ mod tests {
 
         async fn stage_write(&mut self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
             let count = match &write {
-                StageWrite::Rows { rows } => rows.len() as u64,
+                StageWrite::Rows { rows, .. } => rows.len() as u64,
                 StageWrite::RowsWithFileData { count, .. } => *count,
             };
             let rows = match write {
-                StageWrite::Rows { rows } => rows,
+                StageWrite::Rows { rows, .. } => rows,
                 StageWrite::RowsWithFileData { rows, .. } => rows,
             };
             self.staged_writes

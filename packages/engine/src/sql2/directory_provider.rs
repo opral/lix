@@ -48,7 +48,7 @@ use super::result_metadata::json_field;
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
-use crate::transaction::types::StageWrite;
+use crate::transaction::types::{StageWrite, StageWriteMode};
 
 const DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
@@ -435,7 +435,10 @@ impl DataSink for LixDirectoryInsertSink {
         }
 
         self.write_ctx
-            .stage_write(StageWrite::Rows { rows })
+            .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Insert,
+                rows,
+            })
             .await
             .map_err(lix_error_to_datafusion_error)?;
 
@@ -577,7 +580,10 @@ impl ExecutionPlan for LixDirectoryDeleteExec {
 
             if count > 0 {
                 write_ctx
-                    .stage_write(StageWrite::Rows { rows: write_rows })
+                    .stage_write(StageWrite::Rows {
+                        mode: StageWriteMode::Replace,
+                        rows: write_rows,
+                    })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -726,7 +732,10 @@ impl ExecutionPlan for LixDirectoryUpdateExec {
 
             if count > 0 {
                 write_ctx
-                    .stage_write(StageWrite::Rows { rows: write_rows })
+                    .stage_write(StageWrite::Rows {
+                        mode: StageWriteMode::Replace,
+                        rows: write_rows,
+                    })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -1624,7 +1633,7 @@ mod tests {
         LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
-    use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
+    use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWriteOutcome};
     use crate::LixError;
 
     use super::{
@@ -2113,8 +2122,7 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(
             write_context.writes.as_slice(),
-            &[StageWrite::Rows {
-                rows: vec![StageRow {
+            &[StageWrite::Rows { mode: StageWriteMode::Insert, rows: vec![StageRow {
                     entity_id: Some(crate::entity_identity::EntityIdentity::single("dir-docs")),
                     schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                     file_id: None,
@@ -2164,7 +2172,7 @@ mod tests {
             .expect("directory sink should stage path write");
 
         assert_eq!(count, 1);
-        let [StageWrite::Rows { rows }] = write_context.writes.as_slice() else {
+        let [StageWrite::Rows { rows, .. }] = write_context.writes.as_slice() else {
             panic!("expected one directory staged write");
         };
         assert_eq!(rows.len(), 1);
