@@ -39,7 +39,7 @@ use crate::{LixError, NullableKeyFilter};
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
-use crate::transaction::types::StageWrite;
+use crate::transaction::types::{StageWrite, StageWriteMode};
 
 use super::result_metadata::json_field;
 
@@ -385,7 +385,10 @@ impl DataSink for LixStateInsertSink {
             .map_err(|_| DataFusionError::Execution("INSERT row count overflow".into()))?;
 
         self.write_ctx
-            .stage_write(StageWrite::Rows { rows })
+            .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Insert,
+                rows,
+            })
             .await
             .map_err(lix_error_to_datafusion_error)?;
 
@@ -514,7 +517,10 @@ impl ExecutionPlan for LixStateDeleteExec {
 
             if count > 0 {
                 write_ctx
-                    .stage_write(StageWrite::Rows { rows: write_rows })
+                    .stage_write(StageWrite::Rows {
+                        mode: StageWriteMode::Replace,
+                        rows: write_rows,
+                    })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -663,7 +669,10 @@ impl ExecutionPlan for LixStateUpdateExec {
 
             if count > 0 {
                 write_ctx
-                    .stage_write(StageWrite::Rows { rows: write_rows })
+                    .stage_write(StageWrite::Rows {
+                        mode: StageWriteMode::Replace,
+                        rows: write_rows,
+                    })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -1441,7 +1450,7 @@ mod tests {
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
-    use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
+    use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWriteOutcome};
     use crate::version_ref::{VersionHead, VersionRefReader};
     use crate::{
         entity_identity::EntityIdentity,
@@ -2134,6 +2143,7 @@ mod tests {
         assert_eq!(
             write_context.writes.as_slice(),
             &[StageWrite::Rows {
+                mode: StageWriteMode::Insert,
                 rows: vec![StageRow {
                     entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-1")),
                     schema_key: "lix_key_value".to_string(),
@@ -2234,6 +2244,7 @@ mod tests {
         assert_eq!(
             write_context.writes.as_slice(),
             &[StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![StageRow {
                     entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-1")),
                     schema_key: "lix_key_value".to_string(),
@@ -2287,6 +2298,7 @@ mod tests {
         assert_eq!(
             write_context.writes.as_slice(),
             &[StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![
                     StageRow {
                         entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-1")),

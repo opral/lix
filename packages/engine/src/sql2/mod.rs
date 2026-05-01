@@ -14,6 +14,7 @@ mod filesystem_visibility;
 mod history_provider;
 mod history_route;
 mod lix_state_provider;
+mod record_batch;
 mod result_metadata;
 mod udfs;
 mod version_provider;
