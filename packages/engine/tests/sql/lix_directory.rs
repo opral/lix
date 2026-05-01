@@ -68,6 +68,94 @@ simulation_test!(lix_directory_insert_reads_nested_paths, |sim| async move {
 });
 
 simulation_test!(
+    lix_directory_insert_applies_defaulted_id,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let insert_result = session
+            .execute(
+                "INSERT INTO lix_directory (parent_id, name) \
+             VALUES (NULL, 'docs')",
+                &[],
+            )
+            .await
+            .expect("directory insert should apply defaulted id and hidden flag");
+        assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
+
+        let result = session
+            .execute(
+                "SELECT id, path, parent_id, name, hidden \
+             FROM lix_directory \
+             WHERE path = '/docs/'",
+                &[],
+            )
+            .await
+            .expect("directory read should succeed");
+        let row_set = result;
+        assert_eq!(row_set.len(), 1);
+        let values = row_set.rows()[0].values();
+        let [Value::Text(id), Value::Text(path), Value::Null, Value::Text(name), Value::Boolean(hidden)] =
+            values
+        else {
+            panic!("expected generated directory row, got {values:?}");
+        };
+        assert!(!id.is_empty(), "defaulted directory id should be non-empty");
+        assert_eq!(path, "/docs/");
+        assert_eq!(name, "docs");
+        assert!(!hidden);
+    }
+);
+
+simulation_test!(
+    lix_directory_path_insert_applies_defaulted_id,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let insert_result = session
+            .execute("INSERT INTO lix_directory (path) VALUES ('/docs/')", &[])
+            .await
+            .expect("directory path insert should apply defaulted id");
+        assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
+
+        let result = session
+            .execute(
+                "SELECT id, path, parent_id, name, hidden \
+             FROM lix_directory \
+             WHERE path = '/docs/'",
+                &[],
+            )
+            .await
+            .expect("directory read should succeed");
+        let row_set = result;
+        assert_eq!(row_set.len(), 1);
+        let values = row_set.rows()[0].values();
+        let [Value::Text(id), Value::Text(path), Value::Null, Value::Text(name), Value::Boolean(hidden)] =
+            values
+        else {
+            panic!("expected generated directory path row, got {values:?}");
+        };
+        assert!(!id.is_empty(), "defaulted directory id should be non-empty");
+        assert_eq!(path, "/docs/");
+        assert_eq!(name, "docs");
+        assert!(!hidden);
+    }
+);
+
+simulation_test!(
     lix_directory_delete_recursively_deletes_tree,
     |sim| async move {
         let engine = sim.boot_engine().await;

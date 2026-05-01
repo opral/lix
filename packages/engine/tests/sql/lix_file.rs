@@ -83,6 +83,200 @@ simulation_test!(
     }
 );
 
+simulation_test!(lix_file_insert_applies_defaulted_id, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
+
+    session
+        .execute(
+            "INSERT INTO lix_directory (id, parent_id, name, hidden) \
+             VALUES ('dir-docs', NULL, 'docs', false)",
+            &[],
+        )
+        .await
+        .expect("directory insert should succeed");
+
+    let insert_result = session
+        .execute(
+            "INSERT INTO lix_file (directory_id, name, extension) \
+             VALUES ('dir-docs', 'readme', 'md')",
+            &[],
+        )
+        .await
+        .expect("file insert should apply defaulted id and hidden flag");
+    assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
+
+    let result = session
+        .execute(
+            "SELECT id, path, directory_id, name, extension, hidden \
+             FROM lix_file \
+             WHERE path = '/docs/readme.md'",
+            &[],
+        )
+        .await
+        .expect("file read should succeed");
+    let row_set = result;
+    assert_eq!(row_set.len(), 1);
+    let values = row_set.rows()[0].values();
+    let [Value::Text(id), Value::Text(path), Value::Text(directory_id), Value::Text(name), Value::Text(extension), Value::Boolean(hidden)] =
+        values
+    else {
+        panic!("expected generated file row, got {values:?}");
+    };
+    assert!(!id.is_empty(), "defaulted file id should be non-empty");
+    assert_eq!(path, "/docs/readme.md");
+    assert_eq!(directory_id, "dir-docs");
+    assert_eq!(name, "readme");
+    assert_eq!(extension, "md");
+    assert!(!hidden);
+});
+
+simulation_test!(
+    lix_file_path_insert_applies_defaulted_id,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let insert_result = session
+            .execute(
+                "INSERT INTO lix_file (path) VALUES ('/docs/readme.md')",
+                &[],
+            )
+            .await
+            .expect("file path insert should apply defaulted id");
+        assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
+
+        let result = session
+            .execute(
+                "SELECT id, path, name, extension, hidden \
+             FROM lix_file \
+             WHERE path = '/docs/readme.md'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        let row_set = result;
+        assert_eq!(row_set.len(), 1);
+        let values = row_set.rows()[0].values();
+        let [Value::Text(id), Value::Text(path), Value::Text(name), Value::Text(extension), Value::Boolean(hidden)] =
+            values
+        else {
+            panic!("expected generated file path row, got {values:?}");
+        };
+        assert!(!id.is_empty(), "defaulted file id should be non-empty");
+        assert_eq!(path, "/docs/readme.md");
+        assert_eq!(name, "readme");
+        assert_eq!(extension, "md");
+        assert!(!hidden);
+    }
+);
+
+simulation_test!(
+    lix_file_path_data_insert_applies_defaulted_id,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let insert_result = session
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ('/docs/readme.md', X'68656C6C6F')",
+                &[],
+            )
+            .await
+            .expect("file path data insert should apply defaulted id");
+        assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
+
+        let result = session
+            .execute(
+                "SELECT id, path, data \
+             FROM lix_file \
+             WHERE path = '/docs/readme.md'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        let row_set = result;
+        assert_eq!(row_set.len(), 1);
+        let values = row_set.rows()[0].values();
+        let [Value::Text(id), Value::Text(path), Value::Blob(data)] = values else {
+            panic!("expected generated file data row, got {values:?}");
+        };
+        assert!(!id.is_empty(), "defaulted file id should be non-empty");
+        assert_eq!(path, "/docs/readme.md");
+        assert_eq!(data, b"hello");
+    }
+);
+
+simulation_test!(
+    lix_file_data_insert_applies_defaulted_id,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, parent_id, name, hidden) \
+             VALUES ('dir-docs', NULL, 'docs', false)",
+                &[],
+            )
+            .await
+            .expect("directory insert should succeed");
+
+        let insert_result = session
+            .execute(
+                "INSERT INTO lix_file (directory_id, name, extension, data) \
+             VALUES ('dir-docs', 'readme', 'md', X'68656C6C6F')",
+                &[],
+            )
+            .await
+            .expect("file data insert should apply defaulted id");
+        assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
+
+        let result = session
+            .execute(
+                "SELECT id, path, data \
+             FROM lix_file \
+             WHERE path = '/docs/readme.md'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        let row_set = result;
+        assert_eq!(row_set.len(), 1);
+        let values = row_set.rows()[0].values();
+        let [Value::Text(id), Value::Text(path), Value::Blob(data)] = values else {
+            panic!("expected generated file data row, got {values:?}");
+        };
+        assert!(!id.is_empty(), "defaulted file id should be non-empty");
+        assert_eq!(path, "/docs/readme.md");
+        assert_eq!(data, b"hello");
+    }
+);
+
 simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(

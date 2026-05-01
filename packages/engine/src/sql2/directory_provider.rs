@@ -40,8 +40,9 @@ use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 
 use super::filesystem_planner::{
-    directory_descriptor_row, plan_recursive_directory_delete, DirectoryDescriptorRowInput,
-    DirectoryPathResolver, FilesystemDeletePlan, FilesystemRowContext,
+    directory_descriptor_write_row, plan_recursive_directory_delete,
+    DirectoryDescriptorWriteIntent, DirectoryPathResolver, FilesystemDeletePlan,
+    FilesystemRowContext,
 };
 use super::filesystem_visibility::VisibleFilesystem;
 use super::result_metadata::json_field;
@@ -1015,8 +1016,8 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         }
 
         let path = optional_string_value(batch, row_index, "path")?;
-        let id = required_string_value(batch, row_index, "id")?;
-        let hidden = optional_bool_value(batch, row_index, "hidden")?.unwrap_or(false);
+        let id = optional_string_value(batch, row_index, "id")?;
+        let hidden = optional_bool_value(batch, row_index, "hidden")?;
         let context = directory_row_context_from_batch(batch, row_index, version_binding)?;
 
         if let Some(path) = path.filter(|_| reject_read_only_fields) {
@@ -1041,9 +1042,9 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
             let planned_rows = resolver
                 .ensure_directory_path_with_leaf_id(
                     &path,
-                    Some(id),
+                    id,
                     context,
-                    hidden,
+                    hidden.unwrap_or(false),
                     generate_directory_id,
                 )
                 .map_err(lix_error_to_datafusion_error)?;
@@ -1053,13 +1054,15 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
 
         let parent_id = optional_string_value(batch, row_index, "parent_id")?;
         let name = required_string_value(batch, row_index, "name")?;
-        rows.push(directory_descriptor_row(DirectoryDescriptorRowInput {
-            id,
-            parent_id,
-            name,
-            hidden,
-            context,
-        }));
+        rows.push(directory_descriptor_write_row(
+            DirectoryDescriptorWriteIntent {
+                id,
+                parent_id,
+                name,
+                hidden,
+                context,
+            },
+        ));
     }
     Ok(rows)
 }
@@ -1561,11 +1564,11 @@ fn optional_scalar_value(
 
 fn lix_directory_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
+        Field::new("id", DataType::Utf8, true),
         Field::new("path", DataType::Utf8, true),
         Field::new("parent_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
-        Field::new("hidden", DataType::Boolean, false),
+        Field::new("hidden", DataType::Boolean, true),
         Field::new("lixcol_entity_id", DataType::Utf8, false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),

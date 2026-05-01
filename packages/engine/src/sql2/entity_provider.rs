@@ -27,7 +27,7 @@ use futures_util::{stream, StreamExt, TryStreamExt};
 use serde_json::Value as JsonValue;
 
 use crate::commit_graph::CommitGraphReader;
-use crate::entity_identity::{EntityIdentity, EntityIdentityError};
+use crate::entity_identity::EntityIdentity;
 use crate::live_state::LiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
@@ -162,6 +162,7 @@ pub(super) struct EntitySurfaceSpec {
     primary_key_paths: Vec<Vec<String>>,
     pub(super) visible_columns: Vec<String>,
     pub(super) column_types: BTreeMap<String, EntityColumnType>,
+    defaulted_columns: BTreeSet<String>,
 }
 
 pub(crate) struct EntityProvider {
@@ -1019,12 +1020,6 @@ fn entity_lix_state_write_rows_from_batch_with_options(
                     ))
                 })?;
             let snapshot_content = entity_snapshot_content_from_batch(spec, batch, row_index)?;
-            let snapshot = serde_json::from_str::<JsonValue>(&snapshot_content).map_err(|error| {
-                DataFusionError::Execution(format!(
-                    "failed to decode entity surface '{}' snapshot_content for entity id derivation: {error}",
-                    spec.schema_key
-                ))
-            })?;
             let explicit_entity_id = optional_string_value(batch, row_index, "lixcol_entity_id")?;
             let entity_id = if spec.primary_key_paths.is_empty() {
                 let entity_id = explicit_entity_id.ok_or_else(|| {
@@ -1033,25 +1028,27 @@ fn entity_lix_state_write_rows_from_batch_with_options(
                         spec.schema_key
                     ))
                 })?;
-                EntityIdentity::from_string(&entity_id).map_err(|error| {
+                Some(EntityIdentity::from_string(&entity_id).map_err(|error| {
                     DataFusionError::Execution(format!(
                         "INSERT into entity surface '{}' has invalid lixcol_entity_id: {error}",
                         spec.schema_key
                     ))
-                })?
+                })?)
             } else {
-                if reject_read_only_fields && explicit_entity_id.is_some() {
-                    return Err(DataFusionError::Execution(format!(
-                        "INSERT into entity surface '{}' cannot stage opaque projection column 'lixcol_entity_id'; use the schema primary-key columns instead",
-                        spec.schema_key
-                    )));
-                }
-                derive_entity_identity_from_snapshot(spec, &snapshot)
-                    .map_err(DataFusionError::Execution)?
+                explicit_entity_id
+                    .map(|entity_id| {
+                        EntityIdentity::from_string(&entity_id).map_err(|error| {
+                            DataFusionError::Execution(format!(
+                                "INSERT into entity surface '{}' has invalid lixcol_entity_id: {error}",
+                                spec.schema_key
+                            ))
+                        })
+                    })
+                    .transpose()?
             };
 
             Ok(StageRow {
-                entity_id: Some(entity_id),
+                entity_id,
                 schema_key: spec.schema_key.clone(),
                 file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
                 snapshot_content: Some(snapshot_content),
@@ -1092,10 +1089,11 @@ fn entity_snapshot_content_from_batch(
             ))
         })?;
         let value = optional_scalar_value(batch, row_index, column_name)?;
-        object.insert(
-            column_name.clone(),
-            entity_json_value_from_scalar(value, *column_type)?,
-        );
+        let value = entity_json_value_from_scalar(value, *column_type)?;
+        if value.is_null() && spec.defaulted_columns.contains(column_name) {
+            continue;
+        }
+        object.insert(column_name.clone(), value);
     }
     serde_json::to_string(&JsonValue::Object(object)).map_err(|error| {
         DataFusionError::Execution(format!(
@@ -1103,62 +1101,6 @@ fn entity_snapshot_content_from_batch(
             spec.schema_key
         ))
     })
-}
-
-fn derive_entity_identity_from_snapshot(
-    spec: &EntitySurfaceSpec,
-    snapshot: &JsonValue,
-) -> std::result::Result<EntityIdentity, String> {
-    EntityIdentity::from_primary_key_paths(snapshot, &spec.primary_key_paths)
-        .map_err(|error| entity_id_derivation_error_message(spec, error))
-}
-
-fn entity_id_derivation_error_message(
-    spec: &EntitySurfaceSpec,
-    error: EntityIdentityError,
-) -> String {
-    match error {
-        EntityIdentityError::EmptyPrimaryKey => format!(
-            "INSERT into entity surface '{}' has empty x-lix-primary-key",
-            spec.schema_key
-        ),
-        EntityIdentityError::EmptyPrimaryKeyPath { index } => format!(
-            "INSERT into entity surface '{}' has empty x-lix-primary-key pointer at index {index}",
-            spec.schema_key
-        ),
-        EntityIdentityError::MissingPrimaryKeyValue { index } => {
-            let pointer = format_json_pointer(&spec.primary_key_paths[index]);
-            format!(
-                "INSERT into entity surface '{}' requires value at primary-key pointer '{pointer}'",
-                spec.schema_key
-            )
-        }
-        EntityIdentityError::NullPrimaryKeyValue { index } => {
-            let pointer = format_json_pointer(&spec.primary_key_paths[index]);
-            format!(
-                "INSERT into entity surface '{}' requires non-null value at primary-key pointer '{pointer}'",
-                spec.schema_key
-            )
-        }
-        EntityIdentityError::EmptyPrimaryKeyValue { index } => {
-            let pointer = format_json_pointer(&spec.primary_key_paths[index]);
-            format!(
-                "INSERT into entity surface '{}' requires non-empty value at primary-key pointer '{pointer}'",
-                spec.schema_key
-            )
-        }
-        EntityIdentityError::UnsupportedPrimaryKeyValue { index } => {
-            let pointer = format_json_pointer(&spec.primary_key_paths[index]);
-            format!(
-                "INSERT into entity surface '{}' requires scalar value at primary-key pointer '{pointer}'",
-                spec.schema_key
-            )
-        }
-        EntityIdentityError::InvalidEncodedEntityIdentity => format!(
-            "INSERT into entity surface '{}' derived invalid entity identity",
-            spec.schema_key
-        ),
-    }
 }
 
 fn entity_json_value_from_scalar(
@@ -1665,7 +1607,7 @@ pub(super) fn entity_system_fields(variant: EntityProviderVariant) -> Vec<Field>
     }
 
     let mut fields = vec![
-        Field::new("lixcol_entity_id", DataType::Utf8, false),
+        Field::new("lixcol_entity_id", DataType::Utf8, true),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         json_field("lixcol_snapshot_content", true),
@@ -1737,6 +1679,19 @@ fn derive_entity_surface_spec_from_schema(
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
+    let defaulted_columns = schema
+        .get("properties")
+        .and_then(JsonValue::as_object)
+        .map(|properties| {
+            properties
+                .iter()
+                .filter(|(key, property_schema)| {
+                    !key.starts_with("lixcol_") && property_schema_has_default(property_schema)
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
     let primary_key_paths = parse_primary_key_paths(schema)?;
 
     Ok(EntitySurfaceSpec {
@@ -1745,7 +1700,12 @@ fn derive_entity_surface_spec_from_schema(
         primary_key_paths,
         visible_columns,
         column_types,
+        defaulted_columns,
     })
+}
+
+fn property_schema_has_default(schema: &JsonValue) -> bool {
+    schema.get("x-lix-default").is_some() || schema.get("default").is_some()
 }
 
 fn parse_primary_key_paths(schema: &JsonValue) -> std::result::Result<Vec<Vec<String>>, LixError> {
@@ -1812,18 +1772,6 @@ fn decode_json_pointer_segment(segment: &str) -> std::result::Result<String, Lix
         }
     }
     Ok(out)
-}
-
-fn format_json_pointer(segments: &[String]) -> String {
-    if segments.is_empty() {
-        return String::new();
-    }
-    let encoded = segments
-        .iter()
-        .map(|segment| segment.replace('~', "~0").replace('/', "~1"))
-        .collect::<Vec<_>>()
-        .join("/");
-    format!("/{encoded}")
 }
 
 fn schema_exposed_as_entity_surface(schema_key: &str) -> bool {
@@ -2208,6 +2156,36 @@ mod tests {
     }
 
     #[test]
+    fn insert_schema_allows_defaulted_identity_columns_to_be_omitted() {
+        let spec = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "project_message",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "x-lix-default": "lix_uuid_v7()" },
+                "body": { "type": "string" }
+            }
+        }))
+        .expect("schema should derive entity surface spec");
+
+        let schema = entity_surface_schema(&spec, EntityProviderVariant::Active);
+        assert!(
+            schema
+                .field_with_name("id")
+                .expect("id field")
+                .is_nullable(),
+            "defaulted primary-key property should be nullable at SQL input"
+        );
+        assert!(
+            schema
+                .field_with_name("lixcol_entity_id")
+                .expect("entity id field")
+                .is_nullable(),
+            "opaque identity projection should be nullable for normal primary-key inserts"
+        );
+    }
+
+    #[test]
     fn record_batch_projects_payload_and_system_columns() {
         let spec = Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
@@ -2338,7 +2316,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_key_entity_insert_derives_opaque_projection_from_normal_columns() {
+    fn primary_key_entity_insert_stages_partial_row_for_normalization() {
         let spec = entity_insert_spec_with_primary_key();
         let rows = entity_lix_state_write_rows_from_batch(
             &spec,
@@ -2348,10 +2326,7 @@ mod tests {
         .expect("entity batch should decode");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].entity_id.as_ref(),
-            Some(&crate::entity_identity::EntityIdentity::single("message-1"))
-        );
+        assert_eq!(rows[0].entity_id, None);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(
                 rows[0]
@@ -2368,18 +2343,19 @@ mod tests {
     }
 
     #[test]
-    fn primary_key_entity_insert_rejects_explicit_opaque_projection() {
+    fn primary_key_entity_insert_preserves_explicit_opaque_projection_for_normalization() {
         let spec = entity_insert_spec_with_primary_key();
-        let error = entity_lix_state_write_rows_from_batch(
+        let rows = entity_lix_state_write_rows_from_batch(
             &spec,
             &primary_key_entity_insert_batch(true),
             None,
         )
-        .expect_err("primary-key entity insert should reject lixcol_entity_id");
+        .expect("primary-key entity insert should stage explicit lixcol_entity_id");
 
-        assert!(
-            error.to_string().contains("primary-key columns"),
-            "unexpected error: {error}"
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].entity_id.as_ref(),
+            Some(&crate::entity_identity::EntityIdentity::single("message-1"))
         );
     }
 
