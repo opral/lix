@@ -190,6 +190,35 @@ pub(crate) fn bench(c: &mut Criterion, runtime: &Runtime, args: Args) {
             )
         });
     }
+    for threshold in [512, 1024, 2048, 4096, 8192] {
+        let name = format!("write_root_payload_1k_max_inline_encoded_value_{threshold}/10k");
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || {
+                    let backend = BenchBackend::new();
+                    let fixture = runtime
+                        .block_on(
+                            storage_bench::prepare_tracked_state_write_root_with_max_inline_encoded_value_bytes(
+                                config(&args).with_state_payload_bytes(1024),
+                                threshold,
+                            ),
+                        )
+                        .expect("prepare tracked_state/write_root max inline encoded value");
+                    (backend, fixture)
+                },
+                |(backend, fixture)| {
+                    black_box(
+                        runtime
+                            .block_on(storage_bench::tracked_state_write_root_prepared(
+                                &backend, &fixture,
+                            ))
+                            .expect("tracked_state/write_root max inline encoded value succeeds"),
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        });
+    }
     for (label, key_pattern) in [
         ("sequential_keys", StorageBenchKeyPattern::Sequential),
         ("random_keys", StorageBenchKeyPattern::Random),
@@ -235,6 +264,153 @@ pub(crate) fn bench(c: &mut Criterion, runtime: &Runtime, args: Args) {
                                 &backend, &fixture,
                             ))
                             .expect("tracked_state/scan_schema selectivity succeeds"),
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        });
+    }
+    for (label, selectivity) in [
+        ("1pct", StorageBenchSelectivity::Percent1),
+        ("10pct", StorageBenchSelectivity::Percent10),
+    ] {
+        let name = format!("scan_file_selectivity_payload_1k_{label}/10k");
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || {
+                    prepare_read_file_selective_with(
+                        runtime,
+                        args,
+                        config(&args)
+                            .with_state_payload_bytes(1024)
+                            .with_selectivity(selectivity),
+                    )
+                },
+                |(backend, fixture)| {
+                    black_box(
+                        runtime
+                            .block_on(storage_bench::tracked_state_scan_file_selective_prepared(
+                                &backend, &fixture,
+                            ))
+                            .expect("tracked_state/scan_file payload selectivity succeeds"),
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        });
+    }
+    for threshold in [512, 1024, 2048, 4096, 8192] {
+        let name = format!(
+            "scan_file_selectivity_payload_1k_max_inline_encoded_value_{threshold}_10pct/10k"
+        );
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || {
+                    prepare_read_file_selective_with_max_inline_encoded_value(
+                        runtime,
+                        args,
+                        config(&args)
+                            .with_state_payload_bytes(1024)
+                            .with_selectivity(StorageBenchSelectivity::Percent10),
+                        threshold,
+                    )
+                },
+                |(backend, fixture)| {
+                    black_box(
+                        runtime
+                            .block_on(storage_bench::tracked_state_scan_file_selective_prepared(
+                                &backend, &fixture,
+                            ))
+                            .expect("tracked_state/scan_file inline threshold succeeds"),
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        });
+    }
+    for (label, selectivity) in [
+        ("1pct", StorageBenchSelectivity::Percent1),
+        ("10pct", StorageBenchSelectivity::Percent10),
+        ("100pct", StorageBenchSelectivity::Percent100),
+    ] {
+        let name = format!("scan_file_selectivity_{label}/10k");
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || {
+                    prepare_read_file_selective_with(
+                        runtime,
+                        args,
+                        config(&args).with_selectivity(selectivity),
+                    )
+                },
+                |(backend, fixture)| {
+                    black_box(
+                        runtime
+                            .block_on(storage_bench::tracked_state_scan_file_selective_prepared(
+                                &backend, &fixture,
+                            ))
+                            .expect("tracked_state/scan_file selectivity succeeds"),
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        });
+    }
+    for (label, selectivity) in [
+        ("1pct", StorageBenchSelectivity::Percent1),
+        ("10pct", StorageBenchSelectivity::Percent10),
+        ("100pct", StorageBenchSelectivity::Percent100),
+    ] {
+        let name = format!("scan_file_header_selectivity_{label}/10k");
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || {
+                    prepare_read_file_selective_with(
+                        runtime,
+                        args,
+                        config(&args).with_selectivity(selectivity),
+                    )
+                },
+                |(backend, fixture)| {
+                    black_box(
+                        runtime
+                            .block_on(
+                                storage_bench::tracked_state_scan_file_header_selective_prepared(
+                                    &backend, &fixture,
+                                ),
+                            )
+                            .expect("tracked_state/scan_file header selectivity succeeds"),
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        });
+    }
+    for (label, selectivity) in [
+        ("1pct", StorageBenchSelectivity::Percent1),
+        ("10pct", StorageBenchSelectivity::Percent10),
+    ] {
+        let name = format!("scan_file_header_selectivity_payload_1k_{label}/10k");
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || {
+                    prepare_read_file_selective_with(
+                        runtime,
+                        args,
+                        config(&args)
+                            .with_state_payload_bytes(1024)
+                            .with_selectivity(selectivity),
+                    )
+                },
+                |(backend, fixture)| {
+                    black_box(
+                        runtime
+                            .block_on(
+                                storage_bench::tracked_state_scan_file_header_selective_prepared(
+                                    &backend, &fixture,
+                                ),
+                            )
+                            .expect("tracked_state/scan_file header payload selectivity succeeds"),
                     )
                 },
                 BatchSize::LargeInput,
@@ -541,6 +717,47 @@ fn prepare_read_with(
     let fixture = runtime
         .block_on(storage_bench::prepare_tracked_state_read(&backend, config))
         .expect("prepare tracked_state/read variant");
+    (backend, fixture)
+}
+
+fn prepare_read_file_selective_with(
+    runtime: &Runtime,
+    args: Args,
+    config: StorageBenchConfig,
+) -> (
+    BenchBackend,
+    lix_engine::storage_bench::TrackedStateReadFixture,
+) {
+    let _ = args;
+    let backend = BenchBackend::new();
+    let fixture = runtime
+        .block_on(storage_bench::prepare_tracked_state_read_file_selective(
+            &backend, config,
+        ))
+        .expect("prepare tracked_state/read file-selective variant");
+    (backend, fixture)
+}
+
+fn prepare_read_file_selective_with_max_inline_encoded_value(
+    runtime: &Runtime,
+    args: Args,
+    config: StorageBenchConfig,
+    max_inline_encoded_value_bytes: usize,
+) -> (
+    BenchBackend,
+    lix_engine::storage_bench::TrackedStateReadFixture,
+) {
+    let _ = args;
+    let backend = BenchBackend::new();
+    let fixture = runtime
+        .block_on(
+            storage_bench::prepare_tracked_state_read_file_selective_with_max_inline_encoded_value_bytes(
+                &backend,
+                config,
+                max_inline_encoded_value_bytes,
+            ),
+        )
+        .expect("prepare tracked_state/read file-selective max inline encoded value variant");
     (backend, fixture)
 }
 

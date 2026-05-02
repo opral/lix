@@ -1,9 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
-
 use crate::entity_identity::EntityIdentity;
-use crate::tracked_state::{
-    TrackedStateFilter, TrackedStateRow, TrackedStateScanRequest, TrackedStateStoreReader,
-};
+use crate::tracked_state::tree_types::TrackedStateTreeScanRequest;
+use crate::tracked_state::{TrackedStateFilter, TrackedStateRow, TrackedStateStoreReader};
 use crate::LixError;
 
 /// Filter for comparing two tracked-state commit roots.
@@ -54,11 +51,6 @@ pub(crate) enum TrackedStateDiffKind {
 
 /// Diffs two tracked-state commit roots.
 ///
-/// This first implementation scans both roots with tombstones included and
-/// merge-joins the keyed rows. It deliberately mirrors the shape of prolly-tree
-/// diffs (`before`, `after`, `Added | Modified | Removed`) so we can later
-/// replace the internals with a chunk-skipping cursor diff without changing
-/// merge code.
 pub(crate) async fn diff_commits<S>(
     reader: &mut TrackedStateStoreReader<S>,
     left_commit_id: &str,
@@ -69,26 +61,17 @@ where
     S: crate::backend::KvStore,
 {
     let scan_request = scan_request_for_diff(request);
-    let left_rows = keyed_rows(
-        reader
-            .scan_rows_at_commit(left_commit_id, &scan_request)
-            .await?,
-    )?;
-    let right_rows = keyed_rows(
-        reader
-            .scan_rows_at_commit(right_commit_id, &scan_request)
-            .await?,
-    )?;
-    let identities = left_rows
-        .keys()
-        .chain(right_rows.keys())
-        .cloned()
-        .collect::<BTreeSet<_>>();
-
     let mut entries = Vec::new();
-    for identity in identities {
-        let before = left_rows.get(&identity);
-        let after = right_rows.get(&identity);
+    for tree_entry in reader
+        .diff_tree_entries_at_commits(left_commit_id, right_commit_id, &scan_request)
+        .await?
+    {
+        let before = tree_entry.before.map(|(key, value)| value.into_row(key));
+        let after = tree_entry.after.map(|(key, value)| value.into_row(key));
+        let identity = match before.as_ref().or(after.as_ref()) {
+            Some(row) => TrackedStateDiffIdentity::from_row(row)?,
+            None => continue,
+        };
         let Some(entry) = classify_diff(identity, before, after) else {
             continue;
         };
@@ -98,51 +81,43 @@ where
     Ok(TrackedStateDiff { entries })
 }
 
-fn scan_request_for_diff(request: &TrackedStateDiffRequest) -> TrackedStateScanRequest {
+fn scan_request_for_diff(request: &TrackedStateDiffRequest) -> TrackedStateTreeScanRequest {
     let mut filter = request.filter.clone();
     filter.include_tombstones = true;
-    TrackedStateScanRequest {
-        filter,
-        projection: Default::default(),
+    TrackedStateTreeScanRequest {
+        schema_keys: filter.schema_keys,
+        entity_ids: filter.entity_ids,
+        file_ids: filter.file_ids,
+        include_tombstones: filter.include_tombstones,
         limit: None,
     }
 }
 
-fn keyed_rows(
-    rows: Vec<TrackedStateRow>,
-) -> Result<BTreeMap<TrackedStateDiffIdentity, TrackedStateRow>, LixError> {
-    let mut keyed = BTreeMap::new();
-    for row in rows {
-        keyed.insert(TrackedStateDiffIdentity::from_row(&row)?, row);
-    }
-    Ok(keyed)
-}
-
 fn classify_diff(
     identity: TrackedStateDiffIdentity,
-    before: Option<&TrackedStateRow>,
-    after: Option<&TrackedStateRow>,
+    before: Option<TrackedStateRow>,
+    after: Option<TrackedStateRow>,
 ) -> Option<TrackedStateDiffEntry> {
-    match (is_live_row(before), is_live_row(after)) {
+    match (is_live_row(before.as_ref()), is_live_row(after.as_ref())) {
         (None, None) => None,
         (None, Some(_)) => Some(TrackedStateDiffEntry {
             identity,
             kind: TrackedStateDiffKind::Added,
-            before: before.cloned(),
-            after: after.cloned(),
+            before,
+            after,
         }),
         (Some(_), None) => Some(TrackedStateDiffEntry {
             identity,
             kind: TrackedStateDiffKind::Removed,
-            before: before.cloned(),
-            after: after.cloned(),
+            before,
+            after,
         }),
         (Some(before), Some(after)) if tracked_row_payload_eq(before, after) => None,
-        (Some(before), Some(after)) => Some(TrackedStateDiffEntry {
+        (Some(_), Some(_)) => Some(TrackedStateDiffEntry {
             identity,
             kind: TrackedStateDiffKind::Modified,
-            before: Some(before.clone()),
-            after: Some(after.clone()),
+            before,
+            after,
         }),
     }
 }
