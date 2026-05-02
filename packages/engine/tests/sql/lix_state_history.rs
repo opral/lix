@@ -77,6 +77,44 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_state_history_rejects_prefixed_start_commit_id_filter,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('history-prefixed-start', 'one')",
+                &[],
+            )
+            .await
+            .expect("tracked write should succeed");
+
+        let error = session
+            .execute(
+                "SELECT entity_id \
+                 FROM lix_state_history \
+                 WHERE lixcol_start_commit_id = lix_active_version_commit_id()",
+                &[],
+            )
+            .await
+            .expect_err("lix_state_history should only expose bare start_commit_id");
+
+        assert_eq!(error.code, lix_engine::LixError::CODE_COLUMN_NOT_FOUND);
+        assert!(
+            error.to_string().contains("lixcol_start_commit_id"),
+            "unexpected error: {error}"
+        );
+    }
+);
+
+simulation_test!(
     lix_state_history_reads_from_explicit_historical_commit,
     |sim| async move {
         let engine = sim.boot_engine().await;

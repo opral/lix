@@ -6,6 +6,8 @@ mod support;
 mod entity_history;
 #[path = "sql/errors.rs"]
 mod errors;
+#[path = "sql/history_conformance.rs"]
+mod history_conformance;
 #[path = "sql/lix_change.rs"]
 mod lix_change;
 #[path = "sql/lix_commit.rs"]
