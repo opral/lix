@@ -2958,6 +2958,7 @@ dependencies = [
  "getrandom 0.3.4",
  "js-sys",
  "lix_rs_sdk",
+ "serde",
  "serde-wasm-bindgen",
  "serde_json",
  "wasm-bindgen",
