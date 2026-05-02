@@ -10,7 +10,7 @@ mod lix;
 pub use lix::{open_lix, Lix, OpenLixOptions};
 pub use lix_engine::{
     CreateVersionOptions, CreateVersionReceipt as CreateVersionResult, ExecuteResult, KvPair,
-    KvScanRange, LixBackend, LixBackendTransaction, LixError, MergeVersionOptions,
+    KvScanRange, LixBackend, LixBackendTransaction, LixError, LixNotice, MergeVersionOptions,
     MergeVersionOutcome, MergeVersionReceipt as MergeVersionResult, Row, SqlQueryResult,
     SwitchVersionOptions, SwitchVersionReceipt as SwitchVersionResult, TransactionBeginMode,
     TryFromValue, Value,

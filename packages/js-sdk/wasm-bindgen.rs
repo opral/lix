@@ -34,6 +34,13 @@ export type ExecuteResult = {
   columns: string[];
   rows: LixValue[][];
   rowsAffected: number;
+  notices: LixNotice[];
+};
+
+export type LixNotice = {
+  code: string;
+  message: string;
+  hint?: string;
 };
 
 export type TransactionBeginMode = "read" | "write" | "deferred";
@@ -805,6 +812,18 @@ export type MergeVersionResult = {
         Reflect::set(&object, &JsValue::from_str("rows"), &values)
             .map_err(|_| js_sdk_error("could not set rows"))?;
         set_number(&object, "rowsAffected", result.rows_affected() as f64)?;
+        let notices = Array::new();
+        for notice in result.notices() {
+            let notice_object = Object::new();
+            set_string(&notice_object, "code", &notice.code)?;
+            set_string(&notice_object, "message", &notice.message)?;
+            if let Some(hint) = &notice.hint {
+                set_string(&notice_object, "hint", hint)?;
+            }
+            notices.push(&notice_object);
+        }
+        Reflect::set(&object, &JsValue::from_str("notices"), &notices)
+            .map_err(|_| js_sdk_error("could not set notices"))?;
         Ok(object.into())
     }
 
