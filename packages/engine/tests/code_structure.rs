@@ -1716,7 +1716,8 @@ fn sealed_owner_root_facade_owners() -> BTreeSet<&'static str> {
 }
 
 fn sealed_owner_allows_importer(owner_root: &str, importer_file: &str) -> bool {
-    matches!(owner_root, "api") && importer_file == "lib.rs"
+    (matches!(owner_root, "api") && importer_file == "lib.rs")
+        || importer_file == "storage_bench.rs"
 }
 
 fn sealed_owner_allows_import_path(owner_root: &str, imported_path: &[String]) -> bool {

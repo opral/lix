@@ -6,6 +6,7 @@ use lix_engine::storage_bench::{
 mod backend;
 mod binary_cas;
 mod changelog;
+mod json_store;
 mod tracked_state;
 mod untracked_state;
 
@@ -56,6 +57,7 @@ fn storage_benches(c: &mut Criterion) {
     untracked_state::bench(c, &runtime, args);
     changelog::bench(c, &runtime, args);
     binary_cas::bench(c, &runtime, args);
+    json_store::bench(c, &runtime, args);
 }
 
 criterion_group!(benches, storage_benches);

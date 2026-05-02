@@ -8,6 +8,8 @@ pub mod engine;
 pub(crate) mod entity_identity;
 pub(crate) mod functions;
 pub(crate) mod init;
+#[allow(dead_code)]
+pub(crate) mod json_store;
 pub(crate) mod live_state;
 mod schema;
 pub(crate) mod schema_registry;

@@ -334,6 +334,11 @@ where
 }
 
 fn tracked_scan_request_from_live(request: &LiveStateScanRequest) -> TrackedStateScanRequest {
+    let mut columns = request.projection.columns.clone();
+    if !columns.is_empty() && !columns.iter().any(|column| column == "snapshot_content") {
+        columns.push("snapshot_content".to_string());
+    }
+
     TrackedStateScanRequest {
         filter: TrackedStateFilter {
             schema_keys: request.filter.schema_keys.clone(),
@@ -343,9 +348,7 @@ fn tracked_scan_request_from_live(request: &LiveStateScanRequest) -> TrackedStat
             // global fallback rows before the serving facade filters them.
             include_tombstones: true,
         },
-        projection: TrackedStateProjection {
-            columns: request.projection.columns.clone(),
-        },
+        projection: TrackedStateProjection { columns },
         limit: None,
     }
 }

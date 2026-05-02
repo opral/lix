@@ -2,8 +2,8 @@
 
 use async_trait::async_trait;
 use lix_engine::storage_bench::{
-    self, StorageBenchConfig, StorageBenchKeyPattern, StorageBenchSelectivity,
-    StorageBenchUpdateFraction,
+    self, JsonStorePayloadShape, StorageBenchConfig, StorageBenchKeyPattern,
+    StorageBenchSelectivity, StorageBenchUpdateFraction,
 };
 use lix_engine::{
     KvPair, KvScanRange, LixBackend, LixBackendTransaction, LixError, TransactionBeginMode,
@@ -29,6 +29,10 @@ struct AccountingSnapshot {
     tracked_snapshot_value_bytes: usize,
     tracked_root_entries: usize,
     tracked_by_file_root_entries: usize,
+    json_entries: usize,
+    json_value_bytes: usize,
+    json_chunk_entries: usize,
+    json_chunk_value_bytes: usize,
 }
 
 impl AccountingSnapshot {
@@ -67,6 +71,16 @@ impl AccountingSnapshot {
             tracked_by_file_root_entries: self
                 .tracked_by_file_root_entries
                 .saturating_sub(before.tracked_by_file_root_entries),
+            json_entries: self.json_entries.saturating_sub(before.json_entries),
+            json_value_bytes: self
+                .json_value_bytes
+                .saturating_sub(before.json_value_bytes),
+            json_chunk_entries: self
+                .json_chunk_entries
+                .saturating_sub(before.json_chunk_entries),
+            json_chunk_value_bytes: self
+                .json_chunk_value_bytes
+                .saturating_sub(before.json_chunk_value_bytes),
         }
     }
 }
@@ -87,6 +101,17 @@ enum AccountingWorkload {
     Update10Pct {
         rows: usize,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum JsonAccountingWorkload {
+    Raw1k { rows: usize },
+    Structured16k { rows: usize },
+    Structured128k { rows: usize },
+    Array128k { rows: usize },
+    DedupeSame16k { rows: usize },
+    BaseUpdateObject1Of1000 { rows: usize },
+    BaseUpdateArray1Of1000 { rows: usize },
 }
 
 #[tokio::test]
@@ -212,6 +237,49 @@ async fn max_inline_encoded_value_accounting() {
     }
 }
 
+#[tokio::test]
+#[ignore = "prints deterministic json_store storage accounting table"]
+async fn json_store_accounting() {
+    let workloads = [
+        JsonAccountingWorkload::Raw1k { rows: 1_000 },
+        JsonAccountingWorkload::Structured16k { rows: 200 },
+        JsonAccountingWorkload::Structured128k { rows: 50 },
+        JsonAccountingWorkload::Array128k { rows: 50 },
+        JsonAccountingWorkload::DedupeSame16k { rows: 1_000 },
+        JsonAccountingWorkload::BaseUpdateObject1Of1000 { rows: 50 },
+        JsonAccountingWorkload::BaseUpdateArray1Of1000 { rows: 50 },
+    ];
+
+    println!(
+        "{:<37} {:>7} {:>8} {:>12} {:>12} {:>10} {:>11} {:>15}",
+        "workload",
+        "rows",
+        "entries",
+        "value_bytes",
+        "total_bytes",
+        "bytes/row",
+        "json_refs",
+        "json_chunks"
+    );
+
+    for workload in workloads {
+        let row = run_json_workload(workload)
+            .await
+            .expect("json_store accounting workload should run");
+        println!(
+            "{:<37} {:>7} {:>8} {:>12} {:>12} {:>10} {:>11} {:>15}",
+            json_workload_label(workload),
+            row.rows,
+            row.snapshot.entries,
+            row.snapshot.value_bytes,
+            row.snapshot.total_bytes(),
+            row.snapshot.bytes_per_row(row.rows),
+            row.snapshot.json_entries,
+            row.snapshot.json_chunk_entries,
+        );
+    }
+}
+
 struct AccountingRow {
     rows: usize,
     snapshot: AccountingSnapshot,
@@ -276,6 +344,72 @@ async fn run_write_root_workload_with_max_inline_encoded_value(
     })
 }
 
+async fn run_json_workload(workload: JsonAccountingWorkload) -> Result<AccountingRow, LixError> {
+    let backend = AccountingBackend::default();
+    let rows = json_workload_rows(workload);
+    let snapshot = match workload {
+        JsonAccountingWorkload::Raw1k { rows } => {
+            let fixture =
+                storage_bench::prepare_json_store_write(JsonStorePayloadShape::SmallRaw1k, rows)
+                    .await?;
+            storage_bench::json_store_write_prepared(&backend, &fixture).await?;
+            backend.accounting()?
+        }
+        JsonAccountingWorkload::Structured16k { rows } => {
+            let fixture = storage_bench::prepare_json_store_write(
+                JsonStorePayloadShape::MediumStructured16k,
+                rows,
+            )
+            .await?;
+            storage_bench::json_store_write_prepared(&backend, &fixture).await?;
+            backend.accounting()?
+        }
+        JsonAccountingWorkload::Structured128k { rows } => {
+            let fixture = storage_bench::prepare_json_store_write(
+                JsonStorePayloadShape::LargeStructured128k,
+                rows,
+            )
+            .await?;
+            storage_bench::json_store_write_prepared(&backend, &fixture).await?;
+            backend.accounting()?
+        }
+        JsonAccountingWorkload::Array128k { rows } => {
+            let fixture = storage_bench::prepare_json_store_write(
+                JsonStorePayloadShape::LargeArray128k,
+                rows,
+            )
+            .await?;
+            storage_bench::json_store_write_prepared(&backend, &fixture).await?;
+            backend.accounting()?
+        }
+        JsonAccountingWorkload::DedupeSame16k { rows } => {
+            let fixture = storage_bench::prepare_json_store_write_dedupe(
+                JsonStorePayloadShape::MediumStructured16k,
+                rows,
+            )
+            .await?;
+            storage_bench::json_store_write_prepared(&backend, &fixture).await?;
+            backend.accounting()?
+        }
+        JsonAccountingWorkload::BaseUpdateObject1Of1000 { rows } => {
+            let fixture =
+                storage_bench::prepare_json_store_base_update_object(&backend, rows).await?;
+            let before = backend.accounting()?;
+            storage_bench::json_store_write_against_base_object_prepared(&backend, &fixture)
+                .await?;
+            backend.accounting()?.saturating_sub(before)
+        }
+        JsonAccountingWorkload::BaseUpdateArray1Of1000 { rows } => {
+            let fixture =
+                storage_bench::prepare_json_store_base_update_array(&backend, rows).await?;
+            let before = backend.accounting()?;
+            storage_bench::json_store_write_against_base_array_prepared(&backend, &fixture).await?;
+            backend.accounting()?.saturating_sub(before)
+        }
+    };
+    Ok(AccountingRow { rows, snapshot })
+}
+
 fn config_for(workload: AccountingWorkload) -> StorageBenchConfig {
     StorageBenchConfig {
         rows: workload_rows(workload),
@@ -310,6 +444,44 @@ fn workload_label(workload: AccountingWorkload) -> String {
         }
         AccountingWorkload::Update10Pct { rows } => {
             format!("update_10pct_existing/{}", row_label(rows))
+        }
+    }
+}
+
+fn json_workload_rows(workload: JsonAccountingWorkload) -> usize {
+    match workload {
+        JsonAccountingWorkload::Raw1k { rows }
+        | JsonAccountingWorkload::Structured16k { rows }
+        | JsonAccountingWorkload::Structured128k { rows }
+        | JsonAccountingWorkload::Array128k { rows }
+        | JsonAccountingWorkload::DedupeSame16k { rows }
+        | JsonAccountingWorkload::BaseUpdateObject1Of1000 { rows }
+        | JsonAccountingWorkload::BaseUpdateArray1Of1000 { rows } => rows,
+    }
+}
+
+fn json_workload_label(workload: JsonAccountingWorkload) -> String {
+    match workload {
+        JsonAccountingWorkload::Raw1k { rows } => {
+            format!("raw_1k/{}", row_label(rows))
+        }
+        JsonAccountingWorkload::Structured16k { rows } => {
+            format!("structured_16k/{}", row_label(rows))
+        }
+        JsonAccountingWorkload::Structured128k { rows } => {
+            format!("structured_128k/{}", row_label(rows))
+        }
+        JsonAccountingWorkload::Array128k { rows } => {
+            format!("array_128k/{}", row_label(rows))
+        }
+        JsonAccountingWorkload::DedupeSame16k { rows } => {
+            format!("dedupe_same_16k/{}", row_label(rows))
+        }
+        JsonAccountingWorkload::BaseUpdateObject1Of1000 { rows } => {
+            format!("base_update_object_1_of_1000/{}", row_label(rows))
+        }
+        JsonAccountingWorkload::BaseUpdateArray1Of1000 { rows } => {
+            format!("base_update_array_1_of_1000/{}", row_label(rows))
         }
     }
 }
@@ -351,6 +523,14 @@ impl AccountingBackend {
                 "tracked_state.snapshot" => {
                     snapshot.tracked_snapshot_entries += 1;
                     snapshot.tracked_snapshot_value_bytes += value.len();
+                }
+                "json_store.json" => {
+                    snapshot.json_entries += 1;
+                    snapshot.json_value_bytes += value.len();
+                }
+                "json_store.json_chunk" => {
+                    snapshot.json_chunk_entries += 1;
+                    snapshot.json_chunk_value_bytes += value.len();
                 }
                 _ => {}
             }

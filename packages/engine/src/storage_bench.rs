@@ -1,6 +1,8 @@
 use crate::binary_cas::{BinaryBlobWrite, BinaryCasContext};
 use crate::changelog::{CanonicalChange, ChangelogContext, ChangelogScanRequest};
 use crate::entity_identity::EntityIdentity;
+use crate::json_store::context::JsonStoreContext;
+use crate::json_store::types::{JsonProjectionPath, JsonRef, StoreJsonOptions};
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateDiffRequest, TrackedStateFilter, TrackedStateProjection,
     TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
@@ -9,7 +11,7 @@ use crate::untracked_state::{
     UntrackedStateContext, UntrackedStateFilter, UntrackedStateRow, UntrackedStateRowRequest,
     UntrackedStateScanRequest,
 };
-use crate::{KvScanRange, LixBackend, LixError, NullableKeyFilter, TransactionBeginMode};
+use crate::{LixBackend, LixError, NullableKeyFilter, TransactionBeginMode};
 use std::time::{Duration, Instant};
 
 const DEFAULT_MAX_INLINE_ENCODED_VALUE_BYTES: usize = 1024;
@@ -162,6 +164,34 @@ pub struct BinaryCasReadFixture {
     context: BinaryCasContext,
     rows: usize,
     hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum JsonStorePayloadShape {
+    SmallRaw1k,
+    MediumStructured16k,
+    LargeStructured128k,
+    LargeArray128k,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum JsonStoreProjectionShape {
+    TopLevelTarget,
+    TopLevelTenProps,
+    NestedTarget,
+    ArrayItem999,
+    Status,
+}
+
+pub struct JsonStoreWriteFixture {
+    context: JsonStoreContext,
+    documents: Vec<Vec<u8>>,
+}
+
+pub struct JsonStoreReadFixture {
+    context: JsonStoreContext,
+    refs: Vec<JsonRef>,
+    paths: Vec<JsonProjectionPath>,
 }
 
 pub async fn prepare_tracked_state_write_root(
@@ -1108,6 +1138,233 @@ pub async fn binary_cas_read_blob_miss_prepared(
     Ok(report(fixture.rows, misses, Duration::ZERO))
 }
 
+pub async fn prepare_json_store_write(
+    shape: JsonStorePayloadShape,
+    rows: usize,
+) -> Result<JsonStoreWriteFixture, LixError> {
+    Ok(JsonStoreWriteFixture {
+        context: JsonStoreContext::new(),
+        documents: json_documents(shape, rows),
+    })
+}
+
+pub async fn prepare_json_store_write_dedupe(
+    shape: JsonStorePayloadShape,
+    rows: usize,
+) -> Result<JsonStoreWriteFixture, LixError> {
+    let document = json_document(shape, 0);
+    Ok(JsonStoreWriteFixture {
+        context: JsonStoreContext::new(),
+        documents: (0..rows).map(|_| document.clone()).collect(),
+    })
+}
+
+pub async fn json_store_write_prepared(
+    backend: &(dyn LixBackend + Send + Sync),
+    fixture: &JsonStoreWriteFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let mut transaction = backend
+        .begin_transaction(TransactionBeginMode::Write)
+        .await?;
+    {
+        let mut writer = fixture.context.writer(transaction.as_mut());
+        for document in &fixture.documents {
+            writer
+                .store_json_bytes(document, StoreJsonOptions::default())
+                .await?;
+        }
+    }
+    transaction.commit().await?;
+    Ok(report(
+        fixture.documents.len(),
+        fixture.documents.len(),
+        Duration::ZERO,
+    ))
+}
+
+pub async fn prepare_json_store_read(
+    backend: &(dyn LixBackend + Send + Sync),
+    shape: JsonStorePayloadShape,
+    rows: usize,
+) -> Result<JsonStoreReadFixture, LixError> {
+    prepare_json_store_projection_read(
+        backend,
+        shape,
+        rows,
+        JsonStoreProjectionShape::TopLevelTarget,
+    )
+    .await
+}
+
+pub async fn prepare_json_store_projection_read(
+    backend: &(dyn LixBackend + Send + Sync),
+    shape: JsonStorePayloadShape,
+    rows: usize,
+    projection: JsonStoreProjectionShape,
+) -> Result<JsonStoreReadFixture, LixError> {
+    let context = JsonStoreContext::new();
+    let documents = json_documents(shape, rows);
+    let mut refs = Vec::with_capacity(documents.len());
+    let mut transaction = backend
+        .begin_transaction(TransactionBeginMode::Write)
+        .await?;
+    {
+        let mut writer = context.writer(transaction.as_mut());
+        for document in documents {
+            refs.push(
+                writer
+                    .store_json_bytes(&document, StoreJsonOptions::default())
+                    .await?,
+            );
+        }
+    }
+    transaction.commit().await?;
+    Ok(JsonStoreReadFixture {
+        context,
+        refs,
+        paths: json_projection_paths(projection),
+    })
+}
+
+pub async fn json_store_read_bytes_prepared(
+    backend: &(dyn LixBackend + Send + Sync),
+    fixture: &JsonStoreReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let mut verified_rows = 0;
+    let mut reader = fixture.context.reader(backend);
+    for json_ref in &fixture.refs {
+        if reader.load_json_bytes(json_ref).await?.is_some() {
+            verified_rows += 1;
+        }
+    }
+    Ok(report(fixture.refs.len(), verified_rows, Duration::ZERO))
+}
+
+pub async fn json_store_read_value_prepared(
+    backend: &(dyn LixBackend + Send + Sync),
+    fixture: &JsonStoreReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let mut verified_rows = 0;
+    let mut reader = fixture.context.reader(backend);
+    for json_ref in &fixture.refs {
+        if reader.load_json_value(json_ref).await?.is_some() {
+            verified_rows += 1;
+        }
+    }
+    Ok(report(fixture.refs.len(), verified_rows, Duration::ZERO))
+}
+
+pub async fn json_store_read_projection_prepared(
+    backend: &(dyn LixBackend + Send + Sync),
+    fixture: &JsonStoreReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let mut verified_rows = 0;
+    let mut reader = fixture.context.reader(backend);
+    for json_ref in &fixture.refs {
+        if reader
+            .load_json_projection(json_ref, &fixture.paths)
+            .await?
+            .is_some()
+        {
+            verified_rows += 1;
+        }
+    }
+    Ok(report(fixture.refs.len(), verified_rows, Duration::ZERO))
+}
+
+pub async fn prepare_json_store_base_update_object(
+    backend: &(dyn LixBackend + Send + Sync),
+    rows: usize,
+) -> Result<JsonStoreReadFixture, LixError> {
+    prepare_json_store_base_update(backend, JsonStorePayloadShape::LargeStructured128k, rows).await
+}
+
+pub async fn prepare_json_store_base_update_array(
+    backend: &(dyn LixBackend + Send + Sync),
+    rows: usize,
+) -> Result<JsonStoreReadFixture, LixError> {
+    prepare_json_store_base_update(backend, JsonStorePayloadShape::LargeArray128k, rows).await
+}
+
+async fn prepare_json_store_base_update(
+    backend: &(dyn LixBackend + Send + Sync),
+    shape: JsonStorePayloadShape,
+    rows: usize,
+) -> Result<JsonStoreReadFixture, LixError> {
+    let context = JsonStoreContext::new();
+    let documents = json_documents(shape, rows);
+    let mut refs = Vec::with_capacity(documents.len());
+    let mut transaction = backend
+        .begin_transaction(TransactionBeginMode::Write)
+        .await?;
+    {
+        let mut writer = context.writer(transaction.as_mut());
+        for document in documents {
+            refs.push(
+                writer
+                    .store_json_bytes(&document, StoreJsonOptions::default())
+                    .await?,
+            );
+        }
+    }
+    transaction.commit().await?;
+    Ok(JsonStoreReadFixture {
+        context,
+        refs,
+        paths: json_projection_paths(JsonStoreProjectionShape::TopLevelTarget),
+    })
+}
+
+pub async fn json_store_write_against_base_object_prepared(
+    backend: &(dyn LixBackend + Send + Sync),
+    fixture: &JsonStoreReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    json_store_write_against_base_prepared(
+        backend,
+        fixture,
+        JsonStorePayloadShape::LargeStructured128k,
+    )
+    .await
+}
+
+pub async fn json_store_write_against_base_array_prepared(
+    backend: &(dyn LixBackend + Send + Sync),
+    fixture: &JsonStoreReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    json_store_write_against_base_prepared(backend, fixture, JsonStorePayloadShape::LargeArray128k)
+        .await
+}
+
+async fn json_store_write_against_base_prepared(
+    backend: &(dyn LixBackend + Send + Sync),
+    fixture: &JsonStoreReadFixture,
+    shape: JsonStorePayloadShape,
+) -> Result<StorageBenchReport, LixError> {
+    let mut transaction = backend
+        .begin_transaction(TransactionBeginMode::Write)
+        .await?;
+    {
+        let mut writer = fixture.context.writer(transaction.as_mut());
+        for (index, json_ref) in fixture.refs.iter().enumerate() {
+            let updated = updated_json_document(shape, index);
+            writer
+                .store_json_bytes(
+                    &updated,
+                    StoreJsonOptions {
+                        base: Some(json_ref),
+                    },
+                )
+                .await?;
+        }
+    }
+    transaction.commit().await?;
+    Ok(report(
+        fixture.refs.len(),
+        fixture.refs.len(),
+        Duration::ZERO,
+    ))
+}
+
 pub async fn tracked_state_write_root(
     backend: &(dyn LixBackend + Send + Sync),
     config: StorageBenchConfig,
@@ -1947,4 +2204,129 @@ fn binary_payload(index: usize, len: usize) -> Vec<u8> {
         }
     }
     payload
+}
+
+fn json_documents(shape: JsonStorePayloadShape, rows: usize) -> Vec<Vec<u8>> {
+    (0..rows).map(|index| json_document(shape, index)).collect()
+}
+
+fn json_document(shape: JsonStorePayloadShape, index: usize) -> Vec<u8> {
+    match shape {
+        JsonStorePayloadShape::SmallRaw1k => json_object_document(index, 1_024, 8),
+        JsonStorePayloadShape::MediumStructured16k => json_object_document(index, 16 * 1024, 128),
+        JsonStorePayloadShape::LargeStructured128k => {
+            json_object_document(index, 128 * 1024, 1_000)
+        }
+        JsonStorePayloadShape::LargeArray128k => json_array_document(index, 128 * 1024, 1_000),
+    }
+}
+
+fn updated_json_document(shape: JsonStorePayloadShape, index: usize) -> Vec<u8> {
+    let bytes = json_document(shape, index);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("storage bench JSON document should parse");
+    match shape {
+        JsonStorePayloadShape::LargeArray128k => {
+            value["items"][999]["value"] =
+                serde_json::Value::String(format!("updated-array-value-{index}"));
+        }
+        JsonStorePayloadShape::SmallRaw1k
+        | JsonStorePayloadShape::MediumStructured16k
+        | JsonStorePayloadShape::LargeStructured128k => {
+            value["field_999"] = serde_json::Value::String(format!("updated-object-value-{index}"));
+        }
+    }
+    serde_json::to_vec(&value).expect("storage bench updated JSON should serialize")
+}
+
+fn json_object_document(index: usize, target_bytes: usize, fields: usize) -> Vec<u8> {
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "id".to_string(),
+        serde_json::Value::String(format!("json-{index}")),
+    );
+    object.insert(
+        "target".to_string(),
+        serde_json::Value::String(format!("target-{index}")),
+    );
+    object.insert(
+        "status".to_string(),
+        serde_json::Value::String(if index % 2 == 0 { "open" } else { "closed" }.to_string()),
+    );
+    object.insert(
+        "nested".to_string(),
+        serde_json::json!({
+            "target": format!("nested-target-{index}"),
+            "revision": index,
+        }),
+    );
+    for field_index in 0..fields {
+        object.insert(
+            format!("field_{field_index}"),
+            serde_json::Value::String(format!("value-{index}-{field_index}")),
+        );
+    }
+    pad_json_object(&mut object, target_bytes);
+    serde_json::to_vec(&serde_json::Value::Object(object))
+        .expect("storage bench object JSON should serialize")
+}
+
+fn json_array_document(index: usize, target_bytes: usize, items: usize) -> Vec<u8> {
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "id".to_string(),
+        serde_json::Value::String(format!("json-array-{index}")),
+    );
+    object.insert(
+        "target".to_string(),
+        serde_json::Value::String(format!("target-{index}")),
+    );
+    object.insert(
+        "status".to_string(),
+        serde_json::Value::String(if index % 2 == 0 { "open" } else { "closed" }.to_string()),
+    );
+    object.insert(
+        "items".to_string(),
+        serde_json::Value::Array(
+            (0..items)
+                .map(|item_index| {
+                    serde_json::json!({
+                        "index": item_index,
+                        "status": if item_index % 2 == 0 { "ready" } else { "blocked" },
+                        "value": format!("item-{index}-{item_index}"),
+                    })
+                })
+                .collect(),
+        ),
+    );
+    pad_json_object(&mut object, target_bytes);
+    serde_json::to_vec(&serde_json::Value::Object(object))
+        .expect("storage bench array JSON should serialize")
+}
+
+fn pad_json_object(object: &mut serde_json::Map<String, serde_json::Value>, target_bytes: usize) {
+    let current = serde_json::to_vec(&serde_json::Value::Object(object.clone()))
+        .expect("storage bench JSON should serialize")
+        .len();
+    if target_bytes <= current {
+        return;
+    }
+    object.insert(
+        "padding".to_string(),
+        serde_json::Value::String("x".repeat(target_bytes - current)),
+    );
+}
+
+fn json_projection_paths(projection: JsonStoreProjectionShape) -> Vec<JsonProjectionPath> {
+    match projection {
+        JsonStoreProjectionShape::TopLevelTarget => vec![JsonProjectionPath::new("/target")],
+        JsonStoreProjectionShape::TopLevelTenProps => (0..10)
+            .map(|index| JsonProjectionPath::new(format!("/field_{index}")))
+            .collect(),
+        JsonStoreProjectionShape::NestedTarget => vec![JsonProjectionPath::new("/nested/target")],
+        JsonStoreProjectionShape::ArrayItem999 => {
+            vec![JsonProjectionPath::new("/items/999/value")]
+        }
+        JsonStoreProjectionShape::Status => vec![JsonProjectionPath::new("/status")],
+    }
 }
