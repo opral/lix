@@ -41,6 +41,11 @@ use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 
 use super::entity_history_provider::EntityHistoryProvider;
+use super::history_route::{
+    HISTORY_COL_CHANGE_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_COMMIT_ID, HISTORY_COL_DEPTH,
+    HISTORY_COL_ENTITY_ID, HISTORY_COL_FILE_ID, HISTORY_COL_METADATA, HISTORY_COL_SCHEMA_KEY,
+    HISTORY_COL_SCHEMA_VERSION, HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
+};
 use super::result_metadata::{json_field, mark_json_field};
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
@@ -159,7 +164,7 @@ pub(super) enum EntityColumnType {
 pub(super) struct EntitySurfaceSpec {
     pub(super) schema_key: String,
     schema_version: Option<String>,
-    primary_key_paths: Vec<Vec<String>>,
+    pub(super) primary_key_paths: Vec<Vec<String>>,
     pub(super) visible_columns: Vec<String>,
     pub(super) column_types: BTreeMap<String, EntityColumnType>,
     defaulted_columns: BTreeSet<String>,
@@ -1601,17 +1606,17 @@ fn arrow_data_type_for_entity_column_type(column_type: EntityColumnType) -> Data
 pub(super) fn entity_system_fields(variant: EntityProviderVariant) -> Vec<Field> {
     if variant == EntityProviderVariant::History {
         return vec![
-            Field::new("lixcol_entity_id", DataType::Utf8, false),
-            Field::new("lixcol_schema_key", DataType::Utf8, false),
-            Field::new("lixcol_file_id", DataType::Utf8, true),
-            json_field("lixcol_snapshot_content", true),
-            json_field("lixcol_metadata", true),
-            Field::new("lixcol_schema_version", DataType::Utf8, false),
-            Field::new("lixcol_change_id", DataType::Utf8, false),
-            Field::new("lixcol_commit_id", DataType::Utf8, false),
-            Field::new("lixcol_commit_created_at", DataType::Utf8, false),
-            Field::new("lixcol_start_commit_id", DataType::Utf8, false),
-            Field::new("lixcol_depth", DataType::Int64, false),
+            Field::new(HISTORY_COL_ENTITY_ID, DataType::Utf8, false),
+            Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
+            Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
+            json_field(HISTORY_COL_SNAPSHOT_CONTENT, true),
+            json_field(HISTORY_COL_METADATA, true),
+            Field::new(HISTORY_COL_SCHEMA_VERSION, DataType::Utf8, false),
+            Field::new(HISTORY_COL_CHANGE_ID, DataType::Utf8, false),
+            Field::new(HISTORY_COL_COMMIT_ID, DataType::Utf8, false),
+            Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
+            Field::new(HISTORY_COL_START_COMMIT_ID, DataType::Utf8, false),
+            Field::new(HISTORY_COL_DEPTH, DataType::Int64, false),
         ];
     }
 

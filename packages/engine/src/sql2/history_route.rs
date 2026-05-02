@@ -28,10 +28,10 @@ pub(crate) struct HistoryRoute {
 }
 
 impl HistoryRoute {
-    pub(crate) fn from_filters(filters: &[Expr]) -> Self {
+    pub(crate) fn from_filters(filters: &[Expr], column_style: HistoryColumnStyle) -> Self {
         let mut route = Self::default();
         for filter in filters {
-            apply_history_filter(filter, &mut route);
+            apply_history_filter(filter, &mut route, column_style);
         }
         route
     }
@@ -138,13 +138,46 @@ pub(crate) struct HistoryEntry {
     pub(crate) depth: u32,
 }
 
-pub(crate) struct HistoryViewErrorContext<'a> {
+pub(crate) const HISTORY_COL_ENTITY_ID: &str = "lixcol_entity_id";
+pub(crate) const HISTORY_COL_SCHEMA_KEY: &str = "lixcol_schema_key";
+pub(crate) const HISTORY_COL_FILE_ID: &str = "lixcol_file_id";
+pub(crate) const HISTORY_COL_SNAPSHOT_CONTENT: &str = "lixcol_snapshot_content";
+pub(crate) const HISTORY_COL_METADATA: &str = "lixcol_metadata";
+pub(crate) const HISTORY_COL_SCHEMA_VERSION: &str = "lixcol_schema_version";
+pub(crate) const HISTORY_COL_CHANGE_ID: &str = "lixcol_change_id";
+pub(crate) const HISTORY_COL_COMMIT_ID: &str = "lixcol_commit_id";
+pub(crate) const HISTORY_COL_COMMIT_CREATED_AT: &str = "lixcol_commit_created_at";
+pub(crate) const HISTORY_COL_START_COMMIT_ID: &str = "lixcol_start_commit_id";
+pub(crate) const HISTORY_COL_DEPTH: &str = "lixcol_depth";
+
+pub(crate) struct HistoryViewDescriptor<'a> {
     pub(crate) view_name: &'a str,
     pub(crate) start_commit_column: &'a str,
 }
 
-pub(crate) fn parse_history_filter(expr: &Expr) -> Option<()> {
-    parse_history_filter_terms(expr).map(|_| ())
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum HistoryColumnStyle {
+    Bare,
+    Prefixed,
+}
+
+/// Shaped history views expose delete events as tombstone rows.
+///
+/// If the current event is the descriptor tombstone itself, the provider must
+/// use that tombstone row instead of looking through to an earlier live
+/// descriptor. This keeps one contract across typed entity, file, directory,
+/// and state history: `snapshot_content IS NULL` means projected user/domain
+/// columns are NULL while metadata columns still identify the event.
+pub(crate) fn history_descriptor_event_matches(
+    descriptor_entry: &HistoryEntry,
+    event_depth: u32,
+    event_change_id: &str,
+) -> bool {
+    descriptor_entry.depth == event_depth && descriptor_entry.change.id == event_change_id
+}
+
+pub(crate) fn parse_history_filter(expr: &Expr, column_style: HistoryColumnStyle) -> Option<()> {
+    parse_history_filter_terms(expr, column_style).map(|_| ())
 }
 
 pub(crate) fn commit_graph_history_request(
@@ -171,7 +204,7 @@ pub(crate) fn commit_graph_history_request(
 /// Providers pass the schema keys they know how to shape. An empty list means
 /// "do not constrain by provider schema"; this is what `lix_state_history` uses.
 pub(crate) async fn load_history_entries(
-    error_context: HistoryViewErrorContext<'_>,
+    descriptor: HistoryViewDescriptor<'_>,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     route: &HistoryRoute,
     schema_keys: Vec<String>,
@@ -184,12 +217,12 @@ pub(crate) async fn load_history_entries(
             LixError::CODE_HISTORY_FILTER_REQUIRED,
             format!(
                 "{} requires a {} filter",
-                error_context.view_name, error_context.start_commit_column
+                descriptor.view_name, descriptor.start_commit_column
             ),
         )
         .with_hint(format!(
             "Use WHERE {} = lix_active_version_commit_id() to inspect {} from the active version head.",
-            error_context.start_commit_column, error_context.view_name
+            descriptor.start_commit_column, descriptor.view_name
         )));
     }
     let Some(request) = commit_graph_history_request(route, schema_keys) else {
@@ -254,41 +287,55 @@ fn effective_schema_keys(
     }
 }
 
-fn parse_history_filter_terms(expr: &Expr) -> Option<Vec<HistoryFilterTerm>> {
+fn parse_history_filter_terms(
+    expr: &Expr,
+    column_style: HistoryColumnStyle,
+) -> Option<Vec<HistoryFilterTerm>> {
     match expr {
         Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
-            let mut terms = parse_history_filter_terms(&binary_expr.left)?;
-            terms.extend(parse_history_filter_terms(&binary_expr.right)?);
+            let mut terms = parse_history_filter_terms(&binary_expr.left, column_style)?;
+            terms.extend(parse_history_filter_terms(
+                &binary_expr.right,
+                column_style,
+            )?);
             Some(terms)
         }
         Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
-            parse_history_disjunction(binary_expr)
+            parse_history_disjunction(binary_expr, column_style)
         }
         Expr::BinaryExpr(binary_expr) => {
-            parse_history_binary_filter(binary_expr).map(|term| vec![term])
+            parse_history_binary_filter(binary_expr, column_style).map(|term| vec![term])
         }
-        Expr::InList(in_list) => parse_history_in_list_filter(in_list).map(|term| vec![term]),
+        Expr::InList(in_list) => {
+            parse_history_in_list_filter(in_list, column_style).map(|term| vec![term])
+        }
         _ => None,
     }
 }
 
-fn collect_history_route_terms(expr: &Expr) -> Vec<HistoryFilterTerm> {
+fn collect_history_route_terms(
+    expr: &Expr,
+    column_style: HistoryColumnStyle,
+) -> Vec<HistoryFilterTerm> {
     match expr {
         Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
-            let mut terms = collect_history_route_terms(&binary_expr.left);
-            terms.extend(collect_history_route_terms(&binary_expr.right));
+            let mut terms = collect_history_route_terms(&binary_expr.left, column_style);
+            terms.extend(collect_history_route_terms(
+                &binary_expr.right,
+                column_style,
+            ));
             terms
         }
         // OR filters are only safe to route when the entire disjunction is a
         // supported history predicate. Partially routing one side would change
         // SQL semantics before DataFusion can apply the residual filter.
         Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
-            parse_history_disjunction(binary_expr).unwrap_or_default()
+            parse_history_disjunction(binary_expr, column_style).unwrap_or_default()
         }
-        Expr::BinaryExpr(binary_expr) => parse_history_binary_filter(binary_expr)
+        Expr::BinaryExpr(binary_expr) => parse_history_binary_filter(binary_expr, column_style)
             .map(|term| vec![term])
             .unwrap_or_default(),
-        Expr::InList(in_list) => parse_history_in_list_filter(in_list)
+        Expr::InList(in_list) => parse_history_in_list_filter(in_list, column_style)
             .map(|term| vec![term])
             .unwrap_or_default(),
         _ => Vec::new(),
@@ -297,9 +344,10 @@ fn collect_history_route_terms(expr: &Expr) -> Vec<HistoryFilterTerm> {
 
 fn parse_history_disjunction(
     binary_expr: &datafusion::logical_expr::BinaryExpr,
+    column_style: HistoryColumnStyle,
 ) -> Option<Vec<HistoryFilterTerm>> {
-    let left = parse_history_filter_terms(&binary_expr.left)?;
-    let right = parse_history_filter_terms(&binary_expr.right)?;
+    let left = parse_history_filter_terms(&binary_expr.left, column_style)?;
+    let right = parse_history_filter_terms(&binary_expr.right, column_style)?;
     let [left] = left.as_slice() else {
         return None;
     };
@@ -347,11 +395,12 @@ fn merge_history_disjunction_terms(
 
 fn parse_history_binary_filter(
     binary_expr: &datafusion::logical_expr::BinaryExpr,
+    column_style: HistoryColumnStyle,
 ) -> Option<HistoryFilterTerm> {
     let Expr::Column(column) = &*binary_expr.left else {
         return None;
     };
-    let column_name = canonical_history_column_name(column.name.as_str())?;
+    let column_name = canonical_history_column_name(column.name.as_str(), column_style)?;
     let right = &*binary_expr.right;
     match (column_name, &binary_expr.op, right) {
         ("start_commit_id", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _))
@@ -385,7 +434,10 @@ fn parse_history_binary_filter(
     }
 }
 
-fn parse_history_in_list_filter(in_list: &InList) -> Option<HistoryFilterTerm> {
+fn parse_history_in_list_filter(
+    in_list: &InList,
+    column_style: HistoryColumnStyle,
+) -> Option<HistoryFilterTerm> {
     if in_list.negated {
         return None;
     }
@@ -393,7 +445,7 @@ fn parse_history_in_list_filter(in_list: &InList) -> Option<HistoryFilterTerm> {
     let Expr::Column(column) = in_list.expr.as_ref() else {
         return None;
     };
-    let column_name = canonical_history_column_name(column.name.as_str())?;
+    let column_name = canonical_history_column_name(column.name.as_str(), column_style)?;
     let values = in_list
         .list
         .iter()
@@ -412,8 +464,8 @@ fn parse_history_in_list_filter(in_list: &InList) -> Option<HistoryFilterTerm> {
     }
 }
 
-fn apply_history_filter(expr: &Expr, route: &mut HistoryRoute) {
-    for term in collect_history_route_terms(expr) {
+fn apply_history_filter(expr: &Expr, route: &mut HistoryRoute, column_style: HistoryColumnStyle) {
+    for term in collect_history_route_terms(expr, column_style) {
         match term {
             HistoryFilterTerm::StartCommitIds(values) => {
                 route.contradictory |=
@@ -459,13 +511,19 @@ fn apply_conjunctive_values_filter(bucket: &mut Vec<String>, incoming_values: Ve
     bucket.is_empty()
 }
 
-fn canonical_history_column_name(name: &str) -> Option<&str> {
-    match name {
-        "lixcol_start_commit_id" | "start_commit_id" => Some("start_commit_id"),
-        "lixcol_entity_id" | "entity_id" => Some("entity_id"),
-        "lixcol_schema_key" | "schema_key" => Some("schema_key"),
-        "lixcol_file_id" | "file_id" => Some("file_id"),
-        "lixcol_depth" | "depth" => Some("depth"),
+fn canonical_history_column_name(name: &str, column_style: HistoryColumnStyle) -> Option<&str> {
+    match (column_style, name) {
+        (HistoryColumnStyle::Bare, "start_commit_id")
+        | (HistoryColumnStyle::Prefixed, "lixcol_start_commit_id") => Some("start_commit_id"),
+        (HistoryColumnStyle::Bare, "entity_id")
+        | (HistoryColumnStyle::Prefixed, "lixcol_entity_id") => Some("entity_id"),
+        (HistoryColumnStyle::Bare, "schema_key")
+        | (HistoryColumnStyle::Prefixed, "lixcol_schema_key") => Some("schema_key"),
+        (HistoryColumnStyle::Bare, "file_id")
+        | (HistoryColumnStyle::Prefixed, "lixcol_file_id") => Some("file_id"),
+        (HistoryColumnStyle::Bare, "depth") | (HistoryColumnStyle::Prefixed, "lixcol_depth") => {
+            Some("depth")
+        }
         _ => None,
     }
 }
@@ -508,7 +566,7 @@ mod tests {
     use datafusion::common::{Column, ScalarValue};
     use datafusion::logical_expr::{BinaryExpr, Expr, Like, Operator};
 
-    use super::{parse_history_filter, HistoryRoute};
+    use super::{parse_history_filter, HistoryColumnStyle, HistoryRoute};
 
     #[test]
     fn route_extraction_keeps_supported_terms_from_mixed_and_filter() {
@@ -524,11 +582,11 @@ mod tests {
         );
 
         assert!(
-            parse_history_filter(&filter).is_none(),
+            parse_history_filter(&filter, HistoryColumnStyle::Bare).is_none(),
             "mixed filters must not be advertised as exact pushdown"
         );
 
-        let route = HistoryRoute::from_filters(&[filter]);
+        let route = HistoryRoute::from_filters(&[filter], HistoryColumnStyle::Bare);
         assert_eq!(route.start_commit_ids, vec!["commit-1".to_string()]);
     }
 
@@ -545,7 +603,7 @@ mod tests {
             )),
         );
 
-        let route = HistoryRoute::from_filters(&[filter]);
+        let route = HistoryRoute::from_filters(&[filter], HistoryColumnStyle::Bare);
         assert!(
             route.start_commit_ids.is_empty(),
             "partial OR pushdown would change SQL semantics"

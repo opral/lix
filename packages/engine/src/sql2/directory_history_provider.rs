@@ -25,8 +25,13 @@ use crate::changelog::CanonicalChange;
 use crate::commit_graph::CommitGraphReader;
 use crate::LixError;
 
+use super::history_projection::{tombstone_identity_column_value, HistoryIdentityProjection};
 use super::history_route::{
-    load_history_entries, parse_history_filter, HistoryEntry, HistoryRoute, HistoryViewErrorContext,
+    history_descriptor_event_matches, load_history_entries, parse_history_filter,
+    HistoryColumnStyle, HistoryEntry, HistoryRoute, HistoryViewDescriptor, HISTORY_COL_CHANGE_ID,
+    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_COMMIT_ID, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_ID,
+    HISTORY_COL_FILE_ID, HISTORY_COL_METADATA, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SCHEMA_VERSION,
+    HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
 };
 use super::result_metadata::json_field;
 
@@ -88,7 +93,7 @@ impl TableProvider for LixDirectoryHistoryProvider {
         Ok(filters
             .iter()
             .map(|filter| {
-                if parse_history_filter(filter).is_some() {
+                if parse_history_filter(filter, HistoryColumnStyle::Prefixed).is_some() {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -107,7 +112,7 @@ impl TableProvider for LixDirectoryHistoryProvider {
         Ok(Arc::new(LixDirectoryHistoryScanExec::new(
             Arc::clone(&self.commit_graph),
             projected_schema(&self.schema, projection)?,
-            HistoryRoute::from_filters(filters),
+            HistoryRoute::from_filters(filters, HistoryColumnStyle::Prefixed),
             limit,
         )))
     }
@@ -240,11 +245,12 @@ struct DirectoryHistoryRecord {
 
 #[derive(Debug, Clone)]
 struct DirectoryHistoryOutputRow {
+    entity_id: String,
     id: String,
     path: Option<String>,
     parent_id: Option<String>,
     name: Option<String>,
-    hidden: bool,
+    hidden: Option<bool>,
     descriptor_change: CanonicalChange,
     event: DirectoryHistoryEvent,
 }
@@ -273,9 +279,9 @@ async fn load_directory_history_rows(
 ) -> Result<Vec<DirectoryHistoryOutputRow>, LixError> {
     let event_route = route.traversal_only();
     let event_entries = load_history_entries(
-        HistoryViewErrorContext {
+        HistoryViewDescriptor {
             view_name: "lix_directory_history",
-            start_commit_column: "lixcol_start_commit_id",
+            start_commit_column: HISTORY_COL_START_COMMIT_ID,
         },
         Arc::clone(&commit_graph),
         &event_route,
@@ -284,9 +290,9 @@ async fn load_directory_history_rows(
     .await?;
     let context_route = route.starts_only();
     let context_entries = load_history_entries(
-        HistoryViewErrorContext {
+        HistoryViewDescriptor {
             view_name: "lix_directory_history",
-            start_commit_column: "lixcol_start_commit_id",
+            start_commit_column: HISTORY_COL_START_COMMIT_ID,
         },
         commit_graph,
         &context_route,
@@ -302,18 +308,31 @@ async fn load_directory_history_rows(
         let Some(visible_descriptor) = nearest_directory_descriptor(&descriptors, &event) else {
             continue;
         };
-        output.push(DirectoryHistoryOutputRow {
-            id: visible_descriptor.id.clone(),
-            path: resolve_directory_history_path(
+        let path = if visible_descriptor.name.is_some() {
+            resolve_directory_history_path(
                 &visible_descriptor.id,
                 &event.start_commit_id,
                 event.depth,
                 &descriptors,
                 &mut BTreeMap::new(),
-            ),
+            )
+        } else {
+            None
+        };
+        let id = tombstone_identity_column_value(
+            "id",
+            &visible_descriptor.id,
+            HistoryIdentityProjection::SingleColumn { column: "id" },
+        )?
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| visible_descriptor.id.clone());
+        output.push(DirectoryHistoryOutputRow {
+            entity_id: visible_descriptor.id.clone(),
+            id,
+            path,
             parent_id: visible_descriptor.parent_id.clone(),
             name: visible_descriptor.name.clone(),
-            hidden: visible_descriptor.hidden.unwrap_or(false),
+            hidden: visible_descriptor.hidden,
             descriptor_change: visible_descriptor.entry.change.clone(),
             event,
         });
@@ -321,15 +340,15 @@ async fn load_directory_history_rows(
     output.retain(|row| {
         route.matches_surface_row(
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-            &row.id,
+            &row.entity_id,
             None,
             row.event.depth,
         )
     });
 
     output.sort_by(|left, right| {
-        left.id
-            .cmp(&right.id)
+        left.entity_id
+            .cmp(&right.entity_id)
             .then(left.event.start_commit_id.cmp(&right.event.start_commit_id))
             .then(left.event.depth.cmp(&right.event.depth))
             .then(left.event.commit_id.cmp(&right.event.commit_id))
@@ -393,7 +412,9 @@ fn nearest_directory_descriptor<'a>(
     descriptors
         .iter()
         .filter(|descriptor| {
-            descriptor.name.is_some()
+            let exact_descriptor_event =
+                history_descriptor_event_matches(&descriptor.entry, event.depth, &event.change.id);
+            (exact_descriptor_event || descriptor.name.is_some())
                 && descriptor.id == event.directory_id
                 && descriptor.entry.start_commit_id == event.start_commit_id
                 && descriptor.entry.depth >= event.depth
@@ -476,36 +497,40 @@ fn directory_history_column_array(
         "parent_id" => string_array(rows.iter().map(|row| row.parent_id.as_deref())),
         "name" => string_array(rows.iter().map(|row| row.name.as_deref())),
         "hidden" => Arc::new(BooleanArray::from(
-            rows.iter().map(|row| Some(row.hidden)).collect::<Vec<_>>(),
+            rows.iter().map(|row| row.hidden).collect::<Vec<_>>(),
         )) as ArrayRef,
-        "lixcol_entity_id" => string_array(rows.iter().map(|row| Some(row.id.as_str()))),
-        "lixcol_schema_key" => {
+        HISTORY_COL_ENTITY_ID => string_array(rows.iter().map(|row| Some(row.entity_id.as_str()))),
+        HISTORY_COL_SCHEMA_KEY => {
             string_array(rows.iter().map(|_| Some(DIRECTORY_DESCRIPTOR_SCHEMA_KEY)))
         }
-        "lixcol_file_id" => string_array(rows.iter().map(|_| None)),
-        "lixcol_schema_version" => string_array(
+        HISTORY_COL_FILE_ID => string_array(rows.iter().map(|_| None)),
+        HISTORY_COL_SCHEMA_VERSION => string_array(
             rows.iter()
                 .map(|row| Some(row.descriptor_change.schema_version.as_str())),
         ),
-        "lixcol_change_id" => {
+        HISTORY_COL_CHANGE_ID => {
             string_array(rows.iter().map(|row| Some(row.event.change.id.as_str())))
         }
-        "lixcol_metadata" => string_array(
+        HISTORY_COL_SNAPSHOT_CONTENT => string_array(
+            rows.iter()
+                .map(|row| row.descriptor_change.snapshot_content.as_deref()),
+        ),
+        HISTORY_COL_METADATA => string_array(
             rows.iter()
                 .map(|row| row.descriptor_change.metadata.as_deref()),
         ),
-        "lixcol_commit_id" => {
+        HISTORY_COL_COMMIT_ID => {
             string_array(rows.iter().map(|row| Some(row.event.commit_id.as_str())))
         }
-        "lixcol_commit_created_at" => string_array(
+        HISTORY_COL_COMMIT_CREATED_AT => string_array(
             rows.iter()
                 .map(|row| Some(row.event.commit_created_at.as_str())),
         ),
-        "lixcol_start_commit_id" | "start_commit_id" => string_array(
+        HISTORY_COL_START_COMMIT_ID => string_array(
             rows.iter()
                 .map(|row| Some(row.event.start_commit_id.as_str())),
         ),
-        "lixcol_depth" | "depth" => Arc::new(Int64Array::from(
+        HISTORY_COL_DEPTH => Arc::new(Int64Array::from(
             rows.iter()
                 .map(|row| i64::from(row.event.depth))
                 .collect::<Vec<_>>(),
@@ -527,17 +552,18 @@ fn lix_directory_history_schema() -> SchemaRef {
         Field::new("path", DataType::Utf8, true),
         Field::new("parent_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, true),
-        Field::new("hidden", DataType::Boolean, false),
-        Field::new("lixcol_entity_id", DataType::Utf8, false),
-        Field::new("lixcol_schema_key", DataType::Utf8, false),
-        Field::new("lixcol_file_id", DataType::Utf8, true),
-        Field::new("lixcol_schema_version", DataType::Utf8, false),
-        Field::new("lixcol_change_id", DataType::Utf8, false),
-        json_field("lixcol_metadata", true),
-        Field::new("lixcol_commit_id", DataType::Utf8, false),
-        Field::new("lixcol_commit_created_at", DataType::Utf8, false),
-        Field::new("lixcol_start_commit_id", DataType::Utf8, false),
-        Field::new("lixcol_depth", DataType::Int64, false),
+        Field::new("hidden", DataType::Boolean, true),
+        Field::new(HISTORY_COL_ENTITY_ID, DataType::Utf8, false),
+        Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
+        Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
+        json_field(HISTORY_COL_SNAPSHOT_CONTENT, true),
+        Field::new(HISTORY_COL_SCHEMA_VERSION, DataType::Utf8, false),
+        Field::new(HISTORY_COL_CHANGE_ID, DataType::Utf8, false),
+        json_field(HISTORY_COL_METADATA, true),
+        Field::new(HISTORY_COL_COMMIT_ID, DataType::Utf8, false),
+        Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
+        Field::new(HISTORY_COL_START_COMMIT_ID, DataType::Utf8, false),
+        Field::new(HISTORY_COL_DEPTH, DataType::Int64, false),
     ]))
 }
 

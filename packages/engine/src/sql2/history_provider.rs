@@ -24,7 +24,8 @@ use crate::commit_graph::CommitGraphReader;
 use crate::LixError;
 
 use super::history_route::{
-    load_history_entries, parse_history_filter, HistoryRoute, HistoryViewErrorContext,
+    load_history_entries, parse_history_filter, HistoryColumnStyle, HistoryRoute,
+    HistoryViewDescriptor,
 };
 use super::result_metadata::json_field;
 
@@ -82,7 +83,7 @@ impl TableProvider for LixStateHistoryProvider {
         Ok(filters
             .iter()
             .map(|filter| {
-                if parse_history_filter(filter).is_some() {
+                if parse_history_filter(filter, HistoryColumnStyle::Bare).is_some() {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -103,7 +104,7 @@ impl TableProvider for LixStateHistoryProvider {
             Arc::clone(&self.commit_graph),
             projected_schema,
             projection.cloned(),
-            HistoryRoute::from_filters(filters),
+            HistoryRoute::from_filters(filters, HistoryColumnStyle::Bare),
             limit,
         )))
     }
@@ -348,7 +349,7 @@ async fn load_state_history_rows(
     route: &HistoryRoute,
 ) -> Result<Vec<StateHistorySqlRow>, LixError> {
     let entries = load_history_entries(
-        HistoryViewErrorContext {
+        HistoryViewDescriptor {
             view_name: "lix_state_history",
             start_commit_column: "start_commit_id",
         },
