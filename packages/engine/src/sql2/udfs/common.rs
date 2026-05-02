@@ -22,7 +22,7 @@ pub(super) fn json_value_to_serde(array: &dyn Array, row: usize) -> Result<Optio
         .map(Some)
         .map_err(|error| {
             DataFusionError::Execution(format!(
-                "lix_json_extract() expected valid JSON text in its first argument, got error: {error}"
+                "JSON function expected valid JSON text in its first argument, got error: {error}"
             ))
         })
 }
@@ -159,13 +159,17 @@ pub(super) fn validate_utf8_encoding_arg(
     }
 }
 
-pub(super) fn extract_json_path(arrays: &[ArrayRef], row: usize) -> Result<Option<JsonValue>> {
+pub(super) fn extract_json_path(
+    fn_name: &str,
+    arrays: &[ArrayRef],
+    row: usize,
+) -> Result<Option<JsonValue>> {
     let Some(mut current) = json_value_to_serde(arrays[0].as_ref(), row)? else {
         return Ok(None);
     };
 
     for path in &arrays[1..] {
-        let Some(segment) = json_path_segment(path.as_ref(), row)? else {
+        let Some(segment) = json_path_segment(fn_name, path.as_ref(), row)? else {
             return Ok(None);
         };
         let next = match segment {
@@ -196,7 +200,7 @@ pub(super) fn json_text_value(value: &JsonValue) -> Result<String> {
         JsonValue::Array(_) | JsonValue::Object(_) => {
             serde_json::to_string(value).map_err(|error| {
                 DataFusionError::Execution(format!(
-                    "lix_json_extract() could not render JSON value: {error}"
+                    "lix_json_get_text() could not render JSON value: {error}"
                 ))
             })
         }
@@ -207,7 +211,7 @@ pub(super) fn json_text_value(value: &JsonValue) -> Result<String> {
 pub(super) fn json_json_value(value: &JsonValue) -> Result<String> {
     serde_json::to_string(value).map_err(|error| {
         DataFusionError::Execution(format!(
-            "lix_json_extract() could not render JSON value: {error}"
+            "lix_json_get() could not render JSON value: {error}"
         ))
     })
 }
@@ -217,16 +221,26 @@ enum JsonPathSegment {
     Index(usize),
 }
 
-fn json_path_segment(array: &dyn Array, row: usize) -> Result<Option<JsonPathSegment>> {
+fn json_path_segment(
+    fn_name: &str,
+    array: &dyn Array,
+    row: usize,
+) -> Result<Option<JsonPathSegment>> {
     if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
-        return Ok(
-            (!array.is_null(row)).then(|| JsonPathSegment::Key(array.value(row).to_string()))
-        );
+        if array.is_null(row) {
+            return Ok(None);
+        }
+        let value = array.value(row).to_string();
+        validate_json_path_key_segment(fn_name, &value)?;
+        return Ok(Some(JsonPathSegment::Key(value)));
     }
     if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
-        return Ok(
-            (!array.is_null(row)).then(|| JsonPathSegment::Key(array.value(row).to_string()))
-        );
+        if array.is_null(row) {
+            return Ok(None);
+        }
+        let value = array.value(row).to_string();
+        validate_json_path_key_segment(fn_name, &value)?;
+        return Ok(Some(JsonPathSegment::Key(value)));
     }
     macro_rules! index_array {
         ($ty:ty) => {
@@ -236,9 +250,9 @@ fn json_path_segment(array: &dyn Array, row: usize) -> Result<Option<JsonPathSeg
                 }
                 let value = array.value(row);
                 let index = usize::try_from(value).map_err(|_| {
-                    DataFusionError::Execution(
-                        "lix_json_extract() path indexes must be non-negative integers".to_string(),
-                    )
+                    DataFusionError::Execution(format!(
+                        "{fn_name}() path indexes must be non-negative integers"
+                    ))
                 })?;
                 return Ok(Some(JsonPathSegment::Index(index)));
             }
@@ -253,9 +267,19 @@ fn json_path_segment(array: &dyn Array, row: usize) -> Result<Option<JsonPathSeg
     index_array!(Int32Array);
     index_array!(Int64Array);
     Err(DataFusionError::Execution(format!(
-        "lix_json_extract() path arguments must be strings or non-negative integers, got {:?}",
+        "{fn_name}() path arguments must be strings or non-negative integers, got {:?}",
         array.data_type()
     )))
+}
+
+fn validate_json_path_key_segment(fn_name: &str, value: &str) -> Result<()> {
+    if value == "$" || value.starts_with("$.") || value.starts_with("$[") || value.starts_with('/')
+    {
+        return Err(DataFusionError::Execution(format!(
+            "{fn_name}() uses variadic path segments, not JSONPath or JSON Pointer; got '{value}'"
+        )));
+    }
+    Ok(())
 }
 
 pub(super) fn binary_array_from_owned(values: &[Option<Vec<u8>>]) -> BinaryArray {

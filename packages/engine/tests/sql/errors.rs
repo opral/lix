@@ -78,7 +78,7 @@ simulation_test!(sql_json_function_miss_has_lix_udf_hint, |sim| async move {
     assert!(
         error
             .hint()
-            .is_some_and(|hint| hint.contains("lix_json_extract")),
+            .is_some_and(|hint| hint.contains("lix_json_get")),
         "expected JSON UDF hint: {error}"
     );
 });
@@ -104,7 +104,7 @@ simulation_test!(
         assert!(
             error
                 .hint()
-                .is_some_and(|hint| hint.contains("lix_json_extract_text")),
+                .is_some_and(|hint| hint.contains("lix_json_get_text")),
             "expected JSON dialect hint: {error}"
         );
     }
