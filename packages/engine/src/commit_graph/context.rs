@@ -488,6 +488,8 @@ fn parse_commit_change(
     }
 
     let change_ids = required_string_array(&snapshot, "change_ids", &change_entity_id)?;
+    let author_account_ids =
+        optional_string_array(&snapshot, "author_account_ids", &change_entity_id)?;
     let parent_commit_ids =
         required_string_array(&snapshot, "parent_commit_ids", &change_entity_id)?;
     let change_set_id = required_string(&snapshot, "change_set_id", &change_entity_id)?;
@@ -497,6 +499,7 @@ fn parse_commit_change(
         commit_id,
         change_set_id,
         change_ids,
+        author_account_ids,
         parent_commit_ids,
     })
 }
@@ -547,6 +550,17 @@ fn required_string_array(
             })
         })
         .collect()
+}
+
+fn optional_string_array(
+    snapshot: &serde_json::Value,
+    field: &str,
+    commit_id: &str,
+) -> Result<Vec<String>, LixError> {
+    match snapshot.get(field) {
+        Some(_) => required_string_array(snapshot, field, commit_id),
+        None => Ok(Vec::new()),
+    }
 }
 
 #[cfg(test)]

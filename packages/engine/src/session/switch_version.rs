@@ -64,7 +64,7 @@ impl SessionContext {
             })
             .await?;
 
-        let session = SessionContext::new(
+        let session = SessionContext::new_with_closed(
             next_mode,
             Arc::clone(&self.backend),
             Arc::clone(&self.live_state),
@@ -73,6 +73,7 @@ impl SessionContext {
             Arc::clone(&self.changelog),
             Arc::clone(&self.version_ref),
             Arc::clone(&self.schema_registry),
+            self.closed_flag(),
         );
         Ok((
             session,

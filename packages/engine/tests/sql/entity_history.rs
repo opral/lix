@@ -1,4 +1,5 @@
 use lix_engine::Value;
+use serde_json::json;
 
 use super::assert_rows_eq;
 
@@ -79,7 +80,7 @@ simulation_test!(
                     Value::Text("history-entity".to_string()),
                     Value::Integer(2),
                     Value::Boolean(false),
-                    Value::Text("{\"source\":\"update\"}".to_string()),
+                    Value::Json(json!({"source": "update"})),
                     Value::Text("history-entity".to_string()),
                     Value::Text(second_commit_id.clone()),
                     Value::Text(second_commit_id.clone()),
@@ -89,13 +90,58 @@ simulation_test!(
                     Value::Text("history-entity".to_string()),
                     Value::Integer(1),
                     Value::Boolean(true),
-                    Value::Text("{\"source\":\"insert\"}".to_string()),
+                    Value::Json(json!({"source": "insert"})),
                     Value::Text("history-entity".to_string()),
                     Value::Text(first_commit_id),
                     Value::Text(second_commit_id),
                     Value::Integer(1),
                 ],
             ],
+        );
+    }
+);
+
+simulation_test!(
+    entity_history_requires_lixcol_start_commit_id,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine2_history_error_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+                 true,\
+                 true\
+                 )",
+                &[],
+            )
+            .await
+            .expect("registered schema insert should succeed");
+
+        let error = session
+            .execute("SELECT id FROM engine2_history_error_schema_history", &[])
+            .await
+            .expect_err("typed history queries must provide start commit");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires a lixcol_start_commit_id filter"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error
+                .hint()
+                .is_some_and(|hint| hint.contains("WHERE lixcol_start_commit_id")),
+            "unexpected error: {error}"
         );
     }
 );

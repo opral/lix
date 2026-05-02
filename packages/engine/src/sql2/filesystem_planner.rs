@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Map as JsonMap, Value as JsonValue};
 
 use crate::common::{
     directory_ancestor_paths, directory_name_from_path, normalize_directory_path,
@@ -86,6 +86,25 @@ pub(crate) struct FileDescriptorRowInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirectoryDescriptorWriteIntent {
+    pub(crate) id: Option<String>,
+    pub(crate) parent_id: Option<String>,
+    pub(crate) name: String,
+    pub(crate) hidden: Option<bool>,
+    pub(crate) context: FilesystemRowContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileDescriptorWriteIntent {
+    pub(crate) id: Option<String>,
+    pub(crate) directory_id: Option<String>,
+    pub(crate) name: String,
+    pub(crate) extension: Option<String>,
+    pub(crate) hidden: Option<bool>,
+    pub(crate) context: FilesystemRowContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobRefRowInput {
     pub(crate) file_id: String,
     pub(crate) data: Vec<u8>,
@@ -94,10 +113,10 @@ pub(crate) struct BlobRefRowInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FilePathWriteInput {
-    pub(crate) id: String,
+    pub(crate) id: Option<String>,
     pub(crate) path: String,
     pub(crate) data: Option<Vec<u8>>,
-    pub(crate) hidden: bool,
+    pub(crate) hidden: Option<bool>,
     pub(crate) context: FilesystemRowContext,
 }
 
@@ -229,38 +248,84 @@ impl DirectoryPathResolver {
 }
 
 pub(crate) fn directory_descriptor_row(input: DirectoryDescriptorRowInput) -> StageRow {
-    let snapshot_content = json!({
-        "id": input.id.clone(),
-        "parent_id": input.parent_id.clone(),
-        "name": input.name.clone(),
-        "hidden": input.hidden,
+    directory_descriptor_write_row(DirectoryDescriptorWriteIntent {
+        id: Some(input.id),
+        parent_id: input.parent_id,
+        name: input.name,
+        hidden: Some(input.hidden),
+        context: input.context,
     })
-    .to_string();
+}
 
-    state_row(
-        input.id.clone(),
+pub(crate) fn file_descriptor_row(input: FileDescriptorRowInput) -> StageRow {
+    file_descriptor_write_row(FileDescriptorWriteIntent {
+        id: Some(input.id),
+        directory_id: input.directory_id,
+        name: input.name,
+        extension: input.extension,
+        hidden: Some(input.hidden),
+        context: input.context,
+    })
+}
+
+pub(crate) fn directory_descriptor_write_row(input: DirectoryDescriptorWriteIntent) -> StageRow {
+    let mut snapshot = JsonMap::new();
+    if let Some(id) = input.id.as_ref() {
+        snapshot.insert("id".to_string(), JsonValue::String(id.clone()));
+    }
+    snapshot.insert(
+        "parent_id".to_string(),
+        input
+            .parent_id
+            .clone()
+            .map(JsonValue::String)
+            .unwrap_or(JsonValue::Null),
+    );
+    snapshot.insert("name".to_string(), JsonValue::String(input.name));
+    if let Some(hidden) = input.hidden {
+        snapshot.insert("hidden".to_string(), JsonValue::Bool(hidden));
+    }
+
+    partial_state_row(
+        input.id,
         DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
         DIRECTORY_DESCRIPTOR_SCHEMA_VERSION.to_string(),
-        Some(snapshot_content),
+        Some(JsonValue::Object(snapshot).to_string()),
         input.context,
     )
 }
 
-pub(crate) fn file_descriptor_row(input: FileDescriptorRowInput) -> StageRow {
-    let snapshot_content = json!({
-        "id": input.id.clone(),
-        "directory_id": input.directory_id.clone(),
-        "name": input.name.clone(),
-        "extension": input.extension.clone(),
-        "hidden": input.hidden,
-    })
-    .to_string();
+pub(crate) fn file_descriptor_write_row(input: FileDescriptorWriteIntent) -> StageRow {
+    let mut snapshot = JsonMap::new();
+    if let Some(id) = input.id.as_ref() {
+        snapshot.insert("id".to_string(), JsonValue::String(id.clone()));
+    }
+    snapshot.insert(
+        "directory_id".to_string(),
+        input
+            .directory_id
+            .clone()
+            .map(JsonValue::String)
+            .unwrap_or(JsonValue::Null),
+    );
+    snapshot.insert("name".to_string(), JsonValue::String(input.name));
+    snapshot.insert(
+        "extension".to_string(),
+        input
+            .extension
+            .clone()
+            .map(JsonValue::String)
+            .unwrap_or(JsonValue::Null),
+    );
+    if let Some(hidden) = input.hidden {
+        snapshot.insert("hidden".to_string(), JsonValue::Bool(hidden));
+    }
 
-    state_row(
-        input.id.clone(),
+    partial_state_row(
+        input.id,
         FILE_DESCRIPTOR_SCHEMA_KEY,
         FILE_DESCRIPTOR_SCHEMA_VERSION.to_string(),
-        Some(snapshot_content),
+        Some(JsonValue::Object(snapshot).to_string()),
         input.context,
     )
 }
@@ -301,6 +366,7 @@ pub(crate) fn plan_file_path_write(
 ) -> Result<FilesystemWritePlan, LixError> {
     let parsed = ParsedFilePath::try_from_path(&input.path)?;
     let mut rows = Vec::new();
+    let file_id = input.id.unwrap_or_else(&mut *generate_directory_id);
 
     let directory_id = match parsed.directory_path.as_ref() {
         Some(directory_path) => {
@@ -318,18 +384,18 @@ pub(crate) fn plan_file_path_write(
     };
 
     rows.push(file_descriptor_row(FileDescriptorRowInput {
-        id: input.id.clone(),
+        id: file_id.clone(),
         directory_id,
         name: parsed.name,
         extension: parsed.extension,
-        hidden: input.hidden,
+        hidden: input.hidden.unwrap_or(false),
         context: input.context.clone(),
     }));
 
     let mut file_data = Vec::new();
     if let Some(data) = input.data {
         rows.push(blob_ref_row(BlobRefRowInput {
-            file_id: input.id.clone(),
+            file_id: file_id.clone(),
             data: data.clone(),
             context: FilesystemRowContext {
                 file_id: None,
@@ -338,7 +404,7 @@ pub(crate) fn plan_file_path_write(
             },
         })?);
         file_data.push(StageFileData {
-            file_id: input.id,
+            file_id,
             version_id: input.context.version_id,
             untracked: input.context.untracked,
             data,
@@ -535,11 +601,27 @@ fn state_row(
     snapshot_content: Option<String>,
     context: FilesystemRowContext,
 ) -> StageRow {
+    partial_state_row(
+        Some(entity_id),
+        schema_key,
+        schema_version,
+        snapshot_content,
+        context,
+    )
+}
+
+fn partial_state_row(
+    entity_id: Option<String>,
+    schema_key: &str,
+    schema_version: String,
+    snapshot_content: Option<String>,
+    context: FilesystemRowContext,
+) -> StageRow {
     StageRow {
-        entity_id: Some(
+        entity_id: entity_id.map(|entity_id| {
             EntityIdentity::from_string(&entity_id)
-                .expect("filesystem entity id should decode as entity identity"),
-        ),
+                .expect("filesystem entity id should decode as entity identity")
+        }),
         schema_key: schema_key.to_string(),
         file_id: context.file_id,
         snapshot_content,
@@ -832,10 +914,10 @@ mod tests {
         let plan = plan_file_path_write(
             &mut resolver,
             FilePathWriteInput {
-                id: "file-readme".to_string(),
+                id: Some("file-readme".to_string()),
                 path: "/docs/guides/readme.md".to_string(),
                 data: Some(b"hello".to_vec()),
-                hidden: false,
+                hidden: Some(false),
                 context: FilesystemRowContext::active_version("version-a"),
             },
             &mut test_id_generator(&["dir-generated-docs", "dir-generated-guides"]),
@@ -884,10 +966,10 @@ mod tests {
         let plan = plan_file_path_write(
             &mut resolver,
             FilePathWriteInput {
-                id: "file-readme".to_string(),
+                id: Some("file-readme".to_string()),
                 path: "/docs/guides/readme.md".to_string(),
                 data: Some(b"hello".to_vec()),
-                hidden: false,
+                hidden: Some(false),
                 context: FilesystemRowContext::active_version("version-a"),
             },
             &mut test_id_generator(&["should-not-be-used"]),

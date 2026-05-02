@@ -1,6 +1,7 @@
 import init, {
 	resolveEngineWasmModuleOrPath,
 	Value,
+	type LixError,
 } from "./engine-wasm/index.js";
 import * as wasmModule from "./engine-wasm/index.js";
 
@@ -13,15 +14,108 @@ export type JsonValue =
 	| { [key: string]: JsonValue };
 
 export type LixRuntimeValue = JsonValue | Uint8Array | ArrayBuffer | Value;
+export type LixNativeValue = JsonValue | Uint8Array;
 
-export type RowSet = {
+export type ExecuteResult = {
 	columns: string[];
-	rows: Value[][];
+	rows: Row[];
+	rowsAffected: number;
 };
 
-export type ExecuteResult =
-	| { kind: "rows"; rows: RowSet }
-	| { kind: "affectedRows"; affectedRows: number };
+export class Row {
+	readonly columns: string[];
+	private readonly valuesByIndex: Value[];
+
+	constructor(columns: string[], values: Value[]) {
+		this.columns = columns;
+		this.valuesByIndex = values;
+	}
+
+	get(columnName: string): LixNativeValue {
+		return valueToNative(this.value(columnName));
+	}
+
+	tryGet(columnName: string): LixNativeValue | undefined {
+		const value = this.tryValue(columnName);
+		return value === undefined ? undefined : valueToNative(value);
+	}
+
+	value(columnName: string): Value {
+		const index = this.columns.indexOf(columnName);
+		if (index === -1) {
+			throw createLixError(
+				"LIX_COLUMN_NOT_FOUND",
+				`Column "${columnName}" does not exist. Available columns: ${this.availableColumns()}`,
+			);
+		}
+		const value = this.valuesByIndex[index];
+		if (value === undefined) {
+			throw createLixError(
+				"LIX_COLUMN_NOT_FOUND",
+				`Column "${columnName}" is outside row width ${this.valuesByIndex.length}.`,
+			);
+		}
+		return value;
+	}
+
+	tryValue(columnName: string): Value | undefined {
+		const index = this.columns.indexOf(columnName);
+		return index === -1 ? undefined : this.valuesByIndex[index];
+	}
+
+	getAt(index: number): LixNativeValue {
+		return valueToNative(this.valueAt(index));
+	}
+
+	valueAt(index: number): Value {
+		const value = this.valuesByIndex[index];
+		if (value === undefined) {
+			throw createLixError(
+				"LIX_COLUMN_NOT_FOUND",
+				`Column index ${index} is outside row width ${this.valuesByIndex.length}.`,
+			);
+		}
+		return value;
+	}
+
+	values(): Value[] {
+		return [...this.valuesByIndex];
+	}
+
+	toObject(): Record<string, LixNativeValue> {
+		return Object.fromEntries(
+			this.columns.map((column, index) => [
+				column,
+				valueToNative(this.valueAt(index)),
+			]),
+		);
+	}
+
+	toValueMap(): Record<string, Value> {
+		return Object.fromEntries(
+			this.columns.map((column, index) => [column, this.valueAt(index)]),
+		);
+	}
+
+	private availableColumns(): string {
+		return this.columns.length === 0 ? "<none>" : this.columns.join(", ");
+	}
+}
+
+function valueToNative(value: Value): LixNativeValue {
+	switch (value.kind) {
+		case "null":
+			return null;
+		case "boolean":
+		case "integer":
+		case "real":
+		case "text":
+		case "json":
+			return value.value as JsonValue;
+		case "blob":
+			return value.asBlob() ?? new Uint8Array();
+	}
+}
 
 export type TransactionBeginMode = "read" | "write" | "deferred";
 
@@ -98,6 +192,14 @@ export type MergeVersionResult = {
 };
 
 export type Lix = {
+	/**
+	 * Executes one DataFusion SQL statement against this Lix session.
+	 *
+	 * This is not SQLite SQL. Use the DataFusion SQL dialect; positional
+	 * placeholders are `$1`, `$2`, and so on. SQLite-specific catalog tables and
+	 * transaction statements such as `sqlite_master`, `BEGIN`, and `COMMIT` are
+	 * not available. Use `information_schema` for catalog inspection.
+	 */
 	execute(
 		sql: string,
 		params?: ReadonlyArray<LixRuntimeValue>,
@@ -111,14 +213,17 @@ export type Lix = {
 
 let wasmReady: Promise<void> | null = null;
 
-type WasmExecuteResult =
-	| {
-			kind: "rows";
-			rows: { columns: string[]; rows: unknown[][] };
-	  }
-	| { kind: "affectedRows"; affectedRows: number };
+type WasmExecuteResult = {
+	columns: string[];
+	rows: unknown[][];
+	rowsAffected: number;
+};
 
 type WasmLix = {
+	/**
+	 * Executes one DataFusion SQL statement. See `Lix.execute` for the public
+	 * SQL contract.
+	 */
 	execute(sql: string, params: unknown[]): Promise<WasmExecuteResult>;
 	activeVersionId(): Promise<string>;
 	createVersion(options: CreateVersionOptions): Promise<CreateVersionResult>;
@@ -144,26 +249,19 @@ export async function openLix(
 		const wasmLix = (await (wasmModule as unknown as {
 			openLix(options: OpenLixOptions): Promise<WasmLix>;
 		}).openLix(options)) as WasmLix;
-		return createLixHandle(wasmLix, options.backend);
+		return createLixHandle(wasmLix);
 	} catch (error) {
 		try {
 			options.backend?.close?.();
 		} catch {
 			// Preserve the original open failure.
 		}
-		throw error;
+		throw normalizeThrownError(error);
 	}
 }
 
-function createLixHandle(wasmLix: WasmLix, backend?: LixBackend): Lix {
-	let closed = false;
+function createLixHandle(wasmLix: WasmLix): Lix {
 	let operationQueue: Promise<void> = Promise.resolve();
-
-	const ensureOpen = (methodName: string): void => {
-		if (closed) {
-			throw new Error(`lix is closed; ${methodName}() is unavailable`);
-		}
-	};
 
 	const acquireOperationSlot = async (): Promise<() => void> => {
 		const previous = operationQueue;
@@ -180,6 +278,8 @@ function createLixHandle(wasmLix: WasmLix, backend?: LixBackend): Lix {
 		const release = await acquireOperationSlot();
 		try {
 			return await operation();
+		} catch (error) {
+			throw normalizeThrownError(error);
 		} finally {
 			release();
 		}
@@ -190,7 +290,6 @@ function createLixHandle(wasmLix: WasmLix, backend?: LixBackend): Lix {
 			sql: string,
 			params: ReadonlyArray<LixRuntimeValue> = [],
 		): Promise<ExecuteResult> {
-			ensureOpen("execute");
 			const result = await runQueued(() =>
 				wasmLix.execute(sql, params.map((param) => Value.from(param))),
 			);
@@ -198,53 +297,103 @@ function createLixHandle(wasmLix: WasmLix, backend?: LixBackend): Lix {
 		},
 
 		async activeVersionId(): Promise<string> {
-			ensureOpen("activeVersionId");
 			return await runQueued(() => wasmLix.activeVersionId());
 		},
 
 		async createVersion(
 			options: CreateVersionOptions,
 		): Promise<CreateVersionResult> {
-			ensureOpen("createVersion");
 			return await runQueued(() => wasmLix.createVersion(options));
 		},
 
 		async switchVersion(
 			options: SwitchVersionOptions,
 		): Promise<SwitchVersionResult> {
-			ensureOpen("switchVersion");
 			return await runQueued(() => wasmLix.switchVersion(options));
 		},
 
 		async mergeVersion(options: MergeVersionOptions): Promise<MergeVersionResult> {
-			ensureOpen("mergeVersion");
 			return await runQueued(() => wasmLix.mergeVersion(options));
 		},
 
 		async close(): Promise<void> {
-			if (closed) return;
-			try {
-				await runQueued(() => wasmLix.close());
-			} finally {
-				backend?.close?.();
-				closed = true;
-			}
+			await runQueued(() => wasmLix.close());
 		},
 	};
 }
 
 function normalizeExecuteResult(result: WasmExecuteResult): ExecuteResult {
-	if (result.kind === "rows") {
-		return {
-			kind: "rows",
-			rows: {
-				columns: [...result.rows.columns],
-				rows: result.rows.rows.map((row) => row.map((value) => Value.from(value))),
-			},
-		};
-	}
+	const columns = [...result.columns];
 	return {
-		kind: "affectedRows",
-		affectedRows: result.affectedRows,
+		columns,
+		rows: result.rows.map(
+			(row) => new Row(columns, row.map((value) => Value.from(value))),
+		),
+		rowsAffected: result.rowsAffected,
 	};
+}
+
+function createLixError(
+	code: string,
+	message: string,
+	options: { hint?: string; cause?: unknown } = {},
+): LixError {
+	const error = new Error(message) as LixError;
+	error.name = "LixError";
+	error.code = code;
+	if (options.hint !== undefined) {
+		error.hint = options.hint;
+	}
+	if (options.cause !== undefined) {
+		(error as Error & { cause?: unknown }).cause = options.cause;
+	}
+	return error;
+}
+
+function normalizeThrownError(error: unknown): LixError {
+	if (isLixErrorLike(error)) {
+		const hint =
+			typeof error.hint === "string"
+				? error.hint
+				: extractHintFromMessage(error.message);
+		if (error instanceof Error) {
+			if (hint !== undefined && error.hint === undefined) {
+				error.hint = hint;
+			}
+			return error;
+		}
+		const message =
+			typeof error.message === "string"
+				? error.message
+				: typeof error.description === "string"
+					? error.description
+					: error.code;
+		return createLixError(error.code, message, { hint });
+	}
+
+	if (error instanceof Error) {
+		return createLixError("LIX_ERROR_UNKNOWN", error.message, { cause: error });
+	}
+
+	return createLixError("LIX_ERROR_UNKNOWN", String(error));
+}
+
+function extractHintFromMessage(message: unknown): string | undefined {
+	if (typeof message !== "string") return undefined;
+	const match = message.match(/(?:^|\n)hint:\s*(.+)$/s);
+	return match?.[1]?.trim();
+}
+
+function isLixErrorLike(error: unknown): error is {
+	code: string;
+	message?: string;
+	description?: string;
+	hint?: string;
+} {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		typeof (error as { code?: unknown }).code === "string" &&
+		(error as { code: string }).code.startsWith("LIX_")
+	);
 }

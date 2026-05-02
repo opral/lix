@@ -9,6 +9,7 @@ import {
 	type LixBackendTransaction,
 	type Lix,
 	type TransactionBeginMode,
+	isLixError,
 } from "./index.js";
 
 test("openLix exposes the rs-sdk e2e flow", async () => {
@@ -18,8 +19,38 @@ test("openLix exposes the rs-sdk e2e flow", async () => {
 	await registerCrmTaskSchema(lix);
 
 	await lix.execute(
-		"INSERT INTO crm_task (id, title, done) VALUES ($1, $2, $3)",
-		["task-1", "Draft JS SDK flow", false],
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		[
+			"task-1",
+			"Draft JS SDK flow",
+			false,
+			JSON.stringify({ priority: "high", tags: ["sdk", "json"] }),
+		],
+	);
+
+	const projected = await lix.execute(
+		"SELECT title, meta FROM crm_task WHERE id = $1",
+		["task-1"],
+	);
+	const projectedRow = projected.rows[0]!;
+	expect(projectedRow.get("title")).toBe("Draft JS SDK flow");
+	expect(projectedRow.value("title")).toBeInstanceOf(Value);
+	expect(projectedRow.get("meta")).toEqual({
+		priority: "high",
+		tags: ["sdk", "json"],
+	});
+	expect(projectedRow.value("meta").kind).toBe("json");
+	expect(projectedRow.value("meta").asJson()).toEqual({
+		priority: "high",
+		tags: ["sdk", "json"],
+	});
+	expect(projectedRow.toObject()).toEqual({
+		title: "Draft JS SDK flow",
+		meta: { priority: "high", tags: ["sdk", "json"] },
+	});
+	expect(projectedRow.toValueMap().title).toBeInstanceOf(Value);
+	expect(() => projectedRow.get("missing")).toThrow(
+		/Available columns: title, meta/,
 	);
 
 	expect(await taskDone(lix, "task-1")).toBe(false);
@@ -52,7 +83,13 @@ test("openLix exposes the rs-sdk e2e flow", async () => {
 	expect(await taskDone(lix, "task-1")).toBe(true);
 
 	await lix.close();
-	await expect(lix.activeVersionId()).rejects.toThrow("lix is closed");
+	await lix.close();
+	await expect(lix.activeVersionId()).rejects.toMatchObject({
+		code: "LIX_ERROR_CLOSED",
+	});
+	await expect(lix.execute("SELECT 1")).rejects.toMatchObject({
+		code: "LIX_ERROR_CLOSED",
+	});
 });
 
 test("openLix accepts an explicit backend", async () => {
@@ -61,14 +98,79 @@ test("openLix accepts an explicit backend", async () => {
 	const first = await openLix({ backend });
 	await registerCrmTaskSchema(first);
 	await first.execute(
-		"INSERT INTO crm_task (id, title, done) VALUES ($1, $2, $3)",
-		["backend-task", "Stored through explicit backend", false],
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		[
+			"backend-task",
+			"Stored through explicit backend",
+			false,
+			JSON.stringify({ priority: "normal" }),
+		],
 	);
 	await first.close();
 
 	const second = await openLix({ backend });
 	expect(await taskDone(second, "backend-task")).toBe(false);
 	await second.close();
+});
+
+test("lix.close delegates backend close through the engine bridge", async () => {
+	let closeCount = 0;
+	const backend = {
+		...createMemoryBackend(),
+		close() {
+			closeCount += 1;
+		},
+	};
+
+	const lix = await openLix({ backend });
+	await lix.close();
+	await lix.close();
+
+	expect(closeCount).toBe(1);
+});
+
+test("engine errors expose structured hints", async () => {
+	const lix = await openLix();
+
+	try {
+		await lix.execute("SELECT entity_id FROM lix_state_history");
+		throw new Error("expected history query to fail");
+	} catch (error) {
+		expect(isLixError(error)).toBe(true);
+		if (!isLixError(error)) throw error;
+		expect(error.code).toBe("LIX_HISTORY_FILTER_REQUIRED");
+		expect(error.hint).toContain("lix_active_version_commit_id()");
+	}
+
+	await lix.close();
+});
+
+test("lix_state_history snapshot_content preserves JSON null for binary file rows", async () => {
+	const lix = await openLix();
+
+	await lix.execute(
+		"INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
+		[
+			"history-binary-js-repro",
+			"/history/repro.bin",
+			new Uint8Array([0x80, 0xff, 0x00]),
+		],
+	);
+
+	const result = await lix.execute(
+		"SELECT schema_key, snapshot_content \
+		 FROM lix_state_history \
+		 WHERE start_commit_id = lix_active_version_commit_id()",
+	);
+	const directoryRow = result.rows.find(
+		(row) => row.get("schema_key") === "lix_directory_descriptor",
+	);
+
+	expect(directoryRow?.get("snapshot_content")).toMatchObject({
+		parent_id: null,
+	});
+
+	await lix.close();
 });
 
 async function registerCrmTaskSchema(lix: Lix) {
@@ -78,11 +180,12 @@ async function registerCrmTaskSchema(lix: Lix) {
 		"x-lix-version": "1",
 		"x-lix-primary-key": ["/id"],
 		type: "object",
-		required: ["id", "title", "done"],
+		required: ["id", "title", "done", "meta"],
 		properties: {
 			id: { type: "string" },
 			title: { type: "string" },
 			done: { type: "boolean" },
+			meta: { type: "object" },
 		},
 		additionalProperties: false,
 	} as const;
@@ -100,18 +203,13 @@ async function taskDone(lix: Lix, taskId: string): Promise<boolean> {
 	);
 	const rows = expectRows(result);
 	expect(rows.rows).toHaveLength(1);
-	const done = rows.rows[0]?.[0];
-	expect(done).toBeInstanceOf(Value);
-	expect(done?.asBoolean()).not.toBeUndefined();
-	return done!.asBoolean()!;
+	const done = rows.rows[0]?.get("done");
+	expect(typeof done).toBe("boolean");
+	return done as boolean;
 }
 
 function expectRows(result: ExecuteResult) {
-	expect(result.kind).toBe("rows");
-	if (result.kind !== "rows") {
-		throw new Error("expected rows");
-	}
-	return result.rows;
+	return result;
 }
 
 type StoredKvPair = {

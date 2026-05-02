@@ -1,5 +1,5 @@
-use lix_engine::ExecuteResult;
 use lix_engine::Value;
+use serde_json::json;
 
 simulation_test!(
     lix_state_history_requires_start_commit_id,
@@ -26,11 +26,52 @@ simulation_test!(
             .await
             .expect_err("history queries must provide start_commit_id");
 
+        assert!(error
+            .to_string()
+            .contains("requires a start_commit_id filter"));
+        assert_eq!(
+            error.code,
+            lix_engine::LixError::CODE_HISTORY_FILTER_REQUIRED
+        );
         assert!(
             error
-                .to_string()
-                .contains("requires an explicit start_commit_id"),
-            "unexpected error: {error}"
+                .hint()
+                .is_some_and(|hint| hint.contains("lix_active_version_commit_id()")),
+            "expected active-version-head hint: {error}"
+        );
+    }
+);
+
+simulation_test!(
+    lix_state_history_accepts_active_version_commit_id_filter,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('history-active-head', 'one')",
+                &[],
+            )
+            .await
+            .expect("tracked write should succeed");
+
+        let rows = select_history_rows(
+            &session,
+            "SELECT entity_id FROM lix_state_history WHERE start_commit_id = lix_active_version_commit_id()",
+        )
+        .await;
+
+        assert!(
+            rows.iter()
+                .any(|row| row.first() == Some(&Value::Text("history-active-head".to_string()))),
+            "expected active-head history row, got {rows:?}"
         );
     }
 );
@@ -105,7 +146,7 @@ simulation_test!(
             &[
                 Value::Text(first_commit_id.clone()),
                 Value::Integer(0),
-                Value::Text("{\"key\":\"history-explicit\",\"value\":\"one\"}".to_string()),
+                Value::Json(json!({"key": "history-explicit", "value": "one"})),
             ],
             "historical commit should be queryable after later commits"
         );
@@ -141,11 +182,11 @@ simulation_test!(
             vec![
                 vec![
                     Value::Integer(0),
-                    Value::Text("{\"key\":\"history-explicit\",\"value\":\"two\"}".to_string()),
+                    Value::Json(json!({"key": "history-explicit", "value": "two"})),
                 ],
                 vec![
                     Value::Integer(1),
-                    Value::Text("{\"key\":\"history-explicit\",\"value\":\"one\"}".to_string()),
+                    Value::Json(json!({"key": "history-explicit", "value": "one"})),
                 ],
             ],
             "depth 0 is the start commit and parent changes appear at depth > 0"
@@ -411,12 +452,12 @@ simulation_test!(
                 vec![
                     Value::Text(first_commit_id.clone()),
                     Value::Integer(0),
-                    Value::Text("{\"key\":\"history-multi-start\",\"value\":\"one\"}".to_string()),
+                    Value::Json(json!({"key": "history-multi-start", "value": "one"})),
                 ],
                 vec![
                     Value::Text(second_commit_id.clone()),
                     Value::Integer(0),
-                    Value::Text("{\"key\":\"history-multi-start\",\"value\":\"two\"}".to_string()),
+                    Value::Json(json!({"key": "history-multi-start", "value": "two"})),
                 ],
             ],
             "IN should allow multiple explicit history starts"
@@ -522,9 +563,7 @@ async fn select_history_rows(
         .execute(sql, &[])
         .await
         .expect("history SELECT should succeed");
-    let ExecuteResult::Rows(row_set) = result else {
-        panic!("SELECT should return rows");
-    };
+    let row_set = result;
     row_set
         .rows()
         .iter()

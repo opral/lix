@@ -7,6 +7,7 @@ mod wasm {
         Lix as RsLix, LixBackend, LixBackendTransaction, LixError, MergeVersionOptions,
         OpenLixOptions, SwitchVersionOptions, TransactionBeginMode, Value,
     };
+    use serde::Serialize;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
 
@@ -22,21 +23,18 @@ export type JsonValue =
 
 export type LixValue =
   | { kind: "null"; value: null }
-  | { kind: "bool"; value: boolean }
-  | { kind: "int"; value: number }
-  | { kind: "float"; value: number }
+  | { kind: "boolean"; value: boolean }
+  | { kind: "integer"; value: number }
+  | { kind: "real"; value: number }
   | { kind: "text"; value: string }
   | { kind: "json"; value: JsonValue }
   | { kind: "blob"; base64: string };
 
-export type RowSet = {
+export type ExecuteResult = {
   columns: string[];
   rows: LixValue[][];
+  rowsAffected: number;
 };
-
-export type ExecuteResult =
-  | { kind: "rows"; rows: RowSet }
-  | { kind: "affectedRows"; affectedRows: number };
 
 export type TransactionBeginMode = "read" | "write" | "deferred";
 
@@ -107,35 +105,39 @@ export type MergeVersionResult = {
 
     #[wasm_bindgen]
     pub struct Lix {
-        inner: Option<RsLix>,
+        inner: RsLix,
     }
 
     #[wasm_bindgen]
     impl Lix {
+        /// Executes one DataFusion SQL statement against this Lix session.
+        ///
+        /// The SQL dialect is DataFusion SQL, not SQLite SQL. Positional
+        /// placeholders use `$1`, `$2`, and so on. SQLite-specific catalog
+        /// tables and transaction statements such as `sqlite_master`, `BEGIN`,
+        /// and `COMMIT` are not part of this contract; use
+        /// `information_schema` for catalog inspection.
         #[wasm_bindgen(js_name = execute)]
         pub async fn execute(&self, sql: String, params: JsValue) -> Result<JsValue, JsValue> {
-            let lix = self.inner.as_ref().ok_or_else(closed_error)?;
             let params = Array::from(&params);
             let values = params
                 .iter()
                 .map(value_from_js)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(js_error)?;
-            let result = lix.execute(&sql, &values).await.map_err(js_error)?;
+            let result = self.inner.execute(&sql, &values).await.map_err(js_error)?;
             execute_result_to_js(result).map_err(js_error)
         }
 
         #[wasm_bindgen(js_name = activeVersionId)]
         pub async fn active_version_id(&self) -> Result<String, JsValue> {
-            let lix = self.inner.as_ref().ok_or_else(closed_error)?;
-            lix.active_version_id().await.map_err(js_error)
+            self.inner.active_version_id().await.map_err(js_error)
         }
 
         #[wasm_bindgen(js_name = createVersion)]
         pub async fn create_version(&self, args: JsValue) -> Result<JsValue, JsValue> {
-            let lix = self.inner.as_ref().ok_or_else(closed_error)?;
             let options = parse_create_version_options(args).map_err(js_error)?;
-            let result = lix.create_version(options).await.map_err(js_error)?;
+            let result = self.inner.create_version(options).await.map_err(js_error)?;
             let object = Object::new();
             set_string(&object, "versionId", &result.version_id).map_err(js_error)?;
             Ok(object.into())
@@ -143,9 +145,8 @@ export type MergeVersionResult = {
 
         #[wasm_bindgen(js_name = switchVersion)]
         pub async fn switch_version(&self, args: JsValue) -> Result<JsValue, JsValue> {
-            let lix = self.inner.as_ref().ok_or_else(closed_error)?;
             let options = parse_switch_version_options(args).map_err(js_error)?;
-            let result = lix.switch_version(options).await.map_err(js_error)?;
+            let result = self.inner.switch_version(options).await.map_err(js_error)?;
             let object = Object::new();
             set_string(&object, "versionId", &result.version_id).map_err(js_error)?;
             Ok(object.into())
@@ -153,9 +154,8 @@ export type MergeVersionResult = {
 
         #[wasm_bindgen(js_name = mergeVersion)]
         pub async fn merge_version(&self, args: JsValue) -> Result<JsValue, JsValue> {
-            let lix = self.inner.as_ref().ok_or_else(closed_error)?;
             let options = parse_merge_version_options(args).map_err(js_error)?;
-            let result = lix.merge_version(options).await.map_err(js_error)?;
+            let result = self.inner.merge_version(options).await.map_err(js_error)?;
             let object = Object::new();
             let outcome = match result.outcome {
                 lix_rs_sdk::MergeVersionOutcome::AlreadyUpToDate => "alreadyUpToDate",
@@ -204,11 +204,8 @@ export type MergeVersionResult = {
         }
 
         #[wasm_bindgen(js_name = close)]
-        pub async fn close(&mut self) -> Result<(), JsValue> {
-            let Some(lix) = self.inner.take() else {
-                return Ok(());
-            };
-            lix.close().await.map_err(js_error)
+        pub async fn close(&self) -> Result<(), JsValue> {
+            self.inner.close().await.map_err(js_error)
         }
     }
 
@@ -216,7 +213,7 @@ export type MergeVersionResult = {
     pub async fn open_lix(args: Option<JsValue>) -> Result<Lix, JsValue> {
         let options = parse_open_lix_options(args).map_err(js_error)?;
         let inner = open_lix_rs(options).await.map_err(js_error)?;
-        Ok(Lix { inner: Some(inner) })
+        Ok(Lix { inner })
     }
 
     fn parse_open_lix_options(args: Option<JsValue>) -> Result<OpenLixOptions, LixError> {
@@ -333,6 +330,16 @@ export type MergeVersionResult = {
             let rows = tx.kv_scan(namespace, range, limit).await;
             tx.rollback().await?;
             rows
+        }
+
+        async fn close(&self) -> Result<(), LixError> {
+            let method = Reflect::get(&self.inner, &JsValue::from_str("close"))
+                .map_err(|_| js_sdk_error("backend.close could not be read"))?;
+            if method.is_undefined() || method.is_null() {
+                return Ok(());
+            }
+            call_function0(&method, &self.inner)?;
+            Ok(())
         }
     }
 
@@ -600,11 +607,24 @@ export type MergeVersionResult = {
         if let Some(message) = value.as_string() {
             return js_sdk_error(message);
         }
+        let code = Reflect::get(&value, &JsValue::from_str("code"))
+            .ok()
+            .and_then(|code| code.as_string());
         let message = Reflect::get(&value, &JsValue::from_str("message"))
             .ok()
             .and_then(|message| message.as_string())
             .unwrap_or_else(|| "JavaScript backend error".to_string());
-        js_sdk_error(message)
+        let hint = Reflect::get(&value, &JsValue::from_str("hint"))
+            .ok()
+            .and_then(|hint| hint.as_string());
+        let mut error = LixError::new(
+            code.unwrap_or_else(|| "LIX_ERROR_JS_SDK".to_string()),
+            message,
+        );
+        if let Some(hint) = hint {
+            error = error.with_hint(hint);
+        }
+        error
     }
 
     fn parse_create_version_options(value: JsValue) -> Result<CreateVersionOptions, LixError> {
@@ -702,24 +722,24 @@ export type MergeVersionResult = {
             .and_then(|value| value.as_string());
         match kind.as_deref() {
             Some("null") => Ok(Value::Null),
-            Some("bool") => Ok(Value::Boolean(
+            Some("boolean") => Ok(Value::Boolean(
                 Reflect::get(&object, &JsValue::from_str("value"))
                     .ok()
                     .and_then(|value| value.as_bool())
-                    .ok_or_else(|| invalid_value("bool value must be boolean"))?,
+                    .ok_or_else(|| invalid_value("boolean value must be boolean"))?,
             )),
-            Some("int") => {
+            Some("integer") => {
                 let value = Reflect::get(&object, &JsValue::from_str("value"))
                     .ok()
                     .and_then(|value| value.as_f64())
-                    .ok_or_else(|| invalid_value("int value must be number"))?;
+                    .ok_or_else(|| invalid_value("integer value must be number"))?;
                 Ok(Value::Integer(value as i64))
             }
-            Some("float") => {
+            Some("real") => {
                 let value = Reflect::get(&object, &JsValue::from_str("value"))
                     .ok()
                     .and_then(|value| value.as_f64())
-                    .ok_or_else(|| invalid_value("float value must be number"))?;
+                    .ok_or_else(|| invalid_value("real value must be number"))?;
                 Ok(Value::Real(value))
             }
             Some("text") => Ok(Value::Text(
@@ -768,34 +788,23 @@ export type MergeVersionResult = {
 
     fn execute_result_to_js(result: ExecuteResult) -> Result<JsValue, LixError> {
         let object = Object::new();
-        match result {
-            ExecuteResult::Rows(rows) => {
-                set_string(&object, "kind", "rows")?;
-                let rows_object = Object::new();
-                let columns = Array::new();
-                for column in rows.columns() {
-                    columns.push(&JsValue::from_str(column));
-                }
-                Reflect::set(&rows_object, &JsValue::from_str("columns"), &columns)
-                    .map_err(|_| js_sdk_error("could not set columns"))?;
-                let values = Array::new();
-                for row in rows.rows() {
-                    let row_values = Array::new();
-                    for value in row.values() {
-                        row_values.push(&value_to_js(value)?);
-                    }
-                    values.push(&row_values);
-                }
-                Reflect::set(&rows_object, &JsValue::from_str("rows"), &values)
-                    .map_err(|_| js_sdk_error("could not set rows"))?;
-                Reflect::set(&object, &JsValue::from_str("rows"), &rows_object)
-                    .map_err(|_| js_sdk_error("could not set result rows"))?;
-            }
-            ExecuteResult::AffectedRows(count) => {
-                set_string(&object, "kind", "affectedRows")?;
-                set_number(&object, "affectedRows", count as f64)?;
-            }
+        let columns = Array::new();
+        for column in result.columns() {
+            columns.push(&JsValue::from_str(column));
         }
+        Reflect::set(&object, &JsValue::from_str("columns"), &columns)
+            .map_err(|_| js_sdk_error("could not set columns"))?;
+        let values = Array::new();
+        for row in result.rows() {
+            let row_values = Array::new();
+            for value in row.values() {
+                row_values.push(&value_to_js(value)?);
+            }
+            values.push(&row_values);
+        }
+        Reflect::set(&object, &JsValue::from_str("rows"), &values)
+            .map_err(|_| js_sdk_error("could not set rows"))?;
+        set_number(&object, "rowsAffected", result.rows_affected() as f64)?;
         Ok(object.into())
     }
 
@@ -808,20 +817,20 @@ export type MergeVersionResult = {
                     .map_err(|_| js_sdk_error("could not set null value"))?;
             }
             Value::Boolean(value) => {
-                set_string(&object, "kind", "bool")?;
+                set_string(&object, "kind", "boolean")?;
                 Reflect::set(
                     &object,
                     &JsValue::from_str("value"),
                     &JsValue::from_bool(*value),
                 )
-                .map_err(|_| js_sdk_error("could not set bool value"))?;
+                .map_err(|_| js_sdk_error("could not set boolean value"))?;
             }
             Value::Integer(value) => {
-                set_string(&object, "kind", "int")?;
+                set_string(&object, "kind", "integer")?;
                 set_number(&object, "value", *value as f64)?;
             }
             Value::Real(value) => {
-                set_string(&object, "kind", "float")?;
+                set_string(&object, "kind", "real")?;
                 set_number(&object, "value", *value)?;
             }
             Value::Text(value) => {
@@ -830,7 +839,8 @@ export type MergeVersionResult = {
             }
             Value::Json(value) => {
                 set_string(&object, "kind", "json")?;
-                let value = serde_wasm_bindgen::to_value(value).map_err(|error| {
+                let serializer = serde_wasm_bindgen::Serializer::json_compatible();
+                let value = value.serialize(&serializer).map_err(|error| {
                     LixError::new(
                         "LIX_ERROR_JS_SDK",
                         format!("could not serialize JSON value: {error}"),
@@ -880,10 +890,6 @@ export type MergeVersionResult = {
 
     fn js_sdk_error(message: impl Into<String>) -> LixError {
         LixError::new("LIX_ERROR_JS_SDK", message.into())
-    }
-
-    fn closed_error() -> JsValue {
-        js_error(LixError::new("LIX_ERROR_JS_SDK", "lix is closed"))
     }
 
     fn js_error(error: LixError) -> JsValue {

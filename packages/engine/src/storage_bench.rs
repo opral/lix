@@ -1714,14 +1714,9 @@ async fn write_binary_blob_writes(
 async fn count_binary_cas_manifests(
     backend: &(dyn LixBackend + Send + Sync),
 ) -> Result<usize, LixError> {
-    Ok(backend
-        .kv_scan(
-            crate::binary_cas::kv::BINARY_CAS_MANIFEST_NAMESPACE,
-            KvScanRange::Prefix(Vec::new()),
-            None,
-        )
-        .await?
-        .len())
+    let context = BinaryCasContext::new();
+    let mut reader = context.reader(backend);
+    reader.count_blob_manifests().await
 }
 
 fn report(measured_rows: usize, verified_rows: usize, elapsed: Duration) -> StorageBenchReport {

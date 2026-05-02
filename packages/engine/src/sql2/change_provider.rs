@@ -21,6 +21,9 @@ use futures_util::stream;
 use crate::changelog::{CanonicalChange, ChangelogReader, ChangelogScanRequest};
 use crate::LixError;
 
+use super::record_batch::record_batch_with_row_count;
+use super::result_metadata::json_field;
+
 pub(crate) async fn register_lix_change_provider(
     session: &datafusion::prelude::SessionContext,
     changelog: Arc<dyn ChangelogReader>,
@@ -213,9 +216,9 @@ fn lix_change_schema() -> SchemaRef {
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("schema_version", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
-        Field::new("metadata", DataType::Utf8, true),
+        json_field("metadata", true),
         Field::new("created_at", DataType::Utf8, false),
-        Field::new("snapshot_content", DataType::Utf8, true),
+        json_field("snapshot_content", true),
     ]))
 }
 
@@ -283,7 +286,7 @@ fn change_record_batch(
             }
         })
         .collect::<Vec<_>>();
-    RecordBatch::try_new(change_schema(projection), arrays).map_err(|error| {
+    record_batch_with_row_count(change_schema(projection), arrays, changes.len()).map_err(|error| {
         DataFusionError::Execution(format!("failed to build lix_change batch: {error}"))
     })
 }
@@ -298,11 +301,9 @@ fn change_schema(projection: &[ChangeColumn]) -> SchemaRef {
                 ChangeColumn::SchemaKey => Field::new("schema_key", DataType::Utf8, false),
                 ChangeColumn::SchemaVersion => Field::new("schema_version", DataType::Utf8, false),
                 ChangeColumn::FileId => Field::new("file_id", DataType::Utf8, true),
-                ChangeColumn::Metadata => Field::new("metadata", DataType::Utf8, true),
+                ChangeColumn::Metadata => json_field("metadata", true),
                 ChangeColumn::CreatedAt => Field::new("created_at", DataType::Utf8, false),
-                ChangeColumn::SnapshotContent => {
-                    Field::new("snapshot_content", DataType::Utf8, true)
-                }
+                ChangeColumn::SnapshotContent => json_field("snapshot_content", true),
             })
             .collect::<Vec<_>>(),
     ))
@@ -313,12 +314,9 @@ fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
 }
 
 fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
-    LixError::new(
-        "LIX_ERROR_UNKNOWN",
-        format!("sql2 DataFusion error: {error}"),
-    )
+    super::error::datafusion_error_to_lix_error(error)
 }
 
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
-    DataFusionError::Execution(format!("sql2 changelog provider error: {error}"))
+    super::error::lix_error_to_datafusion_error(error)
 }

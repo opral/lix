@@ -178,6 +178,7 @@ async fn finalize_commit_rows(
             "id": commit_id,
             "change_set_id": change_set_id,
             "change_ids": change_ids,
+            "author_account_ids": [],
             "parent_commit_ids": parent_commit_ids,
         }))
         .map_err(|error| {
@@ -226,7 +227,7 @@ fn merge_parent_commit_ids(mut base: Vec<String>, extra: Vec<String>) -> Vec<Str
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
     use serde_json::Value as JsonValue;
@@ -268,6 +269,7 @@ mod tests {
             &version_ref,
             transaction.as_mut(),
             StagedWriteSet {
+                insert_identities: BTreeSet::new(),
                 state_rows: vec![tracked_global_row("change-1")],
                 commit_members_by_version: BTreeMap::from([(
                     GLOBAL_VERSION_ID.to_string(),
@@ -331,6 +333,7 @@ mod tests {
             &version_ref,
             transaction.as_mut(),
             StagedWriteSet {
+                insert_identities: BTreeSet::new(),
                 state_rows: vec![untracked_global_row("change-untracked")],
                 commit_members_by_version: BTreeMap::new(),
                 extra_commit_parents_by_version: BTreeMap::new(),
@@ -408,6 +411,7 @@ mod tests {
             &version_ref,
             transaction.as_mut(),
             StagedWriteSet {
+                insert_identities: BTreeSet::new(),
                 state_rows: vec![tracked_global_row("change-tracked")],
                 commit_members_by_version: BTreeMap::from([(
                     GLOBAL_VERSION_ID.to_string(),
@@ -469,6 +473,7 @@ mod tests {
             &version_ref,
             transaction.as_mut(),
             StagedWriteSet {
+                insert_identities: BTreeSet::new(),
                 state_rows: vec![tracked_version_row("version-a", "change-version-a")],
                 commit_members_by_version: BTreeMap::from([(
                     "version-a".to_string(),

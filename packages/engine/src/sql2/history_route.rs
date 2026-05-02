@@ -138,6 +138,11 @@ pub(crate) struct HistoryEntry {
     pub(crate) depth: u32,
 }
 
+pub(crate) struct HistoryViewErrorContext<'a> {
+    pub(crate) view_name: &'a str,
+    pub(crate) start_commit_column: &'a str,
+}
+
 pub(crate) fn parse_history_filter(expr: &Expr) -> Option<()> {
     parse_history_filter_terms(expr).map(|_| ())
 }
@@ -166,6 +171,7 @@ pub(crate) fn commit_graph_history_request(
 /// Providers pass the schema keys they know how to shape. An empty list means
 /// "do not constrain by provider schema"; this is what `lix_state_history` uses.
 pub(crate) async fn load_history_entries(
+    error_context: HistoryViewErrorContext<'_>,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     route: &HistoryRoute,
     schema_keys: Vec<String>,
@@ -175,9 +181,16 @@ pub(crate) async fn load_history_entries(
     }
     if route.start_commit_ids.is_empty() {
         return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "history provider requires an explicit start_commit_id filter",
-        ));
+            LixError::CODE_HISTORY_FILTER_REQUIRED,
+            format!(
+                "{} requires a {} filter",
+                error_context.view_name, error_context.start_commit_column
+            ),
+        )
+        .with_hint(format!(
+            "Use WHERE {} = lix_active_version_commit_id() to inspect {} from the active version head.",
+            error_context.start_commit_column, error_context.view_name
+        )));
     }
     let Some(request) = commit_graph_history_request(route, schema_keys) else {
         return Ok(Vec::new());

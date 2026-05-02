@@ -27,6 +27,33 @@ test.runIf(hasBetterSqlite3)(
 );
 
 test.runIf(hasBetterSqlite3)(
+	"committed writes survive close and reopen",
+	async () => {
+		const { createBetterSqlite3Backend } = await import("./index.js");
+		const file = tempLixPath();
+		const first = await openLix({
+			backend: createBetterSqlite3Backend({ path: file }),
+		});
+
+		await registerCrmTaskSchema(first);
+		await first.execute(
+			"INSERT INTO crm_task (id, title, done) VALUES ($1, $2, $3)",
+			["persistent-task", "Persist before close", false],
+		);
+		await first.close();
+
+		const second = await openLix({
+			backend: createBetterSqlite3Backend({ path: file }),
+		});
+
+		expect(await taskTitle(second, "persistent-task")).toBe(
+			"Persist before close",
+		);
+		await second.close();
+	},
+);
+
+test.runIf(hasBetterSqlite3)(
 	"createBetterSqlite3Backend rejects a second handle for the same file",
 	async () => {
 		const { createBetterSqlite3Backend } = await import("./index.js");
@@ -75,10 +102,9 @@ async function taskTitle(lix: Lix, taskId: string): Promise<string> {
 	);
 	const rows = expectRows(result);
 	expect(rows.rows).toHaveLength(1);
-	const title = rows.rows[0]?.[0];
-	expect(title).toBeInstanceOf(Value);
-	expect(title?.asText()).not.toBeUndefined();
-	return title!.asText()!;
+	const title = rows.rows[0]?.get("title");
+	expect(typeof title).toBe("string");
+	return title as string;
 }
 
 function tempLixPath(): string {
@@ -88,9 +114,5 @@ function tempLixPath(): string {
 }
 
 function expectRows(result: ExecuteResult) {
-	expect(result.kind).toBe("rows");
-	if (result.kind !== "rows") {
-		throw new Error("expected rows");
-	}
-	return result.rows;
+	return result;
 }

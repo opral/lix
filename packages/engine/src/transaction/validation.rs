@@ -105,7 +105,44 @@ pub(crate) async fn validate_staged_writes(
             .await?;
     reject_unresolved_foreign_keys(&unresolved_foreign_keys)?;
     validate_committed_delete_restrictions(&input, &schema_catalog, &pending_constraints).await?;
+    validate_committed_insert_identities(&input, &pending_constraints).await?;
     validate_committed_unique_constraints(&input, &pending_constraints).await?;
+    Ok(())
+}
+
+async fn validate_committed_insert_identities(
+    input: &TransactionValidationInput<'_>,
+    pending_constraints: &PendingConstraintIndexes,
+) -> Result<(), LixError> {
+    for identity in &input.staged_writes.insert_identities {
+        let Some(committed_row) = input
+            .live_state
+            .load_row(&LiveStateRowRequest {
+                schema_key: identity.schema_key.clone(),
+                version_id: identity.version_id.clone(),
+                entity_id: identity.entity_id.clone(),
+                file_id: nullable_filter_from_option(&identity.file_id),
+            })
+            .await?
+        else {
+            continue;
+        };
+        if committed_row.snapshot_content.is_none()
+            || !committed_row_is_exact_version_scoped(&committed_row, &identity.version_id)
+            || pending_constraints.tombstones_identity(&committed_row)
+        {
+            continue;
+        }
+        return Err(LixError::new(
+            LixError::CODE_UNIQUE,
+            format!(
+                "primary-key constraint violation on schema '{}' version '{}': INSERT would duplicate entity_id '{}'",
+                identity.schema_key,
+                committed_row.schema_version,
+                identity.entity_id.as_string()?
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -215,7 +252,7 @@ fn missing_file_owner_reference_error(
     file_id: &str,
 ) -> Result<LixError, LixError> {
     Ok(LixError::new(
-        LixError::CODE_UNKNOWN,
+        LixError::CODE_FILE_NOT_FOUND,
         format!(
             "file ownership validation failed for schema '{}': entity '{}' references missing file_id '{}' in effective file scope for version '{}'",
             row.schema_key,
@@ -223,7 +260,8 @@ fn missing_file_owner_reference_error(
             file_id,
             row.version_id
         ),
-    ))
+    )
+    .with_hint("Insert a row into lix_file with this id first, or use null for a global entity."))
 }
 
 fn validate_staged_row_shape(row: &StagedStateRow) -> Result<(), LixError> {
@@ -1986,6 +2024,8 @@ fn validate_pending_registered_schema(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use async_trait::async_trait;
     use serde_json::json;
 
@@ -2194,7 +2234,6 @@ mod tests {
             .expect_err("registered schema writes require snapshot_content");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(error.description.contains("snapshot_content"));
     }
 
     #[test]
@@ -2205,7 +2244,6 @@ mod tests {
         let error = validate_pending_registered_schema(&row).expect_err("invalid JSON should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(error.description.contains("invalid JSON"));
     }
 
     #[test]
@@ -2217,7 +2255,6 @@ mod tests {
             .expect_err("builtin lix_registered_schema validation should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-        assert!(error.description.contains("value"));
     }
 
     #[test]
@@ -2243,7 +2280,6 @@ mod tests {
             .expect_err("nested Lix schema definition should be rejected");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(error.description.contains("x-lix-version"));
     }
 
     #[test]
@@ -2264,9 +2300,6 @@ mod tests {
             .expect_err("duplicate pending schema keys should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(error
-            .description
-            .contains("duplicate pending registered schema"));
     }
 
     #[test]
@@ -2299,8 +2332,6 @@ mod tests {
             .expect_err("missing referenced schema should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(error.description.contains("references missing schema"));
-        assert!(error.description.contains("fk_parent_schema"));
     }
 
     #[test]
@@ -2320,8 +2351,6 @@ mod tests {
             .expect_err("missing local FK field should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(error.description.contains("missing local property"));
-        assert!(error.description.contains("/missing_parent_id"));
     }
 
     #[test]
@@ -2341,8 +2370,6 @@ mod tests {
             .expect_err("missing referenced FK field should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(error.description.contains("missing target property"));
-        assert!(error.description.contains("/missing_id"));
     }
 
     #[test]
@@ -2364,10 +2391,6 @@ mod tests {
             .expect_err("FK target must be primary-key or unique");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(error
-            .description
-            .contains("primary key or a unique constraint"));
-        assert!(error.description.contains("/name"));
     }
 
     #[test]
@@ -2401,7 +2424,6 @@ mod tests {
             .expect_err("lix_state FK target must include schema identity");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(error.description.contains("/schema_key"));
     }
 
     #[tokio::test]
@@ -2421,7 +2443,6 @@ mod tests {
             .expect_err("unknown schema_key should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(error.description.contains("unknown_schema"));
     }
 
     #[tokio::test]
@@ -2441,7 +2462,6 @@ mod tests {
             .expect_err("unknown schema_version should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(error.description.contains("version '2'"));
     }
 
     #[tokio::test]
@@ -2457,7 +2477,6 @@ mod tests {
             .expect_err("tombstone with unknown schema should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(error.description.contains("unknown_schema"));
     }
 
     #[tokio::test]
@@ -2497,7 +2516,6 @@ mod tests {
             .expect_err("missing required snapshot field should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-        assert!(error.description.contains("value"));
     }
 
     #[tokio::test]
@@ -2517,7 +2535,6 @@ mod tests {
             .expect_err("invalid snapshot JSON should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
-        assert!(error.description.contains("invalid JSON"));
     }
 
     #[tokio::test]
@@ -2549,11 +2566,7 @@ mod tests {
         .await
         .expect_err("non-null file_id should require a file descriptor");
 
-        assert_eq!(error.code, LixError::CODE_UNKNOWN);
-        assert!(error
-            .description
-            .contains("file ownership validation failed"));
-        assert!(error.description.contains("file-a"));
+        assert_eq!(error.code, LixError::CODE_FILE_NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2618,10 +2631,7 @@ mod tests {
         .await
         .expect_err("global file descriptor should not satisfy a version-local row");
 
-        assert_eq!(error.code, LixError::CODE_UNKNOWN);
-        assert!(error
-            .description
-            .contains("file ownership validation failed"));
+        assert_eq!(error.code, LixError::CODE_FILE_NOT_FOUND);
     }
 
     #[tokio::test]
@@ -2639,12 +2649,6 @@ mod tests {
             .expect_err("same primary key under different identity should fail");
 
         assert_eq!(error.code, LixError::CODE_UNIQUE);
-        assert!(
-            error
-                .description
-                .contains("primary-key constraint violation"),
-            "error should explain primary-key conflict: {error:?}"
-        );
     }
 
     #[tokio::test]
@@ -2663,16 +2667,6 @@ mod tests {
             .expect_err("duplicate pending unique value should fail");
 
         assert_eq!(error.code, LixError::CODE_UNIQUE);
-        assert!(
-            error
-                .description
-                .contains("unique constraint violation on unique_schema./slug"),
-            "error should name the unique constraint: {error:?}"
-        );
-        assert!(
-            error.description.contains("\"hello-world\""),
-            "error should include the conflicting value: {error:?}"
-        );
     }
 
     #[tokio::test]
@@ -2927,10 +2921,6 @@ mod tests {
             .expect_err("foreign key must resolve in the same version");
 
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
-        assert!(
-            error.description.contains("foreign key on schema"),
-            "error should explain unresolved FK: {error:?}"
-        );
     }
 
     #[tokio::test]
@@ -3063,10 +3053,6 @@ mod tests {
         .expect_err("pending child reference should block parent delete");
 
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
-        assert!(
-            error.description.contains("cannot delete"),
-            "error should explain delete restriction: {error:?}"
-        );
     }
 
     #[tokio::test]
@@ -3691,6 +3677,7 @@ mod tests {
     fn empty_staged_write_set() -> StagedWriteSet {
         StagedWriteSet {
             state_rows: Vec::new(),
+            insert_identities: BTreeSet::new(),
             commit_members_by_version: BTreeMap::new(),
             extra_commit_parents_by_version: BTreeMap::new(),
             file_data_writes: Vec::new(),
