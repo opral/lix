@@ -3,8 +3,7 @@
 mod support;
 use lix_engine::Value;
 use lix_engine::{
-    CreateVersionOptions, Engine, ExecuteResult, MergeVersionOptions, MergeVersionOutcome,
-    SwitchVersionOptions,
+    CreateVersionOptions, Engine, MergeVersionOptions, MergeVersionOutcome, SwitchVersionOptions,
 };
 use serde_json::Value as JsonValue;
 
@@ -921,13 +920,13 @@ async fn assert_key_value(
         )
         .await
         .expect("key-value query should succeed");
-    let ExecuteResult::Rows(rows) = result else {
-        panic!("SELECT should return rows");
-    };
+    let rows = result;
     match expected {
         Some(value) => {
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows.rows()[0].values(), &[Value::Text(value.to_string())]);
+            let expected_json = serde_json::from_str::<JsonValue>(value)
+                .expect("expected key-value should be valid JSON");
+            assert_eq!(rows.rows()[0].values(), &[Value::Json(expected_json)]);
         }
         None => assert_eq!(rows.len(), 0),
     }
@@ -945,9 +944,7 @@ async fn assert_version_descriptor(
         )
         .await
         .expect("version query should succeed");
-    let ExecuteResult::Rows(rows) = result else {
-        panic!("SELECT should return rows");
-    };
+    let rows = result;
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows.rows()[0].values(),
@@ -973,12 +970,10 @@ async fn load_commit_snapshot(
         )
         .await
         .expect("commit row should read");
-    let ExecuteResult::Rows(rows) = result else {
-        panic!("SELECT should return rows");
-    };
+    let rows = result;
     assert_eq!(rows.len(), 1);
-    let Value::Text(snapshot_content) = &rows.rows()[0].values()[0] else {
-        panic!("commit snapshot should be text");
+    let Value::Json(snapshot_content) = &rows.rows()[0].values()[0] else {
+        panic!("commit snapshot should be JSON");
     };
-    serde_json::from_str::<JsonValue>(snapshot_content).expect("commit snapshot should be JSON")
+    snapshot_content.clone()
 }

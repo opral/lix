@@ -39,7 +39,9 @@ use crate::{LixError, NullableKeyFilter};
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
-use crate::transaction::types::StageWrite;
+use crate::transaction::types::{StageWrite, StageWriteMode};
+
+use super::result_metadata::json_field;
 
 pub(crate) async fn register_lix_state_providers(
     session: &SessionContext,
@@ -383,7 +385,10 @@ impl DataSink for LixStateInsertSink {
             .map_err(|_| DataFusionError::Execution("INSERT row count overflow".into()))?;
 
         self.write_ctx
-            .stage_write(StageWrite::Rows { rows })
+            .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Insert,
+                rows,
+            })
             .await
             .map_err(lix_error_to_datafusion_error)?;
 
@@ -512,7 +517,10 @@ impl ExecutionPlan for LixStateDeleteExec {
 
             if count > 0 {
                 write_ctx
-                    .stage_write(StageWrite::Rows { rows: write_rows })
+                    .stage_write(StageWrite::Rows {
+                        mode: StageWriteMode::Replace,
+                        rows: write_rows,
+                    })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -661,7 +669,10 @@ impl ExecutionPlan for LixStateUpdateExec {
 
             if count > 0 {
                 write_ctx
-                    .stage_write(StageWrite::Rows { rows: write_rows })
+                    .stage_write(StageWrite::Rows {
+                        mode: StageWriteMode::Replace,
+                        rows: write_rows,
+                    })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -814,7 +825,7 @@ fn lix_state_write_rows_from_batch(
 ) -> Result<Vec<StageRow>> {
     (0..batch.num_rows())
         .map(|row_index| {
-            let global = required_bool_value(batch, row_index, "global")?;
+            let global = optional_bool_value(batch, row_index, "global")?.unwrap_or(false);
             let version_id =
                 optional_string_value(batch, row_index, "version_id")?.unwrap_or_else(|| {
                     if global {
@@ -847,7 +858,7 @@ fn lix_state_write_rows_from_batch(
                 global,
                 change_id: optional_string_value(batch, row_index, "change_id")?,
                 commit_id: optional_string_value(batch, row_index, "commit_id")?,
-                untracked: required_bool_value(batch, row_index, "untracked")?,
+                untracked: optional_bool_value(batch, row_index, "untracked")?.unwrap_or(false),
                 version_id,
             })
         })
@@ -886,14 +897,14 @@ fn optional_string_value(
     }
 }
 
-fn required_bool_value(batch: &RecordBatch, row_index: usize, column_name: &str) -> Result<bool> {
+fn optional_bool_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+) -> Result<Option<bool>> {
     match optional_scalar_value(batch, row_index, column_name)? {
-        Some(ScalarValue::Boolean(Some(value))) => Ok(value),
-        None | Some(ScalarValue::Null) | Some(ScalarValue::Boolean(None)) => {
-            Err(DataFusionError::Execution(format!(
-                "INSERT into lix_state requires non-null boolean column '{column_name}'"
-            )))
-        }
+        Some(ScalarValue::Boolean(Some(value))) => Ok(Some(value)),
+        None | Some(ScalarValue::Null) | Some(ScalarValue::Boolean(None)) => Ok(None),
         Some(other) => Err(DataFusionError::Execution(format!(
             "INSERT into lix_state expected boolean column '{column_name}', got {other:?}"
         ))),
@@ -1041,15 +1052,15 @@ fn lix_state_schema() -> SchemaRef {
         Field::new("entity_id", DataType::Utf8, false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
-        Field::new("snapshot_content", DataType::Utf8, true),
-        Field::new("metadata", DataType::Utf8, true),
+        json_field("snapshot_content", true),
+        json_field("metadata", true),
         Field::new("schema_version", DataType::Utf8, true),
         Field::new("created_at", DataType::Utf8, true),
         Field::new("updated_at", DataType::Utf8, true),
-        Field::new("global", DataType::Boolean, false),
+        Field::new("global", DataType::Boolean, true),
         Field::new("change_id", DataType::Utf8, true),
         Field::new("commit_id", DataType::Utf8, true),
-        Field::new("untracked", DataType::Boolean, false),
+        Field::new("untracked", DataType::Boolean, true),
     ]))
 }
 
@@ -1058,15 +1069,15 @@ fn lix_state_by_version_schema() -> SchemaRef {
         Field::new("entity_id", DataType::Utf8, false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
-        Field::new("snapshot_content", DataType::Utf8, true),
-        Field::new("metadata", DataType::Utf8, true),
+        json_field("snapshot_content", true),
+        json_field("metadata", true),
         Field::new("schema_version", DataType::Utf8, true),
         Field::new("created_at", DataType::Utf8, true),
         Field::new("updated_at", DataType::Utf8, true),
-        Field::new("global", DataType::Boolean, false),
+        Field::new("global", DataType::Boolean, true),
         Field::new("change_id", DataType::Utf8, true),
         Field::new("commit_id", DataType::Utf8, true),
-        Field::new("untracked", DataType::Boolean, false),
+        Field::new("untracked", DataType::Boolean, true),
         Field::new("version_id", DataType::Utf8, false),
     ]))
 }
@@ -1416,14 +1427,11 @@ fn projected_schema(schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Resu
 }
 
 fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
-    LixError::new(
-        "LIX_ERROR_UNKNOWN",
-        format!("sql2 DataFusion error: {error}"),
-    )
+    super::error::datafusion_error_to_lix_error(error)
 }
 
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
-    DataFusionError::Execution(format!("sql2 live-state provider error: {error}"))
+    super::error::lix_error_to_datafusion_error(error)
 }
 
 #[cfg(test)]
@@ -1439,7 +1447,7 @@ mod tests {
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
-    use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
+    use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWriteOutcome};
     use crate::version_ref::{VersionHead, VersionRefReader};
     use crate::{
         entity_identity::EntityIdentity,
@@ -2132,6 +2140,7 @@ mod tests {
         assert_eq!(
             write_context.writes.as_slice(),
             &[StageWrite::Rows {
+                mode: StageWriteMode::Insert,
                 rows: vec![StageRow {
                     entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-1")),
                     schema_key: "lix_key_value".to_string(),
@@ -2232,6 +2241,7 @@ mod tests {
         assert_eq!(
             write_context.writes.as_slice(),
             &[StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![StageRow {
                     entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-1")),
                     schema_key: "lix_key_value".to_string(),
@@ -2285,6 +2295,7 @@ mod tests {
         assert_eq!(
             write_context.writes.as_slice(),
             &[StageWrite::Rows {
+                mode: StageWriteMode::Replace,
                 rows: vec![
                     StageRow {
                         entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-1")),

@@ -76,7 +76,7 @@ impl<T: PartialEq> NullableKeyFilter<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct QueryResult {
+pub struct SqlQueryResult {
     pub rows: Vec<Vec<Value>>,
     #[serde(default)]
     pub columns: Vec<String>,

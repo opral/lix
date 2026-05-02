@@ -45,14 +45,16 @@ const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
 use super::filesystem_planner::{
-    blob_ref_row, directory_path_resolvers_from_state_rows, file_descriptor_row, plan_file_delete,
-    plan_file_path_update, BlobRefRowInput, DirectoryPathResolver, FileDeleteInput,
-    FileDescriptorRowInput, FilePathWriteInput, FilesystemDeletePlan, FilesystemRowContext,
+    blob_ref_row, directory_path_resolvers_from_state_rows, file_descriptor_row,
+    file_descriptor_write_row, plan_file_delete, plan_file_path_update, BlobRefRowInput,
+    DirectoryPathResolver, FileDeleteInput, FileDescriptorRowInput, FileDescriptorWriteIntent,
+    FilePathWriteInput, FilesystemDeletePlan, FilesystemRowContext,
 };
+use super::result_metadata::json_field;
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
-use crate::transaction::types::{StageFileData, StageWrite};
+use crate::transaction::types::{StageFileData, StageWrite, StageWriteMode};
 
 pub(crate) async fn register_lix_file_providers(
     session: &SessionContext,
@@ -429,9 +431,10 @@ impl DataSink for LixFileInsertSink {
                     &mut || self.functions.call_uuid_v7(),
                 )?);
             } else {
-                staged.extend(lix_file_insert_stage_from_batch(
+                staged.extend(lix_file_insert_stage_from_batch_with_id_generator(
                     &batch,
                     self.version_binding.active_version_id(),
+                    &mut || self.functions.call_uuid_v7(),
                 )?);
             }
         }
@@ -439,10 +442,12 @@ impl DataSink for LixFileInsertSink {
         if !staged.state_rows.is_empty() || !staged.file_data_writes.is_empty() {
             let intent = if staged.file_data_writes.is_empty() {
                 StageWrite::Rows {
+                    mode: StageWriteMode::Insert,
                     rows: staged.state_rows,
                 }
             } else {
                 StageWrite::RowsWithFileData {
+                    mode: StageWriteMode::Insert,
                     rows: staged.state_rows,
                     file_data: staged.file_data_writes,
                     count: staged.count,
@@ -586,6 +591,7 @@ impl ExecutionPlan for LixFileDeleteExec {
             if count > 0 {
                 write_ctx
                     .stage_write(StageWrite::Rows {
+                        mode: StageWriteMode::Replace,
                         rows: staged.state_rows,
                     })
                     .await
@@ -760,10 +766,12 @@ impl ExecutionPlan for LixFileUpdateExec {
             if count > 0 {
                 let intent = if staged.file_data_writes.is_empty() {
                     StageWrite::Rows {
+                        mode: StageWriteMode::Replace,
                         rows: staged.state_rows,
                     }
                 } else {
                     StageWrite::RowsWithFileData {
+                        mode: StageWriteMode::Replace,
                         rows: staged.state_rows,
                         file_data: staged.file_data_writes,
                         count,
@@ -1020,11 +1028,28 @@ fn blob_ref_file_ids_from_live_rows(
     Ok(file_ids)
 }
 
+#[cfg(test)]
 fn lix_file_insert_stage_from_batch(
     batch: &RecordBatch,
     version_binding: Option<&str>,
 ) -> Result<LixFileStagedBatch> {
     lix_file_stage_from_batch_with_options(batch, version_binding, true, true, true)
+}
+
+fn lix_file_insert_stage_from_batch_with_id_generator(
+    batch: &RecordBatch,
+    version_binding: Option<&str>,
+    generate_id: &mut dyn FnMut() -> String,
+) -> Result<LixFileStagedBatch> {
+    lix_file_stage_from_batch_with_options_and_path_resolvers(
+        batch,
+        version_binding,
+        true,
+        true,
+        true,
+        None,
+        Some(generate_id),
+    )
 }
 
 fn lix_file_insert_stage_from_batch_with_path_resolvers(
@@ -1182,6 +1207,7 @@ fn lix_file_path_update_stage_from_batch(
     Ok(staged)
 }
 
+#[cfg(test)]
 fn lix_file_stage_from_batch_with_options(
     batch: &RecordBatch,
     version_binding: Option<&str>,
@@ -1222,8 +1248,8 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
         }
 
         let path = optional_string_value(batch, row_index, "path")?;
-        let id = required_string_value(batch, row_index, "id")?;
-        let hidden = optional_bool_value(batch, row_index, "hidden")?.unwrap_or(false);
+        let id = optional_string_value(batch, row_index, "id")?;
+        let hidden = optional_bool_value(batch, row_index, "hidden")?;
         let context = file_row_context_from_batch(batch, row_index, version_binding)?;
         let data = if include_data_writes {
             optional_binary_value(batch, row_index, "data")?
@@ -1269,10 +1295,26 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
         let name = required_string_value(batch, row_index, "name")?;
         let extension = optional_string_value(batch, row_index, "extension")?;
 
+        let id = if data.is_some() {
+            match id {
+                Some(id) => Some(id),
+                None => {
+                    let Some(generate_id) = generate_directory_id.as_deref_mut() else {
+                        return Err(DataFusionError::Execution(
+                            "INSERT into lix_file with data requires id generator".to_string(),
+                        ));
+                    };
+                    Some(generate_id())
+                }
+            }
+        } else {
+            id
+        };
+
         if include_descriptor_writes {
             staged
                 .state_rows
-                .push(file_descriptor_row(FileDescriptorRowInput {
+                .push(file_descriptor_write_row(FileDescriptorWriteIntent {
                     id: id.clone(),
                     directory_id: directory_id.clone(),
                     name: name.clone(),
@@ -1282,7 +1324,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                 }));
         }
 
-        if let Some(data) = data {
+        if let (Some(id), Some(data)) = (id, data) {
             stage_lix_file_data_write(&mut staged, id, data, context)?;
         }
         staged.count = staged
@@ -1883,24 +1925,24 @@ fn optional_scalar_value(
 
 fn lix_file_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
+        Field::new("id", DataType::Utf8, true),
         Field::new("path", DataType::Utf8, false),
         Field::new("directory_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
         Field::new("extension", DataType::Utf8, true),
-        Field::new("hidden", DataType::Boolean, false),
+        Field::new("hidden", DataType::Boolean, true),
         Field::new("data", DataType::Binary, true),
         Field::new("lixcol_entity_id", DataType::Utf8, false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_schema_version", DataType::Utf8, false),
-        Field::new("lixcol_global", DataType::Boolean, false),
+        Field::new("lixcol_global", DataType::Boolean, true),
         Field::new("lixcol_change_id", DataType::Utf8, true),
         Field::new("lixcol_created_at", DataType::Utf8, true),
         Field::new("lixcol_updated_at", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
-        Field::new("lixcol_untracked", DataType::Boolean, false),
-        Field::new("lixcol_metadata", DataType::Utf8, true),
+        Field::new("lixcol_untracked", DataType::Boolean, true),
+        json_field("lixcol_metadata", true),
     ]))
 }
 
@@ -1915,14 +1957,11 @@ fn lix_file_by_version_schema() -> SchemaRef {
 }
 
 fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
-    LixError::new(
-        "LIX_ERROR_UNKNOWN",
-        format!("sql2 DataFusion error: {error}"),
-    )
+    super::error::datafusion_error_to_lix_error(error)
 }
 
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
-    DataFusionError::Execution(format!("sql2 lix_file provider error: {error}"))
+    super::error::lix_error_to_datafusion_error(error)
 }
 
 #[cfg(test)]
@@ -1949,7 +1988,7 @@ mod tests {
     use crate::live_state::LiveStateRow;
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
-    use crate::transaction::types::{StageWrite, StageWriteOutcome};
+    use crate::transaction::types::{StageWrite, StageWriteMode, StageWriteOutcome};
     use crate::LixError;
 
     use super::{
@@ -2691,7 +2730,8 @@ mod tests {
         let writes = &write_context.writes;
         assert_eq!(writes.len(), 1);
         match &writes[0] {
-            StageWrite::Rows { rows } => {
+            StageWrite::Rows { mode, rows } => {
+                assert_eq!(*mode, StageWriteMode::Insert);
                 assert_eq!(rows.len(), 1);
                 assert_eq!(
                     rows[0].entity_id.as_ref(),
@@ -2727,10 +2767,13 @@ mod tests {
         assert_eq!(writes.len(), 1);
         match &writes[0] {
             StageWrite::RowsWithFileData {
+                mode,
                 rows,
                 file_data,
                 count,
+                ..
             } => {
+                assert_eq!(*mode, StageWriteMode::Insert);
                 assert_eq!(*count, 1);
                 assert_eq!(rows.len(), 2);
                 assert!(rows
@@ -2786,6 +2829,7 @@ mod tests {
                 rows,
                 file_data,
                 count,
+                ..
             } => {
                 assert_eq!(*count, 1);
                 assert_eq!(file_data.len(), 1);

@@ -6,14 +6,14 @@ use crate::commands::version::{
 use crate::db::{open_lix_at, resolve_db_path};
 use crate::error::CliError;
 use crate::hints::CommandOutput;
-use lix_rs_sdk::{CreateVersionOptions, CreateVersionResult};
+use lix_rs_sdk::{CreateVersionOptions, CreateVersionResult, SwitchVersionOptions};
 
 pub fn run(context: &AppContext, command: CreateVersionCommand) -> Result<CommandOutput, CliError> {
     let path = resolve_db_path(context)?;
     let lix = open_lix_at(&path)?;
-    let source_version_id = match (command.from_id.as_deref(), command.from_name.as_deref()) {
-        (Some(id), None) => Some(resolve_version_ref(&lix, VersionLookup::Id(id))?.id),
-        (None, Some(name)) => Some(resolve_version_ref(&lix, VersionLookup::Name(name))?.id),
+    let source = match (command.from_id.as_deref(), command.from_name.as_deref()) {
+        (Some(id), None) => Some(resolve_version_ref(&lix, VersionLookup::Id(id))?),
+        (None, Some(name)) => Some(resolve_version_ref(&lix, VersionLookup::Name(name))?),
         (None, None) => None,
         _ => {
             return Err(CliError::msg(
@@ -21,17 +21,32 @@ pub fn run(context: &AppContext, command: CreateVersionCommand) -> Result<Comman
             ));
         }
     };
-    let result = pollster::block_on(lix.create_version(CreateVersionOptions {
+    let original_active = resolve_active_version_ref(&lix)?;
+    if let Some(source) = &source {
+        crate::db::block_on(lix.switch_version(SwitchVersionOptions {
+            version_id: source.id.clone(),
+        }))
+        .map_err(|error| CliError::msg(error.to_string()))?;
+    }
+    let name = command
+        .name
+        .clone()
+        .or_else(|| command.id.clone())
+        .ok_or_else(|| CliError::msg("version create requires --name when --id is omitted"))?;
+    let result = crate::db::block_on(lix.create_version(CreateVersionOptions {
         id: command.id,
-        name: command.name,
-        source_version_id,
-        hidden: command.hidden,
+        name,
     }))
     .map_err(|error| CliError::msg(error.to_string()))?;
-    let parent = resolve_version_ref(&lix, VersionLookup::Id(&result.parent_version_id))?;
-    let active = resolve_active_version_ref(&lix)?;
+    if source.is_some() {
+        crate::db::block_on(lix.switch_version(SwitchVersionOptions {
+            version_id: original_active.id.clone(),
+        }))
+        .map_err(|error| CliError::msg(error.to_string()))?;
+    }
 
-    let (created_line, active_line) = create_confirmation_lines(&result, &parent, &active);
+    let parent = source.as_ref().unwrap_or(&original_active);
+    let (created_line, active_line) = create_confirmation_lines(&result, parent, &original_active);
     println!("{created_line}");
     println!("{active_line}");
     Ok(CommandOutput::empty())
@@ -44,12 +59,12 @@ fn create_confirmation_lines(
 ) -> (String, String) {
     (
         format!(
-            "Created version {} ({}) with initial head from {} ({}) at commit {}.",
-            result.name, result.id, parent.name, parent.id, result.parent_commit_id
+            "Created version {} from {} ({}).",
+            result.version_id, parent.name, parent.id
         ),
         format!(
-            "Active version is still {} ({}). Use `lix version switch --id {}` or `lix version switch --name {}` to work on it.",
-            active.name, active.id, result.id, result.name
+            "Active version is still {} ({}). Use `lix version switch --id {}` to work on it.",
+            active.name, active.id, result.version_id
         ),
     )
 }
@@ -63,10 +78,7 @@ mod tests {
     #[test]
     fn create_confirmation_uses_active_version_not_parent_version() {
         let result = CreateVersionResult {
-            id: "new-version".to_string(),
-            name: "New Version".to_string(),
-            parent_version_id: "feature-b".to_string(),
-            parent_commit_id: "commit-123".to_string(),
+            version_id: "new-version".to_string(),
         };
         let parent = ResolvedVersionRef {
             id: "feature-b".to_string(),

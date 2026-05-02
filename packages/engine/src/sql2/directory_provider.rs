@@ -40,14 +40,16 @@ use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 
 use super::filesystem_planner::{
-    directory_descriptor_row, plan_recursive_directory_delete, DirectoryDescriptorRowInput,
-    DirectoryPathResolver, FilesystemDeletePlan, FilesystemRowContext,
+    directory_descriptor_write_row, plan_recursive_directory_delete,
+    DirectoryDescriptorWriteIntent, DirectoryPathResolver, FilesystemDeletePlan,
+    FilesystemRowContext,
 };
 use super::filesystem_visibility::VisibleFilesystem;
+use super::result_metadata::json_field;
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
-use crate::transaction::types::StageWrite;
+use crate::transaction::types::{StageWrite, StageWriteMode};
 
 const DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
@@ -434,7 +436,10 @@ impl DataSink for LixDirectoryInsertSink {
         }
 
         self.write_ctx
-            .stage_write(StageWrite::Rows { rows })
+            .stage_write(StageWrite::Rows {
+                mode: StageWriteMode::Insert,
+                rows,
+            })
             .await
             .map_err(lix_error_to_datafusion_error)?;
 
@@ -576,7 +581,10 @@ impl ExecutionPlan for LixDirectoryDeleteExec {
 
             if count > 0 {
                 write_ctx
-                    .stage_write(StageWrite::Rows { rows: write_rows })
+                    .stage_write(StageWrite::Rows {
+                        mode: StageWriteMode::Replace,
+                        rows: write_rows,
+                    })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -725,7 +733,10 @@ impl ExecutionPlan for LixDirectoryUpdateExec {
 
             if count > 0 {
                 write_ctx
-                    .stage_write(StageWrite::Rows { rows: write_rows })
+                    .stage_write(StageWrite::Rows {
+                        mode: StageWriteMode::Replace,
+                        rows: write_rows,
+                    })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -1014,8 +1025,8 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         }
 
         let path = optional_string_value(batch, row_index, "path")?;
-        let id = required_string_value(batch, row_index, "id")?;
-        let hidden = optional_bool_value(batch, row_index, "hidden")?.unwrap_or(false);
+        let id = optional_string_value(batch, row_index, "id")?;
+        let hidden = optional_bool_value(batch, row_index, "hidden")?;
         let context = directory_row_context_from_batch(batch, row_index, version_binding)?;
 
         if let Some(path) = path.filter(|_| reject_read_only_fields) {
@@ -1040,9 +1051,9 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
             let planned_rows = resolver
                 .ensure_directory_path_with_leaf_id(
                     &path,
-                    Some(id),
+                    id,
                     context,
-                    hidden,
+                    hidden.unwrap_or(false),
                     generate_directory_id,
                 )
                 .map_err(lix_error_to_datafusion_error)?;
@@ -1052,13 +1063,15 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
 
         let parent_id = optional_string_value(batch, row_index, "parent_id")?;
         let name = required_string_value(batch, row_index, "name")?;
-        rows.push(directory_descriptor_row(DirectoryDescriptorRowInput {
-            id,
-            parent_id,
-            name,
-            hidden,
-            context,
-        }));
+        rows.push(directory_descriptor_write_row(
+            DirectoryDescriptorWriteIntent {
+                id,
+                parent_id,
+                name,
+                hidden,
+                context,
+            },
+        ));
     }
     Ok(rows)
 }
@@ -1560,22 +1573,22 @@ fn optional_scalar_value(
 
 fn lix_directory_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
+        Field::new("id", DataType::Utf8, true),
         Field::new("path", DataType::Utf8, true),
         Field::new("parent_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
-        Field::new("hidden", DataType::Boolean, false),
+        Field::new("hidden", DataType::Boolean, true),
         Field::new("lixcol_entity_id", DataType::Utf8, false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_schema_version", DataType::Utf8, false),
-        Field::new("lixcol_global", DataType::Boolean, false),
+        Field::new("lixcol_global", DataType::Boolean, true),
         Field::new("lixcol_change_id", DataType::Utf8, true),
         Field::new("lixcol_created_at", DataType::Utf8, true),
         Field::new("lixcol_updated_at", DataType::Utf8, true),
         Field::new("lixcol_commit_id", DataType::Utf8, true),
-        Field::new("lixcol_untracked", DataType::Boolean, false),
-        Field::new("lixcol_metadata", DataType::Utf8, true),
+        Field::new("lixcol_untracked", DataType::Boolean, true),
+        json_field("lixcol_metadata", true),
     ]))
 }
 
@@ -1590,14 +1603,11 @@ fn lix_directory_by_version_schema() -> SchemaRef {
 }
 
 fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
-    LixError::new(
-        "LIX_ERROR_UNKNOWN",
-        format!("sql2 DataFusion error: {error}"),
-    )
+    super::error::datafusion_error_to_lix_error(error)
 }
 
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
-    DataFusionError::Execution(format!("sql2 lix_directory provider error: {error}"))
+    super::error::lix_error_to_datafusion_error(error)
 }
 
 #[cfg(test)]
@@ -1623,7 +1633,7 @@ mod tests {
         LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
-    use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
+    use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWriteOutcome};
     use crate::LixError;
 
     use super::{
@@ -2112,8 +2122,7 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(
             write_context.writes.as_slice(),
-            &[StageWrite::Rows {
-                rows: vec![StageRow {
+            &[StageWrite::Rows { mode: StageWriteMode::Insert, rows: vec![StageRow {
                     entity_id: Some(crate::entity_identity::EntityIdentity::single("dir-docs")),
                     schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                     file_id: None,
@@ -2163,7 +2172,7 @@ mod tests {
             .expect("directory sink should stage path write");
 
         assert_eq!(count, 1);
-        let [StageWrite::Rows { rows }] = write_context.writes.as_slice() else {
+        let [StageWrite::Rows { rows, .. }] = write_context.writes.as_slice() else {
             panic!("expected one directory staged write");
         };
         assert_eq!(rows.len(), 1);

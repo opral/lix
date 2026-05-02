@@ -1,10 +1,11 @@
+use datafusion::arrow::datatypes::Field;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use std::sync::Arc;
 
-use crate::{LixError, QueryResult, Value};
+use crate::{LixError, SqlQueryResult, Value};
 
 use super::change_provider::register_lix_change_provider;
 use super::commit_provider::register_commit_providers;
@@ -17,6 +18,7 @@ use super::file_history_provider::register_lix_file_history_provider;
 use super::file_provider::{register_lix_file_providers, register_lix_file_write_providers};
 use super::history_provider::register_history_providers;
 use super::lix_state_provider::{register_lix_state_providers, register_lix_state_write_providers};
+use super::result_metadata::field_is_json;
 use super::udfs::register_sql2_functions;
 use super::version_provider::register_lix_version_provider;
 use super::{SqlExecutionContext, SqlStatementKind, SqlWriteContext, SqlWriteExecutionContext};
@@ -51,7 +53,7 @@ pub(crate) async fn execute_sql(
     ctx: &dyn SqlExecutionContext,
     sql: &str,
     params: &[Value],
-) -> Result<QueryResult, LixError> {
+) -> Result<SqlQueryResult, LixError> {
     let plan = create_logical_plan(ctx, sql).await?;
     execute_logical_plan(plan, params).await
 }
@@ -98,7 +100,7 @@ pub(crate) async fn create_write_logical_plan(
 pub(crate) async fn execute_logical_plan(
     plan: SqlLogicalPlan,
     params: &[Value],
-) -> Result<QueryResult, LixError> {
+) -> Result<SqlQueryResult, LixError> {
     let SqlLogicalPlan {
         session,
         plan,
@@ -120,23 +122,27 @@ pub(crate) async fn execute_logical_plan(
             .map_err(datafusion_error_to_lix_error)?;
     }
 
-    let result_columns = dataframe
+    let result_fields = dataframe
         .schema()
         .fields()
         .iter()
-        .map(|field| field.name().to_string())
+        .map(|field| field.as_ref().clone())
         .collect::<Vec<_>>();
     let batches = dataframe
         .collect()
         .await
         .map_err(datafusion_error_to_lix_error)?;
-    query_result_from_batches(&result_columns, &batches)
+    query_result_from_batches(&result_fields, &batches)
 }
 
 async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, LixError> {
-    let session = SessionContext::new();
-    register_sql2_functions(&session, ctx.functions());
+    let session = new_lix_session_context();
     let version_ref = ctx.version_ref();
+    let active_version_commit_id = version_ref
+        .load_head(ctx.active_version_id())
+        .await?
+        .map(|head| head.commit_id);
+    register_sql2_functions(&session, ctx.functions(), active_version_commit_id);
     register_lix_state_providers(
         &session,
         ctx.active_version_id(),
@@ -195,9 +201,12 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
 async fn build_write_session(
     ctx: &mut dyn SqlWriteExecutionContext,
 ) -> Result<SessionContext, LixError> {
-    let session = SessionContext::new();
+    let session = new_lix_session_context();
     let write_ctx = SqlWriteContext::new(ctx);
-    register_sql2_functions(&session, write_ctx.functions());
+    let active_version_commit_id = write_ctx
+        .load_version_head(&write_ctx.active_version_id())
+        .await?;
+    register_sql2_functions(&session, write_ctx.functions(), active_version_commit_id);
 
     register_lix_state_write_providers(&session, write_ctx.clone()).await?;
 
@@ -211,6 +220,10 @@ async fn build_write_session(
     .await?;
 
     Ok(session)
+}
+
+fn new_lix_session_context() -> SessionContext {
+    SessionContext::new_with_config(SessionConfig::new().with_information_schema(true))
 }
 
 fn classify_logical_plan(plan: &LogicalPlan) -> SqlStatementKind {
@@ -236,96 +249,99 @@ fn scalar_value_from_lix_value(value: &Value) -> ScalarValue {
 }
 
 fn datafusion_error_to_lix_error(error: datafusion::error::DataFusionError) -> LixError {
-    if let Some(error) = lix_error_from_datafusion_error(&error) {
-        return error;
-    }
-
-    LixError::new(
-        "LIX_ERROR_UNKNOWN",
-        format!("sql2 DataFusion error: {error}"),
-    )
-}
-
-fn lix_error_from_datafusion_error(error: &datafusion::error::DataFusionError) -> Option<LixError> {
-    match error {
-        datafusion::error::DataFusionError::External(error) => {
-            error.downcast_ref::<LixError>().cloned()
-        }
-        datafusion::error::DataFusionError::Context(_, error)
-        | datafusion::error::DataFusionError::Diagnostic(_, error) => {
-            lix_error_from_datafusion_error(error)
-        }
-        datafusion::error::DataFusionError::Shared(error) => lix_error_from_datafusion_error(error),
-        datafusion::error::DataFusionError::Collection(errors) => {
-            errors.iter().find_map(lix_error_from_datafusion_error)
-        }
-        _ => None,
-    }
+    super::error::datafusion_error_to_lix_error(error)
 }
 
 fn query_result_from_batches(
-    result_columns: &[String],
+    result_fields: &[Field],
     batches: &[RecordBatch],
-) -> Result<QueryResult, LixError> {
+) -> Result<SqlQueryResult, LixError> {
+    let result_columns = result_fields
+        .iter()
+        .map(|field| field.name().to_string())
+        .collect::<Vec<_>>();
     let mut rows = Vec::<Vec<Value>>::new();
     for batch in batches {
         for row_index in 0..batch.num_rows() {
             let mut row = Vec::<Value>::with_capacity(batch.num_columns());
-            for array in batch.columns() {
+            for (column_index, array) in batch.columns().iter().enumerate() {
                 let scalar = ScalarValue::try_from_array(array.as_ref(), row_index)
                     .map_err(datafusion_error_to_lix_error)?;
-                row.push(scalar_value_to_lix_value(&scalar));
+                let field = result_fields.get(column_index);
+                row.push(scalar_value_to_lix_value(&scalar, field)?);
             }
             rows.push(row);
         }
     }
 
-    Ok(QueryResult {
+    Ok(SqlQueryResult {
         rows,
         columns: result_columns.to_vec(),
     })
 }
 
-fn scalar_value_to_lix_value(value: &ScalarValue) -> Value {
+fn scalar_value_to_lix_value(
+    value: &ScalarValue,
+    field: Option<&Field>,
+) -> Result<Value, LixError> {
     match value {
-        ScalarValue::Null => Value::Null,
-        ScalarValue::Boolean(Some(value)) => Value::Boolean(*value),
-        ScalarValue::Boolean(None) => Value::Null,
-        ScalarValue::Int8(Some(value)) => Value::Integer(i64::from(*value)),
-        ScalarValue::Int8(None) => Value::Null,
-        ScalarValue::Int16(Some(value)) => Value::Integer(i64::from(*value)),
-        ScalarValue::Int16(None) => Value::Null,
-        ScalarValue::Int32(Some(value)) => Value::Integer(i64::from(*value)),
-        ScalarValue::Int32(None) => Value::Null,
-        ScalarValue::Int64(Some(value)) => Value::Integer(*value),
-        ScalarValue::Int64(None) => Value::Null,
-        ScalarValue::UInt8(Some(value)) => Value::Integer(i64::from(*value)),
-        ScalarValue::UInt8(None) => Value::Null,
-        ScalarValue::UInt16(Some(value)) => Value::Integer(i64::from(*value)),
-        ScalarValue::UInt16(None) => Value::Null,
-        ScalarValue::UInt32(Some(value)) => Value::Integer(i64::from(*value)),
-        ScalarValue::UInt32(None) => Value::Null,
+        ScalarValue::Null => Ok(Value::Null),
+        ScalarValue::Boolean(Some(value)) => Ok(Value::Boolean(*value)),
+        ScalarValue::Boolean(None) => Ok(Value::Null),
+        ScalarValue::Int8(Some(value)) => Ok(Value::Integer(i64::from(*value))),
+        ScalarValue::Int8(None) => Ok(Value::Null),
+        ScalarValue::Int16(Some(value)) => Ok(Value::Integer(i64::from(*value))),
+        ScalarValue::Int16(None) => Ok(Value::Null),
+        ScalarValue::Int32(Some(value)) => Ok(Value::Integer(i64::from(*value))),
+        ScalarValue::Int32(None) => Ok(Value::Null),
+        ScalarValue::Int64(Some(value)) => Ok(Value::Integer(*value)),
+        ScalarValue::Int64(None) => Ok(Value::Null),
+        ScalarValue::UInt8(Some(value)) => Ok(Value::Integer(i64::from(*value))),
+        ScalarValue::UInt8(None) => Ok(Value::Null),
+        ScalarValue::UInt16(Some(value)) => Ok(Value::Integer(i64::from(*value))),
+        ScalarValue::UInt16(None) => Ok(Value::Null),
+        ScalarValue::UInt32(Some(value)) => Ok(Value::Integer(i64::from(*value))),
+        ScalarValue::UInt32(None) => Ok(Value::Null),
         ScalarValue::UInt64(Some(value)) => match i64::try_from(*value) {
-            Ok(value) => Value::Integer(value),
-            Err(_) => Value::Text(value.to_string()),
+            Ok(value) => Ok(Value::Integer(value)),
+            Err(_) => Ok(Value::Text(value.to_string())),
         },
-        ScalarValue::UInt64(None) => Value::Null,
-        ScalarValue::Float32(Some(value)) => Value::Real(f64::from(*value)),
-        ScalarValue::Float32(None) => Value::Null,
-        ScalarValue::Float64(Some(value)) => Value::Real(*value),
-        ScalarValue::Float64(None) => Value::Null,
+        ScalarValue::UInt64(None) => Ok(Value::Null),
+        ScalarValue::Float32(Some(value)) => Ok(Value::Real(f64::from(*value))),
+        ScalarValue::Float32(None) => Ok(Value::Null),
+        ScalarValue::Float64(Some(value)) => Ok(Value::Real(*value)),
+        ScalarValue::Float64(None) => Ok(Value::Null),
         ScalarValue::Utf8(Some(value))
         | ScalarValue::Utf8View(Some(value))
-        | ScalarValue::LargeUtf8(Some(value)) => Value::Text(value.clone()),
+        | ScalarValue::LargeUtf8(Some(value)) => string_scalar_to_lix_value(value, field),
         ScalarValue::Utf8(None) | ScalarValue::Utf8View(None) | ScalarValue::LargeUtf8(None) => {
-            Value::Null
+            Ok(Value::Null)
         }
         ScalarValue::Binary(Some(value)) | ScalarValue::LargeBinary(Some(value)) => {
-            Value::Blob(value.clone())
+            Ok(Value::Blob(value.clone()))
         }
-        ScalarValue::Binary(None) | ScalarValue::LargeBinary(None) => Value::Null,
-        other => Value::Text(other.to_string()),
+        ScalarValue::Binary(None) | ScalarValue::LargeBinary(None) => Ok(Value::Null),
+        other => Ok(Value::Text(other.to_string())),
     }
+}
+
+fn string_scalar_to_lix_value(value: &str, field: Option<&Field>) -> Result<Value, LixError> {
+    if field.is_some_and(field_is_json) {
+        return serde_json::from_str::<serde_json::Value>(value)
+            .map(Value::Json)
+            .map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_INVALID_JSON",
+                    format!(
+                        "column '{}' is marked as JSON but contains invalid JSON: {error}",
+                        field
+                            .map(|field| field.name().as_str())
+                            .unwrap_or("<unknown>")
+                    ),
+                )
+            });
+    }
+    Ok(Value::Text(value.to_string()))
 }
 
 #[cfg(test)]
@@ -429,6 +445,8 @@ mod tests {
         file_id: Option<String>,
         snapshot_content: Option<String>,
         metadata: Option<String>,
+        global: bool,
+        untracked: bool,
         tombstone: bool,
     }
 
@@ -444,6 +462,8 @@ mod tests {
                 schema_version: row.schema_version,
                 version_id: row.version_id,
                 file_id: row.file_id,
+                global: row.global,
+                untracked: row.untracked,
                 tombstone: row.snapshot_content.is_none(),
                 snapshot_content: row.snapshot_content,
                 metadata: row.metadata,
@@ -534,11 +554,11 @@ mod tests {
 
         async fn stage_write(&mut self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
             let count = match &write {
-                StageWrite::Rows { rows } => rows.len() as u64,
+                StageWrite::Rows { rows, .. } => rows.len() as u64,
                 StageWrite::RowsWithFileData { count, .. } => *count,
             };
             let rows = match write {
-                StageWrite::Rows { rows } => rows,
+                StageWrite::Rows { rows, .. } => rows,
                 StageWrite::RowsWithFileData { rows, .. } => rows,
             };
             self.staged_writes
@@ -554,7 +574,7 @@ mod tests {
         ctx: &mut dyn SqlWriteExecutionContext,
         sql: &str,
         params: &[Value],
-    ) -> Result<crate::QueryResult, LixError> {
+    ) -> Result<crate::SqlQueryResult, LixError> {
         let plan = create_write_logical_plan(ctx, sql).await?;
         execute_logical_plan(plan, params).await
     }
@@ -847,6 +867,38 @@ mod tests {
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
     }
 
+    #[tokio::test]
+    async fn execute_sql_exposes_datafusion_information_schema() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            schema_definitions: vec![],
+        };
+
+        let information_schema_result = execute_sql(
+            &ctx,
+            "SELECT table_name FROM information_schema.tables WHERE table_name = 'lix_state'",
+            &[],
+        )
+        .await
+        .expect("information_schema.tables should be enabled");
+        assert_eq!(
+            information_schema_result.rows,
+            vec![vec![Value::Text("lix_state".to_string())]]
+        );
+
+        let show_tables_result = execute_sql(&ctx, "SHOW TABLES", &[])
+            .await
+            .expect("SHOW TABLES should use information_schema");
+        assert!(show_tables_result.rows.iter().any(|row| {
+            row.iter()
+                .any(|value| matches!(value, Value::Text(value) if value == "lix_state"))
+        }));
+    }
+
     async fn setup_engine2_history_fixture() -> Result<(SessionContext, String), LixError> {
         let backend = crate::backend::testing::UnitTestBackend::new();
         let init_receipt = Engine::initialize(Box::new(backend.clone())).await?;
@@ -901,9 +953,7 @@ mod tests {
     }
 
     fn rows_from_execute_result(result: ExecuteResult) -> (Vec<String>, Vec<Vec<Value>>) {
-        let ExecuteResult::Rows(rows) = result else {
-            panic!("SELECT should return rows");
-        };
+        let rows = result;
         (
             rows.columns().to_vec(),
             rows.rows()
@@ -946,14 +996,8 @@ mod tests {
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::Text("entity-history".to_string()));
-        assert_eq!(
-            rows[0][1],
-            Value::Text("{\"count\":7,\"value\":\"A\"}".to_string())
-        );
-        assert_eq!(
-            rows[0][2],
-            Value::Text("{\"source\":\"history\"}".to_string())
-        );
+        assert_eq!(rows[0][1], Value::Json(json!({"count": 7, "value": "A"})));
+        assert_eq!(rows[0][2], Value::Json(json!({"source": "history"})));
         assert!(matches!(rows[0][3], Value::Integer(_)));
         assert_eq!(rows[0][4], Value::Text(head_commit_id));
     }
@@ -1114,11 +1158,54 @@ mod tests {
         assert_eq!(rows[0].entity_id, "entity-1");
         assert_eq!(rows[0].schema_version, "1");
         assert_eq!(rows[0].version_id, "version-a");
+        assert!(!rows[0].global);
+        assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"key\":\"hello\",\"value\":\"world\"}")
         );
         assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"sql\"}"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_lix_state_defaults_global_and_untracked_to_false() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_write_sql(
+            &mut ctx,
+            "INSERT INTO lix_state (\
+             entity_id, schema_key, file_id, snapshot_content, metadata, schema_version\
+             ) VALUES (\
+             'entity-defaults', 'lix_key_value', NULL, '{\"key\":\"hello\",\"value\":\"defaults\"}', NULL, '1'\
+             )",
+            &[],
+        )
+        .await
+        .expect("INSERT INTO lix_state should default bookkeeping flags");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_key_value");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "entity-defaults");
+        assert_eq!(rows[0].version_id, "version-a");
+        assert!(!rows[0].global);
+        assert!(!rows[0].untracked);
     }
 
     #[tokio::test]
@@ -1216,6 +1303,8 @@ mod tests {
         assert_eq!(rows[0].entity_id, "entity-c");
         assert_eq!(rows[0].schema_version, "1");
         assert_eq!(rows[0].version_id, "version-b");
+        assert!(!rows[0].global);
+        assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"value\":\"C\"}")
@@ -1263,6 +1352,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_id, "entity-c");
         assert_eq!(rows[0].version_id, "version-a");
+        assert!(!rows[0].global);
+        assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"value\":\"C\"}")
@@ -1305,6 +1396,8 @@ mod tests {
         assert_eq!(rows[0].entity_id, "dir-docs");
         assert_eq!(rows[0].schema_version, "1");
         assert_eq!(rows[0].version_id, "version-b");
+        assert!(!rows[0].global);
+        assert!(!rows[0].untracked);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"hidden\":false,\"id\":\"dir-docs\",\"name\":\"docs\",\"parent_id\":null}")
@@ -1345,6 +1438,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_id, "dir-docs");
         assert_eq!(rows[0].version_id, "version-a");
+        assert!(!rows[0].global);
+        assert!(!rows[0].untracked);
     }
 
     #[tokio::test]
@@ -1516,6 +1611,8 @@ mod tests {
         assert_eq!(rows[0].entity_id, "file-readme");
         assert_eq!(rows[0].schema_version, "1");
         assert_eq!(rows[0].version_id, "version-b");
+        assert!(!rows[0].global);
+        assert!(!rows[0].untracked);
         let snapshot: JsonValue =
             serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap())
                 .expect("descriptor snapshot JSON");
@@ -1560,6 +1657,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_id, "file-readme");
         assert_eq!(rows[0].version_id, "version-a");
+        assert!(!rows[0].global);
+        assert!(!rows[0].untracked);
     }
 
     #[tokio::test]
@@ -2220,10 +2319,7 @@ mod tests {
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(result.rows[0][0], Value::Text("entity-b".to_string()));
                 assert_eq!(result.rows[0][1], Value::Text("version-b".to_string()));
-                assert_eq!(
-                    result.rows[0][2],
-                    Value::Text("{\"value\":\"B\"}".to_string())
-                );
+                assert_eq!(result.rows[0][2], Value::Json(json!({"value": "B"})));
                 match &result.rows[0][3] {
                     Value::Text(commit_id) => assert!(!commit_id.is_empty()),
                     other => panic!("expected non-null commit_id text, got {other:?}"),
@@ -2305,10 +2401,7 @@ mod tests {
                 assert_eq!(result.columns, vec!["entity_id", "snapshot_content"]);
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(result.rows[0][0], Value::Text("entity-a".to_string()));
-                assert_eq!(
-                    result.rows[0][1],
-                    Value::Text("{\"value\":\"A\"}".to_string())
-                );
+                assert_eq!(result.rows[0][1], Value::Json(json!({"value": "A"})));
             })
         });
     }

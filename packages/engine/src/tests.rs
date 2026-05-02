@@ -29,7 +29,7 @@ async fn tracked_state_rebuild_restores_sql_reads_from_changelog() {
         )
         .await
         .expect("tracked state write should succeed");
-    assert_eq!(insert_result, ExecuteResult::AffectedRows(1));
+    assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
     assert_key_value_visible(&session, "\"before-rebuild\"").await;
 
     let head_commit_id = engine
@@ -97,14 +97,11 @@ async fn assert_key_value_visible(session: &crate::SessionContext, expected: &st
         )
         .await
         .expect("key-value read should succeed");
-    let ExecuteResult::Rows(rows) = result else {
-        panic!("SELECT should return rows");
-    };
+    let rows = result;
     assert_eq!(rows.len(), 1);
-    assert_eq!(
-        rows.rows()[0].values(),
-        &[Value::Text(expected.to_string())]
-    );
+    let expected_json = serde_json::from_str::<serde_json::Value>(expected)
+        .expect("expected key-value should be valid JSON");
+    assert_eq!(rows.rows()[0].values(), &[Value::Json(expected_json)]);
 }
 
 async fn assert_key_value_missing(session: &crate::SessionContext) {
@@ -115,8 +112,6 @@ async fn assert_key_value_missing(session: &crate::SessionContext) {
         )
         .await
         .expect("key-value read should succeed");
-    let ExecuteResult::Rows(rows) = result else {
-        panic!("SELECT should return rows");
-    };
+    let rows = result;
     assert_eq!(rows.len(), 0);
 }

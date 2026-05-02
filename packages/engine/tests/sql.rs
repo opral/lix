@@ -4,6 +4,8 @@ mod support;
 
 #[path = "sql/entity_history.rs"]
 mod entity_history;
+#[path = "sql/errors.rs"]
+mod errors;
 #[path = "sql/lix_change.rs"]
 mod lix_change;
 #[path = "sql/lix_commit.rs"]
@@ -16,6 +18,8 @@ mod lix_directory_history;
 mod lix_file;
 #[path = "sql/lix_file_history.rs"]
 mod lix_file_history;
+#[path = "sql/lix_json.rs"]
+mod lix_json;
 #[path = "sql/lix_key_value.rs"]
 mod lix_key_value;
 #[path = "sql/lix_registered_schema.rs"]
@@ -26,6 +30,8 @@ mod lix_state;
 mod lix_state_history;
 #[path = "sql/lix_version.rs"]
 mod lix_version;
+#[path = "sql/udfs.rs"]
+mod udfs;
 
 use lix_engine::ExecuteResult;
 use lix_engine::Value;
@@ -46,9 +52,7 @@ fn assert_rows_eq(result: ExecuteResult, expected: Vec<Vec<Value>>) {
 }
 
 fn rows_from_result(result: ExecuteResult) -> Vec<Vec<Value>> {
-    let ExecuteResult::Rows(row_set) = result else {
-        panic!("SELECT should return rows");
-    };
+    let row_set = result;
     row_set
         .rows()
         .iter()

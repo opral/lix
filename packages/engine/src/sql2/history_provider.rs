@@ -23,7 +23,10 @@ use tokio::sync::Mutex;
 use crate::commit_graph::CommitGraphReader;
 use crate::LixError;
 
-use super::history_route::{load_history_entries, parse_history_filter, HistoryRoute};
+use super::history_route::{
+    load_history_entries, parse_history_filter, HistoryRoute, HistoryViewErrorContext,
+};
+use super::result_metadata::json_field;
 
 pub(crate) async fn register_history_providers(
     session: &SessionContext,
@@ -254,8 +257,8 @@ fn lix_state_history_schema() -> SchemaRef {
         Field::new("entity_id", DataType::Utf8, false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
-        Field::new("snapshot_content", DataType::Utf8, true),
-        Field::new("metadata", DataType::Utf8, true),
+        json_field("snapshot_content", true),
+        json_field("metadata", true),
         Field::new("schema_version", DataType::Utf8, false),
         Field::new("change_id", DataType::Utf8, false),
         Field::new("commit_id", DataType::Utf8, false),
@@ -344,7 +347,16 @@ async fn load_state_history_rows(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     route: &HistoryRoute,
 ) -> Result<Vec<StateHistorySqlRow>, LixError> {
-    let entries = load_history_entries(commit_graph, route, Vec::new()).await?;
+    let entries = load_history_entries(
+        HistoryViewErrorContext {
+            view_name: "lix_state_history",
+            start_commit_column: "start_commit_id",
+        },
+        commit_graph,
+        route,
+        Vec::new(),
+    )
+    .await?;
     let mut rows = entries
         .into_iter()
         .map(|entry| -> Result<StateHistorySqlRow, LixError> {
@@ -376,12 +388,9 @@ async fn load_state_history_rows(
 }
 
 fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
-    LixError::new(
-        "LIX_ERROR_UNKNOWN",
-        format!("sql2 DataFusion error: {error}"),
-    )
+    super::error::datafusion_error_to_lix_error(error)
 }
 
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
-    DataFusionError::Execution(format!("sql2 history provider error: {error}"))
+    super::error::lix_error_to_datafusion_error(error)
 }

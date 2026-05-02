@@ -31,6 +31,35 @@ impl LixError {
     /// never the default.
     pub const CODE_UNKNOWN: &'static str = "LIX_ERROR_UNKNOWN";
 
+    /// SQL text could not be parsed.
+    pub const CODE_PARSE_ERROR: &'static str = "LIX_PARSE_ERROR";
+
+    /// SQL parameters could not be bound to placeholders.
+    pub const CODE_BINDING_ERROR: &'static str = "LIX_BINDING_ERROR";
+
+    /// A SQL table or view name could not be resolved.
+    pub const CODE_TABLE_NOT_FOUND: &'static str = "LIX_TABLE_NOT_FOUND";
+
+    /// A SQL column name could not be resolved in the available projection.
+    pub const CODE_COLUMN_NOT_FOUND: &'static str = "LIX_COLUMN_NOT_FOUND";
+
+    /// A SQL write violated a primary-key, unique, NOT NULL, or other
+    /// relational constraint.
+    pub const CODE_CONSTRAINT_VIOLATION: &'static str = "LIX_CONSTRAINT_VIOLATION";
+
+    /// A history table was queried without an explicit commit/version range.
+    pub const CODE_HISTORY_FILTER_REQUIRED: &'static str = "LIX_HISTORY_FILTER_REQUIRED";
+
+    /// SQL syntax is valid, but the feature is intentionally outside the Lix
+    /// SQL surface.
+    pub const CODE_UNSUPPORTED_SQL: &'static str = "LIX_UNSUPPORTED_SQL";
+
+    /// Storage/backend IO failed while executing an operation.
+    pub const CODE_STORAGE_ERROR: &'static str = "LIX_STORAGE_ERROR";
+
+    /// An internal engine invariant failed.
+    pub const CODE_INTERNAL_ERROR: &'static str = "LIX_INTERNAL_ERROR";
+
     /// Write-time failure where user data did not conform to a registered
     /// schema (type mismatch, missing required field, pattern violation,
     /// additionalProperties, etc.). Raised from the JSON-Schema validator
@@ -41,6 +70,10 @@ impl LixError {
     /// insert-side "no matching target row" failure and the delete-side
     /// "still referenced" (restrict) failure.
     pub const CODE_FOREIGN_KEY: &'static str = "LIX_ERROR_FOREIGN_KEY";
+
+    /// A row references a non-null `file_id` that has no matching `lix_file`
+    /// descriptor in the same effective version scope.
+    pub const CODE_FILE_NOT_FOUND: &'static str = "LIX_ERROR_FILE_NOT_FOUND";
 
     /// A primary-key or `x-lix-unique` constraint was violated — another
     /// row already owns the value(s) for the declared pointer group.
@@ -57,6 +90,11 @@ impl LixError {
     /// leading slash, a reserved-namespace collision, or any other
     /// meta-schema validation failure.
     pub const CODE_SCHEMA_DEFINITION: &'static str = "LIX_ERROR_SCHEMA_DEFINITION";
+
+    /// The logical Lix handle/session has been closed and cannot run further
+    /// operations. Close is a resource-release lifecycle boundary, not a
+    /// durability boundary.
+    pub const CODE_CLOSED: &'static str = "LIX_ERROR_CLOSED";
 
     pub fn new(code: impl Into<String>, description: impl Into<String>) -> Self {
         Self {

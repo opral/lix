@@ -50,6 +50,12 @@ impl TransactionSchemaCatalog {
 
 /// Normalizes one incoming row into a row with final snapshot/entity identity.
 ///
+/// This is the canonical schema-semantics boundary for staged writes. It owns
+/// schema default application, primary-key identity derivation, and explicit
+/// identity mismatch validation. SQL providers should not pre-derive primary
+/// keys for schemas that can be normalized here; they should stage decoded
+/// snapshots and let this layer complete them.
+///
 /// This function intentionally does not assign timestamps, change ids, or
 /// commit ids; those are transaction hydration fields handled by staging after
 /// semantic normalization has produced the final identity.

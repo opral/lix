@@ -1,4 +1,3 @@
-use lix_engine::ExecuteResult;
 use lix_engine::Value;
 
 simulation_test!(lix_version_lists_descriptors_with_refs, |sim| async move {
@@ -18,9 +17,7 @@ simulation_test!(lix_version_lists_descriptors_with_refs, |sim| async move {
         )
         .await
         .expect("lix_version should read");
-    let ExecuteResult::Rows(rows) = result else {
-        panic!("SELECT should return rows");
-    };
+    let rows = result;
     assert_eq!(rows.len(), 2);
 
     let values = rows

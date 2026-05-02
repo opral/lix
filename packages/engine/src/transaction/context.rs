@@ -20,7 +20,7 @@ use crate::transaction::commit;
 use crate::transaction::live_state_overlay::{overlay_scan_rows, TransactionLiveStateContext};
 use crate::transaction::normalization::TransactionSchemaCatalog;
 use crate::transaction::staging::TransactionStagedWrites;
-use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
+use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWriteOutcome};
 use crate::transaction::validation::{validate_staged_writes, TransactionValidationInput};
 use crate::version_ref::{VersionRefContext, VersionRefReader, VersionRefStoreReader};
 use crate::GLOBAL_VERSION_ID;
@@ -113,15 +113,25 @@ impl<'tx> Transaction<'tx> {
         mut self,
         runtime_functions: &FunctionContext,
     ) -> Result<TransactionCommitOutcome, LixError> {
-        let staged_writes = self.staged_writes.drain()?;
+        let staged_writes = match self.staged_writes.drain() {
+            Ok(staged_writes) => staged_writes,
+            Err(error) => {
+                let _ = self.backend_transaction.rollback().await;
+                return Err(error);
+            }
+        };
         let live_state_reader = self.live_state.reader(Arc::clone(self.backend));
-        validate_staged_writes(TransactionValidationInput::new(
+        if let Err(error) = validate_staged_writes(TransactionValidationInput::new(
             &staged_writes,
             &self.visible_schemas,
             &live_state_reader,
         ))
-        .await?;
-        commit::commit_staged_writes(
+        .await
+        {
+            let _ = self.backend_transaction.rollback().await;
+            return Err(error);
+        }
+        if let Err(error) = commit::commit_staged_writes(
             &self.binary_cas,
             &self.changelog,
             &self.live_state,
@@ -129,10 +139,18 @@ impl<'tx> Transaction<'tx> {
             self.backend_transaction.as_mut(),
             staged_writes,
         )
-        .await?;
-        runtime_functions
+        .await
+        {
+            let _ = self.backend_transaction.rollback().await;
+            return Err(error);
+        }
+        if let Err(error) = runtime_functions
             .persist_if_needed(&mut self.live_state.writer(self.backend_transaction.as_mut()))
-            .await?;
+            .await
+        {
+            let _ = self.backend_transaction.rollback().await;
+            return Err(error);
+        }
         self.backend_transaction.commit().await?;
         Ok(TransactionCommitOutcome::default())
     }
@@ -162,7 +180,10 @@ impl<'tx> Transaction<'tx> {
     /// Convenience helper for programmatic APIs that only stage state rows.
     #[allow(dead_code)]
     pub(crate) fn stage_rows(&self, rows: Vec<StageRow>) -> Result<(), LixError> {
-        self.stage_write(StageWrite::Rows { rows })
+        self.stage_write(StageWrite::Rows {
+            mode: StageWriteMode::Replace,
+            rows,
+        })
     }
 
     /// Returns the active version resolved inside this write transaction.

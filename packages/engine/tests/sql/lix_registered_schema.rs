@@ -1,6 +1,7 @@
 use lix_engine::ExecuteResult;
 use lix_engine::LixError;
 use lix_engine::Value;
+use serde_json::json;
 
 use super::assert_rows_eq;
 
@@ -28,7 +29,7 @@ simulation_test!(
         )
         .await
         .expect("registered schema insert should succeed");
-        assert_eq!(register_schema_result, ExecuteResult::AffectedRows(1));
+        assert_eq!(register_schema_result, ExecuteResult::from_rows_affected(1));
 
         let registered_schema_row = session
             .execute(
@@ -38,9 +39,7 @@ simulation_test!(
             )
             .await
             .expect("registered schema read should succeed");
-        let ExecuteResult::Rows(registered_schema_rows) = registered_schema_row else {
-            panic!("SELECT should return rows");
-        };
+        let registered_schema_rows = registered_schema_row;
         let registered_schema_entity_id = registered_schema_rows
             .rows()
             .iter()
@@ -74,7 +73,7 @@ simulation_test!(
         )
         .await
         .expect("lix_state insert for registered schema should succeed");
-        assert_eq!(insert_state_result, ExecuteResult::AffectedRows(1));
+        assert_eq!(insert_state_result, ExecuteResult::from_rows_affected(1));
 
         let result = session
             .execute(
@@ -85,16 +84,14 @@ simulation_test!(
             )
             .await
             .expect("lix_state read should succeed");
-        let ExecuteResult::Rows(row_set) = result else {
-            panic!("SELECT should return rows");
-        };
+        let row_set = result;
         assert_eq!(row_set.len(), 1);
         assert_eq!(
             row_set.rows()[0].values(),
             &[
                 Value::Text("dummy-1".to_string()),
                 Value::Text("engine2_dummy_schema".to_string()),
-                Value::Text("{\"id\":\"dummy-1\",\"name\":\"Dummy\"}".to_string()),
+                Value::Json(json!({"id": "dummy-1", "name": "Dummy"})),
             ]
         );
     }
@@ -143,6 +140,61 @@ simulation_test!(
             hint.contains("Did you mean [\"/id\"]?"),
             "hint should suggest the JSON Pointer form: {hint}"
         );
+    }
+);
+
+simulation_test!(
+    registered_entity_insert_applies_defaulted_primary_key,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine2_default_id_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 true,\
+                 true\
+                 )",
+                &[],
+            )
+            .await
+            .expect("registered schema insert should succeed");
+
+        let insert_result = session
+            .execute(
+                "INSERT INTO engine2_default_id_schema (name) VALUES ('Generated')",
+                &[],
+            )
+            .await
+            .expect("entity insert should apply defaulted primary key");
+        assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
+
+        let result = session
+            .execute(
+                "SELECT lixcol_entity_id, id, name \
+                 FROM engine2_default_id_schema \
+                 WHERE name = 'Generated'",
+                &[],
+            )
+            .await
+            .expect("entity read should succeed");
+        let row_set = result;
+        assert_eq!(row_set.len(), 1);
+        let values = row_set.rows()[0].values();
+        let [Value::Text(entity_id), Value::Text(id), Value::Text(name)] = values else {
+            panic!("expected generated id row, got {values:?}");
+        };
+        assert_eq!(entity_id, id);
+        assert!(!id.is_empty(), "defaulted id should be non-empty");
+        assert_eq!(name, "Generated");
     }
 );
 
@@ -244,7 +296,7 @@ simulation_test!(
             )
             .await
             .expect("typed entity insert should succeed");
-        assert_eq!(insert_result, ExecuteResult::AffectedRows(1));
+        assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
 
         let result = session
             .execute(

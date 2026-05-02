@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -20,6 +21,8 @@ pub struct OpenLixOptions {
 pub struct Lix {
     _engine: Engine,
     session: SessionContext,
+    backend: SharedBackend,
+    backend_closed: AtomicBool,
 }
 
 /// Opens a Lix workspace session.
@@ -37,10 +40,19 @@ pub async fn open_lix(options: OpenLixOptions) -> Result<Lix, LixError> {
     Ok(Lix {
         _engine: engine,
         session,
+        backend,
+        backend_closed: AtomicBool::new(false),
     })
 }
 
 impl Lix {
+    /// Executes one DataFusion SQL statement against this Lix session.
+    ///
+    /// The SQL dialect is DataFusion SQL, not SQLite SQL. Positional
+    /// placeholders use `$1`, `$2`, and so on. SQLite-specific catalog tables
+    /// and transaction statements such as `sqlite_master`, `BEGIN`, and
+    /// `COMMIT` are not part of this contract; use `information_schema` for
+    /// catalog inspection. Lix owns transaction boundaries for each statement.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         self.session.execute(sql, params).await
     }
@@ -71,7 +83,11 @@ impl Lix {
         self.session.merge_version(options).await
     }
 
-    pub async fn close(self) -> Result<(), LixError> {
+    pub async fn close(&self) -> Result<(), LixError> {
+        self.session.close().await?;
+        if !self.backend_closed.swap(true, Ordering::SeqCst) {
+            self.backend.close().await?;
+        }
         Ok(())
     }
 }
@@ -124,5 +140,9 @@ impl LixBackend for SharedBackend {
 
     async fn destroy(&self) -> Result<(), LixError> {
         self.inner.destroy().await
+    }
+
+    async fn close(&self) -> Result<(), LixError> {
+        self.inner.close().await
     }
 }

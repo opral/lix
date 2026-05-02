@@ -37,7 +37,7 @@ pub use common::LixError;
 pub use common::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
 };
-pub use common::{NullableKeyFilter, QueryResult, Value, WriteReceipt};
+pub use common::{NullableKeyFilter, SqlQueryResult, Value, WriteReceipt};
 pub use common::{WireQueryResult, WireValue};
 pub use engine::Engine;
 pub use init::InitReceipt;
@@ -45,6 +45,6 @@ pub use session::{
     CreateVersionOptions, CreateVersionReceipt, MergeVersionOptions, MergeVersionOutcome,
     MergeVersionReceipt, SessionContext, SwitchVersionOptions, SwitchVersionReceipt,
 };
-pub use session::{ExecuteResult, Row, RowRef, RowSet};
+pub use session::{ExecuteResult, Row, RowRef, TryFromValue};
 
 pub(crate) const GLOBAL_VERSION_ID: &str = "global";

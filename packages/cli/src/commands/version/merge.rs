@@ -4,7 +4,7 @@ use crate::commands::version::{resolve_version_ref, VersionLookup};
 use crate::db::{open_lix_at, resolve_db_path};
 use crate::error::CliError;
 use crate::hints::CommandOutput;
-use lix_rs_sdk::{MergeOutcome, MergeVersionOptions};
+use lix_rs_sdk::{MergeVersionOptions, MergeVersionOutcome, SwitchVersionOptions};
 
 pub fn run(context: &AppContext, command: MergeVersionCommand) -> Result<CommandOutput, CliError> {
     let path = resolve_db_path(context)?;
@@ -33,27 +33,23 @@ pub fn run(context: &AppContext, command: MergeVersionCommand) -> Result<Command
             }
         },
     )?;
-    let result = pollster::block_on(lix.merge_version(MergeVersionOptions {
+    crate::db::block_on(lix.switch_version(SwitchVersionOptions {
+        version_id: target.id.clone(),
+    }))
+    .map_err(|error| CliError::msg(error.to_string()))?;
+    let result = crate::db::block_on(lix.merge_version(MergeVersionOptions {
         source_version_id: source.id.clone(),
-        target_version_id: target.id.clone(),
-        expected_heads: None,
     }))
     .map_err(|error| CliError::msg(error.to_string()))?;
 
     match result.outcome {
-        MergeOutcome::AlreadyUpToDate => {
+        MergeVersionOutcome::AlreadyUpToDate => {
             println!(
                 "{} ({}) already contains {} ({})",
                 target.name, target.id, source.name, source.id
             );
         }
-        MergeOutcome::FastForwarded => {
-            println!(
-                "Fast-forwarded {} ({}) to {}",
-                target.name, target.id, result.target_head_after_commit_id
-            );
-        }
-        MergeOutcome::MergeCommitted => {
+        MergeVersionOutcome::MergeCommitted => {
             let commit_id = result.created_merge_commit_id.ok_or_else(|| {
                 CliError::msg("merge_version returned MergeCommitted without a merge commit id")
             })?;
