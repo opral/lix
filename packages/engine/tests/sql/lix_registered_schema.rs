@@ -318,3 +318,61 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    typed_entity_number_update_accepts_integer_param_like_insert,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine2_number_update_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"score\":{\"type\":\"number\"}},\"required\":[\"id\",\"score\"],\"additionalProperties\":false}'),\
+                 true,\
+                 true\
+                 )",
+                &[],
+            )
+            .await
+            .expect("registered schema insert should succeed");
+
+        session
+            .execute(
+                "INSERT INTO engine2_number_update_schema \
+                 (id, score, lixcol_global, lixcol_untracked) \
+                 VALUES ('score-1', 1, false, false)",
+                &[],
+            )
+            .await
+            .expect("typed entity insert should accept integer literal for number column");
+
+        session
+            .execute(
+                "UPDATE engine2_number_update_schema \
+                 SET score = $1 \
+                 WHERE id = 'score-1'",
+                &[Value::Integer(52000)],
+            )
+            .await
+            .expect("typed entity update should accept integer param for number column");
+
+        let result = session
+            .execute(
+                "SELECT score \
+                 FROM engine2_number_update_schema \
+                 WHERE id = 'score-1'",
+                &[],
+            )
+            .await
+            .expect("typed entity query should succeed");
+        assert_rows_eq(result, vec![vec![Value::Real(52000.0)]]);
+    }
+);

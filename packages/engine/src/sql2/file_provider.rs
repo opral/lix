@@ -35,6 +35,7 @@ use crate::live_state::{
 use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
 };
+use crate::sql2::write_normalization::UpdateAssignmentValues;
 use crate::transaction::types::StageRow;
 use crate::version_ref::VersionRefReader;
 use crate::LixError;
@@ -740,8 +741,7 @@ impl ExecutionPlan for LixFileUpdateExec {
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             let matched_batch = filter_lix_file_batch(source_batch, &filters)?;
-            let updated_batch =
-                apply_lix_file_update_assignments(&table_schema, matched_batch, &assignments)?;
+            let assignment_values = UpdateAssignmentValues::evaluate(&matched_batch, &assignments)?;
             let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
             let mut path_resolvers = None;
             if update_columns.path {
@@ -755,7 +755,8 @@ impl ExecutionPlan for LixFileUpdateExec {
                 );
             }
             let staged = lix_file_update_stage_from_batch(
-                &updated_batch,
+                &matched_batch,
+                &assignment_values,
                 version_binding.active_version_id(),
                 update_columns,
                 path_resolvers.as_mut(),
@@ -1069,8 +1070,9 @@ fn lix_file_insert_stage_from_batch_with_path_resolvers(
     )
 }
 
-fn lix_file_existing_stage_from_batch(
+fn lix_file_existing_update_stage_from_batch(
     batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
     version_binding: Option<&str>,
     include_descriptor_writes: bool,
     include_data_writes: bool,
@@ -1079,24 +1081,43 @@ fn lix_file_existing_stage_from_batch(
 
     for row_index in 0..batch.num_rows() {
         let id = required_string_value(batch, row_index, "id")?;
-        let hidden = optional_bool_value(batch, row_index, "hidden")?.unwrap_or(false);
-        let context = file_row_context_from_batch(batch, row_index, version_binding)?;
+        let hidden = update_optional_bool_value(batch, assignment_values, row_index, "hidden")?
+            .unwrap_or(false);
+        let context =
+            file_row_context_from_update(batch, assignment_values, row_index, version_binding)?;
 
         if include_descriptor_writes {
             staged
                 .state_rows
                 .push(file_descriptor_row(FileDescriptorRowInput {
                     id: id.clone(),
-                    directory_id: optional_string_value(batch, row_index, "directory_id")?,
-                    name: required_string_value(batch, row_index, "name")?,
-                    extension: optional_string_value(batch, row_index, "extension")?,
+                    directory_id: update_optional_string_value(
+                        batch,
+                        assignment_values,
+                        row_index,
+                        "directory_id",
+                    )?,
+                    name: update_required_string_value(
+                        batch,
+                        assignment_values,
+                        row_index,
+                        "name",
+                    )?,
+                    extension: update_optional_string_value(
+                        batch,
+                        assignment_values,
+                        row_index,
+                        "extension",
+                    )?,
                     hidden,
                     context: context.clone(),
                 }));
         }
 
         if include_data_writes {
-            if let Some(data) = optional_binary_value(batch, row_index, "data")? {
+            if let Some(data) =
+                update_optional_binary_value(batch, assignment_values, row_index, "data")?
+            {
                 stage_lix_file_data_write(&mut staged, id, data, context)?;
             }
         }
@@ -1138,6 +1159,7 @@ impl LixFileUpdateColumns {
 
 fn lix_file_update_stage_from_batch(
     batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
     version_binding: Option<&str>,
     update_columns: LixFileUpdateColumns,
     path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
@@ -1151,14 +1173,16 @@ fn lix_file_update_stage_from_batch(
         };
         lix_file_path_update_stage_from_batch(
             batch,
+            assignment_values,
             version_binding,
             update_columns,
             path_resolvers,
             generate_directory_id,
         )
     } else {
-        lix_file_existing_stage_from_batch(
+        lix_file_existing_update_stage_from_batch(
             batch,
+            assignment_values,
             version_binding,
             update_columns.descriptor,
             update_columns.data,
@@ -1168,6 +1192,7 @@ fn lix_file_update_stage_from_batch(
 
 fn lix_file_path_update_stage_from_batch(
     batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
     version_binding: Option<&str>,
     update_columns: LixFileUpdateColumns,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
@@ -1177,10 +1202,13 @@ fn lix_file_path_update_stage_from_batch(
 
     for row_index in 0..batch.num_rows() {
         let id = required_string_value(batch, row_index, "id")?;
-        let path = required_string_value(batch, row_index, "path")?;
-        let hidden = optional_bool_value(batch, row_index, "hidden")?.unwrap_or(false);
-        let context = file_row_context_from_batch(batch, row_index, version_binding)?;
-        let existing_data = optional_binary_value(batch, row_index, "data")?;
+        let path = update_required_string_value(batch, assignment_values, row_index, "path")?;
+        let hidden = update_optional_bool_value(batch, assignment_values, row_index, "hidden")?
+            .unwrap_or(false);
+        let context =
+            file_row_context_from_update(batch, assignment_values, row_index, version_binding)?;
+        let existing_data =
+            update_optional_binary_value(batch, assignment_values, row_index, "data")?;
 
         let resolver = path_resolvers
             .entry(file_path_resolver_key(&context))
@@ -1387,6 +1415,39 @@ fn file_row_context_from_batch(
         untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         metadata: optional_string_value(batch, row_index, "lixcol_metadata")?,
+    })
+}
+
+fn file_row_context_from_update(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    row_index: usize,
+    version_binding: Option<&str>,
+) -> Result<FilesystemRowContext> {
+    let global = optional_bool_value(batch, row_index, "lixcol_global")?.unwrap_or(false);
+    let version_id = if global {
+        GLOBAL_VERSION_ID.to_string()
+    } else {
+        optional_string_value(batch, row_index, "lixcol_version_id")?
+            .or_else(|| version_binding.map(ToOwned::to_owned))
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "UPDATE into lix_file_by_version requires lixcol_version_id".to_string(),
+                )
+            })?
+    };
+
+    Ok(FilesystemRowContext {
+        version_id,
+        global,
+        untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
+        file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
+        metadata: update_optional_string_value(
+            batch,
+            assignment_values,
+            row_index,
+            "lixcol_metadata",
+        )?,
     })
 }
 
@@ -1761,36 +1822,6 @@ fn evaluate_lix_file_filters(
     Ok(combined_mask)
 }
 
-fn apply_lix_file_update_assignments(
-    schema: &SchemaRef,
-    batch: RecordBatch,
-    assignments: &[(String, Arc<dyn PhysicalExpr>)],
-) -> Result<RecordBatch> {
-    if batch.num_rows() == 0 || assignments.is_empty() {
-        return Ok(batch);
-    }
-
-    let mut columns = Vec::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        let column_name = field.name();
-        let original_column = batch.column_by_name(column_name).ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "UPDATE lix_file source batch is missing column '{column_name}'"
-            ))
-        })?;
-        let new_column = if let Some((_, assignment)) =
-            assignments.iter().find(|(name, _)| name == column_name)
-        {
-            assignment.evaluate(&batch)?.into_array(batch.num_rows())?
-        } else {
-            Arc::clone(original_column)
-        };
-        columns.push(new_column);
-    }
-
-    RecordBatch::try_new(Arc::clone(schema), columns).map_err(DataFusionError::from)
-}
-
 fn dml_count_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
         "count",
@@ -1841,6 +1872,79 @@ fn required_string_value(
             "INSERT into lix_file requires non-null text column '{column_name}'"
         ))
     })
+}
+
+fn update_required_string_value(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    row_index: usize,
+    column_name: &str,
+) -> Result<String> {
+    update_optional_string_value(batch, assignment_values, row_index, column_name)?.ok_or_else(
+        || {
+            DataFusionError::Execution(format!(
+                "UPDATE lix_file requires non-null text column '{column_name}'"
+            ))
+        },
+    )
+}
+
+fn update_optional_string_value(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    row_index: usize,
+    column_name: &str,
+) -> Result<Option<String>> {
+    match assignment_values.scalar_value(batch, row_index, column_name)? {
+        None
+        | Some(ScalarValue::Null)
+        | Some(ScalarValue::Utf8(None))
+        | Some(ScalarValue::Utf8View(None))
+        | Some(ScalarValue::LargeUtf8(None)) => Ok(None),
+        Some(ScalarValue::Utf8(Some(value)))
+        | Some(ScalarValue::Utf8View(Some(value)))
+        | Some(ScalarValue::LargeUtf8(Some(value))) => Ok(Some(value)),
+        Some(other) => Err(DataFusionError::Execution(format!(
+            "UPDATE lix_file expected text-compatible column '{column_name}', got {other:?}"
+        ))),
+    }
+}
+
+fn update_optional_bool_value(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    row_index: usize,
+    column_name: &str,
+) -> Result<Option<bool>> {
+    match assignment_values.scalar_value(batch, row_index, column_name)? {
+        None | Some(ScalarValue::Null) | Some(ScalarValue::Boolean(None)) => Ok(None),
+        Some(ScalarValue::Boolean(Some(value))) => Ok(Some(value)),
+        Some(other) => Err(DataFusionError::Execution(format!(
+            "UPDATE lix_file expected boolean column '{column_name}', got {other:?}"
+        ))),
+    }
+}
+
+fn update_optional_binary_value(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    row_index: usize,
+    column_name: &str,
+) -> Result<Option<Vec<u8>>> {
+    match assignment_values.scalar_value(batch, row_index, column_name)? {
+        None
+        | Some(ScalarValue::Null)
+        | Some(ScalarValue::Binary(None))
+        | Some(ScalarValue::LargeBinary(None))
+        | Some(ScalarValue::FixedSizeBinary(_, None)) => Ok(None),
+        Some(ScalarValue::Binary(Some(value))) | Some(ScalarValue::LargeBinary(Some(value))) => {
+            Ok(Some(value))
+        }
+        Some(ScalarValue::FixedSizeBinary(_, Some(value))) => Ok(Some(value)),
+        Some(other) => Err(DataFusionError::Execution(format!(
+            "UPDATE lix_file expected binary column '{column_name}', got {other:?}"
+        ))),
+    }
 }
 
 fn optional_string_value(
@@ -2006,6 +2110,24 @@ mod tests {
     fn test_functions() -> FunctionProviderHandle {
         SharedFunctionProvider::new(
             Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>
+        )
+    }
+
+    fn lix_file_update_stage_from_batch_for_test(
+        batch: &RecordBatch,
+        version_binding: Option<&str>,
+        update_columns: super::LixFileUpdateColumns,
+        path_resolvers: Option<&mut BTreeMap<String, super::DirectoryPathResolver>>,
+        generate_directory_id: &mut dyn FnMut() -> String,
+    ) -> datafusion::common::Result<super::LixFileStagedBatch> {
+        let assignment_values = super::UpdateAssignmentValues::evaluate(batch, &[])?;
+        super::lix_file_update_stage_from_batch(
+            batch,
+            &assignment_values,
+            version_binding,
+            update_columns,
+            path_resolvers,
+            generate_directory_id,
         )
     }
 
@@ -2321,7 +2443,7 @@ mod tests {
             .expect("directory resolver should seed"),
         );
 
-        let staged = super::lix_file_update_stage_from_batch(
+        let staged = lix_file_update_stage_from_batch_for_test(
             &path_update_batch(),
             None,
             super::LixFileUpdateColumns {
@@ -2364,7 +2486,7 @@ mod tests {
             .expect("directory resolver should seed"),
         );
 
-        let staged = super::lix_file_update_stage_from_batch(
+        let staged = lix_file_update_stage_from_batch_for_test(
             &path_update_batch(),
             None,
             super::LixFileUpdateColumns {
@@ -2405,7 +2527,7 @@ mod tests {
         .await
         .expect("directory state should seed path resolver");
 
-        let staged = super::lix_file_update_stage_from_batch(
+        let staged = lix_file_update_stage_from_batch_for_test(
             &path_update_batch(),
             None,
             super::LixFileUpdateColumns {
@@ -2442,7 +2564,7 @@ mod tests {
         .await
         .expect("empty directory state should seed path resolver");
 
-        let staged = super::lix_file_update_stage_from_batch(
+        let staged = lix_file_update_stage_from_batch_for_test(
             &path_update_batch(),
             None,
             super::LixFileUpdateColumns {
@@ -2501,7 +2623,7 @@ mod tests {
             .expect("directory resolver should seed"),
         );
 
-        let staged = super::lix_file_update_stage_from_batch(
+        let staged = lix_file_update_stage_from_batch_for_test(
             &path_update_batch(),
             None,
             super::LixFileUpdateColumns {
@@ -2530,7 +2652,7 @@ mod tests {
 
     #[test]
     fn file_data_update_without_path_ignores_materialized_path_column() {
-        let staged = super::lix_file_update_stage_from_batch(
+        let staged = lix_file_update_stage_from_batch_for_test(
             &path_update_batch(),
             None,
             super::LixFileUpdateColumns {
