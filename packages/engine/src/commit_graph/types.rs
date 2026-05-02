@@ -11,6 +11,7 @@ pub(crate) struct CommitGraphCommit {
     pub(crate) commit_id: String,
     pub(crate) change_set_id: String,
     pub(crate) change_ids: Vec<String>,
+    pub(crate) author_account_ids: Vec<String>,
     pub(crate) parent_commit_ids: Vec<String>,
 }
 
