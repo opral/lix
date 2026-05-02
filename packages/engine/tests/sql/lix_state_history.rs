@@ -26,11 +26,52 @@ simulation_test!(
             .await
             .expect_err("history queries must provide start_commit_id");
 
+        assert!(error
+            .to_string()
+            .contains("requires a start_commit_id filter"));
+        assert_eq!(
+            error.code,
+            lix_engine::LixError::CODE_HISTORY_FILTER_REQUIRED
+        );
         assert!(
             error
-                .to_string()
-                .contains("requires an explicit start_commit_id"),
-            "unexpected error: {error}"
+                .hint()
+                .is_some_and(|hint| hint.contains("lix_active_version_commit_id()")),
+            "expected active-version-head hint: {error}"
+        );
+    }
+);
+
+simulation_test!(
+    lix_state_history_accepts_active_version_commit_id_filter,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('history-active-head', 'one')",
+                &[],
+            )
+            .await
+            .expect("tracked write should succeed");
+
+        let rows = select_history_rows(
+            &session,
+            "SELECT entity_id FROM lix_state_history WHERE start_commit_id = lix_active_version_commit_id()",
+        )
+        .await;
+
+        assert!(
+            rows.iter()
+                .any(|row| row.first() == Some(&Value::Text("history-active-head".to_string()))),
+            "expected active-head history row, got {rows:?}"
         );
     }
 );

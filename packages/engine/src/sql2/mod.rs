@@ -6,6 +6,7 @@ mod directory_history_provider;
 mod directory_provider;
 mod entity_history_provider;
 mod entity_provider;
+mod error;
 mod execute;
 mod file_history_provider;
 mod file_provider;

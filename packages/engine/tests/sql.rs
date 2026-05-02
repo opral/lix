@@ -4,6 +4,8 @@ mod support;
 
 #[path = "sql/entity_history.rs"]
 mod entity_history;
+#[path = "sql/errors.rs"]
+mod errors;
 #[path = "sql/lix_change.rs"]
 mod lix_change;
 #[path = "sql/lix_commit.rs"]
@@ -28,6 +30,8 @@ mod lix_state;
 mod lix_state_history;
 #[path = "sql/lix_version.rs"]
 mod lix_version;
+#[path = "sql/udfs.rs"]
+mod udfs;
 
 use lix_engine::ExecuteResult;
 use lix_engine::Value;

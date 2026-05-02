@@ -104,7 +104,13 @@ simulation_test!(
         assert!(
             error
                 .to_string()
-                .contains("requires an explicit start_commit_id"),
+                .contains("requires a lixcol_start_commit_id filter"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error
+                .hint()
+                .is_some_and(|hint| hint.contains("WHERE lixcol_start_commit_id")),
             "unexpected error: {error}"
         );
     }

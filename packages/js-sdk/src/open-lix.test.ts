@@ -9,6 +9,7 @@ import {
 	type LixBackendTransaction,
 	type Lix,
 	type TransactionBeginMode,
+	isLixError,
 } from "./index.js";
 
 test("openLix exposes the rs-sdk e2e flow", async () => {
@@ -126,6 +127,22 @@ test("lix.close delegates backend close through the engine bridge", async () => 
 	await lix.close();
 
 	expect(closeCount).toBe(1);
+});
+
+test("engine errors expose structured hints", async () => {
+	const lix = await openLix();
+
+	try {
+		await lix.execute("SELECT entity_id FROM lix_state_history");
+		throw new Error("expected history query to fail");
+	} catch (error) {
+		expect(isLixError(error)).toBe(true);
+		if (!isLixError(error)) throw error;
+		expect(error.code).toBe("LIX_HISTORY_FILTER_REQUIRED");
+		expect(error.hint).toContain("lix_active_version_commit_id()");
+	}
+
+	await lix.close();
 });
 
 async function registerCrmTaskSchema(lix: Lix) {

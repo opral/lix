@@ -1,6 +1,7 @@
 import init, {
 	resolveEngineWasmModuleOrPath,
 	Value,
+	type LixError,
 } from "./engine-wasm/index.js";
 import * as wasmModule from "./engine-wasm/index.js";
 
@@ -42,13 +43,15 @@ export class Row {
 	value(columnName: string): Value {
 		const index = this.columns.indexOf(columnName);
 		if (index === -1) {
-			throw new Error(
+			throw createLixError(
+				"LIX_COLUMN_NOT_FOUND",
 				`Column "${columnName}" does not exist. Available columns: ${this.availableColumns()}`,
 			);
 		}
 		const value = this.valuesByIndex[index];
 		if (value === undefined) {
-			throw new Error(
+			throw createLixError(
+				"LIX_COLUMN_NOT_FOUND",
 				`Column "${columnName}" is outside row width ${this.valuesByIndex.length}.`,
 			);
 		}
@@ -67,7 +70,8 @@ export class Row {
 	valueAt(index: number): Value {
 		const value = this.valuesByIndex[index];
 		if (value === undefined) {
-			throw new Error(
+			throw createLixError(
+				"LIX_COLUMN_NOT_FOUND",
 				`Column index ${index} is outside row width ${this.valuesByIndex.length}.`,
 			);
 		}
@@ -240,7 +244,7 @@ export async function openLix(
 		} catch {
 			// Preserve the original open failure.
 		}
-		throw error;
+		throw normalizeThrownError(error);
 	}
 }
 
@@ -262,6 +266,8 @@ function createLixHandle(wasmLix: WasmLix): Lix {
 		const release = await acquireOperationSlot();
 		try {
 			return await operation();
+		} catch (error) {
+			throw normalizeThrownError(error);
 		} finally {
 			release();
 		}
@@ -313,4 +319,69 @@ function normalizeExecuteResult(result: WasmExecuteResult): ExecuteResult {
 		),
 		rowsAffected: result.rowsAffected,
 	};
+}
+
+function createLixError(
+	code: string,
+	message: string,
+	options: { hint?: string; cause?: unknown } = {},
+): LixError {
+	const error = new Error(message) as LixError;
+	error.name = "LixError";
+	error.code = code;
+	if (options.hint !== undefined) {
+		error.hint = options.hint;
+	}
+	if (options.cause !== undefined) {
+		(error as Error & { cause?: unknown }).cause = options.cause;
+	}
+	return error;
+}
+
+function normalizeThrownError(error: unknown): LixError {
+	if (isLixErrorLike(error)) {
+		const hint =
+			typeof error.hint === "string"
+				? error.hint
+				: extractHintFromMessage(error.message);
+		if (error instanceof Error) {
+			if (hint !== undefined && error.hint === undefined) {
+				error.hint = hint;
+			}
+			return error;
+		}
+		const message =
+			typeof error.message === "string"
+				? error.message
+				: typeof error.description === "string"
+					? error.description
+					: error.code;
+		return createLixError(error.code, message, { hint });
+	}
+
+	if (error instanceof Error) {
+		return createLixError("LIX_ERROR_UNKNOWN", error.message, { cause: error });
+	}
+
+	return createLixError("LIX_ERROR_UNKNOWN", String(error));
+}
+
+function extractHintFromMessage(message: unknown): string | undefined {
+	if (typeof message !== "string") return undefined;
+	const match = message.match(/(?:^|\n)hint:\s*(.+)$/s);
+	return match?.[1]?.trim();
+}
+
+function isLixErrorLike(error: unknown): error is {
+	code: string;
+	message?: string;
+	description?: string;
+	hint?: string;
+} {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		typeof (error as { code?: unknown }).code === "string" &&
+		(error as { code: string }).code.startsWith("LIX_")
+	);
 }
