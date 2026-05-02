@@ -28,7 +28,9 @@ use super::entity_provider::{
     entity_f64_value, entity_i64_value, entity_json_text_value, entity_surface_schema,
     parse_snapshot, string_array, EntityColumnType, EntityProviderVariant, EntitySurfaceSpec,
 };
-use super::history_route::{load_history_entries, parse_history_filter, HistoryRoute};
+use super::history_route::{
+    load_history_entries, parse_history_filter, HistoryRoute, HistoryViewErrorContext,
+};
 
 /// Schema-specific history surface backed directly by the commit graph.
 ///
@@ -243,7 +245,17 @@ async fn load_entity_history_rows(
     route: &HistoryRoute,
     limit: Option<usize>,
 ) -> Result<Vec<EntityHistoryRow>, LixError> {
-    let entries = load_history_entries(commit_graph, route, vec![spec.schema_key.clone()]).await?;
+    let history_view_name = format!("{}_history", spec.schema_key);
+    let entries = load_history_entries(
+        HistoryViewErrorContext {
+            view_name: history_view_name.as_str(),
+            start_commit_column: "lixcol_start_commit_id",
+        },
+        commit_graph,
+        route,
+        vec![spec.schema_key.clone()],
+    )
+    .await?;
     let mut rows = entries
         .into_iter()
         .map(|entry| EntityHistoryRow {
@@ -396,5 +408,5 @@ fn projected_schema(schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Resu
 }
 
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
-    DataFusionError::Execution(format!("sql2 entity history provider error: {error}"))
+    super::error::lix_error_to_datafusion_error(error)
 }

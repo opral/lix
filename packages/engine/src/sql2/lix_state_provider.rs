@@ -1427,14 +1427,11 @@ fn projected_schema(schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Resu
 }
 
 fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
-    LixError::new(
-        "LIX_ERROR_UNKNOWN",
-        format!("sql2 DataFusion error: {error}"),
-    )
+    super::error::datafusion_error_to_lix_error(error)
 }
 
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
-    DataFusionError::Execution(format!("sql2 live-state provider error: {error}"))
+    super::error::lix_error_to_datafusion_error(error)
 }
 
 #[cfg(test)]

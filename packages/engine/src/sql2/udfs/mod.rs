@@ -1,4 +1,5 @@
 mod common;
+mod lix_active_version_commit_id;
 mod lix_empty_blob;
 mod lix_json;
 mod lix_json_extract;
@@ -19,7 +20,14 @@ pub(crate) fn system_sql2_function_provider() -> FunctionProviderHandle {
     SharedFunctionProvider::new(Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>)
 }
 
-pub(crate) fn register_sql2_functions(ctx: &SessionContext, functions: FunctionProviderHandle) {
+pub(crate) fn register_sql2_functions(
+    ctx: &SessionContext,
+    functions: FunctionProviderHandle,
+    active_version_commit_id: Option<String>,
+) {
+    ctx.register_udf(ScalarUDF::from(
+        lix_active_version_commit_id::LixActiveVersionCommitId::new(active_version_commit_id),
+    ));
     ctx.register_udf(ScalarUDF::from(lix_json_extract::LixJsonExtract::new()));
     ctx.register_udf(ScalarUDF::from(
         lix_json_extract_text::LixJsonExtractText::new(),
@@ -40,7 +48,7 @@ pub(super) mod test_support {
 
     pub(super) async fn single_text(sql: &str) -> Option<String> {
         let ctx = SessionContext::new();
-        register_sql2_functions(&ctx, system_sql2_function_provider());
+        register_sql2_functions(&ctx, system_sql2_function_provider(), None);
         let batches = ctx
             .sql(sql)
             .await
@@ -58,7 +66,7 @@ pub(super) mod test_support {
 
     pub(super) async fn single_binary(sql: &str) -> Option<Vec<u8>> {
         let ctx = SessionContext::new();
-        register_sql2_functions(&ctx, system_sql2_function_provider());
+        register_sql2_functions(&ctx, system_sql2_function_provider(), None);
         let batches = ctx
             .sql(sql)
             .await

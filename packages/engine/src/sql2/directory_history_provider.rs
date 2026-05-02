@@ -26,7 +26,7 @@ use crate::commit_graph::CommitGraphReader;
 use crate::LixError;
 
 use super::history_route::{
-    load_history_entries, parse_history_filter, HistoryEntry, HistoryRoute,
+    load_history_entries, parse_history_filter, HistoryEntry, HistoryRoute, HistoryViewErrorContext,
 };
 use super::result_metadata::json_field;
 
@@ -273,6 +273,10 @@ async fn load_directory_history_rows(
 ) -> Result<Vec<DirectoryHistoryOutputRow>, LixError> {
     let event_route = route.traversal_only();
     let event_entries = load_history_entries(
+        HistoryViewErrorContext {
+            view_name: "lix_directory_history",
+            start_commit_column: "lixcol_start_commit_id",
+        },
         Arc::clone(&commit_graph),
         &event_route,
         vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
@@ -280,6 +284,10 @@ async fn load_directory_history_rows(
     .await?;
     let context_route = route.starts_only();
     let context_entries = load_history_entries(
+        HistoryViewErrorContext {
+            view_name: "lix_directory_history",
+            start_commit_column: "lixcol_start_commit_id",
+        },
         commit_graph,
         &context_route,
         vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
@@ -545,14 +553,9 @@ fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
 }
 
 fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
-    LixError::new(
-        "LIX_ERROR_UNKNOWN",
-        format!("sql2 DataFusion error: {error}"),
-    )
+    super::error::datafusion_error_to_lix_error(error)
 }
 
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
-    DataFusionError::Execution(format!(
-        "sql2 lix_directory_history provider error: {error}"
-    ))
+    super::error::lix_error_to_datafusion_error(error)
 }

@@ -126,7 +126,7 @@ impl Row {
         let index = self.column_index(column_name)?;
         self.values.get(index).ok_or_else(|| {
             LixError::new(
-                "LIX_ERROR_COLUMN_NOT_FOUND",
+                LixError::CODE_COLUMN_NOT_FOUND,
                 format!(
                     "column '{}' points past row width {}; available columns: {}",
                     column_name,
@@ -151,7 +151,7 @@ impl Row {
             .position(|column| column == column_name)
             .ok_or_else(|| {
                 LixError::new(
-                    "LIX_ERROR_COLUMN_NOT_FOUND",
+                    LixError::CODE_COLUMN_NOT_FOUND,
                     format!(
                         "column '{}' does not exist; available columns: {}",
                         column_name,
@@ -398,7 +398,7 @@ mod tests {
         let row = &result.rows()[0];
 
         let missing = row.get::<String>("missing").unwrap_err();
-        assert_eq!(missing.code, "LIX_ERROR_COLUMN_NOT_FOUND");
+        assert_eq!(missing.code, LixError::CODE_COLUMN_NOT_FOUND);
         assert!(missing.description.contains("available columns: title"));
 
         let wrong_type = row.get::<bool>("title").unwrap_err();

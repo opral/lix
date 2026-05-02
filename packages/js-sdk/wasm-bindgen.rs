@@ -599,11 +599,24 @@ export type MergeVersionResult = {
         if let Some(message) = value.as_string() {
             return js_sdk_error(message);
         }
+        let code = Reflect::get(&value, &JsValue::from_str("code"))
+            .ok()
+            .and_then(|code| code.as_string());
         let message = Reflect::get(&value, &JsValue::from_str("message"))
             .ok()
             .and_then(|message| message.as_string())
             .unwrap_or_else(|| "JavaScript backend error".to_string());
-        js_sdk_error(message)
+        let hint = Reflect::get(&value, &JsValue::from_str("hint"))
+            .ok()
+            .and_then(|hint| hint.as_string());
+        let mut error = LixError::new(
+            code.unwrap_or_else(|| "LIX_ERROR_JS_SDK".to_string()),
+            message,
+        );
+        if let Some(hint) = hint {
+            error = error.with_hint(hint);
+        }
+        error
     }
 
     fn parse_create_version_options(value: JsValue) -> Result<CreateVersionOptions, LixError> {

@@ -184,13 +184,13 @@ export interface LixError extends Error {
 
 /**
  * Type guard: returns `true` when `err` is a Lix-produced error carrying a
- * structured `code` field (all engine codes start with `LIX_ERROR_`).
+ * structured `code` field (all engine codes start with `LIX_`).
  */
 export function isLixError(err: unknown): err is LixError {
 	return (
 		err instanceof Error &&
 		typeof (err as Partial<LixError>).code === "string" &&
-		(err as LixError).code.startsWith("LIX_ERROR")
+		(err as LixError).code.startsWith("LIX_")
 	);
 }
 

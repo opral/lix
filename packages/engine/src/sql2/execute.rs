@@ -137,8 +137,12 @@ pub(crate) async fn execute_logical_plan(
 
 async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, LixError> {
     let session = new_lix_session_context();
-    register_sql2_functions(&session, ctx.functions());
     let version_ref = ctx.version_ref();
+    let active_version_commit_id = version_ref
+        .load_head(ctx.active_version_id())
+        .await?
+        .map(|head| head.commit_id);
+    register_sql2_functions(&session, ctx.functions(), active_version_commit_id);
     register_lix_state_providers(
         &session,
         ctx.active_version_id(),
@@ -199,7 +203,10 @@ async fn build_write_session(
 ) -> Result<SessionContext, LixError> {
     let session = new_lix_session_context();
     let write_ctx = SqlWriteContext::new(ctx);
-    register_sql2_functions(&session, write_ctx.functions());
+    let active_version_commit_id = write_ctx
+        .load_version_head(&write_ctx.active_version_id())
+        .await?;
+    register_sql2_functions(&session, write_ctx.functions(), active_version_commit_id);
 
     register_lix_state_write_providers(&session, write_ctx.clone()).await?;
 
@@ -242,31 +249,7 @@ fn scalar_value_from_lix_value(value: &Value) -> ScalarValue {
 }
 
 fn datafusion_error_to_lix_error(error: datafusion::error::DataFusionError) -> LixError {
-    if let Some(error) = lix_error_from_datafusion_error(&error) {
-        return error;
-    }
-
-    LixError::new(
-        "LIX_ERROR_UNKNOWN",
-        format!("sql2 DataFusion error: {error}"),
-    )
-}
-
-fn lix_error_from_datafusion_error(error: &datafusion::error::DataFusionError) -> Option<LixError> {
-    match error {
-        datafusion::error::DataFusionError::External(error) => {
-            error.downcast_ref::<LixError>().cloned()
-        }
-        datafusion::error::DataFusionError::Context(_, error)
-        | datafusion::error::DataFusionError::Diagnostic(_, error) => {
-            lix_error_from_datafusion_error(error)
-        }
-        datafusion::error::DataFusionError::Shared(error) => lix_error_from_datafusion_error(error),
-        datafusion::error::DataFusionError::Collection(errors) => {
-            errors.iter().find_map(lix_error_from_datafusion_error)
-        }
-        _ => None,
-    }
+    super::error::datafusion_error_to_lix_error(error)
 }
 
 fn query_result_from_batches(
