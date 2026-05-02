@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use lix_engine::Value;
 use serde_json::json;
 
@@ -43,6 +45,25 @@ simulation_test!(lix_change_queries_tracked_changes, |sim| async move {
 });
 
 simulation_test!(
+    lix_change_sql_surface_matches_builtin_schema,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        assert_eq!(
+            non_system_column_names(&session, "lix_change").await,
+            builtin_schema_property_names(),
+        );
+    }
+);
+
+simulation_test!(
     lix_change_count_handles_empty_projection,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -66,4 +87,46 @@ fn assert_single_count(rows: Vec<Vec<Value>>) {
         panic!("expected integer count, got {:?}", rows[0][0]);
     };
     assert!(count >= 0);
+}
+
+fn builtin_schema_property_names() -> BTreeSet<String> {
+    let schema = serde_json::from_str::<serde_json::Value>(include_str!(
+        "../../src/schema/builtin/lix_change.json"
+    ))
+    .expect("builtin lix_change schema should parse");
+    schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .expect("builtin lix_change schema should define properties")
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+}
+
+async fn non_system_column_names(
+    session: &crate::support::simulation_test::engine::SimSession,
+    table_name: &str,
+) -> BTreeSet<String> {
+    let result = session
+        .execute(
+            &format!(
+                "SELECT column_name \
+                 FROM information_schema.columns \
+                 WHERE table_name = '{table_name}'"
+            ),
+            &[],
+        )
+        .await
+        .expect("information_schema.columns should read");
+    result
+        .rows()
+        .iter()
+        .map(|row| {
+            let Value::Text(column_name) = &row.values()[0] else {
+                panic!("expected text column name, got {:?}", row.values()[0]);
+            };
+            column_name.clone()
+        })
+        .filter(|column_name| !column_name.starts_with("lixcol_"))
+        .collect()
 }
