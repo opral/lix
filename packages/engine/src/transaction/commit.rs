@@ -178,6 +178,7 @@ async fn finalize_commit_rows(
             "id": commit_id,
             "change_set_id": change_set_id,
             "change_ids": change_ids,
+            "author_account_ids": [],
             "parent_commit_ids": parent_commit_ids,
         }))
         .map_err(|error| {
