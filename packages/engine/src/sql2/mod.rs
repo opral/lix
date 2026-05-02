@@ -12,6 +12,7 @@ mod file_history_provider;
 mod file_provider;
 mod filesystem_planner;
 mod filesystem_visibility;
+mod history_projection;
 mod history_provider;
 mod history_route;
 mod lix_state_provider;

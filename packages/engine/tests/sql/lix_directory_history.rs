@@ -1,4 +1,5 @@
 use lix_engine::Value;
+use serde_json::json;
 
 use super::assert_rows_eq;
 
@@ -76,11 +77,34 @@ simulation_test!(
                     Value::Null,
                     Value::Text("docs".to_string()),
                     Value::Boolean(false),
-                    Value::Text(second_commit_id),
+                    Value::Text(second_commit_id.clone()),
                     Value::Integer(1),
                 ],
             ],
         );
+
+        let snapshot_result = session
+            .execute(
+                &format!(
+                    "SELECT lixcol_snapshot_content \
+                     FROM lix_directory_history \
+                     WHERE lixcol_start_commit_id = '{second_commit_id}' \
+                       AND id = 'history-dir-guides' \
+                       AND lixcol_depth = 0"
+                ),
+                &[],
+            )
+            .await
+            .expect("directory history descriptor snapshot should be selectable");
+        let snapshot = snapshot_result.rows()[0]
+            .get::<Value>("lixcol_snapshot_content")
+            .expect("snapshot_content should be present");
+        let Value::Json(snapshot) = snapshot else {
+            panic!("snapshot_content should be semantic JSON, got {snapshot:?}");
+        };
+        assert_eq!(snapshot["parent_id"], json!("history-dir-docs"));
+        assert_eq!(snapshot["name"], json!("guides"));
+        assert_eq!(snapshot["hidden"], json!(false));
     }
 );
 
@@ -161,12 +185,12 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, path, lixcol_schema_key, lixcol_start_commit_id, lixcol_depth \
+                    "SELECT id, path, name, hidden, lixcol_snapshot_content, lixcol_schema_key, lixcol_start_commit_id, lixcol_depth \
                      FROM lix_directory_history \
                      WHERE lixcol_start_commit_id = '{delete_commit_id}' \
-                       AND id IN ('history-delete-docs', 'history-delete-guides') \
+                       AND lixcol_entity_id IN ('history-delete-docs', 'history-delete-guides') \
                        AND lixcol_depth = 0 \
-                     ORDER BY path"
+                     ORDER BY lixcol_entity_id"
                 ),
                 &[],
             )
@@ -178,14 +202,20 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("history-delete-docs".to_string()),
-                    Value::Text("/docs/".to_string()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
                     Value::Text("lix_directory_descriptor".to_string()),
                     Value::Text(delete_commit_id.clone()),
                     Value::Integer(0),
                 ],
                 vec![
                     Value::Text("history-delete-guides".to_string()),
-                    Value::Text("/docs/guides/".to_string()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
                     Value::Text("lix_directory_descriptor".to_string()),
                     Value::Text(delete_commit_id),
                     Value::Integer(0),

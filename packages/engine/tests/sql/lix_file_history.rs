@@ -1,4 +1,5 @@
 use lix_engine::Value;
+use serde_json::json;
 
 use super::assert_rows_eq;
 
@@ -80,11 +81,34 @@ simulation_test!(
                     Value::Text("md".to_string()),
                     Value::Boolean(false),
                     Value::Blob(b"hello".to_vec()),
-                    Value::Text(second_commit_id),
+                    Value::Text(second_commit_id.clone()),
                     Value::Integer(1),
                 ],
             ],
         );
+
+        let snapshot_result = session
+            .execute(
+                &format!(
+                    "SELECT lixcol_snapshot_content \
+                     FROM lix_file_history \
+                     WHERE lixcol_start_commit_id = '{second_commit_id}' \
+                       AND id = 'history-file' \
+                       AND lixcol_depth = 0"
+                ),
+                &[],
+            )
+            .await
+            .expect("file history descriptor snapshot should be selectable");
+        let snapshot = snapshot_result.rows()[0]
+            .get::<Value>("lixcol_snapshot_content")
+            .expect("snapshot_content should be present");
+        let Value::Json(snapshot) = snapshot else {
+            panic!("snapshot_content should be semantic JSON, got {snapshot:?}");
+        };
+        assert_eq!(snapshot["name"], json!("readme-renamed"));
+        assert_eq!(snapshot["extension"], json!("md"));
+        assert_eq!(snapshot["hidden"], json!(false));
 
         let result = session
             .execute(
