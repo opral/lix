@@ -62,6 +62,9 @@ impl ScalarUDFImpl for LixJson {
 }
 
 fn json_value(array: &dyn Array, row: usize) -> Result<Option<String>> {
+    if matches!(array.data_type(), DataType::Null) {
+        return Ok(Some("null".to_string()));
+    }
     let Some(raw) = text_like_value(array, row)? else {
         return Ok(Some("null".to_string()));
     };
@@ -84,6 +87,14 @@ mod tests {
         assert_eq!(
             single_text("SELECT lix_json('{ \"name\" : \"Ada\" }')").await,
             Some("{\"name\":\"Ada\"}".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn null_input_returns_json_null() {
+        assert_eq!(
+            single_text("SELECT lix_json(NULL)").await,
+            Some("null".to_string())
         );
     }
 }

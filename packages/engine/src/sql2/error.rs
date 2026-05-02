@@ -32,11 +32,21 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
     let description = format!("sql2 DataFusion error: {error}");
     let lower = description.to_ascii_lowercase();
 
+    if looks_like_json_udf_miss(&lower) {
+        return LixError::new(LixError::CODE_UDF_NOT_FOUND, description)
+            .with_hint("Use lix_json_extract(json, path) for JSON values or lix_json_extract_text(json, path) for text.");
+    }
+
+    if looks_like_unsupported_dialect(&lower) {
+        return LixError::new(LixError::CODE_DIALECT_UNSUPPORTED, description)
+            .with_hint("Lix SQL uses DataFusion syntax. Use lix_json_extract(...) or lix_json_extract_text(...) for JSON access, and numbered placeholders like $1, $2, ...");
+    }
+
     if lower.contains("failed to parse placeholder id")
         || lower.contains("placeholder")
         || lower.contains("bind")
     {
-        return LixError::new(LixError::CODE_BINDING_ERROR, description).with_hint(
+        return LixError::new(LixError::CODE_PARSE_ERROR, description).with_hint(
             "Use numbered placeholders like $1, $2, ...; '?' placeholders are not supported.",
         );
     }
@@ -88,14 +98,19 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
     }
 
     if lower.contains("unsupported sql type json") {
-        return LixError::new(LixError::CODE_UNSUPPORTED_SQL, description)
+        return LixError::new(LixError::CODE_DIALECT_UNSUPPORTED, description)
             .with_hint("Declare JSON/object columns through lix.registerSchema(...) or lix_registered_schema; SQL type JSON is not supported.");
+    }
+
+    if looks_like_type_mismatch(&lower) {
+        return LixError::new(LixError::CODE_TYPE_MISMATCH, description)
+            .with_hint("Check the SQL function argument types. JSON text can be converted with lix_json(...); JSON fields can be read with lix_json_extract(...) or lix_json_extract_text(...).");
     }
 
     match error {
         DataFusionError::SQL(_, _) => LixError::new(LixError::CODE_PARSE_ERROR, description),
         DataFusionError::NotImplemented(_) => {
-            LixError::new(LixError::CODE_UNSUPPORTED_SQL, description)
+            LixError::new(LixError::CODE_DIALECT_UNSUPPORTED, description)
         }
         DataFusionError::Plan(_) | DataFusionError::SchemaError(_, _) => {
             LixError::new(LixError::CODE_PARSE_ERROR, description)
@@ -106,4 +121,44 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
         DataFusionError::Internal(_) => LixError::new(LixError::CODE_INTERNAL_ERROR, description),
         _ => LixError::new(LixError::CODE_UNKNOWN, description),
     }
+}
+
+fn looks_like_json_udf_miss(lower: &str) -> bool {
+    let json_function_guess = [
+        "json_extract",
+        "json_get",
+        "json_get_string",
+        "json_get_text",
+        "json_extract_string",
+        "json_extract_text",
+    ]
+    .iter()
+    .any(|name| lower.contains(name));
+
+    json_function_guess
+        && (lower.contains("function")
+            || lower.contains("udf")
+            || lower.contains("not found")
+            || lower.contains("does not exist")
+            || lower.contains("did you mean"))
+}
+
+fn looks_like_unsupported_dialect(lower: &str) -> bool {
+    lower.contains("->>")
+        || lower.contains("operator does not exist")
+        || lower.contains("unsupported sql type json")
+        || lower.contains("sqlite_master")
+        || lower.contains("returning")
+}
+
+fn looks_like_type_mismatch(lower: &str) -> bool {
+    (lower.contains("type")
+        || lower.contains("signature")
+        || lower.contains("coerc")
+        || lower.contains("argument"))
+        && (lower.contains("mismatch")
+            || lower.contains("incompatible")
+            || lower.contains("expected")
+            || lower.contains("cannot")
+            || lower.contains("invalid"))
 }

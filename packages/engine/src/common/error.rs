@@ -34,6 +34,16 @@ impl LixError {
     /// SQL text could not be parsed.
     pub const CODE_PARSE_ERROR: &'static str = "LIX_PARSE_ERROR";
 
+    /// A SQL function name could not be resolved.
+    pub const CODE_UDF_NOT_FOUND: &'static str = "LIX_UDF_NOT_FOUND";
+
+    /// A SQL expression or function argument had an incompatible type.
+    pub const CODE_TYPE_MISMATCH: &'static str = "LIX_TYPE_MISMATCH";
+
+    /// SQL syntax belongs to another dialect and is outside the Lix SQL
+    /// surface.
+    pub const CODE_DIALECT_UNSUPPORTED: &'static str = "LIX_DIALECT_UNSUPPORTED";
+
     /// SQL parameters could not be bound to placeholders.
     pub const CODE_BINDING_ERROR: &'static str = "LIX_BINDING_ERROR";
 
