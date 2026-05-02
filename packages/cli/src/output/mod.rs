@@ -49,6 +49,7 @@ fn execute_result_to_json(result: &ExecuteResult) -> JsonValue {
         "columns": result.columns(),
         "rows": result.rows().iter().map(|row| row_to_json(result.columns(), row)).collect::<Vec<_>>(),
         "rowsAffected": result.rows_affected(),
+        "notices": result.notices(),
     })
 }
 
@@ -161,6 +162,7 @@ mod tests {
                     {"n": 2, "payload": {"$blob": "AQI="}},
                 ],
                 "rowsAffected": 0,
+                "notices": [],
             })
         );
     }
