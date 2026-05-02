@@ -224,11 +224,13 @@ mod tests {
                         Value::Text("blob-plugin-json".to_string()),
                     ]],
                     columns: Vec::new(),
+                    notices: Vec::new(),
                 });
             }
             Ok(SqlQueryResult {
                 rows: Vec::new(),
                 columns: Vec::new(),
+                notices: Vec::new(),
             })
         }
 
@@ -329,6 +331,7 @@ mod tests {
             Ok(SqlQueryResult {
                 rows: Vec::new(),
                 columns: Vec::new(),
+                notices: Vec::new(),
             })
         }
 

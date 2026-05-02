@@ -80,6 +80,16 @@ pub struct SqlQueryResult {
     pub rows: Vec<Vec<Value>>,
     #[serde(default)]
     pub columns: Vec<String>,
+    #[serde(default)]
+    pub notices: Vec<LixNotice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LixNotice {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]

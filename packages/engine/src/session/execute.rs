@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::backend::TransactionBeginMode;
 use crate::functions::FunctionContext;
 use crate::sql2;
-use crate::{LixError, SqlQueryResult, Value};
+use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
 use super::context::{SessionContext, SessionSqlExecutionContext};
 
@@ -17,6 +17,7 @@ pub struct ExecuteResult {
     columns: Vec<String>,
     rows: Vec<Row>,
     rows_affected: u64,
+    notices: Vec<LixNotice>,
 }
 
 impl ExecuteResult {
@@ -25,6 +26,7 @@ impl ExecuteResult {
             columns: result.columns,
             rows: Vec::new(),
             rows_affected: 0,
+            notices: result.notices,
         }
         .with_rows(result.rows)
     }
@@ -34,6 +36,7 @@ impl ExecuteResult {
             columns: Vec::new(),
             rows: Vec::new(),
             rows_affected,
+            notices: Vec::new(),
         }
     }
 
@@ -42,6 +45,7 @@ impl ExecuteResult {
             columns,
             rows: Vec::new(),
             rows_affected: 0,
+            notices: Vec::new(),
         }
         .with_rows(rows)
     }
@@ -89,6 +93,11 @@ impl ExecuteResult {
     /// Returns the number of rows affected by a mutation statement.
     pub fn rows_affected(&self) -> u64 {
         self.rows_affected
+    }
+
+    /// Returns non-fatal diagnostics produced while executing the statement.
+    pub fn notices(&self) -> &[LixNotice] {
+        &self.notices
     }
 
     /// Looks up the value for `column_name` on an owned row from this set.

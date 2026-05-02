@@ -28,8 +28,10 @@ use super::entity_provider::{
     entity_f64_value, entity_i64_value, entity_json_text_value, entity_surface_schema,
     parse_snapshot, string_array, EntityColumnType, EntityProviderVariant, EntitySurfaceSpec,
 };
+use super::history_projection::{tombstone_identity_column_value, HistoryIdentityProjection};
 use super::history_route::{
-    load_history_entries, parse_history_filter, HistoryRoute, HistoryViewErrorContext,
+    load_history_entries, parse_history_filter, HistoryColumnStyle, HistoryRoute,
+    HistoryViewDescriptor, HISTORY_COL_START_COMMIT_ID,
 };
 
 /// Schema-specific history surface backed directly by the commit graph.
@@ -85,7 +87,7 @@ impl TableProvider for EntityHistoryProvider {
         Ok(filters
             .iter()
             .map(|filter| {
-                if parse_history_filter(filter).is_some() {
+                if parse_history_filter(filter, HistoryColumnStyle::Prefixed).is_some() {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -101,7 +103,7 @@ impl TableProvider for EntityHistoryProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let route = HistoryRoute::from_filters(filters);
+        let route = HistoryRoute::from_filters(filters, HistoryColumnStyle::Prefixed);
         let schema = projected_schema(&self.schema, projection)?;
         Ok(Arc::new(EntityHistoryScanExec::new(
             Arc::clone(&self.spec),
@@ -247,9 +249,9 @@ async fn load_entity_history_rows(
 ) -> Result<Vec<EntityHistoryRow>, LixError> {
     let history_view_name = format!("{}_history", spec.schema_key);
     let entries = load_history_entries(
-        HistoryViewErrorContext {
+        HistoryViewDescriptor {
             view_name: history_view_name.as_str(),
-            start_commit_column: "lixcol_start_commit_id",
+            start_commit_column: HISTORY_COL_START_COMMIT_ID,
         },
         commit_graph,
         route,
@@ -304,51 +306,60 @@ fn entity_history_column_array(
             spec.schema_key, column_name
         ))
     })?;
-    let snapshots = rows
+    let projected_values = rows
         .iter()
-        .map(|row| parse_snapshot(row.change.snapshot_content.as_deref()))
+        .map(|row| entity_history_column_value(row, spec, column_name))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(match column_type {
         EntityColumnType::String | EntityColumnType::Json => Arc::new(StringArray::from(
-            snapshots
+            projected_values
                 .iter()
-                .map(|snapshot| {
-                    entity_json_text_value(
-                        snapshot.as_ref().and_then(|json| json.get(column_name)),
-                        *column_type,
-                    )
-                })
+                .map(|snapshot| entity_json_text_value(snapshot.as_ref(), *column_type))
                 .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
         EntityColumnType::Integer => Arc::new(Int64Array::from(
-            snapshots
+            projected_values
                 .iter()
-                .map(|snapshot| {
-                    entity_i64_value(snapshot.as_ref().and_then(|json| json.get(column_name)))
-                })
+                .map(|snapshot| entity_i64_value(snapshot.as_ref()))
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
         EntityColumnType::Number => Arc::new(Float64Array::from(
-            snapshots
+            projected_values
                 .iter()
-                .map(|snapshot| {
-                    entity_f64_value(snapshot.as_ref().and_then(|json| json.get(column_name)))
-                })
+                .map(|snapshot| entity_f64_value(snapshot.as_ref()))
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
         EntityColumnType::Boolean => Arc::new(BooleanArray::from(
-            snapshots
+            projected_values
                 .iter()
-                .map(|snapshot| {
-                    snapshot
-                        .as_ref()
-                        .and_then(|json| json.get(column_name))
-                        .and_then(JsonValue::as_bool)
-                })
+                .map(|snapshot| snapshot.as_ref().and_then(JsonValue::as_bool))
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
     })
+}
+
+fn entity_history_column_value(
+    row: &EntityHistoryRow,
+    spec: &EntitySurfaceSpec,
+    column_name: &str,
+) -> Result<Option<JsonValue>> {
+    let snapshot = parse_snapshot(row.change.snapshot_content.as_deref())?;
+    if let Some(snapshot) = snapshot {
+        return Ok(snapshot.get(column_name).cloned());
+    }
+
+    let entity_id = row.change.entity_id.as_string().map_err(|error| {
+        DataFusionError::Execution(format!(
+            "sql2 entity history provider failed to project entity id: {error}"
+        ))
+    })?;
+    tombstone_identity_column_value(
+        column_name,
+        &entity_id,
+        HistoryIdentityProjection::PrimaryKeyPaths(&spec.primary_key_paths),
+    )
+    .map_err(|error| DataFusionError::Execution(error.to_string()))
 }
 
 fn entity_history_system_column_array(

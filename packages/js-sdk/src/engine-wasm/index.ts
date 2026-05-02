@@ -166,6 +166,13 @@ export type ExecuteResult = {
 	columns: string[];
 	rows: LixValue[][];
 	rowsAffected: number;
+	notices: LixNotice[];
+};
+
+export type LixNotice = {
+	code: string;
+	message: string;
+	hint?: string;
 };
 
 /**

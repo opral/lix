@@ -20,6 +20,13 @@ export type ExecuteResult = {
 	columns: string[];
 	rows: Row[];
 	rowsAffected: number;
+	notices: LixNotice[];
+};
+
+export type LixNotice = {
+	code: string;
+	message: string;
+	hint?: string;
 };
 
 export class Row {
@@ -217,6 +224,7 @@ type WasmExecuteResult = {
 	columns: string[];
 	rows: unknown[][];
 	rowsAffected: number;
+	notices?: LixNotice[];
 };
 
 type WasmLix = {
@@ -330,6 +338,7 @@ function normalizeExecuteResult(result: WasmExecuteResult): ExecuteResult {
 			(row) => new Row(columns, row.map((value) => Value.from(value))),
 		),
 		rowsAffected: result.rowsAffected,
+		notices: result.notices ?? [],
 	};
 }
 
