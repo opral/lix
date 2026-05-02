@@ -35,6 +35,7 @@ use crate::live_state::{
 use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
 };
+use crate::sql2::write_normalization::UpdateAssignmentValues;
 use crate::transaction::types::StageRow;
 use crate::version_ref::VersionRefReader;
 use crate::LixError;
@@ -824,11 +825,10 @@ impl ExecutionPlan for EntityUpdateExec {
             };
             let source_batch = entity_record_batch(&spec, Arc::clone(&table_schema), &rows)?;
             let matched_batch = filter_entity_batch(source_batch, &filters)?;
-            let updated_batch =
-                apply_entity_update_assignments(&table_schema, matched_batch, &assignments)?;
-            let write_rows = entity_existing_lix_state_write_rows_from_batch(
+            let write_rows = entity_update_write_rows_from_batch(
                 &spec,
-                &updated_batch,
+                &matched_batch,
+                &assignments,
                 version_binding.active_version_id(),
             )?;
             let count = u64::try_from(write_rows.len()).map_err(|_| {
@@ -922,34 +922,135 @@ fn evaluate_entity_filters(
     Ok(combined_mask)
 }
 
-fn apply_entity_update_assignments(
-    schema: &SchemaRef,
-    batch: RecordBatch,
+fn entity_update_write_rows_from_batch(
+    spec: &EntitySurfaceSpec,
+    batch: &RecordBatch,
     assignments: &[(String, Arc<dyn PhysicalExpr>)],
-) -> Result<RecordBatch> {
-    if batch.num_rows() == 0 || assignments.is_empty() {
-        return Ok(batch);
-    }
+    version_binding: Option<&str>,
+) -> Result<Vec<StageRow>> {
+    let assignment_values = UpdateAssignmentValues::evaluate(batch, assignments)?;
+    (0..batch.num_rows())
+        .map(|row_index| {
+            let explicit_global = optional_bool_value(batch, row_index, "lixcol_global")?;
+            let version_id = if explicit_global == Some(true) {
+                GLOBAL_VERSION_ID.to_string()
+            } else {
+                optional_string_value(batch, row_index, "lixcol_version_id")?
+                    .or_else(|| version_binding.map(ToOwned::to_owned))
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(format!(
+                            "UPDATE into {}_by_version requires lixcol_version_id",
+                            spec.schema_key
+                        ))
+                    })?
+            };
+            let global = explicit_global.unwrap_or(version_id == GLOBAL_VERSION_ID);
 
-    let mut columns = Vec::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        let column_name = field.name();
-        let original_column = batch.column_by_name(column_name).ok_or_else(|| {
+            let schema_version = optional_string_value(batch, row_index, "lixcol_schema_version")?
+                .or_else(|| spec.schema_version.clone())
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "UPDATE entity surface '{}' requires lixcol_schema_version",
+                        spec.schema_key
+                    ))
+                })?;
+
+            Ok(StageRow {
+                entity_id: optional_string_value(batch, row_index, "lixcol_entity_id")?
+                    .map(|entity_id| {
+                        EntityIdentity::from_string(&entity_id).map_err(|error| {
+                            DataFusionError::Execution(format!(
+                                "UPDATE entity surface '{}' has invalid lixcol_entity_id: {error}",
+                                spec.schema_key
+                            ))
+                        })
+                    })
+                    .transpose()?,
+                schema_key: spec.schema_key.clone(),
+                file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
+                snapshot_content: Some(entity_update_snapshot_content_from_batch(
+                    spec,
+                    batch,
+                    &assignment_values,
+                    row_index,
+                )?),
+                metadata: entity_update_optional_string_value(
+                    batch,
+                    &assignment_values,
+                    row_index,
+                    "lixcol_metadata",
+                )?,
+                schema_version,
+                created_at: None,
+                updated_at: None,
+                global,
+                change_id: None,
+                commit_id: None,
+                untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?
+                    .unwrap_or(false),
+                version_id,
+            })
+        })
+        .collect()
+}
+
+fn entity_update_snapshot_content_from_batch(
+    spec: &EntitySurfaceSpec,
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    row_index: usize,
+) -> Result<String> {
+    let mut object = serde_json::Map::new();
+    for column_name in &spec.visible_columns {
+        let column_type = spec.column_types.get(column_name).ok_or_else(|| {
             DataFusionError::Execution(format!(
-                "UPDATE entity surface source batch is missing column '{column_name}'"
+                "entity surface '{}' is missing type metadata for '{}'",
+                spec.schema_key, column_name
             ))
         })?;
-        let new_column = if let Some((_, assignment)) =
-            assignments.iter().find(|(name, _)| name == column_name)
-        {
-            assignment.evaluate(&batch)?.into_array(batch.num_rows())?
-        } else {
-            Arc::clone(original_column)
-        };
-        columns.push(new_column);
+        let value = entity_update_scalar_value(batch, assignment_values, row_index, column_name)?;
+        let value = entity_json_value_from_scalar(value, *column_type)?;
+        if value.is_null() && spec.defaulted_columns.contains(column_name) {
+            continue;
+        }
+        object.insert(column_name.clone(), value);
     }
+    serde_json::to_string(&JsonValue::Object(object)).map_err(|error| {
+        DataFusionError::Execution(format!(
+            "failed to serialize entity surface '{}' snapshot_content: {error}",
+            spec.schema_key
+        ))
+    })
+}
 
-    RecordBatch::try_new(Arc::clone(schema), columns).map_err(DataFusionError::from)
+fn entity_update_optional_string_value(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    row_index: usize,
+    column_name: &str,
+) -> Result<Option<String>> {
+    match entity_update_scalar_value(batch, assignment_values, row_index, column_name)? {
+        None
+        | Some(ScalarValue::Null)
+        | Some(ScalarValue::Utf8(None))
+        | Some(ScalarValue::Utf8View(None))
+        | Some(ScalarValue::LargeUtf8(None)) => Ok(None),
+        Some(ScalarValue::Utf8(Some(value)))
+        | Some(ScalarValue::Utf8View(Some(value)))
+        | Some(ScalarValue::LargeUtf8(Some(value))) => Ok(Some(value)),
+        Some(other) => Err(DataFusionError::Execution(format!(
+            "UPDATE entity surface expected text-compatible column '{column_name}', got {other:?}"
+        ))),
+    }
+}
+
+fn entity_update_scalar_value(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    row_index: usize,
+    column_name: &str,
+) -> Result<Option<ScalarValue>> {
+    assignment_values.scalar_value(batch, row_index, column_name)
 }
 
 fn dml_count_schema() -> SchemaRef {

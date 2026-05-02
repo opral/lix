@@ -34,6 +34,7 @@ use crate::live_state::{
 use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
 };
+use crate::sql2::write_normalization::UpdateAssignmentValues;
 use crate::transaction::types::StageRow;
 use crate::version_ref::VersionRefReader;
 use crate::LixError;
@@ -721,10 +722,9 @@ impl ExecutionPlan for LixDirectoryUpdateExec {
             let source_batch = lix_directory_record_batch(&table_schema, rows)
                 .map_err(lix_error_to_datafusion_error)?;
             let matched_batch = filter_lix_directory_batch(source_batch, &filters)?;
-            let updated_batch =
-                apply_lix_directory_update_assignments(&table_schema, matched_batch, &assignments)?;
-            let write_rows = lix_directory_existing_write_rows_from_batch(
-                &updated_batch,
+            let write_rows = lix_directory_update_write_rows_from_batch(
+                &matched_batch,
+                &assignments,
                 version_binding.active_version_id(),
             )?;
             let count = u64::try_from(write_rows.len()).map_err(|_| {
@@ -902,11 +902,36 @@ fn lix_directory_write_rows_from_batch_with_path_resolvers(
     )
 }
 
-fn lix_directory_existing_write_rows_from_batch(
+fn lix_directory_update_write_rows_from_batch(
     batch: &RecordBatch,
+    assignments: &[(String, Arc<dyn PhysicalExpr>)],
     version_binding: Option<&str>,
 ) -> Result<Vec<StageRow>> {
-    lix_directory_write_rows_from_batch_with_options(batch, version_binding, false)
+    let assignment_values = UpdateAssignmentValues::evaluate(batch, assignments)?;
+    let mut rows = Vec::new();
+    for row_index in 0..batch.num_rows() {
+        let context = directory_row_context_from_update(
+            batch,
+            &assignment_values,
+            row_index,
+            version_binding,
+        )?;
+        rows.push(directory_descriptor_write_row(
+            DirectoryDescriptorWriteIntent {
+                id: optional_string_value(batch, row_index, "id")?,
+                parent_id: update_optional_string_value(
+                    batch,
+                    &assignment_values,
+                    row_index,
+                    "parent_id",
+                )?,
+                name: update_required_string_value(batch, &assignment_values, row_index, "name")?,
+                hidden: update_optional_bool_value(batch, &assignment_values, row_index, "hidden")?,
+                context,
+            },
+        ));
+    }
+    Ok(rows)
 }
 
 fn directory_version_ids_from_batch(
@@ -1100,6 +1125,39 @@ fn directory_row_context_from_batch(
         untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         metadata: optional_string_value(batch, row_index, "lixcol_metadata")?,
+    })
+}
+
+fn directory_row_context_from_update(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    row_index: usize,
+    version_binding: Option<&str>,
+) -> Result<FilesystemRowContext> {
+    let global = optional_bool_value(batch, row_index, "lixcol_global")?.unwrap_or(false);
+    let version_id = if global {
+        GLOBAL_VERSION_ID.to_string()
+    } else {
+        optional_string_value(batch, row_index, "lixcol_version_id")?
+            .or_else(|| version_binding.map(ToOwned::to_owned))
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "UPDATE into lix_directory_by_version requires lixcol_version_id".to_string(),
+                )
+            })?
+    };
+
+    Ok(FilesystemRowContext {
+        version_id,
+        global,
+        untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
+        file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
+        metadata: update_optional_string_value(
+            batch,
+            assignment_values,
+            row_index,
+            "lixcol_metadata",
+        )?,
     })
 }
 
@@ -1430,36 +1488,6 @@ fn evaluate_lix_directory_filters(
     Ok(combined_mask)
 }
 
-fn apply_lix_directory_update_assignments(
-    schema: &SchemaRef,
-    batch: RecordBatch,
-    assignments: &[(String, Arc<dyn PhysicalExpr>)],
-) -> Result<RecordBatch> {
-    if batch.num_rows() == 0 || assignments.is_empty() {
-        return Ok(batch);
-    }
-
-    let mut columns = Vec::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        let column_name = field.name();
-        let original_column = batch.column_by_name(column_name).ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "UPDATE lix_directory source batch is missing column '{column_name}'"
-            ))
-        })?;
-        let new_column = if let Some((_, assignment)) =
-            assignments.iter().find(|(name, _)| name == column_name)
-        {
-            assignment.evaluate(&batch)?.into_array(batch.num_rows())?
-        } else {
-            Arc::clone(original_column)
-        };
-        columns.push(new_column);
-    }
-
-    RecordBatch::try_new(Arc::clone(schema), columns).map_err(DataFusionError::from)
-}
-
 fn dml_count_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
         "count",
@@ -1510,6 +1538,57 @@ fn required_string_value(
             "INSERT into lix_directory requires non-null text column '{column_name}'"
         ))
     })
+}
+
+fn update_required_string_value(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    row_index: usize,
+    column_name: &str,
+) -> Result<String> {
+    update_optional_string_value(batch, assignment_values, row_index, column_name)?.ok_or_else(
+        || {
+            DataFusionError::Execution(format!(
+                "UPDATE lix_directory requires non-null text column '{column_name}'"
+            ))
+        },
+    )
+}
+
+fn update_optional_string_value(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    row_index: usize,
+    column_name: &str,
+) -> Result<Option<String>> {
+    match assignment_values.scalar_value(batch, row_index, column_name)? {
+        None
+        | Some(ScalarValue::Null)
+        | Some(ScalarValue::Utf8(None))
+        | Some(ScalarValue::Utf8View(None))
+        | Some(ScalarValue::LargeUtf8(None)) => Ok(None),
+        Some(ScalarValue::Utf8(Some(value)))
+        | Some(ScalarValue::Utf8View(Some(value)))
+        | Some(ScalarValue::LargeUtf8(Some(value))) => Ok(Some(value)),
+        Some(other) => Err(DataFusionError::Execution(format!(
+            "UPDATE lix_directory expected text-compatible column '{column_name}', got {other:?}"
+        ))),
+    }
+}
+
+fn update_optional_bool_value(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    row_index: usize,
+    column_name: &str,
+) -> Result<Option<bool>> {
+    match assignment_values.scalar_value(batch, row_index, column_name)? {
+        None | Some(ScalarValue::Null) | Some(ScalarValue::Boolean(None)) => Ok(None),
+        Some(ScalarValue::Boolean(Some(value))) => Ok(Some(value)),
+        Some(other) => Err(DataFusionError::Execution(format!(
+            "UPDATE lix_directory expected boolean column '{column_name}', got {other:?}"
+        ))),
+    }
 }
 
 fn optional_string_value(

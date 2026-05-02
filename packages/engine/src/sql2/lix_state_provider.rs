@@ -31,6 +31,7 @@ use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
 use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
+use crate::sql2::write_normalization::UpdateAssignmentValues;
 use crate::transaction::types::StageRow;
 use crate::version_ref::VersionRefReader;
 use crate::GLOBAL_VERSION_ID;
@@ -660,10 +661,11 @@ impl ExecutionPlan for LixStateUpdateExec {
             let source_batch = lix_state_record_batch(Arc::clone(&table_schema), &rows)
                 .map_err(lix_error_to_datafusion_error)?;
             let matched_batch = filter_lix_state_batch(source_batch, &filters)?;
-            let updated_batch =
-                apply_lix_state_update_assignments(&table_schema, matched_batch, &assignments)?;
-            let write_rows =
-                lix_state_stageable_write_rows_from_batch(&updated_batch, &version_binding)?;
+            let write_rows = lix_state_update_write_rows_from_batch(
+                &matched_batch,
+                &assignments,
+                &version_binding,
+            )?;
             let count = u64::try_from(write_rows.len())
                 .map_err(|_| DataFusionError::Execution("UPDATE row count overflow".to_string()))?;
 
@@ -748,36 +750,6 @@ fn evaluate_lix_state_filters(
     Ok(combined_mask)
 }
 
-fn apply_lix_state_update_assignments(
-    schema: &SchemaRef,
-    batch: RecordBatch,
-    assignments: &[(String, Arc<dyn PhysicalExpr>)],
-) -> Result<RecordBatch> {
-    if batch.num_rows() == 0 || assignments.is_empty() {
-        return Ok(batch);
-    }
-
-    let mut columns = Vec::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        let column_name = field.name();
-        let original_column = batch.column_by_name(column_name).ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "UPDATE lix_state source batch is missing column '{column_name}'"
-            ))
-        })?;
-        let new_column = if let Some((_, assignment)) =
-            assignments.iter().find(|(name, _)| name == column_name)
-        {
-            assignment.evaluate(&batch)?.into_array(batch.num_rows())?
-        } else {
-            Arc::clone(original_column)
-        };
-        columns.push(new_column);
-    }
-
-    RecordBatch::try_new(Arc::clone(schema), columns).map_err(DataFusionError::from)
-}
-
 fn lix_state_stageable_write_rows_from_batch(
     batch: &RecordBatch,
     version_binding: &str,
@@ -792,6 +764,64 @@ fn lix_state_stageable_write_rows_from_batch(
     Ok(rows)
 }
 
+fn lix_state_update_write_rows_from_batch(
+    batch: &RecordBatch,
+    assignments: &[(String, Arc<dyn PhysicalExpr>)],
+    version_binding: &str,
+) -> Result<Vec<StageRow>> {
+    let assignment_values = UpdateAssignmentValues::evaluate(batch, assignments)?;
+    (0..batch.num_rows())
+        .map(|row_index| {
+            let global = optional_bool_value(batch, row_index, "global")?.unwrap_or(false);
+            let version_id =
+                optional_string_value(batch, row_index, "version_id")?.unwrap_or_else(|| {
+                    if global {
+                        GLOBAL_VERSION_ID.to_string()
+                    } else {
+                        version_binding.to_string()
+                    }
+                });
+
+            Ok(StageRow {
+                entity_id: Some(
+                    EntityIdentity::from_string(&required_string_value(
+                        batch,
+                        row_index,
+                        "entity_id",
+                    )?)
+                    .map_err(|error| {
+                        DataFusionError::Execution(format!(
+                            "lix_state UPDATE has invalid entity_id: {error}"
+                        ))
+                    })?,
+                ),
+                schema_key: required_string_value(batch, row_index, "schema_key")?,
+                file_id: optional_string_value(batch, row_index, "file_id")?,
+                snapshot_content: update_optional_string_value(
+                    batch,
+                    &assignment_values,
+                    row_index,
+                    "snapshot_content",
+                )?,
+                metadata: update_optional_string_value(
+                    batch,
+                    &assignment_values,
+                    row_index,
+                    "metadata",
+                )?,
+                schema_version: required_string_value(batch, row_index, "schema_version")?,
+                created_at: None,
+                updated_at: None,
+                global,
+                change_id: None,
+                commit_id: None,
+                untracked: optional_bool_value(batch, row_index, "untracked")?.unwrap_or(false),
+                version_id,
+            })
+        })
+        .collect()
+}
+
 fn lix_state_deletable_write_rows_from_batch(
     batch: &RecordBatch,
     version_binding: &str,
@@ -801,6 +831,27 @@ fn lix_state_deletable_write_rows_from_batch(
         row.snapshot_content = None;
     }
     Ok(rows)
+}
+
+fn update_optional_string_value(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    row_index: usize,
+    column_name: &str,
+) -> Result<Option<String>> {
+    match assignment_values.scalar_value(batch, row_index, column_name)? {
+        None
+        | Some(ScalarValue::Null)
+        | Some(ScalarValue::Utf8(None))
+        | Some(ScalarValue::Utf8View(None))
+        | Some(ScalarValue::LargeUtf8(None)) => Ok(None),
+        Some(ScalarValue::Utf8(Some(value)))
+        | Some(ScalarValue::Utf8View(Some(value)))
+        | Some(ScalarValue::LargeUtf8(Some(value))) => Ok(Some(value)),
+        Some(other) => Err(DataFusionError::Execution(format!(
+            "UPDATE lix_state expected text-compatible column '{column_name}', got {other:?}"
+        ))),
+    }
 }
 
 fn dml_count_schema() -> SchemaRef {
