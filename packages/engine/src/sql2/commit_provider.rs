@@ -27,6 +27,7 @@ use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 
 use super::record_batch::record_batch_with_row_count;
+use super::result_metadata::json_field;
 
 pub(crate) async fn register_commit_providers(
     session: &datafusion::prelude::SessionContext,
@@ -328,6 +329,9 @@ enum SurfaceRow {
         version_id: Option<String>,
         id: String,
         change_set_id: String,
+        change_ids: Vec<String>,
+        author_account_ids: Vec<String>,
+        parent_commit_ids: Vec<String>,
     },
     CommitEdge {
         version_id: Option<String>,
@@ -375,6 +379,9 @@ async fn rows_for_surface(
                             version_id: surface.by_version().then(|| version_id.clone()),
                             id: commit.commit_id,
                             change_set_id: commit.change_set_id,
+                            change_ids: commit.change_ids,
+                            author_account_ids: commit.author_account_ids,
+                            parent_commit_ids: commit.parent_commit_ids,
                         });
                     }
                 }
@@ -470,6 +477,9 @@ fn surface_record_batch(
 enum SurfaceColumn {
     Id,
     ChangeSetId,
+    ChangeIds,
+    AuthorAccountIds,
+    ParentCommitIds,
     ParentId,
     ChildId,
     ChangeId,
@@ -486,6 +496,9 @@ impl SurfaceColumn {
         match self {
             Self::Id => Field::new("id", DataType::Utf8, false),
             Self::ChangeSetId => Field::new("change_set_id", DataType::Utf8, false),
+            Self::ChangeIds => json_field("change_ids", false),
+            Self::AuthorAccountIds => json_field("author_account_ids", false),
+            Self::ParentCommitIds => json_field("parent_commit_ids", false),
             Self::ParentId => Field::new("parent_id", DataType::Utf8, false),
             Self::ChildId => Field::new("child_id", DataType::Utf8, false),
             Self::ChangeId => Field::new("change_id", DataType::Utf8, false),
@@ -511,6 +524,22 @@ impl SurfaceColumn {
                 | SurfaceRow::ChangeSetElement { change_set_id, .. } => {
                     Some(change_set_id.as_str())
                 }
+                _ => None,
+            })),
+            Self::ChangeIds => json_array_column(rows.iter().map(|row| match row {
+                SurfaceRow::Commit { change_ids, .. } => Some(change_ids),
+                _ => None,
+            })),
+            Self::AuthorAccountIds => json_array_column(rows.iter().map(|row| match row {
+                SurfaceRow::Commit {
+                    author_account_ids, ..
+                } => Some(author_account_ids),
+                _ => None,
+            })),
+            Self::ParentCommitIds => json_array_column(rows.iter().map(|row| match row {
+                SurfaceRow::Commit {
+                    parent_commit_ids, ..
+                } => Some(parent_commit_ids),
                 _ => None,
             })),
             Self::ParentId => string_array(rows.iter().map(|row| match row {
@@ -554,12 +583,18 @@ fn surface_columns(surface: CommitSurface, projection: Option<&Vec<usize>>) -> V
         CommitSurface::Commit => vec![
             SurfaceColumn::Id,
             SurfaceColumn::ChangeSetId,
+            SurfaceColumn::ChangeIds,
+            SurfaceColumn::AuthorAccountIds,
+            SurfaceColumn::ParentCommitIds,
             SurfaceColumn::Global,
             SurfaceColumn::Untracked,
         ],
         CommitSurface::CommitByVersion => vec![
             SurfaceColumn::Id,
             SurfaceColumn::ChangeSetId,
+            SurfaceColumn::ChangeIds,
+            SurfaceColumn::AuthorAccountIds,
+            SurfaceColumn::ParentCommitIds,
             SurfaceColumn::VersionId,
             SurfaceColumn::Global,
             SurfaceColumn::Untracked,
@@ -678,6 +713,18 @@ fn projected_schema(schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Sche
 
 fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
     Arc::new(StringArray::from(values.collect::<Vec<_>>())) as ArrayRef
+}
+
+fn json_array_column<'a>(values: impl Iterator<Item = Option<&'a Vec<String>>>) -> ArrayRef {
+    let values = values
+        .map(|value| {
+            value.map(|strings| {
+                serde_json::to_string(strings)
+                    .expect("serializing string arrays for commit surfaces should not fail")
+            })
+        })
+        .collect::<Vec<_>>();
+    Arc::new(StringArray::from(values)) as ArrayRef
 }
 
 fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {

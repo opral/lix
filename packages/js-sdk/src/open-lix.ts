@@ -192,6 +192,14 @@ export type MergeVersionResult = {
 };
 
 export type Lix = {
+	/**
+	 * Executes one DataFusion SQL statement against this Lix session.
+	 *
+	 * This is not SQLite SQL. Use the DataFusion SQL dialect; positional
+	 * placeholders are `$1`, `$2`, and so on. SQLite-specific catalog tables and
+	 * transaction statements such as `sqlite_master`, `BEGIN`, and `COMMIT` are
+	 * not available. Use `information_schema` for catalog inspection.
+	 */
 	execute(
 		sql: string,
 		params?: ReadonlyArray<LixRuntimeValue>,
@@ -212,6 +220,10 @@ type WasmExecuteResult = {
 };
 
 type WasmLix = {
+	/**
+	 * Executes one DataFusion SQL statement. See `Lix.execute` for the public
+	 * SQL contract.
+	 */
 	execute(sql: string, params: unknown[]): Promise<WasmExecuteResult>;
 	activeVersionId(): Promise<string>;
 	createVersion(options: CreateVersionOptions): Promise<CreateVersionResult>;
