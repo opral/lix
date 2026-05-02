@@ -145,6 +145,34 @@ test("engine errors expose structured hints", async () => {
 	await lix.close();
 });
 
+test("lix_state_history snapshot_content preserves JSON null for binary file rows", async () => {
+	const lix = await openLix();
+
+	await lix.execute(
+		"INSERT INTO lix_file (id, path, data, hidden) VALUES ($1, $2, $3, false)",
+		[
+			"history-binary-js-repro",
+			"/history/repro.bin",
+			new Uint8Array([0x80, 0xff, 0x00]),
+		],
+	);
+
+	const result = await lix.execute(
+		"SELECT schema_key, snapshot_content \
+		 FROM lix_state_history \
+		 WHERE start_commit_id = lix_active_version_commit_id()",
+	);
+	const directoryRow = result.rows.find(
+		(row) => row.get("schema_key") === "lix_directory_descriptor",
+	);
+
+	expect(directoryRow?.get("snapshot_content")).toMatchObject({
+		parent_id: null,
+	});
+
+	await lix.close();
+});
+
 async function registerCrmTaskSchema(lix: Lix) {
 	const schema = {
 		$schema: "https://json-schema.org/draft/2020-12/schema",

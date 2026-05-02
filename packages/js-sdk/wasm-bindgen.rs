@@ -7,6 +7,7 @@ mod wasm {
         Lix as RsLix, LixBackend, LixBackendTransaction, LixError, MergeVersionOptions,
         OpenLixOptions, SwitchVersionOptions, TransactionBeginMode, Value,
     };
+    use serde::Serialize;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
 
@@ -838,7 +839,8 @@ export type MergeVersionResult = {
             }
             Value::Json(value) => {
                 set_string(&object, "kind", "json")?;
-                let value = serde_wasm_bindgen::to_value(value).map_err(|error| {
+                let serializer = serde_wasm_bindgen::Serializer::json_compatible();
+                let value = value.serialize(&serializer).map_err(|error| {
                     LixError::new(
                         "LIX_ERROR_JS_SDK",
                         format!("could not serialize JSON value: {error}"),
