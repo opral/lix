@@ -24,6 +24,84 @@ simulation_test!(create_version_from_main, |sim| async move {
     drop(engine);
 });
 
+simulation_test!(create_version_rejects_existing_id, |sim| async move {
+    let (engine, main, draft) = create_draft_from_main(&sim).await;
+
+    let error = main
+        .create_version(CreateVersionOptions {
+            id: Some("draft-version".to_string()),
+            name: "Overwritten draft".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect_err("creating a version with an existing id should fail");
+
+    assert_eq!(error.code, "LIX_ERROR_UNIQUE");
+    assert!(
+        error
+            .to_string()
+            .contains("INSERT would duplicate entity_id"),
+        "error should explain the duplicate version id: {error:?}"
+    );
+    assert_version_descriptor(&main, "draft-version", "Draft").await;
+
+    drop(draft);
+    drop(main);
+    drop(engine);
+});
+
+simulation_test!(
+    create_version_can_start_from_explicit_commit,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_version_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('main-after-initial', 'main')",
+            &[],
+        )
+        .await
+        .expect("main write should succeed");
+
+        assert_key_value(&main, "main-after-initial", Some("\"main\"")).await;
+
+        let receipt = main
+            .create_version(CreateVersionOptions {
+                id: Some("from-initial".to_string()),
+                name: "From initial".to_string(),
+                from_commit_id: Some(sim.initial_commit_id().to_string()),
+            })
+            .await
+            .expect("version should be created from explicit commit");
+        assert_eq!(receipt.version_id, "from-initial");
+        assert_eq!(
+            engine
+                .load_version_head_commit_id("from-initial")
+                .await
+                .expect("version head should load"),
+            Some(sim.initial_commit_id().to_string())
+        );
+
+        let from_initial = main.wrap_session(
+            engine
+                .open_session("from-initial")
+                .await
+                .expect("explicit commit version session should open"),
+            &engine,
+        );
+        assert_key_value(&from_initial, "main-after-initial", None).await;
+
+        drop(from_initial);
+        drop(main);
+        drop(engine);
+    }
+);
+
 simulation_test!(created_version_sees_inherited_state, |sim| async move {
     let (_engine, _main, draft) = create_draft_after_shared_write(&sim).await;
 
@@ -984,6 +1062,7 @@ async fn create_draft(
         .create_version(CreateVersionOptions {
             id: Some("draft-version".to_string()),
             name: "Draft".to_string(),
+            from_commit_id: None,
         })
         .await
         .expect("version should be created");
