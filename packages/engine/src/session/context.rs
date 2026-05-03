@@ -232,9 +232,10 @@ impl SessionContext {
             .load_head_commit_id(&version_id)
             .await?;
         if head.is_none() {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("workspace version selector points to missing version ref '{version_id}'"),
+            return Err(LixError::version_not_found(
+                version_id,
+                "load_workspace_version_id",
+                "workspace_selector",
             ));
         }
 

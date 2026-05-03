@@ -3,7 +3,8 @@
 mod support;
 use lix_engine::Value;
 use lix_engine::{
-    CreateVersionOptions, Engine, MergeVersionOptions, MergeVersionOutcome, SwitchVersionOptions,
+    CreateVersionOptions, Engine, LixError, MergeVersionOptions, MergeVersionOutcome,
+    SwitchVersionOptions,
 };
 use serde_json::Value as JsonValue;
 
@@ -219,7 +220,10 @@ simulation_test!(
             })
             .await
             .expect("version should be created from explicit commit");
-        assert_eq!(receipt.version_id, "from-initial");
+        assert_eq!(receipt.id, "from-initial");
+        assert_eq!(receipt.name, "From initial");
+        assert!(!receipt.hidden);
+        assert_eq!(receipt.commit_id, sim.initial_commit_id());
         assert_eq!(
             engine
                 .load_version_head_commit_id("from-initial")
@@ -564,9 +568,28 @@ simulation_test!(
             panic!("missing version ref should fail");
         };
 
-        assert!(error
-            .description
-            .contains("cannot switch to missing version ref 'missing-version'"));
+        assert_eq!(error.code, LixError::CODE_VERSION_NOT_FOUND);
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("version_id")),
+            Some(&JsonValue::String("missing-version".to_string()))
+        );
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("operation")),
+            Some(&JsonValue::String("switch_version".to_string()))
+        );
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("role")),
+            Some(&JsonValue::String("target".to_string()))
+        );
     }
 );
 
@@ -1233,9 +1256,28 @@ simulation_test!(
             .await
             .expect_err("missing source ref should fail");
 
-        assert!(error
-            .description
-            .contains("cannot merge from missing source version ref 'missing-version'"));
+        assert_eq!(error.code, LixError::CODE_VERSION_NOT_FOUND);
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("version_id")),
+            Some(&JsonValue::String("missing-version".to_string()))
+        );
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("operation")),
+            Some(&JsonValue::String("merge_version".to_string()))
+        );
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("role")),
+            Some(&JsonValue::String("source".to_string()))
+        );
     }
 );
 
@@ -1309,10 +1351,28 @@ async fn create_draft(
         })
         .await
         .expect("version should be created");
-    assert_eq!(receipt.version_id, "draft-version");
+    assert_eq!(receipt.id, "draft-version");
+    let version_row = main
+        .execute(
+            "SELECT id, name, hidden, commit_id FROM lix_version WHERE id = 'draft-version'",
+            &[],
+        )
+        .await
+        .expect("created version should be queryable through lix_version");
+    assert_eq!(version_row.len(), 1);
+    assert_eq!(
+        version_row.rows()[0].values(),
+        &[
+            Value::Text(receipt.id.clone()),
+            Value::Text(receipt.name.clone()),
+            Value::Boolean(receipt.hidden),
+            Value::Text(receipt.commit_id.clone()),
+        ],
+        "create_version should return the same public shape as lix_version"
+    );
     main.wrap_session(
         engine
-            .open_session(receipt.version_id)
+            .open_session(receipt.id)
             .await
             .expect("draft session should open"),
         engine,

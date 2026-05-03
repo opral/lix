@@ -19,7 +19,10 @@ pub struct CreateVersionOptions {
 /// Receipt returned after creating a version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateVersionReceipt {
-    pub version_id: String,
+    pub id: String,
+    pub name: String,
+    pub hidden: bool,
+    pub commit_id: String,
 }
 
 impl SessionContext {
@@ -46,12 +49,10 @@ impl SessionContext {
                         .load_head_commit_id(&active_version_id)
                         .await?
                         .ok_or_else(|| {
-                            LixError::new(
-                                "LIX_ERROR_UNKNOWN",
-                                format!(
-                                    "cannot create version from missing active version ref '{}'",
-                                    active_version_id
-                                ),
+                            LixError::version_not_found(
+                                active_version_id.clone(),
+                                "create_version",
+                                "source",
                             )
                         })?
                 };
@@ -64,7 +65,12 @@ impl SessionContext {
                     ],
                 })?;
 
-                Ok(CreateVersionReceipt { version_id })
+                Ok(CreateVersionReceipt {
+                    id: version_id,
+                    name: options.name,
+                    hidden: false,
+                    commit_id: source_head,
+                })
             })
         })
         .await

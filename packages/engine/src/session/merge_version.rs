@@ -59,24 +59,20 @@ impl SessionContext {
                         .load_head_commit_id(&active_version_id)
                         .await?
                         .ok_or_else(|| {
-                            LixError::new(
-                                "LIX_ERROR_UNKNOWN",
-                                format!(
-                                    "cannot merge into missing active version ref '{}'",
-                                    active_version_id
-                                ),
+                            LixError::version_not_found(
+                                active_version_id.clone(),
+                                "merge_version",
+                                "target",
                             )
                         })?;
                     let source_head = reader
                         .load_head_commit_id(&source_version_id)
                         .await?
                         .ok_or_else(|| {
-                            LixError::new(
-                                "LIX_ERROR_UNKNOWN",
-                                format!(
-                                    "cannot merge from missing source version ref '{}'",
-                                    source_version_id
-                                ),
+                            LixError::version_not_found(
+                                source_version_id.clone(),
+                                "merge_version",
+                                "source",
                             )
                         })?;
                     (target_head, source_head)

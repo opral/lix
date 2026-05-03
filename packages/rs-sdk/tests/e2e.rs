@@ -46,9 +46,12 @@ async fn rs_sdk_open_register_write_query_version_and_merge_flow() {
         })
         .await
         .unwrap();
+    assert_eq!(draft.id, "draft-version");
+    assert_eq!(draft.name, "Draft");
+    assert!(!draft.hidden);
 
     lix.switch_version(SwitchVersionOptions {
-        version_id: draft.version_id.clone(),
+        version_id: draft.id.clone(),
     })
     .await
     .unwrap();
@@ -72,7 +75,7 @@ async fn rs_sdk_open_register_write_query_version_and_merge_flow() {
 
     let merge = lix
         .merge_version(MergeVersionOptions {
-            source_version_id: draft.version_id,
+            source_version_id: draft.id,
         })
         .await
         .unwrap();

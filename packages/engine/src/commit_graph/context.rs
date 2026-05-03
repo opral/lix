@@ -134,11 +134,13 @@ where
                 ),
             )),
             [base] => Ok(base.clone()),
-            _ => Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "commit_graph found ambiguous merge base between '{left_commit_id}' and '{right_commit_id}'"
-                ),
+            _ => Err(LixError::ambiguous_merge_base(
+                left_commit_id,
+                right_commit_id,
+                ancestors
+                    .iter()
+                    .map(|ancestor| ancestor.commit_id.clone())
+                    .collect(),
             )),
         }
     }
