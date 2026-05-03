@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use lix_engine::{CreateVersionOptions, Value};
 use serde_json::json;
@@ -345,6 +345,125 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_commit_derived_by_version_surfaces_match_commit_entity_projection,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('main-edge-probe', 'main')",
+            &[],
+        )
+        .await
+        .expect("main write should succeed");
+
+        main.create_version(CreateVersionOptions {
+            id: Some("edge-probe-a".to_string()),
+            name: "Edge Probe A".to_string(),
+            from_commit_id: Some(sim.initial_commit_id().to_string()),
+        })
+        .await
+        .expect("edge-probe-a should be created from the initial commit");
+        main.create_version(CreateVersionOptions {
+            id: Some("edge-probe-b".to_string()),
+            name: "Edge Probe B".to_string(),
+            from_commit_id: Some(sim.initial_commit_id().to_string()),
+        })
+        .await
+        .expect("edge-probe-b should be created from the initial commit");
+
+        let branch_a = sim.wrap_session(
+            engine
+                .open_session("edge-probe-a")
+                .await
+                .expect("edge-probe-a session should open"),
+            &engine,
+        );
+        branch_a
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('edge-probe-a-only', 'a')",
+                &[],
+            )
+            .await
+            .expect("edge-probe-a write should succeed");
+
+        let branch_b = sim.wrap_session(
+            engine
+                .open_session("edge-probe-b")
+                .await
+                .expect("edge-probe-b session should open"),
+            &engine,
+        );
+        branch_b
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('edge-probe-b-only', 'b')",
+                &[],
+            )
+            .await
+            .expect("edge-probe-b write should succeed");
+
+        let global_change_set_elements = change_set_elements_by_version(&main, "global").await;
+        for version_id in [sim.main_version_id(), "edge-probe-a", "edge-probe-b"] {
+            let commits = commit_parents_by_version(&main, version_id).await;
+            let expected_edges = commits
+                .iter()
+                .flat_map(|(child_id, parent_ids)| {
+                    parent_ids
+                        .iter()
+                        .map(|parent_id| (parent_id.clone(), child_id.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<BTreeSet<_>>();
+            let actual_edges = commit_edges_by_version(&main, version_id).await;
+            assert_eq!(
+                actual_edges, expected_edges,
+                "lix_commit_edge_by_version should derive from lix_commit_by_version.parent_commit_ids for {version_id}"
+            );
+
+            let roots_from_parent_ids = commits
+                .iter()
+                .filter_map(|(commit_id, parent_ids)| {
+                    parent_ids.is_empty().then(|| commit_id.clone())
+                })
+                .collect::<BTreeSet<_>>();
+            let children_with_edges = actual_edges
+                .iter()
+                .map(|(_, child_id)| child_id.clone())
+                .collect::<BTreeSet<_>>();
+            let roots_from_edges = commits
+                .keys()
+                .filter(|commit_id| !children_with_edges.contains(*commit_id))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                roots_from_edges, roots_from_parent_ids,
+                "root discovery should agree for {version_id}"
+            );
+
+            let expected_change_sets = commit_change_sets_by_version(&main, version_id).await;
+            let actual_change_sets = change_sets_by_version(&main, version_id).await;
+            assert_eq!(
+                actual_change_sets, expected_change_sets,
+                "lix_change_set_by_version should derive from lix_commit_by_version.change_set_id for {version_id}"
+            );
+
+            let actual_change_set_elements =
+                change_set_elements_by_version(&main, version_id).await;
+            assert_eq!(
+                actual_change_set_elements, global_change_set_elements,
+                "lix_change_set_element_by_version should project derived global elements for {version_id}"
+            );
+        }
+    }
+);
+
+simulation_test!(
     lix_commit_surfaces_match_canonical_schema_definitions,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -445,6 +564,128 @@ fn assert_json_array_is_non_empty(value: &Value, column_name: &str) {
 
 fn assert_global_tracked(values: &[Value]) {
     assert_eq!(values, &[Value::Boolean(true), Value::Boolean(false)]);
+}
+
+async fn commit_parents_by_version(
+    session: &crate::support::simulation_test::engine::SimSession,
+    version_id: &str,
+) -> BTreeMap<String, Vec<String>> {
+    select_rows(
+        session,
+        &format!(
+            "SELECT id, parent_commit_ids \
+             FROM lix_commit_by_version \
+             WHERE lixcol_version_id = '{version_id}'"
+        ),
+    )
+    .await
+    .into_iter()
+    .map(|row| (text_value(&row[0]), json_string_array(&row[1])))
+    .collect()
+}
+
+async fn commit_edges_by_version(
+    session: &crate::support::simulation_test::engine::SimSession,
+    version_id: &str,
+) -> BTreeSet<(String, String)> {
+    select_rows(
+        session,
+        &format!(
+            "SELECT parent_id, child_id \
+             FROM lix_commit_edge_by_version \
+             WHERE lixcol_version_id = '{version_id}'"
+        ),
+    )
+    .await
+    .into_iter()
+    .map(|row| (text_value(&row[0]), text_value(&row[1])))
+    .collect()
+}
+
+async fn commit_change_sets_by_version(
+    session: &crate::support::simulation_test::engine::SimSession,
+    version_id: &str,
+) -> BTreeSet<String> {
+    select_rows(
+        session,
+        &format!(
+            "SELECT change_set_id \
+             FROM lix_commit_by_version \
+             WHERE lixcol_version_id = '{version_id}'"
+        ),
+    )
+    .await
+    .into_iter()
+    .map(|row| text_value(&row[0]))
+    .collect()
+}
+
+async fn change_sets_by_version(
+    session: &crate::support::simulation_test::engine::SimSession,
+    version_id: &str,
+) -> BTreeSet<String> {
+    select_rows(
+        session,
+        &format!(
+            "SELECT id \
+             FROM lix_change_set_by_version \
+             WHERE lixcol_version_id = '{version_id}'"
+        ),
+    )
+    .await
+    .into_iter()
+    .map(|row| text_value(&row[0]))
+    .collect()
+}
+
+async fn change_set_elements_by_version(
+    session: &crate::support::simulation_test::engine::SimSession,
+    version_id: &str,
+) -> BTreeSet<(String, String, String, String, Option<String>)> {
+    select_rows(
+        session,
+        &format!(
+            "SELECT change_set_id, change_id, entity_id, schema_key, file_id \
+             FROM lix_change_set_element_by_version \
+             WHERE lixcol_version_id = '{version_id}'"
+        ),
+    )
+    .await
+    .into_iter()
+    .map(|row| {
+        (
+            text_value(&row[0]),
+            text_value(&row[1]),
+            text_value(&row[2]),
+            text_value(&row[3]),
+            optional_text_value(&row[4]),
+        )
+    })
+    .collect()
+}
+
+fn optional_text_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::Text(value) => Some(value.clone()),
+        other => panic!("expected optional text value, got {other:?}"),
+    }
+}
+
+fn json_string_array(value: &Value) -> Vec<String> {
+    let Value::Json(value) = value else {
+        panic!("expected JSON array, got {value:?}");
+    };
+    value
+        .as_array()
+        .unwrap_or_else(|| panic!("expected JSON array, got {value:?}"))
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .unwrap_or_else(|| panic!("expected JSON string, got {item:?}"))
+                .to_string()
+        })
+        .collect()
 }
 
 fn builtin_schema_property_names(schema_key: &str) -> BTreeSet<String> {
