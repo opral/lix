@@ -744,7 +744,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
     use crate::changelog::{canonicalize_materialized_change, MaterializedCanonicalChange};
     use crate::entity_identity::EntityIdentity;
     use crate::json_store::JsonStoreContext;
@@ -764,7 +764,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_state_overlays_untracked_rows() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
         let untracked_state = UntrackedStateContext::new();
 
@@ -822,7 +822,7 @@ mod tests {
 
     #[tokio::test]
     async fn tracked_row_is_visible_without_untracked_overlay() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
 
         let mut transaction = backend
@@ -859,7 +859,7 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_untracked_row_reveals_tracked_row() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
         let untracked_state = UntrackedStateContext::new();
 
@@ -909,7 +909,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_row_falls_back_to_global_tracked_row_for_requested_version() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
 
         let mut transaction = backend
@@ -951,7 +951,7 @@ mod tests {
 
     #[tokio::test]
     async fn main_sees_global_row_by_reading_global_root_separately() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let tracked_state = TrackedStateContext::new();
         let live_state = LiveStateContext::new(
             tracked_state.clone(),
@@ -1004,7 +1004,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_row_prefers_requested_version_over_global() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
 
         let mut transaction = backend
@@ -1049,7 +1049,7 @@ mod tests {
 
     #[tokio::test]
     async fn main_override_hides_global_row() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
 
         let mut transaction = backend
@@ -1094,7 +1094,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_row_prefers_requested_untracked_over_requested_tracked_and_global_rows() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
         let untracked_state = UntrackedStateContext::new();
 
@@ -1142,7 +1142,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_rows_overlays_requested_version_over_global() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
 
         let mut transaction = backend
@@ -1186,7 +1186,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_rows_projects_global_row_into_requested_version() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
 
         let mut transaction = backend
@@ -1227,7 +1227,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_rows_does_not_project_global_rows_into_missing_version() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
 
         let mut transaction = backend
@@ -1264,7 +1264,7 @@ mod tests {
 
     #[tokio::test]
     async fn winning_tombstone_hides_row_unless_tombstones_are_included() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
 
         let mut transaction = backend
@@ -1309,7 +1309,7 @@ mod tests {
 
     #[tokio::test]
     async fn main_tombstone_hides_global_row() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
 
         let mut transaction = backend
@@ -1354,7 +1354,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_rows_projects_commit_graph_facts_as_global_rows() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
         append_commit_change(Arc::clone(&backend), "commit-a").await;
         write_version_refs(
@@ -1388,7 +1388,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_row_reads_commit_graph_fact() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
         append_commit_change(Arc::clone(&backend), "commit-a").await;
         write_version_refs(
@@ -1418,7 +1418,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_commit_row_does_not_project_into_missing_version() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
         append_commit_change(Arc::clone(&backend), "commit-a").await;
 
@@ -1441,7 +1441,7 @@ mod tests {
 
     #[tokio::test]
     async fn writer_rejects_tracked_root_batches_that_mix_global_and_version_rows() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -1475,7 +1475,7 @@ mod tests {
 
     #[tokio::test]
     async fn writer_rejects_tracked_rows_with_invalid_storage_scope() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
         let mut invalid_row =
             tracked_row_at_with_commit("version-a", "bad-row", Some("change-bad"), "commit-bad");
@@ -1499,7 +1499,7 @@ mod tests {
 
     #[tokio::test]
     async fn writer_allows_commit_fact_to_share_the_touched_version_commit_id() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -1538,7 +1538,7 @@ mod tests {
 
     #[tokio::test]
     async fn writer_uses_first_parent_as_merge_root_base() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
         let mut seed_transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -1579,7 +1579,7 @@ mod tests {
 
     #[tokio::test]
     async fn writer_rejects_commit_root_with_missing_parent_commit_ids() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -1615,7 +1615,7 @@ mod tests {
 
     #[tokio::test]
     async fn writer_rejects_commit_root_with_non_array_parent_commit_ids() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = live_state_context();
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -1654,7 +1654,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_global_root_does_not_store_global_rows() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let tracked_state = TrackedStateContext::new();
         let live_state = LiveStateContext::new(
             tracked_state.clone(),
@@ -1700,7 +1700,7 @@ mod tests {
 
     async fn load_selected_tab(
         live_state: &LiveStateContext,
-        backend: Arc<dyn LixBackend + Send + Sync>,
+        backend: Arc<dyn Backend + Send + Sync>,
     ) -> Result<Option<LiveStateRow>, LixError> {
         live_state
             .reader(backend)
@@ -1715,7 +1715,7 @@ mod tests {
 
     async fn load_selected_tab_at(
         live_state: &LiveStateContext,
-        backend: Arc<dyn LixBackend + Send + Sync>,
+        backend: Arc<dyn Backend + Send + Sync>,
         version_id: &str,
     ) -> Result<Option<LiveStateRow>, LixError> {
         live_state
@@ -1731,7 +1731,7 @@ mod tests {
 
     async fn scan_selected_tab_at(
         live_state: &LiveStateContext,
-        backend: Arc<dyn LixBackend + Send + Sync>,
+        backend: Arc<dyn Backend + Send + Sync>,
         version_id: &str,
         include_tombstones: bool,
     ) -> Result<Vec<LiveStateRow>, LixError> {
@@ -1755,7 +1755,7 @@ mod tests {
 
     async fn scan_tracked_root(
         tracked_state: &TrackedStateContext,
-        backend: Arc<dyn LixBackend + Send + Sync>,
+        backend: Arc<dyn Backend + Send + Sync>,
         commit_id: &str,
     ) -> Vec<TrackedStateRow> {
         tracked_state
@@ -1857,7 +1857,7 @@ mod tests {
     }
 
     async fn write_version_refs(
-        backend: Arc<dyn LixBackend + Send + Sync>,
+        backend: Arc<dyn Backend + Send + Sync>,
         refs: &[UntrackedStateRow],
     ) {
         let mut transaction = backend
@@ -1917,7 +1917,7 @@ mod tests {
         }
     }
 
-    async fn append_commit_change(backend: Arc<dyn LixBackend + Send + Sync>, commit_id: &str) {
+    async fn append_commit_change(backend: Arc<dyn Backend + Send + Sync>, commit_id: &str) {
         let changelog = crate::changelog::ChangelogContext::new();
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)

@@ -63,7 +63,7 @@ fn encode_change_key(change_id: &str) -> Vec<u8> {
 mod tests {
     use std::sync::Arc;
 
-    use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
     use crate::changelog::{
         canonicalize_materialized_change, materialize_change, ChangelogContext,
         ChangelogScanRequest, MaterializedCanonicalChange,
@@ -175,7 +175,7 @@ mod tests {
 
     async fn append_test_changes(
         changelog: &ChangelogContext,
-        tx: &mut (dyn crate::LixBackendTransaction + Send + Sync),
+        tx: &mut (dyn crate::BackendTransaction + Send + Sync),
         changes: &[MaterializedCanonicalChange],
     ) {
         let mut json_writer = JsonStoreContext::new().writer();

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lix_rs_sdk::{
-    open_lix, CreateVersionOptions, KvPair, KvScanRange, LixBackend, LixBackendTransaction,
+    open_lix, CreateVersionOptions, KvPair, KvScanRange, Backend, BackendTransaction,
     LixError, MergeVersionOptions, MergeVersionOutcome, OpenLixOptions, SwitchVersionOptions,
     TransactionBeginMode, Value,
 };
@@ -368,11 +368,11 @@ impl SharedTestBackend {
 }
 
 #[async_trait]
-impl LixBackend for SharedTestBackend {
+impl Backend for SharedTestBackend {
     async fn begin_transaction(
         &self,
         mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
+    ) -> Result<Box<dyn BackendTransaction + Send + Sync + 'static>, LixError> {
         let mut active_transaction = self
             .active_transaction
             .lock()
@@ -439,7 +439,7 @@ struct SharedTestTransaction {
 }
 
 #[async_trait]
-impl LixBackendTransaction for SharedTestTransaction {
+impl BackendTransaction for SharedTestTransaction {
     fn mode(&self) -> TransactionBeginMode {
         self.mode
     }

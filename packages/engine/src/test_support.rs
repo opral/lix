@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::backend::{LixBackend, TransactionBeginMode};
+use crate::backend::{Backend, TransactionBeginMode};
 use crate::tracked_state::{TrackedStateContext, TrackedStateRow};
 use crate::untracked_state::UntrackedStateContext;
 use crate::version::VersionContext;
@@ -15,7 +15,7 @@ const TEST_TIMESTAMP: &str = "1970-01-01T00:00:00.000Z";
 /// the serving projection. This helper keeps that invariant in one place while
 /// still letting low-level tests use synthetic commit ids.
 pub(crate) async fn seed_version_head(
-    backend: &(dyn LixBackend + Send + Sync),
+    backend: &(dyn Backend + Send + Sync),
     version_id: &str,
     commit_id: &str,
 ) {
@@ -23,13 +23,13 @@ pub(crate) async fn seed_version_head(
 }
 
 /// Seeds the global version head to an empty tracked root for unit tests.
-pub(crate) async fn seed_global_version_head(backend: &(dyn LixBackend + Send + Sync)) {
+pub(crate) async fn seed_global_version_head(backend: &(dyn Backend + Send + Sync)) {
     seed_version_head(backend, GLOBAL_VERSION_ID, TEST_EMPTY_ROOT_COMMIT_ID).await;
 }
 
 /// Seeds a version head and writes the tracked root contents for its commit.
 pub(crate) async fn seed_version_head_with_rows(
-    backend: &(dyn LixBackend + Send + Sync),
+    backend: &(dyn Backend + Send + Sync),
     version_id: &str,
     commit_id: &str,
     rows: &[TrackedStateRow],

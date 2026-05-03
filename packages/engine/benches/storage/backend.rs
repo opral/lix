@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use lix_engine::{
-    KvPair, KvScanRange, LixBackend, LixBackendTransaction, LixError, TransactionBeginMode,
+    Backend, BackendTransaction, KvPair, KvScanRange, LixError, TransactionBeginMode,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -31,11 +31,11 @@ impl BenchBackend {
 }
 
 #[async_trait]
-impl LixBackend for BenchBackend {
+impl Backend for BenchBackend {
     async fn begin_transaction(
         &self,
         mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
+    ) -> Result<Box<dyn BackendTransaction + Send + Sync + 'static>, LixError> {
         Ok(Box::new(BenchTransaction {
             store: Arc::clone(&self.store),
             mode,
@@ -62,7 +62,7 @@ impl LixBackend for BenchBackend {
 }
 
 #[async_trait]
-impl LixBackendTransaction for BenchTransaction {
+impl BackendTransaction for BenchTransaction {
     fn mode(&self) -> TransactionBeginMode {
         self.mode
     }

@@ -4,7 +4,7 @@ mod wasm {
     use js_sys::{Array, Object, Reflect};
     use lix_rs_sdk::{
         open_lix as open_lix_rs, CreateVersionOptions, ExecuteResult, KvPair, KvScanRange,
-        Lix as RsLix, LixBackend, LixBackendTransaction, LixError, MergeVersionOptions,
+        Lix as RsLix, Backend, BackendTransaction, LixError, MergeVersionOptions,
         OpenLixOptions, SwitchVersionOptions, TransactionBeginMode, Value,
     };
     use serde::Serialize;
@@ -54,7 +54,7 @@ export type KvPair = {
   value: Uint8Array;
 };
 
-export type LixBackendTransaction = {
+export type BackendTransaction = {
   kvGet(namespace: string, key: Uint8Array): Uint8Array | null | undefined;
   kvScan(namespace: string, range: KvScanRange, limit?: number | null): KvPair[];
   kvPut(namespace: string, key: Uint8Array, value: Uint8Array): void;
@@ -63,15 +63,15 @@ export type LixBackendTransaction = {
   rollback(): void;
 };
 
-export type LixBackend = {
-  beginTransaction(mode: TransactionBeginMode): LixBackendTransaction;
+export type Backend = {
+  beginTransaction(mode: TransactionBeginMode): BackendTransaction;
   kvGet?(namespace: string, key: Uint8Array): Uint8Array | null | undefined;
   kvScan?(namespace: string, range: KvScanRange, limit?: number | null): KvPair[];
   close?(): void;
 };
 
 export type OpenLixOptions = {
-  backend?: LixBackend;
+  backend?: Backend;
 };
 
 export type CreateVersionOptions = {
@@ -282,11 +282,11 @@ export type MergeVersionResult = {
     unsafe impl Sync for JsBackend {}
 
     #[async_trait]
-    impl LixBackend for JsBackend {
+    impl Backend for JsBackend {
         async fn begin_transaction(
             &self,
             mode: TransactionBeginMode,
-        ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
+        ) -> Result<Box<dyn BackendTransaction + Send + Sync + 'static>, LixError> {
             let transaction = call_method1(
                 &self.inner,
                 "beginTransaction",
@@ -375,7 +375,7 @@ export type MergeVersionResult = {
     unsafe impl Sync for JsBackendTransaction {}
 
     #[async_trait]
-    impl LixBackendTransaction for JsBackendTransaction {
+    impl BackendTransaction for JsBackendTransaction {
         fn mode(&self) -> TransactionBeginMode {
             self.mode
         }
@@ -552,7 +552,7 @@ export type MergeVersionResult = {
     fn reject_promise(value: JsValue) -> Result<JsValue, LixError> {
         if value.is_instance_of::<js_sys::Promise>() {
             return Err(js_sdk_error(
-                "JavaScript LixBackend methods must return synchronously",
+                "JavaScript Backend methods must return synchronously",
             ));
         }
         Ok(value)

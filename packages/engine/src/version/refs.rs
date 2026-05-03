@@ -230,7 +230,7 @@ fn version_ref_row(
 mod tests {
     use std::sync::Arc;
 
-    use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
     use crate::untracked_state::{UntrackedStateContext, UntrackedStateRowRequest};
 
     use super::*;
@@ -251,7 +251,7 @@ mod tests {
 
     #[tokio::test]
     async fn advance_head_writes_untracked_global_ref() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let version_ref = VersionRefContext::new(Arc::new(UntrackedStateContext::new()));
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -295,7 +295,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_heads_returns_sorted_version_heads() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let version_ref = test_version_ref();
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -340,7 +340,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_snapshot_errors_clearly() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let untracked_state = UntrackedStateContext::new();
         let version_ref = VersionRefContext::new(Arc::new(UntrackedStateContext::new()));
         let mut transaction = backend

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::backend::{LixBackend, LixBackendTransaction};
+use crate::backend::{Backend, BackendTransaction};
 use crate::LixError;
 
 /// One key/value pair returned by a backend KV scan.
@@ -55,8 +55,8 @@ impl KvScanRange {
 ///
 /// Higher-level stores should depend on this trait so the same reader API works
 /// both outside and inside a transaction. Outside a transaction, callers can
-/// pass `&dyn LixBackend`; inside a transaction, callers can pass
-/// `&mut dyn LixBackendTransaction`.
+/// pass `&dyn Backend`; inside a transaction, callers can pass
+/// `&mut dyn BackendTransaction`.
 #[async_trait]
 pub(crate) trait KvStore: Send {
     async fn kv_get(&mut self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError>;
@@ -83,7 +83,7 @@ pub(crate) trait KvWriter: KvStore {
 #[async_trait]
 impl<T> KvStore for &T
 where
-    T: LixBackend + ?Sized,
+    T: Backend + ?Sized,
 {
     async fn kv_get(&mut self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
         (*self).kv_get(namespace, key).await
@@ -102,7 +102,7 @@ where
 #[async_trait]
 impl<T> KvStore for Arc<T>
 where
-    T: LixBackend + ?Sized,
+    T: Backend + ?Sized,
 {
     async fn kv_get(&mut self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
         self.as_ref().kv_get(namespace, key).await
@@ -137,7 +137,7 @@ impl KvStore for &mut dyn KvStore {
 #[async_trait]
 impl<T> KvStore for &mut T
 where
-    T: LixBackendTransaction + ?Sized,
+    T: BackendTransaction + ?Sized,
 {
     async fn kv_get(&mut self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
         (**self).kv_get(namespace, key).await
@@ -183,7 +183,7 @@ impl KvWriter for &mut dyn KvWriter {
 #[async_trait]
 impl<T> KvWriter for &mut T
 where
-    T: LixBackendTransaction + ?Sized,
+    T: BackendTransaction + ?Sized,
 {
     async fn kv_put(&mut self, namespace: &str, key: &[u8], value: &[u8]) -> Result<(), LixError> {
         (**self).kv_put(namespace, key, value).await
@@ -204,7 +204,7 @@ mod tests {
 
     #[tokio::test]
     async fn backend_and_transaction_handles_share_kv_read_trait() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await

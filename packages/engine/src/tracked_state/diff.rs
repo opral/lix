@@ -173,7 +173,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
     use crate::tracked_state::TrackedStateContext;
     use crate::NullableKeyFilter;
 

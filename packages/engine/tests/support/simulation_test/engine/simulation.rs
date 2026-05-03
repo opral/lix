@@ -1,9 +1,9 @@
+use lix_engine::{Backend, LixError, Value};
 use lix_engine::{
     CreateVersionOptions, CreateVersionReceipt, Engine, ExecuteResult, InitReceipt,
     MergeVersionOptions, MergeVersionReceipt, SessionContext, SwitchVersionOptions,
     SwitchVersionReceipt,
 };
-use lix_engine::{LixBackend, LixError, Value};
 
 use super::expect_same::SimulationAssertions;
 use super::kv_backend::InMemoryKvBackend;
@@ -74,7 +74,7 @@ impl Simulation {
     }
 
     /// Returns a fresh, empty backend for lifecycle tests.
-    pub fn uninitialized_backend(&self) -> Box<dyn LixBackend + Send + Sync> {
+    pub fn uninitialized_backend(&self) -> Box<dyn Backend + Send + Sync> {
         Box::new(InMemoryKvBackend::new())
     }
 

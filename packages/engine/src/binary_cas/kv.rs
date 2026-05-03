@@ -287,7 +287,7 @@ fn decode_json<T: serde::de::DeserializeOwned>(bytes: &[u8], label: &str) -> Res
 mod tests {
     use super::*;
     use crate::backend::testing::UnitTestBackend;
-    use crate::backend::{LixBackend, TransactionBeginMode};
+    use crate::backend::{Backend, TransactionBeginMode};
 
     #[tokio::test]
     async fn stores_manifest_chunks_in_scan_order() {

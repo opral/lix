@@ -34,7 +34,7 @@ pub use schema::{
 };
 
 pub use backend::TransactionBeginMode;
-pub use backend::{KvPair, KvScanRange, LixBackend, LixBackendTransaction};
+pub use backend::{Backend, BackendTransaction, KvPair, KvScanRange};
 pub use common::LixError;
 pub use common::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,

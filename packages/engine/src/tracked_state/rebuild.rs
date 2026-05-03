@@ -81,7 +81,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
     use crate::changelog::{
         canonicalize_materialized_change, ChangelogContext, MaterializedCanonicalChange,
     };

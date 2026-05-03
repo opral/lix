@@ -8,7 +8,7 @@ use crate::transaction::staging::StagedWriteSet;
 use crate::transaction::types::{StagedAdoptedStateRow, StagedCommitMembers, StagedStateRow};
 use crate::version::{VersionContext, VersionRefReader};
 use crate::GLOBAL_VERSION_ID;
-use crate::{LixBackendTransaction, LixError};
+use crate::{BackendTransaction, LixError};
 
 /// Commits transaction-staged rows into durable tracked and untracked stores.
 ///
@@ -22,7 +22,7 @@ pub(crate) async fn commit_staged_writes(
     changelog: &ChangelogContext,
     live_state: &LiveStateContext,
     version_ctx: &VersionContext,
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: &mut dyn BackendTransaction,
     staged_writes: StagedWriteSet,
 ) -> Result<(), LixError> {
     if !staged_writes.file_data_writes.is_empty() {
@@ -112,7 +112,7 @@ pub(crate) async fn commit_staged_writes(
 
 async fn new_canonical_changes(
     changelog: &ChangelogContext,
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: &mut dyn BackendTransaction,
     json_writer: &mut JsonStoreWriter,
     rows: &[StagedStateRow],
 ) -> Result<Vec<CanonicalChange>, LixError> {
@@ -144,7 +144,7 @@ async fn new_canonical_changes(
 
 async fn validate_adopted_canonical_changes(
     changelog: &ChangelogContext,
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: &mut dyn BackendTransaction,
     rows: &[StagedAdoptedStateRow],
 ) -> Result<(), LixError> {
     let mut json_writer = JsonStoreContext::new().writer();
@@ -263,7 +263,7 @@ async fn finalize_commit_rows(
     commit_members_by_version: BTreeMap<String, StagedCommitMembers>,
     extra_commit_parents_by_version: BTreeMap<String, Vec<String>>,
     version_ctx: &VersionContext,
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: &mut dyn BackendTransaction,
 ) -> Result<FinalizedCommitRows, LixError> {
     let mut commit_rows = Vec::new();
     let mut version_heads = Vec::new();
@@ -350,7 +350,7 @@ mod tests {
     use serde_json::Value as JsonValue;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
     use crate::changelog::ChangelogContext;
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
     use crate::untracked_state::{
@@ -369,7 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_staged_writes_appends_changelog_and_updates_serving_projection() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
         let live_state = Arc::new(live_state_context());
@@ -433,7 +433,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_with_only_untracked_writes_does_not_create_lix_commit() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
         let live_state = Arc::new(live_state_context());
@@ -496,7 +496,7 @@ mod tests {
 
     #[tokio::test]
     async fn tracked_write_deletes_matching_untracked_overlay() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
         let untracked_state = UntrackedStateContext::new();
@@ -568,7 +568,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_global_tracked_write_creates_one_commit_and_advances_only_touched_version() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
         let live_state = Arc::new(live_state_context());
@@ -653,7 +653,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_commit_rows_parents_global_commit_to_existing_version_ref() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
         crate::test_support::seed_version_head(
             backend.as_ref(),
@@ -730,7 +730,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_commit_rows_skips_empty_members() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -754,7 +754,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_commit_rows_uses_existing_version_ref_as_parent() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
         crate::test_support::seed_version_head(
             backend.as_ref(),
@@ -800,7 +800,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_commit_rows_appends_extra_merge_parent_after_target_head() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
         crate::test_support::seed_version_head(backend.as_ref(), "version-a", "target-head").await;
 

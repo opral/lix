@@ -4,11 +4,11 @@ use crate::backend::{KvPair, KvScanRange, TransactionBeginMode};
 use crate::LixError;
 
 #[async_trait]
-pub trait LixBackend: Send + Sync {
+pub trait Backend: Send + Sync {
     async fn begin_transaction(
         &self,
         mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError>;
+    ) -> Result<Box<dyn BackendTransaction + Send + Sync + 'static>, LixError>;
 
     /// Reads one value from the backend key/value store.
     async fn kv_get(&self, _namespace: &str, _key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
@@ -64,7 +64,7 @@ pub trait LixBackend: Send + Sync {
 }
 
 #[async_trait]
-pub trait LixBackendTransaction: Send + Sync {
+pub trait BackendTransaction: Send + Sync {
     fn mode(&self) -> TransactionBeginMode;
 
     /// Reads one value from the backend key/value store inside this transaction.

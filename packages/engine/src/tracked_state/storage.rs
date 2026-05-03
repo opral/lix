@@ -712,11 +712,11 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
 
     #[tokio::test]
     async fn root_roundtrips_through_kv_storage() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let root = TrackedStateRootId::new([7_u8; TRACKED_STATE_HASH_BYTES]);
 
         let mut transaction = backend
@@ -742,7 +742,7 @@ mod tests {
 
     #[tokio::test]
     async fn chunk_roundtrips_through_kv_storage() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let data = b"chunk-data".to_vec();
         let chunk = PendingChunkWrite {
             hash: crate::tracked_state::codec::hash_bytes(&data),
@@ -772,7 +772,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_roundtrips_raw_payload() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let snapshot_content = "{\"value\":\"small\"}";
         let encoded = encode_snapshot_content(snapshot_content).expect("snapshot should encode");
         assert_eq!(encoded.snapshot_ref.codec, SnapshotCodec::Raw);
@@ -804,7 +804,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_roundtrips_zstd_payload() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let snapshot_content = "zstd-friendly text ".repeat(2048);
         let encoded = encode_snapshot_content(&snapshot_content).expect("snapshot should encode");
         assert_eq!(encoded.snapshot_ref.codec, SnapshotCodec::Zstd);
@@ -837,7 +837,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_roundtrips_json_chunks_and_shares_unchanged_chunks() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let before = large_json_array(None);
         let after = large_json_array(Some((128, "changed")));
         let expected_before = canonical_json(&before);

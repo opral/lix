@@ -3,9 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::backend::{
-    KvPair, KvScanRange, LixBackend, LixBackendTransaction, TransactionBeginMode,
-};
+use crate::backend::{Backend, BackendTransaction, KvPair, KvScanRange, TransactionBeginMode};
 use crate::LixError;
 
 type KvMap = BTreeMap<(String, Vec<u8>), Vec<u8>>;
@@ -26,11 +24,11 @@ impl UnitTestBackend {
 }
 
 #[async_trait]
-impl LixBackend for UnitTestBackend {
+impl Backend for UnitTestBackend {
     async fn begin_transaction(
         &self,
         mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
+    ) -> Result<Box<dyn BackendTransaction + Send + Sync + 'static>, LixError> {
         let snapshot = self
             .kv
             .lock()
@@ -73,7 +71,7 @@ struct UnitTestTransaction {
 }
 
 #[async_trait]
-impl LixBackendTransaction for UnitTestTransaction {
+impl BackendTransaction for UnitTestTransaction {
     fn mode(&self) -> TransactionBeginMode {
         self.mode
     }
@@ -116,11 +114,11 @@ impl LixBackendTransaction for UnitTestTransaction {
 }
 
 #[async_trait]
-impl LixBackend for Arc<UnitTestBackend> {
+impl Backend for Arc<UnitTestBackend> {
     async fn begin_transaction(
         &self,
         mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
+    ) -> Result<Box<dyn BackendTransaction + Send + Sync + 'static>, LixError> {
         self.as_ref().begin_transaction(mode).await
     }
 

@@ -24,7 +24,7 @@ use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWrite
 use crate::transaction::validation::{validate_staged_writes, TransactionValidationInput};
 use crate::version::{VersionContext, VersionRefReader};
 use crate::GLOBAL_VERSION_ID;
-use crate::{LixBackend, LixBackendTransaction, LixError, NullableKeyFilter};
+use crate::{Backend, BackendTransaction, LixError, NullableKeyFilter};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TransactionCommitOutcome;
@@ -42,14 +42,14 @@ pub(crate) struct TransactionCommitOutcome;
 /// helpers.
 pub(crate) struct Transaction<'tx> {
     active_version_id: String,
-    backend: &'tx Arc<dyn LixBackend + Send + Sync>,
+    backend: &'tx Arc<dyn Backend + Send + Sync>,
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
     changelog: Arc<ChangelogContext>,
     version_ctx: Arc<VersionContext>,
     staged_writes: Arc<TransactionStagedWrites>,
-    backend_transaction: Box<dyn LixBackendTransaction + Send + Sync + 'static>,
+    backend_transaction: Box<dyn BackendTransaction + Send + Sync + 'static>,
     visible_schemas: Vec<JsonValue>,
     functions: FunctionProviderHandle,
 }
@@ -59,7 +59,7 @@ impl<'tx> Transaction<'tx> {
     /// staging area for SQL/provider hooks.
     async fn open(
         mode: &SessionMode,
-        backend: &'tx Arc<dyn LixBackend + Send + Sync>,
+        backend: &'tx Arc<dyn Backend + Send + Sync>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
@@ -250,14 +250,14 @@ impl<'tx> Transaction<'tx> {
     /// Creates a tracked-state reader scoped to this write transaction.
     pub(crate) fn tracked_state_reader(
         &mut self,
-    ) -> TrackedStateStoreReader<&mut dyn LixBackendTransaction> {
+    ) -> TrackedStateStoreReader<&mut dyn BackendTransaction> {
         self.tracked_state.reader(self.backend_transaction.as_mut())
     }
 
     /// Creates a commit-graph reader scoped to this write transaction.
     pub(crate) fn commit_graph_reader(
         &mut self,
-    ) -> CommitGraphStoreReader<&mut dyn LixBackendTransaction> {
+    ) -> CommitGraphStoreReader<&mut dyn BackendTransaction> {
         CommitGraphContext::new(self.changelog.as_ref().clone())
             .reader(self.backend_transaction.as_mut())
     }
@@ -265,7 +265,7 @@ impl<'tx> Transaction<'tx> {
 
 pub(crate) async fn open_transaction<'tx>(
     mode: &SessionMode,
-    backend: &'tx Arc<dyn LixBackend + Send + Sync>,
+    backend: &'tx Arc<dyn Backend + Send + Sync>,
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
@@ -331,7 +331,7 @@ async fn resolve_active_version_id(
     mode: &SessionMode,
     live_state: &LiveStateContext,
     version_ctx: &VersionContext,
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: &mut dyn BackendTransaction,
 ) -> Result<String, LixError> {
     match mode {
         SessionMode::Pinned { version_id } => Ok(version_id.clone()),
@@ -344,7 +344,7 @@ async fn resolve_active_version_id(
 async fn load_workspace_version_id(
     live_state: &LiveStateContext,
     version_ctx: &VersionContext,
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: &mut dyn BackendTransaction,
 ) -> Result<String, LixError> {
     let row = live_state
         .reader(&mut *transaction)
@@ -425,7 +425,7 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_routes_tracked_and_untracked_rows_without_sql() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = Arc::new(live_state_context());
         let binary_cas = Arc::new(BinaryCasContext::new());
         let changelog = Arc::new(ChangelogContext::new());
@@ -555,7 +555,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_validates_staged_rows_before_persistence() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let live_state = Arc::new(live_state_context());
         let binary_cas = Arc::new(BinaryCasContext::new());
         let changelog = Arc::new(ChangelogContext::new());
@@ -621,7 +621,7 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_rejects_unknown_schema_key_without_sql() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let (_live_state, _binary_cas, _changelog, _version_ref, _runtime_functions, transaction) =
             open_test_transaction(&backend).await;
 
@@ -643,7 +643,7 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_rejects_unknown_schema_version_without_sql() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let (_live_state, _binary_cas, _changelog, _version_ref, _runtime_functions, transaction) =
             open_test_transaction(&backend).await;
 
@@ -665,7 +665,7 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_rejects_invalid_snapshot_json_without_sql() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let (_live_state, _binary_cas, _changelog, _version_ref, _runtime_functions, transaction) =
             open_test_transaction(&backend).await;
 
@@ -685,7 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_rejects_snapshot_that_violates_json_schema_without_sql() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let (live_state, _binary_cas, changelog, version_ref, runtime_functions, transaction) =
             open_test_transaction(&backend).await;
 
@@ -718,7 +718,7 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_rejects_malformed_registered_schema_without_sql() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let (_live_state, _binary_cas, _changelog, _version_ref, _runtime_functions, transaction) =
             open_test_transaction(&backend).await;
 
@@ -748,7 +748,7 @@ mod tests {
 
     #[tokio::test]
     async fn stage_rows_rejects_primary_key_entity_id_mismatch_without_sql() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let (_live_state, _binary_cas, _changelog, _version_ref, _runtime_functions, transaction) =
             open_test_transaction(&backend).await;
 
@@ -769,7 +769,7 @@ mod tests {
     }
 
     async fn open_test_transaction<'a>(
-        backend: &'a Arc<dyn LixBackend + Send + Sync>,
+        backend: &'a Arc<dyn Backend + Send + Sync>,
     ) -> (
         Arc<LiveStateContext>,
         Arc<BinaryCasContext>,
@@ -815,7 +815,7 @@ mod tests {
     }
 
     async fn assert_no_persistence_after_validation_failure(
-        backend: &Arc<dyn LixBackend + Send + Sync>,
+        backend: &Arc<dyn Backend + Send + Sync>,
         live_state: &LiveStateContext,
         changelog: &ChangelogContext,
         version_ctx: &VersionContext,

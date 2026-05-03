@@ -2045,7 +2045,7 @@ fn current_engine_owned_persistence_raw_backend_type_violations() -> Vec<RawBack
         }
 
         let masked_source = mask_rust_source(&source);
-        for type_name in ["LixBackend", "LixBackendTransaction"] {
+        for type_name in ["Backend", "BackendTransaction"] {
             if contains_identifier(&masked_source, type_name) {
                 violations.insert(RawBackendTypeViolation {
                     file: relative_path.clone(),
@@ -2080,8 +2080,8 @@ fn current_owner_persistence_backend_root_dependency_violations() -> Vec<ImportP
         }
 
         let masked_source = mask_rust_source(&source);
-        if !contains_identifier(&masked_source, "LixBackend")
-            && !contains_identifier(&masked_source, "LixBackendTransaction")
+        if !contains_identifier(&masked_source, "Backend")
+            && !contains_identifier(&masked_source, "BackendTransaction")
         {
             continue;
         }

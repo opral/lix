@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lix_engine::{
-    KvPair, KvScanRange, LixBackend, LixBackendTransaction, LixError, TransactionBeginMode,
+    KvPair, KvScanRange, Backend, BackendTransaction, LixError, TransactionBeginMode,
 };
 
 type KvMap = BTreeMap<(String, Vec<u8>), Vec<u8>>;
@@ -20,11 +20,11 @@ impl InMemoryBackend {
 }
 
 #[async_trait]
-impl LixBackend for InMemoryBackend {
+impl Backend for InMemoryBackend {
     async fn begin_transaction(
         &self,
         mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
+    ) -> Result<Box<dyn BackendTransaction + Send + Sync + 'static>, LixError> {
         let snapshot = self
             .kv
             .lock()
@@ -67,7 +67,7 @@ struct InMemoryTransaction {
 }
 
 #[async_trait]
-impl LixBackendTransaction for InMemoryTransaction {
+impl BackendTransaction for InMemoryTransaction {
     fn mode(&self) -> TransactionBeginMode {
         self.mode
     }

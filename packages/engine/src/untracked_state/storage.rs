@@ -185,7 +185,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
     use crate::untracked_state::UntrackedStateContext;
 
     #[tokio::test]

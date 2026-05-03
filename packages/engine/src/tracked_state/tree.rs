@@ -2027,12 +2027,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
     use crate::entity_identity::EntityIdentity;
 
     #[tokio::test]
     async fn exact_read_roundtrips_from_stored_root() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let tree = TrackedStateTree::new();
         let key = key("schema", None, "entity");
         let value = value("change-1", Some("{}"));
@@ -2072,7 +2072,7 @@ mod tests {
 
     #[tokio::test]
     async fn latest_mutation_for_key_wins() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let tree = TrackedStateTree::new();
         let key = key("schema", None, "entity");
 
@@ -2109,7 +2109,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_filters_and_hides_tombstones_by_default() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let tree = TrackedStateTree::new();
 
         let mut transaction = backend
@@ -2161,7 +2161,7 @@ mod tests {
 
     #[tokio::test]
     async fn scan_filters_by_schema_entity_and_file() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let tree = TrackedStateTree::new();
 
         let mut transaction = backend
@@ -2225,7 +2225,7 @@ mod tests {
 
     #[tokio::test]
     async fn applying_to_base_root_reuses_existing_rows_and_overwrites_changed_rows() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let tree = TrackedStateTree::new();
         let unchanged_key = key("schema", None, "unchanged");
         let changed_key = key("schema", None, "changed");
@@ -2287,7 +2287,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_commit_roots_can_share_unchanged_rows() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let tree = TrackedStateTree::new();
         let shared_key = key("schema", None, "shared");
         let branch_a_key = key("schema", None, "branch-a");
@@ -2366,7 +2366,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_update_matches_full_canonical_rebuild() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
             target_chunk_bytes: 128,
             min_chunk_bytes: 64,
@@ -2425,7 +2425,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_insert_matches_full_canonical_rebuild() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
             target_chunk_bytes: 128,
             min_chunk_bytes: 64,
@@ -2487,7 +2487,7 @@ mod tests {
 
     #[tokio::test]
     async fn batch_update_matches_full_canonical_rebuild() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
             target_chunk_bytes: 128,
             min_chunk_bytes: 64,
@@ -2552,7 +2552,7 @@ mod tests {
 
     #[tokio::test]
     async fn batch_insert_matches_full_canonical_rebuild() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
             target_chunk_bytes: 128,
             min_chunk_bytes: 64,

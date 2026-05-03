@@ -19,7 +19,7 @@ use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{open_transaction, Transaction};
 use crate::version::{VersionContext, VersionRefReader};
 use crate::GLOBAL_VERSION_ID;
-use crate::{LixBackend, LixError, NullableKeyFilter};
+use crate::{Backend, LixError, NullableKeyFilter};
 
 pub(crate) const WORKSPACE_VERSION_KEY: &str = "lix_workspace_version_id";
 
@@ -42,7 +42,7 @@ pub(crate) enum SessionMode {
 #[derive(Clone)]
 pub struct SessionContext {
     pub(super) mode: SessionMode,
-    pub(super) backend: Arc<dyn LixBackend + Send + Sync>,
+    pub(super) backend: Arc<dyn Backend + Send + Sync>,
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) tracked_state: Arc<TrackedStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
@@ -54,7 +54,7 @@ pub struct SessionContext {
 
 impl SessionContext {
     pub(crate) async fn open_workspace(
-        backend: Arc<dyn LixBackend + Send + Sync>,
+        backend: Arc<dyn Backend + Send + Sync>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
@@ -78,7 +78,7 @@ impl SessionContext {
 
     pub(crate) async fn open(
         active_version_id: String,
-        backend: Arc<dyn LixBackend + Send + Sync>,
+        backend: Arc<dyn Backend + Send + Sync>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
@@ -102,7 +102,7 @@ impl SessionContext {
 
     pub(super) fn new(
         mode: SessionMode,
-        backend: Arc<dyn LixBackend + Send + Sync>,
+        backend: Arc<dyn Backend + Send + Sync>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
@@ -125,7 +125,7 @@ impl SessionContext {
 
     pub(super) fn new_with_closed(
         mode: SessionMode,
-        backend: Arc<dyn LixBackend + Send + Sync>,
+        backend: Arc<dyn Backend + Send + Sync>,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
@@ -291,7 +291,7 @@ fn closed_error() -> LixError {
 /// has no write stager.
 pub(super) struct SessionSqlExecutionContext<'a> {
     pub(super) active_version_id: &'a str,
-    pub(super) backend: Arc<dyn LixBackend + Send + Sync>,
+    pub(super) backend: Arc<dyn Backend + Send + Sync>,
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) changelog: Arc<ChangelogContext>,
