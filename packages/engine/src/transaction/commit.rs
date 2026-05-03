@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::binary_cas::{BinaryBlobWrite, BinaryCasContext};
 use crate::changelog::{CanonicalChange, ChangelogContext};
+use crate::json_store::{JsonRef, JsonStoreContext, JsonStoreWriter};
 use crate::live_state::{LiveStateContext, LiveStateRow};
 use crate::transaction::staging::StagedWriteSet;
 use crate::transaction::types::{StagedCommitMembers, StagedStateRow};
@@ -59,10 +60,15 @@ pub(crate) async fn commit_staged_writes(
     }
 
     if !changelog_rows.is_empty() {
+        let mut json_writer = JsonStoreContext::new().writer();
         let canonical_changes = changelog_rows
             .iter()
-            .map(canonical_change_from_staged_row)
+            .map(|row| canonical_change_from_staged_row(&mut json_writer, row))
             .collect::<Result<Vec<_>, _>>()?;
+        {
+            let mut writer_store = &mut *transaction;
+            json_writer.flush(&mut writer_store).await?;
+        }
         {
             let mut writer = changelog.writer(&mut *transaction);
             writer.append_changes(&canonical_changes).await?;
@@ -96,7 +102,10 @@ pub(crate) async fn commit_staged_writes(
     Ok(())
 }
 
-fn canonical_change_from_staged_row(row: &StagedStateRow) -> Result<CanonicalChange, LixError> {
+fn canonical_change_from_staged_row(
+    json_writer: &mut JsonStoreWriter,
+    row: &StagedStateRow,
+) -> Result<CanonicalChange, LixError> {
     let Some(change_id) = row.change_id.as_ref() else {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -110,10 +119,20 @@ fn canonical_change_from_staged_row(row: &StagedStateRow) -> Result<CanonicalCha
         schema_key: row.schema_key.clone(),
         schema_version: row.schema_version.clone(),
         file_id: row.file_id.clone(),
-        snapshot_content: row.snapshot_content.clone(),
-        metadata: row.metadata.clone(),
+        snapshot_ref: stage_optional_json(json_writer, row.snapshot_content.as_deref())?,
+        metadata_ref: stage_optional_json(json_writer, row.metadata.as_deref())?,
         created_at: row.created_at.clone(),
     })
+}
+
+fn stage_optional_json(
+    json_writer: &mut JsonStoreWriter,
+    value: Option<&str>,
+) -> Result<Option<JsonRef>, LixError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    json_writer.stage_bytes(value.as_bytes()).map(Some)
 }
 
 /// Materializes tracked staged membership into `lix_commit` rows.

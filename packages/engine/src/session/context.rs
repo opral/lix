@@ -5,14 +5,16 @@ use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
+use crate::backend::ReadScope;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
-use crate::changelog::{ChangelogContext, ChangelogReader};
+use crate::changelog::ChangelogContext;
 use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
+use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
 use crate::schema_registry::SchemaRegistry;
-use crate::sql2::SqlExecutionContext;
+use crate::sql2::{ChangelogQuerySource, SqlChangelogQuerySource, SqlExecutionContext};
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{open_transaction, Transaction};
 use crate::version_ref::{VersionRefContext, VersionRefReader};
@@ -306,8 +308,12 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
         Arc::new(self.live_state.reader(Arc::clone(&self.backend))) as Arc<dyn LiveStateReader>
     }
 
-    fn changelog(&self) -> Arc<dyn ChangelogReader> {
-        Arc::new(self.changelog.reader(Arc::clone(&self.backend)))
+    fn changelog_query_source(&self) -> SqlChangelogQuerySource {
+        let read_scope = ReadScope::new(Arc::clone(&self.backend));
+        ChangelogQuerySource {
+            changelog_reader: Arc::new(self.changelog.reader(read_scope.store())),
+            json_reader: JsonStoreContext::new().reader(read_scope.store()),
+        }
     }
 
     fn commit_graph(&self) -> Box<dyn CommitGraphReader> {

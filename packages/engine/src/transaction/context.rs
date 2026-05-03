@@ -5,24 +5,24 @@ use serde_json::Value as JsonValue;
 
 use crate::backend::TransactionBeginMode;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
-use crate::changelog::{ChangelogContext, ChangelogReader};
-use crate::commit_graph::{CommitGraphContext, CommitGraphReader, CommitGraphStoreReader};
+use crate::changelog::ChangelogContext;
+use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::live_state::{
-    LiveStateContext, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+    LiveStateContext, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
 };
 use crate::schema_registry::SchemaRegistry;
 use crate::session::{SessionMode, WORKSPACE_VERSION_KEY};
-use crate::sql2::{SqlExecutionContext, SqlWriteExecutionContext};
+use crate::sql2::SqlWriteExecutionContext;
 use crate::tracked_state::{TrackedStateContext, TrackedStateStoreReader};
 use crate::transaction::commit;
-use crate::transaction::live_state_overlay::{overlay_scan_rows, TransactionLiveStateContext};
+use crate::transaction::live_state_overlay::overlay_scan_rows;
 use crate::transaction::normalization::TransactionSchemaCatalog;
 use crate::transaction::staging::TransactionStagedWrites;
 use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWriteOutcome};
 use crate::transaction::validation::{validate_staged_writes, TransactionValidationInput};
-use crate::version_ref::{VersionRefContext, VersionRefReader, VersionRefStoreReader};
+use crate::version_ref::{VersionRefContext, VersionRefStoreReader};
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixBackendTransaction, LixError, NullableKeyFilter};
 
@@ -264,51 +264,6 @@ pub(crate) async fn open_transaction<'tx>(
     .await
 }
 
-impl SqlExecutionContext for Transaction<'_> {
-    /// Returns the version that active-version SQL surfaces should resolve to.
-    fn active_version_id(&self) -> &str {
-        &self.active_version_id
-    }
-
-    /// Returns live state with this transaction's staged rows overlaid on top.
-    fn live_state(&self) -> Arc<dyn LiveStateReader> {
-        transaction_live_state(
-            self.backend,
-            Arc::clone(&self.live_state),
-            Arc::clone(&self.staged_writes),
-        )
-        .expect("engine2 transaction should build staging overlay")
-    }
-
-    fn changelog(&self) -> Arc<dyn ChangelogReader> {
-        Arc::new(self.changelog.reader(Arc::clone(self.backend)))
-    }
-
-    fn commit_graph(&self) -> Box<dyn CommitGraphReader> {
-        Box::new(CommitGraphContext::new(ChangelogContext::new()).reader(Arc::clone(self.backend)))
-    }
-
-    fn version_ref(&self) -> Arc<dyn VersionRefReader> {
-        Arc::new(self.version_ref.reader(Arc::clone(self.backend)))
-    }
-
-    /// Returns the same function provider used by the owning session.
-    fn functions(&self) -> FunctionProviderHandle {
-        self.functions.clone()
-    }
-
-    /// Provides blob reads for file/data surfaces during SQL execution.
-    fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
-        Arc::new(self.binary_cas.reader(Arc::clone(self.backend))) as Arc<dyn BlobDataReader>
-    }
-
-    /// Returns the transaction-scoped schema snapshot for SQL surface
-    /// registration.
-    fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
-        Ok(self.visible_schemas.clone())
-    }
-}
-
 #[async_trait]
 impl SqlWriteExecutionContext for Transaction<'_> {
     fn active_version_id(&self) -> &str {
@@ -418,16 +373,6 @@ async fn load_workspace_version_id(
     }
 
     Ok(version_id)
-}
-
-fn transaction_live_state(
-    backend: &Arc<dyn LixBackend + Send + Sync>,
-    live_state: Arc<LiveStateContext>,
-    staged_writes: Arc<TransactionStagedWrites>,
-) -> Result<Arc<dyn LiveStateReader>, LixError> {
-    let staged = staged_writes.staging_overlay()?;
-    let base: Arc<dyn LiveStateReader> = Arc::new(live_state.reader(Arc::clone(backend)));
-    Ok(Arc::new(TransactionLiveStateContext::new(base, staged)))
 }
 
 #[cfg(test)]

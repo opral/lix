@@ -18,25 +18,26 @@ use datafusion::physical_plan::{
 };
 use futures_util::stream;
 
-use crate::changelog::{CanonicalChange, ChangelogReader, ChangelogScanRequest};
+use crate::changelog::{materialize_change, ChangelogScanRequest, MaterializedCanonicalChange};
 use crate::LixError;
 
 use super::record_batch::record_batch_with_row_count;
 use super::result_metadata::json_field;
+use super::SqlChangelogQuerySource;
 
 pub(crate) async fn register_lix_change_provider(
     session: &datafusion::prelude::SessionContext,
-    changelog: Arc<dyn ChangelogReader>,
+    query_source: SqlChangelogQuerySource,
 ) -> Result<(), LixError> {
     session
-        .register_table("lix_change", Arc::new(LixChangeProvider::new(changelog)))
+        .register_table("lix_change", Arc::new(LixChangeProvider::new(query_source)))
         .map_err(datafusion_error_to_lix_error)?;
     Ok(())
 }
 
 struct LixChangeProvider {
     schema: SchemaRef,
-    changelog: Arc<dyn ChangelogReader>,
+    query_source: SqlChangelogQuerySource,
 }
 
 impl std::fmt::Debug for LixChangeProvider {
@@ -46,10 +47,10 @@ impl std::fmt::Debug for LixChangeProvider {
 }
 
 impl LixChangeProvider {
-    fn new(changelog: Arc<dyn ChangelogReader>) -> Self {
+    fn new(query_source: SqlChangelogQuerySource) -> Self {
         Self {
             schema: lix_change_schema(),
-            changelog,
+            query_source,
         }
     }
 }
@@ -86,7 +87,7 @@ impl TableProvider for LixChangeProvider {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(LixChangeScanExec::new(
-            Arc::clone(&self.changelog),
+            self.query_source.clone(),
             projected_schema(&self.schema, projection),
             projection.cloned(),
             limit,
@@ -95,7 +96,7 @@ impl TableProvider for LixChangeProvider {
 }
 
 struct LixChangeScanExec {
-    changelog: Arc<dyn ChangelogReader>,
+    query_source: SqlChangelogQuerySource,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
@@ -110,7 +111,7 @@ impl std::fmt::Debug for LixChangeScanExec {
 
 impl LixChangeScanExec {
     fn new(
-        changelog: Arc<dyn ChangelogReader>,
+        query_source: SqlChangelogQuerySource,
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
@@ -122,7 +123,7 @@ impl LixChangeScanExec {
             Boundedness::Bounded,
         );
         Self {
-            changelog,
+            query_source,
             schema,
             projection,
             limit,
@@ -182,15 +183,25 @@ impl ExecutionPlan for LixChangeScanExec {
             )));
         }
 
-        let changelog = Arc::clone(&self.changelog);
+        let query_source = self.query_source.clone();
         let projection = change_projection_for_scan(self.projection.as_ref());
         let limit = self.limit;
         let schema = Arc::clone(&self.schema);
         let stream = stream::once(async move {
-            let changes = changelog
+            let mut json_reader = query_source.json_reader;
+            let canonical_changes = query_source
+                .changelog_reader
                 .scan_changes(&ChangelogScanRequest { limit })
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
+            let mut changes = Vec::with_capacity(canonical_changes.len());
+            for change in canonical_changes {
+                changes.push(
+                    materialize_change(&mut json_reader, change)
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?,
+                );
+            }
             change_record_batch(&projection, &changes)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
@@ -250,7 +261,7 @@ fn projected_schema(schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Sche
 
 fn change_record_batch(
     projection: &[ChangeColumn],
-    changes: &[CanonicalChange],
+    changes: &[MaterializedCanonicalChange],
 ) -> Result<RecordBatch> {
     let arrays = projection
         .iter()

@@ -49,7 +49,8 @@ use super::history_route::{
 };
 use super::result_metadata::{json_field, mark_json_field};
 use crate::sql2::{
-    SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
+    SqlChangelogQuerySource, SqlWriteContext, WriteAccess, WriteContextLiveStateReader,
+    WriteContextVersionRefReader,
 };
 use crate::transaction::types::{StageWrite, StageWriteMode};
 
@@ -59,6 +60,7 @@ pub(crate) async fn register_entity_providers(
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
     commit_graph: Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>,
+    query_source: SqlChangelogQuerySource,
     schema_definitions: &[JsonValue],
 ) -> Result<(), LixError> {
     for schema in schema_definitions {
@@ -99,6 +101,7 @@ pub(crate) async fn register_entity_providers(
             Arc::new(EntityHistoryProvider::new(
                 Arc::clone(&spec),
                 Arc::clone(&commit_graph),
+                query_source.clone(),
             )),
         )
         .map_err(datafusion_error_to_lix_error)?;

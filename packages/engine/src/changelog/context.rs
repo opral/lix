@@ -46,6 +46,7 @@ impl<S> ChangelogStoreReader<S>
 where
     S: KvStore,
 {
+    #[allow(dead_code)]
     pub(crate) async fn load_change(
         &self,
         change_id: &str,
@@ -54,6 +55,7 @@ where
         crate::changelog::storage::load_change(&mut *store, change_id).await
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn scan_changes(
         &self,
         request: &ChangelogScanRequest,
@@ -89,6 +91,7 @@ impl<S> ChangelogWriter<S>
 where
     S: KvWriter,
 {
+    #[allow(dead_code)]
     pub(crate) async fn append_changes(
         &mut self,
         changes: &[CanonicalChange],

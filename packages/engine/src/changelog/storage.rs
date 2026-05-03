@@ -64,7 +64,11 @@ mod tests {
     use std::sync::Arc;
 
     use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
-    use crate::changelog::{ChangelogContext, ChangelogScanRequest};
+    use crate::changelog::{
+        canonicalize_materialized_change, materialize_change, ChangelogContext,
+        ChangelogScanRequest, MaterializedCanonicalChange,
+    };
+    use crate::json_store::JsonStoreContext;
 
     use super::*;
 
@@ -78,18 +82,10 @@ mod tests {
             .begin_transaction(TransactionBeginMode::Write)
             .await
             .expect("transaction should open");
-        changelog
-            .writer(tx.as_mut())
-            .append_changes(std::slice::from_ref(&change))
-            .await
-            .expect("append should succeed");
+        append_test_changes(&changelog, tx.as_mut(), std::slice::from_ref(&change)).await;
         tx.commit().await.expect("commit should succeed");
 
-        let loaded = {
-            let reader = changelog.reader(backend);
-            reader.load_change("change-1").await
-        }
-        .expect("load should succeed");
+        let loaded = load_test_change(&changelog, Arc::clone(&backend), "change-1").await;
         assert_eq!(loaded, Some(change));
     }
 
@@ -109,18 +105,10 @@ mod tests {
             .begin_transaction(TransactionBeginMode::Write)
             .await
             .expect("transaction should open");
-        changelog
-            .writer(tx.as_mut())
-            .append_changes(std::slice::from_ref(&change))
-            .await
-            .expect("append should succeed");
+        append_test_changes(&changelog, tx.as_mut(), std::slice::from_ref(&change)).await;
         tx.commit().await.expect("commit should succeed");
 
-        let loaded = {
-            let reader = changelog.reader(backend);
-            reader.load_change("change-composite").await
-        }
-        .expect("load should succeed");
+        let loaded = load_test_change(&changelog, Arc::clone(&backend), "change-composite").await;
         assert_eq!(loaded, Some(change));
     }
 
@@ -144,25 +132,36 @@ mod tests {
             .begin_transaction(TransactionBeginMode::Write)
             .await
             .expect("transaction should open");
-        changelog
-            .writer(tx.as_mut())
-            .append_changes(&[test_change("change-1"), test_change("change-2")])
-            .await
-            .expect("append should succeed");
+        append_test_changes(
+            &changelog,
+            tx.as_mut(),
+            &[test_change("change-1"), test_change("change-2")],
+        )
+        .await;
         tx.commit().await.expect("commit should succeed");
 
-        let changes = {
-            let reader = changelog.reader(backend);
+        let canonical_changes = {
+            let reader = changelog.reader(Arc::clone(&backend));
             reader
                 .scan_changes(&ChangelogScanRequest { limit: Some(1) })
                 .await
         }
         .expect("scan should succeed");
+        let materialize_store = Arc::clone(&backend);
+        let mut json_reader = JsonStoreContext::new().reader(materialize_store);
+        let mut changes = Vec::new();
+        for change in canonical_changes {
+            changes.push(
+                materialize_change(&mut json_reader, change)
+                    .await
+                    .expect("change should materialize"),
+            );
+        }
         assert_eq!(changes, vec![test_change("change-1")]);
     }
 
-    fn test_change(id: &str) -> CanonicalChange {
-        CanonicalChange {
+    fn test_change(id: &str) -> MaterializedCanonicalChange {
+        MaterializedCanonicalChange {
             id: id.to_string(),
             entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
             schema_key: "test_schema".to_string(),
@@ -172,5 +171,49 @@ mod tests {
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
         }
+    }
+
+    async fn append_test_changes(
+        changelog: &ChangelogContext,
+        tx: &mut (dyn crate::LixBackendTransaction + Send + Sync),
+        changes: &[MaterializedCanonicalChange],
+    ) {
+        let mut json_writer = JsonStoreContext::new().writer();
+        let canonical_changes = changes
+            .iter()
+            .map(|change| canonicalize_materialized_change(&mut json_writer, change))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("changes should canonicalize");
+        {
+            let mut writer_store = &mut *tx;
+            json_writer
+                .flush(&mut writer_store)
+                .await
+                .expect("json should flush");
+        }
+        changelog
+            .writer(tx)
+            .append_changes(&canonical_changes)
+            .await
+            .expect("append should succeed");
+    }
+
+    async fn load_test_change(
+        changelog: &ChangelogContext,
+        backend: Arc<UnitTestBackend>,
+        change_id: &str,
+    ) -> Option<MaterializedCanonicalChange> {
+        let canonical = {
+            let reader = changelog.reader(Arc::clone(&backend));
+            reader
+                .load_change(change_id)
+                .await
+                .expect("load should succeed")
+        }?;
+        let mut json_reader = JsonStoreContext::new().reader(backend);
+        materialize_change(&mut json_reader, canonical)
+            .await
+            .map(Some)
+            .expect("change should materialize")
     }
 }
