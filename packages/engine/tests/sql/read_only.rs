@@ -142,6 +142,83 @@ simulation_test!(
     }
 );
 
+simulation_test!(read_only_history_views_reject_dml, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+        &engine,
+    );
+
+    assert_read_only_error(
+        session
+            .execute(
+                "INSERT INTO lix_file_history (id, path) VALUES ('history-file', '/x.txt')",
+                &[],
+            )
+            .await
+            .expect_err("history insert should be read-only"),
+        "lix_file_history",
+        "History views are query-only",
+    );
+
+    assert_read_only_error(
+        session
+            .execute("UPDATE lix_directory_history SET name = 'renamed'", &[])
+            .await
+            .expect_err("history update should be read-only"),
+        "lix_directory_history",
+        "History views are query-only",
+    );
+
+    assert_read_only_error(
+        session
+            .execute("DELETE FROM lix_state_history", &[])
+            .await
+            .expect_err("history delete should be read-only"),
+        "lix_state_history",
+        "History views are query-only",
+    );
+});
+
+simulation_test!(read_only_typed_history_views_reject_dml, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+        &engine,
+    );
+
+    session
+        .execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"read_only_history_entity\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+             true,\
+             true\
+             )",
+            &[],
+        )
+        .await
+        .expect("registered schema insert should succeed");
+
+    assert_read_only_error(
+        session
+            .execute(
+                "INSERT INTO read_only_history_entity_history (id) VALUES ('entity-a')",
+                &[],
+            )
+            .await
+            .expect_err("typed history insert should be read-only"),
+        "read_only_history_entity_history",
+        "History views are query-only",
+    );
+});
+
 fn assert_read_only_error(error: LixError, schema_key: &str, hint_fragment: &str) {
     assert_eq!(error.code, LixError::CODE_READ_ONLY);
     assert!(

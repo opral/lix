@@ -24,7 +24,9 @@ mod version_provider;
 mod version_scope;
 mod write_normalization;
 
-pub(crate) use classify::{classify_statement, validate_supported_statement_ast, SqlStatementKind};
+pub(crate) use classify::{
+    classify_statement, dml_target_table_names, validate_supported_statement_ast, SqlStatementKind,
+};
 pub(crate) use context::{
     ChangelogQuerySource, SqlChangelogQuerySource, SqlExecutionContext, SqlJsonReader,
     SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextLiveStateReader,
