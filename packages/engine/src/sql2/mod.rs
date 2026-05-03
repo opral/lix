@@ -24,7 +24,7 @@ mod version_provider;
 mod version_scope;
 mod write_normalization;
 
-pub(crate) use classify::{classify_statement, SqlStatementKind};
+pub(crate) use classify::{classify_statement, validate_supported_statement_ast, SqlStatementKind};
 pub(crate) use context::{
     SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
     WriteContextLiveStateReader, WriteContextVersionRefReader,
