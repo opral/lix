@@ -81,7 +81,10 @@ export type CreateVersionOptions = {
 };
 
 export type CreateVersionResult = {
-  versionId: string;
+  id: string;
+  name: string;
+  hidden: boolean;
+  commitId: string;
 };
 
 export type SwitchVersionOptions = {
@@ -150,7 +153,15 @@ export type MergeVersionResult = {
             let options = parse_create_version_options(args).map_err(js_error)?;
             let result = self.inner.create_version(options).await.map_err(js_error)?;
             let object = Object::new();
-            set_string(&object, "versionId", &result.version_id).map_err(js_error)?;
+            set_string(&object, "id", &result.id).map_err(js_error)?;
+            set_string(&object, "name", &result.name).map_err(js_error)?;
+            Reflect::set(
+                &object,
+                &JsValue::from_str("hidden"),
+                &JsValue::from_bool(result.hidden),
+            )
+            .map_err(|_| js_error(js_sdk_error("could not set hidden")))?;
+            set_string(&object, "commitId", &result.commit_id).map_err(js_error)?;
             Ok(object.into())
         }
 

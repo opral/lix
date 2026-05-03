@@ -170,7 +170,10 @@ export type CreateVersionOptions = {
 };
 
 export type CreateVersionResult = {
-	versionId: string;
+	id: string;
+	name: string;
+	hidden: boolean;
+	commitId: string;
 };
 
 export type SwitchVersionOptions = {

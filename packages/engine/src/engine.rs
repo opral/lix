@@ -147,9 +147,10 @@ impl Engine {
             .load_version_head_commit_id(version_id)
             .await?
             .ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("missing version ref for version '{version_id}'"),
+                LixError::version_not_found(
+                    version_id.to_string(),
+                    "rebuild_tracked_state_for_version",
+                    "target",
                 )
             })?;
         let commit_graph = CommitGraphContext::new(ChangelogContext::new());

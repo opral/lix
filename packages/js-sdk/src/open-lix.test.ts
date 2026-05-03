@@ -7,6 +7,7 @@ import {
 	type KvScanRange,
 	type LixBackend,
 	type LixBackendTransaction,
+	type LixError,
 	type Lix,
 	type TransactionBeginMode,
 	isLixError,
@@ -55,12 +56,22 @@ test("openLix exposes the rs-sdk e2e flow", async () => {
 
 	expect(await taskDone(lix, "task-1")).toBe(false);
 
+	const mainHead = await lix.execute("SELECT lix_active_version_commit_id()");
+	const mainHeadCommitId = mainHead.rows[0]!.get("lix_active_version_commit_id()");
+	expect(typeof mainHeadCommitId).toBe("string");
+
 	const draft = await lix.createVersion({
 		id: "draft-version",
 		name: "Draft",
 	});
+	expect(draft).toMatchObject({
+		id: "draft-version",
+		name: "Draft",
+		hidden: false,
+		commitId: mainHeadCommitId,
+	});
 
-	await lix.switchVersion({ versionId: draft.versionId });
+	await lix.switchVersion({ versionId: draft.id });
 
 	await lix.execute("UPDATE crm_task SET done = $1 WHERE id = $2", [
 		true,
@@ -74,7 +85,7 @@ test("openLix exposes the rs-sdk e2e flow", async () => {
 	expect(await taskDone(lix, "task-1")).toBe(false);
 
 	const merge = await lix.mergeVersion({
-		sourceVersionId: draft.versionId,
+		sourceVersionId: draft.id,
 	});
 
 	expect(merge.outcome).toBe("fastForward");
@@ -137,7 +148,13 @@ test("createVersion can start from an explicit commit id", async () => {
 		name: "From explicit commit",
 		fromCommitId: fromCommitId as string,
 	});
-	await lix.switchVersion({ versionId: version.versionId });
+	expect(version).toMatchObject({
+		id: "from-explicit-commit",
+		name: "From explicit commit",
+		hidden: false,
+		commitId: fromCommitId,
+	});
+	await lix.switchVersion({ versionId: version.id });
 
 	const projected = await lix.execute(
 		"SELECT id FROM crm_task WHERE id = $1",
@@ -166,7 +183,7 @@ test("merge conflicts expose structured details", async () => {
 		name: "Conflict draft",
 	});
 
-	await lix.switchVersion({ versionId: draft.versionId });
+	await lix.switchVersion({ versionId: draft.id });
 	await lix.execute("UPDATE crm_task SET title = $1 WHERE id = $2", [
 		"Draft",
 		"conflict-task",
@@ -179,12 +196,14 @@ test("merge conflicts expose structured details", async () => {
 	]);
 
 	try {
-		await lix.mergeVersion({ sourceVersionId: draft.versionId });
+		await lix.mergeVersion({ sourceVersionId: draft.id });
 		throw new Error("expected merge conflict");
 	} catch (error) {
 		expect(isLixError(error)).toBe(true);
 		if (!isLixError(error)) throw error;
 		expect(error.code).toBe("LIX_MERGE_CONFLICT");
+		expect(error.details).toBeDefined();
+		expect((error as LixError & { data?: unknown }).data).toBeUndefined();
 		const details = error.details as {
 			conflicts?: Array<{
 				schema_key?: string;

@@ -190,6 +190,14 @@ export interface LixError extends Error {
 	details?: unknown;
 }
 
+type Assert<T extends true> = T;
+type _LixErrorHasDetails = Assert<
+	LixError extends { details?: unknown } ? true : false
+>;
+type _LixErrorDoesNotHaveData = Assert<
+	"data" extends keyof LixError ? false : true
+>;
+
 /**
  * Type guard: returns `true` when `err` is a Lix-produced error carrying a
  * structured `code` field (all engine codes start with `LIX_`).

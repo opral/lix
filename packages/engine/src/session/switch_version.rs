@@ -45,9 +45,10 @@ impl SessionContext {
                         reader.load_head_commit_id(&version_id).await?
                     };
                     if head.is_none() {
-                        return Err(LixError::new(
-                            "LIX_ERROR_UNKNOWN",
-                            format!("cannot switch to missing version ref '{version_id}'"),
+                        return Err(LixError::version_not_found(
+                            version_id.clone(),
+                            "switch_version",
+                            "target",
                         ));
                     }
 
