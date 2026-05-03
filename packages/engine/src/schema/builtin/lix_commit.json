@@ -1,7 +1,7 @@
 {
   "x-lix-key": "lix_commit",
   "x-lix-version": "1",
-  "description": "Commit header change. Canonical commit membership is stored in change_ids as the ordered list of non-header member changes for this commit. Derived projections such as lix_change_set_element must be rebuildable from this header plus the referenced change rows. Version head pointers such as lix_version_ref are maintained separately and are not commit members.",
+  "description": "Commit header change. Canonical commit membership is stored in change_ids as the ordered list of canonical changes whose effects this commit introduces relative to its first parent. A merge commit may reference canonical changes originally authored in another parent instead of copying them. Derived projections such as lix_change_set_element must be rebuildable from this header plus the referenced change rows. Version head pointers such as lix_version_ref are maintained separately and are not commit members.",
   "x-lix-primary-key": [
     "/id"
   ],
@@ -35,7 +35,7 @@
       "items": {
         "type": "string"
       },
-      "description": "Canonical ordered membership list of non-header change IDs that belong to this commit. Derived indexes such as lix_change_set_element must be rebuildable from this list. This does not include lix_version_ref pointer rows."
+      "description": "Canonical ordered membership list of non-header change IDs whose effects this commit introduces relative to its first parent. Merge commits may reference existing changes from another parent instead of minting equivalent copies. Derived indexes such as lix_change_set_element must be rebuildable from this list. This does not include lix_version_ref pointer rows."
     },
     "author_account_ids": {
       "type": "array",

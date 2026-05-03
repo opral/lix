@@ -481,6 +481,95 @@ simulation_test!(
 );
 
 simulation_test!(
+    merge_version_adopts_source_change_without_minting_equivalent_copy,
+    |sim| async move {
+        let (engine, main, draft) = create_draft_from_main(&sim).await;
+        draft
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('merge-adopt-change', 'source')",
+                &[],
+            )
+            .await
+            .expect("draft write should succeed");
+
+        let source_head = engine
+            .load_version_head_commit_id("draft-version")
+            .await
+            .expect("draft head should load")
+            .expect("draft head should exist");
+        let source_change_id = select_single_text(
+            &draft,
+            "SELECT lixcol_change_id FROM lix_key_value WHERE key = 'merge-adopt-change'",
+        )
+        .await;
+
+        let receipt = main
+            .merge_version(MergeVersionOptions {
+                source_version_id: "draft-version".to_string(),
+            })
+            .await
+            .expect("merge should apply source change");
+        let merge_commit_id = receipt
+            .created_merge_commit_id
+            .as_deref()
+            .expect("non-empty merge should create a merge commit");
+
+        let global = sim.wrap_session(
+            engine
+                .open_session("global")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
+        let merge_snapshot = load_commit_snapshot(&global, merge_commit_id).await;
+        let merge_change_ids = json_string_array(&merge_snapshot, "change_ids");
+        assert_eq!(
+            merge_change_ids,
+            vec![source_change_id.clone()],
+            "merge commit should adopt the source change id, not mint an equivalent copy"
+        );
+
+        let source_snapshot = load_commit_snapshot(&global, &source_head).await;
+        assert_eq!(
+            json_string_array(&source_snapshot, "change_ids"),
+            vec![source_change_id.clone()],
+            "source commit should remain the original owner of the canonical source change"
+        );
+
+        let equivalent_change_count = select_single_integer(
+            &global,
+            "SELECT count(*) \
+             FROM lix_change \
+             WHERE schema_key = 'lix_key_value' \
+               AND entity_id = 'merge-adopt-change' \
+               AND snapshot_content = lix_json('{\"key\":\"merge-adopt-change\",\"value\":\"source\"}')",
+        )
+        .await;
+        assert_eq!(
+            equivalent_change_count, 1,
+            "merge must not append a second canonical change with identical effect"
+        );
+
+        let history = main
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state_history \
+                 WHERE start_commit_id = lix_active_version_commit_id() \
+                   AND entity_id = 'merge-adopt-change' \
+                 ORDER BY depth",
+                &[],
+            )
+            .await
+            .expect("history query should succeed");
+        assert_eq!(
+            history.len(),
+            1,
+            "history should show the adopted canonical change once, not once from the merge commit and once from the source parent"
+        );
+    }
+);
+
+simulation_test!(
     merge_version_errors_on_divergent_same_entity_change,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
@@ -955,6 +1044,36 @@ async fn assert_version_descriptor(
     );
 }
 
+async fn select_single_text(
+    session: &crate::support::simulation_test::engine::SimSession,
+    sql: &str,
+) -> String {
+    let result = session
+        .execute(sql, &[])
+        .await
+        .expect("query should succeed");
+    assert_eq!(result.len(), 1, "expected exactly one row for query: {sql}");
+    let Value::Text(value) = &result.rows()[0].values()[0] else {
+        panic!("expected text value for query: {sql}");
+    };
+    value.clone()
+}
+
+async fn select_single_integer(
+    session: &crate::support::simulation_test::engine::SimSession,
+    sql: &str,
+) -> i64 {
+    let result = session
+        .execute(sql, &[])
+        .await
+        .expect("query should succeed");
+    assert_eq!(result.len(), 1, "expected exactly one row for query: {sql}");
+    let Value::Integer(value) = result.rows()[0].values()[0] else {
+        panic!("expected integer value for query: {sql}");
+    };
+    value
+}
+
 async fn load_commit_snapshot(
     session: &crate::support::simulation_test::engine::SimSession,
     commit_id: &str,
@@ -976,4 +1095,19 @@ async fn load_commit_snapshot(
         panic!("commit snapshot should be JSON");
     };
     snapshot_content.clone()
+}
+
+fn json_string_array(snapshot: &JsonValue, key: &str) -> Vec<String> {
+    snapshot
+        .get(key)
+        .and_then(JsonValue::as_array)
+        .unwrap_or_else(|| panic!("snapshot field '{key}' should be an array"))
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .unwrap_or_else(|| panic!("snapshot field '{key}' should contain strings"))
+                .to_string()
+        })
+        .collect()
 }

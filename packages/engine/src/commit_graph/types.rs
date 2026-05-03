@@ -4,7 +4,10 @@ use crate::{changelog::CanonicalChange, entity_identity::EntityIdentity};
 /// Parsed `lix_commit` entity from the changelog.
 ///
 /// Commits are stored as ordinary canonical changes. The graph reader parses
-/// their snapshot so traversal code can work with explicit parent/member ids.
+/// their snapshot so traversal code can work with explicit parent ids and the
+/// ordered canonical changes introduced relative to the first parent. A merge
+/// commit may reference existing changes from another parent instead of owning
+/// newly minted copies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphCommit {
     pub(crate) change: CanonicalChange,
@@ -36,7 +39,7 @@ pub(crate) struct CommitGraphChangeSet {
     pub(crate) commit_id: String,
 }
 
-/// Derived membership row for a commit's change set.
+/// Derived membership row for a commit's introduced/adopted change set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphChangeSetElement {
     pub(crate) change_set_id: String,
@@ -61,7 +64,7 @@ pub(crate) struct CommitGraphChangeHistoryRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphChangeHistoryEntry {
     pub(crate) change: CanonicalChange,
-    pub(crate) commit_id: String,
+    pub(crate) observed_commit_id: String,
     pub(crate) start_commit_id: String,
     pub(crate) depth: u32,
 }

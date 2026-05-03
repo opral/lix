@@ -629,7 +629,8 @@ mod tests {
             .expect("merge should plan");
 
         assert_eq!(merge_patch_ids(&plan), vec!["entity-a"]);
-        assert_eq!(plan.patches[0].source_row.snapshot_content, None);
+        assert_eq!(plan.patches[0].projected_row().snapshot_content, None);
+        assert_eq!(plan.patches[0].change_id(), "change-source-delete");
     }
 
     #[tokio::test]
@@ -901,7 +902,7 @@ mod tests {
     fn merge_patch_ids(plan: &TrackedStateMergePlan) -> Vec<String> {
         plan.patches
             .iter()
-            .map(|entry| entry.identity.entity_id.as_string().expect("identity"))
+            .map(|entry| entry.identity().entity_id.as_string().expect("identity"))
             .collect()
     }
 

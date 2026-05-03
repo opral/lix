@@ -33,7 +33,7 @@ Use these schema references when building queries. Nullable columns are marked a
 | `inherited_from_version_id` | TEXT, nullable  | Source version when inherited                 |
 | `change_id`                 | TEXT            | Change that produced the state                |
 | `untracked`                 | INTEGER/BOOLEAN | `1` for untracked UI/ephemeral state          |
-| `commit_id`                 | TEXT            | Commit that contains the change               |
+| `commit_id`                 | TEXT            | Commit that introduced/adopted the change     |
 | `writer_key`                | TEXT, nullable  | Writer attribution for echo suppression       |
 | `metadata`                  | JSON, nullable  | Metadata attached to the originating change   |
 
@@ -53,7 +53,7 @@ Use these schema references when building queries. Nullable columns are marked a
 | `inherited_from_version_id` | TEXT, nullable  | Source version when inherited                 |
 | `change_id`                 | TEXT            | Change that produced the state                |
 | `untracked`                 | INTEGER/BOOLEAN | `1` for untracked UI/ephemeral state          |
-| `commit_id`                 | TEXT            | Commit that contains the change               |
+| `commit_id`                 | TEXT            | Commit that introduced/adopted the change     |
 | `writer_key`                | TEXT, nullable  | Writer attribution for echo suppression       |
 | `metadata`                  | JSON, nullable  | Metadata attached to the originating change   |
 
@@ -69,7 +69,7 @@ Use these schema references when building queries. Nullable columns are marked a
 | `metadata`         | JSON, nullable | Metadata from the change that produced the state    |
 | `schema_version`   | TEXT           | Schema version string (e.g., `1.0`)                 |
 | `change_id`        | TEXT           | Change that produced the historical state           |
-| `commit_id`        | TEXT           | Commit where this state was created                 |
+| `observed_commit_id` | TEXT        | Nearest reachable commit that introduced/adopted the change |
 | `root_commit_id`   | TEXT           | Commit you are traversing history from              |
 | `depth`            | INTEGER        | Distance from `root_commit_id` (`0` = root)         |
 | `version_id`       | TEXT           | Always `global` (history is global across versions) |

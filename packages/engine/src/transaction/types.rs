@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use crate::entity_identity::EntityIdentity;
 use crate::live_state::LiveStateRow;
+use crate::tracked_state::TrackedStateRow;
 use crate::untracked_state::UntrackedStateRow;
 
 /// Incoming state row before transaction hydration.
@@ -43,6 +44,18 @@ pub(crate) struct StageFileData {
     pub(crate) data: Vec<u8>,
 }
 
+/// Existing canonical change adopted into another version's tracked projection.
+///
+/// Merges use this path when the source side already owns the canonical
+/// changelog fact. The target commit references that existing change id and
+/// writes a target-version projection row without appending a copied change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StageAdoptedChange {
+    pub(crate) version_id: String,
+    pub(crate) change_id: String,
+    pub(crate) projected_row: TrackedStateRow,
+}
+
 /// One decoded write batch before transaction hydration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StageWrite {
@@ -55,6 +68,9 @@ pub(crate) enum StageWrite {
         rows: Vec<StageRow>,
         file_data: Vec<StageFileData>,
         count: u64,
+    },
+    AdoptedChanges {
+        changes: Vec<StageAdoptedChange>,
     },
 }
 
@@ -88,6 +104,23 @@ pub(crate) struct StagedStateRow {
     pub(crate) change_id: Option<String>,
     pub(crate) commit_id: Option<String>,
     pub(crate) untracked: bool,
+    pub(crate) version_id: String,
+}
+
+/// Transaction-hydrated projection for an adopted canonical change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StagedAdoptedStateRow {
+    pub(crate) entity_id: EntityIdentity,
+    pub(crate) schema_key: String,
+    pub(crate) file_id: Option<String>,
+    pub(crate) snapshot_content: Option<String>,
+    pub(crate) metadata: Option<String>,
+    pub(crate) schema_version: String,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) global: bool,
+    pub(crate) change_id: String,
+    pub(crate) commit_id: String,
     pub(crate) version_id: String,
 }
 
@@ -131,6 +164,66 @@ impl From<&StagedStateRow> for LiveStateRow {
     }
 }
 
+impl From<StagedAdoptedStateRow> for LiveStateRow {
+    fn from(row: StagedAdoptedStateRow) -> Self {
+        LiveStateRow {
+            entity_id: row.entity_id,
+            schema_key: row.schema_key,
+            file_id: row.file_id,
+            snapshot_content: row.snapshot_content,
+            metadata: row.metadata,
+            schema_version: row.schema_version,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            global: row.global,
+            change_id: Some(row.change_id),
+            commit_id: Some(row.commit_id),
+            untracked: false,
+            version_id: row.version_id,
+        }
+    }
+}
+
+impl From<&StagedAdoptedStateRow> for LiveStateRow {
+    fn from(row: &StagedAdoptedStateRow) -> Self {
+        LiveStateRow {
+            entity_id: row.entity_id.clone(),
+            schema_key: row.schema_key.clone(),
+            file_id: row.file_id.clone(),
+            snapshot_content: row.snapshot_content.clone(),
+            metadata: row.metadata.clone(),
+            schema_version: row.schema_version.clone(),
+            created_at: row.created_at.clone(),
+            updated_at: row.updated_at.clone(),
+            global: row.global,
+            change_id: Some(row.change_id.clone()),
+            commit_id: Some(row.commit_id.clone()),
+            untracked: false,
+            version_id: row.version_id.clone(),
+        }
+    }
+}
+
+impl From<&StagedAdoptedStateRow> for StagedStateRow {
+    fn from(row: &StagedAdoptedStateRow) -> Self {
+        StagedStateRow {
+            entity_id: row.entity_id.clone(),
+            schema_key: row.schema_key.clone(),
+            file_id: row.file_id.clone(),
+            snapshot_content: row.snapshot_content.clone(),
+            metadata: row.metadata.clone(),
+            schema_version: row.schema_version.clone(),
+            created_at: row.created_at.clone(),
+            updated_at: row.updated_at.clone(),
+            global: row.global,
+            change_id: Some(row.change_id.clone()),
+            commit_id: Some(row.commit_id.clone()),
+            untracked: false,
+            version_id: row.version_id.clone(),
+        }
+    }
+}
+
 impl From<StagedStateRow> for UntrackedStateRow {
     fn from(row: StagedStateRow) -> Self {
         UntrackedStateRow {
@@ -148,11 +241,11 @@ impl From<StagedStateRow> for UntrackedStateRow {
     }
 }
 
-/// Transaction-local commit membership accumulated while rows are staged.
+/// Transaction-local introduced-change membership accumulated while rows are staged.
 ///
 /// Final commit row materialization owns commit ids, parent heads, and commit
-/// row timestamps. Staging only tracks which hydrated tracked changes belong
-/// to the future commit for a version.
+/// row timestamps. Staging only tracks which hydrated tracked changes the
+/// future commit introduces for a version.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct StagedCommitMembers {
     pub(crate) commit_id: String,
