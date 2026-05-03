@@ -2,8 +2,8 @@ mod common;
 mod lix_active_version_commit_id;
 mod lix_empty_blob;
 mod lix_json;
-mod lix_json_extract;
-mod lix_json_extract_text;
+mod lix_json_get;
+mod lix_json_get_text;
 mod lix_text_decode;
 mod lix_text_encode;
 mod lix_uuid_v7;
@@ -28,10 +28,8 @@ pub(crate) fn register_sql2_functions(
     ctx.register_udf(ScalarUDF::from(
         lix_active_version_commit_id::LixActiveVersionCommitId::new(active_version_commit_id),
     ));
-    ctx.register_udf(ScalarUDF::from(lix_json_extract::LixJsonExtract::new()));
-    ctx.register_udf(ScalarUDF::from(
-        lix_json_extract_text::LixJsonExtractText::new(),
-    ));
+    ctx.register_udf(ScalarUDF::from(lix_json_get::LixJsonGet::new()));
+    ctx.register_udf(ScalarUDF::from(lix_json_get_text::LixJsonGetText::new()));
     ctx.register_udf(ScalarUDF::from(lix_text_decode::LixTextDecode::new()));
     ctx.register_udf(ScalarUDF::from(lix_text_encode::LixTextEncode::new()));
     ctx.register_udf(ScalarUDF::from(lix_json::LixJson));

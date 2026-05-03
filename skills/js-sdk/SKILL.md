@@ -402,7 +402,7 @@ Use DataFusion-style numbered placeholders. Bare `?` is rejected with `Failed to
 await lix.execute("SELECT * FROM acme_brochure WHERE id = $1", ["spring-2026"]);
 ```
 
-The only UDF the canonical demo uses is `lix_json($1)` — it parses a TEXT parameter as a JSON value, required when writing JSON-typed columns like `lix_registered_schema.value`. Other UDFs (`lix_json_extract`, `lix_uuid_v7`, `lix_text_encode`/`_decode`, `lix_empty_blob`, …) live in [packages/engine/src/sql2/udfs](https://github.com/opral/lix/tree/561f92b5bc3fa68e48a863ed3a02129645a57011/packages/engine/src/sql2/udfs) — read source when you need them.
+The only UDF the canonical demo uses is `lix_json($1)` — it parses a TEXT parameter as a JSON value, required when writing JSON-typed columns like `lix_registered_schema.value`. Other UDFs (`lix_json_get`, `lix_json_get_text`, `lix_uuid_v7`, `lix_text_encode`/`_decode`, `lix_empty_blob`, …) live in [packages/engine/src/sql2/udfs](https://github.com/opral/lix/tree/561f92b5bc3fa68e48a863ed3a02129645a57011/packages/engine/src/sql2/udfs) — read source when you need them.
 
 ## Built-in Queryable Tables
 

@@ -34,12 +34,17 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
 
     if looks_like_json_udf_miss(&lower) {
         return LixError::new(LixError::CODE_UDF_NOT_FOUND, description)
-            .with_hint("Use lix_json_extract(json, path) for JSON values or lix_json_extract_text(json, path) for text.");
+            .with_hint("Use lix_json_get(json, key_or_index, ...) for JSON values or lix_json_get_text(json, key_or_index, ...) for text.");
     }
 
     if looks_like_unsupported_dialect(&lower) {
         return LixError::new(LixError::CODE_DIALECT_UNSUPPORTED, description)
-            .with_hint("Lix SQL uses DataFusion syntax. Use lix_json_extract(...) or lix_json_extract_text(...) for JSON access, and numbered placeholders like $1, $2, ...");
+            .with_hint("Lix SQL uses DataFusion syntax. Use lix_json_get(...) or lix_json_get_text(...) for JSON access, and numbered placeholders like $1, $2, ...");
+    }
+
+    if lower.contains("uses variadic path segments") {
+        return LixError::new(LixError::CODE_INVALID_JSON_PATH, description)
+            .with_hint("Pass path segments as separate arguments, for example lix_json_get_text(document, 'user', 'name'), not '$.user.name' or '/user/name'.");
     }
 
     if lower.contains("failed to parse placeholder id")
@@ -104,7 +109,7 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
 
     if looks_like_type_mismatch(&lower) {
         return LixError::new(LixError::CODE_TYPE_MISMATCH, description)
-            .with_hint("Check the SQL function argument types. JSON text can be converted with lix_json(...); JSON fields can be read with lix_json_extract(...) or lix_json_extract_text(...).");
+            .with_hint("Check the SQL function argument types. JSON text can be converted with lix_json(...); JSON fields can be read with lix_json_get(...) or lix_json_get_text(...).");
     }
 
     match error {

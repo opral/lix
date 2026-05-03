@@ -12,11 +12,11 @@ use serde_json::Value as JsonValue;
 use super::common::{extract_json_path, json_text_value, scalar_inputs};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct LixJsonExtractText {
+pub(super) struct LixJsonGetText {
     signature: Signature,
 }
 
-impl LixJsonExtractText {
+impl LixJsonGetText {
     pub(super) fn new() -> Self {
         Self {
             signature: Signature::variadic_any(Volatility::Immutable),
@@ -24,13 +24,13 @@ impl LixJsonExtractText {
     }
 }
 
-impl ScalarUDFImpl for LixJsonExtractText {
+impl ScalarUDFImpl for LixJsonGetText {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn name(&self) -> &str {
-        "lix_json_extract_text"
+        "lix_json_get_text"
     }
 
     fn signature(&self) -> &Signature {
@@ -43,7 +43,7 @@ impl ScalarUDFImpl for LixJsonExtractText {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         if args.args.len() < 2 {
-            return plan_err!("lix_json_extract_text requires at least 2 arguments");
+            return plan_err!("lix_json_get_text requires at least 2 arguments");
         }
 
         let scalar_inputs = scalar_inputs(&args.args);
@@ -52,7 +52,7 @@ impl ScalarUDFImpl for LixJsonExtractText {
 
         let mut values = Vec::with_capacity(len);
         for row in 0..len {
-            values.push(match extract_json_path(&arrays, row)? {
+            values.push(match extract_json_path(self.name(), &arrays, row)? {
                 None | Some(JsonValue::Null) => None,
                 Some(JsonValue::Bool(value)) => Some(if value {
                     "true".to_string()
@@ -80,11 +80,11 @@ mod tests {
     #[tokio::test]
     async fn returns_unwrapped_text() {
         assert_eq!(
-            single_text("SELECT lix_json_extract_text('{\"name\":\"Ada\"}', 'name')").await,
+            single_text("SELECT lix_json_get_text('{\"name\":\"Ada\"}', 'name')").await,
             Some("Ada".to_string())
         );
         assert_eq!(
-            single_text("SELECT lix_json_extract_text('{\"active\":true}', 'active')").await,
+            single_text("SELECT lix_json_get_text('{\"active\":true}', 'active')").await,
             Some("true".to_string())
         );
     }
@@ -92,7 +92,7 @@ mod tests {
     #[tokio::test]
     async fn missing_path_returns_null() {
         assert_eq!(
-            single_text("SELECT lix_json_extract_text('{\"name\":\"Ada\"}', 'missing')").await,
+            single_text("SELECT lix_json_get_text('{\"name\":\"Ada\"}', 'missing')").await,
             None
         );
     }
