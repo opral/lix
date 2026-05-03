@@ -1899,8 +1899,7 @@ fn decode_json_pointer_segment(segment: &str) -> std::result::Result<String, Lix
 fn schema_exposed_as_entity_surface(schema_key: &str) -> bool {
     !matches!(
         schema_key,
-        "lix_active_version"
-            | "lix_active_account"
+        "lix_active_account"
             | "lix_change"
             | "lix_commit_edge"
             | "lix_change_set"
@@ -2201,7 +2200,6 @@ mod tests {
 
     #[test]
     fn excludes_non_entity_builtin_session_surfaces() {
-        assert!(!schema_exposed_as_entity_surface("lix_active_version"));
         assert!(!schema_exposed_as_entity_surface("lix_active_account"));
         assert!(schema_exposed_as_entity_surface("project_message"));
     }
