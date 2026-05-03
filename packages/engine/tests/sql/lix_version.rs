@@ -42,6 +42,33 @@ simulation_test!(lix_version_lists_descriptors_with_refs, |sim| async move {
 });
 
 simulation_test!(
+    lix_version_count_star_handles_empty_projection,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session("global")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
+
+        assert_eq!(
+            count_rows(&session, "SELECT COUNT(*) FROM lix_version").await,
+            2
+        );
+        assert_eq!(
+            count_rows(
+                &session,
+                "SELECT COUNT(*) FROM lix_version WHERE name = 'main'",
+            )
+            .await,
+            1
+        );
+    }
+);
+
+simulation_test!(
     lix_version_insert_creates_descriptor_and_ref,
     |sim| async move {
         let engine = sim.boot_engine().await;
