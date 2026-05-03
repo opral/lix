@@ -1094,9 +1094,13 @@ mod tests {
             vec![vec![Value::Text("lix_state".to_string())]]
         );
 
-        let tables_result = execute_sql(&ctx, "SELECT table_name FROM information_schema.tables", &[])
-            .await
-            .expect("information_schema.tables should list registered tables");
+        let tables_result = execute_sql(
+            &ctx,
+            "SELECT table_name FROM information_schema.tables",
+            &[],
+        )
+        .await
+        .expect("information_schema.tables should list registered tables");
         assert!(tables_result.rows.iter().any(|row| {
             row.iter()
                 .any(|value| matches!(value, Value::Text(value) if value == "lix_state"))
@@ -1770,7 +1774,7 @@ mod tests {
         .expect_err("path should remain read-only");
 
         assert!(
-            error.description.contains("read-only column 'path'"),
+            error.message.contains("read-only column 'path'"),
             "unexpected error: {error:?}"
         );
         assert!(staged_writes

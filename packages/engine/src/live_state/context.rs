@@ -1468,7 +1468,7 @@ mod tests {
             .expect_err("one tracked root must not mix global and version rows");
 
         assert!(
-            error.description.contains("mixes multiple storage scopes"),
+            error.message.contains("mixes multiple storage scopes"),
             "unexpected error: {error:?}"
         );
     }
@@ -1492,7 +1492,7 @@ mod tests {
             .expect_err("global rows must be stored in the global root only");
 
         assert!(
-            error.description.contains("invalid storage scope"),
+            error.message.contains("invalid storage scope"),
             "unexpected error: {error:?}"
         );
     }
@@ -1608,7 +1608,7 @@ mod tests {
             .expect_err("commit roots must declare parent_commit_ids");
 
         assert!(
-            error.description.contains("missing parent_commit_ids"),
+            error.message.contains("missing parent_commit_ids"),
             "unexpected error: {error:?}"
         );
     }
@@ -1645,9 +1645,7 @@ mod tests {
             .expect_err("commit root parent_commit_ids must be an array");
 
         assert!(
-            error
-                .description
-                .contains("parent_commit_ids must be an array"),
+            error.message.contains("parent_commit_ids must be an array"),
             "unexpected error: {error:?}"
         );
     }

@@ -202,8 +202,12 @@ test("merge conflicts expose structured details", async () => {
 		expect(isLixError(error)).toBe(true);
 		if (!isLixError(error)) throw error;
 		expect(error.code).toBe("LIX_MERGE_CONFLICT");
+		expect(error.message).toContain("tracked-state conflict");
 		expect(error.details).toBeDefined();
 		expect((error as LixError & { data?: unknown }).data).toBeUndefined();
+		expect(
+			"description" in (error as LixError & { description?: unknown }),
+		).toBe(false);
 		const details = error.details as {
 			conflicts?: Array<{
 				schema_key?: string;

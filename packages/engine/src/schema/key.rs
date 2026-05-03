@@ -24,7 +24,7 @@ impl SchemaKey {
 pub fn schema_key_from_definition(schema: &JsonValue) -> Result<SchemaKey, LixError> {
     let object = schema.as_object().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "schema definition must be a JSON object".to_string(),
+        message: "schema definition must be a JSON object".to_string(),
         hint: None,
         details: None,
     })?;
@@ -33,7 +33,7 @@ pub fn schema_key_from_definition(schema: &JsonValue) -> Result<SchemaKey, LixEr
         .and_then(JsonValue::as_str)
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "schema definition must include string x-lix-key".to_string(),
+            message: "schema definition must include string x-lix-key".to_string(),
             hint: None,
             details: None,
         })?;
@@ -42,7 +42,7 @@ pub fn schema_key_from_definition(schema: &JsonValue) -> Result<SchemaKey, LixEr
         .and_then(JsonValue::as_str)
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "schema definition must include string x-lix-version".to_string(),
+            message: "schema definition must include string x-lix-version".to_string(),
             hint: None,
             details: None,
         })?;
@@ -58,13 +58,13 @@ pub fn schema_from_registered_snapshot(
 ) -> Result<(SchemaKey, JsonValue), LixError> {
     let value = snapshot.get("value").ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "registered schema snapshot_content missing value".to_string(),
+        message: "registered schema snapshot_content missing value".to_string(),
         hint: None,
         details: None,
     })?;
     let value = value.as_object().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "registered schema snapshot_content value must be an object".to_string(),
+        message: "registered schema snapshot_content value must be an object".to_string(),
         hint: None,
         details: None,
     })?;
@@ -74,7 +74,7 @@ pub fn schema_from_registered_snapshot(
         .and_then(|value| value.as_str())
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "registered schema value.x-lix-key must be string".to_string(),
+            message: "registered schema value.x-lix-key must be string".to_string(),
             hint: None,
             details: None,
         })?;
@@ -83,7 +83,7 @@ pub fn schema_from_registered_snapshot(
         .and_then(|value| value.as_str())
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "registered schema value.x-lix-version must be string".to_string(),
+            message: "registered schema value.x-lix-version must be string".to_string(),
             hint: None,
             details: None,
         })?;
@@ -134,7 +134,7 @@ mod tests {
         let snapshot = json!({});
 
         let err = schema_from_registered_snapshot(&snapshot).expect_err("should fail");
-        assert!(err.description.contains("missing value"), "{err:?}");
+        assert!(err.message.contains("missing value"), "{err:?}");
     }
 
     #[test]
@@ -147,7 +147,7 @@ mod tests {
         });
 
         let err = schema_from_registered_snapshot(&snapshot).expect_err("should fail");
-        assert!(err.description.contains("x-lix-key"), "{err:?}");
+        assert!(err.message.contains("x-lix-key"), "{err:?}");
     }
 
     #[test]

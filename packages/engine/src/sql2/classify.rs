@@ -88,6 +88,6 @@ fn validate_supported_set_expr(expr: &SetExpr) -> Result<(), LixError> {
     }
 }
 
-fn unsupported_sql_error(description: impl Into<String>) -> LixError {
-    LixError::new(LixError::CODE_UNSUPPORTED_SQL, description)
+fn unsupported_sql_error(message: impl Into<String>) -> LixError {
+    LixError::new(LixError::CODE_UNSUPPORTED_SQL, message)
 }

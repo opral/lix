@@ -4,7 +4,7 @@ use crate::LixError;
 pub(crate) fn compress_json_payload(json_data: &[u8]) -> Result<Vec<u8>, LixError> {
     zstd::bulk::compress(json_data, 1).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("json compression failed: {error}"),
+        message: format!("json compression failed: {error}"),
         hint: None,
         details: None,
     })
@@ -26,7 +26,7 @@ pub(crate) fn decode_json_zstd_payload(
 ) -> Result<Vec<u8>, LixError> {
     zstd::bulk::decompress(compressed_payload, uncompressed_len).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("json decompression failed for ref '{hash_hex}': {error}"),
+        message: format!("json decompression failed for ref '{hash_hex}': {error}"),
         hint: None,
         details: None,
     })
@@ -43,7 +43,7 @@ pub(crate) fn decode_json_zstd_payload(
     let mut decoder =
         ruzstd::decoding::StreamingDecoder::new(compressed_payload).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("json decompression failed: {error}"),
+            message: format!("json decompression failed: {error}"),
             hint: None,
             details: None,
         })?;
@@ -51,7 +51,7 @@ pub(crate) fn decode_json_zstd_payload(
     let mut output = Vec::new();
     decoder.read_to_end(&mut output).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("json decompression failed: {error}"),
+        message: format!("json decompression failed: {error}"),
         hint: None,
         details: None,
     })?;

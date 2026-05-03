@@ -124,16 +124,16 @@ simulation_test!(
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
         assert!(
-            error.description.contains("must begin with '/'"),
-            "unexpected description: {}",
-            error.description
+            error.message.contains("must begin with '/'"),
+            "unexpected message: {}",
+            error.message
         );
         assert!(
             error
-                .description
+                .message
                 .contains("x-lix-primary-key: \"id\" → \"/id\""),
-            "description should show the offending primary key pointer: {}",
-            error.description
+            "message should show the offending primary key pointer: {}",
+            error.message
         );
         let hint = error.hint.as_deref().expect("error should include a hint");
         assert!(

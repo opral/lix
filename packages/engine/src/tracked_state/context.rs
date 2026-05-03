@@ -515,8 +515,7 @@ mod tests {
             .expect_err("parent root must exist when parent_commit_id is provided");
 
         assert!(
-            error.description.contains("parent root")
-                && error.description.contains("missing-parent"),
+            error.message.contains("parent root") && error.message.contains("missing-parent"),
             "unexpected error: {error:?}"
         );
     }
