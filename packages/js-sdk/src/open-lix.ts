@@ -166,6 +166,7 @@ export type OpenLixOptions = {
 export type CreateVersionOptions = {
 	id?: string;
 	name: string;
+	fromCommitId?: string;
 };
 
 export type CreateVersionResult = {

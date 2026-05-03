@@ -77,6 +77,7 @@ export type OpenLixOptions = {
 export type CreateVersionOptions = {
   id?: string;
   name: string;
+  fromCommitId?: string;
 };
 
 export type CreateVersionResult = {
@@ -638,7 +639,12 @@ export type MergeVersionResult = {
         let object = expect_object(value, "createVersion")?;
         let id = optional_string(&object, "id", "createVersion")?;
         let name = required_string(&object, "name", "createVersion")?;
-        Ok(CreateVersionOptions { id, name })
+        let from_commit_id = optional_string(&object, "fromCommitId", "createVersion")?;
+        Ok(CreateVersionOptions {
+            id,
+            name,
+            from_commit_id,
+        })
     }
 
     fn parse_switch_version_options(value: JsValue) -> Result<SwitchVersionOptions, LixError> {

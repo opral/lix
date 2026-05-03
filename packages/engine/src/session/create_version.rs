@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use crate::transaction::types::StageRow;
+use crate::transaction::types::{StageRow, StageWrite, StageWriteMode};
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 
@@ -18,6 +18,9 @@ pub struct CreateVersionOptions {
     pub id: Option<String>,
     /// User-facing version name.
     pub name: String,
+    /// Optional commit id for the new version head. If omitted, the current
+    /// active version head is used.
+    pub from_commit_id: Option<String>,
 }
 
 /// Receipt returned after creating a version.
@@ -41,9 +44,10 @@ impl SessionContext {
                 let version_id = options
                     .id
                     .unwrap_or_else(|| transaction.functions().call_uuid_v7());
-                let active_version_id = transaction.active_version_id().to_string();
-
-                let source_head = {
+                let source_head = if let Some(from_commit_id) = options.from_commit_id {
+                    from_commit_id
+                } else {
+                    let active_version_id = transaction.active_version_id().to_string();
                     let reader = transaction.version_ref_reader();
                     reader
                         .load_head_commit_id(&active_version_id)
@@ -59,10 +63,13 @@ impl SessionContext {
                         })?
                 };
 
-                transaction.stage_rows(vec![
-                    version_descriptor_stage_row(&version_id, &options.name)?,
-                    version_ref_stage_row(&version_id, &source_head)?,
-                ])?;
+                transaction.stage_write(StageWrite::Rows {
+                    mode: StageWriteMode::Insert,
+                    rows: vec![
+                        version_descriptor_stage_row(&version_id, &options.name)?,
+                        version_ref_stage_row(&version_id, &source_head)?,
+                    ],
+                })?;
 
                 Ok(CreateVersionReceipt { version_id })
             })

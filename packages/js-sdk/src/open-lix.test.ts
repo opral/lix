@@ -113,6 +113,40 @@ test("openLix accepts an explicit backend", async () => {
 	await second.close();
 });
 
+test("createVersion can start from an explicit commit id", async () => {
+	const lix = await openLix();
+
+	await registerCrmTaskSchema(lix);
+	const baseHead = await lix.execute("SELECT lix_active_version_commit_id()");
+	const fromCommitId = baseHead.rows[0]!.get("lix_active_version_commit_id()");
+	expect(typeof fromCommitId).toBe("string");
+
+	await lix.execute(
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		[
+			"after-base",
+			"Written after base",
+			false,
+			JSON.stringify({ priority: "normal" }),
+		],
+	);
+
+	const version = await lix.createVersion({
+		id: "from-explicit-commit",
+		name: "From explicit commit",
+		fromCommitId: fromCommitId as string,
+	});
+	await lix.switchVersion({ versionId: version.versionId });
+
+	const projected = await lix.execute(
+		"SELECT id FROM crm_task WHERE id = $1",
+		["after-base"],
+	);
+	expect(projected.rows).toHaveLength(0);
+
+	await lix.close();
+});
+
 test("lix.close delegates backend close through the engine bridge", async () => {
 	let closeCount = 0;
 	const backend = {

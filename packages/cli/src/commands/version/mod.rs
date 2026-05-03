@@ -266,11 +266,13 @@ mod tests {
         crate::db::block_on(lix.create_version(CreateVersionOptions {
             id: Some("feature-a".to_string()),
             name: "feature".to_string(),
+            from_commit_id: None,
         }))
         .expect("first version create should succeed");
         crate::db::block_on(lix.create_version(CreateVersionOptions {
             id: Some("feature-b".to_string()),
             name: "feature".to_string(),
+            from_commit_id: None,
         }))
         .expect("second version create should succeed");
 
