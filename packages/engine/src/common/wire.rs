@@ -36,6 +36,7 @@ impl WireValue {
                         description: "cannot encode non-finite float value to wire format"
                             .to_string(),
                         hint: None,
+                        details: None,
                     });
                 }
                 Ok(Self::Float { value: *value })
@@ -64,6 +65,7 @@ impl WireValue {
                         description: "cannot decode non-finite float value from wire format"
                             .to_string(),
                         hint: None,
+                        details: None,
                     });
                 }
                 Ok(Value::Real(value))
@@ -77,6 +79,7 @@ impl WireValue {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: format!("failed to decode wire blob base64: {error}"),
                         hint: None,
+                        details: None,
                     })?;
                 Ok(Value::Blob(decoded))
             }
@@ -161,6 +164,7 @@ mod tests {
                 code: "LIX_TEST_NOTICE".to_string(),
                 message: "test notice".to_string(),
                 hint: Some("test hint".to_string()),
+                details: None,
             }],
         };
 

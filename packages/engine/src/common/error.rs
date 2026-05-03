@@ -1,3 +1,5 @@
+use serde_json::Value as JsonValue;
+
 /// Structured error type surfaced by Lix to every SDK binding.
 ///
 /// Carries a machine-readable [`code`](Self::code), a human-readable
@@ -22,6 +24,7 @@ pub struct LixError {
     pub code: String,
     pub description: String,
     pub hint: Option<String>,
+    pub details: Option<JsonValue>,
 }
 
 impl LixError {
@@ -110,11 +113,15 @@ impl LixError {
     /// durability boundary.
     pub const CODE_CLOSED: &'static str = "LIX_ERROR_CLOSED";
 
+    /// A merge found incompatible changes to the same tracked-state identity.
+    pub const CODE_MERGE_CONFLICT: &'static str = "LIX_MERGE_CONFLICT";
+
     pub fn new(code: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             description: description.into(),
             hint: None,
+            details: None,
         }
     }
 
@@ -133,6 +140,12 @@ impl LixError {
     /// ```
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
+        self
+    }
+
+    /// Attach machine-readable details to this error.
+    pub fn with_details(mut self, details: JsonValue) -> Self {
+        self.details = Some(details);
         self
     }
 

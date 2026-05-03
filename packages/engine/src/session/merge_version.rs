@@ -1,3 +1,5 @@
+use serde_json::json;
+
 use crate::tracked_state::{TrackedStateDiffRequest, TrackedStateMergePlan};
 use crate::transaction::types::{StageAdoptedChange, StageWrite};
 use crate::LixError;
@@ -129,13 +131,7 @@ impl SessionContext {
                 };
 
                 if !merge_plan.conflicts.is_empty() {
-                    let conflict_count = merge_plan.conflicts.len();
-                    return Err(LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!(
-                            "engine2 merge_version found {conflict_count} tracked-state conflict(s)"
-                        ),
-                    ));
+                    return Err(merge_conflict_error(&merge_plan)?);
                 }
 
                 let adopted_changes =
@@ -183,6 +179,71 @@ impl SessionContext {
         })
         .await
     }
+}
+
+fn merge_conflict_error(plan: &TrackedStateMergePlan) -> Result<LixError, LixError> {
+    let conflict_count = plan.conflicts.len();
+    Ok(LixError::new(
+        LixError::CODE_MERGE_CONFLICT,
+        format!("merge_version found {conflict_count} tracked-state conflict(s)"),
+    )
+    .with_hint("Resolve the conflicting entities in the target version, then retry the merge.")
+    .with_details(json!({
+        "conflicts": plan.conflicts.iter()
+            .map(merge_conflict_details)
+            .collect::<Result<Vec<_>, _>>()?,
+    })))
+}
+
+fn merge_conflict_details(
+    conflict: &crate::tracked_state::TrackedStateMergeConflict,
+) -> Result<serde_json::Value, LixError> {
+    Ok(json!({
+        "schema_key": conflict.identity.schema_key,
+        "entity_id": conflict.identity.entity_id.as_string()?,
+        "file_id": conflict.identity.file_id,
+        "target": merge_conflict_side_details(&conflict.target)?,
+        "source": merge_conflict_side_details(&conflict.source)?,
+    }))
+}
+
+fn merge_conflict_side_details(
+    entry: &crate::tracked_state::TrackedStateDiffEntry,
+) -> Result<serde_json::Value, LixError> {
+    Ok(json!({
+        "kind": match entry.kind {
+            crate::tracked_state::TrackedStateDiffKind::Added => "added",
+            crate::tracked_state::TrackedStateDiffKind::Modified => "modified",
+            crate::tracked_state::TrackedStateDiffKind::Removed => "removed",
+        },
+        "before": merge_conflict_row_snapshot(entry.before.as_ref())?,
+        "after": merge_conflict_row_snapshot(entry.after.as_ref())?,
+        "before_change_id": entry.before.as_ref().map(|row| row.change_id.as_str()),
+        "after_change_id": entry.after.as_ref().map(|row| row.change_id.as_str()),
+    }))
+}
+
+fn merge_conflict_row_snapshot(
+    row: Option<&crate::tracked_state::TrackedStateRow>,
+) -> Result<Option<serde_json::Value>, LixError> {
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+        return Ok(None);
+    };
+    serde_json::from_str(snapshot_content).map(Some).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "merge_version conflict details could not parse snapshot_content for schema '{}' entity '{}': {error}",
+                row.schema_key,
+                row.entity_id
+                    .as_string()
+                    .unwrap_or_else(|_| "<invalid entity_id>".to_string())
+            ),
+        )
+    })
 }
 
 fn adopted_changes_from_merge_plan(

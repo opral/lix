@@ -873,10 +873,7 @@ simulation_test!(
             })
             .await
             .expect_err("divergent same-entity changes should conflict");
-        assert!(
-            error.description.contains("tracked-state conflict"),
-            "unexpected merge error: {error:?}"
-        );
+        assert_merge_conflict_error(&error);
         assert_eq!(
             engine
                 .load_version_head_commit_id(sim.main_version_id())
@@ -976,11 +973,7 @@ simulation_test!(
             })
             .await
             .expect_err("delete/modify should conflict");
-
-        assert!(
-            error.description.contains("tracked-state conflict"),
-            "unexpected merge error: {error:?}"
-        );
+        assert_merge_conflict_error(&error);
         assert_eq!(
             engine
                 .load_version_head_commit_id(sim.main_version_id())
@@ -1017,11 +1010,7 @@ simulation_test!(
             })
             .await
             .expect_err("modify/delete should conflict");
-
-        assert!(
-            error.description.contains("tracked-state conflict"),
-            "unexpected merge error: {error:?}"
-        );
+        assert_merge_conflict_error(&error);
         assert_eq!(
             engine
                 .load_version_head_commit_id(sim.main_version_id())
@@ -1110,11 +1099,7 @@ simulation_test!(
             })
             .await
             .expect_err("independent adds with different payloads should conflict");
-
-        assert!(
-            error.description.contains("tracked-state conflict"),
-            "unexpected merge error: {error:?}"
-        );
+        assert_merge_conflict_error(&error);
         assert_eq!(
             engine
                 .load_version_head_commit_id(sim.main_version_id())
@@ -1355,6 +1340,43 @@ fn assert_version_pair_delete_restricted(error: &lix_engine::LixError) {
     assert!(
         error.to_string().contains("lix_version"),
         "error should explain the version pair restriction: {error:?}"
+    );
+}
+
+fn assert_merge_conflict_error(error: &lix_engine::LixError) {
+    assert_eq!(error.code, "LIX_MERGE_CONFLICT");
+    assert!(
+        error.description.contains("tracked-state conflict"),
+        "unexpected merge error: {error:?}"
+    );
+    let details = error
+        .details
+        .as_ref()
+        .expect("merge conflict should include details");
+    let conflicts = details
+        .get("conflicts")
+        .and_then(JsonValue::as_array)
+        .expect("merge conflict details should include conflicts array");
+    assert_eq!(conflicts.len(), 1);
+    let conflict = &conflicts[0];
+    assert_eq!(
+        conflict.get("schema_key").and_then(JsonValue::as_str),
+        Some("lix_key_value")
+    );
+    assert!(
+        conflict
+            .get("entity_id")
+            .and_then(JsonValue::as_str)
+            .is_some(),
+        "conflict should include entity_id: {conflict:?}"
+    );
+    assert!(
+        conflict.get("target").is_some(),
+        "conflict should include target side: {conflict:?}"
+    );
+    assert!(
+        conflict.get("source").is_some(),
+        "conflict should include source side: {conflict:?}"
     );
 }
 
