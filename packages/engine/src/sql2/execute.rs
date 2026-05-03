@@ -3,6 +3,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::prelude::{SessionConfig, SessionContext};
+use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -116,6 +117,7 @@ pub(crate) async fn execute_logical_plan(
         kind: _,
         notices,
     } = plan;
+    validate_parameter_count(&plan, params.len())?;
 
     let mut dataframe = session
         .execute_logical_plan(plan)
@@ -145,6 +147,70 @@ pub(crate) async fn execute_logical_plan(
     let mut result = query_result_from_batches(&result_fields, &batches)?;
     result.notices = notices;
     Ok(result)
+}
+
+fn validate_parameter_count(plan: &LogicalPlan, param_count: usize) -> Result<(), LixError> {
+    let parameter_names = plan
+        .get_parameter_names()
+        .map_err(datafusion_error_to_lix_error)?;
+    let expected_count = expected_positional_parameter_count(&parameter_names)?;
+    if param_count == expected_count {
+        return Ok(());
+    }
+
+    Err(LixError::new(
+        LixError::CODE_INVALID_PARAM,
+        format!(
+            "SQL expected {expected_count} parameter(s), but {param_count} parameter(s) were provided"
+        ),
+    )
+    .with_details(json!({
+        "operation": "execute",
+        "expected_param_count": expected_count,
+        "provided_param_count": param_count,
+        "placeholders": sorted_parameter_names(&parameter_names),
+    })))
+}
+
+fn expected_positional_parameter_count(
+    parameter_names: &HashSet<String>,
+) -> Result<usize, LixError> {
+    let mut max_index = 0usize;
+    for name in parameter_names {
+        let Some(index) = name
+            .strip_prefix('$')
+            .and_then(|raw| raw.parse::<usize>().ok())
+        else {
+            return Err(LixError::new(
+                LixError::CODE_PARSE_ERROR,
+                format!("unsupported SQL parameter placeholder '{name}'"),
+            )
+            .with_hint("Use numbered placeholders like $1, $2, ...")
+            .with_details(json!({
+                "operation": "execute",
+                "placeholder": name,
+            })));
+        };
+        if index == 0 {
+            return Err(LixError::new(
+                LixError::CODE_PARSE_ERROR,
+                "SQL parameter placeholders are 1-indexed",
+            )
+            .with_hint("Use numbered placeholders like $1, $2, ...")
+            .with_details(json!({
+                "operation": "execute",
+                "placeholder": name,
+            })));
+        }
+        max_index = max_index.max(index);
+    }
+    Ok(max_index)
+}
+
+fn sorted_parameter_names(parameter_names: &HashSet<String>) -> Vec<String> {
+    let mut names = parameter_names.iter().cloned().collect::<Vec<_>>();
+    names.sort();
+    names
 }
 
 async fn build_read_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, LixError> {
@@ -1069,6 +1135,41 @@ mod tests {
             .await
             .expect("sql2 execute should support literal-only queries");
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_rejects_extra_parameters() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            schema_definitions: vec![],
+        };
+
+        let error = execute_sql(
+            &ctx,
+            "SELECT $1 AS value",
+            &[Value::Integer(1), Value::Integer(2)],
+        )
+        .await
+        .expect_err("extra params should fail instead of being ignored");
+
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert_eq!(
+            error.message,
+            "SQL expected 1 parameter(s), but 2 parameter(s) were provided"
+        );
+        assert_eq!(
+            error.details,
+            Some(json!({
+                "operation": "execute",
+                "expected_param_count": 1,
+                "provided_param_count": 2,
+                "placeholders": ["$1"],
+            }))
+        );
     }
 
     #[tokio::test]

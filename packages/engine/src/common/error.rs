@@ -54,6 +54,9 @@ impl LixError {
     /// SQL parameters could not be bound to placeholders.
     pub const CODE_BINDING_ERROR: &'static str = "LIX_BINDING_ERROR";
 
+    /// A caller supplied an invalid SQL parameter value or parameter list.
+    pub const CODE_INVALID_PARAM: &'static str = "LIX_INVALID_PARAM";
+
     /// A SQL table or view name could not be resolved.
     pub const CODE_TABLE_NOT_FOUND: &'static str = "LIX_TABLE_NOT_FOUND";
 
