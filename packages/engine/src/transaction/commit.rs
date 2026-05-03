@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::binary_cas::{BinaryBlobWrite, BinaryCasContext};
 use crate::changelog::{CanonicalChange, ChangelogContext};
+use crate::json_store::{JsonRef, JsonStoreContext, JsonStoreWriter};
 use crate::live_state::{LiveStateContext, LiveStateRow};
 use crate::transaction::staging::StagedWriteSet;
 use crate::transaction::types::{StagedAdoptedStateRow, StagedCommitMembers, StagedStateRow};
@@ -64,8 +65,14 @@ pub(crate) async fn commit_staged_writes(
     }
 
     if !changelog_rows.is_empty() {
+        let mut json_writer = JsonStoreContext::new().writer();
         let canonical_changes =
-            new_canonical_changes(changelog, transaction, &changelog_rows).await?;
+            new_canonical_changes(changelog, transaction, &mut json_writer, &changelog_rows)
+                .await?;
+        {
+            let mut writer_store = &mut *transaction;
+            json_writer.flush(&mut writer_store).await?;
+        }
         {
             let mut writer = changelog.writer(&mut *transaction);
             writer.append_changes(&canonical_changes).await?;
@@ -106,12 +113,13 @@ pub(crate) async fn commit_staged_writes(
 async fn new_canonical_changes(
     changelog: &ChangelogContext,
     transaction: &mut dyn LixBackendTransaction,
+    json_writer: &mut JsonStoreWriter,
     rows: &[StagedStateRow],
 ) -> Result<Vec<CanonicalChange>, LixError> {
     let reader = changelog.reader(&mut *transaction);
     let mut changes = Vec::new();
     for row in rows {
-        let change = canonical_change_from_staged_row(row)?;
+        let change = canonical_change_from_staged_row(json_writer, row)?;
         match reader.load_change(&change.id).await? {
             Some(existing) => {
                 let entity_id = existing
@@ -139,9 +147,10 @@ async fn validate_adopted_canonical_changes(
     transaction: &mut dyn LixBackendTransaction,
     rows: &[StagedAdoptedStateRow],
 ) -> Result<(), LixError> {
+    let mut json_writer = JsonStoreContext::new().writer();
     let reader = changelog.reader(&mut *transaction);
     for row in rows {
-        let expected = canonical_change_from_adopted_row(row);
+        let expected = canonical_change_from_adopted_row(&mut json_writer, row)?;
         match reader.load_change(&expected.id).await? {
             Some(existing) if existing == expected => {}
             Some(existing) => {
@@ -171,7 +180,10 @@ async fn validate_adopted_canonical_changes(
     Ok(())
 }
 
-fn canonical_change_from_staged_row(row: &StagedStateRow) -> Result<CanonicalChange, LixError> {
+fn canonical_change_from_staged_row(
+    json_writer: &mut JsonStoreWriter,
+    row: &StagedStateRow,
+) -> Result<CanonicalChange, LixError> {
     let Some(change_id) = row.change_id.as_ref() else {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -185,23 +197,36 @@ fn canonical_change_from_staged_row(row: &StagedStateRow) -> Result<CanonicalCha
         schema_key: row.schema_key.clone(),
         schema_version: row.schema_version.clone(),
         file_id: row.file_id.clone(),
-        snapshot_content: row.snapshot_content.clone(),
-        metadata: row.metadata.clone(),
+        snapshot_ref: stage_optional_json(json_writer, row.snapshot_content.as_deref())?,
+        metadata_ref: stage_optional_json(json_writer, row.metadata.as_deref())?,
         created_at: row.created_at.clone(),
     })
 }
 
-fn canonical_change_from_adopted_row(row: &StagedAdoptedStateRow) -> CanonicalChange {
-    CanonicalChange {
+fn stage_optional_json(
+    json_writer: &mut JsonStoreWriter,
+    value: Option<&str>,
+) -> Result<Option<JsonRef>, LixError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    json_writer.stage_bytes(value.as_bytes()).map(Some)
+}
+
+fn canonical_change_from_adopted_row(
+    json_writer: &mut JsonStoreWriter,
+    row: &StagedAdoptedStateRow,
+) -> Result<CanonicalChange, LixError> {
+    Ok(CanonicalChange {
         id: row.change_id.clone(),
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
         schema_version: row.schema_version.clone(),
         file_id: row.file_id.clone(),
-        snapshot_content: row.snapshot_content.clone(),
-        metadata: row.metadata.clone(),
+        snapshot_ref: stage_optional_json(json_writer, row.snapshot_content.as_deref())?,
+        metadata_ref: stage_optional_json(json_writer, row.metadata.as_deref())?,
         created_at: row.created_at.clone(),
-    }
+    })
 }
 
 /// Materializes tracked staged membership into `lix_commit` rows.

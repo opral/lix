@@ -81,6 +81,8 @@ Additional high-signal variants are registered for:
 - batch sizes: `1`, `10`, `100`, `1k`, `10k`
 - state payload sizes: `small/10k`, `1k/10k`, `16k/1k`, `128k/100`
 - binary payload sizes: `small/10k`, `1k/10k`, `16k/1k`, `128k/100`
+- changelog shared JSON payloads: shared snapshot, shared metadata, and shared
+  snapshot+metadata workloads for measuring JsonStore writer dedupe
 - key distribution: `sequential_keys`, `random_keys`
 - scan selectivity: `1pct`, `10pct`, `100pct`
 - projection-aware scans: file-selective header scans that omit

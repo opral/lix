@@ -1,11 +1,14 @@
 use serde_json::json;
 use std::sync::Arc;
 
-use crate::changelog::{CanonicalChange, ChangelogContext};
+use crate::changelog::{
+    canonicalize_materialized_change, ChangelogContext, MaterializedCanonicalChange,
+};
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{
     FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
 };
+use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateRow};
 use crate::untracked_state::UntrackedStateRow;
 use crate::version::{
@@ -28,7 +31,7 @@ const COMMIT_SCHEMA_VERSION: &str = "1";
 /// `lix_version_ref` are seeded as untracked local state so repository heads can
 /// advance without becoming commit members.
 pub(crate) struct InitSeedPlan {
-    pub(crate) changes: Vec<CanonicalChange>,
+    pub(crate) changes: Vec<MaterializedCanonicalChange>,
     pub(crate) untracked_rows: Vec<UntrackedStateRow>,
     pub(crate) receipt: InitReceipt,
 }
@@ -159,8 +162,15 @@ pub(crate) async fn initialize(
         .await?;
 
     {
+        let mut json_writer = JsonStoreContext::new().writer();
+        let canonical_changes = plan
+            .changes
+            .iter()
+            .map(|change| canonicalize_materialized_change(&mut json_writer, change))
+            .collect::<Result<Vec<_>, _>>()?;
+        json_writer.flush(&mut transaction.as_mut()).await?;
         let mut writer = changelog.writer(transaction.as_mut());
-        writer.append_changes(&plan.changes).await?;
+        writer.append_changes(&canonical_changes).await?;
     }
 
     let mut live_rows = plan
@@ -180,7 +190,7 @@ pub(crate) async fn initialize(
 }
 
 fn live_state_row_from_initial_change(
-    change: &CanonicalChange,
+    change: &MaterializedCanonicalChange,
     initial_commit_id: &str,
 ) -> LiveStateRow {
     LiveStateRow {
@@ -228,8 +238,8 @@ fn canonical_change(
     schema_version: &str,
     snapshot_content: String,
     created_at: &str,
-) -> CanonicalChange {
-    CanonicalChange {
+) -> MaterializedCanonicalChange {
+    MaterializedCanonicalChange {
         id,
         entity_id,
         schema_key: schema_key.to_string(),
@@ -381,7 +391,7 @@ mod tests {
         );
     }
 
-    fn snapshot(change: &CanonicalChange) -> JsonValue {
+    fn snapshot(change: &MaterializedCanonicalChange) -> JsonValue {
         serde_json::from_str(
             change
                 .snapshot_content

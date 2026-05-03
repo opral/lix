@@ -1,7 +1,7 @@
 use crate::backend::{KvStore, KvWriter};
 use crate::json_store::compression::{compress_json_payload, decode_json_zstd_payload};
 use crate::json_store::encoded::{EncodedJson, JsonCodec};
-use crate::json_store::types::{JsonRef, StoreJsonOptions};
+use crate::json_store::types::JsonRef;
 use crate::LixError;
 use std::borrow::Cow;
 
@@ -28,6 +28,13 @@ fn encode_json(json: &str) -> Result<EncodedJson<'_>, LixError> {
 
 fn encode_json_for_storage(json: &str) -> Result<EncodedJson<'_>, LixError> {
     let raw_ref = raw_json_ref_for_content(json);
+    encode_json_for_storage_with_ref(json, raw_ref)
+}
+
+fn encode_json_for_storage_with_ref(
+    json: &str,
+    raw_ref: JsonRef,
+) -> Result<EncodedJson<'_>, LixError> {
     let raw_data = json.as_bytes();
 
     if raw_data.len() >= ZSTD_MIN_JSON_BYTES {
@@ -50,22 +57,33 @@ fn encode_json_for_storage(json: &str) -> Result<EncodedJson<'_>, LixError> {
     })
 }
 
-pub(crate) async fn store_json_bytes(
+pub(crate) async fn persist_json_bytes(
     writer: &mut (impl KvWriter + ?Sized),
     bytes: &[u8],
-    options: StoreJsonOptions<'_>,
 ) -> Result<JsonRef, LixError> {
-    let _base = options.base;
+    let (json_ref, stored_payload) = encode_json_bytes_for_storage(bytes)?;
+    persist_stored_json_payload(writer, &json_ref, &stored_payload).await?;
+    Ok(json_ref)
+}
+
+pub(crate) fn encode_json_bytes_for_storage(bytes: &[u8]) -> Result<(JsonRef, Vec<u8>), LixError> {
     let json = std::str::from_utf8(bytes).map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!("json bytes are invalid UTF-8: {error}"),
         )
     })?;
-    let encoded_json = encode_json_for_storage(json)?;
+    let json_ref = JsonRef::from_hash(blake3::hash(bytes));
+    encode_json_str_for_storage_with_ref(json, json_ref)
+}
+
+pub(crate) fn encode_json_str_for_storage_with_ref(
+    json: &str,
+    json_ref: JsonRef,
+) -> Result<(JsonRef, Vec<u8>), LixError> {
+    let encoded_json = encode_json_for_storage_with_ref(json, json_ref)?;
     let json_ref = encoded_json.json_ref.clone();
-    persist_encoded_json(writer, &encoded_json).await?;
-    Ok(json_ref)
+    Ok((json_ref, encode_stored_json_payload(&encoded_json)))
 }
 
 async fn persist_encoded_json(
@@ -79,6 +97,16 @@ async fn persist_encoded_json(
             encoded_json.json_ref.as_hash_bytes(),
             stored_payload.as_slice(),
         )
+        .await
+}
+
+pub(crate) async fn persist_stored_json_payload(
+    writer: &mut (impl KvWriter + ?Sized),
+    json_ref: &JsonRef,
+    stored_payload: &[u8],
+) -> Result<(), LixError> {
+    writer
+        .kv_put(JSON_NAMESPACE, json_ref.as_hash_bytes(), stored_payload)
         .await
 }
 

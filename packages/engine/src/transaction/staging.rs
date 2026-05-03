@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use crate::functions::{FunctionProvider, FunctionProviderHandle};
-use crate::live_state::{
-    LiveStateRow, LiveStateRowIdentity, LiveStateRowRequest, LiveStateScanRequest,
-};
+#[cfg(test)]
+use crate::live_state::LiveStateRowRequest;
+use crate::live_state::{LiveStateRow, LiveStateRowIdentity, LiveStateScanRequest};
 use crate::transaction::normalization::{normalize_stage_row, TransactionSchemaCatalog};
 use crate::transaction::types::{
     StageAdoptedChange, StageFileData, StageRow, StageWrite, StageWriteMode, StageWriteOutcome,
@@ -409,6 +409,7 @@ impl StagedStateRowOverlay {
     }
 
     /// Returns a staged exact-row answer, if this transaction has one.
+    #[cfg(test)]
     pub(crate) fn load_exact(&self, request: &LiveStateRowRequest) -> Option<StagedExactRow> {
         let untracked_identity = StagedStateRowIdentity::from_exact_request(request, true)?;
         if let Some(row) = self.rows.get(&untracked_identity) {
@@ -437,6 +438,7 @@ impl StagedStateRowOverlay {
     }
 }
 
+#[cfg(test)]
 pub(crate) enum StagedExactRow {
     Row(LiveStateRow),
     Tombstone,
@@ -462,6 +464,7 @@ impl StagedStateRowIdentity {
         }
     }
 
+    #[cfg(test)]
     fn from_exact_request(request: &LiveStateRowRequest, untracked: bool) -> Option<Self> {
         let file_id = match &request.file_id {
             NullableKeyFilter::Null => None,

@@ -6,10 +6,12 @@ use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{Expr, Operator};
 use tokio::sync::Mutex;
 
-use crate::changelog::CanonicalChange;
+use crate::changelog::{materialize_change, MaterializedCanonicalChange};
 use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
 use crate::entity_identity::EntityIdentity;
 use crate::LixError;
+
+use super::SqlJsonReader;
 
 /// Shared routing state for commit-shaped history SQL surfaces.
 ///
@@ -131,7 +133,7 @@ impl HistoryRoute {
 /// history surfaces.
 #[derive(Debug, Clone)]
 pub(crate) struct HistoryEntry {
-    pub(crate) change: CanonicalChange,
+    pub(crate) change: MaterializedCanonicalChange,
     pub(crate) observed_commit_id: String,
     pub(crate) commit_created_at: String,
     pub(crate) start_commit_id: String,
@@ -206,6 +208,7 @@ pub(crate) fn commit_graph_history_request(
 pub(crate) async fn load_history_entries(
     descriptor: HistoryViewDescriptor<'_>,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    mut json_reader: SqlJsonReader,
     route: &HistoryRoute,
     schema_keys: Vec<String>,
 ) -> Result<Vec<HistoryEntry>, LixError> {
@@ -230,12 +233,15 @@ pub(crate) async fn load_history_entries(
     };
 
     let mut rows = Vec::new();
-    let mut guard = commit_graph.lock().await;
     for start_commit_id in &route.start_commit_ids {
-        let entries = guard
-            .change_history_from_commit(start_commit_id, &request)
-            .await?;
-        let reachable_commits = guard.reachable_commits(start_commit_id).await?;
+        let (entries, reachable_commits) = {
+            let mut guard = commit_graph.lock().await;
+            let entries = guard
+                .change_history_from_commit(start_commit_id, &request)
+                .await?;
+            let reachable_commits = guard.reachable_commits(start_commit_id).await?;
+            (entries, reachable_commits)
+        };
         let commit_created_at_by_id = reachable_commits
             .into_iter()
             .map(|reachable| {
@@ -246,18 +252,19 @@ pub(crate) async fn load_history_entries(
             })
             .collect::<BTreeMap<_, _>>();
 
-        rows.extend(entries.into_iter().map(|entry| {
-            HistoryEntry {
+        for entry in entries {
+            let change = materialize_change(&mut json_reader, entry.change).await?;
+            rows.push(HistoryEntry {
                 commit_created_at: commit_created_at_by_id
                     .get(&entry.observed_commit_id)
                     .cloned()
-                    .unwrap_or_else(|| entry.change.created_at.clone()),
-                change: entry.change,
+                    .unwrap_or_else(|| change.created_at.clone()),
+                change,
                 observed_commit_id: entry.observed_commit_id,
                 start_commit_id: entry.start_commit_id,
                 depth: entry.depth,
-            }
-        }));
+            });
+        }
     }
 
     Ok(rows)
