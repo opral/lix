@@ -29,6 +29,7 @@ pub struct MergeVersionReceipt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeVersionOutcome {
     AlreadyUpToDate,
+    FastForward,
     MergeCommitted,
 }
 
@@ -82,6 +83,38 @@ impl SessionContext {
                     let mut reader = transaction.commit_graph_reader();
                     reader.merge_base(&target_head, &source_head).await?
                 };
+
+                if merge_base.commit_id == source_head {
+                    return Ok(MergeVersionReceipt {
+                        outcome: MergeVersionOutcome::AlreadyUpToDate,
+                        target_version_id: active_version_id,
+                        source_version_id,
+                        merge_base_commit_id: Some(merge_base.commit_id),
+                        target_head_after_commit_id: target_head.clone(),
+                        target_head_before_commit_id: target_head,
+                        source_head_before_commit_id: source_head,
+                        created_merge_commit_id: None,
+                        applied_change_count: 0,
+                    });
+                }
+
+                if merge_base.commit_id == target_head {
+                    transaction
+                        .advance_version_ref(&active_version_id, &source_head)
+                        .await?;
+
+                    return Ok(MergeVersionReceipt {
+                        outcome: MergeVersionOutcome::FastForward,
+                        target_version_id: active_version_id,
+                        source_version_id,
+                        merge_base_commit_id: Some(merge_base.commit_id),
+                        target_head_before_commit_id: target_head,
+                        source_head_before_commit_id: source_head.clone(),
+                        target_head_after_commit_id: source_head,
+                        created_merge_commit_id: None,
+                        applied_change_count: 0,
+                    });
+                }
 
                 let merge_plan = {
                     let mut reader = transaction.tracked_state_reader();

@@ -77,9 +77,10 @@ async fn rs_sdk_open_register_write_query_version_and_merge_flow() {
         .await
         .unwrap();
 
-    assert_eq!(merge.outcome, MergeVersionOutcome::MergeCommitted);
+    assert_eq!(merge.outcome, MergeVersionOutcome::FastForward);
     assert_eq!(merge.target_version_id, main_version_id);
-    assert!(merge.applied_change_count > 0);
+    assert_eq!(merge.applied_change_count, 0);
+    assert_eq!(merge.created_merge_commit_id, None);
     assert_eq!(task_done(&lix, "task-1").await, true);
 
     lix.close().await.unwrap();

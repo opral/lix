@@ -588,9 +588,80 @@ simulation_test!(
 );
 
 simulation_test!(
+    merge_version_fast_forwards_when_target_is_merge_base,
+    |sim| async move {
+        let (engine, main, draft) = create_draft_from_main(&sim).await;
+        draft
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('draft-fast-forward', 'draft')",
+                &[],
+            )
+            .await
+            .expect("draft write should succeed");
+
+        let target_head_before = engine
+            .load_version_head_commit_id(sim.main_version_id())
+            .await
+            .expect("main head should load")
+            .expect("main head should exist");
+        let source_head = engine
+            .load_version_head_commit_id("draft-version")
+            .await
+            .expect("draft head should load")
+            .expect("draft head should exist");
+
+        let receipt = main
+            .merge_version(MergeVersionOptions {
+                source_version_id: "draft-version".to_string(),
+            })
+            .await
+            .expect("merge should fast-forward target");
+        assert_eq!(receipt.outcome, MergeVersionOutcome::FastForward);
+        assert_eq!(receipt.applied_change_count, 0);
+        assert_eq!(receipt.created_merge_commit_id, None);
+        assert_eq!(
+            receipt.merge_base_commit_id.as_deref(),
+            Some(target_head_before.as_str())
+        );
+        assert_eq!(receipt.target_head_before_commit_id, target_head_before);
+        assert_eq!(receipt.source_head_before_commit_id, source_head);
+        assert_eq!(receipt.target_head_after_commit_id, source_head);
+        assert_eq!(
+            engine
+                .load_version_head_commit_id(sim.main_version_id())
+                .await
+                .expect("main head should load")
+                .as_deref(),
+            Some(source_head.as_str())
+        );
+        assert_key_value(&main, "draft-fast-forward", Some("\"draft\"")).await;
+
+        let global = sim.wrap_session(
+            engine
+                .open_session("global")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
+        let source_snapshot = load_commit_snapshot(&global, &source_head).await;
+        assert_eq!(
+            json_string_array(&source_snapshot, "parent_commit_ids"),
+            vec![target_head_before],
+            "fast-forward should not create a two-parent merge commit"
+        );
+    }
+);
+
+simulation_test!(
     merge_version_advances_target_with_two_parent_commit,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('main-merge-target', 'main')",
+            &[],
+        )
+        .await
+        .expect("main write should succeed");
         draft
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('draft-merge-source', 'draft')",
@@ -647,6 +718,7 @@ simulation_test!(
         );
 
         assert_key_value(&main, "draft-merge-source", Some("\"draft\"")).await;
+        assert_key_value(&main, "main-merge-target", Some("\"main\"")).await;
 
         let global = sim.wrap_session(
             engine
@@ -680,6 +752,12 @@ simulation_test!(
     merge_version_adopts_source_change_without_minting_equivalent_copy,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('merge-adopt-target', 'target')",
+            &[],
+        )
+        .await
+        .expect("main write should succeed");
         draft
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('merge-adopt-change', 'source')",
@@ -812,11 +890,16 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_version_applies_source_delete_when_target_unchanged,
+    merge_version_fast_forwards_source_delete_when_target_unchanged,
     |sim| async move {
-        let (_engine, main, draft) = create_draft_after_shared_write(&sim).await;
+        let (engine, main, draft) = create_draft_after_shared_write(&sim).await;
 
         delete_key_value(&draft, "shared-before-branch").await;
+        let source_head = engine
+            .load_version_head_commit_id("draft-version")
+            .await
+            .expect("draft head should load")
+            .expect("draft head should exist");
 
         let receipt = main
             .merge_version(MergeVersionOptions {
@@ -825,9 +908,10 @@ simulation_test!(
             .await
             .expect("merge should apply source delete");
 
-        assert_eq!(receipt.outcome, MergeVersionOutcome::MergeCommitted);
-        assert_eq!(receipt.applied_change_count, 1);
-        assert!(receipt.created_merge_commit_id.is_some());
+        assert_eq!(receipt.outcome, MergeVersionOutcome::FastForward);
+        assert_eq!(receipt.applied_change_count, 0);
+        assert_eq!(receipt.created_merge_commit_id, None);
+        assert_eq!(receipt.target_head_after_commit_id, source_head);
         assert_key_value(&main, "shared-before-branch", None).await;
     }
 );

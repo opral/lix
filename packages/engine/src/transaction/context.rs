@@ -210,6 +210,22 @@ impl<'tx> Transaction<'tx> {
             .add_commit_parent(version_id, parent_commit_id)
     }
 
+    /// Advances a version ref without staging tracked rows.
+    ///
+    /// Fast-forward merges use this path because the commit graph already
+    /// contains the source head; the target ref only needs to move to it.
+    pub(crate) async fn advance_version_ref(
+        &mut self,
+        version_id: &str,
+        commit_id: &str,
+    ) -> Result<(), LixError> {
+        let timestamp = self.functions.call_timestamp();
+        self.version_ref
+            .writer(self.backend_transaction.as_mut())
+            .advance_head(version_id, commit_id, &timestamp)
+            .await
+    }
+
     /// Returns the commit id currently staged for `version_id`, if tracked rows
     /// have been staged for that version.
     pub(crate) fn staged_commit_id(&self, version_id: &str) -> Result<Option<String>, LixError> {
