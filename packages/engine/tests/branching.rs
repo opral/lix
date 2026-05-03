@@ -51,6 +51,124 @@ simulation_test!(create_version_rejects_existing_id, |sim| async move {
 });
 
 simulation_test!(
+    version_descriptor_delete_via_entity_surface_is_rejected_when_ref_exists,
+    |sim| async move {
+        let (engine, main, _draft) = create_draft_from_main(&sim).await;
+
+        let error = main
+            .execute(
+                "DELETE FROM lix_version_descriptor WHERE id = 'draft-version'",
+                &[],
+            )
+            .await
+            .expect_err("descriptor delete through entity surface should fail");
+        assert_version_pair_delete_restricted(&error);
+
+        assert_eq!(count_version_descriptors(&main, "draft-version").await, 1);
+        assert_eq!(count_version_refs(&main, "draft-version").await, 1);
+        assert_eq!(
+            engine
+                .load_version_head_commit_id("draft-version")
+                .await
+                .expect("version ref head should still load"),
+            Some(sim.initial_commit_id().to_string())
+        );
+
+        drop(main);
+        drop(engine);
+    }
+);
+
+simulation_test!(
+    version_descriptor_delete_via_lix_state_is_rejected_when_ref_exists,
+    |sim| async move {
+        let (engine, main, _draft) = create_draft_from_main(&sim).await;
+
+        let error = main
+            .execute(
+                "DELETE FROM lix_state \
+                 WHERE schema_key = 'lix_version_descriptor' AND entity_id = 'draft-version'",
+                &[],
+            )
+            .await
+            .expect_err("descriptor delete through lix_state should fail");
+        assert_version_pair_delete_restricted(&error);
+
+        assert_eq!(count_version_descriptors(&main, "draft-version").await, 1);
+        assert_eq!(count_version_refs(&main, "draft-version").await, 1);
+        assert_eq!(
+            engine
+                .load_version_head_commit_id("draft-version")
+                .await
+                .expect("version ref head should still load"),
+            Some(sim.initial_commit_id().to_string())
+        );
+
+        drop(main);
+        drop(engine);
+    }
+);
+
+simulation_test!(
+    version_ref_delete_via_entity_surface_is_rejected_when_descriptor_exists,
+    |sim| async move {
+        let (engine, main, _draft) = create_draft_from_main(&sim).await;
+
+        let error = main
+            .execute(
+                "DELETE FROM lix_version_ref WHERE id = 'draft-version'",
+                &[],
+            )
+            .await
+            .expect_err("ref delete through entity surface should fail");
+        assert_version_pair_delete_restricted(&error);
+
+        assert_eq!(count_version_descriptors(&main, "draft-version").await, 1);
+        assert_eq!(count_version_refs(&main, "draft-version").await, 1);
+        assert_eq!(
+            engine
+                .load_version_head_commit_id("draft-version")
+                .await
+                .expect("version ref head should still load"),
+            Some(sim.initial_commit_id().to_string())
+        );
+
+        drop(main);
+        drop(engine);
+    }
+);
+
+simulation_test!(
+    version_ref_delete_via_lix_state_is_rejected_when_descriptor_exists,
+    |sim| async move {
+        let (engine, main, _draft) = create_draft_from_main(&sim).await;
+
+        let error = main
+            .execute(
+                "DELETE FROM lix_state \
+                 WHERE schema_key = 'lix_version_ref' AND entity_id = 'draft-version'",
+                &[],
+            )
+            .await
+            .expect_err("ref delete through lix_state should fail");
+        assert_version_pair_delete_restricted(&error);
+
+        assert_eq!(count_version_descriptors(&main, "draft-version").await, 1);
+        assert_eq!(count_version_refs(&main, "draft-version").await, 1);
+        assert_eq!(
+            engine
+                .load_version_head_commit_id("draft-version")
+                .await
+                .expect("version ref head should still load"),
+            Some(sim.initial_commit_id().to_string())
+        );
+
+        drop(main);
+        drop(engine);
+    }
+);
+
+simulation_test!(
     create_version_can_start_from_explicit_commit,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -1120,6 +1238,39 @@ async fn assert_version_descriptor(
             Value::Text(version_id.to_string()),
             Value::Text(expected_name.to_string()),
         ]
+    );
+}
+
+async fn count_version_descriptors(
+    session: &crate::support::simulation_test::engine::SimSession,
+    version_id: &str,
+) -> i64 {
+    select_single_integer(
+        session,
+        &format!("SELECT COUNT(*) FROM lix_version_descriptor WHERE id = '{version_id}'"),
+    )
+    .await
+}
+
+async fn count_version_refs(
+    session: &crate::support::simulation_test::engine::SimSession,
+    version_id: &str,
+) -> i64 {
+    select_single_integer(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM lix_state \
+             WHERE schema_key = 'lix_version_ref' AND entity_id = '{version_id}'"
+        ),
+    )
+    .await
+}
+
+fn assert_version_pair_delete_restricted(error: &lix_engine::LixError) {
+    assert_eq!(error.code, "LIX_ERROR_FOREIGN_KEY");
+    assert!(
+        error.to_string().contains("lix_version"),
+        "error should explain the version pair restriction: {error:?}"
     );
 }
 
