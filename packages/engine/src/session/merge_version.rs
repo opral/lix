@@ -52,6 +52,9 @@ impl SessionContext {
         self.with_write_transaction(|transaction| {
             Box::pin(async move {
                 let active_version_id = transaction.active_version_id().to_string();
+                if source_version_id == active_version_id {
+                    return Err(LixError::invalid_self_merge(active_version_id));
+                }
 
                 let (target_head, source_head) = {
                     let reader = transaction.version_ref_reader();

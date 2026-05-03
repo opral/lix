@@ -125,6 +125,10 @@ impl LixError {
     /// Merge graph analysis found multiple equally valid merge bases.
     pub const CODE_AMBIGUOUS_MERGE_BASE: &'static str = "LIX_AMBIGUOUS_MERGE_BASE";
 
+    /// A merge request is well-formed but nonsensical for the commit graph,
+    /// such as merging a version into itself.
+    pub const CODE_INVALID_MERGE: &'static str = "LIX_INVALID_MERGE";
+
     pub fn new(code: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
             code: code.into(),
@@ -172,6 +176,19 @@ impl LixError {
             "left_commit_id": left_commit_id,
             "right_commit_id": right_commit_id,
             "candidates": candidates,
+        }))
+    }
+
+    pub fn invalid_self_merge(version_id: impl Into<String>) -> Self {
+        let version_id = version_id.into();
+        Self::new(
+            Self::CODE_INVALID_MERGE,
+            format!("cannot merge version '{version_id}' into itself"),
+        )
+        .with_details(json!({
+            "operation": "merge_version",
+            "target_version_id": version_id,
+            "source_version_id": version_id,
         }))
     }
 
