@@ -20,7 +20,7 @@ use datafusion::physical_plan::{
 use futures_util::stream;
 use tokio::sync::Mutex;
 
-use crate::commit_graph::{CommitGraphCommit, CommitGraphReader};
+use crate::commit_graph::CommitGraphReader;
 use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
 use crate::version::VersionRefReader;
 use crate::LixError;
@@ -285,14 +285,9 @@ impl ExecutionPlan for CommitSurfaceScanExec {
             } else {
                 vec![GLOBAL_VERSION_ID.to_string()]
             };
-            let rows = rows_for_surface(
-                surface,
-                &version_ids,
-                Arc::clone(&commit_graph),
-                Arc::clone(&version_ref),
-            )
-            .await
-            .map_err(lix_error_to_datafusion_error)?;
+            let rows = rows_for_surface(surface, &version_ids, Arc::clone(&commit_graph))
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
             let rows = match limit {
                 Some(limit) => rows.into_iter().take(limit).collect::<Vec<_>>(),
                 None => rows,
@@ -328,15 +323,13 @@ async fn rows_for_surface(
     surface: CommitSurface,
     version_ids: &[String],
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    version_ref: Arc<dyn VersionRefReader>,
 ) -> Result<Vec<SurfaceRow>, LixError> {
     let mut rows = Vec::new();
     let mut seen = BTreeSet::<String>::new();
     let mut graph = commit_graph.lock().await;
+    let commits = graph.all_commits().await?;
 
     for version_id in version_ids {
-        let commits =
-            visible_commits_for_version(&mut **graph, version_ref.as_ref(), version_id).await?;
         match surface {
             CommitSurface::CommitEdge | CommitSurface::CommitEdgeByVersion => {
                 for edge in graph.commit_edges(&commits) {
@@ -385,25 +378,6 @@ async fn rows_for_surface(
         }
     }
     Ok(rows)
-}
-
-async fn visible_commits_for_version(
-    commit_graph: &mut dyn CommitGraphReader,
-    version_ref: &dyn VersionRefReader,
-    version_id: &str,
-) -> Result<Vec<CommitGraphCommit>, LixError> {
-    if version_id == GLOBAL_VERSION_ID {
-        return commit_graph.all_commits().await;
-    }
-    let Some(head_commit_id) = version_ref.load_head_commit_id(version_id).await? else {
-        return Ok(Vec::new());
-    };
-    Ok(commit_graph
-        .reachable_commits(&head_commit_id)
-        .await?
-        .into_iter()
-        .map(|reachable| reachable.commit)
-        .collect())
 }
 
 fn surface_record_batch(
