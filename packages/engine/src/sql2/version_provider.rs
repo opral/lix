@@ -2,27 +2,42 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, BooleanArray, StringArray};
+use datafusion::arrow::array::{ArrayRef, BooleanArray, StringArray, UInt64Array};
+use datafusion::arrow::compute::{and, filter_record_batch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::{not_impl_err, DFSchema, DataFusionError, Result, ScalarValue};
+use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::{create_physical_expr, EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
 };
-use futures_util::stream;
+use futures_util::{stream, StreamExt, TryStreamExt};
+use serde_json::json;
 use serde_json::Value as JsonValue;
 
+use crate::entity_identity::EntityIdentity;
 use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateScanRequest};
+use crate::sql2::write_normalization::UpdateAssignmentValues;
+use crate::sql2::{
+    SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
+};
+use crate::transaction::types::{StageRow, StageWrite, StageWriteMode};
 use crate::version_ref::VersionRefReader;
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
+
+const VERSION_DESCRIPTOR_SCHEMA_KEY: &str = "lix_version_descriptor";
+const VERSION_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
+const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
+const VERSION_REF_SCHEMA_VERSION: &str = "1";
 
 pub(crate) async fn register_lix_version_provider(
     session: &datafusion::prelude::SessionContext,
@@ -38,10 +53,24 @@ pub(crate) async fn register_lix_version_provider(
     Ok(())
 }
 
+pub(crate) async fn register_lix_version_write_provider(
+    session: &datafusion::prelude::SessionContext,
+    write_ctx: SqlWriteContext,
+) -> Result<(), LixError> {
+    session
+        .register_table(
+            "lix_version",
+            Arc::new(LixVersionProvider::with_write(write_ctx)),
+        )
+        .map_err(datafusion_error_to_lix_error)?;
+    Ok(())
+}
+
 struct LixVersionProvider {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
+    write_access: WriteAccess,
 }
 
 impl std::fmt::Debug for LixVersionProvider {
@@ -56,6 +85,18 @@ impl LixVersionProvider {
             schema: lix_version_schema(),
             live_state,
             version_ref,
+            write_access: WriteAccess::read_only(),
+        }
+    }
+
+    fn with_write(write_ctx: SqlWriteContext) -> Self {
+        let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx.clone()));
+        let version_ref = Arc::new(WriteContextVersionRefReader::new(write_ctx.clone()));
+        Self {
+            schema: lix_version_schema(),
+            live_state,
+            version_ref,
+            write_access: WriteAccess::write(write_ctx),
         }
     }
 }
@@ -96,6 +137,435 @@ impl TableProvider for LixVersionProvider {
             Arc::clone(&self.version_ref),
             projected_schema(&self.schema, projection),
             projection.cloned(),
+        )))
+    }
+
+    async fn insert_into(
+        &self,
+        _state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if insert_op != InsertOp::Append {
+            return not_impl_err!("{insert_op} not implemented for lix_version yet");
+        }
+
+        let write_ctx = self.write_access.require_write("INSERT into lix_version")?;
+        let sink = LixVersionInsertSink::new(input.schema(), write_ctx);
+        Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
+    }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let write_ctx = self.write_access.require_write("DELETE FROM lix_version")?;
+        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        let physical_filters = filters
+            .iter()
+            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Arc::new(LixVersionDeleteExec::new(
+            write_ctx,
+            Arc::clone(&self.live_state),
+            Arc::clone(&self.version_ref),
+            Arc::clone(&self.schema),
+            physical_filters,
+        )))
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let write_ctx = self.write_access.require_write("UPDATE lix_version")?;
+        validate_lix_version_update_assignments(&assignments)?;
+
+        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        let physical_assignments = assignments
+            .iter()
+            .map(|(column_name, expr)| {
+                Ok((
+                    column_name.clone(),
+                    create_physical_expr(expr, &df_schema, state.execution_props())?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let physical_filters = filters
+            .iter()
+            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Arc::new(LixVersionUpdateExec::new(
+            write_ctx,
+            Arc::clone(&self.live_state),
+            Arc::clone(&self.version_ref),
+            Arc::clone(&self.schema),
+            physical_assignments,
+            physical_filters,
+        )))
+    }
+}
+
+struct LixVersionInsertSink {
+    schema: SchemaRef,
+    write_ctx: SqlWriteContext,
+}
+
+impl std::fmt::Debug for LixVersionInsertSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LixVersionInsertSink").finish()
+    }
+}
+
+impl LixVersionInsertSink {
+    fn new(schema: SchemaRef, write_ctx: SqlWriteContext) -> Self {
+        Self { schema, write_ctx }
+    }
+}
+
+impl DisplayAs for LixVersionInsertSink {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "LixVersionInsertSink")
+            }
+            DisplayFormatType::TreeRender => write!(f, "LixVersionInsertSink"),
+        }
+    }
+}
+
+#[async_trait]
+impl DataSink for LixVersionInsertSink {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    async fn write_all(
+        &self,
+        mut data: SendableRecordBatchStream,
+        _context: &Arc<TaskContext>,
+    ) -> Result<u64> {
+        let default_commit_id = self
+            .write_ctx
+            .load_version_head(&self.write_ctx.active_version_id())
+            .await
+            .map_err(lix_error_to_datafusion_error)?
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "INSERT into lix_version could not resolve active version head".to_string(),
+                )
+            })?;
+        let mut rows = Vec::new();
+        let mut count = 0u64;
+        while let Some(batch) = data.next().await.transpose()? {
+            let version_rows = version_insert_rows_from_batch(&batch, &default_commit_id)?;
+            count = count
+                .checked_add(u64::try_from(version_rows.len()).map_err(|_| {
+                    DataFusionError::Execution("INSERT row count overflow".to_string())
+                })?)
+                .ok_or_else(|| DataFusionError::Execution("INSERT row count overflow".into()))?;
+            rows.extend(version_rows.into_iter().flat_map(version_stage_rows));
+        }
+
+        if !rows.is_empty() {
+            self.write_ctx
+                .stage_write(StageWrite::Rows {
+                    mode: StageWriteMode::Insert,
+                    rows,
+                })
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+        }
+
+        Ok(count)
+    }
+}
+
+struct LixVersionDeleteExec {
+    write_ctx: SqlWriteContext,
+    active_version_id: String,
+    live_state: Arc<dyn LiveStateReader>,
+    version_ref: Arc<dyn VersionRefReader>,
+    table_schema: SchemaRef,
+    filters: Vec<Arc<dyn PhysicalExpr>>,
+    result_schema: SchemaRef,
+    properties: Arc<PlanProperties>,
+}
+
+impl std::fmt::Debug for LixVersionDeleteExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LixVersionDeleteExec").finish()
+    }
+}
+
+impl LixVersionDeleteExec {
+    fn new(
+        write_ctx: SqlWriteContext,
+        live_state: Arc<dyn LiveStateReader>,
+        version_ref: Arc<dyn VersionRefReader>,
+        table_schema: SchemaRef,
+        filters: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Self {
+        let result_schema = dml_count_schema();
+        let properties = dml_plan_properties(Arc::clone(&result_schema));
+        let active_version_id = write_ctx.active_version_id();
+        Self {
+            write_ctx,
+            active_version_id,
+            live_state,
+            version_ref,
+            table_schema,
+            filters,
+            result_schema,
+            properties: Arc::new(properties),
+        }
+    }
+}
+
+impl DisplayAs for LixVersionDeleteExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "LixVersionDeleteExec(filters={})", self.filters.len())
+            }
+            DisplayFormatType::TreeRender => write!(f, "LixVersionDeleteExec"),
+        }
+    }
+}
+
+impl ExecutionPlan for LixVersionDeleteExec {
+    fn name(&self) -> &str {
+        "LixVersionDeleteExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        Vec::new()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if !children.is_empty() {
+            return Err(DataFusionError::Execution(
+                "LixVersionDeleteExec does not accept children".to_string(),
+            ));
+        }
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Execution(format!(
+                "LixVersionDeleteExec only exposes one partition, got {partition}"
+            )));
+        }
+        let write_ctx = self.write_ctx.clone();
+        let active_version_id = self.active_version_id.clone();
+        let live_state = Arc::clone(&self.live_state);
+        let version_ref = Arc::clone(&self.version_ref);
+        let filters = self.filters.clone();
+        let table_schema = Arc::clone(&self.table_schema);
+        let result_schema = Arc::clone(&self.result_schema);
+        let stream_schema = Arc::clone(&result_schema);
+
+        let stream = stream::once(async move {
+            let rows = load_version_rows(live_state, version_ref)
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+            let source_batch = version_record_batch(&version_projection_for_scan(None), &rows)?;
+            let matched_batch = filter_version_batch(source_batch, &filters)?;
+            let version_rows = version_rows_from_batch(&matched_batch)?;
+            reject_protected_version_deletes(&version_rows, &active_version_id)?;
+            let count = u64::try_from(version_rows.len())
+                .map_err(|_| DataFusionError::Execution("DELETE row count overflow".to_string()))?;
+            let rows = version_rows
+                .into_iter()
+                .flat_map(version_tombstone_rows)
+                .collect::<Vec<_>>();
+
+            if !rows.is_empty() {
+                write_ctx
+                    .stage_write(StageWrite::Rows {
+                        mode: StageWriteMode::Replace,
+                        rows,
+                    })
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+            }
+
+            let _ = table_schema;
+            Ok::<_, DataFusionError>(stream::iter(vec![Ok::<RecordBatch, DataFusionError>(
+                dml_count_batch(Arc::clone(&stream_schema), count)?,
+            )]))
+        })
+        .try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            result_schema,
+            stream,
+        )))
+    }
+}
+
+struct LixVersionUpdateExec {
+    write_ctx: SqlWriteContext,
+    live_state: Arc<dyn LiveStateReader>,
+    version_ref: Arc<dyn VersionRefReader>,
+    table_schema: SchemaRef,
+    assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+    filters: Vec<Arc<dyn PhysicalExpr>>,
+    result_schema: SchemaRef,
+    properties: Arc<PlanProperties>,
+}
+
+impl std::fmt::Debug for LixVersionUpdateExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LixVersionUpdateExec").finish()
+    }
+}
+
+impl LixVersionUpdateExec {
+    fn new(
+        write_ctx: SqlWriteContext,
+        live_state: Arc<dyn LiveStateReader>,
+        version_ref: Arc<dyn VersionRefReader>,
+        table_schema: SchemaRef,
+        assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
+        filters: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Self {
+        let result_schema = dml_count_schema();
+        let properties = dml_plan_properties(Arc::clone(&result_schema));
+        Self {
+            write_ctx,
+            live_state,
+            version_ref,
+            table_schema,
+            assignments,
+            filters,
+            result_schema,
+            properties: Arc::new(properties),
+        }
+    }
+}
+
+impl DisplayAs for LixVersionUpdateExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    "LixVersionUpdateExec(assignments={}, filters={})",
+                    self.assignments.len(),
+                    self.filters.len()
+                )
+            }
+            DisplayFormatType::TreeRender => write!(f, "LixVersionUpdateExec"),
+        }
+    }
+}
+
+impl ExecutionPlan for LixVersionUpdateExec {
+    fn name(&self) -> &str {
+        "LixVersionUpdateExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        Vec::new()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if !children.is_empty() {
+            return Err(DataFusionError::Execution(
+                "LixVersionUpdateExec does not accept children".to_string(),
+            ));
+        }
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Execution(format!(
+                "LixVersionUpdateExec only exposes one partition, got {partition}"
+            )));
+        }
+        let write_ctx = self.write_ctx.clone();
+        let live_state = Arc::clone(&self.live_state);
+        let version_ref = Arc::clone(&self.version_ref);
+        let table_schema = Arc::clone(&self.table_schema);
+        let assignments = self.assignments.clone();
+        let filters = self.filters.clone();
+        let result_schema = Arc::clone(&self.result_schema);
+        let stream_schema = Arc::clone(&result_schema);
+
+        let stream = stream::once(async move {
+            let rows = load_version_rows(live_state, version_ref)
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+            let source_batch = version_record_batch(&version_projection_for_scan(None), &rows)?;
+            let matched_batch = filter_version_batch(source_batch, &filters)?;
+            let version_rows =
+                version_update_rows_from_batch(&matched_batch, &assignments, &table_schema)?;
+            let count = u64::try_from(version_rows.len())
+                .map_err(|_| DataFusionError::Execution("UPDATE row count overflow".to_string()))?;
+            let rows = version_rows
+                .into_iter()
+                .flat_map(version_stage_rows)
+                .collect::<Vec<_>>();
+
+            if !rows.is_empty() {
+                write_ctx
+                    .stage_write(StageWrite::Rows {
+                        mode: StageWriteMode::Replace,
+                        rows,
+                    })
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
+            }
+
+            Ok::<_, DataFusionError>(stream::iter(vec![Ok::<RecordBatch, DataFusionError>(
+                dml_count_batch(Arc::clone(&stream_schema), count)?,
+            )]))
+        })
+        .try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            result_schema,
+            stream,
         )))
     }
 }
@@ -294,6 +764,392 @@ fn parse_snapshot(row: &LiveStateRow, schema_key: &str) -> Result<JsonValue, Lix
             format!("{schema_key} snapshot_content is invalid JSON: {error}"),
         )
     })
+}
+
+fn validate_lix_version_update_assignments(assignments: &[(String, Expr)]) -> Result<()> {
+    for (column_name, _) in assignments {
+        match column_name.as_str() {
+            "name" | "hidden" | "commit_id" => {}
+            "id" => {
+                return Err(DataFusionError::Execution(
+                    "UPDATE lix_version cannot change immutable column 'id'".to_string(),
+                ));
+            }
+            other => {
+                return Err(DataFusionError::Plan(format!(
+                    "UPDATE lix_version failed: column '{other}' does not exist"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn filter_version_batch(
+    batch: RecordBatch,
+    filters: &[Arc<dyn PhysicalExpr>],
+) -> Result<RecordBatch> {
+    let Some(mask) = evaluate_version_filters(&batch, filters)? else {
+        return Ok(batch);
+    };
+    Ok(filter_record_batch(&batch, &mask)?)
+}
+
+fn evaluate_version_filters(
+    batch: &RecordBatch,
+    filters: &[Arc<dyn PhysicalExpr>],
+) -> Result<Option<BooleanArray>> {
+    if filters.is_empty() {
+        return Ok(None);
+    }
+
+    let mut combined_mask: Option<BooleanArray> = None;
+    for filter in filters {
+        let result = filter.evaluate(batch)?;
+        let array = result.into_array(batch.num_rows())?;
+        let bool_array = array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                DataFusionError::Execution("lix_version filter was not boolean".to_string())
+            })?;
+        let normalized = bool_array
+            .iter()
+            .map(|value| Some(value == Some(true)))
+            .collect::<BooleanArray>();
+        combined_mask = Some(match combined_mask {
+            Some(existing) => and(&existing, &normalized)?,
+            None => normalized,
+        });
+    }
+    Ok(combined_mask)
+}
+
+fn version_insert_rows_from_batch(
+    batch: &RecordBatch,
+    default_commit_id: &str,
+) -> Result<Vec<VersionRow>> {
+    (0..batch.num_rows())
+        .map(|row_index| {
+            let id = required_string_value(batch, row_index, "id", "INSERT")?;
+            let name = required_string_value(batch, row_index, "name", "INSERT")?;
+            let hidden =
+                optional_bool_value(batch, row_index, "hidden", "INSERT")?.unwrap_or(false);
+            let commit_id = optional_string_value(batch, row_index, "commit_id", "INSERT")?
+                .unwrap_or_else(|| default_commit_id.to_string());
+            Ok(VersionRow {
+                id,
+                name,
+                hidden,
+                commit_id,
+            })
+        })
+        .collect()
+}
+
+fn version_rows_from_batch(batch: &RecordBatch) -> Result<Vec<VersionRow>> {
+    (0..batch.num_rows())
+        .map(|row_index| {
+            Ok(VersionRow {
+                id: required_string_value(batch, row_index, "id", "DELETE")?,
+                name: required_string_value(batch, row_index, "name", "DELETE")?,
+                hidden: required_bool_value(batch, row_index, "hidden", "DELETE")?,
+                commit_id: required_string_value(batch, row_index, "commit_id", "DELETE")?,
+            })
+        })
+        .collect()
+}
+
+fn reject_protected_version_deletes(rows: &[VersionRow], active_version_id: &str) -> Result<()> {
+    for row in rows {
+        if row.id == GLOBAL_VERSION_ID {
+            return Err(DataFusionError::Execution(
+                "DELETE FROM lix_version cannot delete the global version".to_string(),
+            ));
+        }
+        if row.id == active_version_id {
+            return Err(DataFusionError::Execution(format!(
+                "DELETE FROM lix_version cannot delete active version '{}'",
+                row.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn version_update_rows_from_batch(
+    batch: &RecordBatch,
+    assignments: &[(String, Arc<dyn PhysicalExpr>)],
+    table_schema: &SchemaRef,
+) -> Result<Vec<VersionRow>> {
+    let assignment_values = UpdateAssignmentValues::evaluate(batch, assignments)?;
+    (0..batch.num_rows())
+        .map(|row_index| {
+            Ok(VersionRow {
+                id: required_string_value(batch, row_index, "id", "UPDATE")?,
+                name: update_string_value(
+                    batch,
+                    &assignment_values,
+                    table_schema,
+                    row_index,
+                    "name",
+                )?,
+                hidden: update_bool_value(
+                    batch,
+                    &assignment_values,
+                    table_schema,
+                    row_index,
+                    "hidden",
+                )?,
+                commit_id: update_string_value(
+                    batch,
+                    &assignment_values,
+                    table_schema,
+                    row_index,
+                    "commit_id",
+                )?,
+            })
+        })
+        .collect()
+}
+
+fn version_stage_rows(row: VersionRow) -> Vec<StageRow> {
+    vec![
+        version_descriptor_stage_row(&row.id, &row.name, row.hidden),
+        version_ref_stage_row(&row.id, &row.commit_id),
+    ]
+}
+
+fn version_tombstone_rows(row: VersionRow) -> Vec<StageRow> {
+    vec![
+        version_descriptor_tombstone_row(&row.id),
+        version_ref_tombstone_row(&row.id),
+    ]
+}
+
+fn version_descriptor_stage_row(version_id: &str, name: &str, hidden: bool) -> StageRow {
+    StageRow {
+        entity_id: Some(EntityIdentity::single(version_id)),
+        schema_key: VERSION_DESCRIPTOR_SCHEMA_KEY.to_string(),
+        file_id: None,
+        snapshot_content: Some(encode_snapshot(json!({
+            "id": version_id,
+            "name": name,
+            "hidden": hidden,
+        }))),
+        metadata: None,
+        schema_version: VERSION_DESCRIPTOR_SCHEMA_VERSION.to_string(),
+        created_at: None,
+        updated_at: None,
+        global: true,
+        change_id: None,
+        commit_id: None,
+        untracked: false,
+        version_id: GLOBAL_VERSION_ID.to_string(),
+    }
+}
+
+fn version_ref_stage_row(version_id: &str, commit_id: &str) -> StageRow {
+    StageRow {
+        entity_id: Some(EntityIdentity::single(version_id)),
+        schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
+        file_id: None,
+        snapshot_content: Some(encode_snapshot(json!({
+            "id": version_id,
+            "commit_id": commit_id,
+        }))),
+        metadata: None,
+        schema_version: VERSION_REF_SCHEMA_VERSION.to_string(),
+        created_at: None,
+        updated_at: None,
+        global: true,
+        change_id: None,
+        commit_id: None,
+        untracked: true,
+        version_id: GLOBAL_VERSION_ID.to_string(),
+    }
+}
+
+fn version_descriptor_tombstone_row(version_id: &str) -> StageRow {
+    let mut row = version_descriptor_stage_row(version_id, "", false);
+    row.snapshot_content = None;
+    row
+}
+
+fn version_ref_tombstone_row(version_id: &str) -> StageRow {
+    let mut row = version_ref_stage_row(version_id, "");
+    row.snapshot_content = None;
+    row
+}
+
+fn encode_snapshot(value: JsonValue) -> String {
+    serde_json::to_string(&value).expect("lix_version snapshot should be serializable")
+}
+
+fn update_string_value(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    table_schema: &SchemaRef,
+    row_index: usize,
+    column_name: &str,
+) -> Result<String> {
+    let column_index = table_schema.index_of(column_name)?;
+    match assignment_values.scalar_value(batch, row_index, column_name)? {
+        None => required_string_value(batch, row_index, column_name, "UPDATE"),
+        Some(ScalarValue::Utf8(Some(value)))
+        | Some(ScalarValue::Utf8View(Some(value)))
+        | Some(ScalarValue::LargeUtf8(Some(value))) => Ok(value),
+        Some(ScalarValue::Null)
+        | Some(ScalarValue::Utf8(None))
+        | Some(ScalarValue::Utf8View(None))
+        | Some(ScalarValue::LargeUtf8(None)) => Err(DataFusionError::Execution(format!(
+            "UPDATE lix_version requires non-null text column '{column_name}'"
+        ))),
+        Some(other) => Err(DataFusionError::Execution(format!(
+            "UPDATE lix_version expected text-compatible column '{column_name}', got {other:?}"
+        ))),
+    }
+    .or_else(|error| {
+        if batch.column(column_index).is_null(row_index) {
+            Err(DataFusionError::Execution(format!(
+                "UPDATE lix_version requires non-null text column '{column_name}'"
+            )))
+        } else {
+            Err(error)
+        }
+    })
+}
+
+fn update_bool_value(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    table_schema: &SchemaRef,
+    row_index: usize,
+    column_name: &str,
+) -> Result<bool> {
+    let column_index = table_schema.index_of(column_name)?;
+    match assignment_values.scalar_value(batch, row_index, column_name)? {
+        None => required_bool_value(batch, row_index, column_name, "UPDATE"),
+        Some(ScalarValue::Boolean(Some(value))) => Ok(value),
+        Some(ScalarValue::Null) | Some(ScalarValue::Boolean(None)) => {
+            Err(DataFusionError::Execution(format!(
+                "UPDATE lix_version requires non-null boolean column '{column_name}'"
+            )))
+        }
+        Some(other) => Err(DataFusionError::Execution(format!(
+            "UPDATE lix_version expected boolean column '{column_name}', got {other:?}"
+        ))),
+    }
+    .or_else(|error| {
+        if batch.column(column_index).is_null(row_index) {
+            Err(DataFusionError::Execution(format!(
+                "UPDATE lix_version requires non-null boolean column '{column_name}'"
+            )))
+        } else {
+            Err(error)
+        }
+    })
+}
+
+fn required_string_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+    operation: &str,
+) -> Result<String> {
+    optional_string_value(batch, row_index, column_name, operation)?.ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "{operation} lix_version requires non-null text column '{column_name}'"
+        ))
+    })
+}
+
+fn optional_string_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+    operation: &str,
+) -> Result<Option<String>> {
+    match optional_scalar_value(batch, row_index, column_name)? {
+        None
+        | Some(ScalarValue::Null)
+        | Some(ScalarValue::Utf8(None))
+        | Some(ScalarValue::Utf8View(None))
+        | Some(ScalarValue::LargeUtf8(None)) => Ok(None),
+        Some(ScalarValue::Utf8(Some(value)))
+        | Some(ScalarValue::Utf8View(Some(value)))
+        | Some(ScalarValue::LargeUtf8(Some(value))) => Ok(Some(value)),
+        Some(other) => Err(DataFusionError::Execution(format!(
+            "{operation} lix_version expected text-compatible column '{column_name}', got {other:?}"
+        ))),
+    }
+}
+
+fn required_bool_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+    operation: &str,
+) -> Result<bool> {
+    optional_bool_value(batch, row_index, column_name, operation)?.ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "{operation} lix_version requires non-null boolean column '{column_name}'"
+        ))
+    })
+}
+
+fn optional_bool_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+    operation: &str,
+) -> Result<Option<bool>> {
+    match optional_scalar_value(batch, row_index, column_name)? {
+        None | Some(ScalarValue::Null) | Some(ScalarValue::Boolean(None)) => Ok(None),
+        Some(ScalarValue::Boolean(Some(value))) => Ok(Some(value)),
+        Some(other) => Err(DataFusionError::Execution(format!(
+            "{operation} lix_version expected boolean column '{column_name}', got {other:?}"
+        ))),
+    }
+}
+
+fn optional_scalar_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+) -> Result<Option<ScalarValue>> {
+    let Ok(column_index) = batch.schema().index_of(column_name) else {
+        return Ok(None);
+    };
+    Ok(Some(ScalarValue::try_from_array(
+        batch.column(column_index).as_ref(),
+        row_index,
+    )?))
+}
+
+fn dml_count_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "count",
+        DataType::UInt64,
+        false,
+    )]))
+}
+
+fn dml_plan_properties(schema: SchemaRef) -> PlanProperties {
+    PlanProperties::new(
+        EquivalenceProperties::new(schema),
+        Partitioning::UnknownPartitioning(1),
+        EmissionType::Final,
+        Boundedness::Bounded,
+    )
+}
+
+fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(UInt64Array::from(vec![count])) as ArrayRef],
+    )
+    .map_err(DataFusionError::from)
 }
 
 fn lix_version_schema() -> SchemaRef {

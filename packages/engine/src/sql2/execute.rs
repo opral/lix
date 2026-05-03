@@ -21,7 +21,7 @@ use super::history_provider::register_history_providers;
 use super::lix_state_provider::{register_lix_state_providers, register_lix_state_write_providers};
 use super::result_metadata::field_is_json;
 use super::udfs::register_sql2_functions;
-use super::version_provider::register_lix_version_provider;
+use super::version_provider::{register_lix_version_provider, register_lix_version_write_provider};
 use super::{SqlExecutionContext, SqlStatementKind, SqlWriteContext, SqlWriteExecutionContext};
 
 #[allow(dead_code)]
@@ -217,6 +217,7 @@ async fn build_write_session(
     register_sql2_functions(&session, write_ctx.functions(), active_version_commit_id);
 
     register_lix_state_write_providers(&session, write_ctx.clone()).await?;
+    register_lix_version_write_provider(&session, write_ctx.clone()).await?;
 
     register_lix_directory_write_providers(&session, write_ctx.clone()).await?;
     register_lix_file_write_providers(&session, write_ctx.clone()).await?;
