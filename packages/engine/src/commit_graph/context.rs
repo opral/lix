@@ -693,7 +693,7 @@ mod tests {
             .await
             .expect_err("malformed commit should fail");
 
-        assert!(error.description.contains("change_ids"));
+        assert!(error.message.contains("change_ids"));
     }
 
     #[tokio::test]
@@ -1405,7 +1405,7 @@ mod tests {
             .await
             .expect_err("missing member change should fail");
 
-        assert!(error.description.contains("missing-change"));
+        assert!(error.message.contains("missing-change"));
     }
 
     async fn append_changes(

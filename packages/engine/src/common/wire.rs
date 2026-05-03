@@ -33,8 +33,7 @@ impl WireValue {
                 if !value.is_finite() {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        description: "cannot encode non-finite float value to wire format"
-                            .to_string(),
+                        message: "cannot encode non-finite float value to wire format".to_string(),
                         hint: None,
                         details: None,
                     });
@@ -62,7 +61,7 @@ impl WireValue {
                 if !value.is_finite() {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        description: "cannot decode non-finite float value from wire format"
+                        message: "cannot decode non-finite float value from wire format"
                             .to_string(),
                         hint: None,
                         details: None,
@@ -77,7 +76,7 @@ impl WireValue {
                     .decode(base64.as_bytes())
                     .map_err(|error| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        description: format!("failed to decode wire blob base64: {error}"),
+                        message: format!("failed to decode wire blob base64: {error}"),
                         hint: None,
                         details: None,
                     })?;

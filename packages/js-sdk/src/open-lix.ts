@@ -385,12 +385,7 @@ function normalizeThrownError(error: unknown): LixError {
 			}
 			return error;
 		}
-		const message =
-			typeof error.message === "string"
-				? error.message
-				: typeof error.description === "string"
-					? error.description
-					: error.code;
+		const message = typeof error.message === "string" ? error.message : error.code;
 		return createLixError(error.code, message, { hint, details });
 	}
 
@@ -410,7 +405,6 @@ function extractHintFromMessage(message: unknown): string | undefined {
 function isLixErrorLike(error: unknown): error is {
 	code: string;
 	message?: string;
-	description?: string;
 	hint?: string;
 	details?: unknown;
 } {

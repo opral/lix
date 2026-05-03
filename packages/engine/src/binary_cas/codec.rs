@@ -61,7 +61,7 @@ pub(crate) fn decode_binary_chunk_payload(
         ),
         Some(other) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
+            message: format!(
                 "{context}: unsupported chunk codec '{}' for blob hash '{}' chunk '{}'",
                 other, blob_hash, chunk_hash
             ),
@@ -70,7 +70,7 @@ pub(crate) fn decode_binary_chunk_payload(
         }),
         None => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
+            message: format!(
                 "{context}: missing chunk codec for blob hash '{}' chunk '{}'",
                 blob_hash, chunk_hash
             ),
@@ -84,7 +84,7 @@ pub(crate) fn decode_binary_chunk_payload(
 fn compress_binary_chunk_payload(chunk_data: &[u8]) -> Result<Vec<u8>, LixError> {
     zstd::bulk::compress(chunk_data, 3).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("binary chunk compression failed: {error}"),
+        message: format!("binary chunk compression failed: {error}"),
         hint: None,
         details: None,
     })
@@ -108,7 +108,7 @@ fn decode_binary_chunk_zstd_payload(
 ) -> Result<Vec<u8>, LixError> {
     zstd::bulk::decompress(compressed_payload, expected_chunk_size).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
+        message: format!(
             "{context}: chunk decompression failed for blob hash '{}' chunk '{}': {error}",
             blob_hash, chunk_hash
         ),
@@ -130,7 +130,7 @@ fn decode_binary_chunk_zstd_payload(
     let mut decoder =
         ruzstd::decoding::StreamingDecoder::new(compressed_payload).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
+            message: format!(
                 "{context}: chunk decompression failed for blob hash '{}' chunk '{}': {error}",
                 blob_hash, chunk_hash
             ),
@@ -141,7 +141,7 @@ fn decode_binary_chunk_zstd_payload(
     let mut output = Vec::new();
     decoder.read_to_end(&mut output).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
+        message: format!(
             "{context}: chunk decompression failed for blob hash '{}' chunk '{}': {error}",
             blob_hash, chunk_hash
         ),

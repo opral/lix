@@ -128,7 +128,7 @@ impl StateContextColumn {
 pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, LixError> {
     let manifest_json: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("Plugin manifest must be valid JSON: {error}"),
+        message: format!("Plugin manifest must be valid JSON: {error}"),
         hint: None,
             details: None,
     })?;
@@ -138,7 +138,7 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
     let manifest: PluginManifest =
         serde_json::from_value(manifest_json.clone()).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("Plugin manifest does not match expected shape: {error}"),
+            message: format!("Plugin manifest does not match expected shape: {error}"),
             hint: None,
             details: None,
         })?;
@@ -146,7 +146,7 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
 
     let normalized_json = serde_json::to_string(&manifest_json).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("Failed to normalize plugin manifest JSON: {error}"),
+        message: format!("Failed to normalize plugin manifest JSON: {error}"),
         hint: None,
             details: None,
     })?;
@@ -218,7 +218,7 @@ pub fn glob_matches_path(glob: &str, path: &str) -> bool {
 fn validate_path_glob(glob: &str) -> Result<(), LixError> {
     Glob::new(glob).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("Invalid plugin manifest: match.path_glob is invalid: {error}"),
+        message: format!("Invalid plugin manifest: match.path_glob is invalid: {error}"),
         hint: None,
             details: None,
     })?;
@@ -231,7 +231,7 @@ fn validate_plugin_manifest_json(manifest: &JsonValue) -> Result<(), LixError> {
         let details = format_validation_errors(errors);
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("Invalid plugin manifest: {details}"),
+            message: format!("Invalid plugin manifest: {details}"),
             hint: None,
             details: None,
         });
@@ -279,7 +279,7 @@ fn plugin_manifest_validator() -> Result<&'static JSONSchema, LixError> {
             .compile(plugin_manifest_schema())
             .map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!("Failed to compile plugin manifest schema: {error}"),
+                message: format!("Failed to compile plugin manifest schema: {error}"),
                 hint: None,
             details: None,
             })
@@ -289,7 +289,7 @@ fn plugin_manifest_validator() -> Result<&'static JSONSchema, LixError> {
         Ok(schema) => Ok(schema),
         Err(error) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: error.description.clone(),
+            message: error.message.clone(),
             hint: None,
             details: None,
         }),
@@ -403,8 +403,8 @@ mod tests {
         )
         .expect_err("manifest should be invalid");
 
-        assert!(err.description.contains("Invalid plugin manifest"));
-        assert!(err.description.contains("key"));
+        assert!(err.message.contains("Invalid plugin manifest"));
+        assert!(err.message.contains("key"));
     }
 
     #[test]
@@ -421,7 +421,7 @@ mod tests {
         )
         .expect_err("invalid glob should fail");
 
-        assert!(err.description.contains("match.path_glob"));
+        assert!(err.message.contains("match.path_glob"));
     }
 
     #[test]

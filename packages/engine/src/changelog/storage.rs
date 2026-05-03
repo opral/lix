@@ -118,7 +118,7 @@ mod tests {
             .expect_err("json changelog payloads are not accepted after the hard cut");
         assert!(
             error
-                .description
+                .message
                 .contains("invalid FlatBuffers file identifier"),
             "unexpected error: {error:?}"
         );

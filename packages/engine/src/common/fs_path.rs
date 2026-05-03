@@ -156,7 +156,7 @@ enum PathError {
 
 impl PathError {
     fn into_lix_error(self) -> LixError {
-        let (code, description, hint) = match self {
+        let (code, message, hint) = match self {
             Self::MissingLeadingSlash => (
                 "LIX_ERROR_PATH_MISSING_LEADING_SLASH",
                 "path must start with '/'",
@@ -221,7 +221,7 @@ impl PathError {
             ),
         };
 
-        let err = LixError::new(code, description);
+        let err = LixError::new(code, message);
         match hint {
             Some(hint) => err.with_hint(hint),
             None => err,

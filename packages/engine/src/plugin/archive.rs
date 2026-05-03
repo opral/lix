@@ -23,13 +23,13 @@ pub(crate) fn parse_plugin_archive_for_install(
 
     let manifest_bytes = files.get("manifest.json").ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "Plugin archive must contain manifest.json".to_string(),
+        message: "Plugin archive must contain manifest.json".to_string(),
         hint: None,
             details: None,
     })?;
     let manifest_raw = std::str::from_utf8(manifest_bytes).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("Plugin archive manifest.json must be UTF-8: {error}"),
+        message: format!("Plugin archive manifest.json must be UTF-8: {error}"),
         hint: None,
             details: None,
     })?;
@@ -40,7 +40,7 @@ pub(crate) fn parse_plugin_archive_for_install(
         .get(&entry_path)
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
+            message: format!(
                 "Plugin archive is missing manifest entry file '{}'",
                 validated_manifest.manifest.entry
             ),
@@ -56,14 +56,14 @@ pub(crate) fn parse_plugin_archive_for_install(
         let normalized_schema_path = normalize_archive_path_for_install(schema_path)?;
         let schema_bytes = files.get(&normalized_schema_path).ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("Plugin archive is missing schema file '{schema_path}'"),
+            message: format!("Plugin archive is missing schema file '{schema_path}'"),
             hint: None,
             details: None,
         })?;
         let schema_json: JsonValue =
             serde_json::from_slice(schema_bytes).map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
+                message: format!(
                     "Plugin archive schema '{schema_path}' is invalid JSON: {error}"
                 ),
                 hint: None,
@@ -77,7 +77,7 @@ pub(crate) fn parse_plugin_archive_for_install(
         )) {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
+                message: format!(
                     "Plugin archive declares duplicate schema '{}~{}'",
                     schema_key.schema_key, schema_key.schema_version
                 ),
@@ -102,7 +102,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
     let files = read_plugin_archive_files(archive_path, archive_bytes)?;
     let manifest_bytes = files.get("manifest.json").ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
+        message: format!(
             "plugin materialization: archive '{}' is missing manifest.json",
             archive_path
         ),
@@ -111,7 +111,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
     })?;
     let manifest_raw = std::str::from_utf8(manifest_bytes).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
+        message: format!(
             "plugin materialization: archive '{}' manifest.json must be UTF-8: {error}",
             archive_path
         ),
@@ -122,7 +122,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
     if validated_manifest.manifest.key != plugin_key {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
+            message: format!(
                 "plugin materialization: archive '{}' key mismatch: path key '{}' vs manifest key '{}'",
                 archive_path, plugin_key, validated_manifest.manifest.key
             ),
@@ -135,7 +135,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
         normalize_plugin_archive_path_for_materialization(&validated_manifest.manifest.entry)?;
     let wasm = files.get(&entry_path).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
+        message: format!(
             "plugin materialization: archive '{}' is missing entry file '{}'",
             archive_path, validated_manifest.manifest.entry
         ),
@@ -165,7 +165,7 @@ fn read_archive_files_for_install(
     if archive_bytes.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "Plugin archive bytes must not be empty".to_string(),
+            message: "Plugin archive bytes must not be empty".to_string(),
             hint: None,
             details: None,
         });
@@ -173,7 +173,7 @@ fn read_archive_files_for_install(
 
     let mut archive = ZipArchive::new(Cursor::new(archive_bytes)).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("Plugin archive is not a valid zip file: {error}"),
+        message: format!("Plugin archive is not a valid zip file: {error}"),
         hint: None,
             details: None,
     })?;
@@ -182,7 +182,7 @@ fn read_archive_files_for_install(
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("Failed to read plugin archive entry at index {index}: {error}"),
+            message: format!("Failed to read plugin archive entry at index {index}: {error}"),
             hint: None,
             details: None,
         })?;
@@ -194,7 +194,7 @@ fn read_archive_files_for_install(
         if is_symlink_mode(entry.unix_mode()) {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!("Plugin archive entry '{raw_name}' must not be a symlink"),
+                message: format!("Plugin archive entry '{raw_name}' must not be a symlink"),
                 hint: None,
             details: None,
             });
@@ -204,14 +204,14 @@ fn read_archive_files_for_install(
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("Failed to read plugin archive entry '{raw_name}': {error}"),
+            message: format!("Failed to read plugin archive entry '{raw_name}': {error}"),
             hint: None,
             details: None,
         })?;
         if files.insert(normalized_path.clone(), bytes).is_some() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!("Plugin archive contains duplicate entry '{normalized_path}'"),
+                message: format!("Plugin archive contains duplicate entry '{normalized_path}'"),
                 hint: None,
             details: None,
             });
@@ -228,7 +228,7 @@ fn read_plugin_archive_files(
     if archive_bytes.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
+            message: format!(
                 "plugin materialization: archive '{}' is empty",
                 archive_path
             ),
@@ -239,7 +239,7 @@ fn read_plugin_archive_files(
 
     let mut archive = ZipArchive::new(Cursor::new(archive_bytes)).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
+        message: format!(
             "plugin materialization: archive '{}' is not a valid zip file: {error}",
             archive_path
         ),
@@ -251,7 +251,7 @@ fn read_plugin_archive_files(
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
+            message: format!(
                 "plugin materialization: failed to read archive '{}' entry index {}: {error}",
                 archive_path, index
             ),
@@ -268,7 +268,7 @@ fn read_plugin_archive_files(
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
+            message: format!(
                 "plugin materialization: failed to read archive '{}' entry '{}': {error}",
                 archive_path, entry_name
             ),
@@ -285,7 +285,7 @@ fn normalize_archive_path_for_install(path: &str) -> Result<String, LixError> {
     if path.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "Plugin archive path must not be empty".to_string(),
+            message: "Plugin archive path must not be empty".to_string(),
             hint: None,
             details: None,
         });
@@ -293,7 +293,7 @@ fn normalize_archive_path_for_install(path: &str) -> Result<String, LixError> {
     if path.starts_with('/') || path.starts_with('\\') {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("Plugin archive path '{path}' must be relative"),
+            message: format!("Plugin archive path '{path}' must be relative"),
             hint: None,
             details: None,
         });
@@ -301,7 +301,7 @@ fn normalize_archive_path_for_install(path: &str) -> Result<String, LixError> {
     if path.contains('\\') {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("Plugin archive path '{path}' must use forward slash separators"),
+            message: format!("Plugin archive path '{path}' must use forward slash separators"),
             hint: None,
             details: None,
         });
@@ -313,7 +313,7 @@ fn normalize_archive_path_for_install(path: &str) -> Result<String, LixError> {
             Component::Normal(value) => {
                 let segment = value.to_str().ok_or_else(|| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!(
+                    message: format!(
                         "Plugin archive path '{path}' contains non-UTF-8 components"
                     ),
                     hint: None,
@@ -322,7 +322,7 @@ fn normalize_archive_path_for_install(path: &str) -> Result<String, LixError> {
                 if segment.is_empty() {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
-                        description: format!("Plugin archive path '{path}' is invalid"),
+                        message: format!("Plugin archive path '{path}' is invalid"),
                         hint: None,
             details: None,
                     });
@@ -332,7 +332,7 @@ fn normalize_archive_path_for_install(path: &str) -> Result<String, LixError> {
             Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!(
+                    message: format!(
                         "Plugin archive path '{path}' must not contain traversal or absolute components"
                     ),
                     hint: None,
@@ -345,7 +345,7 @@ fn normalize_archive_path_for_install(path: &str) -> Result<String, LixError> {
     if segments.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("Plugin archive path '{path}' is invalid"),
+            message: format!("Plugin archive path '{path}' is invalid"),
             hint: None,
             details: None,
         });
@@ -359,7 +359,7 @@ fn normalize_plugin_archive_path_for_materialization(path: &str) -> Result<Strin
     if raw_path.is_absolute() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
+            message: format!(
                 "plugin materialization: archive path '{}' must be relative",
                 path
             ),
@@ -376,7 +376,7 @@ fn normalize_plugin_archive_path_for_materialization(path: &str) -> Result<Strin
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!(
+                    message: format!(
                         "plugin materialization: archive path '{}' must not escape the archive root",
                         path
                     ),
@@ -390,7 +390,7 @@ fn normalize_plugin_archive_path_for_materialization(path: &str) -> Result<Strin
     if normalized.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "plugin materialization: archive path must not be empty".to_string(),
+            message: "plugin materialization: archive path must not be empty".to_string(),
             hint: None,
             details: None,
         });
@@ -403,7 +403,7 @@ fn ensure_valid_plugin_wasm_for_install(wasm_bytes: &[u8]) -> Result<(), LixErro
     if wasm_bytes.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "Plugin wasm bytes must not be empty".to_string(),
+            message: "Plugin wasm bytes must not be empty".to_string(),
             hint: None,
             details: None,
         });
@@ -411,7 +411,7 @@ fn ensure_valid_plugin_wasm_for_install(wasm_bytes: &[u8]) -> Result<(), LixErro
     if wasm_bytes.len() < 8 || !wasm_bytes.starts_with(&[0x00, 0x61, 0x73, 0x6d]) {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "Plugin wasm bytes must start with a valid wasm header".to_string(),
+            message: "Plugin wasm bytes must start with a valid wasm header".to_string(),
             hint: None,
             details: None,
         });
@@ -424,7 +424,7 @@ fn ensure_valid_plugin_wasm_for_materialization(bytes: &[u8]) -> Result<(), LixE
     if bytes.len() < WASM_MAGIC.len() || &bytes[..WASM_MAGIC.len()] != WASM_MAGIC {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "plugin materialization: entry file must be a valid WebAssembly module"
+            message: "plugin materialization: entry file must be a valid WebAssembly module"
                 .to_string(),
             hint: None,
             details: None,

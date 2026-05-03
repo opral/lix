@@ -197,6 +197,9 @@ type _LixErrorHasDetails = Assert<
 type _LixErrorDoesNotHaveData = Assert<
 	"data" extends keyof LixError ? false : true
 >;
+type _LixErrorDoesNotHaveDescription = Assert<
+	"description" extends keyof LixError ? false : true
+>;
 
 /**
  * Type guard: returns `true` when `err` is a Lix-produced error carrying a

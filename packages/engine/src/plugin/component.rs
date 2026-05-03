@@ -28,7 +28,7 @@ pub(crate) async fn load_or_init_plugin_component(
     {
         let guard = host.plugin_component_cache().lock().map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "plugin component cache lock poisoned".to_string(),
+            message: "plugin component cache lock poisoned".to_string(),
             hint: None,
             details: None,
         })?;
@@ -45,7 +45,7 @@ pub(crate) async fn load_or_init_plugin_component(
         .await?;
     let mut guard = host.plugin_component_cache().lock().map_err(|_| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "plugin component cache lock poisoned".to_string(),
+        message: "plugin component cache lock poisoned".to_string(),
         hint: None,
             details: None,
     })?;
@@ -81,13 +81,13 @@ async fn invoke_apply_changes_export(
     for export in APPLY_CHANGES_EXPORTS {
         match instance.call(export, payload).await {
             Ok(output) => return Ok(output),
-            Err(error) => errors.push(format!("{export}: {}", error.description)),
+            Err(error) => errors.push(format!("{export}: {}", error.message)),
         }
     }
 
     Err(LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
+        message: format!(
             "plugin materialization: failed to call apply-changes export ({})",
             errors.join("; ")
         ),

@@ -51,7 +51,7 @@ impl WasmRuntime for NoopWasmRuntime {
     ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "wasm runtime is required to execute plugins; provide a non-noop runtime"
+            message: "wasm runtime is required to execute plugins; provide a non-noop runtime"
                 .to_string(),
             hint: None,
             details: None,

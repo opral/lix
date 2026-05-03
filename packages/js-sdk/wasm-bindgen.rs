@@ -945,7 +945,7 @@ export type MergeVersionResult = {
     }
 
     fn js_error(error: LixError) -> JsValue {
-        let js_error = js_sys::Error::new(&error.description);
+        let js_error = js_sys::Error::new(&error.message);
         let object: &Object = js_error.as_ref();
         let _ = Reflect::set(
             object,

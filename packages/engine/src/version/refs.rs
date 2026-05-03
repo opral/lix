@@ -368,7 +368,7 @@ mod tests {
 
         assert!(
             error
-                .description
+                .message
                 .contains("engine2 version-ref snapshot parse failed"),
             "unexpected error: {error:?}"
         );

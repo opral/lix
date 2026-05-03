@@ -145,7 +145,7 @@ simulation_test!(
 fn assert_read_only_error(error: LixError, schema_key: &str, hint_fragment: &str) {
     assert_eq!(error.code, LixError::CODE_READ_ONLY);
     assert!(
-        error.description.contains(schema_key),
+        error.message.contains(schema_key),
         "read-only error should name {schema_key}: {error:?}"
     );
     assert!(
