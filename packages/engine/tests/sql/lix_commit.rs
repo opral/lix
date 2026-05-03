@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use lix_engine::Value;
+use lix_engine::{CreateVersionOptions, Value};
 use serde_json::json;
 
 use super::select_rows;
@@ -256,6 +256,91 @@ simulation_test!(
                 ],
             ]
         );
+    }
+);
+
+simulation_test!(
+    lix_commit_is_plain_global_entity_not_active_reachability_view,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('main-only', 'main')",
+            &[],
+        )
+        .await
+        .expect("main write should succeed");
+
+        main.create_version(CreateVersionOptions {
+            id: Some("commit-branch".to_string()),
+            name: "Commit branch".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("branch version should be created");
+
+        let branch = sim.wrap_session(
+            engine
+                .open_session("commit-branch")
+                .await
+                .expect("branch session should open"),
+            &engine,
+        );
+        branch
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('branch-only', 'branch')",
+                &[],
+            )
+            .await
+            .expect("branch write should succeed");
+
+        let branch_head = engine
+            .load_version_head_commit_id("commit-branch")
+            .await
+            .expect("branch head should load")
+            .expect("branch head should exist");
+
+        let main_commit_rows = select_rows(
+            &main,
+            &format!("SELECT id FROM lix_commit WHERE id = '{branch_head}'"),
+        )
+        .await;
+        let branch_commit_rows = select_rows(
+            &branch,
+            &format!("SELECT id FROM lix_commit WHERE id = '{branch_head}'"),
+        )
+        .await;
+        assert_eq!(
+            main_commit_rows, branch_commit_rows,
+            "lix_commit should not depend on the active version"
+        );
+        assert_eq!(
+            main_commit_rows,
+            vec![vec![Value::Text(branch_head.clone())]]
+        );
+
+        let main_edge_rows = select_rows(
+            &main,
+            &format!("SELECT child_id FROM lix_commit_edge WHERE child_id = '{branch_head}'"),
+        )
+        .await;
+        let branch_edge_rows = select_rows(
+            &branch,
+            &format!("SELECT child_id FROM lix_commit_edge WHERE child_id = '{branch_head}'"),
+        )
+        .await;
+        assert_eq!(
+            main_edge_rows, branch_edge_rows,
+            "derived commit surfaces should also expose global commit-derived rows"
+        );
+        assert_eq!(main_edge_rows, vec![vec![Value::Text(branch_head)]]);
     }
 );
 

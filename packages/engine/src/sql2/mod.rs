@@ -1,6 +1,6 @@
 mod change_provider;
 mod classify;
-mod commit_provider;
+mod commit_derived_provider;
 mod context;
 mod directory_history_provider;
 mod directory_provider;

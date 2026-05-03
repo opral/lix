@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
 use super::change_provider::register_lix_change_provider;
-use super::commit_provider::register_commit_providers;
+use super::commit_derived_provider::register_commit_derived_providers;
 use super::directory_history_provider::register_lix_directory_history_provider;
 use super::directory_provider::{
     register_lix_directory_providers, register_lix_directory_write_providers,
@@ -161,13 +161,7 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
     register_lix_version_provider(&session, ctx.live_state(), Arc::clone(&version_ref)).await?;
     register_lix_change_provider(&session, ctx.changelog()).await?;
     let commit_graph = ctx.commit_graph();
-    register_commit_providers(
-        &session,
-        ctx.active_version_id(),
-        commit_graph,
-        Arc::clone(&version_ref),
-    )
-    .await?;
+    register_commit_derived_providers(&session, commit_graph, Arc::clone(&version_ref)).await?;
     let state_history_commit_graph = ctx.commit_graph();
     register_history_providers(&session, state_history_commit_graph).await?;
     let file_history_commit_graph = ctx.commit_graph();

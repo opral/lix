@@ -1902,7 +1902,6 @@ fn schema_exposed_as_entity_surface(schema_key: &str) -> bool {
         "lix_active_version"
             | "lix_active_account"
             | "lix_change"
-            | "lix_commit"
             | "lix_commit_edge"
             | "lix_change_set"
             | "lix_change_set_element"
