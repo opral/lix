@@ -554,9 +554,10 @@ impl PendingConstraintIndexes {
         snapshot: &JsonValue,
     ) -> Result<(), LixError> {
         for foreign_key in foreign_key_definitions(schema)? {
-            let Some(local_value) =
-                UniqueConstraintValue::from_snapshot(snapshot, &foreign_key.local_properties)
-            else {
+            let Some(local_value) = UniqueConstraintValue::from_snapshot_non_null(
+                snapshot,
+                &foreign_key.local_properties,
+            ) else {
                 continue;
             };
             let target = if foreign_key.referenced_schema_key == STATE_SURFACE_SCHEMA_KEY {
@@ -871,7 +872,8 @@ async fn validate_committed_normal_delete_restriction(
             continue;
         };
         let snapshot = parse_committed_snapshot(&row, snapshot_content)?;
-        if UniqueConstraintValue::from_snapshot(&snapshot, &foreign_key.local_properties).as_ref()
+        if UniqueConstraintValue::from_snapshot_non_null(&snapshot, &foreign_key.local_properties)
+            .as_ref()
             == Some(&deleted_value)
         {
             return Err(committed_delete_restriction_error(
@@ -1018,9 +1020,10 @@ fn validate_pending_foreign_keys(
     let mut unresolved = Vec::new();
     for (row, schema, snapshot) in staged_snapshots {
         for foreign_key in foreign_key_definitions(schema)? {
-            let Some(local_value) =
-                UniqueConstraintValue::from_snapshot(snapshot, &foreign_key.local_properties)
-            else {
+            let Some(local_value) = UniqueConstraintValue::from_snapshot_non_null(
+                snapshot,
+                &foreign_key.local_properties,
+            ) else {
                 continue;
             };
             if foreign_key.referenced_schema_key == STATE_SURFACE_SCHEMA_KEY {
@@ -1466,6 +1469,15 @@ impl UniqueConstraintValue {
     }
 
     fn from_snapshot(snapshot: &JsonValue, pointers: &[Vec<String>]) -> Option<Self> {
+        let mut values = Vec::with_capacity(pointers.len());
+        for pointer in pointers {
+            let value = json_pointer_get(snapshot, pointer)?;
+            values.push(stable_unique_value(value));
+        }
+        Some(Self(values))
+    }
+
+    fn from_snapshot_non_null(snapshot: &JsonValue, pointers: &[Vec<String>]) -> Option<Self> {
         let mut values = Vec::with_capacity(pointers.len());
         for pointer in pointers {
             let value = json_pointer_get(snapshot, pointer)?;
@@ -2754,6 +2766,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validation_rejects_pending_unique_duplicate_with_null_component() {
+        let visible_schemas = vec![nullable_unique_schema()];
+        let staged_writes = StagedWriteSet {
+            state_rows: vec![
+                nullable_unique_row("row-1", None, "root-name"),
+                nullable_unique_row("row-2", None, "root-name"),
+            ],
+            ..empty_staged_write_set()
+        };
+
+        let error = validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+            .await
+            .expect_err("duplicate nullable unique value should fail");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+    }
+
+    #[tokio::test]
     async fn validation_rejects_pending_unique_same_value_in_same_version() {
         let visible_schemas = vec![unique_schema()];
         let mut duplicate = unique_row("post-2", "hello-world", "second");
@@ -2859,6 +2889,29 @@ mod tests {
         ))
         .await
         .expect_err("committed visible unique value should conflict");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_committed_unique_duplicate_with_null_component() {
+        let visible_schemas = vec![nullable_unique_schema()];
+        let staged_writes = StagedWriteSet {
+            state_rows: vec![nullable_unique_row("row-2", None, "root-name")],
+            adopted_rows: Vec::new(),
+            ..empty_staged_write_set()
+        };
+        let live_state = StaticLiveStateReader {
+            rows: vec![committed_nullable_unique_row("row-1", None, "root-name")],
+        };
+
+        let error = validate_staged_writes(TransactionValidationInput::new(
+            &staged_writes,
+            &visible_schemas,
+            &live_state,
+        ))
+        .await
+        .expect_err("committed duplicate nullable unique value should conflict");
 
         assert_eq!(error.code, LixError::CODE_UNIQUE);
     }
@@ -3900,6 +3953,23 @@ mod tests {
         })
     }
 
+    fn nullable_unique_schema() -> JsonValue {
+        json!({
+            "x-lix-key": "nullable_unique_schema",
+            "x-lix-version": "1",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-unique": [["/scope", "/name"]],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "scope": { "type": ["string", "null"] },
+                "name": { "type": "string" }
+            },
+            "required": ["id", "scope", "name"],
+            "additionalProperties": false
+        })
+    }
+
     fn fk_parent_schema() -> JsonValue {
         json!({
             "x-lix-key": "fk_parent_schema",
@@ -3969,6 +4039,26 @@ mod tests {
                     "id": entity_id,
                     "slug": slug,
                     "title": title,
+                })
+                .to_string(),
+            ),
+        );
+        row.entity_id = crate::entity_identity::EntityIdentity::single(entity_id);
+        row.file_id = Some("file-a".to_string());
+        row.version_id = "version-a".to_string();
+        row.global = false;
+        row
+    }
+
+    fn nullable_unique_row(entity_id: &str, scope: Option<&str>, name: &str) -> StagedStateRow {
+        let mut row = staged_row(
+            "nullable_unique_schema",
+            "1",
+            Some(
+                json!({
+                    "id": entity_id,
+                    "scope": scope,
+                    "name": name,
                 })
                 .to_string(),
             ),
@@ -4075,6 +4165,14 @@ mod tests {
             untracked: row.untracked,
             version_id: row.version_id,
         }
+    }
+
+    fn committed_nullable_unique_row(
+        entity_id: &str,
+        scope: Option<&str>,
+        name: &str,
+    ) -> LiveStateRow {
+        LiveStateRow::from(nullable_unique_row(entity_id, scope, name))
     }
 
     fn staged_row(

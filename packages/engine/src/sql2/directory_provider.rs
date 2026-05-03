@@ -1074,7 +1074,7 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
                 ));
             };
             let planned_rows = resolver
-                .ensure_directory_path_with_leaf_id(
+                .create_directory_path_with_leaf_id(
                     &path,
                     id,
                     context,

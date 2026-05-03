@@ -1,4 +1,5 @@
 use lix_engine::ExecuteResult;
+use lix_engine::LixError;
 use lix_engine::Value;
 
 use super::assert_rows_eq;
@@ -152,6 +153,31 @@ simulation_test!(
         assert_eq!(path, "/docs/");
         assert_eq!(name, "docs");
         assert!(!hidden);
+    }
+);
+
+simulation_test!(
+    lix_directory_path_insert_rejects_duplicate_root_path,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute("INSERT INTO lix_directory (path) VALUES ('/docs/')", &[])
+            .await
+            .expect("first directory insert should succeed");
+        let error = session
+            .execute("INSERT INTO lix_directory (path) VALUES ('/docs/')", &[])
+            .await
+            .expect_err("duplicate directory path insert should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
     }
 );
 
