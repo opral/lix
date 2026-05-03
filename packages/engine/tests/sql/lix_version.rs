@@ -335,6 +335,89 @@ simulation_test!(lix_version_duplicate_insert_rejects, |sim| async move {
 });
 
 simulation_test!(
+    lix_version_duplicate_name_insert_rejects,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_version (id, name) \
+             VALUES ('sql-version-name-a', 'Duplicate Name')",
+                &[],
+            )
+            .await
+            .expect("initial version insert should succeed");
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_version (id, name) \
+             VALUES ('sql-version-name-b', 'Duplicate Name')",
+                &[],
+            )
+            .await
+            .expect_err("duplicate version name should be rejected");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert!(
+            error.to_string().contains("/name"),
+            "error should explain duplicate version name: {error:?}"
+        );
+    }
+);
+
+simulation_test!(
+    lix_version_duplicate_name_update_rejects,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_version (id, name) \
+             VALUES ('sql-version-name-update-a', 'Name A')",
+                &[],
+            )
+            .await
+            .expect("first version insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_version (id, name) \
+             VALUES ('sql-version-name-update-b', 'Name B')",
+                &[],
+            )
+            .await
+            .expect("second version insert should succeed");
+
+        let error = session
+            .execute(
+                "UPDATE lix_version \
+             SET name = 'Name A' \
+             WHERE id = 'sql-version-name-update-b'",
+                &[],
+            )
+            .await
+            .expect_err("updating to a duplicate version name should fail");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert!(
+            error.to_string().contains("/name"),
+            "error should explain duplicate version name: {error:?}"
+        );
+    }
+);
+
+simulation_test!(
     lix_version_insert_rejects_invalid_commit_id,
     |sim| async move {
         let engine = sim.boot_engine().await;

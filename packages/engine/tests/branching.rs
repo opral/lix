@@ -50,6 +50,29 @@ simulation_test!(create_version_rejects_existing_id, |sim| async move {
     drop(engine);
 });
 
+simulation_test!(create_version_rejects_duplicate_name, |sim| async move {
+    let (engine, main, draft) = create_draft_from_main(&sim).await;
+
+    let error = main
+        .create_version(CreateVersionOptions {
+            id: Some("duplicate-name-version".to_string()),
+            name: "Draft".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect_err("creating a version with an existing name should fail");
+
+    assert_eq!(error.code, lix_engine::LixError::CODE_UNIQUE);
+    assert!(
+        error.to_string().contains("/name"),
+        "error should explain the duplicate version name: {error:?}"
+    );
+
+    drop(draft);
+    drop(main);
+    drop(engine);
+});
+
 simulation_test!(
     version_descriptor_delete_via_entity_surface_is_rejected_when_ref_exists,
     |sim| async move {

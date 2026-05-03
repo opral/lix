@@ -5,6 +5,11 @@
   "x-lix-primary-key": [
     "/id"
   ],
+  "x-lix-unique": [
+    [
+      "/name"
+    ]
+  ],
   "type": "object",
   "properties": {
     "id": {
