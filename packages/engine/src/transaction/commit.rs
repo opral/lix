@@ -244,7 +244,7 @@ async fn finalize_commit_rows(
     let mut version_heads = Vec::new();
 
     for (version_id, members) in commit_members_by_version {
-        if members.is_empty() {
+        if members.is_empty() && !members.allow_empty {
             continue;
         }
 

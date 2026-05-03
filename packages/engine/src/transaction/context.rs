@@ -236,6 +236,11 @@ impl<'tx> Transaction<'tx> {
         self.staged_writes.staged_commit_id(version_id)
     }
 
+    /// Stages a commit for `version_id` even if no tracked rows changed.
+    pub(crate) fn stage_empty_commit(&self, version_id: String) -> Result<String, LixError> {
+        self.staged_writes.stage_empty_commit(version_id)
+    }
+
     /// Creates a version-ref reader scoped to this write transaction.
     pub(crate) fn version_ref_reader(&mut self) -> impl VersionRefReader + '_ {
         self.version_ctx

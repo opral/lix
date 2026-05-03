@@ -320,9 +320,6 @@ where
                 .filter(|row| row.schema_key != COMMIT_SCHEMA_KEY)
                 .map(|row| TrackedStateRow::try_from(*row))
                 .collect::<Result<Vec<_>, _>>()?;
-            if root_rows.is_empty() {
-                continue;
-            }
             let store: &mut dyn KvWriter = &mut self.store;
             self.tracked_state
                 .writer(store)

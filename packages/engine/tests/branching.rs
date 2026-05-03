@@ -937,7 +937,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_version_treats_both_sides_delete_as_noop,
+    merge_version_records_empty_merge_when_both_sides_delete,
     |sim| async move {
         let (engine, main, draft) = create_draft_after_shared_write(&sim).await;
 
@@ -948,6 +948,11 @@ simulation_test!(
             .await
             .expect("main head should load")
             .expect("main head should exist");
+        let source_head = engine
+            .load_version_head_commit_id("draft-version")
+            .await
+            .expect("draft head should load")
+            .expect("draft head should exist");
 
         let receipt = main
             .merge_version(MergeVersionOptions {
@@ -956,17 +961,23 @@ simulation_test!(
             .await
             .expect("convergent delete merge should succeed");
 
-        assert_eq!(receipt.outcome, MergeVersionOutcome::AlreadyUpToDate);
+        assert_eq!(receipt.outcome, MergeVersionOutcome::MergeCommitted);
         assert_eq!(receipt.applied_change_count, 0);
-        assert_eq!(receipt.created_merge_commit_id, None);
-        assert_eq!(
-            engine
-                .load_version_head_commit_id(sim.main_version_id())
-                .await
-                .expect("main head should load"),
-            Some(main_head_before),
-            "convergent delete should not create a new target commit"
-        );
+        let merge_commit_id = receipt
+            .created_merge_commit_id
+            .clone()
+            .expect("convergent delete should create an empty merge commit");
+        assert_eq!(receipt.target_head_after_commit_id, merge_commit_id);
+        assert_eq!(receipt.target_head_before_commit_id, main_head_before);
+        assert_eq!(receipt.source_head_before_commit_id, source_head);
+        assert_empty_merge_commit(
+            &engine,
+            &main,
+            &merge_commit_id,
+            &receipt.target_head_before_commit_id,
+            &receipt.source_head_before_commit_id,
+        )
+        .await;
         assert_key_value(&main, "shared-before-branch", None).await;
     }
 );
@@ -1047,7 +1058,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_version_converges_same_payload_without_new_commit,
+    merge_version_records_empty_merge_for_same_payload_convergence,
     |sim| async move {
         let (engine, main, draft) = create_draft_after_shared_write(&sim).await;
 
@@ -1069,6 +1080,11 @@ simulation_test!(
             .await
             .expect("main head should load")
             .expect("main head should exist");
+        let source_head = engine
+            .load_version_head_commit_id("draft-version")
+            .await
+            .expect("draft head should load")
+            .expect("draft head should exist");
 
         let receipt = main
             .merge_version(MergeVersionOptions {
@@ -1077,17 +1093,23 @@ simulation_test!(
             .await
             .expect("convergent update merge should succeed");
 
-        assert_eq!(receipt.outcome, MergeVersionOutcome::AlreadyUpToDate);
+        assert_eq!(receipt.outcome, MergeVersionOutcome::MergeCommitted);
         assert_eq!(receipt.applied_change_count, 0);
-        assert_eq!(receipt.created_merge_commit_id, None);
-        assert_eq!(
-            engine
-                .load_version_head_commit_id(sim.main_version_id())
-                .await
-                .expect("main head should load"),
-            Some(main_head_before),
-            "convergent update should not create a new target commit"
-        );
+        let merge_commit_id = receipt
+            .created_merge_commit_id
+            .clone()
+            .expect("convergent update should create an empty merge commit");
+        assert_eq!(receipt.target_head_after_commit_id, merge_commit_id);
+        assert_eq!(receipt.target_head_before_commit_id, main_head_before);
+        assert_eq!(receipt.source_head_before_commit_id, source_head);
+        assert_empty_merge_commit(
+            &engine,
+            &main,
+            &merge_commit_id,
+            &receipt.target_head_before_commit_id,
+            &receipt.source_head_before_commit_id,
+        )
+        .await;
         assert_key_value(&main, "shared-before-branch", Some("\"same\"")).await;
     }
 );
@@ -1136,7 +1158,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_version_converges_independent_add_same_identity_same_payload,
+    merge_version_records_empty_merge_for_same_identity_same_payload_add,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
 
@@ -1158,6 +1180,11 @@ simulation_test!(
             .await
             .expect("main head should load")
             .expect("main head should exist");
+        let source_head = engine
+            .load_version_head_commit_id("draft-version")
+            .await
+            .expect("draft head should load")
+            .expect("draft head should exist");
 
         let receipt = main
             .merge_version(MergeVersionOptions {
@@ -1166,17 +1193,23 @@ simulation_test!(
             .await
             .expect("convergent independent add merge should succeed");
 
-        assert_eq!(receipt.outcome, MergeVersionOutcome::AlreadyUpToDate);
+        assert_eq!(receipt.outcome, MergeVersionOutcome::MergeCommitted);
         assert_eq!(receipt.applied_change_count, 0);
-        assert_eq!(receipt.created_merge_commit_id, None);
-        assert_eq!(
-            engine
-                .load_version_head_commit_id(sim.main_version_id())
-                .await
-                .expect("main head should load"),
-            Some(main_head_before),
-            "convergent independent add should not create a new target commit"
-        );
+        let merge_commit_id = receipt
+            .created_merge_commit_id
+            .clone()
+            .expect("convergent independent add should create an empty merge commit");
+        assert_eq!(receipt.target_head_after_commit_id, merge_commit_id);
+        assert_eq!(receipt.target_head_before_commit_id, main_head_before);
+        assert_eq!(receipt.source_head_before_commit_id, source_head);
+        assert_empty_merge_commit(
+            &engine,
+            &main,
+            &merge_commit_id,
+            &receipt.target_head_before_commit_id,
+            &receipt.source_head_before_commit_id,
+        )
+        .await;
         assert_key_value(&main, "merge-independent-same-add", Some("\"same\"")).await;
     }
 );
@@ -1461,6 +1494,47 @@ async fn load_commit_snapshot(
         panic!("commit snapshot should be JSON");
     };
     snapshot_content.clone()
+}
+
+async fn assert_empty_merge_commit(
+    engine: &Engine,
+    session: &crate::support::simulation_test::engine::SimSession,
+    merge_commit_id: &str,
+    target_head_before: &str,
+    source_head: &str,
+) {
+    let active_version_id = session
+        .active_version_id()
+        .await
+        .expect("active version should load");
+    assert_eq!(
+        engine
+            .load_version_head_commit_id(&active_version_id)
+            .await
+            .expect("target version head should load")
+            .as_deref(),
+        Some(merge_commit_id),
+        "empty merge should advance the target version ref"
+    );
+
+    let global = session.wrap_session(
+        engine
+            .open_session("global")
+            .await
+            .expect("global session should open"),
+        engine,
+    );
+    let commit_snapshot = load_commit_snapshot(&global, merge_commit_id).await;
+    assert_eq!(
+        json_string_array(&commit_snapshot, "change_ids"),
+        Vec::<String>::new(),
+        "empty merge commit should not claim state changes"
+    );
+    assert_eq!(
+        json_string_array(&commit_snapshot, "parent_commit_ids"),
+        vec![target_head_before.to_string(), source_head.to_string()],
+        "empty merge commit should preserve target/source ancestry"
+    );
 }
 
 fn json_string_array(snapshot: &JsonValue, key: &str) -> Vec<String> {

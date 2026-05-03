@@ -154,6 +154,31 @@ impl TransactionStagedWrites {
             .map(|members| members.commit_id.clone()))
     }
 
+    /// Stages a commit for `version_id` even if no tracked state rows changed.
+    ///
+    /// Merge uses this to record graph ancestry for convergent merges where the
+    /// target already has the same final state as the source, but the source
+    /// head is not reachable from the target head.
+    pub(crate) fn stage_empty_commit(&self, version_id: String) -> Result<String, LixError> {
+        let mut functions = self.functions.clone();
+        let mut guard = self.commit_members_by_version.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged commit membership lock",
+            )
+        })?;
+        let members = guard.entry(version_id).or_insert_with(|| {
+            StagedCommitMembers::new(
+                functions.uuid_v7(),
+                functions.uuid_v7(),
+                functions.uuid_v7(),
+                functions.timestamp(),
+            )
+        });
+        members.allow_empty();
+        Ok(members.commit_id.clone())
+    }
+
     /// Builds the transaction-local read overlay from currently staged writes.
     pub(crate) fn staging_overlay(&self) -> Result<StagedStateRowOverlay, LixError> {
         let guard = self.rows.lock().map_err(|_| {
