@@ -260,6 +260,160 @@ test("engine errors expose structured hints", async () => {
 	await lix.close();
 });
 
+test("execute rejects invalid runtime arguments before wasm", async () => {
+	const lix = await openLix();
+	const unsafeLix = lix as unknown as {
+		execute(sql: unknown, params?: unknown): Promise<ExecuteResult>;
+	};
+
+	await expect(unsafeLix.execute(123, [])).rejects.toMatchObject({
+		name: "LixError",
+		code: "LIX_INVALID_ARGUMENT",
+		message: "lix.execute() expected sql to be a string",
+		details: {
+			operation: "execute",
+			argument: "sql",
+			expected: "string",
+			actual: "number",
+		},
+	});
+
+	await expect(unsafeLix.execute("SELECT 1", 123)).rejects.toMatchObject({
+		name: "LixError",
+		code: "LIX_INVALID_ARGUMENT",
+		message: "lix.execute() expected params to be an array",
+		details: {
+			operation: "execute",
+			argument: "params",
+			expected: "array",
+			actual: "number",
+		},
+	});
+
+	await lix.close();
+});
+
+test("execute rejects lossy JavaScript parameter coercions", async () => {
+	const lix = await openLix();
+	const circular: Record<string, unknown> = {};
+	circular.self = circular;
+
+	const invalidCases: Array<{
+		name: string;
+		value: unknown;
+		message: string | RegExp;
+		actual?: string;
+	}> = [
+		{
+			name: "Date",
+			value: new Date("2026-01-02T03:04:05.000Z"),
+			message: /Date is not a valid SQL parameter/,
+			actual: "Date",
+		},
+		{
+			name: "Int32Array",
+			value: new Int32Array([1, 2, 3]),
+			message: /typed array SQL parameters must be Uint8Array/,
+			actual: "Int32Array",
+		},
+		{
+			name: "lone surrogate",
+			value: "X\uD83DY",
+			message: /well-formed UTF-16/,
+			actual: "string",
+		},
+		{
+			name: "undefined",
+			value: undefined,
+			message: /undefined is not a valid SQL parameter/,
+			actual: "undefined",
+		},
+		{
+			name: "BigInt",
+			value: 10n,
+			message: /requires a LixValue, JSON value, or binary value/,
+			actual: "bigint",
+		},
+		{
+			name: "NaN",
+			value: Number.NaN,
+			message: /finite number/,
+			actual: "number",
+		},
+		{
+			name: "Infinity",
+			value: Number.POSITIVE_INFINITY,
+			message: /finite number/,
+			actual: "number",
+		},
+		{
+			name: "circular object",
+			value: circular,
+			message: /circular references/,
+			actual: "object",
+		},
+		{
+			name: "Symbol",
+			value: Symbol("x"),
+			message: /requires a LixValue, JSON value, or binary value/,
+			actual: "symbol",
+		},
+		{
+			name: "function",
+			value: () => undefined,
+			message: /requires a LixValue, JSON value, or binary value/,
+			actual: "function",
+		},
+	];
+
+	for (const testCase of invalidCases) {
+		try {
+			await lix.execute("SELECT $1 AS v", [testCase.value as never]);
+			throw new Error(`expected ${testCase.name} to fail`);
+		} catch (error) {
+			expect(error, testCase.name).toMatchObject({
+				name: "LixError",
+				code: "LIX_INVALID_PARAM",
+				details: {
+					operation: "execute",
+					parameter_index: 1,
+					argument: "params[0]",
+					actual: testCase.actual,
+				},
+			});
+			if (!(error instanceof Error)) throw error;
+			expect(error.message, testCase.name).toMatch(testCase.message);
+		}
+	}
+
+	await lix.close();
+});
+
+test("execute rejects extra SQL parameters", async () => {
+	const lix = await openLix();
+
+	try {
+		await lix.execute("SELECT $1 AS v", [1, 2]);
+		throw new Error("expected extra params to fail");
+	} catch (error) {
+		expect(error).toMatchObject({
+			code: "LIX_INVALID_PARAM",
+			details: {
+				operation: "execute",
+				expected_param_count: 1,
+				provided_param_count: 2,
+				placeholders: ["$1"],
+			},
+		});
+		if (!(error instanceof Error)) throw error;
+		expect(error.message).toBe(
+			"SQL expected 1 parameter(s), but 2 parameter(s) were provided",
+		);
+	}
+
+	await lix.close();
+});
+
 test("lix_state_history snapshot_content preserves JSON null for binary file rows", async () => {
 	const lix = await openLix();
 
