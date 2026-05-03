@@ -64,6 +64,9 @@ impl LixError {
     /// relational constraint.
     pub const CODE_CONSTRAINT_VIOLATION: &'static str = "LIX_CONSTRAINT_VIOLATION";
 
+    /// A SQL write targeted a read-only internal/component surface.
+    pub const CODE_READ_ONLY: &'static str = "LIX_ERROR_READ_ONLY";
+
     /// A history table was queried without an explicit commit/version range.
     pub const CODE_HISTORY_FILTER_REQUIRED: &'static str = "LIX_HISTORY_FILTER_REQUIRED";
 

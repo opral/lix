@@ -1336,10 +1336,17 @@ async fn count_version_refs(
 }
 
 fn assert_version_pair_delete_restricted(error: &lix_engine::LixError) {
-    assert_eq!(error.code, "LIX_ERROR_FOREIGN_KEY");
+    assert_eq!(error.code, lix_engine::LixError::CODE_READ_ONLY);
     assert!(
         error.to_string().contains("lix_version"),
         "error should explain the version pair restriction: {error:?}"
+    );
+    assert!(
+        error
+            .hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains("lix_version")),
+        "error should guide callers to the lix_version surface: {error:?}"
     );
 }
 

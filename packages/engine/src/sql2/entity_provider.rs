@@ -32,6 +32,7 @@ use crate::live_state::LiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
+use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
 };
@@ -333,6 +334,7 @@ impl TableProvider for EntityProvider {
         if insert_op != InsertOp::Append {
             return not_impl_err!("{insert_op} not implemented for entity surfaces yet");
         }
+        reject_read_only_entity_surface(&self.spec.schema_key, "INSERT")?;
 
         let write_ctx = self.write_access.require_write(&format!(
             "INSERT into {} entity surface",
@@ -361,6 +363,8 @@ impl TableProvider for EntityProvider {
         state: &dyn Session,
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        reject_read_only_entity_surface(&self.spec.schema_key, "DELETE")?;
+
         let write_ctx = self.write_access.require_write(&format!(
             "DELETE FROM {} entity surface",
             self.spec.schema_key
@@ -410,6 +414,8 @@ impl TableProvider for EntityProvider {
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        reject_read_only_entity_surface(&self.spec.schema_key, "UPDATE")?;
+
         let write_ctx = self
             .write_access
             .require_write(&format!("UPDATE {} entity surface", self.spec.schema_key))?;
