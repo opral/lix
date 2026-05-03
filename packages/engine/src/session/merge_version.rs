@@ -138,15 +138,19 @@ impl SessionContext {
                 let adopted_changes =
                     adopted_changes_from_merge_plan(&merge_plan, &active_version_id);
                 if adopted_changes.is_empty() {
+                    let created_merge_commit_id =
+                        transaction.stage_empty_commit(active_version_id.clone())?;
+                    transaction
+                        .add_commit_parent(active_version_id.clone(), source_head.clone())?;
                     return Ok(MergeVersionReceipt {
-                        outcome: MergeVersionOutcome::AlreadyUpToDate,
+                        outcome: MergeVersionOutcome::MergeCommitted,
                         target_version_id: active_version_id,
                         source_version_id,
                         merge_base_commit_id: Some(merge_base.commit_id),
-                        target_head_after_commit_id: target_head.clone(),
+                        target_head_after_commit_id: created_merge_commit_id.clone(),
                         target_head_before_commit_id: target_head,
                         source_head_before_commit_id: source_head,
-                        created_merge_commit_id: None,
+                        created_merge_commit_id: Some(created_merge_commit_id),
                         applied_change_count: 0,
                     });
                 }

@@ -253,6 +253,7 @@ pub(crate) struct StagedCommitMembers {
     pub(crate) change_set_id: String,
     pub(crate) created_at: String,
     pub(crate) change_ids: BTreeSet<String>,
+    pub(crate) allow_empty: bool,
 }
 
 impl StagedCommitMembers {
@@ -268,6 +269,7 @@ impl StagedCommitMembers {
             change_set_id,
             created_at,
             change_ids: BTreeSet::new(),
+            allow_empty: false,
         }
     }
 
@@ -281,5 +283,9 @@ impl StagedCommitMembers {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.change_ids.is_empty()
+    }
+
+    pub(crate) fn allow_empty(&mut self) {
+        self.allow_empty = true;
     }
 }
