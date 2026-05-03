@@ -1,4 +1,5 @@
 use crate::backend::{KvScanRange, KvStore, KvWriter};
+use crate::changelog::codec::{decode_change, encode_change};
 use crate::changelog::{CanonicalChange, ChangelogScanRequest};
 use crate::LixError;
 
@@ -58,24 +59,6 @@ fn encode_change_key(change_id: &str) -> Vec<u8> {
     change_id.as_bytes().to_vec()
 }
 
-fn encode_change(change: &CanonicalChange) -> Result<Vec<u8>, LixError> {
-    serde_json::to_vec(change).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("failed to encode changelog change: {error}"),
-        )
-    })
-}
-
-fn decode_change(bytes: &[u8]) -> Result<CanonicalChange, LixError> {
-    serde_json::from_slice(bytes).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("failed to decode changelog change: {error}"),
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -108,6 +91,49 @@ mod tests {
         }
         .expect("load should succeed");
         assert_eq!(loaded, Some(change));
+    }
+
+    #[tokio::test]
+    async fn append_and_load_composite_entity_identity_roundtrips() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let changelog = ChangelogContext::new();
+        let mut change = test_change("change-composite");
+        change.entity_id = crate::entity_identity::EntityIdentity::tuple(vec![
+            crate::entity_identity::EntityIdentityPart::String("entity".to_string()),
+            crate::entity_identity::EntityIdentityPart::Number("7".to_string()),
+            crate::entity_identity::EntityIdentityPart::Bool(true),
+        ])
+        .expect("composite identity should be valid");
+
+        let mut tx = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should open");
+        changelog
+            .writer(tx.as_mut())
+            .append_changes(std::slice::from_ref(&change))
+            .await
+            .expect("append should succeed");
+        tx.commit().await.expect("commit should succeed");
+
+        let loaded = {
+            let reader = changelog.reader(backend);
+            reader.load_change("change-composite").await
+        }
+        .expect("load should succeed");
+        assert_eq!(loaded, Some(change));
+    }
+
+    #[test]
+    fn decode_rejects_non_flatbuffer_bytes() {
+        let error = decode_change(br#"{"id":"change-json"}"#)
+            .expect_err("json changelog payloads are not accepted after the hard cut");
+        assert!(
+            error
+                .description
+                .contains("invalid FlatBuffers file identifier"),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[tokio::test]

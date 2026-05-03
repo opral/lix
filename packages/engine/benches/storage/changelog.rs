@@ -1,4 +1,6 @@
-use lix_engine::storage_bench::{self, StorageBenchConfig, StorageBenchKeyPattern};
+use lix_engine::storage_bench::{
+    self, StorageBenchConfig, StorageBenchKeyPattern, StorageBenchSelectivity,
+};
 
 use crate::{Args, BenchBackend};
 use criterion::{black_box, BatchSize, Criterion};
@@ -6,6 +8,40 @@ use tokio::runtime::Runtime;
 
 pub(crate) fn bench(c: &mut Criterion, runtime: &Runtime, args: Args) {
     let mut group = c.benchmark_group("storage/changelog");
+    group.bench_function("encode_only/full_row/10k", |b| {
+        b.iter_batched(
+            || {
+                runtime
+                    .block_on(storage_bench::prepare_changelog_codec(config(&args)))
+                    .expect("prepare changelog/encode_only")
+            },
+            |fixture| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::changelog_encode_only_prepared(&fixture))
+                        .expect("changelog/encode_only succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+    group.bench_function("decode_only/full_row/10k", |b| {
+        b.iter_batched(
+            || {
+                runtime
+                    .block_on(storage_bench::prepare_changelog_codec(config(&args)))
+                    .expect("prepare changelog/decode_only")
+            },
+            |fixture| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::changelog_decode_only_prepared(&fixture))
+                        .expect("changelog/decode_only succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
     group.bench_function("append_changes/10k", |b| {
         b.iter_batched(
             || {
@@ -148,6 +184,156 @@ pub(crate) fn bench(c: &mut Criterion, runtime: &Runtime, args: Args) {
             )
         });
     }
+    group.bench_function("append_changes_metadata_1k/10k", |b| {
+        b.iter_batched(
+            || {
+                let backend = BenchBackend::new();
+                let fixture = runtime
+                    .block_on(storage_bench::prepare_changelog_append_metadata(
+                        config(&args).with_state_payload_bytes(1024),
+                    ))
+                    .expect("prepare changelog/append metadata");
+                (backend, fixture)
+            },
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::changelog_append_changes_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("changelog/append metadata succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+    group.bench_function("append_changes_tombstone/10k", |b| {
+        b.iter_batched(
+            || {
+                let backend = BenchBackend::new();
+                let fixture = runtime
+                    .block_on(storage_bench::prepare_changelog_append_tombstones(config(
+                        &args,
+                    )))
+                    .expect("prepare changelog/append tombstones");
+                (backend, fixture)
+            },
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::changelog_append_changes_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("changelog/append tombstones succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+    group.bench_function("append_changes_composite_entity_id/10k", |b| {
+        b.iter_batched(
+            || {
+                let backend = BenchBackend::new();
+                let fixture = runtime
+                    .block_on(
+                        storage_bench::prepare_changelog_append_composite_entity_ids(config(&args)),
+                    )
+                    .expect("prepare changelog/append composite entity ids");
+                (backend, fixture)
+            },
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::changelog_append_changes_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("changelog/append composite entity ids succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+    for (label, selectivity) in [
+        ("1pct", StorageBenchSelectivity::Percent1),
+        ("10pct", StorageBenchSelectivity::Percent10),
+        ("100pct", StorageBenchSelectivity::Percent100),
+    ] {
+        let name = format!("scan_schema_selectivity_{label}/10k");
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || {
+                    let backend = BenchBackend::new();
+                    let fixture = runtime
+                        .block_on(storage_bench::prepare_changelog_read_with_selectivity(
+                            &backend,
+                            config(&args).with_selectivity(selectivity),
+                        ))
+                        .expect("prepare changelog/scan schema selectivity");
+                    (backend, fixture)
+                },
+                |(backend, fixture)| {
+                    black_box(
+                        runtime
+                            .block_on(storage_bench::changelog_scan_schema_prepared(
+                                &backend,
+                                &fixture,
+                                selectivity,
+                            ))
+                            .expect("changelog/scan schema selectivity succeeds"),
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        });
+    }
+    group.bench_function("scan_entity_history/10k", |b| {
+        b.iter_batched(
+            || {
+                let backend = BenchBackend::new();
+                let fixture = runtime
+                    .block_on(storage_bench::prepare_changelog_read_entity_history(
+                        &backend,
+                        config(&args),
+                    ))
+                    .expect("prepare changelog/scan entity history");
+                (backend, fixture)
+            },
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::changelog_scan_entity_history_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("changelog/scan entity history succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+    group.bench_function("scan_commit_facts/10k", |b| {
+        b.iter_batched(
+            || {
+                let backend = BenchBackend::new();
+                let fixture = runtime
+                    .block_on(storage_bench::prepare_changelog_read_commit_facts(
+                        &backend,
+                        config(&args),
+                    ))
+                    .expect("prepare changelog/scan commit facts");
+                (backend, fixture)
+            },
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::changelog_scan_commit_facts_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("changelog/scan commit facts succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
     for (label, key_pattern) in [
         ("sequential_keys", StorageBenchKeyPattern::Sequential),
         ("random_keys", StorageBenchKeyPattern::Random),
