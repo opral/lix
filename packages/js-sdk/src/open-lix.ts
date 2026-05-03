@@ -349,13 +349,16 @@ function normalizeExecuteResult(result: WasmExecuteResult): ExecuteResult {
 function createLixError(
 	code: string,
 	message: string,
-	options: { hint?: string; cause?: unknown } = {},
+	options: { hint?: string; details?: unknown; cause?: unknown } = {},
 ): LixError {
 	const error = new Error(message) as LixError;
 	error.name = "LixError";
 	error.code = code;
 	if (options.hint !== undefined) {
 		error.hint = options.hint;
+	}
+	if (options.details !== undefined) {
+		error.details = options.details;
 	}
 	if (options.cause !== undefined) {
 		(error as Error & { cause?: unknown }).cause = options.cause;
@@ -369,9 +372,13 @@ function normalizeThrownError(error: unknown): LixError {
 			typeof error.hint === "string"
 				? error.hint
 				: extractHintFromMessage(error.message);
+		const details = "details" in error ? error.details : undefined;
 		if (error instanceof Error) {
 			if (hint !== undefined && error.hint === undefined) {
 				error.hint = hint;
+			}
+			if (details !== undefined && error.details === undefined) {
+				error.details = details;
 			}
 			return error;
 		}
@@ -381,7 +388,7 @@ function normalizeThrownError(error: unknown): LixError {
 				: typeof error.description === "string"
 					? error.description
 					: error.code;
-		return createLixError(error.code, message, { hint });
+		return createLixError(error.code, message, { hint, details });
 	}
 
 	if (error instanceof Error) {
@@ -402,6 +409,7 @@ function isLixErrorLike(error: unknown): error is {
 	message?: string;
 	description?: string;
 	hint?: string;
+	details?: unknown;
 } {
 	return (
 		typeof error === "object" &&

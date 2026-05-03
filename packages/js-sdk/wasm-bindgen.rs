@@ -629,12 +629,24 @@ export type MergeVersionResult = {
         let hint = Reflect::get(&value, &JsValue::from_str("hint"))
             .ok()
             .and_then(|hint| hint.as_string());
+        let details = Reflect::get(&value, &JsValue::from_str("details"))
+            .ok()
+            .and_then(|details| {
+                if details.is_undefined() || details.is_null() {
+                    None
+                } else {
+                    serde_wasm_bindgen::from_value(details).ok()
+                }
+            });
         let mut error = LixError::new(
             code.unwrap_or_else(|| "LIX_ERROR_JS_SDK".to_string()),
             message,
         );
         if let Some(hint) = hint {
             error = error.with_hint(hint);
+        }
+        if let Some(details) = details {
+            error = error.with_details(details);
         }
         error
     }
@@ -935,6 +947,12 @@ export type MergeVersionResult = {
                 &JsValue::from_str("hint"),
                 &JsValue::from_str(&hint),
             );
+        }
+        if let Some(details) = error.details {
+            let serializer = serde_wasm_bindgen::Serializer::json_compatible();
+            if let Ok(value) = details.serialize(&serializer) {
+                let _ = Reflect::set(object, &JsValue::from_str("details"), &value);
+            }
         }
         js_error.into()
     }

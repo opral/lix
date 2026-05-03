@@ -148,6 +148,63 @@ test("createVersion can start from an explicit commit id", async () => {
 	await lix.close();
 });
 
+test("merge conflicts expose structured details", async () => {
+	const lix = await openLix();
+	const mainVersionId = await lix.activeVersionId();
+	await registerCrmTaskSchema(lix);
+	await lix.execute(
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		[
+			"conflict-task",
+			"Base",
+			false,
+			JSON.stringify({ priority: "normal" }),
+		],
+	);
+	const draft = await lix.createVersion({
+		id: "conflict-draft",
+		name: "Conflict draft",
+	});
+
+	await lix.switchVersion({ versionId: draft.versionId });
+	await lix.execute("UPDATE crm_task SET title = $1 WHERE id = $2", [
+		"Draft",
+		"conflict-task",
+	]);
+
+	await lix.switchVersion({ versionId: mainVersionId });
+	await lix.execute("UPDATE crm_task SET title = $1 WHERE id = $2", [
+		"Main",
+		"conflict-task",
+	]);
+
+	try {
+		await lix.mergeVersion({ sourceVersionId: draft.versionId });
+		throw new Error("expected merge conflict");
+	} catch (error) {
+		expect(isLixError(error)).toBe(true);
+		if (!isLixError(error)) throw error;
+		expect(error.code).toBe("LIX_MERGE_CONFLICT");
+		const details = error.details as {
+			conflicts?: Array<{
+				schema_key?: string;
+				entity_id?: string;
+				target?: unknown;
+				source?: unknown;
+			}>;
+		};
+		expect(details.conflicts).toHaveLength(1);
+		expect(details.conflicts?.[0]).toMatchObject({
+			schema_key: "crm_task",
+			entity_id: "conflict-task",
+		});
+		expect(details.conflicts?.[0]?.target).toBeDefined();
+		expect(details.conflicts?.[0]?.source).toBeDefined();
+	}
+
+	await lix.close();
+});
+
 test("lix.close delegates backend close through the engine bridge", async () => {
 	let closeCount = 0;
 	const backend = {
