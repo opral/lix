@@ -1,4 +1,5 @@
 use lix_engine::LixError;
+use lix_engine::Value;
 
 simulation_test!(sql_missing_table_has_lix_error_code, |sim| async move {
     let engine = sim.boot_engine().await;
@@ -127,6 +128,69 @@ simulation_test!(sql_udf_argument_mismatch_has_type_code, |sim| async move {
 
     assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
 });
+
+simulation_test!(
+    sql_non_utf8_blob_parameter_has_targeted_error,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute("SELECT length($1)", &[Value::Blob(vec![0xff])])
+            .await
+            .expect_err("non-UTF-8 blob should fail as text");
+
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        assert!(
+            error.message.contains("valid UTF-8 text"),
+            "expected targeted UTF-8 message: {error}"
+        );
+        assert!(
+            error
+                .hint()
+                .is_some_and(|hint| hint.contains("blob") && !hint.contains("lix_json")),
+            "expected blob-specific hint without JSON detour: {error}"
+        );
+    }
+);
+
+simulation_test!(
+    sql_blob_insert_into_json_entity_has_targeted_error,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('blob-value', $1)",
+                &[Value::Blob(vec![1, 2, 3, 255, 0, 128])],
+            )
+            .await
+            .expect_err("blob entity insert should fail cleanly");
+
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        assert!(
+            error.message.contains("cannot store blob values directly"),
+            "expected targeted blob-to-JSON message: {error}"
+        );
+        assert!(
+            !error.message.contains("Binary("),
+            "error should not expose Rust/DataFusion debug formatting: {error}"
+        );
+    }
+);
 
 simulation_test!(sql_create_table_returns_error, |sim| async move {
     let engine = sim.boot_engine().await;

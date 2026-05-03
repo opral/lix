@@ -1287,6 +1287,20 @@ fn entity_json_value_from_scalar(
         ScalarValue::UInt32(Some(value)) => Ok(JsonValue::from(value)),
         ScalarValue::Float64(Some(value)) => json_number_from_f64(value),
         ScalarValue::Float32(Some(value)) => json_number_from_f64(value as f64),
+        ScalarValue::Binary(Some(_))
+        | ScalarValue::LargeBinary(Some(_))
+        | ScalarValue::FixedSizeBinary(_, Some(_)) => Err(lix_error_to_datafusion_error(
+            LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                "entity JSON columns cannot store blob values directly",
+            )
+            .with_hint(
+                "Encode bytes explicitly as JSON text/object, or store raw bytes in a blob-native surface such as lix_file.data.",
+            ),
+        )),
+        ScalarValue::Binary(None)
+        | ScalarValue::LargeBinary(None)
+        | ScalarValue::FixedSizeBinary(_, None) => Ok(JsonValue::Null),
         other => Err(DataFusionError::Execution(format!(
             "entity insert does not support scalar value {other:?}"
         ))),
