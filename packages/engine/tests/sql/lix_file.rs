@@ -1,4 +1,5 @@
 use lix_engine::ExecuteResult;
+use lix_engine::LixError;
 use lix_engine::Value;
 
 use super::assert_rows_eq;
@@ -222,6 +223,38 @@ simulation_test!(
         assert!(!id.is_empty(), "defaulted file id should be non-empty");
         assert_eq!(path, "/docs/readme.md");
         assert_eq!(data, b"hello");
+    }
+);
+
+simulation_test!(
+    lix_file_path_insert_rejects_duplicate_root_path,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ('/x.bin', $1)",
+                &[Value::Blob(vec![1])],
+            )
+            .await
+            .expect("first file path insert should succeed");
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_file (path, data) VALUES ('/x.bin', $1)",
+                &[Value::Blob(vec![2])],
+            )
+            .await
+            .expect_err("duplicate file path insert should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
     }
 );
 

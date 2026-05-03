@@ -200,8 +200,48 @@ impl DirectoryPathResolver {
         hidden: bool,
         generate_directory_id: &mut dyn FnMut() -> String,
     ) -> Result<Vec<StageRow>, LixError> {
+        self.plan_directory_path(
+            directory_path,
+            leaf_id,
+            context,
+            hidden,
+            generate_directory_id,
+            false,
+        )
+    }
+
+    pub(crate) fn create_directory_path_with_leaf_id(
+        &mut self,
+        directory_path: &str,
+        leaf_id: Option<String>,
+        context: FilesystemRowContext,
+        hidden: bool,
+        generate_directory_id: &mut dyn FnMut() -> String,
+    ) -> Result<Vec<StageRow>, LixError> {
+        self.plan_directory_path(
+            directory_path,
+            leaf_id,
+            context,
+            hidden,
+            generate_directory_id,
+            true,
+        )
+    }
+
+    fn plan_directory_path(
+        &mut self,
+        directory_path: &str,
+        leaf_id: Option<String>,
+        context: FilesystemRowContext,
+        hidden: bool,
+        generate_directory_id: &mut dyn FnMut() -> String,
+        reject_existing_leaf: bool,
+    ) -> Result<Vec<StageRow>, LixError> {
         let directory_path = normalize_directory_path(directory_path)?;
         if directory_path == "/" {
+            if reject_existing_leaf {
+                return Err(duplicate_directory_path_error(&directory_path));
+            }
             return Ok(Vec::new());
         }
 
@@ -211,6 +251,9 @@ impl DirectoryPathResolver {
         let mut rows = Vec::new();
         for path in paths {
             if self.directory_ids_by_path.contains_key(&path) {
+                if reject_existing_leaf && path == directory_path {
+                    return Err(duplicate_directory_path_error(&directory_path));
+                }
                 continue;
             }
 
@@ -245,6 +288,13 @@ impl DirectoryPathResolver {
 
         Ok(rows)
     }
+}
+
+fn duplicate_directory_path_error(path: &str) -> LixError {
+    LixError::new(
+        LixError::CODE_UNIQUE,
+        format!("unique constraint violation on lix_directory.path for value {path:?}"),
+    )
 }
 
 pub(crate) fn directory_descriptor_row(input: DirectoryDescriptorRowInput) -> StageRow {
