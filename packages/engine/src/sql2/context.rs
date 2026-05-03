@@ -5,31 +5,43 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
+use crate::backend::ScopedKvStore;
 use crate::binary_cas::BlobDataReader;
 use crate::changelog::ChangelogReader;
 use crate::commit_graph::CommitGraphReader;
 use crate::functions::FunctionProviderHandle;
+use crate::json_store::JsonStoreReader;
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
 };
 use crate::transaction::types::{StageWrite, StageWriteOutcome};
 use crate::version_ref::{VersionHead, VersionRefReader};
-use crate::LixError;
+use crate::{LixBackend, LixError};
 
-/// Single execution boundary for `sql2::execute_sql(...)`.
+pub(crate) type SqlChangelogQuerySource = ChangelogQuerySource<Arc<dyn LixBackend + Send + Sync>>;
+pub(crate) type SqlJsonReader = JsonStoreReader<ScopedKvStore<Arc<dyn LixBackend + Send + Sync>>>;
+
+#[derive(Clone)]
+pub(crate) struct ChangelogQuerySource<S> {
+    pub(crate) changelog_reader: Arc<dyn ChangelogReader>,
+    pub(crate) json_reader: JsonStoreReader<ScopedKvStore<S>>,
+}
+
+/// Read-only execution boundary for `sql2::execute_sql(...)`.
 ///
 /// Session and transaction orchestration stay above `sql2`. They provide the
-/// execution-scoped visible live-state context for each call.
+/// execution-scoped committed read context for each call.
 ///
-/// Catalog lookup/registration will likely join this boundary later, but we
-/// are intentionally not carrying it yet until the new DataFusion-owned path
-/// actually needs it.
+/// This trait is for read SQL session construction. Write SQL should use
+/// `SqlWriteExecutionContext` so transaction-scoped reads and staging stay in
+/// the transaction capability instead of flowing through committed read
+/// sources.
 #[allow(dead_code)]
 pub(crate) trait SqlExecutionContext {
     fn active_version_id(&self) -> &str;
     fn live_state(&self) -> Arc<dyn LiveStateReader>;
     fn functions(&self) -> FunctionProviderHandle;
-    fn changelog(&self) -> Arc<dyn ChangelogReader>;
+    fn changelog_query_source(&self) -> SqlChangelogQuerySource;
     fn commit_graph(&self) -> Box<dyn CommitGraphReader>;
     fn version_ref(&self) -> Arc<dyn VersionRefReader>;
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;

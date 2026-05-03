@@ -1,5 +1,6 @@
 use crate::changelog::CanonicalChange;
 use crate::entity_identity::EntityIdentity;
+use crate::json_store::JsonRef;
 use crate::LixError;
 
 const CHANGELOG_FILE_IDENTIFIER: &str = "LXCH";
@@ -20,14 +21,14 @@ pub(crate) fn encode_change(change: &CanonicalChange) -> Result<Vec<u8>, LixErro
         .file_id
         .as_ref()
         .map(|value| builder.create_string(value));
-    let snapshot_content = change
-        .snapshot_content
+    let snapshot_ref = change
+        .snapshot_ref
         .as_ref()
-        .map(|value| builder.create_string(value));
-    let metadata = change
-        .metadata
+        .map(|value| builder.create_vector(value.as_hash_bytes()));
+    let metadata_ref = change
+        .metadata_ref
         .as_ref()
-        .map(|value| builder.create_string(value));
+        .map(|value| builder.create_vector(value.as_hash_bytes()));
     let created_at = builder.create_string(&change.created_at);
 
     let root = flatbuffer::create_canonical_change(
@@ -38,8 +39,8 @@ pub(crate) fn encode_change(change: &CanonicalChange) -> Result<Vec<u8>, LixErro
             schema_key,
             schema_version,
             file_id,
-            snapshot_content,
-            metadata,
+            snapshot_ref,
+            metadata_ref,
             created_at,
         },
     );
@@ -77,8 +78,8 @@ pub(crate) fn decode_change(bytes: &[u8]) -> Result<CanonicalChange, LixError> {
         schema_key: required_str(change.schema_key(), "schema_key")?.to_string(),
         schema_version: required_str(change.schema_version(), "schema_version")?.to_string(),
         file_id: change.file_id().map(ToString::to_string),
-        snapshot_content: change.snapshot_content().map(ToString::to_string),
-        metadata: change.metadata().map(ToString::to_string),
+        snapshot_ref: optional_json_ref(change.snapshot_ref(), "snapshot_ref")?,
+        metadata_ref: optional_json_ref(change.metadata_ref(), "metadata_ref")?,
         created_at: required_str(change.created_at(), "created_at")?.to_string(),
     })
 }
@@ -90,6 +91,23 @@ fn required_str<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str, LixE
             format!("failed to decode changelog change: missing required field `{field}`"),
         )
     })
+}
+
+fn optional_json_ref(
+    value: Option<flatbuffers::Vector<'_, u8>>,
+    field: &str,
+) -> Result<Option<JsonRef>, LixError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let bytes = value.bytes();
+    let hash = <[u8; 32]>::try_from(bytes).map_err(|_| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("failed to decode changelog change: field `{field}` must be exactly 32 bytes"),
+        )
+    })?;
+    Ok(Some(JsonRef::from_hash_bytes(hash)))
 }
 
 mod flatbuffer {
@@ -115,8 +133,8 @@ mod flatbuffer {
         const VT_SCHEMA_KEY: flatbuffers::VOffsetT = 8;
         const VT_SCHEMA_VERSION: flatbuffers::VOffsetT = 10;
         const VT_FILE_ID: flatbuffers::VOffsetT = 12;
-        const VT_SNAPSHOT_CONTENT: flatbuffers::VOffsetT = 14;
-        const VT_METADATA: flatbuffers::VOffsetT = 16;
+        const VT_SNAPSHOT_REF: flatbuffers::VOffsetT = 14;
+        const VT_METADATA_REF: flatbuffers::VOffsetT = 16;
         const VT_CREATED_AT: flatbuffers::VOffsetT = 18;
 
         #[inline]
@@ -160,18 +178,24 @@ mod flatbuffer {
         }
 
         #[inline]
-        pub(super) fn snapshot_content(&self) -> Option<&'a str> {
+        pub(super) fn snapshot_ref(&self) -> Option<flatbuffers::Vector<'a, u8>> {
             unsafe {
                 self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_SNAPSHOT_CONTENT, None)
+                    .get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(
+                        Self::VT_SNAPSHOT_REF,
+                        None,
+                    )
             }
         }
 
         #[inline]
-        pub(super) fn metadata(&self) -> Option<&'a str> {
+        pub(super) fn metadata_ref(&self) -> Option<flatbuffers::Vector<'a, u8>> {
             unsafe {
                 self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_METADATA, None)
+                    .get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(
+                        Self::VT_METADATA_REF,
+                        None,
+                    )
             }
         }
 
@@ -213,14 +237,14 @@ mod flatbuffer {
                     Self::VT_FILE_ID,
                     false,
                 )?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "snapshot_content",
-                    Self::VT_SNAPSHOT_CONTENT,
+                .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>(
+                    "snapshot_ref",
+                    Self::VT_SNAPSHOT_REF,
                     false,
                 )?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "metadata",
-                    Self::VT_METADATA,
+                .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>(
+                    "metadata_ref",
+                    Self::VT_METADATA_REF,
                     false,
                 )?
                 .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
@@ -239,8 +263,8 @@ mod flatbuffer {
         pub(super) schema_key: flatbuffers::WIPOffset<&'a str>,
         pub(super) schema_version: flatbuffers::WIPOffset<&'a str>,
         pub(super) file_id: Option<flatbuffers::WIPOffset<&'a str>>,
-        pub(super) snapshot_content: Option<flatbuffers::WIPOffset<&'a str>>,
-        pub(super) metadata: Option<flatbuffers::WIPOffset<&'a str>>,
+        pub(super) snapshot_ref: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
+        pub(super) metadata_ref: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
         pub(super) created_at: flatbuffers::WIPOffset<&'a str>,
     }
 
@@ -253,16 +277,16 @@ mod flatbuffer {
             CanonicalChange::VT_CREATED_AT,
             args.created_at,
         );
-        if let Some(metadata) = args.metadata {
+        if let Some(metadata_ref) = args.metadata_ref {
             builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-                CanonicalChange::VT_METADATA,
-                metadata,
+                CanonicalChange::VT_METADATA_REF,
+                metadata_ref,
             );
         }
-        if let Some(snapshot_content) = args.snapshot_content {
+        if let Some(snapshot_ref) = args.snapshot_ref {
             builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-                CanonicalChange::VT_SNAPSHOT_CONTENT,
-                snapshot_content,
+                CanonicalChange::VT_SNAPSHOT_REF,
+                snapshot_ref,
             );
         }
         if let Some(file_id) = args.file_id {

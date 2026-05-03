@@ -1,4 +1,4 @@
-use crate::changelog::CanonicalChange;
+use crate::changelog::MaterializedCanonicalChange;
 use crate::entity_identity::EntityIdentity;
 use crate::tracked_state::TrackedStateRow;
 use crate::untracked_state::{UntrackedStateFilter, UntrackedStateRow, UntrackedStateRowRequest};
@@ -25,9 +25,9 @@ pub(crate) struct LiveStateRow {
     pub(crate) version_id: String,
 }
 
-impl From<LiveStateRow> for CanonicalChange {
+impl From<LiveStateRow> for MaterializedCanonicalChange {
     fn from(row: LiveStateRow) -> Self {
-        CanonicalChange {
+        MaterializedCanonicalChange {
             id: row
                 .change_id
                 .expect("tracked live-state rows must carry change_id"),

@@ -1,9 +1,12 @@
 use crate::binary_cas::{BinaryBlobWrite, BinaryCasContext};
-use crate::changelog::{CanonicalChange, ChangelogContext, ChangelogScanRequest};
+use crate::changelog::{
+    canonicalize_materialized_change, CanonicalChange, ChangelogContext, ChangelogScanRequest,
+    MaterializedCanonicalChange,
+};
 use crate::entity_identity::EntityIdentity;
 use crate::entity_identity::EntityIdentityPart;
 use crate::json_store::context::JsonStoreContext;
-use crate::json_store::types::{JsonProjectionPath, JsonRef, StoreJsonOptions};
+use crate::json_store::types::{JsonProjectionPath, JsonRef};
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateDiffRequest, TrackedStateFilter, TrackedStateProjection,
     TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
@@ -147,7 +150,7 @@ pub struct UntrackedStateReadFixture {
 
 pub struct ChangelogAppendFixture {
     context: ChangelogContext,
-    changes: Vec<CanonicalChange>,
+    changes: Vec<MaterializedCanonicalChange>,
 }
 
 pub struct ChangelogReadFixture {
@@ -957,7 +960,7 @@ pub async fn prepare_changelog_append_changes(
 ) -> Result<ChangelogAppendFixture, LixError> {
     Ok(ChangelogAppendFixture {
         context: ChangelogContext::new(),
-        changes: changelog_changes(config),
+        changes: changelog_materialized_changes(config),
     })
 }
 
@@ -976,6 +979,33 @@ pub async fn prepare_changelog_append_metadata(
     Ok(ChangelogAppendFixture {
         context: ChangelogContext::new(),
         changes: changelog_metadata_changes(config),
+    })
+}
+
+pub async fn prepare_changelog_append_shared_payload(
+    config: StorageBenchConfig,
+) -> Result<ChangelogAppendFixture, LixError> {
+    Ok(ChangelogAppendFixture {
+        context: ChangelogContext::new(),
+        changes: changelog_shared_payload_changes(config),
+    })
+}
+
+pub async fn prepare_changelog_append_shared_metadata(
+    config: StorageBenchConfig,
+) -> Result<ChangelogAppendFixture, LixError> {
+    Ok(ChangelogAppendFixture {
+        context: ChangelogContext::new(),
+        changes: changelog_shared_metadata_changes(config),
+    })
+}
+
+pub async fn prepare_changelog_append_shared_payload_and_metadata(
+    config: StorageBenchConfig,
+) -> Result<ChangelogAppendFixture, LixError> {
+    Ok(ChangelogAppendFixture {
+        context: ChangelogContext::new(),
+        changes: changelog_shared_payload_and_metadata_changes(config),
     })
 }
 
@@ -1020,7 +1050,7 @@ pub async fn prepare_changelog_read(
     config: StorageBenchConfig,
 ) -> Result<ChangelogReadFixture, LixError> {
     let context = ChangelogContext::new();
-    let changes = changelog_changes(config);
+    let changes = changelog_materialized_changes(config);
     append_changelog_changes(backend, &context, &changes).await?;
     Ok(ChangelogReadFixture {
         context,
@@ -1345,12 +1375,12 @@ pub async fn json_store_write_prepared(
         .begin_transaction(TransactionBeginMode::Write)
         .await?;
     {
-        let mut writer = fixture.context.writer(transaction.as_mut());
+        let mut writer = fixture.context.writer();
         for document in &fixture.documents {
-            writer
-                .store_json_bytes(document, StoreJsonOptions::default())
-                .await?;
+            writer.stage_bytes(document)?;
         }
+        let mut store = transaction.as_mut();
+        writer.flush(&mut store).await?;
     }
     transaction.commit().await?;
     Ok(report(
@@ -1387,14 +1417,12 @@ pub async fn prepare_json_store_projection_read(
         .begin_transaction(TransactionBeginMode::Write)
         .await?;
     {
-        let mut writer = context.writer(transaction.as_mut());
+        let mut writer = context.writer();
         for document in documents {
-            refs.push(
-                writer
-                    .store_json_bytes(&document, StoreJsonOptions::default())
-                    .await?,
-            );
+            refs.push(writer.stage_bytes(&document)?);
         }
+        let mut store = transaction.as_mut();
+        writer.flush(&mut store).await?;
     }
     transaction.commit().await?;
     Ok(JsonStoreReadFixture {
@@ -1411,7 +1439,7 @@ pub async fn json_store_read_bytes_prepared(
     let mut verified_rows = 0;
     let mut reader = fixture.context.reader(backend);
     for json_ref in &fixture.refs {
-        if reader.load_json_bytes(json_ref).await?.is_some() {
+        if reader.load_bytes(json_ref).await?.is_some() {
             verified_rows += 1;
         }
     }
@@ -1476,14 +1504,12 @@ async fn prepare_json_store_base_update(
         .begin_transaction(TransactionBeginMode::Write)
         .await?;
     {
-        let mut writer = context.writer(transaction.as_mut());
+        let mut writer = context.writer();
         for document in documents {
-            refs.push(
-                writer
-                    .store_json_bytes(&document, StoreJsonOptions::default())
-                    .await?,
-            );
+            refs.push(writer.stage_bytes(&document)?);
         }
+        let mut store = transaction.as_mut();
+        writer.flush(&mut store).await?;
     }
     transaction.commit().await?;
     Ok(JsonStoreReadFixture {
@@ -1522,18 +1548,13 @@ async fn json_store_write_against_base_prepared(
         .begin_transaction(TransactionBeginMode::Write)
         .await?;
     {
-        let mut writer = fixture.context.writer(transaction.as_mut());
-        for (index, json_ref) in fixture.refs.iter().enumerate() {
+        let mut writer = fixture.context.writer();
+        for (index, _json_ref) in fixture.refs.iter().enumerate() {
             let updated = updated_json_document(shape, index);
-            writer
-                .store_json_bytes(
-                    &updated,
-                    StoreJsonOptions {
-                        base: Some(json_ref),
-                    },
-                )
-                .await?;
+            writer.stage_bytes(&updated)?;
         }
+        let mut store = transaction.as_mut();
+        writer.flush(&mut store).await?;
     }
     transaction.commit().await?;
     Ok(report(
@@ -1882,7 +1903,7 @@ pub async fn changelog_append_changes(
     backend: &(dyn LixBackend + Send + Sync),
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
-    let changes = changelog_changes(config);
+    let changes = changelog_materialized_changes(config);
     let context = ChangelogContext::new();
     let started = Instant::now();
     append_changelog_changes(backend, &context, &changes).await?;
@@ -1900,7 +1921,7 @@ pub async fn changelog_load_change_hit(
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = ChangelogContext::new();
-    let changes = changelog_changes(config);
+    let changes = changelog_materialized_changes(config);
     append_changelog_changes(backend, &context, &changes).await?;
     let reader = context.reader(backend);
 
@@ -1923,7 +1944,7 @@ pub async fn changelog_load_change_miss(
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = ChangelogContext::new();
-    let changes = changelog_changes(config);
+    let changes = changelog_materialized_changes(config);
     append_changelog_changes(backend, &context, &changes).await?;
     let reader = context.reader(backend);
 
@@ -1946,7 +1967,7 @@ pub async fn changelog_scan_all(
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = ChangelogContext::new();
-    let changes = changelog_changes(config);
+    let changes = changelog_materialized_changes(config);
     append_changelog_changes(backend, &context, &changes).await?;
     let reader = context.reader(backend);
 
@@ -1963,7 +1984,7 @@ pub async fn changelog_scan_limit_100(
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = ChangelogContext::new();
-    let changes = changelog_changes(config);
+    let changes = changelog_materialized_changes(config);
     append_changelog_changes(backend, &context, &changes).await?;
     let reader = context.reader(backend);
     let expected = config.rows.min(100);
@@ -2119,14 +2140,20 @@ async fn scan_untracked(
 async fn append_changelog_changes(
     backend: &(dyn LixBackend + Send + Sync),
     context: &ChangelogContext,
-    changes: &[CanonicalChange],
+    changes: &[MaterializedCanonicalChange],
 ) -> Result<(), LixError> {
     let mut transaction = backend
         .begin_transaction(TransactionBeginMode::Write)
         .await?;
     {
+        let mut json_writer = JsonStoreContext::new().writer();
+        let canonical_changes = changes
+            .iter()
+            .map(|change| canonicalize_materialized_change(&mut json_writer, change))
+            .collect::<Result<Vec<_>, _>>()?;
+        json_writer.flush(&mut transaction.as_mut()).await?;
         let mut writer = context.writer(transaction.as_mut());
-        writer.append_changes(changes).await?;
+        writer.append_changes(&canonical_changes).await?;
     }
     transaction.commit().await
 }
@@ -2232,8 +2259,15 @@ fn untracked_rows(config: StorageBenchConfig) -> Vec<UntrackedStateRow> {
 }
 
 fn changelog_changes(config: StorageBenchConfig) -> Vec<CanonicalChange> {
+    changelog_materialized_changes(config)
+        .into_iter()
+        .map(canonical_changelog_bench_change)
+        .collect()
+}
+
+fn changelog_materialized_changes(config: StorageBenchConfig) -> Vec<MaterializedCanonicalChange> {
     (0..config.rows)
-        .map(|index| CanonicalChange {
+        .map(|index| MaterializedCanonicalChange {
             id: format!("bench-change-{index}"),
             entity_id: EntityIdentity::single(entity_id(
                 "change-entity",
@@ -2250,8 +2284,29 @@ fn changelog_changes(config: StorageBenchConfig) -> Vec<CanonicalChange> {
         .collect()
 }
 
-fn changelog_tombstone_changes(config: StorageBenchConfig) -> Vec<CanonicalChange> {
-    changelog_changes(config)
+fn canonical_changelog_bench_change(change: MaterializedCanonicalChange) -> CanonicalChange {
+    let snapshot_ref = change
+        .snapshot_content
+        .as_ref()
+        .map(|value| JsonRef::from_hash(blake3::hash(value.as_bytes())));
+    let metadata_ref = change
+        .metadata
+        .as_ref()
+        .map(|value| JsonRef::from_hash(blake3::hash(value.as_bytes())));
+    CanonicalChange {
+        id: change.id,
+        entity_id: change.entity_id,
+        schema_key: change.schema_key,
+        schema_version: change.schema_version,
+        file_id: change.file_id,
+        snapshot_ref,
+        metadata_ref,
+        created_at: change.created_at,
+    }
+}
+
+fn changelog_tombstone_changes(config: StorageBenchConfig) -> Vec<MaterializedCanonicalChange> {
+    changelog_materialized_changes(config)
         .into_iter()
         .map(|mut change| {
             change.snapshot_content = None;
@@ -2261,8 +2316,8 @@ fn changelog_tombstone_changes(config: StorageBenchConfig) -> Vec<CanonicalChang
         .collect()
 }
 
-fn changelog_metadata_changes(config: StorageBenchConfig) -> Vec<CanonicalChange> {
-    changelog_changes(config)
+fn changelog_metadata_changes(config: StorageBenchConfig) -> Vec<MaterializedCanonicalChange> {
+    changelog_materialized_changes(config)
         .into_iter()
         .enumerate()
         .map(|(index, mut change)| {
@@ -2272,8 +2327,52 @@ fn changelog_metadata_changes(config: StorageBenchConfig) -> Vec<CanonicalChange
         .collect()
 }
 
-fn changelog_composite_entity_id_changes(config: StorageBenchConfig) -> Vec<CanonicalChange> {
-    changelog_changes(config)
+fn changelog_shared_payload_changes(
+    config: StorageBenchConfig,
+) -> Vec<MaterializedCanonicalChange> {
+    let shared_snapshot_content = snapshot_content(0, config.state_payload_bytes);
+    changelog_materialized_changes(config)
+        .into_iter()
+        .map(|mut change| {
+            change.snapshot_content = Some(shared_snapshot_content.clone());
+            change
+        })
+        .collect()
+}
+
+fn changelog_shared_metadata_changes(
+    config: StorageBenchConfig,
+) -> Vec<MaterializedCanonicalChange> {
+    let shared_metadata = snapshot_content(0, config.state_payload_bytes);
+    changelog_materialized_changes(config)
+        .into_iter()
+        .map(|mut change| {
+            change.snapshot_content = None;
+            change.metadata = Some(shared_metadata.clone());
+            change
+        })
+        .collect()
+}
+
+fn changelog_shared_payload_and_metadata_changes(
+    config: StorageBenchConfig,
+) -> Vec<MaterializedCanonicalChange> {
+    let shared_snapshot_content = snapshot_content(0, config.state_payload_bytes);
+    let shared_metadata = snapshot_content(1, config.state_payload_bytes);
+    changelog_materialized_changes(config)
+        .into_iter()
+        .map(|mut change| {
+            change.snapshot_content = Some(shared_snapshot_content.clone());
+            change.metadata = Some(shared_metadata.clone());
+            change
+        })
+        .collect()
+}
+
+fn changelog_composite_entity_id_changes(
+    config: StorageBenchConfig,
+) -> Vec<MaterializedCanonicalChange> {
+    changelog_materialized_changes(config)
         .into_iter()
         .enumerate()
         .map(|(index, mut change)| {
@@ -2293,8 +2392,8 @@ fn changelog_composite_entity_id_changes(config: StorageBenchConfig) -> Vec<Cano
         .collect()
 }
 
-fn changelog_selective_changes(config: StorageBenchConfig) -> Vec<CanonicalChange> {
-    changelog_changes(config)
+fn changelog_selective_changes(config: StorageBenchConfig) -> Vec<MaterializedCanonicalChange> {
+    changelog_materialized_changes(config)
         .into_iter()
         .enumerate()
         .map(|(index, mut change)| {
@@ -2304,8 +2403,10 @@ fn changelog_selective_changes(config: StorageBenchConfig) -> Vec<CanonicalChang
         .collect()
 }
 
-fn changelog_entity_history_changes(config: StorageBenchConfig) -> Vec<CanonicalChange> {
-    changelog_changes(config)
+fn changelog_entity_history_changes(
+    config: StorageBenchConfig,
+) -> Vec<MaterializedCanonicalChange> {
+    changelog_materialized_changes(config)
         .into_iter()
         .enumerate()
         .map(|(index, mut change)| {
@@ -2317,8 +2418,8 @@ fn changelog_entity_history_changes(config: StorageBenchConfig) -> Vec<Canonical
         .collect()
 }
 
-fn changelog_commit_fact_changes(config: StorageBenchConfig) -> Vec<CanonicalChange> {
-    changelog_changes(config)
+fn changelog_commit_fact_changes(config: StorageBenchConfig) -> Vec<MaterializedCanonicalChange> {
+    changelog_materialized_changes(config)
         .into_iter()
         .enumerate()
         .map(|(index, mut change)| {

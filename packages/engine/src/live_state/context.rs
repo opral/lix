@@ -748,7 +748,9 @@ mod tests {
 
     use super::*;
     use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::changelog::{canonicalize_materialized_change, MaterializedCanonicalChange};
     use crate::entity_identity::EntityIdentity;
+    use crate::json_store::JsonStoreContext;
     use crate::live_state::LiveStateFilter;
     use crate::tracked_state::TrackedStateScanRequest;
     use crate::untracked_state::{UntrackedStateContext, UntrackedStateRow};
@@ -1924,26 +1926,34 @@ mod tests {
             .begin_transaction(TransactionBeginMode::Write)
             .await
             .expect("transaction should open");
+        let change = MaterializedCanonicalChange {
+            id: format!("change-{commit_id}"),
+            entity_id: crate::entity_identity::EntityIdentity::single(commit_id),
+            schema_key: COMMIT_SCHEMA_KEY.to_string(),
+            schema_version: "1".to_string(),
+            file_id: None,
+            snapshot_content: Some(
+                serde_json::to_string(&json!({
+                    "id": commit_id,
+                    "change_set_id": format!("change-set-{commit_id}"),
+                    "change_ids": [],
+                    "parent_commit_ids": [],
+                }))
+                .expect("commit snapshot should serialize"),
+            ),
+            metadata: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let mut json_writer = JsonStoreContext::new().writer();
+        let canonical_change = canonicalize_materialized_change(&mut json_writer, &change)
+            .expect("commit change should canonicalize");
+        json_writer
+            .flush(&mut transaction.as_mut())
+            .await
+            .expect("commit json should flush");
         changelog
             .writer(transaction.as_mut())
-            .append_changes(&[crate::changelog::CanonicalChange {
-                id: format!("change-{commit_id}"),
-                entity_id: crate::entity_identity::EntityIdentity::single(commit_id),
-                schema_key: COMMIT_SCHEMA_KEY.to_string(),
-                schema_version: "1".to_string(),
-                file_id: None,
-                snapshot_content: Some(
-                    serde_json::to_string(&json!({
-                        "id": commit_id,
-                        "change_set_id": format!("change-set-{commit_id}"),
-                        "change_ids": [],
-                        "parent_commit_ids": [],
-                    }))
-                    .expect("commit snapshot should serialize"),
-                ),
-                metadata: None,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-            }])
+            .append_changes(&[canonical_change])
             .await
             .expect("commit change should append");
         transaction

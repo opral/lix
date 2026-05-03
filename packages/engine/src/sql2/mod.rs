@@ -25,8 +25,9 @@ mod write_normalization;
 
 pub(crate) use classify::{classify_statement, SqlStatementKind};
 pub(crate) use context::{
-    SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
-    WriteContextLiveStateReader, WriteContextVersionRefReader,
+    ChangelogQuerySource, SqlChangelogQuerySource, SqlExecutionContext, SqlJsonReader,
+    SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextLiveStateReader,
+    WriteContextVersionRefReader,
 };
 #[allow(unused_imports)]
 pub(crate) use execute::{

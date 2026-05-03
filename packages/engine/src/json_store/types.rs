@@ -10,6 +10,10 @@ impl JsonRef {
         }
     }
 
+    pub(crate) fn from_hash_bytes(hash: [u8; 32]) -> Self {
+        Self { hash }
+    }
+
     pub(crate) fn as_hash_bytes(&self) -> &[u8] {
         &self.hash
     }
@@ -45,9 +49,4 @@ impl JsonProjection {
     pub(crate) fn values(&self) -> &[Option<serde_json::Value>] {
         &self.values
     }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct StoreJsonOptions<'a> {
-    pub(crate) base: Option<&'a JsonRef>,
 }
