@@ -36,7 +36,7 @@ use crate::sql2::version_scope::{
 };
 use crate::sql2::write_normalization::UpdateAssignmentValues;
 use crate::transaction::types::StageRow;
-use crate::version_ref::VersionRefReader;
+use crate::version::VersionRefReader;
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 

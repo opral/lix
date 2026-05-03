@@ -4,7 +4,7 @@ use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::scalar::ScalarValue;
 
-use crate::version_ref::VersionRefReader;
+use crate::version::VersionRefReader;
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 
@@ -186,7 +186,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::version_ref::VersionHead;
+    use crate::version::VersionHead;
 
     #[tokio::test]
     async fn active_scope_uses_session_version() {

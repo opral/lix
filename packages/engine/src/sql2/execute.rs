@@ -508,7 +508,7 @@ mod tests {
     use crate::tracked_state::TrackedStateContext;
     use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
     use crate::untracked_state::UntrackedStateContext;
-    use crate::version_ref::VersionRefReader;
+    use crate::version::VersionRefReader;
     use crate::{Engine, ExecuteResult, SessionContext};
     use crate::{LixError, Value};
 
@@ -736,11 +736,11 @@ mod tests {
         async fn load_head(
             &self,
             _version_id: &str,
-        ) -> Result<Option<crate::version_ref::VersionHead>, LixError> {
+        ) -> Result<Option<crate::version::VersionHead>, LixError> {
             Ok(None)
         }
 
-        async fn scan_heads(&self) -> Result<Vec<crate::version_ref::VersionHead>, LixError> {
+        async fn scan_heads(&self) -> Result<Vec<crate::version::VersionHead>, LixError> {
             Ok(Vec::new())
         }
     }
@@ -2347,8 +2347,8 @@ mod tests {
 
         fn version_ref(&self) -> Arc<dyn VersionRefReader> {
             Arc::new(
-                crate::version_ref::VersionRefContext::new(Arc::new(UntrackedStateContext::new()))
-                    .reader(Arc::clone(&self.backend)),
+                crate::version::VersionContext::new(Arc::new(UntrackedStateContext::new()))
+                    .ref_reader(Arc::clone(&self.backend)),
             )
         }
 

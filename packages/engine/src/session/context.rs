@@ -15,7 +15,7 @@ use crate::schema_registry::SchemaRegistry;
 use crate::sql2::SqlExecutionContext;
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{open_transaction, Transaction};
-use crate::version_ref::{VersionRefContext, VersionRefReader};
+use crate::version::{VersionContext, VersionRefReader};
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, NullableKeyFilter};
 
@@ -45,7 +45,7 @@ pub struct SessionContext {
     pub(super) tracked_state: Arc<TrackedStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) changelog: Arc<ChangelogContext>,
-    pub(super) version_ref: Arc<VersionRefContext>,
+    pub(super) version_ctx: Arc<VersionContext>,
     pub(super) schema_registry: Arc<SchemaRegistry>,
     closed: Arc<AtomicBool>,
 }
@@ -57,7 +57,7 @@ impl SessionContext {
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
-        version_ref: Arc<VersionRefContext>,
+        version_ctx: Arc<VersionContext>,
         schema_registry: Arc<SchemaRegistry>,
     ) -> Result<Self, LixError> {
         let session = Self::new(
@@ -67,7 +67,7 @@ impl SessionContext {
             tracked_state,
             binary_cas,
             changelog,
-            version_ref,
+            version_ctx,
             schema_registry,
         );
         session.active_version_id().await?;
@@ -81,7 +81,7 @@ impl SessionContext {
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
-        version_ref: Arc<VersionRefContext>,
+        version_ctx: Arc<VersionContext>,
         schema_registry: Arc<SchemaRegistry>,
     ) -> Result<Self, LixError> {
         Ok(Self::new(
@@ -93,7 +93,7 @@ impl SessionContext {
             tracked_state,
             binary_cas,
             changelog,
-            version_ref,
+            version_ctx,
             schema_registry,
         ))
     }
@@ -105,7 +105,7 @@ impl SessionContext {
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
-        version_ref: Arc<VersionRefContext>,
+        version_ctx: Arc<VersionContext>,
         schema_registry: Arc<SchemaRegistry>,
     ) -> Self {
         Self::new_with_closed(
@@ -115,7 +115,7 @@ impl SessionContext {
             tracked_state,
             binary_cas,
             changelog,
-            version_ref,
+            version_ctx,
             schema_registry,
             Arc::new(AtomicBool::new(false)),
         )
@@ -128,7 +128,7 @@ impl SessionContext {
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
-        version_ref: Arc<VersionRefContext>,
+        version_ctx: Arc<VersionContext>,
         schema_registry: Arc<SchemaRegistry>,
         closed: Arc<AtomicBool>,
     ) -> Self {
@@ -139,7 +139,7 @@ impl SessionContext {
             tracked_state,
             binary_cas,
             changelog,
-            version_ref,
+            version_ctx,
             schema_registry,
             closed,
         }
@@ -227,8 +227,8 @@ impl SessionContext {
             .to_string();
 
         let head = self
-            .version_ref
-            .reader(Arc::clone(&self.backend))
+            .version_ctx
+            .ref_reader(Arc::clone(&self.backend))
             .load_head_commit_id(&version_id)
             .await?;
         if head.is_none() {
@@ -258,7 +258,7 @@ impl SessionContext {
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.changelog),
-            Arc::clone(&self.version_ref),
+            Arc::clone(&self.version_ctx),
             Arc::clone(&self.schema_registry),
             runtime_functions.provider(),
         )
@@ -292,7 +292,7 @@ pub(super) struct SessionSqlExecutionContext<'a> {
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) changelog: Arc<ChangelogContext>,
-    pub(super) version_ref: Arc<VersionRefContext>,
+    pub(super) version_ctx: Arc<VersionContext>,
     pub(super) visible_schemas: Vec<JsonValue>,
     pub(super) functions: FunctionProviderHandle,
 }
@@ -315,7 +315,7 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
     }
 
     fn version_ref(&self) -> Arc<dyn VersionRefReader> {
-        Arc::new(self.version_ref.reader(Arc::clone(&self.backend)))
+        Arc::new(self.version_ctx.ref_reader(Arc::clone(&self.backend)))
     }
 
     fn functions(&self) -> FunctionProviderHandle {

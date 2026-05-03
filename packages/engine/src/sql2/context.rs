@@ -13,7 +13,7 @@ use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
 };
 use crate::transaction::types::{StageWrite, StageWriteOutcome};
-use crate::version_ref::{VersionHead, VersionRefReader};
+use crate::version::{VersionHead, VersionRefReader};
 use crate::LixError;
 
 /// Single execution boundary for `sql2::execute_sql(...)`.

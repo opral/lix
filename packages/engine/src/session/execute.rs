@@ -330,7 +330,7 @@ impl SessionContext {
             live_state: Arc::clone(&self.live_state),
             binary_cas: Arc::clone(&self.binary_cas),
             changelog: Arc::clone(&self.changelog),
-            version_ref: Arc::clone(&self.version_ref),
+            version_ctx: Arc::clone(&self.version_ctx),
             visible_schemas,
             functions: functions.clone(),
         };

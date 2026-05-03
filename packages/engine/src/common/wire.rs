@@ -164,7 +164,6 @@ mod tests {
                 code: "LIX_TEST_NOTICE".to_string(),
                 message: "test notice".to_string(),
                 hint: Some("test hint".to_string()),
-                details: None,
             }],
         };
 

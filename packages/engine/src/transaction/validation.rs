@@ -16,12 +16,11 @@ use crate::schema::{
 };
 use crate::transaction::staging::StagedWriteSet;
 use crate::transaction::types::StagedStateRow;
+use crate::version::{VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_REF_SCHEMA_KEY};
 use crate::{LixError, NullableKeyFilter};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
-const VERSION_DESCRIPTOR_SCHEMA_KEY: &str = "lix_version_descriptor";
-const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
 const STATE_SURFACE_SCHEMA_KEY: &str = "lix_state";
 
 /// Immutable view of the final transaction write set before persistence.

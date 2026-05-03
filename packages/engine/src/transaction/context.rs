@@ -22,7 +22,7 @@ use crate::transaction::normalization::TransactionSchemaCatalog;
 use crate::transaction::staging::TransactionStagedWrites;
 use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWriteOutcome};
 use crate::transaction::validation::{validate_staged_writes, TransactionValidationInput};
-use crate::version_ref::{VersionRefContext, VersionRefReader, VersionRefStoreReader};
+use crate::version::{VersionContext, VersionRefReader};
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixBackendTransaction, LixError, NullableKeyFilter};
 
@@ -47,7 +47,7 @@ pub(crate) struct Transaction<'tx> {
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
     changelog: Arc<ChangelogContext>,
-    version_ref: Arc<VersionRefContext>,
+    version_ctx: Arc<VersionContext>,
     staged_writes: Arc<TransactionStagedWrites>,
     backend_transaction: Box<dyn LixBackendTransaction + Send + Sync + 'static>,
     visible_schemas: Vec<JsonValue>,
@@ -64,7 +64,7 @@ impl<'tx> Transaction<'tx> {
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
-        version_ref: Arc<VersionRefContext>,
+        version_ctx: Arc<VersionContext>,
         schema_registry: Arc<SchemaRegistry>,
         functions: FunctionProviderHandle,
     ) -> Result<Self, LixError> {
@@ -74,7 +74,7 @@ impl<'tx> Transaction<'tx> {
         let active_version_id = resolve_active_version_id(
             mode,
             live_state.as_ref(),
-            version_ref.as_ref(),
+            version_ctx.as_ref(),
             backend_transaction.as_mut(),
         )
         .await?;
@@ -96,7 +96,7 @@ impl<'tx> Transaction<'tx> {
             tracked_state,
             binary_cas,
             changelog,
-            version_ref,
+            version_ctx,
             staged_writes,
             backend_transaction,
             visible_schemas,
@@ -135,7 +135,7 @@ impl<'tx> Transaction<'tx> {
             &self.binary_cas,
             &self.changelog,
             &self.live_state,
-            &self.version_ref,
+            self.version_ctx.as_ref(),
             self.backend_transaction.as_mut(),
             staged_writes,
         )
@@ -220,9 +220,13 @@ impl<'tx> Transaction<'tx> {
         commit_id: &str,
     ) -> Result<(), LixError> {
         let timestamp = self.functions.call_timestamp();
-        self.version_ref
-            .writer(self.backend_transaction.as_mut())
-            .advance_head(version_id, commit_id, &timestamp)
+        self.version_ctx
+            .advance_ref(
+                self.backend_transaction.as_mut(),
+                version_id,
+                commit_id,
+                &timestamp,
+            )
             .await
     }
 
@@ -233,10 +237,9 @@ impl<'tx> Transaction<'tx> {
     }
 
     /// Creates a version-ref reader scoped to this write transaction.
-    pub(crate) fn version_ref_reader(
-        &mut self,
-    ) -> VersionRefStoreReader<&mut dyn LixBackendTransaction> {
-        self.version_ref.reader(self.backend_transaction.as_mut())
+    pub(crate) fn version_ref_reader(&mut self) -> impl VersionRefReader + '_ {
+        self.version_ctx
+            .ref_reader(self.backend_transaction.as_mut())
     }
 
     /// Creates a tracked-state reader scoped to this write transaction.
@@ -262,7 +265,7 @@ pub(crate) async fn open_transaction<'tx>(
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
     changelog: Arc<ChangelogContext>,
-    version_ref: Arc<VersionRefContext>,
+    version_ctx: Arc<VersionContext>,
     schema_registry: Arc<SchemaRegistry>,
     functions: FunctionProviderHandle,
 ) -> Result<Transaction<'tx>, LixError> {
@@ -273,7 +276,7 @@ pub(crate) async fn open_transaction<'tx>(
         tracked_state,
         binary_cas,
         changelog,
-        version_ref,
+        version_ctx,
         schema_registry,
         functions,
     )
@@ -305,7 +308,7 @@ impl SqlExecutionContext for Transaction<'_> {
     }
 
     fn version_ref(&self) -> Arc<dyn VersionRefReader> {
-        Arc::new(self.version_ref.reader(Arc::clone(self.backend)))
+        Arc::new(self.version_ctx.ref_reader(Arc::clone(self.backend)))
     }
 
     /// Returns the same function provider used by the owning session.
@@ -353,8 +356,8 @@ impl SqlWriteExecutionContext for Transaction<'_> {
     }
 
     async fn load_version_head(&mut self, version_id: &str) -> Result<Option<String>, LixError> {
-        self.version_ref
-            .reader(self.backend_transaction.as_mut())
+        self.version_ctx
+            .ref_reader(self.backend_transaction.as_mut())
             .load_head_commit_id(version_id)
             .await
     }
@@ -367,20 +370,20 @@ impl SqlWriteExecutionContext for Transaction<'_> {
 async fn resolve_active_version_id(
     mode: &SessionMode,
     live_state: &LiveStateContext,
-    version_ref: &VersionRefContext,
+    version_ctx: &VersionContext,
     transaction: &mut dyn LixBackendTransaction,
 ) -> Result<String, LixError> {
     match mode {
         SessionMode::Pinned { version_id } => Ok(version_id.clone()),
         SessionMode::Workspace => {
-            load_workspace_version_id(live_state, version_ref, transaction).await
+            load_workspace_version_id(live_state, version_ctx, transaction).await
         }
     }
 }
 
 async fn load_workspace_version_id(
     live_state: &LiveStateContext,
-    version_ref: &VersionRefContext,
+    version_ctx: &VersionContext,
     transaction: &mut dyn LixBackendTransaction,
 ) -> Result<String, LixError> {
     let row = live_state
@@ -422,8 +425,8 @@ async fn load_workspace_version_id(
         })?
         .to_string();
 
-    let head = version_ref
-        .reader(transaction)
+    let head = version_ctx
+        .ref_reader(transaction)
         .load_head_commit_id(&version_id)
         .await?;
     if head.is_none() {
@@ -457,7 +460,7 @@ mod tests {
     use crate::changelog::ChangelogScanRequest;
     use crate::tracked_state::{TrackedStateRowRequest, TrackedStateScanRequest};
     use crate::untracked_state::{UntrackedStateContext, UntrackedStateRowRequest};
-    use crate::version_ref::VersionRefContext;
+    use crate::version::VersionContext;
     use crate::NullableKeyFilter;
     use crate::GLOBAL_VERSION_ID;
 
@@ -475,9 +478,7 @@ mod tests {
         let live_state = Arc::new(live_state_context());
         let binary_cas = Arc::new(BinaryCasContext::new());
         let changelog = Arc::new(ChangelogContext::new());
-        let version_ref = Arc::new(VersionRefContext::new(Arc::new(
-            UntrackedStateContext::new(),
-        )));
+        let version_ctx = Arc::new(VersionContext::new(Arc::new(UntrackedStateContext::new())));
         let schema_registry = Arc::new(SchemaRegistry::new());
         let runtime_live_state = live_state.reader(Arc::clone(&backend));
         let runtime_functions = FunctionContext::prepare(&runtime_live_state).await;
@@ -492,7 +493,7 @@ mod tests {
             Arc::new(crate::tracked_state::TrackedStateContext::new()),
             Arc::clone(&binary_cas),
             Arc::clone(&changelog),
-            Arc::clone(&version_ref),
+            Arc::clone(&version_ctx),
             Arc::clone(&schema_registry),
             runtime_functions.provider(),
         )
@@ -529,8 +530,8 @@ mod tests {
             "untracked staged row must not be appended to changelog"
         );
 
-        let head_commit_id = version_ref
-            .reader(Arc::clone(&backend))
+        let head_commit_id = version_ctx
+            .ref_reader(Arc::clone(&backend))
             .load_head_commit_id(GLOBAL_VERSION_ID)
             .await
             .expect("version ref should load")
@@ -607,9 +608,7 @@ mod tests {
         let live_state = Arc::new(live_state_context());
         let binary_cas = Arc::new(BinaryCasContext::new());
         let changelog = Arc::new(ChangelogContext::new());
-        let version_ref = Arc::new(VersionRefContext::new(Arc::new(
-            UntrackedStateContext::new(),
-        )));
+        let version_ctx = Arc::new(VersionContext::new(Arc::new(UntrackedStateContext::new())));
         let schema_registry = Arc::new(SchemaRegistry::new());
         let runtime_live_state = live_state.reader(Arc::clone(&backend));
         let runtime_functions = FunctionContext::prepare(&runtime_live_state)
@@ -625,7 +624,7 @@ mod tests {
             Arc::new(crate::tracked_state::TrackedStateContext::new()),
             Arc::clone(&binary_cas),
             Arc::clone(&changelog),
-            Arc::clone(&version_ref),
+            Arc::clone(&version_ctx),
             Arc::clone(&schema_registry),
             runtime_functions.provider(),
         )
@@ -658,8 +657,8 @@ mod tests {
             changes.is_empty(),
             "validation failure must happen before changelog persistence"
         );
-        let head = version_ref
-            .reader(Arc::clone(&backend))
+        let head = version_ctx
+            .ref_reader(Arc::clone(&backend))
             .load_head_commit_id(GLOBAL_VERSION_ID)
             .await
             .expect("version ref should load after failed commit");
@@ -824,16 +823,14 @@ mod tests {
         Arc<LiveStateContext>,
         Arc<BinaryCasContext>,
         Arc<ChangelogContext>,
-        Arc<VersionRefContext>,
+        Arc<VersionContext>,
         FunctionContext,
         Transaction<'a>,
     ) {
         let live_state = Arc::new(live_state_context());
         let binary_cas = Arc::new(BinaryCasContext::new());
         let changelog = Arc::new(ChangelogContext::new());
-        let version_ref = Arc::new(VersionRefContext::new(Arc::new(
-            UntrackedStateContext::new(),
-        )));
+        let version_ctx = Arc::new(VersionContext::new(Arc::new(UntrackedStateContext::new())));
         let schema_registry = Arc::new(SchemaRegistry::new());
         let runtime_live_state = live_state.reader(Arc::clone(backend));
         let runtime_functions = FunctionContext::prepare(&runtime_live_state)
@@ -849,7 +846,7 @@ mod tests {
             Arc::new(crate::tracked_state::TrackedStateContext::new()),
             Arc::clone(&binary_cas),
             Arc::clone(&changelog),
-            Arc::clone(&version_ref),
+            Arc::clone(&version_ctx),
             schema_registry,
             runtime_functions.provider(),
         )
@@ -860,7 +857,7 @@ mod tests {
             live_state,
             binary_cas,
             changelog,
-            version_ref,
+            version_ctx,
             runtime_functions,
             transaction,
         )
@@ -870,7 +867,7 @@ mod tests {
         backend: &Arc<dyn LixBackend + Send + Sync>,
         live_state: &LiveStateContext,
         changelog: &ChangelogContext,
-        version_ref: &VersionRefContext,
+        version_ctx: &VersionContext,
     ) {
         let changes = changelog
             .reader(Arc::clone(backend))
@@ -881,8 +878,8 @@ mod tests {
             changes.is_empty(),
             "validation failure must happen before changelog persistence"
         );
-        let head = version_ref
-            .reader(Arc::clone(backend))
+        let head = version_ctx
+            .ref_reader(Arc::clone(backend))
             .load_head_commit_id(GLOBAL_VERSION_ID)
             .await
             .expect("version ref should load after failed commit");

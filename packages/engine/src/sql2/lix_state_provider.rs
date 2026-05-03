@@ -33,7 +33,7 @@ use crate::live_state::{
 use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
 use crate::sql2::write_normalization::UpdateAssignmentValues;
 use crate::transaction::types::StageRow;
-use crate::version_ref::VersionRefReader;
+use crate::version::VersionRefReader;
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
@@ -1499,7 +1499,7 @@ mod tests {
     };
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
     use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWriteOutcome};
-    use crate::version_ref::{VersionHead, VersionRefReader};
+    use crate::version::{VersionHead, VersionRefReader};
     use crate::{
         entity_identity::EntityIdentity,
         live_state::{LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest},
