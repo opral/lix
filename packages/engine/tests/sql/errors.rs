@@ -127,3 +127,52 @@ simulation_test!(sql_udf_argument_mismatch_has_type_code, |sim| async move {
 
     assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
 });
+
+simulation_test!(sql_create_table_returns_error, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
+
+    let error = session
+        .execute("CREATE TABLE scratch (id TEXT)", &[])
+        .await
+        .expect_err("CREATE TABLE should return an error, not panic");
+
+    assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+});
+
+simulation_test!(
+    sql_recursive_cte_over_commit_views_returns_error,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "WITH RECURSIVE commit_walk(id) AS ( \
+                 SELECT id FROM lix_commit \
+                 UNION ALL \
+                 SELECT lix_commit_edge.child_id \
+                 FROM lix_commit_edge \
+                 JOIN commit_walk ON lix_commit_edge.parent_id = commit_walk.id \
+                 ) \
+                 SELECT id FROM commit_walk",
+                &[],
+            )
+            .await
+            .expect_err("recursive CTE should return an error, not panic");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL, "{error:?}");
+    }
+);

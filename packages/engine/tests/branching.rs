@@ -1281,6 +1281,47 @@ simulation_test!(
     }
 );
 
+simulation_test!(merge_version_rejects_self_merge, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let main = sim.wrap_session(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
+
+    let error = main
+        .merge_version(MergeVersionOptions {
+            source_version_id: sim.main_version_id().to_string(),
+        })
+        .await
+        .expect_err("self-merge should fail");
+
+    assert_eq!(error.code, LixError::CODE_INVALID_MERGE);
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("operation")),
+        Some(&JsonValue::String("merge_version".to_string()))
+    );
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("target_version_id")),
+        Some(&JsonValue::String(sim.main_version_id().to_string()))
+    );
+    assert_eq!(
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("source_version_id")),
+        Some(&JsonValue::String(sim.main_version_id().to_string()))
+    );
+});
+
 async fn delete_key_value(
     session: &crate::support::simulation_test::engine::SimSession,
     key: &str,
