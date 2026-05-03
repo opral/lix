@@ -82,9 +82,11 @@ mod tests {
     use std::sync::Arc;
 
     use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
-    use crate::changelog::CanonicalChange;
-    use crate::changelog::ChangelogContext;
+    use crate::changelog::{
+        canonicalize_materialized_change, ChangelogContext, MaterializedCanonicalChange,
+    };
     use crate::commit_graph::CommitGraphContext;
+    use crate::json_store::JsonStoreContext;
     use crate::tracked_state::{TrackedStateFilter, TrackedStateScanRequest};
     use serde_json::json;
 
@@ -483,7 +485,7 @@ mod tests {
 
     fn entity(change_id: &str, snapshot_content: Option<&str>) -> CommitGraphEntity {
         CommitGraphEntity {
-            change: CanonicalChange {
+            change: MaterializedCanonicalChange {
                 id: change_id.to_string(),
                 entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
                 schema_key: "test_schema".to_string(),
@@ -515,15 +517,28 @@ mod tests {
         }
     }
 
-    async fn append_changes(backend: Arc<UnitTestBackend>, changes: &[CanonicalChange]) {
+    async fn append_changes(
+        backend: Arc<UnitTestBackend>,
+        changes: &[MaterializedCanonicalChange],
+    ) {
         let changelog = ChangelogContext::new();
         let mut tx = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await
             .expect("transaction should open");
+        let mut json_writer = JsonStoreContext::new().writer();
+        let canonical_changes = changes
+            .iter()
+            .map(|change| canonicalize_materialized_change(&mut json_writer, change))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("changes should canonicalize");
+        json_writer
+            .flush(&mut tx.as_mut())
+            .await
+            .expect("json should flush");
         changelog
             .writer(tx.as_mut())
-            .append_changes(changes)
+            .append_changes(&canonical_changes)
             .await
             .expect("changes should append");
         tx.commit().await.expect("transaction should commit");
@@ -626,7 +641,7 @@ mod tests {
         entity_id: &str,
         schema_key: &str,
         snapshot_content: Option<&str>,
-    ) -> CanonicalChange {
+    ) -> MaterializedCanonicalChange {
         entity_change_at(
             change_id,
             entity_id,
@@ -642,8 +657,8 @@ mod tests {
         schema_key: &str,
         snapshot_content: Option<&str>,
         created_at: &str,
-    ) -> CanonicalChange {
-        CanonicalChange {
+    ) -> MaterializedCanonicalChange {
+        MaterializedCanonicalChange {
             id: change_id.to_string(),
             entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
             schema_key: schema_key.to_string(),
@@ -660,8 +675,8 @@ mod tests {
         commit_id: &str,
         change_ids: &[&str],
         parent_commit_ids: &[&str],
-    ) -> CanonicalChange {
-        CanonicalChange {
+    ) -> MaterializedCanonicalChange {
+        MaterializedCanonicalChange {
             id: change_id.to_string(),
             entity_id: crate::entity_identity::EntityIdentity::single(commit_id),
             schema_key: "lix_commit".to_string(),

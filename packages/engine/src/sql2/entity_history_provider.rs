@@ -20,7 +20,7 @@ use futures_util::stream;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
-use crate::changelog::CanonicalChange;
+use crate::changelog::MaterializedCanonicalChange;
 use crate::commit_graph::CommitGraphReader;
 use crate::LixError;
 
@@ -33,6 +33,7 @@ use super::history_route::{
     load_history_entries, parse_history_filter, HistoryColumnStyle, HistoryRoute,
     HistoryViewDescriptor, HISTORY_COL_START_COMMIT_ID,
 };
+use super::SqlChangelogQuerySource;
 
 /// Schema-specific history surface backed directly by the commit graph.
 ///
@@ -43,6 +44,7 @@ pub(crate) struct EntityHistoryProvider {
     spec: Arc<EntitySurfaceSpec>,
     schema: SchemaRef,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    query_source: SqlChangelogQuerySource,
 }
 
 impl std::fmt::Debug for EntityHistoryProvider {
@@ -57,11 +59,13 @@ impl EntityHistoryProvider {
     pub(crate) fn new(
         spec: Arc<EntitySurfaceSpec>,
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+        query_source: SqlChangelogQuerySource,
     ) -> Self {
         Self {
             schema: entity_surface_schema(&spec, EntityProviderVariant::History),
             spec,
             commit_graph,
+            query_source,
         }
     }
 }
@@ -108,6 +112,7 @@ impl TableProvider for EntityHistoryProvider {
         Ok(Arc::new(EntityHistoryScanExec::new(
             Arc::clone(&self.spec),
             Arc::clone(&self.commit_graph),
+            self.query_source.clone(),
             schema,
             route,
             limit,
@@ -118,6 +123,7 @@ impl TableProvider for EntityHistoryProvider {
 struct EntityHistoryScanExec {
     spec: Arc<EntitySurfaceSpec>,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    query_source: SqlChangelogQuerySource,
     schema: SchemaRef,
     route: HistoryRoute,
     limit: Option<usize>,
@@ -138,6 +144,7 @@ impl EntityHistoryScanExec {
     fn new(
         spec: Arc<EntitySurfaceSpec>,
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+        query_source: SqlChangelogQuerySource,
         schema: SchemaRef,
         route: HistoryRoute,
         limit: Option<usize>,
@@ -151,6 +158,7 @@ impl EntityHistoryScanExec {
         Self {
             spec,
             commit_graph,
+            query_source,
             schema,
             route,
             limit,
@@ -214,12 +222,13 @@ impl ExecutionPlan for EntityHistoryScanExec {
 
         let spec = Arc::clone(&self.spec);
         let commit_graph = Arc::clone(&self.commit_graph);
+        let query_source = self.query_source.clone();
         let schema = Arc::clone(&self.schema);
         let route = self.route.clone();
         let limit = self.limit;
         let stream_schema = Arc::clone(&schema);
         let fut = async move {
-            let rows = load_entity_history_rows(&spec, commit_graph, &route, limit)
+            let rows = load_entity_history_rows(&spec, commit_graph, query_source, &route, limit)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             entity_history_record_batch(&stream_schema, &spec, &rows)
@@ -234,7 +243,7 @@ impl ExecutionPlan for EntityHistoryScanExec {
 
 #[derive(Debug, Clone)]
 struct EntityHistoryRow {
-    change: CanonicalChange,
+    change: MaterializedCanonicalChange,
     observed_commit_id: String,
     commit_created_at: String,
     start_commit_id: String,
@@ -244,6 +253,7 @@ struct EntityHistoryRow {
 async fn load_entity_history_rows(
     spec: &EntitySurfaceSpec,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    query_source: SqlChangelogQuerySource,
     route: &HistoryRoute,
     limit: Option<usize>,
 ) -> Result<Vec<EntityHistoryRow>, LixError> {
@@ -254,6 +264,7 @@ async fn load_entity_history_rows(
             start_commit_column: HISTORY_COL_START_COMMIT_ID,
         },
         commit_graph,
+        query_source.json_reader,
         route,
         vec![spec.schema_key.clone()],
     )

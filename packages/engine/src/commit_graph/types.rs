@@ -1,5 +1,8 @@
 use crate::LixError;
-use crate::{changelog::CanonicalChange, entity_identity::EntityIdentity};
+use crate::{
+    changelog::{CanonicalChange, MaterializedCanonicalChange},
+    entity_identity::EntityIdentity,
+};
 
 /// Parsed `lix_commit` entity from the changelog.
 ///
@@ -10,7 +13,7 @@ use crate::{changelog::CanonicalChange, entity_identity::EntityIdentity};
 /// newly minted copies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphCommit {
-    pub(crate) change: CanonicalChange,
+    pub(crate) change: MaterializedCanonicalChange,
     pub(crate) commit_id: String,
     pub(crate) change_set_id: String,
     pub(crate) change_ids: Vec<String>,
@@ -43,7 +46,7 @@ pub(crate) struct CommitGraphChangeSet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphChangeSetElement {
     pub(crate) change_set_id: String,
-    pub(crate) change: CanonicalChange,
+    pub(crate) change: MaterializedCanonicalChange,
 }
 
 /// Filter for canonical change history from a chosen traversal start commit.
@@ -134,7 +137,7 @@ pub(crate) trait CommitGraphReader: Send + Sync {
 /// traversal rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphEntity {
-    pub(crate) change: CanonicalChange,
+    pub(crate) change: MaterializedCanonicalChange,
     pub(crate) source_commit_id: String,
     pub(crate) depth: u32,
     pub(crate) created_at: String,

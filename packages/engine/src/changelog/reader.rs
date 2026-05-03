@@ -12,6 +12,7 @@ pub(crate) trait ChangelogReader: Send + Sync {
     #[allow(dead_code)]
     async fn load_change(&self, change_id: &str) -> Result<Option<CanonicalChange>, LixError>;
 
+    #[allow(dead_code)]
     async fn scan_changes(
         &self,
         request: &ChangelogScanRequest,

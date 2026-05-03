@@ -207,6 +207,87 @@ pub(crate) fn bench(c: &mut Criterion, runtime: &Runtime, args: Args) {
             BatchSize::LargeInput,
         )
     });
+    for (label, bytes, rows) in [("1k", 1024, 10_000), ("16k", 16 * 1024, 1_000)] {
+        let name = format!("append_changes_shared_payload_{label}/{rows}");
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || {
+                    let backend = BenchBackend::new();
+                    let fixture = runtime
+                        .block_on(storage_bench::prepare_changelog_append_shared_payload(
+                            config(&args)
+                                .with_state_payload_bytes(bytes)
+                                .with_rows(rows),
+                        ))
+                        .expect("prepare changelog/append shared payload");
+                    (backend, fixture)
+                },
+                |(backend, fixture)| {
+                    black_box(
+                        runtime
+                            .block_on(storage_bench::changelog_append_changes_prepared(
+                                &backend, &fixture,
+                            ))
+                            .expect("changelog/append shared payload succeeds"),
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        });
+    }
+    for (label, bytes, rows) in [("1k", 1024, 10_000), ("16k", 16 * 1024, 1_000)] {
+        let name = format!("append_changes_shared_metadata_{label}/{rows}");
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || {
+                    let backend = BenchBackend::new();
+                    let fixture = runtime
+                        .block_on(storage_bench::prepare_changelog_append_shared_metadata(
+                            config(&args)
+                                .with_state_payload_bytes(bytes)
+                                .with_rows(rows),
+                        ))
+                        .expect("prepare changelog/append shared metadata");
+                    (backend, fixture)
+                },
+                |(backend, fixture)| {
+                    black_box(
+                        runtime
+                            .block_on(storage_bench::changelog_append_changes_prepared(
+                                &backend, &fixture,
+                            ))
+                            .expect("changelog/append shared metadata succeeds"),
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        });
+    }
+    group.bench_function("append_changes_shared_payload_and_metadata_1k/10k", |b| {
+        b.iter_batched(
+            || {
+                let backend = BenchBackend::new();
+                let fixture = runtime
+                    .block_on(
+                        storage_bench::prepare_changelog_append_shared_payload_and_metadata(
+                            config(&args).with_state_payload_bytes(1024),
+                        ),
+                    )
+                    .expect("prepare changelog/append shared payload and metadata");
+                (backend, fixture)
+            },
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::changelog_append_changes_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("changelog/append shared payload and metadata succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
     group.bench_function("append_changes_tombstone/10k", |b| {
         b.iter_batched(
             || {

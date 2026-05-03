@@ -28,14 +28,17 @@ use super::history_route::{
     HistoryViewDescriptor,
 };
 use super::result_metadata::json_field;
+use super::SqlChangelogQuerySource;
 
 pub(crate) async fn register_history_providers(
     session: &SessionContext,
     commit_graph: Box<dyn CommitGraphReader>,
+    query_source: SqlChangelogQuerySource,
 ) -> Result<Arc<dyn TableProvider>, LixError> {
-    let provider: Arc<dyn TableProvider> = Arc::new(LixStateHistoryProvider::new(Arc::new(
-        Mutex::new(commit_graph),
-    )));
+    let provider: Arc<dyn TableProvider> = Arc::new(LixStateHistoryProvider::new(
+        Arc::new(Mutex::new(commit_graph)),
+        query_source,
+    ));
     session
         .register_table("lix_state_history", Arc::clone(&provider))
         .map_err(datafusion_error_to_lix_error)?;
@@ -45,6 +48,7 @@ pub(crate) async fn register_history_providers(
 pub(crate) struct LixStateHistoryProvider {
     schema: SchemaRef,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    query_source: SqlChangelogQuerySource,
 }
 
 impl std::fmt::Debug for LixStateHistoryProvider {
@@ -54,10 +58,14 @@ impl std::fmt::Debug for LixStateHistoryProvider {
 }
 
 impl LixStateHistoryProvider {
-    pub(crate) fn new(commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>) -> Self {
+    pub(crate) fn new(
+        commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+        query_source: SqlChangelogQuerySource,
+    ) -> Self {
         Self {
             schema: lix_state_history_schema(),
             commit_graph,
+            query_source,
         }
     }
 }
@@ -102,6 +110,7 @@ impl TableProvider for LixStateHistoryProvider {
         let projected_schema = projected_schema(&self.schema, projection)?;
         Ok(Arc::new(LixStateHistoryScanExec::new(
             Arc::clone(&self.commit_graph),
+            self.query_source.clone(),
             projected_schema,
             projection.cloned(),
             HistoryRoute::from_filters(filters, HistoryColumnStyle::Bare),
@@ -112,6 +121,7 @@ impl TableProvider for LixStateHistoryProvider {
 
 struct LixStateHistoryScanExec {
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    query_source: SqlChangelogQuerySource,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
     route: HistoryRoute,
@@ -131,6 +141,7 @@ impl std::fmt::Debug for LixStateHistoryScanExec {
 impl LixStateHistoryScanExec {
     fn new(
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+        query_source: SqlChangelogQuerySource,
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
         route: HistoryRoute,
@@ -144,6 +155,7 @@ impl LixStateHistoryScanExec {
         );
         Self {
             commit_graph,
+            query_source,
             schema,
             projection,
             route,
@@ -209,6 +221,7 @@ impl ExecutionPlan for LixStateHistoryScanExec {
         }
 
         let commit_graph = Arc::clone(&self.commit_graph);
+        let query_source = self.query_source.clone();
         let route = self.route.clone();
         let schema = Arc::clone(&self.schema);
         let stream_schema = Arc::clone(&schema);
@@ -222,7 +235,7 @@ impl ExecutionPlan for LixStateHistoryScanExec {
             let rows = if route.is_contradictory() {
                 Vec::new()
             } else {
-                load_state_history_rows(commit_graph, &route)
+                load_state_history_rows(commit_graph, query_source, &route)
                     .await
                     .map_err(lix_error_to_datafusion_error)?
             };
@@ -348,6 +361,7 @@ fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
 
 async fn load_state_history_rows(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
+    query_source: SqlChangelogQuerySource,
     route: &HistoryRoute,
 ) -> Result<Vec<StateHistorySqlRow>, LixError> {
     let entries = load_history_entries(
@@ -356,6 +370,7 @@ async fn load_state_history_rows(
             start_commit_column: "start_commit_id",
         },
         commit_graph,
+        query_source.json_reader,
         route,
         Vec::new(),
     )

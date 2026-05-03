@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::backend::KvStore;
-use crate::changelog::{CanonicalChange, ChangelogContext, ChangelogStoreReader};
+use crate::backend::{KvStore, ReadScope, ScopedKvStore};
+use crate::changelog::{
+    materialize_change, CanonicalChange, ChangelogContext, ChangelogStoreReader,
+    MaterializedCanonicalChange,
+};
 use crate::commit_graph::walker::{best_common_ancestors, walk_reachable_commits};
 use crate::commit_graph::{
     CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphChangeSet,
@@ -9,6 +12,7 @@ use crate::commit_graph::{
     CommitGraphReader, ReachableCommitGraphCommit,
 };
 use crate::entity_identity::EntityIdentity;
+use crate::json_store::{JsonStoreContext, JsonStoreReader};
 use crate::LixError;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
@@ -32,8 +36,10 @@ impl CommitGraphContext {
     where
         S: KvStore,
     {
+        let read_scope = ReadScope::new(store);
         CommitGraphStoreReader {
-            changelog: self.changelog.reader(store),
+            changelog_reader: self.changelog.reader(read_scope.store()),
+            json_reader: JsonStoreContext::new().reader(read_scope.store()),
         }
     }
 }
@@ -43,7 +49,8 @@ pub(crate) struct CommitGraphStoreReader<S>
 where
     S: KvStore,
 {
-    changelog: ChangelogStoreReader<S>,
+    changelog_reader: ChangelogStoreReader<ScopedKvStore<S>>,
+    json_reader: JsonStoreReader<ScopedKvStore<S>>,
 }
 
 impl<S> CommitGraphStoreReader<S>
@@ -68,7 +75,7 @@ where
         &mut self,
         commit_id: &str,
     ) -> Result<Option<CommitGraphCommit>, LixError> {
-        let Some(change) = find_commit_change(&self.changelog, commit_id).await? else {
+        let Some(change) = self.find_commit_change(commit_id).await? else {
             return Ok(None);
         };
         parse_commit_change(change).map(Some)
@@ -80,14 +87,16 @@ where
     /// graph facts themselves, not reachability from a particular version head.
     pub(crate) async fn all_commits(&mut self) -> Result<Vec<CommitGraphCommit>, LixError> {
         let changes = self
-            .changelog
+            .changelog_reader
             .scan_changes(&crate::changelog::ChangelogScanRequest { limit: None })
             .await?;
-        let mut commits = changes
+        let mut commits = Vec::new();
+        for change in changes
             .into_iter()
             .filter(|change| change.schema_key == COMMIT_SCHEMA_KEY)
-            .map(parse_commit_change)
-            .collect::<Result<Vec<_>, _>>()?;
+        {
+            commits.push(parse_commit_change(self.materialize_change(change).await?)?);
+        }
         commits.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));
         Ok(commits)
     }
@@ -216,7 +225,9 @@ where
                 if !seen_change_ids.insert(change_id.clone()) {
                     continue;
                 }
-                let change = self.load_member_change(&change_id, &commit_id).await?;
+                let change = self
+                    .load_member_canonical_change(&change_id, &commit_id)
+                    .await?;
                 if change_matches_history_request(&change, request) {
                     entries.push(CommitGraphChangeHistoryEntry {
                         change,
@@ -229,6 +240,24 @@ where
         }
 
         Ok(entries)
+    }
+
+    async fn load_member_canonical_change(
+        &mut self,
+        change_id: &str,
+        source_commit_id: &str,
+    ) -> Result<CanonicalChange, LixError> {
+        self.changelog_reader
+            .load_change(change_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "commit_graph commit '{source_commit_id}' references missing change '{change_id}'"
+                    ),
+                )
+            })
     }
 
     /// Selects the first reachable change for each canonical entity identity.
@@ -279,8 +308,9 @@ where
         &mut self,
         change_id: &str,
         source_commit_id: &str,
-    ) -> Result<CanonicalChange, LixError> {
-        self.changelog
+    ) -> Result<MaterializedCanonicalChange, LixError> {
+        let change = self
+            .changelog_reader
             .load_change(change_id)
             .await?
             .ok_or_else(|| {
@@ -290,7 +320,35 @@ where
                         "commit_graph commit '{source_commit_id}' references missing change '{change_id}'"
                     ),
                 )
-            })
+            })?;
+        self.materialize_change(change).await
+    }
+
+    async fn materialize_change(
+        &mut self,
+        change: CanonicalChange,
+    ) -> Result<MaterializedCanonicalChange, LixError> {
+        materialize_change(&mut self.json_reader, change).await
+    }
+
+    async fn find_commit_change(
+        &mut self,
+        commit_id: &str,
+    ) -> Result<Option<MaterializedCanonicalChange>, LixError> {
+        let changes = self
+            .changelog_reader
+            .scan_changes(&crate::changelog::ChangelogScanRequest { limit: None })
+            .await?;
+        let Some(change) = changes.into_iter().find(|change| {
+            change.schema_key == COMMIT_SCHEMA_KEY
+                && change
+                    .entity_id
+                    .as_string()
+                    .is_ok_and(|entity_id| entity_id == commit_id)
+        }) else {
+            return Ok(None);
+        };
+        self.materialize_change(change).await.map(Some)
     }
 }
 
@@ -366,7 +424,7 @@ fn change_matches_history_request(
     change: &CanonicalChange,
     request: &CommitGraphChangeHistoryRequest,
 ) -> bool {
-    (request.include_tombstones || change.snapshot_content.is_some())
+    (request.include_tombstones || change.snapshot_ref.is_some())
         && (request.entity_ids.is_empty() || request.entity_ids.contains(&change.entity_id))
         && (request.schema_keys.is_empty() || request.schema_keys.contains(&change.schema_key))
         && (request.file_ids.is_empty()
@@ -379,7 +437,7 @@ fn change_matches_history_request(
 fn observe_change(
     order: &mut Vec<CanonicalEntityIdentity>,
     entities: &mut BTreeMap<CanonicalEntityIdentity, EntityAccumulator>,
-    change: CanonicalChange,
+    change: MaterializedCanonicalChange,
     source_commit_id: String,
     depth: u32,
 ) {
@@ -420,7 +478,7 @@ struct CanonicalEntityIdentity {
 }
 
 impl CanonicalEntityIdentity {
-    fn from_change(change: &CanonicalChange) -> Self {
+    fn from_change(change: &MaterializedCanonicalChange) -> Self {
         Self {
             entity_id: change.entity_id.clone(),
             schema_key: change.schema_key.clone(),
@@ -429,27 +487,8 @@ impl CanonicalEntityIdentity {
     }
 }
 
-async fn find_commit_change<S>(
-    changelog: &ChangelogStoreReader<S>,
-    commit_id: &str,
-) -> Result<Option<crate::changelog::CanonicalChange>, LixError>
-where
-    S: KvStore,
-{
-    let changes = changelog
-        .scan_changes(&crate::changelog::ChangelogScanRequest { limit: None })
-        .await?;
-    Ok(changes.into_iter().find(|change| {
-        change.schema_key == COMMIT_SCHEMA_KEY
-            && change
-                .entity_id
-                .as_string()
-                .is_ok_and(|entity_id| entity_id == commit_id)
-    }))
-}
-
 fn parse_commit_change(
-    change: crate::changelog::CanonicalChange,
+    change: crate::changelog::MaterializedCanonicalChange,
 ) -> Result<CommitGraphCommit, LixError> {
     let change_entity_id = change.entity_id.as_string()?;
     if change.schema_key != COMMIT_SCHEMA_KEY {
@@ -576,8 +615,11 @@ mod tests {
     use serde_json::json;
 
     use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
-    use crate::changelog::{CanonicalChange, ChangelogContext};
+    use crate::changelog::{
+        canonicalize_materialized_change, ChangelogContext, MaterializedCanonicalChange,
+    };
     use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphContext};
+    use crate::json_store::JsonStoreContext;
 
     #[tokio::test]
     async fn load_commit_parses_commit_snapshot() {
@@ -631,7 +673,7 @@ mod tests {
         append_changes(
             Arc::clone(&backend),
             &changelog,
-            &[CanonicalChange {
+            &[MaterializedCanonicalChange {
                 id: "commit-1-change".to_string(),
                 entity_id: crate::entity_identity::EntityIdentity::single("commit-1"),
                 schema_key: super::COMMIT_SCHEMA_KEY.to_string(),
@@ -1369,15 +1411,25 @@ mod tests {
     async fn append_changes(
         backend: Arc<UnitTestBackend>,
         changelog: &ChangelogContext,
-        changes: &[CanonicalChange],
+        changes: &[MaterializedCanonicalChange],
     ) {
         let mut tx = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await
             .expect("transaction should open");
+        let mut json_writer = JsonStoreContext::new().writer();
+        let canonical_changes = changes
+            .iter()
+            .map(|change| canonicalize_materialized_change(&mut json_writer, change))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("changes should canonicalize");
+        json_writer
+            .flush(&mut tx.as_mut())
+            .await
+            .expect("json should flush");
         changelog
             .writer(tx.as_mut())
-            .append_changes(changes)
+            .append_changes(&canonical_changes)
             .await
             .expect("append should succeed");
         tx.commit().await.expect("commit should succeed");
@@ -1388,8 +1440,8 @@ mod tests {
         commit_id: &str,
         change_ids: &[&str],
         parent_commit_ids: &[&str],
-    ) -> CanonicalChange {
-        CanonicalChange {
+    ) -> MaterializedCanonicalChange {
+        MaterializedCanonicalChange {
             id: change_id.to_string(),
             entity_id: crate::entity_identity::EntityIdentity::single(commit_id),
             schema_key: super::COMMIT_SCHEMA_KEY.to_string(),
@@ -1428,7 +1480,7 @@ mod tests {
         entity_id: &str,
         schema_key: &str,
         snapshot_content: &str,
-    ) -> CanonicalChange {
+    ) -> MaterializedCanonicalChange {
         entity_change_at(
             change_id,
             entity_id,
@@ -1444,8 +1496,8 @@ mod tests {
         schema_key: &str,
         snapshot_content: &str,
         created_at: &str,
-    ) -> CanonicalChange {
-        CanonicalChange {
+    ) -> MaterializedCanonicalChange {
+        MaterializedCanonicalChange {
             id: change_id.to_string(),
             entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
             schema_key: schema_key.to_string(),
@@ -1463,8 +1515,8 @@ mod tests {
         schema_key: &str,
         file_id: Option<&str>,
         snapshot_content: &str,
-    ) -> CanonicalChange {
-        CanonicalChange {
+    ) -> MaterializedCanonicalChange {
+        MaterializedCanonicalChange {
             id: change_id.to_string(),
             entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
             schema_key: schema_key.to_string(),
@@ -1476,8 +1528,12 @@ mod tests {
         }
     }
 
-    fn entity_tombstone(change_id: &str, entity_id: &str, schema_key: &str) -> CanonicalChange {
-        CanonicalChange {
+    fn entity_tombstone(
+        change_id: &str,
+        entity_id: &str,
+        schema_key: &str,
+    ) -> MaterializedCanonicalChange {
+        MaterializedCanonicalChange {
             id: change_id.to_string(),
             entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
             schema_key: schema_key.to_string(),

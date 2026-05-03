@@ -65,7 +65,7 @@ pub(crate) async fn create_logical_plan(
     sql: &str,
 ) -> Result<SqlLogicalPlan, LixError> {
     super::validate_supported_statement_ast(sql)?;
-    let session = build_session(ctx).await?;
+    let session = build_read_session(ctx).await?;
     let plan = session
         .state()
         .create_logical_plan(sql)
@@ -147,7 +147,7 @@ pub(crate) async fn execute_logical_plan(
     Ok(result)
 }
 
-async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, LixError> {
+async fn build_read_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, LixError> {
     let session = new_lix_session_context();
     let version_ref = ctx.version_ref();
     let active_version_commit_id = version_ref
@@ -163,16 +163,32 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
     )
     .await?;
     register_lix_version_provider(&session, ctx.live_state(), Arc::clone(&version_ref)).await?;
-    register_lix_change_provider(&session, ctx.changelog()).await?;
+    let changelog_query_source = ctx.changelog_query_source();
+    register_lix_change_provider(&session, changelog_query_source.clone()).await?;
     let commit_graph = ctx.commit_graph();
     register_commit_derived_providers(&session, commit_graph, Arc::clone(&version_ref)).await?;
     let state_history_commit_graph = ctx.commit_graph();
-    register_history_providers(&session, state_history_commit_graph).await?;
+    register_history_providers(
+        &session,
+        state_history_commit_graph,
+        changelog_query_source.clone(),
+    )
+    .await?;
     let file_history_commit_graph = ctx.commit_graph();
-    register_lix_file_history_provider(&session, file_history_commit_graph, ctx.blob_reader())
-        .await?;
+    register_lix_file_history_provider(
+        &session,
+        file_history_commit_graph,
+        changelog_query_source.clone(),
+        ctx.blob_reader(),
+    )
+    .await?;
     let directory_history_commit_graph = ctx.commit_graph();
-    register_lix_directory_history_provider(&session, directory_history_commit_graph).await?;
+    register_lix_directory_history_provider(
+        &session,
+        directory_history_commit_graph,
+        changelog_query_source.clone(),
+    )
+    .await?;
     let entity_commit_graph = Arc::new(tokio::sync::Mutex::new(ctx.commit_graph()));
     register_lix_directory_providers(
         &session,
@@ -197,6 +213,7 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
         ctx.live_state(),
         Arc::clone(&version_ref),
         entity_commit_graph,
+        changelog_query_source,
         &ctx.list_visible_schemas()?,
     )
     .await?;
@@ -532,6 +549,7 @@ mod tests {
         create_write_logical_plan, execute_logical_plan, execute_sql, SqlExecutionContext,
         SqlWriteExecutionContext,
     };
+    use crate::backend::ReadScope;
     use crate::binary_cas::BlobDataReader;
     use crate::changelog::{CanonicalChange, ChangelogReader, ChangelogScanRequest};
     use crate::commit_graph::{
@@ -542,9 +560,11 @@ mod tests {
     use crate::functions::{
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
+    use crate::json_store::JsonStoreContext;
     use crate::live_state::{
         LiveStateContext, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
+    use crate::sql2::{ChangelogQuerySource, SqlChangelogQuerySource};
     use crate::tracked_state::TrackedStateContext;
     use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
     use crate::untracked_state::UntrackedStateContext;
@@ -671,8 +691,14 @@ mod tests {
             Arc::clone(&self.blob_reader)
         }
 
-        fn changelog(&self) -> Arc<dyn ChangelogReader> {
-            Arc::new(DummyChangelogReader)
+        fn changelog_query_source(&self) -> SqlChangelogQuerySource {
+            let read_scope =
+                ReadScope::new(Arc::new(crate::backend::testing::UnitTestBackend::new())
+                    as Arc<dyn crate::LixBackend + Send + Sync>);
+            ChangelogQuerySource {
+                changelog_reader: Arc::new(DummyChangelogReader),
+                json_reader: JsonStoreContext::new().reader(read_scope.store()),
+            }
         }
 
         fn commit_graph(&self) -> Box<dyn CommitGraphReader> {
@@ -1068,10 +1094,10 @@ mod tests {
             vec![vec![Value::Text("lix_state".to_string())]]
         );
 
-        let show_tables_result = execute_sql(&ctx, "SHOW TABLES", &[])
+        let tables_result = execute_sql(&ctx, "SELECT table_name FROM information_schema.tables", &[])
             .await
-            .expect("SHOW TABLES should use information_schema");
-        assert!(show_tables_result.rows.iter().any(|row| {
+            .expect("information_schema.tables should list registered tables");
+        assert!(tables_result.rows.iter().any(|row| {
             row.iter()
                 .any(|value| matches!(value, Value::Text(value) if value == "lix_state"))
         }));
@@ -2377,8 +2403,14 @@ mod tests {
             Arc::clone(&self.blob_reader)
         }
 
-        fn changelog(&self) -> Arc<dyn ChangelogReader> {
-            Arc::new(crate::changelog::ChangelogContext::new().reader(Arc::clone(&self.backend)))
+        fn changelog_query_source(&self) -> SqlChangelogQuerySource {
+            let read_scope = ReadScope::new(Arc::clone(&self.backend));
+            ChangelogQuerySource {
+                changelog_reader: Arc::new(
+                    crate::changelog::ChangelogContext::new().reader(read_scope.store()),
+                ),
+                json_reader: JsonStoreContext::new().reader(read_scope.store()),
+            }
         }
 
         fn commit_graph(&self) -> Box<dyn CommitGraphReader> {
