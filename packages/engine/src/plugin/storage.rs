@@ -42,6 +42,7 @@ fn validate_plugin_key_segment(plugin_key: &str) -> Result<(), LixError> {
                 plugin_key
             ),
             hint: None,
+            details: None,
         });
     }
     Ok(())

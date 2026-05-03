@@ -275,7 +275,7 @@ fn lix_state_history_schema() -> SchemaRef {
         json_field("metadata", true),
         Field::new("schema_version", DataType::Utf8, false),
         Field::new("change_id", DataType::Utf8, false),
-        Field::new("commit_id", DataType::Utf8, false),
+        Field::new("observed_commit_id", DataType::Utf8, false),
         Field::new("commit_created_at", DataType::Utf8, false),
         Field::new("start_commit_id", DataType::Utf8, false),
         Field::new("depth", DataType::Int64, false),
@@ -306,7 +306,7 @@ struct StateHistorySqlRow {
     metadata: Option<String>,
     schema_version: String,
     change_id: String,
-    commit_id: String,
+    observed_commit_id: String,
     commit_created_at: String,
     start_commit_id: String,
     depth: i64,
@@ -332,7 +332,9 @@ fn state_history_record_batch(
                     string_array(rows.iter().map(|row| Some(row.schema_version.as_str())))
                 }
                 "change_id" => string_array(rows.iter().map(|row| Some(row.change_id.as_str()))),
-                "commit_id" => string_array(rows.iter().map(|row| Some(row.commit_id.as_str()))),
+                "observed_commit_id" => {
+                    string_array(rows.iter().map(|row| Some(row.observed_commit_id.as_str())))
+                }
                 "commit_created_at" => {
                     string_array(rows.iter().map(|row| Some(row.commit_created_at.as_str())))
                 }
@@ -384,7 +386,7 @@ async fn load_state_history_rows(
                 metadata: entry.change.metadata,
                 schema_version: entry.change.schema_version,
                 change_id: entry.change.id,
-                commit_id: entry.commit_id,
+                observed_commit_id: entry.observed_commit_id,
                 commit_created_at: entry.commit_created_at,
                 start_commit_id: entry.start_commit_id,
                 depth: i64::from(entry.depth),

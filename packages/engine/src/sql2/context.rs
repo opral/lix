@@ -15,7 +15,7 @@ use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
 };
 use crate::transaction::types::{StageWrite, StageWriteOutcome};
-use crate::version_ref::{VersionHead, VersionRefReader};
+use crate::version::{VersionHead, VersionRefReader};
 use crate::{LixBackend, LixError};
 
 pub(crate) type SqlChangelogQuerySource = ChangelogQuerySource<Arc<dyn LixBackend + Send + Sync>>;

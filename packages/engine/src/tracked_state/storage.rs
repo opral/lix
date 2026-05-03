@@ -611,6 +611,7 @@ fn compress_snapshot_payload(snapshot_data: &[u8]) -> Result<Vec<u8>, LixError> 
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("tracked-state snapshot compression failed: {error}"),
         hint: None,
+        details: None,
     })
 }
 
@@ -635,6 +636,7 @@ fn decode_snapshot_zstd_payload(
                 snapshot_ref.hash_hex
             ),
             hint: None,
+            details: None,
         },
     )
 }
@@ -651,6 +653,7 @@ fn decode_snapshot_zstd_payload(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("tracked-state snapshot decompression failed: {error}"),
             hint: None,
+            details: None,
         })?;
 
     let mut output = Vec::new();
@@ -658,6 +661,7 @@ fn decode_snapshot_zstd_payload(
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("tracked-state snapshot decompression failed: {error}"),
         hint: None,
+        details: None,
     })?;
     Ok(output)
 }

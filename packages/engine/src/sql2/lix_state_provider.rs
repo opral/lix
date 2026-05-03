@@ -30,10 +30,11 @@ use crate::live_state::LiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
+use crate::sql2::read_only::reject_read_only_stage_rows;
 use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
 use crate::sql2::write_normalization::UpdateAssignmentValues;
 use crate::transaction::types::StageRow;
-use crate::version_ref::VersionRefReader;
+use crate::version::VersionRefReader;
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
@@ -382,6 +383,7 @@ impl DataSink for LixStateInsertSink {
                 &self.version_binding,
             )?);
         }
+        reject_read_only_stage_rows(&rows, "INSERT into lix_state")?;
         let count = u64::try_from(rows.len())
             .map_err(|_| DataFusionError::Execution("INSERT row count overflow".into()))?;
 
@@ -513,6 +515,7 @@ impl ExecutionPlan for LixStateDeleteExec {
             let matched_batch = filter_lix_state_batch(source_batch, &filters)?;
             let write_rows =
                 lix_state_deletable_write_rows_from_batch(&matched_batch, &version_binding)?;
+            reject_read_only_stage_rows(&write_rows, "DELETE FROM lix_state")?;
             let count = u64::try_from(write_rows.len())
                 .map_err(|_| DataFusionError::Execution("DELETE row count overflow".to_string()))?;
 
@@ -666,6 +669,7 @@ impl ExecutionPlan for LixStateUpdateExec {
                 &assignments,
                 &version_binding,
             )?;
+            reject_read_only_stage_rows(&write_rows, "UPDATE lix_state")?;
             let count = u64::try_from(write_rows.len())
                 .map_err(|_| DataFusionError::Execution("UPDATE row count overflow".to_string()))?;
 
@@ -1499,7 +1503,7 @@ mod tests {
     };
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
     use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWriteOutcome};
-    use crate::version_ref::{VersionHead, VersionRefReader};
+    use crate::version::{VersionHead, VersionRefReader};
     use crate::{
         entity_identity::EntityIdentity,
         live_state::{LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest},

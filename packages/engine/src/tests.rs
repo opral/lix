@@ -33,9 +33,7 @@ async fn tracked_state_rebuild_restores_sql_reads_from_changelog() {
     assert_key_value_visible(&session, "\"before-rebuild\"").await;
 
     let head_commit_id = engine
-        .version_ref()
-        .reader(&backend)
-        .load_head_commit_id(&receipt.main_version_id)
+        .load_version_head_commit_id(&receipt.main_version_id)
         .await
         .expect("version head should load")
         .expect("version head should exist");

@@ -1,3 +1,5 @@
+use serde_json::{json, Value as JsonValue};
+
 /// Structured error type surfaced by Lix to every SDK binding.
 ///
 /// Carries a machine-readable [`code`](Self::code), a human-readable
@@ -22,6 +24,7 @@ pub struct LixError {
     pub code: String,
     pub description: String,
     pub hint: Option<String>,
+    pub details: Option<JsonValue>,
 }
 
 impl LixError {
@@ -60,6 +63,9 @@ impl LixError {
     /// A SQL write violated a primary-key, unique, NOT NULL, or other
     /// relational constraint.
     pub const CODE_CONSTRAINT_VIOLATION: &'static str = "LIX_CONSTRAINT_VIOLATION";
+
+    /// A SQL write targeted a read-only internal/component surface.
+    pub const CODE_READ_ONLY: &'static str = "LIX_ERROR_READ_ONLY";
 
     /// A history table was queried without an explicit commit/version range.
     pub const CODE_HISTORY_FILTER_REQUIRED: &'static str = "LIX_HISTORY_FILTER_REQUIRED";
@@ -110,16 +116,63 @@ impl LixError {
     /// durability boundary.
     pub const CODE_CLOSED: &'static str = "LIX_ERROR_CLOSED";
 
+    /// A merge found incompatible changes to the same tracked-state identity.
+    pub const CODE_MERGE_CONFLICT: &'static str = "LIX_MERGE_CONFLICT";
+
+    /// A caller referenced a version id that has no matching version ref.
+    pub const CODE_VERSION_NOT_FOUND: &'static str = "LIX_VERSION_NOT_FOUND";
+
+    /// Merge graph analysis found multiple equally valid merge bases.
+    pub const CODE_AMBIGUOUS_MERGE_BASE: &'static str = "LIX_AMBIGUOUS_MERGE_BASE";
+
     pub fn new(code: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             description: description.into(),
             hint: None,
+            details: None,
         }
     }
 
     pub fn unknown(description: impl Into<String>) -> Self {
         Self::new("LIX_ERROR_UNKNOWN", description)
+    }
+
+    pub fn version_not_found(
+        version_id: impl Into<String>,
+        operation: impl Into<String>,
+        role: impl Into<String>,
+    ) -> Self {
+        let version_id = version_id.into();
+        let operation = operation.into();
+        let role = role.into();
+        Self::new(
+            Self::CODE_VERSION_NOT_FOUND,
+            format!("version '{version_id}' was not found"),
+        )
+        .with_details(json!({
+            "version_id": version_id,
+            "operation": operation,
+            "role": role,
+        }))
+    }
+
+    pub fn ambiguous_merge_base(
+        left_commit_id: impl Into<String>,
+        right_commit_id: impl Into<String>,
+        candidates: Vec<String>,
+    ) -> Self {
+        let left_commit_id = left_commit_id.into();
+        let right_commit_id = right_commit_id.into();
+        Self::new(
+            Self::CODE_AMBIGUOUS_MERGE_BASE,
+            format!("ambiguous merge base between '{left_commit_id}' and '{right_commit_id}'"),
+        )
+        .with_details(json!({
+            "left_commit_id": left_commit_id,
+            "right_commit_id": right_commit_id,
+            "candidates": candidates,
+        }))
     }
 
     /// Attach a hint to this error. Consumers render hints alongside the
@@ -133,6 +186,12 @@ impl LixError {
     /// ```
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
+        self
+    }
+
+    /// Attach machine-readable details to this error.
+    pub fn with_details(mut self, details: JsonValue) -> Self {
+        self.details = Some(details);
         self
     }
 

@@ -22,7 +22,7 @@ pub(crate) mod test_support;
 pub(crate) mod tracked_state;
 pub mod transaction;
 pub(crate) mod untracked_state;
-pub(crate) mod version_ref;
+pub(crate) mod version;
 pub mod wasm;
 
 #[cfg(test)]

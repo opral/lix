@@ -30,9 +30,9 @@ use super::history_projection::{tombstone_identity_column_value, HistoryIdentity
 use super::history_route::{
     history_descriptor_event_matches, load_history_entries, parse_history_filter,
     HistoryColumnStyle, HistoryEntry, HistoryRoute, HistoryViewDescriptor, HISTORY_COL_CHANGE_ID,
-    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_COMMIT_ID, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_ID,
-    HISTORY_COL_FILE_ID, HISTORY_COL_METADATA, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SCHEMA_VERSION,
-    HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
+    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_ID, HISTORY_COL_FILE_ID,
+    HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_SCHEMA_KEY,
+    HISTORY_COL_SCHEMA_VERSION, HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
 };
 use super::result_metadata::json_field;
 use super::SqlChangelogQuerySource;
@@ -313,7 +313,7 @@ struct FileHistoryEvent {
     depth: u32,
     priority: u8,
     change: MaterializedCanonicalChange,
-    commit_id: String,
+    observed_commit_id: String,
     commit_created_at: String,
 }
 
@@ -456,7 +456,11 @@ async fn load_file_history_rows(
             .cmp(&right.entity_id)
             .then(left.event.start_commit_id.cmp(&right.event.start_commit_id))
             .then(left.event.depth.cmp(&right.event.depth))
-            .then(left.event.commit_id.cmp(&right.event.commit_id))
+            .then(
+                left.event
+                    .observed_commit_id
+                    .cmp(&right.event.observed_commit_id),
+            )
             .then(left.event.change.id.cmp(&right.event.change.id))
     });
     Ok(output)
@@ -545,7 +549,7 @@ fn file_history_event_from_entry(
         depth: entry.depth,
         priority,
         change: entry.change.clone(),
-        commit_id: entry.commit_id.clone(),
+        observed_commit_id: entry.observed_commit_id.clone(),
         commit_created_at: entry.commit_created_at.clone(),
     }
 }
@@ -810,9 +814,10 @@ fn file_history_column_array(
             rows.iter()
                 .map(|row| row.descriptor_change.metadata.as_deref()),
         ),
-        HISTORY_COL_COMMIT_ID => {
-            string_array(rows.iter().map(|row| Some(row.event.commit_id.as_str())))
-        }
+        HISTORY_COL_OBSERVED_COMMIT_ID => string_array(
+            rows.iter()
+                .map(|row| Some(row.event.observed_commit_id.as_str())),
+        ),
         HISTORY_COL_COMMIT_CREATED_AT => string_array(
             rows.iter()
                 .map(|row| Some(row.event.commit_created_at.as_str())),
@@ -853,7 +858,7 @@ fn lix_file_history_schema() -> SchemaRef {
         Field::new(HISTORY_COL_SCHEMA_VERSION, DataType::Utf8, false),
         Field::new(HISTORY_COL_CHANGE_ID, DataType::Utf8, false),
         json_field(HISTORY_COL_METADATA, true),
-        Field::new(HISTORY_COL_COMMIT_ID, DataType::Utf8, false),
+        Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
         Field::new(HISTORY_COL_START_COMMIT_ID, DataType::Utf8, false),
         Field::new(HISTORY_COL_DEPTH, DataType::Int64, false),

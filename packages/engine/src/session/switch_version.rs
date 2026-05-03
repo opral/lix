@@ -3,6 +3,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use crate::transaction::types::StageRow;
+use crate::version::VersionRefReader;
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 
@@ -44,9 +45,10 @@ impl SessionContext {
                         reader.load_head_commit_id(&version_id).await?
                     };
                     if head.is_none() {
-                        return Err(LixError::new(
-                            "LIX_ERROR_UNKNOWN",
-                            format!("cannot switch to missing version ref '{version_id}'"),
+                        return Err(LixError::version_not_found(
+                            version_id.clone(),
+                            "switch_version",
+                            "target",
                         ));
                     }
 
@@ -71,7 +73,7 @@ impl SessionContext {
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.changelog),
-            Arc::clone(&self.version_ref),
+            Arc::clone(&self.version_ctx),
             Arc::clone(&self.schema_registry),
             self.closed_flag(),
         );

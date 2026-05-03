@@ -7,6 +7,7 @@ import {
 	type KvScanRange,
 	type LixBackend,
 	type LixBackendTransaction,
+	type LixError,
 	type Lix,
 	type TransactionBeginMode,
 	isLixError,
@@ -55,12 +56,22 @@ test("openLix exposes the rs-sdk e2e flow", async () => {
 
 	expect(await taskDone(lix, "task-1")).toBe(false);
 
+	const mainHead = await lix.execute("SELECT lix_active_version_commit_id()");
+	const mainHeadCommitId = mainHead.rows[0]!.get("lix_active_version_commit_id()");
+	expect(typeof mainHeadCommitId).toBe("string");
+
 	const draft = await lix.createVersion({
 		id: "draft-version",
 		name: "Draft",
 	});
+	expect(draft).toMatchObject({
+		id: "draft-version",
+		name: "Draft",
+		hidden: false,
+		commitId: mainHeadCommitId,
+	});
 
-	await lix.switchVersion({ versionId: draft.versionId });
+	await lix.switchVersion({ versionId: draft.id });
 
 	await lix.execute("UPDATE crm_task SET done = $1 WHERE id = $2", [
 		true,
@@ -74,12 +85,13 @@ test("openLix exposes the rs-sdk e2e flow", async () => {
 	expect(await taskDone(lix, "task-1")).toBe(false);
 
 	const merge = await lix.mergeVersion({
-		sourceVersionId: draft.versionId,
+		sourceVersionId: draft.id,
 	});
 
-	expect(merge.outcome).toBe("mergeCommitted");
+	expect(merge.outcome).toBe("fastForward");
 	expect(merge.targetVersionId).toBe(mainVersionId);
-	expect(merge.appliedChangeCount).toBeGreaterThan(0);
+	expect(merge.appliedChangeCount).toBe(0);
+	expect(merge.createdMergeCommitId).toBeNull();
 	expect(await taskDone(lix, "task-1")).toBe(true);
 
 	await lix.close();
@@ -111,6 +123,105 @@ test("openLix accepts an explicit backend", async () => {
 	const second = await openLix({ backend });
 	expect(await taskDone(second, "backend-task")).toBe(false);
 	await second.close();
+});
+
+test("createVersion can start from an explicit commit id", async () => {
+	const lix = await openLix();
+
+	await registerCrmTaskSchema(lix);
+	const baseHead = await lix.execute("SELECT lix_active_version_commit_id()");
+	const fromCommitId = baseHead.rows[0]!.get("lix_active_version_commit_id()");
+	expect(typeof fromCommitId).toBe("string");
+
+	await lix.execute(
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		[
+			"after-base",
+			"Written after base",
+			false,
+			JSON.stringify({ priority: "normal" }),
+		],
+	);
+
+	const version = await lix.createVersion({
+		id: "from-explicit-commit",
+		name: "From explicit commit",
+		fromCommitId: fromCommitId as string,
+	});
+	expect(version).toMatchObject({
+		id: "from-explicit-commit",
+		name: "From explicit commit",
+		hidden: false,
+		commitId: fromCommitId,
+	});
+	await lix.switchVersion({ versionId: version.id });
+
+	const projected = await lix.execute(
+		"SELECT id FROM crm_task WHERE id = $1",
+		["after-base"],
+	);
+	expect(projected.rows).toHaveLength(0);
+
+	await lix.close();
+});
+
+test("merge conflicts expose structured details", async () => {
+	const lix = await openLix();
+	const mainVersionId = await lix.activeVersionId();
+	await registerCrmTaskSchema(lix);
+	await lix.execute(
+		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
+		[
+			"conflict-task",
+			"Base",
+			false,
+			JSON.stringify({ priority: "normal" }),
+		],
+	);
+	const draft = await lix.createVersion({
+		id: "conflict-draft",
+		name: "Conflict draft",
+	});
+
+	await lix.switchVersion({ versionId: draft.id });
+	await lix.execute("UPDATE crm_task SET title = $1 WHERE id = $2", [
+		"Draft",
+		"conflict-task",
+	]);
+
+	await lix.switchVersion({ versionId: mainVersionId });
+	await lix.execute("UPDATE crm_task SET title = $1 WHERE id = $2", [
+		"Main",
+		"conflict-task",
+	]);
+
+	try {
+		await lix.mergeVersion({ sourceVersionId: draft.id });
+		throw new Error("expected merge conflict");
+	} catch (error) {
+		expect(isLixError(error)).toBe(true);
+		if (!isLixError(error)) throw error;
+		expect(error.code).toBe("LIX_MERGE_CONFLICT");
+		expect(error.details).toBeDefined();
+		expect((error as LixError & { data?: unknown }).data).toBeUndefined();
+		const details = error.details as {
+			conflicts?: Array<{
+				schema_key?: string;
+				entity_id?: string;
+				target?: unknown;
+				source?: unknown;
+			}>;
+		};
+		expect(details.conflicts).toHaveLength(1);
+		expect(details.conflicts?.[0]).toMatchObject({
+			schema_key: "crm_task",
+			entity_id: "conflict-task",
+		});
+		expect(details.conflicts?.[0]?.target).toBeDefined();
+		expect(details.conflicts?.[0]?.source).toBeDefined();
+	}
+
+	await lix.close();
 });
 
 test("lix.close delegates backend close through the engine bridge", async () => {

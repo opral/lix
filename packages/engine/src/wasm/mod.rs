@@ -54,6 +54,7 @@ impl WasmRuntime for NoopWasmRuntime {
             description: "wasm runtime is required to execute plugins; provide a non-noop runtime"
                 .to_string(),
             hint: None,
+            details: None,
         })
     }
 }

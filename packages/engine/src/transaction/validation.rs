@@ -16,6 +16,7 @@ use crate::schema::{
 };
 use crate::transaction::staging::StagedWriteSet;
 use crate::transaction::types::StagedStateRow;
+use crate::version::{VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_REF_SCHEMA_KEY};
 use crate::{LixError, NullableKeyFilter};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -64,10 +65,11 @@ pub(crate) async fn validate_staged_writes(
     let schema_catalog = SchemaCatalogSnapshot::from_transaction_input(&input)?;
     let pending_file_descriptors =
         PendingFileDescriptorIndex::from_staged_writes(input.staged_writes);
+    let staged_rows = input.staged_writes.state_rows_for_validation();
     let mut compiled_schemas = CompiledSchemaCatalog::new(&schema_catalog);
     let mut pending_constraints = PendingConstraintIndexes::default();
     let mut staged_snapshots = Vec::new();
-    for row in &input.staged_writes.state_rows {
+    for row in &staged_rows {
         validate_staged_row_shape(row)?;
         validate_schema_exists(row, &schema_catalog)?;
         let snapshot = validate_snapshot_content(row, &mut compiled_schemas)?;
@@ -105,6 +107,7 @@ pub(crate) async fn validate_staged_writes(
             .await?;
     reject_unresolved_foreign_keys(&unresolved_foreign_keys)?;
     validate_committed_delete_restrictions(&input, &schema_catalog, &pending_constraints).await?;
+    validate_version_ref_delete_restrictions(&input, &pending_constraints).await?;
     validate_committed_insert_identities(&input, &pending_constraints).await?;
     validate_committed_unique_constraints(&input, &pending_constraints).await?;
     Ok(())
@@ -146,6 +149,76 @@ async fn validate_committed_insert_identities(
     Ok(())
 }
 
+async fn validate_version_ref_delete_restrictions(
+    input: &TransactionValidationInput<'_>,
+    pending_constraints: &PendingConstraintIndexes,
+) -> Result<(), LixError> {
+    for tombstone in &pending_constraints.tombstones {
+        if tombstone.identity.schema_key != VERSION_REF_SCHEMA_KEY {
+            continue;
+        }
+
+        let descriptor_identity = LiveStateRowIdentity {
+            version_id: tombstone.identity.version_id.clone(),
+            schema_key: VERSION_DESCRIPTOR_SCHEMA_KEY.to_string(),
+            entity_id: tombstone.identity.entity_id.clone(),
+            file_id: tombstone.identity.file_id.clone(),
+        };
+        if pending_constraints.tombstones_target_identity(&descriptor_identity) {
+            continue;
+        }
+        if pending_constraints.has_identity_target(&descriptor_identity) {
+            return Err(version_ref_delete_restriction_error(
+                &tombstone.identity,
+                &descriptor_identity,
+            )?);
+        }
+
+        let Some(descriptor_row) = input
+            .live_state
+            .load_row(&LiveStateRowRequest {
+                schema_key: descriptor_identity.schema_key.clone(),
+                version_id: descriptor_identity.version_id.clone(),
+                entity_id: descriptor_identity.entity_id.clone(),
+                file_id: nullable_filter_from_option(&descriptor_identity.file_id),
+            })
+            .await?
+        else {
+            continue;
+        };
+        if descriptor_row.snapshot_content.is_some()
+            && committed_row_is_exact_version_scoped(
+                &descriptor_row,
+                &descriptor_identity.version_id,
+            )
+            && !pending_constraints.tombstones_identity(&descriptor_row)
+        {
+            return Err(version_ref_delete_restriction_error(
+                &tombstone.identity,
+                &descriptor_identity,
+            )?);
+        }
+    }
+    Ok(())
+}
+
+fn version_ref_delete_restriction_error(
+    ref_identity: &LiveStateRowIdentity,
+    descriptor_identity: &LiveStateRowIdentity,
+) -> Result<LixError, LixError> {
+    Ok(LixError::new(
+        LixError::CODE_FOREIGN_KEY,
+        format!(
+            "cannot delete '{}' row '{}' in version '{}' because matching '{}' row '{}' would remain without a version ref",
+            ref_identity.schema_key,
+            ref_identity.entity_id.as_string()?,
+            ref_identity.version_id,
+            descriptor_identity.schema_key,
+            descriptor_identity.entity_id.as_string()?,
+        ),
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingFileDescriptorState {
     Present,
@@ -160,7 +233,7 @@ struct PendingFileDescriptorIndex {
 impl PendingFileDescriptorIndex {
     fn from_staged_writes(staged_writes: &StagedWriteSet) -> Self {
         let mut index = Self::default();
-        for row in &staged_writes.state_rows {
+        for row in staged_writes.state_rows_for_validation() {
             if row.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || row.file_id.is_some() {
                 continue;
             }
@@ -1817,7 +1890,8 @@ impl SchemaCatalogSnapshot {
     fn from_transaction_input(input: &TransactionValidationInput<'_>) -> Result<Self, LixError> {
         let mut snapshot = Self::default();
         snapshot.remember_visible_schemas(input.visible_schemas)?;
-        snapshot.remember_pending_registered_schemas(&input.staged_writes.state_rows)?;
+        let staged_rows = input.staged_writes.state_rows_for_validation();
+        snapshot.remember_pending_registered_schemas(&staged_rows)?;
         snapshot.validate_foreign_key_definitions()?;
         Ok(snapshot)
     }
@@ -2190,6 +2264,7 @@ mod tests {
         })];
         let staged_writes = StagedWriteSet {
             state_rows: vec![pending_registered_schema_row("pending_schema", "2")],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let input = validation_input(&staged_writes, &visible_schemas);
@@ -2214,6 +2289,7 @@ mod tests {
         })];
         let staged_writes = StagedWriteSet {
             state_rows: vec![pending_registered_schema_row("same_schema", "1")],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let input = validation_input(&staged_writes, &visible_schemas);
@@ -2324,6 +2400,7 @@ mod tests {
     fn schema_catalog_rejects_foreign_key_missing_target_schema() {
         let staged_writes = StagedWriteSet {
             state_rows: vec![pending_registered_schema_from_definition(fk_child_schema())],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let input = validation_input(&staged_writes, &[]);
@@ -2416,6 +2493,7 @@ mod tests {
         schema["x-lix-foreign-keys"][0]["references"]["properties"] = json!(["/entity_id"]);
         let staged_writes = StagedWriteSet {
             state_rows: vec![pending_registered_schema_from_definition(schema)],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let input = validation_input(&staged_writes, &[]);
@@ -2469,6 +2547,7 @@ mod tests {
         let visible_schemas = vec![key_value_schema()];
         let staged_writes = StagedWriteSet {
             state_rows: vec![staged_row("unknown_schema", "1", None)],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -2542,6 +2621,7 @@ mod tests {
         let visible_schemas = vec![key_value_schema()];
         let staged_writes = StagedWriteSet {
             state_rows: vec![staged_row("lix_key_value", "1", None)],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -2555,6 +2635,7 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = StagedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first")],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -2594,6 +2675,7 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = StagedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first")],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -2614,6 +2696,7 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = StagedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first")],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StrictStaticLiveStateReader {
@@ -2641,6 +2724,7 @@ mod tests {
         conflicting.entity_id = crate::entity_identity::EntityIdentity::single("post-2");
         let staged_writes = StagedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first"), conflicting],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -2676,6 +2760,7 @@ mod tests {
         duplicate.version_id = "version-a".to_string();
         let staged_writes = StagedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first"), duplicate],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -2693,6 +2778,7 @@ mod tests {
         version_b.version_id = "version-b".to_string();
         let staged_writes = StagedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first"), version_b],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -2724,6 +2810,7 @@ mod tests {
         tombstone.snapshot_content = None;
         let staged_writes = StagedWriteSet {
             state_rows: vec![tombstone, unique_row("post-2", "hello-world", "second")],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -2758,6 +2845,7 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = StagedWriteSet {
             state_rows: vec![unique_row("post-2", "hello-world", "second")],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -2780,6 +2868,7 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = StagedWriteSet {
             state_rows: vec![unique_row("post-2", "hello-world", "second")],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -2804,6 +2893,7 @@ mod tests {
         version_b.version_id = "version-b".to_string();
         let staged_writes = StagedWriteSet {
             state_rows: vec![version_b],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -2824,6 +2914,7 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = StagedWriteSet {
             state_rows: vec![unique_row("post-2", "hello-world", "second")],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let mut projected_overlay_row = committed_unique_row("post-1", "hello-world", "first");
@@ -2847,6 +2938,7 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = StagedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "updated")],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -2869,6 +2961,7 @@ mod tests {
         tombstone.snapshot_content = None;
         let staged_writes = StagedWriteSet {
             state_rows: vec![tombstone, unique_row("post-2", "hello-world", "second")],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -2893,6 +2986,7 @@ mod tests {
         different_version.version_id = "version-b".to_string();
         let staged_writes = StagedWriteSet {
             state_rows: vec![different_file, different_version],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -2913,6 +3007,7 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = StagedWriteSet {
             state_rows: vec![fk_child_row("child-1", "parent-1", "version-a")],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -2962,6 +3057,7 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = StagedWriteSet {
             state_rows: vec![fk_child_row("child-1", "parent-1", "version-a")],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -2982,6 +3078,7 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = StagedWriteSet {
             state_rows: vec![fk_child_row("child-1", "parent-1", "version-a")],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
@@ -3112,6 +3209,7 @@ mod tests {
         };
         let staged_writes = StagedWriteSet {
             state_rows: vec![parent_delete],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -3139,6 +3237,7 @@ mod tests {
         };
         let staged_writes = StagedWriteSet {
             state_rows: vec![parent_delete],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -3166,6 +3265,7 @@ mod tests {
         };
         let staged_writes = StagedWriteSet {
             state_rows: vec![parent_delete, child_delete],
+            adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
@@ -3677,6 +3777,7 @@ mod tests {
     fn empty_staged_write_set() -> StagedWriteSet {
         StagedWriteSet {
             state_rows: Vec::new(),
+            adopted_rows: Vec::new(),
             insert_identities: BTreeSet::new(),
             commit_members_by_version: BTreeMap::new(),
             extra_commit_parents_by_version: BTreeMap::new(),

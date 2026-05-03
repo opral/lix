@@ -221,6 +221,7 @@ simulation_test!(
                 .create_version(CreateVersionOptions {
                     id: Some("closed-version".to_string()),
                     name: "Closed".to_string(),
+                    from_commit_id: None,
                 })
                 .await
                 .expect_err("create_version after close should fail"),

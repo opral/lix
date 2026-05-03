@@ -244,7 +244,7 @@ impl ExecutionPlan for EntityHistoryScanExec {
 #[derive(Debug, Clone)]
 struct EntityHistoryRow {
     change: MaterializedCanonicalChange,
-    commit_id: String,
+    observed_commit_id: String,
     commit_created_at: String,
     start_commit_id: String,
     depth: u32,
@@ -273,7 +273,7 @@ async fn load_entity_history_rows(
         .into_iter()
         .map(|entry| EntityHistoryRow {
             change: entry.change,
-            commit_id: entry.commit_id,
+            observed_commit_id: entry.observed_commit_id,
             commit_created_at: entry.commit_created_at,
             start_commit_id: entry.start_commit_id,
             depth: entry.depth,
@@ -402,7 +402,9 @@ fn entity_history_system_column_array(
                 .map(|row| Some(row.change.schema_version.as_str())),
         ),
         "change_id" => string_array(rows.iter().map(|row| Some(row.change.id.as_str()))),
-        "commit_id" => string_array(rows.iter().map(|row| Some(row.commit_id.as_str()))),
+        "observed_commit_id" => {
+            string_array(rows.iter().map(|row| Some(row.observed_commit_id.as_str())))
+        }
         "commit_created_at" => {
             string_array(rows.iter().map(|row| Some(row.commit_created_at.as_str())))
         }

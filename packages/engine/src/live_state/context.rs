@@ -15,6 +15,7 @@ use crate::untracked_state::{
     UntrackedStateContext, UntrackedStateIdentity, UntrackedStateRow, UntrackedStateRowRequest,
     UntrackedStateScanRequest,
 };
+use crate::version::VERSION_REF_SCHEMA_KEY;
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 
@@ -319,9 +320,6 @@ where
                 .filter(|row| row.schema_key != COMMIT_SCHEMA_KEY)
                 .map(|row| TrackedStateRow::try_from(*row))
                 .collect::<Result<Vec<_>, _>>()?;
-            if root_rows.is_empty() {
-                continue;
-            }
             let store: &mut dyn KvWriter = &mut self.store;
             self.tracked_state
                 .writer(store)
@@ -466,7 +464,6 @@ async fn version_ref_exists(
     )
 }
 
-const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 
 fn live_state_row_from_commit(commit: CommitGraphCommit) -> LiveStateRow {

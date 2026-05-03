@@ -9,12 +9,10 @@ use crate::untracked_state::{
     UntrackedStateContext, UntrackedStateFilter, UntrackedStateRow, UntrackedStateRowRequest,
     UntrackedStateScanRequest, UntrackedStateWriter,
 };
-use crate::version_ref::{VersionHead, VersionRefReader};
+use crate::version::{VersionHead, VersionRefReader};
+use crate::version::{VERSION_REF_SCHEMA_KEY, VERSION_REF_SCHEMA_VERSION};
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
-
-const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
-const VERSION_REF_SCHEMA_VERSION: &str = "1";
 
 /// Typed access to moving version heads stored in untracked state.
 ///
@@ -22,17 +20,17 @@ const VERSION_REF_SCHEMA_VERSION: &str = "1";
 /// context deliberately bypasses live_state and reads the underlying untracked
 /// rows directly. That keeps the dependency acyclic:
 /// untracked_state -> version_ref -> live_state.
-pub(crate) struct VersionRefContext {
+pub(super) struct VersionRefContext {
     untracked_state: Arc<UntrackedStateContext>,
 }
 
 impl VersionRefContext {
-    pub(crate) fn new(untracked_state: Arc<UntrackedStateContext>) -> Self {
+    pub(super) fn new(untracked_state: Arc<UntrackedStateContext>) -> Self {
         Self { untracked_state }
     }
 
     /// Creates a version-ref reader over a caller-provided KV store.
-    pub(crate) fn reader<S>(&self, store: S) -> VersionRefStoreReader<S>
+    pub(super) fn reader<S>(&self, store: S) -> VersionRefStoreReader<S>
     where
         S: KvStore,
     {
@@ -43,7 +41,7 @@ impl VersionRefContext {
     }
 
     /// Creates a version-ref writer over a caller-provided KV writer.
-    pub(crate) fn writer<S>(&self, store: S) -> VersionRefWriter<S>
+    pub(super) fn writer<S>(&self, store: S) -> VersionRefWriter<S>
     where
         S: KvWriter,
     {
@@ -54,7 +52,7 @@ impl VersionRefContext {
 }
 
 /// Read side for version heads.
-pub(crate) struct VersionRefStoreReader<S>
+pub(super) struct VersionRefStoreReader<S>
 where
     S: KvStore,
 {
@@ -143,7 +141,7 @@ where
 }
 
 /// Write side for moving version heads.
-pub(crate) struct VersionRefWriter<S>
+pub(super) struct VersionRefWriter<S>
 where
     S: KvWriter,
 {

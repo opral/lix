@@ -130,6 +130,7 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("Plugin manifest must be valid JSON: {error}"),
         hint: None,
+            details: None,
     })?;
 
     validate_plugin_manifest_json(&manifest_json)?;
@@ -139,6 +140,7 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("Plugin manifest does not match expected shape: {error}"),
             hint: None,
+            details: None,
         })?;
     validate_path_glob(&manifest.file_match.path_glob)?;
 
@@ -146,6 +148,7 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("Failed to normalize plugin manifest JSON: {error}"),
         hint: None,
+            details: None,
     })?;
 
     Ok(ValidatedPluginManifest {
@@ -217,6 +220,7 @@ fn validate_path_glob(glob: &str) -> Result<(), LixError> {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("Invalid plugin manifest: match.path_glob is invalid: {error}"),
         hint: None,
+            details: None,
     })?;
     Ok(())
 }
@@ -229,6 +233,7 @@ fn validate_plugin_manifest_json(manifest: &JsonValue) -> Result<(), LixError> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("Invalid plugin manifest: {details}"),
             hint: None,
+            details: None,
         });
     }
     Ok(())
@@ -276,6 +281,7 @@ fn plugin_manifest_validator() -> Result<&'static JSONSchema, LixError> {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("Failed to compile plugin manifest schema: {error}"),
                 hint: None,
+            details: None,
             })
     });
 
@@ -285,6 +291,7 @@ fn plugin_manifest_validator() -> Result<&'static JSONSchema, LixError> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: error.description.clone(),
             hint: None,
+            details: None,
         }),
     }
 }

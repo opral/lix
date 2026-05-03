@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
 use super::change_provider::register_lix_change_provider;
-use super::commit_provider::register_commit_providers;
+use super::commit_derived_provider::register_commit_derived_providers;
 use super::directory_history_provider::register_lix_directory_history_provider;
 use super::directory_provider::{
     register_lix_directory_providers, register_lix_directory_write_providers,
@@ -21,7 +21,7 @@ use super::history_provider::register_history_providers;
 use super::lix_state_provider::{register_lix_state_providers, register_lix_state_write_providers};
 use super::result_metadata::field_is_json;
 use super::udfs::register_sql2_functions;
-use super::version_provider::register_lix_version_provider;
+use super::version_provider::{register_lix_version_provider, register_lix_version_write_provider};
 use super::{SqlExecutionContext, SqlStatementKind, SqlWriteContext, SqlWriteExecutionContext};
 
 #[allow(dead_code)]
@@ -162,13 +162,7 @@ async fn build_read_session(ctx: &dyn SqlExecutionContext) -> Result<SessionCont
     let changelog_query_source = ctx.changelog_query_source();
     register_lix_change_provider(&session, changelog_query_source.clone()).await?;
     let commit_graph = ctx.commit_graph();
-    register_commit_providers(
-        &session,
-        ctx.active_version_id(),
-        commit_graph,
-        Arc::clone(&version_ref),
-    )
-    .await?;
+    register_commit_derived_providers(&session, commit_graph, Arc::clone(&version_ref)).await?;
     let state_history_commit_graph = ctx.commit_graph();
     register_history_providers(
         &session,
@@ -234,6 +228,7 @@ async fn build_write_session(
     register_sql2_functions(&session, write_ctx.functions(), active_version_commit_id);
 
     register_lix_state_write_providers(&session, write_ctx.clone()).await?;
+    register_lix_version_write_provider(&session, write_ctx.clone()).await?;
 
     register_lix_directory_write_providers(&session, write_ctx.clone()).await?;
     register_lix_file_write_providers(&session, write_ctx.clone()).await?;
@@ -527,7 +522,7 @@ mod tests {
     use crate::tracked_state::TrackedStateContext;
     use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
     use crate::untracked_state::UntrackedStateContext;
-    use crate::version_ref::VersionRefReader;
+    use crate::version::VersionRefReader;
     use crate::{Engine, ExecuteResult, SessionContext};
     use crate::{LixError, Value};
 
@@ -717,10 +712,12 @@ mod tests {
             let count = match &write {
                 StageWrite::Rows { rows, .. } => rows.len() as u64,
                 StageWrite::RowsWithFileData { count, .. } => *count,
+                StageWrite::AdoptedChanges { changes } => changes.len() as u64,
             };
             let rows = match write {
                 StageWrite::Rows { rows, .. } => rows,
                 StageWrite::RowsWithFileData { rows, .. } => rows,
+                StageWrite::AdoptedChanges { .. } => Vec::new(),
             };
             self.staged_writes
                 .lock()
@@ -759,11 +756,11 @@ mod tests {
         async fn load_head(
             &self,
             _version_id: &str,
-        ) -> Result<Option<crate::version_ref::VersionHead>, LixError> {
+        ) -> Result<Option<crate::version::VersionHead>, LixError> {
             Ok(None)
         }
 
-        async fn scan_heads(&self) -> Result<Vec<crate::version_ref::VersionHead>, LixError> {
+        async fn scan_heads(&self) -> Result<Vec<crate::version::VersionHead>, LixError> {
             Ok(Vec::new())
         }
     }
@@ -2376,8 +2373,8 @@ mod tests {
 
         fn version_ref(&self) -> Arc<dyn VersionRefReader> {
             Arc::new(
-                crate::version_ref::VersionRefContext::new(Arc::new(UntrackedStateContext::new()))
-                    .reader(Arc::clone(&self.backend)),
+                crate::version::VersionContext::new(Arc::new(UntrackedStateContext::new()))
+                    .ref_reader(Arc::clone(&self.backend)),
             )
         }
 

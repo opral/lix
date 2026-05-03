@@ -30,6 +30,7 @@ pub(crate) async fn load_or_init_plugin_component(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "plugin component cache lock poisoned".to_string(),
             hint: None,
+            details: None,
         })?;
         if let Some(cached) = guard.get(&plugin.key) {
             if cached.wasm == plugin.wasm {
@@ -46,6 +47,7 @@ pub(crate) async fn load_or_init_plugin_component(
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "plugin component cache lock poisoned".to_string(),
         hint: None,
+            details: None,
     })?;
     if let Some(cached) = guard.get(&plugin.key) {
         if cached.wasm == plugin.wasm {
@@ -90,6 +92,7 @@ async fn invoke_apply_changes_export(
             errors.join("; ")
         ),
         hint: None,
+            details: None,
     })
 }
 

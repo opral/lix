@@ -8,6 +8,7 @@ pub fn json_to_cel(value: &JsonValue) -> Result<CelValue, LixError> {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("failed to convert JSON value to CEL value: {err}"),
         hint: None,
+        details: None,
     })
 }
 
@@ -16,6 +17,7 @@ pub fn cel_to_json(value: &CelValue) -> Result<JsonValue, LixError> {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("failed to convert CEL value to JSON value: {err}"),
         hint: None,
+        details: None,
     })
 }
 

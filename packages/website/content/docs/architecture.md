@@ -42,11 +42,11 @@ graph RL
     classDef version fill:#fff9c4,stroke:#fbc02d,color:#000;
 ```
 
-In this example, two changes (`c1`, `c2`) serve as atomic units—enabling fine-grained diffing and cherry-picking—while the change set `cs42` groups them together, signaling they belong together while preserving their individual atomicity. The commit `a1` materializes this change set into state, forming a point in time that can be referenced, traversed, and compared. The version `main` acts as a named pointer to this commit, defining what state is currently visible.
+In this example, two changes (`c1`, `c2`) serve as atomic units—enabling fine-grained diffing and cherry-picking—while the change set `cs42` groups the canonical changes whose effects are introduced by commit `a1` relative to its first parent. The commit forms a point in time that can be referenced, traversed, and compared. The version `main` acts as a named pointer to this commit, defining what state is currently visible.
 
 ## The Commit Graph
 
-State is expressed by the commit graph. Each commit packages a change set and links to parent commits, forming a directed acyclic graph (DAG) that records how state evolved over time.
+State is expressed by the commit graph. Each commit links to parent commits and references the canonical changes whose effects it introduces relative to its first parent. A merge commit may reference existing changes from another parent instead of copying them. Together, these commits form a directed acyclic graph (DAG) that records how state evolved over time.
 
 ### Graph Structure
 

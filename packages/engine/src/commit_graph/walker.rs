@@ -228,6 +228,7 @@ mod tests {
     };
     use crate::commit_graph::CommitGraphContext;
     use crate::json_store::JsonStoreContext;
+    use crate::LixError;
 
     #[tokio::test]
     async fn reachable_commits_returns_commits_nearest_first() {
@@ -681,7 +682,28 @@ mod tests {
             .await
             .expect_err("ambiguous best common ancestors should fail");
 
-        assert!(error.description.contains("ambiguous merge base"));
+        assert_eq!(error.code, LixError::CODE_AMBIGUOUS_MERGE_BASE);
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("left_commit_id")),
+            Some(&json!("commit-head-left"))
+        );
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("right_commit_id")),
+            Some(&json!("commit-head-right"))
+        );
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("candidates")),
+            Some(&json!(["commit-left", "commit-right"]))
+        );
     }
 
     async fn append_changes(
