@@ -37,6 +37,27 @@ simulation_test!(sql_missing_column_has_lix_error_code, |sim| async move {
     assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
 });
 
+simulation_test!(
+    sql_duplicate_projection_name_is_parse_error,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute("SELECT 1 AS x, 2 AS x", &[])
+            .await
+            .expect_err("duplicate projection names should fail during planning");
+
+        assert_eq!(error.code, LixError::CODE_PARSE_ERROR);
+    }
+);
+
 simulation_test!(sql_question_mark_placeholder_has_hint, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(

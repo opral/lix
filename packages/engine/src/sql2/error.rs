@@ -91,6 +91,23 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
         return LixError::new(LixError::CODE_SCHEMA_DEFINITION, message);
     }
 
+    if lower.contains("unsupported sql type json") {
+        return LixError::new(LixError::CODE_DIALECT_UNSUPPORTED, message)
+            .with_hint("Declare JSON/object columns through lix.registerSchema(...) or lix_registered_schema; SQL type JSON is not supported.");
+    }
+
+    if looks_like_type_mismatch(&lower) {
+        return LixError::new(LixError::CODE_TYPE_MISMATCH, message)
+            .with_hint("Check the SQL function argument types. JSON text can be converted with lix_json(...); JSON fields can be read with lix_json_get(...) or lix_json_get_text(...).");
+    }
+
+    if matches!(
+        error,
+        DataFusionError::Plan(_) | DataFusionError::SchemaError(_, _)
+    ) {
+        return LixError::new(LixError::CODE_PARSE_ERROR, message);
+    }
+
     if lower.contains("constraint")
         || lower.contains("not null")
         || lower.contains("non-nullable")
@@ -100,16 +117,6 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
         || lower.contains("foreign key")
     {
         return LixError::new(LixError::CODE_CONSTRAINT_VIOLATION, message);
-    }
-
-    if lower.contains("unsupported sql type json") {
-        return LixError::new(LixError::CODE_DIALECT_UNSUPPORTED, message)
-            .with_hint("Declare JSON/object columns through lix.registerSchema(...) or lix_registered_schema; SQL type JSON is not supported.");
-    }
-
-    if looks_like_type_mismatch(&lower) {
-        return LixError::new(LixError::CODE_TYPE_MISMATCH, message)
-            .with_hint("Check the SQL function argument types. JSON text can be converted with lix_json(...); JSON fields can be read with lix_json_get(...) or lix_json_get_text(...).");
     }
 
     match error {
