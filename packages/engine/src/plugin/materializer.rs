@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use crate::common::LixError;
 use crate::live_state::{list_installed_plugin_archive_refs, PluginArchiveRef};
-use crate::LixBackend;
+use crate::Backend;
 
 use super::component::{apply_changes_with_plugin, PluginComponentHost};
 use super::{
@@ -37,7 +37,7 @@ pub trait FilesystemPluginMaterializer {
 }
 
 pub(crate) trait PluginMaterializationHost: PluginComponentHost {
-    fn plugin_backend(&self) -> &Arc<dyn LixBackend + Send + Sync>;
+    fn plugin_backend(&self) -> &Arc<dyn Backend + Send + Sync>;
 
     fn installed_plugins_cache(&self) -> &RwLock<Option<Vec<InstalledPlugin>>>;
 }
@@ -80,7 +80,7 @@ pub(crate) async fn load_installed_plugins_from_backend(
 }
 
 pub(crate) async fn load_installed_plugins_from_backend_state(
-    backend: &dyn LixBackend,
+    backend: &dyn Backend,
 ) -> Result<Vec<InstalledPlugin>, LixError> {
     let archive_refs = list_installed_plugin_archive_refs(backend).await?;
     let mut plugins = Vec::with_capacity(archive_refs.len());
@@ -93,7 +93,7 @@ pub(crate) async fn load_installed_plugins_from_backend_state(
 }
 
 pub(crate) async fn load_installed_plugin_from_archive_ref_with_backend(
-    backend: &dyn LixBackend,
+    backend: &dyn Backend,
     archive_ref: &PluginArchiveRef,
 ) -> Result<InstalledPlugin, LixError> {
     let Some(plugin_key) = plugin_key_from_archive_path(&archive_ref.path) else {
@@ -136,7 +136,7 @@ pub(crate) async fn load_installed_plugin_from_archive_ref_with_backend(
 }
 
 pub(crate) async fn list_installed_plugin_manifest_keys(
-    backend: &dyn LixBackend,
+    backend: &dyn Backend,
 ) -> Result<BTreeSet<String>, LixError> {
     Ok(load_installed_plugins_from_backend_state(backend)
         .await?
@@ -147,7 +147,7 @@ pub(crate) async fn list_installed_plugin_manifest_keys(
 
 #[allow(dead_code)]
 pub(crate) async fn installed_plugin_manifest_key_exists(
-    backend: &dyn LixBackend,
+    backend: &dyn Backend,
     plugin_key: &str,
 ) -> Result<bool, LixError> {
     Ok(list_installed_plugin_manifest_keys(backend)
@@ -203,7 +203,7 @@ mod tests {
         KvBlobManifest, KvBlobManifestChunk, KvChunk, BINARY_CAS_CHUNK_NAMESPACE,
         BINARY_CAS_MANIFEST_CHUNK_NAMESPACE, BINARY_CAS_MANIFEST_NAMESPACE,
     };
-    use crate::{KvPair, KvScanRange, LixBackendTransaction, SqlDialect, SqlQueryResult, Value};
+    use crate::{KvPair, KvScanRange, BackendTransaction, SqlDialect, SqlQueryResult, Value};
     use async_trait::async_trait;
     use std::io::{Cursor, Write};
     use zip::write::SimpleFileOptions;
@@ -216,7 +216,7 @@ mod tests {
     struct UnusedTransaction;
 
     #[async_trait]
-    impl LixBackend for InstalledPluginLookupBackend {
+    impl Backend for InstalledPluginLookupBackend {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
         }
@@ -307,21 +307,21 @@ mod tests {
         async fn begin_transaction(
             &self,
             _mode: crate::backend::TransactionBeginMode,
-        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+        ) -> Result<Box<dyn BackendTransaction + '_>, LixError> {
             Ok(Box::new(UnusedTransaction))
         }
 
         async fn begin_savepoint(
             &self,
             _name: &str,
-        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+        ) -> Result<Box<dyn BackendTransaction + '_>, LixError> {
             self.begin_transaction(crate::backend::TransactionBeginMode::Write)
                 .await
         }
     }
 
     #[async_trait]
-    impl LixBackendTransaction for UnusedTransaction {
+    impl BackendTransaction for UnusedTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
         }

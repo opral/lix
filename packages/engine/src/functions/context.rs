@@ -78,7 +78,7 @@ impl FunctionContext {
 mod tests {
     use std::sync::Arc;
 
-    use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
     use crate::functions::{state::load_sequence, DeterministicSequence};
     use crate::live_state::{LiveStateContext, LiveStateRow};

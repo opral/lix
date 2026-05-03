@@ -220,11 +220,11 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
 
     #[tokio::test]
     async fn json_roundtrips_raw_payload() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let json = "{\"value\":\"small\"}";
         let encoded = encode_json(json).expect("json should encode");
         assert_eq!(encoded.codec, JsonCodec::Raw);

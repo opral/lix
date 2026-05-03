@@ -1,4 +1,4 @@
-use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
 use crate::changelog::ChangelogContext;
 use crate::commit_graph::CommitGraphContext;
 use crate::Value;

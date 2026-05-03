@@ -6,7 +6,7 @@ use lix_engine::storage_bench::{
     StorageBenchSelectivity, StorageBenchUpdateFraction,
 };
 use lix_engine::{
-    KvPair, KvScanRange, LixBackend, LixBackendTransaction, LixError, TransactionBeginMode,
+    Backend, BackendTransaction, KvPair, KvScanRange, LixError, TransactionBeginMode,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -685,11 +685,11 @@ impl AccountingBackend {
 }
 
 #[async_trait]
-impl LixBackend for AccountingBackend {
+impl Backend for AccountingBackend {
     async fn begin_transaction(
         &self,
         mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
+    ) -> Result<Box<dyn BackendTransaction + Send + Sync + 'static>, LixError> {
         Ok(Box::new(AccountingTransaction {
             store: Arc::clone(&self.store),
             mode,
@@ -730,7 +730,7 @@ impl AccountingTransaction {
 }
 
 #[async_trait]
-impl LixBackendTransaction for AccountingTransaction {
+impl BackendTransaction for AccountingTransaction {
     fn mode(&self) -> TransactionBeginMode {
         self.mode
     }

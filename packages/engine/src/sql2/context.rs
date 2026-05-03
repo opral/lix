@@ -16,10 +16,10 @@ use crate::live_state::{
 };
 use crate::transaction::types::{StageWrite, StageWriteOutcome};
 use crate::version::{VersionHead, VersionRefReader};
-use crate::{LixBackend, LixError};
+use crate::{Backend, LixError};
 
-pub(crate) type SqlChangelogQuerySource = ChangelogQuerySource<Arc<dyn LixBackend + Send + Sync>>;
-pub(crate) type SqlJsonReader = JsonStoreReader<ScopedKvStore<Arc<dyn LixBackend + Send + Sync>>>;
+pub(crate) type SqlChangelogQuerySource = ChangelogQuerySource<Arc<dyn Backend + Send + Sync>>;
+pub(crate) type SqlJsonReader = JsonStoreReader<ScopedKvStore<Arc<dyn Backend + Send + Sync>>>;
 
 #[derive(Clone)]
 pub(crate) struct ChangelogQuerySource<S> {

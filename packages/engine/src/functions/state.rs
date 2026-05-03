@@ -173,7 +173,7 @@ fn deterministic_key_value_row(
 mod tests {
     use std::sync::Arc;
 
-    use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
 
     use super::*;

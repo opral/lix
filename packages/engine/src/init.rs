@@ -16,7 +16,7 @@ use crate::version::{
     VERSION_REF_SCHEMA_VERSION,
 };
 use crate::GLOBAL_VERSION_ID;
-use crate::{LixBackend, LixError, TransactionBeginMode};
+use crate::{Backend, LixError, TransactionBeginMode};
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const KEY_VALUE_SCHEMA_VERSION: &str = "1";
@@ -147,7 +147,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 /// changelog for tracked changes, and live_state for the serving projection plus
 /// untracked moving refs.
 pub(crate) async fn initialize(
-    backend: Arc<dyn LixBackend + Send + Sync>,
+    backend: Arc<dyn Backend + Send + Sync>,
     changelog: &ChangelogContext,
     live_state: &LiveStateContext,
 ) -> Result<InitReceipt, LixError> {

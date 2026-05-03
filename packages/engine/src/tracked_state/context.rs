@@ -491,13 +491,13 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, LixBackend, TransactionBeginMode};
+    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
     use crate::tracked_state::snapshot_store::DEFAULT_MAX_INLINE_ENCODED_VALUE_BYTES;
     use crate::NullableKeyFilter;
 
     #[tokio::test]
     async fn write_root_rejects_missing_parent_root() {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let tracked_state = TrackedStateContext::new();
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)

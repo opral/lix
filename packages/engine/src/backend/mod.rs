@@ -10,4 +10,4 @@ pub use kv::{KvPair, KvScanRange};
 pub(crate) use kv::{KvStore, KvWriter};
 pub(crate) use read_scope::{ReadScope, ScopedKvStore};
 pub use transaction_mode::TransactionBeginMode;
-pub use types::{LixBackend, LixBackendTransaction};
+pub use types::{Backend, BackendTransaction};

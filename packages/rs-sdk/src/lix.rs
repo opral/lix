@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use lix_engine::{
     CreateVersionOptions, CreateVersionReceipt as CreateVersionResult, Engine, ExecuteResult,
-    KvPair, KvScanRange, LixBackend, LixBackendTransaction, LixError, MergeVersionOptions,
+    KvPair, KvScanRange, Backend, BackendTransaction, LixError, MergeVersionOptions,
     MergeVersionReceipt as MergeVersionResult, SessionContext, SwitchVersionOptions,
     SwitchVersionReceipt as SwitchVersionResult, TransactionBeginMode, Value,
 };
@@ -14,7 +14,7 @@ use crate::in_memory_backend::InMemoryBackend;
 /// Options for opening a Lix workspace session.
 #[derive(Default)]
 pub struct OpenLixOptions {
-    pub backend: Option<Box<dyn LixBackend + Send + Sync>>,
+    pub backend: Option<Box<dyn Backend + Send + Sync>>,
 }
 
 /// Workspace-session handle for a Lix repository.
@@ -31,7 +31,7 @@ pub struct Lix {
 /// backend is supplied, it is opened when already initialized and initialized
 /// first when empty.
 pub async fn open_lix(options: OpenLixOptions) -> Result<Lix, LixError> {
-    let backend: Box<dyn LixBackend + Send + Sync> = options
+    let backend: Box<dyn Backend + Send + Sync> = options
         .backend
         .unwrap_or_else(|| Box::new(InMemoryBackend::new()));
     let backend = SharedBackend::new(backend);
@@ -105,11 +105,11 @@ async fn open_or_initialize_engine(backend: &SharedBackend) -> Result<Engine, Li
 
 #[derive(Clone)]
 struct SharedBackend {
-    inner: Arc<dyn LixBackend + Send + Sync>,
+    inner: Arc<dyn Backend + Send + Sync>,
 }
 
 impl SharedBackend {
-    fn new(backend: Box<dyn LixBackend + Send + Sync>) -> Self {
+    fn new(backend: Box<dyn Backend + Send + Sync>) -> Self {
         Self {
             inner: Arc::from(backend),
         }
@@ -117,11 +117,11 @@ impl SharedBackend {
 }
 
 #[async_trait]
-impl LixBackend for SharedBackend {
+impl Backend for SharedBackend {
     async fn begin_transaction(
         &self,
         mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + Send + Sync + 'static>, LixError> {
+    ) -> Result<Box<dyn BackendTransaction + Send + Sync + 'static>, LixError> {
         self.inner.begin_transaction(mode).await
     }
 

@@ -13,11 +13,11 @@ use crate::tracked_state::TrackedStateContext;
 use crate::untracked_state::UntrackedStateContext;
 use crate::version::{VersionContext, VersionRefReader};
 use crate::GLOBAL_VERSION_ID;
-use crate::{LixBackend, LixError, NullableKeyFilter, TransactionBeginMode};
+use crate::{Backend, LixError, NullableKeyFilter, TransactionBeginMode};
 
 #[derive(Clone)]
 pub struct Engine {
-    backend: Arc<dyn LixBackend + Send + Sync>,
+    backend: Arc<dyn Backend + Send + Sync>,
     tracked_state: Arc<TrackedStateContext>,
     live_state: Arc<LiveStateContext>,
     version_ctx: Arc<VersionContext>,
@@ -33,9 +33,9 @@ impl Engine {
     /// construction. Call this before `Engine::new(...)` for a brand-new
     /// backend.
     pub async fn initialize(
-        backend: Box<dyn LixBackend + Send + Sync>,
+        backend: Box<dyn Backend + Send + Sync>,
     ) -> Result<InitReceipt, LixError> {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::from(backend);
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::from(backend);
         let changelog = ChangelogContext::new();
         let commit_graph = CommitGraphContext::new(changelog);
         let tracked_state = TrackedStateContext::new();
@@ -49,8 +49,8 @@ impl Engine {
     ///
     /// SessionContext, execution, and transaction overlays are layered below the
     /// instance instead of being hidden behind a legacy boot path.
-    pub async fn new(backend: Box<dyn LixBackend + Send + Sync>) -> Result<Self, LixError> {
-        let backend: Arc<dyn LixBackend + Send + Sync> = Arc::from(backend);
+    pub async fn new(backend: Box<dyn Backend + Send + Sync>) -> Result<Self, LixError> {
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::from(backend);
 
         let tracked_state = Arc::new(TrackedStateContext::new());
         let untracked_state = Arc::new(UntrackedStateContext::new());
@@ -79,7 +79,7 @@ impl Engine {
         })
     }
 
-    pub(crate) fn backend(&self) -> Arc<dyn LixBackend + Send + Sync> {
+    pub(crate) fn backend(&self) -> Arc<dyn Backend + Send + Sync> {
         Arc::clone(&self.backend)
     }
 
@@ -171,7 +171,7 @@ impl Engine {
 }
 
 async fn assert_initialized(
-    backend: Arc<dyn LixBackend + Send + Sync>,
+    backend: Arc<dyn Backend + Send + Sync>,
     live_state: &LiveStateContext,
 ) -> Result<(), LixError> {
     let reader = live_state.reader(backend);

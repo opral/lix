@@ -531,7 +531,7 @@ mod tests {
     struct RowsLiveStateReader {
         rows: Vec<LiveStateRow>,
     }
-    struct BackendBlobReader(Arc<dyn crate::LixBackend + Send + Sync>);
+    struct BackendBlobReader(Arc<dyn crate::Backend + Send + Sync>);
     struct DummyChangelogReader;
     struct DummyCommitGraphReader;
     struct DummyVersionRefReader;
@@ -648,7 +648,7 @@ mod tests {
         fn changelog_query_source(&self) -> SqlChangelogQuerySource {
             let read_scope =
                 ReadScope::new(Arc::new(crate::backend::testing::UnitTestBackend::new())
-                    as Arc<dyn crate::LixBackend + Send + Sync>);
+                    as Arc<dyn crate::Backend + Send + Sync>);
             ChangelogQuerySource {
                 changelog_reader: Arc::new(DummyChangelogReader),
                 json_reader: JsonStoreContext::new().reader(read_scope.store()),
@@ -2334,7 +2334,7 @@ mod tests {
 
     struct BackendSqlExecutionContext<'a> {
         active_version_id: &'a str,
-        backend: Arc<dyn crate::LixBackend + Send + Sync>,
+        backend: Arc<dyn crate::Backend + Send + Sync>,
         blob_reader: Arc<dyn BlobDataReader>,
         live_state: Arc<dyn LiveStateReader>,
         schema_definitions: Vec<JsonValue>,
@@ -2497,7 +2497,7 @@ mod tests {
                     .await
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
-                let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
+                let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
                 let blob_reader: Arc<dyn BlobDataReader> =
                     Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
                 let ctx = BackendSqlExecutionContext {
@@ -2544,7 +2544,7 @@ mod tests {
                     .await
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
-                let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
+                let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
                 let blob_reader: Arc<dyn BlobDataReader> =
                     Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
                 let ctx = BackendSqlExecutionContext {
@@ -2583,7 +2583,7 @@ mod tests {
                     .await
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
-                let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
+                let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
                 let blob_reader: Arc<dyn BlobDataReader> =
                     Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
                 let ctx = BackendSqlExecutionContext {
@@ -2622,7 +2622,7 @@ mod tests {
                     .await
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
-                let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
+                let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
                 let blob_reader: Arc<dyn BlobDataReader> =
                     Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
                 let ctx = BackendSqlExecutionContext {
@@ -2660,7 +2660,7 @@ mod tests {
                     .await
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
-                let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
+                let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
                 let blob_reader: Arc<dyn BlobDataReader> =
                     Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
                 let ctx = BackendSqlExecutionContext {
@@ -2699,7 +2699,7 @@ mod tests {
                     .await
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
-                let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
+                let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
                 let blob_reader: Arc<dyn BlobDataReader> =
                     Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
                 let ctx = BackendSqlExecutionContext {
@@ -2739,7 +2739,7 @@ mod tests {
                     .await
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
-                let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
+                let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
                 let blob_reader: Arc<dyn BlobDataReader> =
                     Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
                 let ctx = BackendSqlExecutionContext {
@@ -2778,7 +2778,7 @@ mod tests {
                     .await
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
-                let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
+                let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
                 let blob_reader: Arc<dyn BlobDataReader> =
                     Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
                 let ctx = BackendSqlExecutionContext {
@@ -2826,7 +2826,7 @@ mod tests {
                     .await
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
-                let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
+                let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
                 let blob_reader: Arc<dyn BlobDataReader> =
                     Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
                 let ctx = BackendSqlExecutionContext {
