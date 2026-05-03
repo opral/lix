@@ -96,7 +96,10 @@ export type MergeVersionOptions = {
   sourceVersionId: string;
 };
 
-export type MergeVersionOutcome = "alreadyUpToDate" | "mergeCommitted";
+export type MergeVersionOutcome =
+  | "alreadyUpToDate"
+  | "fastForward"
+  | "mergeCommitted";
 
 export type MergeVersionResult = {
   outcome: MergeVersionOutcome;
@@ -167,6 +170,7 @@ export type MergeVersionResult = {
             let object = Object::new();
             let outcome = match result.outcome {
                 lix_rs_sdk::MergeVersionOutcome::AlreadyUpToDate => "alreadyUpToDate",
+                lix_rs_sdk::MergeVersionOutcome::FastForward => "fastForward",
                 lix_rs_sdk::MergeVersionOutcome::MergeCommitted => "mergeCommitted",
             };
             set_string(&object, "outcome", outcome).map_err(js_error)?;

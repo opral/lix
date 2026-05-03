@@ -185,7 +185,10 @@ export type MergeVersionOptions = {
 	sourceVersionId: string;
 };
 
-export type MergeVersionOutcome = "alreadyUpToDate" | "mergeCommitted";
+export type MergeVersionOutcome =
+	| "alreadyUpToDate"
+	| "fastForward"
+	| "mergeCommitted";
 
 export type MergeVersionResult = {
 	outcome: MergeVersionOutcome;

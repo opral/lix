@@ -77,9 +77,10 @@ test("openLix exposes the rs-sdk e2e flow", async () => {
 		sourceVersionId: draft.versionId,
 	});
 
-	expect(merge.outcome).toBe("mergeCommitted");
+	expect(merge.outcome).toBe("fastForward");
 	expect(merge.targetVersionId).toBe(mainVersionId);
-	expect(merge.appliedChangeCount).toBeGreaterThan(0);
+	expect(merge.appliedChangeCount).toBe(0);
+	expect(merge.createdMergeCommitId).toBeNull();
 	expect(await taskDone(lix, "task-1")).toBe(true);
 
 	await lix.close();
