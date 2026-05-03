@@ -22,16 +22,14 @@ use tokio::sync::Mutex;
 
 use crate::commit_graph::{CommitGraphCommit, CommitGraphReader};
 use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
-use crate::version_ref::VersionRefReader;
+use crate::version::VersionRefReader;
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 
 use super::record_batch::record_batch_with_row_count;
-use super::result_metadata::json_field;
 
-pub(crate) async fn register_commit_providers(
+pub(crate) async fn register_commit_derived_providers(
     session: &datafusion::prelude::SessionContext,
-    active_version_id: &str,
     commit_graph: Box<dyn CommitGraphReader>,
     version_ref: Arc<dyn VersionRefReader>,
 ) -> Result<(), LixError> {
@@ -39,7 +37,6 @@ pub(crate) async fn register_commit_providers(
     for surface in CommitSurface::all() {
         let provider = Arc::new(CommitSurfaceProvider::new(
             surface,
-            active_version_id.to_string(),
             Arc::clone(&commit_graph),
             Arc::clone(&version_ref),
         ));
@@ -52,8 +49,6 @@ pub(crate) async fn register_commit_providers(
 
 #[derive(Debug, Clone, Copy)]
 enum CommitSurface {
-    Commit,
-    CommitByVersion,
     CommitEdge,
     CommitEdgeByVersion,
     ChangeSet,
@@ -63,10 +58,8 @@ enum CommitSurface {
 }
 
 impl CommitSurface {
-    fn all() -> [Self; 8] {
+    fn all() -> [Self; 6] {
         [
-            Self::Commit,
-            Self::CommitByVersion,
             Self::CommitEdge,
             Self::CommitEdgeByVersion,
             Self::ChangeSet,
@@ -78,8 +71,6 @@ impl CommitSurface {
 
     fn table_name(self) -> &'static str {
         match self {
-            Self::Commit => "lix_commit",
-            Self::CommitByVersion => "lix_commit_by_version",
             Self::CommitEdge => "lix_commit_edge",
             Self::CommitEdgeByVersion => "lix_commit_edge_by_version",
             Self::ChangeSet => "lix_change_set",
@@ -91,8 +82,6 @@ impl CommitSurface {
 
     fn schema(self) -> SchemaRef {
         match self {
-            Self::Commit => commit_schema(false),
-            Self::CommitByVersion => commit_schema(true),
             Self::CommitEdge => commit_edge_schema(false),
             Self::CommitEdgeByVersion => commit_edge_schema(true),
             Self::ChangeSet => change_set_schema(false),
@@ -105,17 +94,13 @@ impl CommitSurface {
     fn by_version(self) -> bool {
         matches!(
             self,
-            Self::CommitByVersion
-                | Self::CommitEdgeByVersion
-                | Self::ChangeSetByVersion
-                | Self::ChangeSetElementByVersion
+            Self::CommitEdgeByVersion | Self::ChangeSetByVersion | Self::ChangeSetElementByVersion
         )
     }
 }
 
 struct CommitSurfaceProvider {
     surface: CommitSurface,
-    active_version_id: String,
     schema: SchemaRef,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     version_ref: Arc<dyn VersionRefReader>,
@@ -132,13 +117,11 @@ impl std::fmt::Debug for CommitSurfaceProvider {
 impl CommitSurfaceProvider {
     fn new(
         surface: CommitSurface,
-        active_version_id: String,
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
         version_ref: Arc<dyn VersionRefReader>,
     ) -> Self {
         Self {
             surface,
-            active_version_id,
             schema: surface.schema(),
             commit_graph,
             version_ref,
@@ -179,7 +162,6 @@ impl TableProvider for CommitSurfaceProvider {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(CommitSurfaceScanExec::new(
             self.surface,
-            self.active_version_id.clone(),
             Arc::clone(&self.commit_graph),
             Arc::clone(&self.version_ref),
             projected_schema(&self.schema, projection),
@@ -191,7 +173,6 @@ impl TableProvider for CommitSurfaceProvider {
 
 struct CommitSurfaceScanExec {
     surface: CommitSurface,
-    active_version_id: String,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     version_ref: Arc<dyn VersionRefReader>,
     schema: SchemaRef,
@@ -211,7 +192,6 @@ impl std::fmt::Debug for CommitSurfaceScanExec {
 impl CommitSurfaceScanExec {
     fn new(
         surface: CommitSurface,
-        active_version_id: String,
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
         version_ref: Arc<dyn VersionRefReader>,
         schema: SchemaRef,
@@ -226,7 +206,6 @@ impl CommitSurfaceScanExec {
         );
         Self {
             surface,
-            active_version_id,
             commit_graph,
             version_ref,
             schema,
@@ -289,22 +268,23 @@ impl ExecutionPlan for CommitSurfaceScanExec {
         }
 
         let surface = self.surface;
-        let active_version_id = self.active_version_id.clone();
         let commit_graph = Arc::clone(&self.commit_graph);
         let version_ref = Arc::clone(&self.version_ref);
         let projection = self.projection.clone();
         let limit = self.limit;
         let schema = Arc::clone(&self.schema);
         let stream = stream::once(async move {
-            let version_binding = if surface.by_version() {
-                VersionBinding::explicit()
+            let version_ids = if surface.by_version() {
+                resolve_provider_version_ids(
+                    version_ref.as_ref(),
+                    &VersionBinding::explicit(),
+                    Vec::new(),
+                )
+                .await
+                .map_err(lix_error_to_datafusion_error)?
             } else {
-                VersionBinding::active(active_version_id)
+                vec![GLOBAL_VERSION_ID.to_string()]
             };
-            let version_ids =
-                resolve_provider_version_ids(version_ref.as_ref(), &version_binding, Vec::new())
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
             let rows = rows_for_surface(
                 surface,
                 &version_ids,
@@ -325,14 +305,6 @@ impl ExecutionPlan for CommitSurfaceScanExec {
 
 #[derive(Debug, Clone)]
 enum SurfaceRow {
-    Commit {
-        version_id: Option<String>,
-        id: String,
-        change_set_id: String,
-        change_ids: Vec<String>,
-        author_account_ids: Vec<String>,
-        parent_commit_ids: Vec<String>,
-    },
     CommitEdge {
         version_id: Option<String>,
         parent_id: String,
@@ -363,29 +335,9 @@ async fn rows_for_surface(
     let mut graph = commit_graph.lock().await;
 
     for version_id in version_ids {
-        let commits = visible_commits_for_version(
-            &mut **graph,
-            version_ref.as_ref(),
-            version_id,
-            surface.by_version(),
-        )
-        .await?;
+        let commits =
+            visible_commits_for_version(&mut **graph, version_ref.as_ref(), version_id).await?;
         match surface {
-            CommitSurface::Commit | CommitSurface::CommitByVersion => {
-                for commit in commits {
-                    let key = format!("{version_id}\0commit\0{}", commit.commit_id);
-                    if seen.insert(key) {
-                        rows.push(SurfaceRow::Commit {
-                            version_id: surface.by_version().then(|| version_id.clone()),
-                            id: commit.commit_id,
-                            change_set_id: commit.change_set_id,
-                            change_ids: commit.change_ids,
-                            author_account_ids: commit.author_account_ids,
-                            parent_commit_ids: commit.parent_commit_ids,
-                        });
-                    }
-                }
-            }
             CommitSurface::CommitEdge | CommitSurface::CommitEdgeByVersion => {
                 for edge in graph.commit_edges(&commits) {
                     let key = format!(
@@ -439,9 +391,8 @@ async fn visible_commits_for_version(
     commit_graph: &mut dyn CommitGraphReader,
     version_ref: &dyn VersionRefReader,
     version_id: &str,
-    by_version: bool,
 ) -> Result<Vec<CommitGraphCommit>, LixError> {
-    if by_version && version_id == GLOBAL_VERSION_ID {
+    if version_id == GLOBAL_VERSION_ID {
         return commit_graph.all_commits().await;
     }
     let Some(head_commit_id) = version_ref.load_head_commit_id(version_id).await? else {
@@ -477,9 +428,6 @@ fn surface_record_batch(
 enum SurfaceColumn {
     Id,
     ChangeSetId,
-    ChangeIds,
-    AuthorAccountIds,
-    ParentCommitIds,
     ParentId,
     ChildId,
     ChangeId,
@@ -496,9 +444,6 @@ impl SurfaceColumn {
         match self {
             Self::Id => Field::new("id", DataType::Utf8, false),
             Self::ChangeSetId => Field::new("change_set_id", DataType::Utf8, false),
-            Self::ChangeIds => json_field("change_ids", false),
-            Self::AuthorAccountIds => json_field("author_account_ids", false),
-            Self::ParentCommitIds => json_field("parent_commit_ids", false),
             Self::ParentId => Field::new("parent_id", DataType::Utf8, false),
             Self::ChildId => Field::new("child_id", DataType::Utf8, false),
             Self::ChangeId => Field::new("change_id", DataType::Utf8, false),
@@ -514,32 +459,11 @@ impl SurfaceColumn {
     fn array(self, rows: &[SurfaceRow]) -> ArrayRef {
         match self {
             Self::Id => string_array(rows.iter().map(|row| match row {
-                SurfaceRow::Commit { id, .. } | SurfaceRow::ChangeSet { id, .. } => {
-                    Some(id.as_str())
-                }
+                SurfaceRow::ChangeSet { id, .. } => Some(id.as_str()),
                 _ => None,
             })),
             Self::ChangeSetId => string_array(rows.iter().map(|row| match row {
-                SurfaceRow::Commit { change_set_id, .. }
-                | SurfaceRow::ChangeSetElement { change_set_id, .. } => {
-                    Some(change_set_id.as_str())
-                }
-                _ => None,
-            })),
-            Self::ChangeIds => json_array_column(rows.iter().map(|row| match row {
-                SurfaceRow::Commit { change_ids, .. } => Some(change_ids),
-                _ => None,
-            })),
-            Self::AuthorAccountIds => json_array_column(rows.iter().map(|row| match row {
-                SurfaceRow::Commit {
-                    author_account_ids, ..
-                } => Some(author_account_ids),
-                _ => None,
-            })),
-            Self::ParentCommitIds => json_array_column(rows.iter().map(|row| match row {
-                SurfaceRow::Commit {
-                    parent_commit_ids, ..
-                } => Some(parent_commit_ids),
+                SurfaceRow::ChangeSetElement { change_set_id, .. } => Some(change_set_id.as_str()),
                 _ => None,
             })),
             Self::ParentId => string_array(rows.iter().map(|row| match row {
@@ -567,8 +491,7 @@ impl SurfaceColumn {
                 _ => None,
             })),
             Self::VersionId => string_array(rows.iter().map(|row| match row {
-                SurfaceRow::Commit { version_id, .. }
-                | SurfaceRow::CommitEdge { version_id, .. }
+                SurfaceRow::CommitEdge { version_id, .. }
                 | SurfaceRow::ChangeSet { version_id, .. }
                 | SurfaceRow::ChangeSetElement { version_id, .. } => version_id.as_deref(),
             })),
@@ -580,25 +503,6 @@ impl SurfaceColumn {
 
 fn surface_columns(surface: CommitSurface, projection: Option<&Vec<usize>>) -> Vec<SurfaceColumn> {
     let all_columns = match surface {
-        CommitSurface::Commit => vec![
-            SurfaceColumn::Id,
-            SurfaceColumn::ChangeSetId,
-            SurfaceColumn::ChangeIds,
-            SurfaceColumn::AuthorAccountIds,
-            SurfaceColumn::ParentCommitIds,
-            SurfaceColumn::Global,
-            SurfaceColumn::Untracked,
-        ],
-        CommitSurface::CommitByVersion => vec![
-            SurfaceColumn::Id,
-            SurfaceColumn::ChangeSetId,
-            SurfaceColumn::ChangeIds,
-            SurfaceColumn::AuthorAccountIds,
-            SurfaceColumn::ParentCommitIds,
-            SurfaceColumn::VersionId,
-            SurfaceColumn::Global,
-            SurfaceColumn::Untracked,
-        ],
         CommitSurface::CommitEdge => vec![
             SurfaceColumn::ParentId,
             SurfaceColumn::ChildId,
@@ -660,17 +564,6 @@ fn surface_schema(columns: &[SurfaceColumn]) -> SchemaRef {
     ))
 }
 
-fn commit_schema(by_version: bool) -> SchemaRef {
-    surface_schema(&surface_columns(
-        if by_version {
-            CommitSurface::CommitByVersion
-        } else {
-            CommitSurface::Commit
-        },
-        None,
-    ))
-}
-
 fn commit_edge_schema(by_version: bool) -> SchemaRef {
     surface_schema(&surface_columns(
         if by_version {
@@ -713,18 +606,6 @@ fn projected_schema(schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Sche
 
 fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
     Arc::new(StringArray::from(values.collect::<Vec<_>>())) as ArrayRef
-}
-
-fn json_array_column<'a>(values: impl Iterator<Item = Option<&'a Vec<String>>>) -> ArrayRef {
-    let values = values
-        .map(|value| {
-            value.map(|strings| {
-                serde_json::to_string(strings)
-                    .expect("serializing string arrays for commit surfaces should not fail")
-            })
-        })
-        .collect::<Vec<_>>();
-    Arc::new(StringArray::from(values)) as ArrayRef
 }
 
 fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {

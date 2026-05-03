@@ -5,8 +5,8 @@ use crate::changelog::{CanonicalChange, ChangelogContext};
 use crate::json_store::{JsonRef, JsonStoreContext, JsonStoreWriter};
 use crate::live_state::{LiveStateContext, LiveStateRow};
 use crate::transaction::staging::StagedWriteSet;
-use crate::transaction::types::{StagedCommitMembers, StagedStateRow};
-use crate::version_ref::VersionRefContext;
+use crate::transaction::types::{StagedAdoptedStateRow, StagedCommitMembers, StagedStateRow};
+use crate::version::{VersionContext, VersionRefReader};
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError};
 
@@ -21,7 +21,7 @@ pub(crate) async fn commit_staged_writes(
     binary_cas: &BinaryCasContext,
     changelog: &ChangelogContext,
     live_state: &LiveStateContext,
-    version_ref: &VersionRefContext,
+    version_ctx: &VersionContext,
     transaction: &mut dyn LixBackendTransaction,
     staged_writes: StagedWriteSet,
 ) -> Result<(), LixError> {
@@ -45,26 +45,30 @@ pub(crate) async fn commit_staged_writes(
         .state_rows
         .into_iter()
         .partition(|row| !row.untracked);
+    let adopted_rows = staged_writes.adopted_rows;
     let finalized = finalize_commit_rows(
         staged_writes.commit_members_by_version,
         staged_writes.extra_commit_parents_by_version,
-        version_ref,
+        version_ctx,
         transaction,
     )
     .await?;
     changelog_rows.extend(finalized.commit_rows);
     let version_heads = finalized.version_heads;
 
-    if changelog_rows.is_empty() && untracked_rows.is_empty() && version_heads.is_empty() {
+    if changelog_rows.is_empty()
+        && adopted_rows.is_empty()
+        && untracked_rows.is_empty()
+        && version_heads.is_empty()
+    {
         return Ok(());
     }
 
     if !changelog_rows.is_empty() {
         let mut json_writer = JsonStoreContext::new().writer();
-        let canonical_changes = changelog_rows
-            .iter()
-            .map(|row| canonical_change_from_staged_row(&mut json_writer, row))
-            .collect::<Result<Vec<_>, _>>()?;
+        let canonical_changes =
+            new_canonical_changes(changelog, transaction, &mut json_writer, &changelog_rows)
+                .await?;
         {
             let mut writer_store = &mut *transaction;
             json_writer.flush(&mut writer_store).await?;
@@ -74,14 +78,18 @@ pub(crate) async fn commit_staged_writes(
             writer.append_changes(&canonical_changes).await?;
         }
     }
+    if !adopted_rows.is_empty() {
+        validate_adopted_canonical_changes(changelog, transaction, &adopted_rows).await?;
+    }
 
     // The serving projection is updated in the same backend transaction as the
     // changelog append. Tracked rows become prolly mutations under their owning
     // commit root; untracked rows remain in the separate local overlay store.
     let live_state_rows = changelog_rows
         .into_iter()
-        .chain(untracked_rows)
         .map(LiveStateRow::from)
+        .chain(adopted_rows.into_iter().map(LiveStateRow::from))
+        .chain(untracked_rows.into_iter().map(LiveStateRow::from))
         .collect::<Vec<_>>();
 
     {
@@ -89,15 +97,85 @@ pub(crate) async fn commit_staged_writes(
         writer.write_rows(&live_state_rows).await?;
     }
 
-    let mut writer = version_ref.writer(transaction);
     for version_head in version_heads {
-        writer
-            .advance_head(
+        version_ctx
+            .advance_ref(
+                &mut *transaction,
                 &version_head.version_id,
                 &version_head.commit_id,
                 &version_head.timestamp,
             )
             .await?;
+    }
+    Ok(())
+}
+
+async fn new_canonical_changes(
+    changelog: &ChangelogContext,
+    transaction: &mut dyn LixBackendTransaction,
+    json_writer: &mut JsonStoreWriter,
+    rows: &[StagedStateRow],
+) -> Result<Vec<CanonicalChange>, LixError> {
+    let reader = changelog.reader(&mut *transaction);
+    let mut changes = Vec::new();
+    for row in rows {
+        let change = canonical_change_from_staged_row(json_writer, row)?;
+        match reader.load_change(&change.id).await? {
+            Some(existing) => {
+                let entity_id = existing
+                    .entity_id
+                    .as_string()
+                    .unwrap_or_else(|_| "<invalid entity_id>".to_string());
+                return Err(LixError::new(
+                    LixError::CODE_UNIQUE,
+                    format!(
+                        "canonical change id '{}' already exists with different content for schema '{}' entity '{}'",
+                        change.id,
+                        existing.schema_key,
+                        entity_id
+                    ),
+                ));
+            }
+            None => changes.push(change),
+        }
+    }
+    Ok(changes)
+}
+
+async fn validate_adopted_canonical_changes(
+    changelog: &ChangelogContext,
+    transaction: &mut dyn LixBackendTransaction,
+    rows: &[StagedAdoptedStateRow],
+) -> Result<(), LixError> {
+    let mut json_writer = JsonStoreContext::new().writer();
+    let reader = changelog.reader(&mut *transaction);
+    for row in rows {
+        let expected = canonical_change_from_adopted_row(&mut json_writer, row)?;
+        match reader.load_change(&expected.id).await? {
+            Some(existing) if existing == expected => {}
+            Some(existing) => {
+                let entity_id = existing
+                    .entity_id
+                    .as_string()
+                    .unwrap_or_else(|_| "<invalid entity_id>".to_string());
+                return Err(LixError::new(
+                    LixError::CODE_UNIQUE,
+                    format!(
+                        "adopted canonical change id '{}' exists with different content for schema '{}' entity '{}'",
+                        expected.id, existing.schema_key, entity_id
+                    ),
+                ));
+            }
+            None => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "adopted canonical change id '{}' does not exist in the changelog",
+                        expected.id
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -135,10 +213,30 @@ fn stage_optional_json(
     json_writer.stage_bytes(value.as_bytes()).map(Some)
 }
 
+fn canonical_change_from_adopted_row(
+    json_writer: &mut JsonStoreWriter,
+    row: &StagedAdoptedStateRow,
+) -> Result<CanonicalChange, LixError> {
+    Ok(CanonicalChange {
+        id: row.change_id.clone(),
+        entity_id: row.entity_id.clone(),
+        schema_key: row.schema_key.clone(),
+        schema_version: row.schema_version.clone(),
+        file_id: row.file_id.clone(),
+        snapshot_ref: stage_optional_json(json_writer, row.snapshot_content.as_deref())?,
+        metadata_ref: stage_optional_json(json_writer, row.metadata.as_deref())?,
+        created_at: row.created_at.clone(),
+    })
+}
+
 /// Materializes tracked staged membership into `lix_commit` rows.
 ///
 /// Staging only accumulates `version_id -> change_ids` because commit ids,
 /// parent heads, and commit-row timestamps belong to transaction finalization.
+/// The `change_ids` list is the ordered set of canonical changes whose effects
+/// the commit introduces relative to its first parent; merge commits may later
+/// populate this list with existing source-parent changes instead of copied
+/// changelog facts.
 /// This function turns those membership sets into normal `StagedStateRow`s with
 /// `schema_key = "lix_commit"`, so the changelog/live_state flush can treat
 /// commit rows exactly like any other staged state row.
@@ -148,7 +246,7 @@ fn stage_optional_json(
 /// `commit_rows` are ordinary changelog facts. live_state later projects them
 /// from commit_graph; tracked_state roots do not store commit graph facts.
 ///
-/// `version_heads` are moving refs. They are written through `VersionRefContext`
+/// `version_heads` are moving refs. They are written through `VersionContext`
 /// and must never be appended to changelog.
 struct FinalizedCommitRows {
     commit_rows: Vec<StagedStateRow>,
@@ -164,14 +262,14 @@ struct PendingVersionHead {
 async fn finalize_commit_rows(
     commit_members_by_version: BTreeMap<String, StagedCommitMembers>,
     extra_commit_parents_by_version: BTreeMap<String, Vec<String>>,
-    version_ref: &VersionRefContext,
+    version_ctx: &VersionContext,
     transaction: &mut dyn LixBackendTransaction,
 ) -> Result<FinalizedCommitRows, LixError> {
     let mut commit_rows = Vec::new();
     let mut version_heads = Vec::new();
 
     for (version_id, members) in commit_members_by_version {
-        if members.is_empty() {
+        if members.is_empty() && !members.allow_empty {
             continue;
         }
 
@@ -180,8 +278,8 @@ async fn finalize_commit_rows(
         let change_set_id = members.change_set_id;
         let timestamp = members.created_at;
         let change_ids = members.change_ids.into_iter().collect::<Vec<_>>();
-        let parent_commit_ids = version_ref
-            .reader(&mut *transaction)
+        let parent_commit_ids = version_ctx
+            .ref_reader(&mut *transaction)
             .load_head_commit_id(&version_id)
             .await?
             .into_iter()
@@ -258,7 +356,7 @@ mod tests {
     use crate::untracked_state::{
         UntrackedStateContext, UntrackedStateRow, UntrackedStateRowRequest,
     };
-    use crate::version_ref::VersionRefContext;
+    use crate::version::VersionContext;
     use crate::NullableKeyFilter;
 
     fn live_state_context() -> LiveStateContext {
@@ -275,7 +373,7 @@ mod tests {
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
         let live_state = Arc::new(live_state_context());
-        let version_ref = VersionRefContext::new(Arc::new(UntrackedStateContext::new()));
+        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await
@@ -285,11 +383,12 @@ mod tests {
             &binary_cas,
             &changelog,
             live_state.as_ref(),
-            &version_ref,
+            &version_ctx,
             transaction.as_mut(),
             StagedWriteSet {
                 insert_identities: BTreeSet::new(),
                 state_rows: vec![tracked_global_row("change-1")],
+                adopted_rows: Vec::new(),
                 commit_members_by_version: BTreeMap::from([(
                     GLOBAL_VERSION_ID.to_string(),
                     members(["change-1"]),
@@ -324,8 +423,8 @@ mod tests {
             .iter()
             .any(|change| change.schema_key == "lix_version_ref"));
 
-        let loaded_head = version_ref
-            .reader(Arc::clone(&backend))
+        let loaded_head = version_ctx
+            .ref_reader(Arc::clone(&backend))
             .load_head_commit_id(GLOBAL_VERSION_ID)
             .await
             .expect("version ref load should succeed");
@@ -338,7 +437,7 @@ mod tests {
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
         let live_state = Arc::new(live_state_context());
-        let version_ref = VersionRefContext::new(Arc::new(UntrackedStateContext::new()));
+        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
         let untracked_state = UntrackedStateContext::new();
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -349,11 +448,12 @@ mod tests {
             &binary_cas,
             &changelog,
             live_state.as_ref(),
-            &version_ref,
+            &version_ctx,
             transaction.as_mut(),
             StagedWriteSet {
                 insert_identities: BTreeSet::new(),
                 state_rows: vec![untracked_global_row("change-untracked")],
+                adopted_rows: Vec::new(),
                 commit_members_by_version: BTreeMap::new(),
                 extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
@@ -401,7 +501,7 @@ mod tests {
         let changelog = ChangelogContext::new();
         let untracked_state = UntrackedStateContext::new();
         let live_state = Arc::new(live_state_context());
-        let version_ref = VersionRefContext::new(Arc::new(UntrackedStateContext::new()));
+        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
 
         let mut seed_transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
@@ -427,11 +527,12 @@ mod tests {
             &binary_cas,
             &changelog,
             live_state.as_ref(),
-            &version_ref,
+            &version_ctx,
             transaction.as_mut(),
             StagedWriteSet {
                 insert_identities: BTreeSet::new(),
                 state_rows: vec![tracked_global_row("change-tracked")],
+                adopted_rows: Vec::new(),
                 commit_members_by_version: BTreeMap::from([(
                     GLOBAL_VERSION_ID.to_string(),
                     members(["change-tracked"]),
@@ -471,7 +572,7 @@ mod tests {
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
         let live_state = Arc::new(live_state_context());
-        let version_ref = VersionRefContext::new(Arc::new(UntrackedStateContext::new()));
+        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
         crate::test_support::seed_version_head(
             backend.as_ref(),
             GLOBAL_VERSION_ID,
@@ -489,11 +590,12 @@ mod tests {
             &binary_cas,
             &changelog,
             live_state.as_ref(),
-            &version_ref,
+            &version_ctx,
             transaction.as_mut(),
             StagedWriteSet {
                 insert_identities: BTreeSet::new(),
                 state_rows: vec![tracked_version_row("version-a", "change-version-a")],
+                adopted_rows: Vec::new(),
                 commit_members_by_version: BTreeMap::from([(
                     "version-a".to_string(),
                     members(["change-version-a"]),
@@ -535,13 +637,13 @@ mod tests {
             .iter()
             .any(|change| change.schema_key == "lix_version_ref"));
 
-        let global_head = version_ref
-            .reader(Arc::clone(&backend))
+        let global_head = version_ctx
+            .ref_reader(Arc::clone(&backend))
             .load_head_commit_id(GLOBAL_VERSION_ID)
             .await
             .expect("global head should load");
-        let version_head = version_ref
-            .reader(Arc::clone(&backend))
+        let version_head = version_ctx
+            .ref_reader(Arc::clone(&backend))
             .load_head_commit_id("version-a")
             .await
             .expect("version head should load");
@@ -552,7 +654,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_parents_global_commit_to_existing_version_ref() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let version_ref = VersionRefContext::new(Arc::new(UntrackedStateContext::new()));
+        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
         crate::test_support::seed_version_head(
             backend.as_ref(),
             GLOBAL_VERSION_ID,
@@ -570,7 +672,7 @@ mod tests {
                 members(["change-a", "change-b"]),
             )]),
             BTreeMap::new(),
-            &version_ref,
+            &version_ctx,
             transaction.as_mut(),
         )
         .await
@@ -629,7 +731,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_skips_empty_members() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let version_ref = VersionRefContext::new(Arc::new(UntrackedStateContext::new()));
+        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
         let mut transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await
@@ -640,7 +742,7 @@ mod tests {
                 StagedCommitMembers::default(),
             )]),
             BTreeMap::new(),
-            &version_ref,
+            &version_ctx,
             transaction.as_mut(),
         )
         .await
@@ -653,7 +755,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_uses_existing_version_ref_as_parent() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let version_ref = VersionRefContext::new(Arc::new(UntrackedStateContext::new()));
+        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
         crate::test_support::seed_version_head(
             backend.as_ref(),
             GLOBAL_VERSION_ID,
@@ -670,7 +772,7 @@ mod tests {
         let rows = finalize_commit_rows(
             BTreeMap::from([("version-a".to_string(), members(["change-a"]))]),
             BTreeMap::new(),
-            &version_ref,
+            &version_ctx,
             transaction.as_mut(),
         )
         .await
@@ -699,7 +801,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_appends_extra_merge_parent_after_target_head() {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let version_ref = VersionRefContext::new(Arc::new(UntrackedStateContext::new()));
+        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
         crate::test_support::seed_version_head(backend.as_ref(), "version-a", "target-head").await;
 
         let mut transaction = backend
@@ -709,7 +811,7 @@ mod tests {
         let rows = finalize_commit_rows(
             BTreeMap::from([("version-a".to_string(), members(["change-a"]))]),
             BTreeMap::from([("version-a".to_string(), vec!["source-head".to_string()])]),
-            &version_ref,
+            &version_ctx,
             transaction.as_mut(),
         )
         .await

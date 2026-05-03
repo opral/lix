@@ -32,6 +32,8 @@ mod lix_state;
 mod lix_state_history;
 #[path = "sql/lix_version.rs"]
 mod lix_version;
+#[path = "sql/read_only.rs"]
+mod read_only;
 #[path = "sql/udfs.rs"]
 mod udfs;
 

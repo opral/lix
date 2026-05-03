@@ -34,6 +34,7 @@ pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError
             code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
             description: format!("Invalid Lix schema definition: {details}"),
             hint: None,
+            details: None,
         });
     }
 
@@ -125,6 +126,7 @@ fn detect_missing_pointer_slash(schema: &JsonValue) -> Option<LixError> {
             code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
             description,
             hint: None,
+            details: None,
         }
         .with_hint(hint),
     )
@@ -140,6 +142,7 @@ pub fn validate_lix_schema(schema: &JsonValue, data: &JsonValue) -> Result<(), L
             code: LixError::CODE_SCHEMA_VALIDATION.to_string(),
             description: format!("Data validation failed: {details}"),
             hint: None,
+            details: None,
         });
     }
 
@@ -154,6 +157,7 @@ fn lix_schema_validator() -> Result<&'static JSONSchema, LixError> {
             code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
             description: err.description.clone(),
             hint: None,
+            details: None,
         }),
     }
 }
@@ -172,6 +176,7 @@ pub(crate) fn compile_lix_schema(schema: &JsonValue) -> Result<JSONSchema, LixEr
         code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
         description: format!("Failed to compile Lix schema definition: {err}"),
         hint: None,
+        details: None,
     })
 }
 
@@ -199,6 +204,7 @@ fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
             code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
             description: "Invalid JSON pointer".to_string(),
             hint: None,
+            details: None,
         });
     }
 
@@ -222,6 +228,7 @@ fn unescape_pointer_segment(segment: &str) -> Result<String, LixError> {
                         code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
                         description: "Invalid JSON pointer".to_string(),
                         hint: None,
+                        details: None,
                     })
                 }
             }
@@ -251,6 +258,7 @@ fn assert_primary_key_pointers(schema: &JsonValue) -> Result<(), LixError> {
                     pointer
                 ),
                 hint: None,
+            details: None,
             });
         }
     }
@@ -281,6 +289,7 @@ fn assert_unique_pointers(schema: &JsonValue) -> Result<(), LixError> {
                         pointer
                     ),
                     hint: None,
+            details: None,
                 });
             }
         }
@@ -314,6 +323,7 @@ fn assert_non_aliased_lix_foreign_key_references(schema: &JsonValue) -> Result<(
                 "Invalid Lix schema definition: x-lix-foreign-keys references.schemaKey uses deprecated alias \"{schema_key}\"; use \"{replacement}\"."
             ),
             hint: None,
+            details: None,
         });
     }
 
@@ -347,6 +357,7 @@ fn assert_known_x_lix_top_level_fields(schema: &JsonValue) -> Result<(), LixErro
                     key
                 ),
                 hint: None,
+                details: None,
             });
         }
     }

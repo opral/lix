@@ -36,6 +36,7 @@ pub fn run(context: &AppContext, command: CreateVersionCommand) -> Result<Comman
     let result = crate::db::block_on(lix.create_version(CreateVersionOptions {
         id: command.id,
         name,
+        from_commit_id: None,
     }))
     .map_err(|error| CliError::msg(error.to_string()))?;
     if source.is_some() {

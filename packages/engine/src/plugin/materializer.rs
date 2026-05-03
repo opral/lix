@@ -52,6 +52,7 @@ pub(crate) async fn load_installed_plugins_with_runtime_cache(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "installed plugin cache lock poisoned".to_string(),
             hint: None,
+            details: None,
         })?
         .clone()
     {
@@ -66,6 +67,7 @@ pub(crate) async fn load_installed_plugins_with_runtime_cache(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "installed plugin cache lock poisoned".to_string(),
             hint: None,
+            details: None,
         })?;
     *guard = Some(plugins.clone());
     Ok(plugins)
@@ -102,6 +104,7 @@ pub(crate) async fn load_installed_plugin_from_archive_ref_with_backend(
                 archive_ref.path
             ),
             hint: None,
+            details: None,
         });
     };
     let binary_cas = crate::binary_cas::BinaryCasContext::new();
@@ -116,6 +119,7 @@ pub(crate) async fn load_installed_plugin_from_archive_ref_with_backend(
                 archive_ref.blob_hash, archive_ref.path, archive_ref.file_id
             ),
             hint: None,
+            details: None,
         })?;
     if archive_bytes.is_empty() {
         return Err(LixError {
@@ -125,6 +129,7 @@ pub(crate) async fn load_installed_plugin_from_archive_ref_with_backend(
                 archive_ref.path
             ),
             hint: None,
+            details: None,
         });
     }
     load_installed_plugin_from_archive_bytes(&plugin_key, &archive_ref.path, &archive_bytes)
@@ -160,12 +165,14 @@ pub(crate) fn invalidate_installed_plugins_cache(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "installed plugin cache lock poisoned".to_string(),
             hint: None,
+            details: None,
         })?;
     *guard = None;
     let mut component_guard = host.plugin_component_cache().lock().map_err(|_| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "plugin component cache lock poisoned".to_string(),
         hint: None,
+            details: None,
     })?;
     component_guard.clear();
     Ok(())

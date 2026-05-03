@@ -171,7 +171,7 @@ simulation_test!(
         let first_history = select_history_rows(
             &session,
             &format!(
-                "SELECT start_commit_id, depth, snapshot_content, change_id, commit_id, commit_created_at \
+                "SELECT start_commit_id, depth, snapshot_content, change_id, observed_commit_id, commit_created_at \
                  FROM lix_state_history \
                  WHERE start_commit_id = '{first_commit_id}' \
                    AND entity_id = 'history-explicit' \
@@ -192,7 +192,7 @@ simulation_test!(
             panic!("change_id should be text");
         };
         let Value::Text(first_row_commit_id) = &first_history[0][4] else {
-            panic!("commit_id should be text");
+            panic!("observed_commit_id should be text");
         };
         let Value::Text(first_commit_created_at) = &first_history[0][5] else {
             panic!("commit_created_at should be text");
@@ -413,7 +413,7 @@ simulation_test!(
         let tombstone_rows = select_history_rows(
             &session,
             &format!(
-                "SELECT commit_id, depth, snapshot_content \
+                "SELECT observed_commit_id, depth, snapshot_content \
                  FROM lix_state_history \
                  WHERE start_commit_id = '{later_commit_id}' \
                    AND entity_id = 'history-ancestor-tombstone' \

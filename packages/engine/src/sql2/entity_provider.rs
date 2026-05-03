@@ -32,20 +32,22 @@ use crate::live_state::LiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
+use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
 };
 use crate::sql2::write_normalization::UpdateAssignmentValues;
 use crate::transaction::types::StageRow;
-use crate::version_ref::VersionRefReader;
+use crate::version::VersionRefReader;
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 
 use super::entity_history_provider::EntityHistoryProvider;
 use super::history_route::{
-    HISTORY_COL_CHANGE_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_COMMIT_ID, HISTORY_COL_DEPTH,
-    HISTORY_COL_ENTITY_ID, HISTORY_COL_FILE_ID, HISTORY_COL_METADATA, HISTORY_COL_SCHEMA_KEY,
-    HISTORY_COL_SCHEMA_VERSION, HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
+    HISTORY_COL_CHANGE_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_ID,
+    HISTORY_COL_FILE_ID, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
+    HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SCHEMA_VERSION, HISTORY_COL_SNAPSHOT_CONTENT,
+    HISTORY_COL_START_COMMIT_ID,
 };
 use super::result_metadata::{json_field, mark_json_field};
 use crate::sql2::{
@@ -335,6 +337,7 @@ impl TableProvider for EntityProvider {
         if insert_op != InsertOp::Append {
             return not_impl_err!("{insert_op} not implemented for entity surfaces yet");
         }
+        reject_read_only_entity_surface(&self.spec.schema_key, "INSERT")?;
 
         let write_ctx = self.write_access.require_write(&format!(
             "INSERT into {} entity surface",
@@ -363,6 +366,8 @@ impl TableProvider for EntityProvider {
         state: &dyn Session,
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        reject_read_only_entity_surface(&self.spec.schema_key, "DELETE")?;
+
         let write_ctx = self.write_access.require_write(&format!(
             "DELETE FROM {} entity surface",
             self.spec.schema_key
@@ -412,6 +417,8 @@ impl TableProvider for EntityProvider {
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        reject_read_only_entity_surface(&self.spec.schema_key, "UPDATE")?;
+
         let write_ctx = self
             .write_access
             .require_write(&format!("UPDATE {} entity surface", self.spec.schema_key))?;
@@ -1717,7 +1724,7 @@ pub(super) fn entity_system_fields(variant: EntityProviderVariant) -> Vec<Field>
             json_field(HISTORY_COL_METADATA, true),
             Field::new(HISTORY_COL_SCHEMA_VERSION, DataType::Utf8, false),
             Field::new(HISTORY_COL_CHANGE_ID, DataType::Utf8, false),
-            Field::new(HISTORY_COL_COMMIT_ID, DataType::Utf8, false),
+            Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
             Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
             Field::new(HISTORY_COL_START_COMMIT_ID, DataType::Utf8, false),
             Field::new(HISTORY_COL_DEPTH, DataType::Int64, false),
@@ -1895,10 +1902,8 @@ fn decode_json_pointer_segment(segment: &str) -> std::result::Result<String, Lix
 fn schema_exposed_as_entity_surface(schema_key: &str) -> bool {
     !matches!(
         schema_key,
-        "lix_active_version"
-            | "lix_active_account"
+        "lix_active_account"
             | "lix_change"
-            | "lix_commit"
             | "lix_commit_edge"
             | "lix_change_set"
             | "lix_change_set_element"
@@ -1987,7 +1992,7 @@ mod tests {
     };
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
     use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWriteOutcome};
-    use crate::version_ref::{VersionHead, VersionRefReader};
+    use crate::version::{VersionHead, VersionRefReader};
     use crate::LixError;
 
     struct EmptyLiveStateReader;
@@ -2198,7 +2203,6 @@ mod tests {
 
     #[test]
     fn excludes_non_entity_builtin_session_surfaces() {
-        assert!(!schema_exposed_as_entity_surface("lix_active_version"));
         assert!(!schema_exposed_as_entity_surface("lix_active_account"));
         assert!(schema_exposed_as_entity_surface("project_message"));
     }

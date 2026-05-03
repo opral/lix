@@ -77,10 +77,14 @@ export type OpenLixOptions = {
 export type CreateVersionOptions = {
   id?: string;
   name: string;
+  fromCommitId?: string;
 };
 
 export type CreateVersionResult = {
-  versionId: string;
+  id: string;
+  name: string;
+  hidden: boolean;
+  commitId: string;
 };
 
 export type SwitchVersionOptions = {
@@ -95,7 +99,10 @@ export type MergeVersionOptions = {
   sourceVersionId: string;
 };
 
-export type MergeVersionOutcome = "alreadyUpToDate" | "mergeCommitted";
+export type MergeVersionOutcome =
+  | "alreadyUpToDate"
+  | "fastForward"
+  | "mergeCommitted";
 
 export type MergeVersionResult = {
   outcome: MergeVersionOutcome;
@@ -146,7 +153,15 @@ export type MergeVersionResult = {
             let options = parse_create_version_options(args).map_err(js_error)?;
             let result = self.inner.create_version(options).await.map_err(js_error)?;
             let object = Object::new();
-            set_string(&object, "versionId", &result.version_id).map_err(js_error)?;
+            set_string(&object, "id", &result.id).map_err(js_error)?;
+            set_string(&object, "name", &result.name).map_err(js_error)?;
+            Reflect::set(
+                &object,
+                &JsValue::from_str("hidden"),
+                &JsValue::from_bool(result.hidden),
+            )
+            .map_err(|_| js_error(js_sdk_error("could not set hidden")))?;
+            set_string(&object, "commitId", &result.commit_id).map_err(js_error)?;
             Ok(object.into())
         }
 
@@ -166,6 +181,7 @@ export type MergeVersionResult = {
             let object = Object::new();
             let outcome = match result.outcome {
                 lix_rs_sdk::MergeVersionOutcome::AlreadyUpToDate => "alreadyUpToDate",
+                lix_rs_sdk::MergeVersionOutcome::FastForward => "fastForward",
                 lix_rs_sdk::MergeVersionOutcome::MergeCommitted => "mergeCommitted",
             };
             set_string(&object, "outcome", outcome).map_err(js_error)?;
@@ -624,12 +640,24 @@ export type MergeVersionResult = {
         let hint = Reflect::get(&value, &JsValue::from_str("hint"))
             .ok()
             .and_then(|hint| hint.as_string());
+        let details = Reflect::get(&value, &JsValue::from_str("details"))
+            .ok()
+            .and_then(|details| {
+                if details.is_undefined() || details.is_null() {
+                    None
+                } else {
+                    serde_wasm_bindgen::from_value(details).ok()
+                }
+            });
         let mut error = LixError::new(
             code.unwrap_or_else(|| "LIX_ERROR_JS_SDK".to_string()),
             message,
         );
         if let Some(hint) = hint {
             error = error.with_hint(hint);
+        }
+        if let Some(details) = details {
+            error = error.with_details(details);
         }
         error
     }
@@ -638,7 +666,12 @@ export type MergeVersionResult = {
         let object = expect_object(value, "createVersion")?;
         let id = optional_string(&object, "id", "createVersion")?;
         let name = required_string(&object, "name", "createVersion")?;
-        Ok(CreateVersionOptions { id, name })
+        let from_commit_id = optional_string(&object, "fromCommitId", "createVersion")?;
+        Ok(CreateVersionOptions {
+            id,
+            name,
+            from_commit_id,
+        })
     }
 
     fn parse_switch_version_options(value: JsValue) -> Result<SwitchVersionOptions, LixError> {
@@ -925,6 +958,12 @@ export type MergeVersionResult = {
                 &JsValue::from_str("hint"),
                 &JsValue::from_str(&hint),
             );
+        }
+        if let Some(details) = error.details {
+            let serializer = serde_wasm_bindgen::Serializer::json_compatible();
+            if let Ok(value) = details.serialize(&serializer) {
+                let _ = Reflect::set(object, &JsValue::from_str("details"), &value);
+            }
         }
         js_error.into()
     }

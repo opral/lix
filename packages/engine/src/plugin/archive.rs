@@ -25,11 +25,13 @@ pub(crate) fn parse_plugin_archive_for_install(
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "Plugin archive must contain manifest.json".to_string(),
         hint: None,
+            details: None,
     })?;
     let manifest_raw = std::str::from_utf8(manifest_bytes).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("Plugin archive manifest.json must be UTF-8: {error}"),
         hint: None,
+            details: None,
     })?;
     let validated_manifest = parse_plugin_manifest_json(manifest_raw)?;
 
@@ -43,6 +45,7 @@ pub(crate) fn parse_plugin_archive_for_install(
                 validated_manifest.manifest.entry
             ),
             hint: None,
+            details: None,
         })?
         .clone();
     ensure_valid_plugin_wasm_for_install(&wasm_bytes)?;
@@ -55,6 +58,7 @@ pub(crate) fn parse_plugin_archive_for_install(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("Plugin archive is missing schema file '{schema_path}'"),
             hint: None,
+            details: None,
         })?;
         let schema_json: JsonValue =
             serde_json::from_slice(schema_bytes).map_err(|error| LixError {
@@ -63,6 +67,7 @@ pub(crate) fn parse_plugin_archive_for_install(
                     "Plugin archive schema '{schema_path}' is invalid JSON: {error}"
                 ),
                 hint: None,
+            details: None,
             })?;
         validate_lix_schema_definition(&schema_json)?;
         let schema_key = schema_key_from_definition(&schema_json)?;
@@ -77,6 +82,7 @@ pub(crate) fn parse_plugin_archive_for_install(
                     schema_key.schema_key, schema_key.schema_version
                 ),
                 hint: None,
+            details: None,
             });
         }
         schemas.push(schema_json);
@@ -101,6 +107,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
             archive_path
         ),
         hint: None,
+            details: None,
     })?;
     let manifest_raw = std::str::from_utf8(manifest_bytes).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -109,6 +116,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
             archive_path
         ),
         hint: None,
+            details: None,
     })?;
     let validated_manifest = parse_plugin_manifest_json(manifest_raw)?;
     if validated_manifest.manifest.key != plugin_key {
@@ -119,6 +127,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
                 archive_path, plugin_key, validated_manifest.manifest.key
             ),
             hint: None,
+            details: None,
         });
     }
 
@@ -131,6 +140,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
             archive_path, validated_manifest.manifest.entry
         ),
         hint: None,
+            details: None,
     })?;
     ensure_valid_plugin_wasm_for_materialization(wasm)?;
 
@@ -157,6 +167,7 @@ fn read_archive_files_for_install(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "Plugin archive bytes must not be empty".to_string(),
             hint: None,
+            details: None,
         });
     }
 
@@ -164,6 +175,7 @@ fn read_archive_files_for_install(
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("Plugin archive is not a valid zip file: {error}"),
         hint: None,
+            details: None,
     })?;
     let mut files = BTreeMap::<String, Vec<u8>>::new();
 
@@ -172,6 +184,7 @@ fn read_archive_files_for_install(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("Failed to read plugin archive entry at index {index}: {error}"),
             hint: None,
+            details: None,
         })?;
         let raw_name = entry.name().to_string();
 
@@ -183,6 +196,7 @@ fn read_archive_files_for_install(
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("Plugin archive entry '{raw_name}' must not be a symlink"),
                 hint: None,
+            details: None,
             });
         }
 
@@ -192,12 +206,14 @@ fn read_archive_files_for_install(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("Failed to read plugin archive entry '{raw_name}': {error}"),
             hint: None,
+            details: None,
         })?;
         if files.insert(normalized_path.clone(), bytes).is_some() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("Plugin archive contains duplicate entry '{normalized_path}'"),
                 hint: None,
+            details: None,
             });
         }
     }
@@ -217,6 +233,7 @@ fn read_plugin_archive_files(
                 archive_path
             ),
             hint: None,
+            details: None,
         });
     }
 
@@ -227,6 +244,7 @@ fn read_plugin_archive_files(
             archive_path
         ),
         hint: None,
+            details: None,
     })?;
     let mut files = BTreeMap::<String, Vec<u8>>::new();
 
@@ -238,6 +256,7 @@ fn read_plugin_archive_files(
                 archive_path, index
             ),
             hint: None,
+            details: None,
         })?;
 
         let entry_name = entry.name().to_string();
@@ -254,6 +273,7 @@ fn read_plugin_archive_files(
                 archive_path, entry_name
             ),
             hint: None,
+            details: None,
         })?;
         files.insert(normalized_path, bytes);
     }
@@ -267,6 +287,7 @@ fn normalize_archive_path_for_install(path: &str) -> Result<String, LixError> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "Plugin archive path must not be empty".to_string(),
             hint: None,
+            details: None,
         });
     }
     if path.starts_with('/') || path.starts_with('\\') {
@@ -274,6 +295,7 @@ fn normalize_archive_path_for_install(path: &str) -> Result<String, LixError> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("Plugin archive path '{path}' must be relative"),
             hint: None,
+            details: None,
         });
     }
     if path.contains('\\') {
@@ -281,6 +303,7 @@ fn normalize_archive_path_for_install(path: &str) -> Result<String, LixError> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("Plugin archive path '{path}' must use forward slash separators"),
             hint: None,
+            details: None,
         });
     }
 
@@ -294,12 +317,14 @@ fn normalize_archive_path_for_install(path: &str) -> Result<String, LixError> {
                         "Plugin archive path '{path}' contains non-UTF-8 components"
                     ),
                     hint: None,
+            details: None,
                 })?;
                 if segment.is_empty() {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: format!("Plugin archive path '{path}' is invalid"),
                         hint: None,
+            details: None,
                     });
                 }
                 segments.push(segment.to_string());
@@ -311,6 +336,7 @@ fn normalize_archive_path_for_install(path: &str) -> Result<String, LixError> {
                         "Plugin archive path '{path}' must not contain traversal or absolute components"
                     ),
                     hint: None,
+            details: None,
                 })
             }
         }
@@ -321,6 +347,7 @@ fn normalize_archive_path_for_install(path: &str) -> Result<String, LixError> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("Plugin archive path '{path}' is invalid"),
             hint: None,
+            details: None,
         });
     }
 
@@ -337,6 +364,7 @@ fn normalize_plugin_archive_path_for_materialization(path: &str) -> Result<Strin
                 path
             ),
             hint: None,
+            details: None,
         });
     }
 
@@ -353,6 +381,7 @@ fn normalize_plugin_archive_path_for_materialization(path: &str) -> Result<Strin
                         path
                     ),
                     hint: None,
+            details: None,
                 });
             }
         }
@@ -363,6 +392,7 @@ fn normalize_plugin_archive_path_for_materialization(path: &str) -> Result<Strin
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "plugin materialization: archive path must not be empty".to_string(),
             hint: None,
+            details: None,
         });
     }
 
@@ -375,6 +405,7 @@ fn ensure_valid_plugin_wasm_for_install(wasm_bytes: &[u8]) -> Result<(), LixErro
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "Plugin wasm bytes must not be empty".to_string(),
             hint: None,
+            details: None,
         });
     }
     if wasm_bytes.len() < 8 || !wasm_bytes.starts_with(&[0x00, 0x61, 0x73, 0x6d]) {
@@ -382,6 +413,7 @@ fn ensure_valid_plugin_wasm_for_install(wasm_bytes: &[u8]) -> Result<(), LixErro
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "Plugin wasm bytes must start with a valid wasm header".to_string(),
             hint: None,
+            details: None,
         });
     }
     Ok(())
@@ -395,6 +427,7 @@ fn ensure_valid_plugin_wasm_for_materialization(bytes: &[u8]) -> Result<(), LixE
             description: "plugin materialization: entry file must be a valid WebAssembly module"
                 .to_string(),
             hint: None,
+            details: None,
         });
     }
 

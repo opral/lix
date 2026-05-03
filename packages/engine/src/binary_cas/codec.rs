@@ -66,6 +66,7 @@ pub(crate) fn decode_binary_chunk_payload(
                 other, blob_hash, chunk_hash
             ),
             hint: None,
+            details: None,
         }),
         None => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -74,6 +75,7 @@ pub(crate) fn decode_binary_chunk_payload(
                 blob_hash, chunk_hash
             ),
             hint: None,
+            details: None,
         }),
     }
 }
@@ -84,6 +86,7 @@ fn compress_binary_chunk_payload(chunk_data: &[u8]) -> Result<Vec<u8>, LixError>
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("binary chunk compression failed: {error}"),
         hint: None,
+        details: None,
     })
 }
 
@@ -110,6 +113,7 @@ fn decode_binary_chunk_zstd_payload(
             blob_hash, chunk_hash
         ),
         hint: None,
+        details: None,
     })
 }
 
@@ -131,6 +135,7 @@ fn decode_binary_chunk_zstd_payload(
                 blob_hash, chunk_hash
             ),
             hint: None,
+            details: None,
         })?;
 
     let mut output = Vec::new();
@@ -141,6 +146,7 @@ fn decode_binary_chunk_zstd_payload(
             blob_hash, chunk_hash
         ),
         hint: None,
+        details: None,
     })?;
     Ok(output)
 }

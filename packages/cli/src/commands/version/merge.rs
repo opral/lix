@@ -49,6 +49,12 @@ pub fn run(context: &AppContext, command: MergeVersionCommand) -> Result<Command
                 target.name, target.id, source.name, source.id
             );
         }
+        MergeVersionOutcome::FastForward => {
+            println!(
+                "Fast-forwarded {} ({}) to {} ({}) at {}",
+                target.name, target.id, source.name, source.id, result.target_head_after_commit_id
+            );
+        }
         MergeVersionOutcome::MergeCommitted => {
             let commit_id = result.created_merge_commit_id.ok_or_else(|| {
                 CliError::msg("merge_version returned MergeCommitted without a merge commit id")

@@ -177,7 +177,7 @@ export type LixNotice = {
 
 /**
  * Error thrown by the Lix engine. Extends the standard `Error` with a
- * machine-readable `code` and an optional `hint` suggesting how to recover.
+ * machine-readable `code`, optional `hint`, and optional structured `details`.
  *
  * Hints follow the Postgres/rustc convention: `message` states what went
  * wrong in factual terms; `hint` offers a fix when one is known. Consumers
@@ -187,7 +187,16 @@ export type LixNotice = {
 export interface LixError extends Error {
 	code: string;
 	hint?: string;
+	details?: unknown;
 }
+
+type Assert<T extends true> = T;
+type _LixErrorHasDetails = Assert<
+	LixError extends { details?: unknown } ? true : false
+>;
+type _LixErrorDoesNotHaveData = Assert<
+	"data" extends keyof LixError ? false : true
+>;
 
 /**
  * Type guard: returns `true` when `err` is a Lix-produced error carrying a

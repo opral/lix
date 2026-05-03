@@ -6,6 +6,7 @@ pub(crate) fn compress_json_payload(json_data: &[u8]) -> Result<Vec<u8>, LixErro
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("json compression failed: {error}"),
         hint: None,
+        details: None,
     })
 }
 
@@ -27,6 +28,7 @@ pub(crate) fn decode_json_zstd_payload(
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("json decompression failed for ref '{hash_hex}': {error}"),
         hint: None,
+        details: None,
     })
 }
 
@@ -43,6 +45,7 @@ pub(crate) fn decode_json_zstd_payload(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("json decompression failed: {error}"),
             hint: None,
+            details: None,
         })?;
 
     let mut output = Vec::new();
@@ -50,6 +53,7 @@ pub(crate) fn decode_json_zstd_payload(
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("json decompression failed: {error}"),
         hint: None,
+        details: None,
     })?;
     Ok(output)
 }

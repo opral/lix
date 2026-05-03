@@ -11,6 +11,10 @@ use crate::functions::{
 use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateRow};
 use crate::untracked_state::UntrackedStateRow;
+use crate::version::{
+    VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_DESCRIPTOR_SCHEMA_VERSION, VERSION_REF_SCHEMA_KEY,
+    VERSION_REF_SCHEMA_VERSION,
+};
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, TransactionBeginMode};
 
@@ -18,10 +22,6 @@ const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const KEY_VALUE_SCHEMA_VERSION: &str = "1";
 const LIX_ID_KEY: &str = "lix_id";
 const WORKSPACE_VERSION_KEY: &str = "lix_workspace_version_id";
-const VERSION_DESCRIPTOR_SCHEMA_KEY: &str = "lix_version_descriptor";
-const VERSION_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
-const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
-const VERSION_REF_SCHEMA_VERSION: &str = "1";
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const COMMIT_SCHEMA_VERSION: &str = "1";
 

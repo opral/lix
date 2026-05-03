@@ -3,7 +3,8 @@
 mod support;
 use lix_engine::Value;
 use lix_engine::{
-    CreateVersionOptions, Engine, MergeVersionOptions, MergeVersionOutcome, SwitchVersionOptions,
+    CreateVersionOptions, Engine, LixError, MergeVersionOptions, MergeVersionOutcome,
+    SwitchVersionOptions,
 };
 use serde_json::Value as JsonValue;
 
@@ -23,6 +24,228 @@ simulation_test!(create_version_from_main, |sim| async move {
     drop(main);
     drop(engine);
 });
+
+simulation_test!(create_version_rejects_existing_id, |sim| async move {
+    let (engine, main, draft) = create_draft_from_main(&sim).await;
+
+    let error = main
+        .create_version(CreateVersionOptions {
+            id: Some("draft-version".to_string()),
+            name: "Overwritten draft".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect_err("creating a version with an existing id should fail");
+
+    assert_eq!(error.code, "LIX_ERROR_UNIQUE");
+    assert!(
+        error
+            .to_string()
+            .contains("INSERT would duplicate entity_id"),
+        "error should explain the duplicate version id: {error:?}"
+    );
+    assert_version_descriptor(&main, "draft-version", "Draft").await;
+
+    drop(draft);
+    drop(main);
+    drop(engine);
+});
+
+simulation_test!(create_version_rejects_duplicate_name, |sim| async move {
+    let (engine, main, draft) = create_draft_from_main(&sim).await;
+
+    let error = main
+        .create_version(CreateVersionOptions {
+            id: Some("duplicate-name-version".to_string()),
+            name: "Draft".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect_err("creating a version with an existing name should fail");
+
+    assert_eq!(error.code, lix_engine::LixError::CODE_UNIQUE);
+    assert!(
+        error.to_string().contains("/name"),
+        "error should explain the duplicate version name: {error:?}"
+    );
+
+    drop(draft);
+    drop(main);
+    drop(engine);
+});
+
+simulation_test!(
+    version_descriptor_delete_via_entity_surface_is_rejected_when_ref_exists,
+    |sim| async move {
+        let (engine, main, _draft) = create_draft_from_main(&sim).await;
+
+        let error = main
+            .execute(
+                "DELETE FROM lix_version_descriptor WHERE id = 'draft-version'",
+                &[],
+            )
+            .await
+            .expect_err("descriptor delete through entity surface should fail");
+        assert_version_pair_delete_restricted(&error);
+
+        assert_eq!(count_version_descriptors(&main, "draft-version").await, 1);
+        assert_eq!(count_version_refs(&main, "draft-version").await, 1);
+        assert_eq!(
+            engine
+                .load_version_head_commit_id("draft-version")
+                .await
+                .expect("version ref head should still load"),
+            Some(sim.initial_commit_id().to_string())
+        );
+
+        drop(main);
+        drop(engine);
+    }
+);
+
+simulation_test!(
+    version_descriptor_delete_via_lix_state_is_rejected_when_ref_exists,
+    |sim| async move {
+        let (engine, main, _draft) = create_draft_from_main(&sim).await;
+
+        let error = main
+            .execute(
+                "DELETE FROM lix_state \
+                 WHERE schema_key = 'lix_version_descriptor' AND entity_id = 'draft-version'",
+                &[],
+            )
+            .await
+            .expect_err("descriptor delete through lix_state should fail");
+        assert_version_pair_delete_restricted(&error);
+
+        assert_eq!(count_version_descriptors(&main, "draft-version").await, 1);
+        assert_eq!(count_version_refs(&main, "draft-version").await, 1);
+        assert_eq!(
+            engine
+                .load_version_head_commit_id("draft-version")
+                .await
+                .expect("version ref head should still load"),
+            Some(sim.initial_commit_id().to_string())
+        );
+
+        drop(main);
+        drop(engine);
+    }
+);
+
+simulation_test!(
+    version_ref_delete_via_entity_surface_is_rejected_when_descriptor_exists,
+    |sim| async move {
+        let (engine, main, _draft) = create_draft_from_main(&sim).await;
+
+        let error = main
+            .execute(
+                "DELETE FROM lix_version_ref WHERE id = 'draft-version'",
+                &[],
+            )
+            .await
+            .expect_err("ref delete through entity surface should fail");
+        assert_version_pair_delete_restricted(&error);
+
+        assert_eq!(count_version_descriptors(&main, "draft-version").await, 1);
+        assert_eq!(count_version_refs(&main, "draft-version").await, 1);
+        assert_eq!(
+            engine
+                .load_version_head_commit_id("draft-version")
+                .await
+                .expect("version ref head should still load"),
+            Some(sim.initial_commit_id().to_string())
+        );
+
+        drop(main);
+        drop(engine);
+    }
+);
+
+simulation_test!(
+    version_ref_delete_via_lix_state_is_rejected_when_descriptor_exists,
+    |sim| async move {
+        let (engine, main, _draft) = create_draft_from_main(&sim).await;
+
+        let error = main
+            .execute(
+                "DELETE FROM lix_state \
+                 WHERE schema_key = 'lix_version_ref' AND entity_id = 'draft-version'",
+                &[],
+            )
+            .await
+            .expect_err("ref delete through lix_state should fail");
+        assert_version_pair_delete_restricted(&error);
+
+        assert_eq!(count_version_descriptors(&main, "draft-version").await, 1);
+        assert_eq!(count_version_refs(&main, "draft-version").await, 1);
+        assert_eq!(
+            engine
+                .load_version_head_commit_id("draft-version")
+                .await
+                .expect("version ref head should still load"),
+            Some(sim.initial_commit_id().to_string())
+        );
+
+        drop(main);
+        drop(engine);
+    }
+);
+
+simulation_test!(
+    create_version_can_start_from_explicit_commit,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_version_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('main-after-initial', 'main')",
+            &[],
+        )
+        .await
+        .expect("main write should succeed");
+
+        assert_key_value(&main, "main-after-initial", Some("\"main\"")).await;
+
+        let receipt = main
+            .create_version(CreateVersionOptions {
+                id: Some("from-initial".to_string()),
+                name: "From initial".to_string(),
+                from_commit_id: Some(sim.initial_commit_id().to_string()),
+            })
+            .await
+            .expect("version should be created from explicit commit");
+        assert_eq!(receipt.id, "from-initial");
+        assert_eq!(receipt.name, "From initial");
+        assert!(!receipt.hidden);
+        assert_eq!(receipt.commit_id, sim.initial_commit_id());
+        assert_eq!(
+            engine
+                .load_version_head_commit_id("from-initial")
+                .await
+                .expect("version head should load"),
+            Some(sim.initial_commit_id().to_string())
+        );
+
+        let from_initial = main.wrap_session(
+            engine
+                .open_session("from-initial")
+                .await
+                .expect("explicit commit version session should open"),
+            &engine,
+        );
+        assert_key_value(&from_initial, "main-after-initial", None).await;
+
+        drop(from_initial);
+        drop(main);
+        drop(engine);
+    }
+);
 
 simulation_test!(created_version_sees_inherited_state, |sim| async move {
     let (_engine, _main, draft) = create_draft_after_shared_write(&sim).await;
@@ -345,9 +568,28 @@ simulation_test!(
             panic!("missing version ref should fail");
         };
 
-        assert!(error
-            .description
-            .contains("cannot switch to missing version ref 'missing-version'"));
+        assert_eq!(error.code, LixError::CODE_VERSION_NOT_FOUND);
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("version_id")),
+            Some(&JsonValue::String("missing-version".to_string()))
+        );
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("operation")),
+            Some(&JsonValue::String("switch_version".to_string()))
+        );
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("role")),
+            Some(&JsonValue::String("target".to_string()))
+        );
     }
 );
 
@@ -392,9 +634,80 @@ simulation_test!(
 );
 
 simulation_test!(
+    merge_version_fast_forwards_when_target_is_merge_base,
+    |sim| async move {
+        let (engine, main, draft) = create_draft_from_main(&sim).await;
+        draft
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('draft-fast-forward', 'draft')",
+                &[],
+            )
+            .await
+            .expect("draft write should succeed");
+
+        let target_head_before = engine
+            .load_version_head_commit_id(sim.main_version_id())
+            .await
+            .expect("main head should load")
+            .expect("main head should exist");
+        let source_head = engine
+            .load_version_head_commit_id("draft-version")
+            .await
+            .expect("draft head should load")
+            .expect("draft head should exist");
+
+        let receipt = main
+            .merge_version(MergeVersionOptions {
+                source_version_id: "draft-version".to_string(),
+            })
+            .await
+            .expect("merge should fast-forward target");
+        assert_eq!(receipt.outcome, MergeVersionOutcome::FastForward);
+        assert_eq!(receipt.applied_change_count, 0);
+        assert_eq!(receipt.created_merge_commit_id, None);
+        assert_eq!(
+            receipt.merge_base_commit_id.as_deref(),
+            Some(target_head_before.as_str())
+        );
+        assert_eq!(receipt.target_head_before_commit_id, target_head_before);
+        assert_eq!(receipt.source_head_before_commit_id, source_head);
+        assert_eq!(receipt.target_head_after_commit_id, source_head);
+        assert_eq!(
+            engine
+                .load_version_head_commit_id(sim.main_version_id())
+                .await
+                .expect("main head should load")
+                .as_deref(),
+            Some(source_head.as_str())
+        );
+        assert_key_value(&main, "draft-fast-forward", Some("\"draft\"")).await;
+
+        let global = sim.wrap_session(
+            engine
+                .open_session("global")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
+        let source_snapshot = load_commit_snapshot(&global, &source_head).await;
+        assert_eq!(
+            json_string_array(&source_snapshot, "parent_commit_ids"),
+            vec![target_head_before],
+            "fast-forward should not create a two-parent merge commit"
+        );
+    }
+);
+
+simulation_test!(
     merge_version_advances_target_with_two_parent_commit,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('main-merge-target', 'main')",
+            &[],
+        )
+        .await
+        .expect("main write should succeed");
         draft
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('draft-merge-source', 'draft')",
@@ -451,6 +764,7 @@ simulation_test!(
         );
 
         assert_key_value(&main, "draft-merge-source", Some("\"draft\"")).await;
+        assert_key_value(&main, "main-merge-target", Some("\"main\"")).await;
 
         let global = sim.wrap_session(
             engine
@@ -476,6 +790,101 @@ simulation_test!(
             parent_commit_ids,
             vec![target_head_before, source_head],
             "merge commit should parent first to the old target head, then to the source head"
+        );
+    }
+);
+
+simulation_test!(
+    merge_version_adopts_source_change_without_minting_equivalent_copy,
+    |sim| async move {
+        let (engine, main, draft) = create_draft_from_main(&sim).await;
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('merge-adopt-target', 'target')",
+            &[],
+        )
+        .await
+        .expect("main write should succeed");
+        draft
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('merge-adopt-change', 'source')",
+                &[],
+            )
+            .await
+            .expect("draft write should succeed");
+
+        let source_head = engine
+            .load_version_head_commit_id("draft-version")
+            .await
+            .expect("draft head should load")
+            .expect("draft head should exist");
+        let source_change_id = select_single_text(
+            &draft,
+            "SELECT lixcol_change_id FROM lix_key_value WHERE key = 'merge-adopt-change'",
+        )
+        .await;
+
+        let receipt = main
+            .merge_version(MergeVersionOptions {
+                source_version_id: "draft-version".to_string(),
+            })
+            .await
+            .expect("merge should apply source change");
+        let merge_commit_id = receipt
+            .created_merge_commit_id
+            .as_deref()
+            .expect("non-empty merge should create a merge commit");
+
+        let global = sim.wrap_session(
+            engine
+                .open_session("global")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
+        let merge_snapshot = load_commit_snapshot(&global, merge_commit_id).await;
+        let merge_change_ids = json_string_array(&merge_snapshot, "change_ids");
+        assert_eq!(
+            merge_change_ids,
+            vec![source_change_id.clone()],
+            "merge commit should adopt the source change id, not mint an equivalent copy"
+        );
+
+        let source_snapshot = load_commit_snapshot(&global, &source_head).await;
+        assert_eq!(
+            json_string_array(&source_snapshot, "change_ids"),
+            vec![source_change_id.clone()],
+            "source commit should remain the original owner of the canonical source change"
+        );
+
+        let equivalent_change_count = select_single_integer(
+            &global,
+            "SELECT count(*) \
+             FROM lix_change \
+             WHERE schema_key = 'lix_key_value' \
+               AND entity_id = 'merge-adopt-change' \
+               AND snapshot_content = lix_json('{\"key\":\"merge-adopt-change\",\"value\":\"source\"}')",
+        )
+        .await;
+        assert_eq!(
+            equivalent_change_count, 1,
+            "merge must not append a second canonical change with identical effect"
+        );
+
+        let history = main
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state_history \
+                 WHERE start_commit_id = lix_active_version_commit_id() \
+                   AND entity_id = 'merge-adopt-change' \
+                 ORDER BY depth",
+                &[],
+            )
+            .await
+            .expect("history query should succeed");
+        assert_eq!(
+            history.len(),
+            1,
+            "history should show the adopted canonical change once, not once from the merge commit and once from the source parent"
         );
     }
 );
@@ -510,10 +919,7 @@ simulation_test!(
             })
             .await
             .expect_err("divergent same-entity changes should conflict");
-        assert!(
-            error.description.contains("tracked-state conflict"),
-            "unexpected merge error: {error:?}"
-        );
+        assert_merge_conflict_error(&error);
         assert_eq!(
             engine
                 .load_version_head_commit_id(sim.main_version_id())
@@ -527,11 +933,16 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_version_applies_source_delete_when_target_unchanged,
+    merge_version_fast_forwards_source_delete_when_target_unchanged,
     |sim| async move {
-        let (_engine, main, draft) = create_draft_after_shared_write(&sim).await;
+        let (engine, main, draft) = create_draft_after_shared_write(&sim).await;
 
         delete_key_value(&draft, "shared-before-branch").await;
+        let source_head = engine
+            .load_version_head_commit_id("draft-version")
+            .await
+            .expect("draft head should load")
+            .expect("draft head should exist");
 
         let receipt = main
             .merge_version(MergeVersionOptions {
@@ -540,15 +951,16 @@ simulation_test!(
             .await
             .expect("merge should apply source delete");
 
-        assert_eq!(receipt.outcome, MergeVersionOutcome::MergeCommitted);
-        assert_eq!(receipt.applied_change_count, 1);
-        assert!(receipt.created_merge_commit_id.is_some());
+        assert_eq!(receipt.outcome, MergeVersionOutcome::FastForward);
+        assert_eq!(receipt.applied_change_count, 0);
+        assert_eq!(receipt.created_merge_commit_id, None);
+        assert_eq!(receipt.target_head_after_commit_id, source_head);
         assert_key_value(&main, "shared-before-branch", None).await;
     }
 );
 
 simulation_test!(
-    merge_version_treats_both_sides_delete_as_noop,
+    merge_version_records_empty_merge_when_both_sides_delete,
     |sim| async move {
         let (engine, main, draft) = create_draft_after_shared_write(&sim).await;
 
@@ -559,6 +971,11 @@ simulation_test!(
             .await
             .expect("main head should load")
             .expect("main head should exist");
+        let source_head = engine
+            .load_version_head_commit_id("draft-version")
+            .await
+            .expect("draft head should load")
+            .expect("draft head should exist");
 
         let receipt = main
             .merge_version(MergeVersionOptions {
@@ -567,17 +984,23 @@ simulation_test!(
             .await
             .expect("convergent delete merge should succeed");
 
-        assert_eq!(receipt.outcome, MergeVersionOutcome::AlreadyUpToDate);
+        assert_eq!(receipt.outcome, MergeVersionOutcome::MergeCommitted);
         assert_eq!(receipt.applied_change_count, 0);
-        assert_eq!(receipt.created_merge_commit_id, None);
-        assert_eq!(
-            engine
-                .load_version_head_commit_id(sim.main_version_id())
-                .await
-                .expect("main head should load"),
-            Some(main_head_before),
-            "convergent delete should not create a new target commit"
-        );
+        let merge_commit_id = receipt
+            .created_merge_commit_id
+            .clone()
+            .expect("convergent delete should create an empty merge commit");
+        assert_eq!(receipt.target_head_after_commit_id, merge_commit_id);
+        assert_eq!(receipt.target_head_before_commit_id, main_head_before);
+        assert_eq!(receipt.source_head_before_commit_id, source_head);
+        assert_empty_merge_commit(
+            &engine,
+            &main,
+            &merge_commit_id,
+            &receipt.target_head_before_commit_id,
+            &receipt.source_head_before_commit_id,
+        )
+        .await;
         assert_key_value(&main, "shared-before-branch", None).await;
     }
 );
@@ -607,11 +1030,7 @@ simulation_test!(
             })
             .await
             .expect_err("delete/modify should conflict");
-
-        assert!(
-            error.description.contains("tracked-state conflict"),
-            "unexpected merge error: {error:?}"
-        );
+        assert_merge_conflict_error(&error);
         assert_eq!(
             engine
                 .load_version_head_commit_id(sim.main_version_id())
@@ -648,11 +1067,7 @@ simulation_test!(
             })
             .await
             .expect_err("modify/delete should conflict");
-
-        assert!(
-            error.description.contains("tracked-state conflict"),
-            "unexpected merge error: {error:?}"
-        );
+        assert_merge_conflict_error(&error);
         assert_eq!(
             engine
                 .load_version_head_commit_id(sim.main_version_id())
@@ -666,7 +1081,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_version_converges_same_payload_without_new_commit,
+    merge_version_records_empty_merge_for_same_payload_convergence,
     |sim| async move {
         let (engine, main, draft) = create_draft_after_shared_write(&sim).await;
 
@@ -688,6 +1103,11 @@ simulation_test!(
             .await
             .expect("main head should load")
             .expect("main head should exist");
+        let source_head = engine
+            .load_version_head_commit_id("draft-version")
+            .await
+            .expect("draft head should load")
+            .expect("draft head should exist");
 
         let receipt = main
             .merge_version(MergeVersionOptions {
@@ -696,17 +1116,23 @@ simulation_test!(
             .await
             .expect("convergent update merge should succeed");
 
-        assert_eq!(receipt.outcome, MergeVersionOutcome::AlreadyUpToDate);
+        assert_eq!(receipt.outcome, MergeVersionOutcome::MergeCommitted);
         assert_eq!(receipt.applied_change_count, 0);
-        assert_eq!(receipt.created_merge_commit_id, None);
-        assert_eq!(
-            engine
-                .load_version_head_commit_id(sim.main_version_id())
-                .await
-                .expect("main head should load"),
-            Some(main_head_before),
-            "convergent update should not create a new target commit"
-        );
+        let merge_commit_id = receipt
+            .created_merge_commit_id
+            .clone()
+            .expect("convergent update should create an empty merge commit");
+        assert_eq!(receipt.target_head_after_commit_id, merge_commit_id);
+        assert_eq!(receipt.target_head_before_commit_id, main_head_before);
+        assert_eq!(receipt.source_head_before_commit_id, source_head);
+        assert_empty_merge_commit(
+            &engine,
+            &main,
+            &merge_commit_id,
+            &receipt.target_head_before_commit_id,
+            &receipt.source_head_before_commit_id,
+        )
+        .await;
         assert_key_value(&main, "shared-before-branch", Some("\"same\"")).await;
     }
 );
@@ -741,11 +1167,7 @@ simulation_test!(
             })
             .await
             .expect_err("independent adds with different payloads should conflict");
-
-        assert!(
-            error.description.contains("tracked-state conflict"),
-            "unexpected merge error: {error:?}"
-        );
+        assert_merge_conflict_error(&error);
         assert_eq!(
             engine
                 .load_version_head_commit_id(sim.main_version_id())
@@ -759,7 +1181,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    merge_version_converges_independent_add_same_identity_same_payload,
+    merge_version_records_empty_merge_for_same_identity_same_payload_add,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
 
@@ -781,6 +1203,11 @@ simulation_test!(
             .await
             .expect("main head should load")
             .expect("main head should exist");
+        let source_head = engine
+            .load_version_head_commit_id("draft-version")
+            .await
+            .expect("draft head should load")
+            .expect("draft head should exist");
 
         let receipt = main
             .merge_version(MergeVersionOptions {
@@ -789,17 +1216,23 @@ simulation_test!(
             .await
             .expect("convergent independent add merge should succeed");
 
-        assert_eq!(receipt.outcome, MergeVersionOutcome::AlreadyUpToDate);
+        assert_eq!(receipt.outcome, MergeVersionOutcome::MergeCommitted);
         assert_eq!(receipt.applied_change_count, 0);
-        assert_eq!(receipt.created_merge_commit_id, None);
-        assert_eq!(
-            engine
-                .load_version_head_commit_id(sim.main_version_id())
-                .await
-                .expect("main head should load"),
-            Some(main_head_before),
-            "convergent independent add should not create a new target commit"
-        );
+        let merge_commit_id = receipt
+            .created_merge_commit_id
+            .clone()
+            .expect("convergent independent add should create an empty merge commit");
+        assert_eq!(receipt.target_head_after_commit_id, merge_commit_id);
+        assert_eq!(receipt.target_head_before_commit_id, main_head_before);
+        assert_eq!(receipt.source_head_before_commit_id, source_head);
+        assert_empty_merge_commit(
+            &engine,
+            &main,
+            &merge_commit_id,
+            &receipt.target_head_before_commit_id,
+            &receipt.source_head_before_commit_id,
+        )
+        .await;
         assert_key_value(&main, "merge-independent-same-add", Some("\"same\"")).await;
     }
 );
@@ -823,9 +1256,28 @@ simulation_test!(
             .await
             .expect_err("missing source ref should fail");
 
-        assert!(error
-            .description
-            .contains("cannot merge from missing source version ref 'missing-version'"));
+        assert_eq!(error.code, LixError::CODE_VERSION_NOT_FOUND);
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("version_id")),
+            Some(&JsonValue::String("missing-version".to_string()))
+        );
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("operation")),
+            Some(&JsonValue::String("merge_version".to_string()))
+        );
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("role")),
+            Some(&JsonValue::String("source".to_string()))
+        );
     }
 );
 
@@ -895,13 +1347,32 @@ async fn create_draft(
         .create_version(CreateVersionOptions {
             id: Some("draft-version".to_string()),
             name: "Draft".to_string(),
+            from_commit_id: None,
         })
         .await
         .expect("version should be created");
-    assert_eq!(receipt.version_id, "draft-version");
+    assert_eq!(receipt.id, "draft-version");
+    let version_row = main
+        .execute(
+            "SELECT id, name, hidden, commit_id FROM lix_version WHERE id = 'draft-version'",
+            &[],
+        )
+        .await
+        .expect("created version should be queryable through lix_version");
+    assert_eq!(version_row.len(), 1);
+    assert_eq!(
+        version_row.rows()[0].values(),
+        &[
+            Value::Text(receipt.id.clone()),
+            Value::Text(receipt.name.clone()),
+            Value::Boolean(receipt.hidden),
+            Value::Text(receipt.commit_id.clone()),
+        ],
+        "create_version should return the same public shape as lix_version"
+    );
     main.wrap_session(
         engine
-            .open_session(receipt.version_id)
+            .open_session(receipt.id)
             .await
             .expect("draft session should open"),
         engine,
@@ -955,6 +1426,113 @@ async fn assert_version_descriptor(
     );
 }
 
+async fn count_version_descriptors(
+    session: &crate::support::simulation_test::engine::SimSession,
+    version_id: &str,
+) -> i64 {
+    select_single_integer(
+        session,
+        &format!("SELECT COUNT(*) FROM lix_version_descriptor WHERE id = '{version_id}'"),
+    )
+    .await
+}
+
+async fn count_version_refs(
+    session: &crate::support::simulation_test::engine::SimSession,
+    version_id: &str,
+) -> i64 {
+    select_single_integer(
+        session,
+        &format!(
+            "SELECT COUNT(*) FROM lix_state \
+             WHERE schema_key = 'lix_version_ref' AND entity_id = '{version_id}'"
+        ),
+    )
+    .await
+}
+
+fn assert_version_pair_delete_restricted(error: &lix_engine::LixError) {
+    assert_eq!(error.code, lix_engine::LixError::CODE_READ_ONLY);
+    assert!(
+        error.to_string().contains("lix_version"),
+        "error should explain the version pair restriction: {error:?}"
+    );
+    assert!(
+        error
+            .hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains("lix_version")),
+        "error should guide callers to the lix_version surface: {error:?}"
+    );
+}
+
+fn assert_merge_conflict_error(error: &lix_engine::LixError) {
+    assert_eq!(error.code, "LIX_MERGE_CONFLICT");
+    assert!(
+        error.description.contains("tracked-state conflict"),
+        "unexpected merge error: {error:?}"
+    );
+    let details = error
+        .details
+        .as_ref()
+        .expect("merge conflict should include details");
+    let conflicts = details
+        .get("conflicts")
+        .and_then(JsonValue::as_array)
+        .expect("merge conflict details should include conflicts array");
+    assert_eq!(conflicts.len(), 1);
+    let conflict = &conflicts[0];
+    assert_eq!(
+        conflict.get("schema_key").and_then(JsonValue::as_str),
+        Some("lix_key_value")
+    );
+    assert!(
+        conflict
+            .get("entity_id")
+            .and_then(JsonValue::as_str)
+            .is_some(),
+        "conflict should include entity_id: {conflict:?}"
+    );
+    assert!(
+        conflict.get("target").is_some(),
+        "conflict should include target side: {conflict:?}"
+    );
+    assert!(
+        conflict.get("source").is_some(),
+        "conflict should include source side: {conflict:?}"
+    );
+}
+
+async fn select_single_text(
+    session: &crate::support::simulation_test::engine::SimSession,
+    sql: &str,
+) -> String {
+    let result = session
+        .execute(sql, &[])
+        .await
+        .expect("query should succeed");
+    assert_eq!(result.len(), 1, "expected exactly one row for query: {sql}");
+    let Value::Text(value) = &result.rows()[0].values()[0] else {
+        panic!("expected text value for query: {sql}");
+    };
+    value.clone()
+}
+
+async fn select_single_integer(
+    session: &crate::support::simulation_test::engine::SimSession,
+    sql: &str,
+) -> i64 {
+    let result = session
+        .execute(sql, &[])
+        .await
+        .expect("query should succeed");
+    assert_eq!(result.len(), 1, "expected exactly one row for query: {sql}");
+    let Value::Integer(value) = result.rows()[0].values()[0] else {
+        panic!("expected integer value for query: {sql}");
+    };
+    value
+}
+
 async fn load_commit_snapshot(
     session: &crate::support::simulation_test::engine::SimSession,
     commit_id: &str,
@@ -976,4 +1554,60 @@ async fn load_commit_snapshot(
         panic!("commit snapshot should be JSON");
     };
     snapshot_content.clone()
+}
+
+async fn assert_empty_merge_commit(
+    engine: &Engine,
+    session: &crate::support::simulation_test::engine::SimSession,
+    merge_commit_id: &str,
+    target_head_before: &str,
+    source_head: &str,
+) {
+    let active_version_id = session
+        .active_version_id()
+        .await
+        .expect("active version should load");
+    assert_eq!(
+        engine
+            .load_version_head_commit_id(&active_version_id)
+            .await
+            .expect("target version head should load")
+            .as_deref(),
+        Some(merge_commit_id),
+        "empty merge should advance the target version ref"
+    );
+
+    let global = session.wrap_session(
+        engine
+            .open_session("global")
+            .await
+            .expect("global session should open"),
+        engine,
+    );
+    let commit_snapshot = load_commit_snapshot(&global, merge_commit_id).await;
+    assert_eq!(
+        json_string_array(&commit_snapshot, "change_ids"),
+        Vec::<String>::new(),
+        "empty merge commit should not claim state changes"
+    );
+    assert_eq!(
+        json_string_array(&commit_snapshot, "parent_commit_ids"),
+        vec![target_head_before.to_string(), source_head.to_string()],
+        "empty merge commit should preserve target/source ancestry"
+    );
+}
+
+fn json_string_array(snapshot: &JsonValue, key: &str) -> Vec<String> {
+    snapshot
+        .get(key)
+        .and_then(JsonValue::as_array)
+        .unwrap_or_else(|| panic!("snapshot field '{key}' should be an array"))
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .unwrap_or_else(|| panic!("snapshot field '{key}' should contain strings"))
+                .to_string()
+        })
+        .collect()
 }

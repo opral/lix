@@ -58,6 +58,7 @@ pub trait LixBackend: Send + Sync {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "destroy is not supported by this backend".to_string(),
             hint: None,
+            details: None,
         })
     }
 }

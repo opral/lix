@@ -134,7 +134,7 @@ impl HistoryRoute {
 #[derive(Debug, Clone)]
 pub(crate) struct HistoryEntry {
     pub(crate) change: MaterializedCanonicalChange,
-    pub(crate) commit_id: String,
+    pub(crate) observed_commit_id: String,
     pub(crate) commit_created_at: String,
     pub(crate) start_commit_id: String,
     pub(crate) depth: u32,
@@ -147,7 +147,7 @@ pub(crate) const HISTORY_COL_SNAPSHOT_CONTENT: &str = "lixcol_snapshot_content";
 pub(crate) const HISTORY_COL_METADATA: &str = "lixcol_metadata";
 pub(crate) const HISTORY_COL_SCHEMA_VERSION: &str = "lixcol_schema_version";
 pub(crate) const HISTORY_COL_CHANGE_ID: &str = "lixcol_change_id";
-pub(crate) const HISTORY_COL_COMMIT_ID: &str = "lixcol_commit_id";
+pub(crate) const HISTORY_COL_OBSERVED_COMMIT_ID: &str = "lixcol_observed_commit_id";
 pub(crate) const HISTORY_COL_COMMIT_CREATED_AT: &str = "lixcol_commit_created_at";
 pub(crate) const HISTORY_COL_START_COMMIT_ID: &str = "lixcol_start_commit_id";
 pub(crate) const HISTORY_COL_DEPTH: &str = "lixcol_depth";
@@ -256,11 +256,11 @@ pub(crate) async fn load_history_entries(
             let change = materialize_change(&mut json_reader, entry.change).await?;
             rows.push(HistoryEntry {
                 commit_created_at: commit_created_at_by_id
-                    .get(&entry.commit_id)
+                    .get(&entry.observed_commit_id)
                     .cloned()
                     .unwrap_or_else(|| change.created_at.clone()),
                 change,
-                commit_id: entry.commit_id,
+                observed_commit_id: entry.observed_commit_id,
                 start_commit_id: entry.start_commit_id,
                 depth: entry.depth,
             });

@@ -8,6 +8,17 @@
   "x-lix-foreign-keys": [
     {
       "properties": [
+        "/id"
+      ],
+      "references": {
+        "schemaKey": "lix_version_descriptor",
+        "properties": [
+          "/id"
+        ]
+      }
+    },
+    {
+      "properties": [
         "/commit_id"
       ],
       "references": {

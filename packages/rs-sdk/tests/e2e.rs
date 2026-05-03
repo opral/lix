@@ -42,12 +42,16 @@ async fn rs_sdk_open_register_write_query_version_and_merge_flow() {
         .create_version(CreateVersionOptions {
             id: Some("draft-version".to_string()),
             name: "Draft".to_string(),
+            from_commit_id: None,
         })
         .await
         .unwrap();
+    assert_eq!(draft.id, "draft-version");
+    assert_eq!(draft.name, "Draft");
+    assert!(!draft.hidden);
 
     lix.switch_version(SwitchVersionOptions {
-        version_id: draft.version_id.clone(),
+        version_id: draft.id.clone(),
     })
     .await
     .unwrap();
@@ -71,14 +75,15 @@ async fn rs_sdk_open_register_write_query_version_and_merge_flow() {
 
     let merge = lix
         .merge_version(MergeVersionOptions {
-            source_version_id: draft.version_id,
+            source_version_id: draft.id,
         })
         .await
         .unwrap();
 
-    assert_eq!(merge.outcome, MergeVersionOutcome::MergeCommitted);
+    assert_eq!(merge.outcome, MergeVersionOutcome::FastForward);
     assert_eq!(merge.target_version_id, main_version_id);
-    assert!(merge.applied_change_count > 0);
+    assert_eq!(merge.applied_change_count, 0);
+    assert_eq!(merge.created_merge_commit_id, None);
     assert_eq!(task_done(&lix, "task-1").await, true);
 
     lix.close().await.unwrap();
@@ -281,7 +286,7 @@ fn assert_crm_task_projection(result: &lix_rs_sdk::ExecuteResult) {
     let missing = row
         .value("missing")
         .expect_err("missing column should return a structured error");
-    assert_eq!(missing.code, "LIX_ERROR_COLUMN_NOT_FOUND");
+    assert_eq!(missing.code, "LIX_COLUMN_NOT_FOUND");
 }
 
 async fn register_poison_task_schema(lix: &lix_rs_sdk::Lix) {
