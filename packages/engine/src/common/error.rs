@@ -40,6 +40,10 @@ impl LixError {
     /// A SQL expression or function argument had an incompatible type.
     pub const CODE_TYPE_MISMATCH: &'static str = "LIX_TYPE_MISMATCH";
 
+    /// A Lix JSON path argument used another dialect's path language instead
+    /// of Lix's canonical variadic key/index segments.
+    pub const CODE_INVALID_JSON_PATH: &'static str = "LIX_INVALID_JSON_PATH";
+
     /// SQL syntax belongs to another dialect and is outside the Lix SQL
     /// surface.
     pub const CODE_DIALECT_UNSUPPORTED: &'static str = "LIX_DIALECT_UNSUPPORTED";
