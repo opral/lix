@@ -15,7 +15,7 @@
     "id": {
       "type": "string",
       "x-lix-default": "lix_uuid_v7()",
-      "description": "Stable version identifier (UUIDv7). Referenced by `lix_version_ref.id` and `lix_active_version.version_id`."
+      "description": "Stable version identifier (UUIDv7). Referenced by `lix_version_ref.id`."
     },
     "name": {
       "type": "string",

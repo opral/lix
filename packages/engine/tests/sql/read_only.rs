@@ -139,20 +139,6 @@ simulation_test!(
             "lix_change",
             "transactions commit",
         );
-
-        assert_read_only_error(
-            session
-                .execute(
-                    "INSERT INTO lix_state (entity_id, schema_key, snapshot_content, schema_version, global) \
-                     VALUES ('workspace', 'lix_active_version', \
-                       lix_json('{\"id\":\"workspace\",\"version_id\":\"main\"}'), '1', true)",
-                    &[],
-                )
-                .await
-                .expect_err("lix_active_version insert via lix_state should be read-only"),
-            "lix_active_version",
-            "switchVersion",
-        );
     }
 );
 

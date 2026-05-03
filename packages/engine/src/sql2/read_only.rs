@@ -43,9 +43,6 @@ fn read_only_schema_message(schema_key: &str) -> Option<&'static str> {
         "lix_file_descriptor" => {
             Some("Use the writable lix_file surface to create, update, or delete files.")
         }
-        "lix_active_version" => Some(
-            "Use switchVersion or workspace-version APIs instead of mutating lix_active_version directly.",
-        ),
         "lix_commit"
         | "lix_commit_edge"
         | "lix_change"
