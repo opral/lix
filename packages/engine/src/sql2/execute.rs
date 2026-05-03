@@ -64,12 +64,14 @@ pub(crate) async fn create_logical_plan(
     ctx: &dyn SqlExecutionContext,
     sql: &str,
 ) -> Result<SqlLogicalPlan, LixError> {
+    super::validate_supported_statement_ast(sql)?;
     let session = build_read_session(ctx).await?;
     let plan = session
         .state()
         .create_logical_plan(sql)
         .await
         .map_err(datafusion_error_to_lix_error)?;
+    validate_supported_logical_plan(&plan)?;
     let kind = classify_logical_plan(&plan);
     let notices = history_filter_notices(&plan);
 
@@ -86,12 +88,14 @@ pub(crate) async fn create_write_logical_plan(
     ctx: &mut dyn SqlWriteExecutionContext,
     sql: &str,
 ) -> Result<SqlLogicalPlan, LixError> {
+    super::validate_supported_statement_ast(sql)?;
     let session = build_write_session(ctx).await?;
     let plan = session
         .state()
         .create_logical_plan(sql)
         .await
         .map_err(datafusion_error_to_lix_error)?;
+    validate_supported_logical_plan(&plan)?;
     let kind = classify_logical_plan(&plan);
 
     Ok(SqlLogicalPlan {
@@ -254,6 +258,48 @@ fn classify_logical_plan(plan: &LogicalPlan) -> SqlStatementKind {
         }
         _ => SqlStatementKind::Read,
     }
+}
+
+fn validate_supported_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
+    match plan {
+        LogicalPlan::Ddl(_) => {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "DDL statements are not supported by Lix SQL",
+            )
+            .with_hint(
+                "Use Lix entity surfaces such as lix_registered_schema, lix_version, lix_file, and lix_key_value instead of CREATE/DROP statements.",
+            ));
+        }
+        LogicalPlan::Statement(_) => {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "SQL utility statements are not supported by Lix SQL",
+            ));
+        }
+        LogicalPlan::Copy(_) => {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "COPY statements are not supported by Lix SQL",
+            ));
+        }
+        LogicalPlan::RecursiveQuery(_) => {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "recursive CTEs are not supported by Lix SQL",
+            )
+            .with_hint(
+                "Use explicit commit graph surfaces such as lix_commit, lix_commit_edge, and lix_state_history instead of WITH RECURSIVE.",
+            ));
+        }
+        _ => {}
+    }
+
+    for input in plan.inputs() {
+        validate_supported_logical_plan(input)?;
+    }
+
+    Ok(())
 }
 
 fn scalar_value_from_lix_value(value: &Value) -> ScalarValue {
@@ -1048,10 +1094,10 @@ mod tests {
             vec![vec![Value::Text("lix_state".to_string())]]
         );
 
-        let show_tables_result = execute_sql(&ctx, "SHOW TABLES", &[])
+        let tables_result = execute_sql(&ctx, "SELECT table_name FROM information_schema.tables", &[])
             .await
-            .expect("SHOW TABLES should use information_schema");
-        assert!(show_tables_result.rows.iter().any(|row| {
+            .expect("information_schema.tables should list registered tables");
+        assert!(tables_result.rows.iter().any(|row| {
             row.iter()
                 .any(|value| matches!(value, Value::Text(value) if value == "lix_state"))
         }));
