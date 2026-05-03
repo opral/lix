@@ -33,6 +33,8 @@ struct AccountingSnapshot {
     json_value_bytes: usize,
     json_chunk_entries: usize,
     json_chunk_value_bytes: usize,
+    changelog_entries: usize,
+    changelog_value_bytes: usize,
 }
 
 impl AccountingSnapshot {
@@ -81,6 +83,12 @@ impl AccountingSnapshot {
             json_chunk_value_bytes: self
                 .json_chunk_value_bytes
                 .saturating_sub(before.json_chunk_value_bytes),
+            changelog_entries: self
+                .changelog_entries
+                .saturating_sub(before.changelog_entries),
+            changelog_value_bytes: self
+                .changelog_value_bytes
+                .saturating_sub(before.changelog_value_bytes),
         }
     }
 }
@@ -112,6 +120,16 @@ enum JsonAccountingWorkload {
     DedupeSame16k { rows: usize },
     BaseUpdateObject1Of1000 { rows: usize },
     BaseUpdateArray1Of1000 { rows: usize },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ChangelogAccountingWorkload {
+    AppendSmall { rows: usize },
+    Append1k { rows: usize },
+    Append16k { rows: usize },
+    Tombstones { rows: usize },
+    Metadata1k { rows: usize },
+    CompositeEntityIds { rows: usize },
 }
 
 #[tokio::test]
@@ -280,6 +298,48 @@ async fn json_store_accounting() {
     }
 }
 
+#[tokio::test]
+#[ignore = "prints deterministic changelog storage accounting table"]
+async fn changelog_accounting() {
+    let workloads = [
+        ChangelogAccountingWorkload::AppendSmall { rows: 10_000 },
+        ChangelogAccountingWorkload::Append1k { rows: 10_000 },
+        ChangelogAccountingWorkload::Append16k { rows: 1_000 },
+        ChangelogAccountingWorkload::Tombstones { rows: 10_000 },
+        ChangelogAccountingWorkload::Metadata1k { rows: 10_000 },
+        ChangelogAccountingWorkload::CompositeEntityIds { rows: 10_000 },
+    ];
+
+    println!(
+        "{:<31} {:>7} {:>8} {:>12} {:>12} {:>10} {:>11} {:>13}",
+        "workload",
+        "rows",
+        "entries",
+        "value_bytes",
+        "total_bytes",
+        "bytes/row",
+        "changes",
+        "change_bytes"
+    );
+
+    for workload in workloads {
+        let row = run_changelog_workload(workload)
+            .await
+            .expect("changelog accounting workload should run");
+        println!(
+            "{:<31} {:>7} {:>8} {:>12} {:>12} {:>10} {:>11} {:>13}",
+            changelog_workload_label(workload),
+            row.rows,
+            row.snapshot.entries,
+            row.snapshot.value_bytes,
+            row.snapshot.total_bytes(),
+            row.snapshot.bytes_per_row(row.rows),
+            row.snapshot.changelog_entries,
+            row.snapshot.changelog_value_bytes,
+        );
+    }
+}
+
 struct AccountingRow {
     rows: usize,
     snapshot: AccountingSnapshot,
@@ -410,6 +470,35 @@ async fn run_json_workload(workload: JsonAccountingWorkload) -> Result<Accountin
     Ok(AccountingRow { rows, snapshot })
 }
 
+async fn run_changelog_workload(
+    workload: ChangelogAccountingWorkload,
+) -> Result<AccountingRow, LixError> {
+    let backend = AccountingBackend::default();
+    let rows = changelog_workload_rows(workload);
+    let config = changelog_config_for(workload);
+    let fixture = match workload {
+        ChangelogAccountingWorkload::AppendSmall { .. }
+        | ChangelogAccountingWorkload::Append1k { .. }
+        | ChangelogAccountingWorkload::Append16k { .. } => {
+            storage_bench::prepare_changelog_append_changes(config).await?
+        }
+        ChangelogAccountingWorkload::Tombstones { .. } => {
+            storage_bench::prepare_changelog_append_tombstones(config).await?
+        }
+        ChangelogAccountingWorkload::Metadata1k { .. } => {
+            storage_bench::prepare_changelog_append_metadata(config).await?
+        }
+        ChangelogAccountingWorkload::CompositeEntityIds { .. } => {
+            storage_bench::prepare_changelog_append_composite_entity_ids(config).await?
+        }
+    };
+    storage_bench::changelog_append_changes_prepared(&backend, &fixture).await?;
+    Ok(AccountingRow {
+        rows,
+        snapshot: backend.accounting()?,
+    })
+}
+
 fn config_for(workload: AccountingWorkload) -> StorageBenchConfig {
     StorageBenchConfig {
         rows: workload_rows(workload),
@@ -457,6 +546,58 @@ fn json_workload_rows(workload: JsonAccountingWorkload) -> usize {
         | JsonAccountingWorkload::DedupeSame16k { rows }
         | JsonAccountingWorkload::BaseUpdateObject1Of1000 { rows }
         | JsonAccountingWorkload::BaseUpdateArray1Of1000 { rows } => rows,
+    }
+}
+
+fn changelog_config_for(workload: ChangelogAccountingWorkload) -> StorageBenchConfig {
+    StorageBenchConfig {
+        rows: changelog_workload_rows(workload),
+        blob_bytes: 1024,
+        state_payload_bytes: match workload {
+            ChangelogAccountingWorkload::AppendSmall { .. }
+            | ChangelogAccountingWorkload::Tombstones { .. }
+            | ChangelogAccountingWorkload::CompositeEntityIds { .. } => 0,
+            ChangelogAccountingWorkload::Append1k { .. }
+            | ChangelogAccountingWorkload::Metadata1k { .. } => 1024,
+            ChangelogAccountingWorkload::Append16k { .. } => 16 * 1024,
+        },
+        key_pattern: StorageBenchKeyPattern::Sequential,
+        selectivity: StorageBenchSelectivity::Percent100,
+        update_fraction: StorageBenchUpdateFraction::Percent100,
+    }
+}
+
+fn changelog_workload_rows(workload: ChangelogAccountingWorkload) -> usize {
+    match workload {
+        ChangelogAccountingWorkload::AppendSmall { rows }
+        | ChangelogAccountingWorkload::Append1k { rows }
+        | ChangelogAccountingWorkload::Append16k { rows }
+        | ChangelogAccountingWorkload::Tombstones { rows }
+        | ChangelogAccountingWorkload::Metadata1k { rows }
+        | ChangelogAccountingWorkload::CompositeEntityIds { rows } => rows,
+    }
+}
+
+fn changelog_workload_label(workload: ChangelogAccountingWorkload) -> String {
+    match workload {
+        ChangelogAccountingWorkload::AppendSmall { rows } => {
+            format!("append_small/{}", row_label(rows))
+        }
+        ChangelogAccountingWorkload::Append1k { rows } => {
+            format!("append_1k/{}", row_label(rows))
+        }
+        ChangelogAccountingWorkload::Append16k { rows } => {
+            format!("append_16k/{}", row_label(rows))
+        }
+        ChangelogAccountingWorkload::Tombstones { rows } => {
+            format!("tombstones/{}", row_label(rows))
+        }
+        ChangelogAccountingWorkload::Metadata1k { rows } => {
+            format!("metadata_1k/{}", row_label(rows))
+        }
+        ChangelogAccountingWorkload::CompositeEntityIds { rows } => {
+            format!("composite_entity_ids/{}", row_label(rows))
+        }
     }
 }
 
@@ -531,6 +672,10 @@ impl AccountingBackend {
                 "json_store.json_chunk" => {
                     snapshot.json_chunk_entries += 1;
                     snapshot.json_chunk_value_bytes += value.len();
+                }
+                "changelog.change" => {
+                    snapshot.changelog_entries += 1;
+                    snapshot.changelog_value_bytes += value.len();
                 }
                 _ => {}
             }

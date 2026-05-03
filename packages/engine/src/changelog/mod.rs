@@ -1,3 +1,4 @@
+pub(crate) mod codec;
 mod context;
 mod reader;
 mod storage;

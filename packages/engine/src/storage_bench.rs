@@ -1,6 +1,7 @@
 use crate::binary_cas::{BinaryBlobWrite, BinaryCasContext};
 use crate::changelog::{CanonicalChange, ChangelogContext, ChangelogScanRequest};
 use crate::entity_identity::EntityIdentity;
+use crate::entity_identity::EntityIdentityPart;
 use crate::json_store::context::JsonStoreContext;
 use crate::json_store::types::{JsonProjectionPath, JsonRef, StoreJsonOptions};
 use crate::tracked_state::{
@@ -152,6 +153,11 @@ pub struct ChangelogAppendFixture {
 pub struct ChangelogReadFixture {
     context: ChangelogContext,
     rows: usize,
+}
+
+pub struct ChangelogCodecFixture {
+    changes: Vec<CanonicalChange>,
+    encoded_changes: Vec<Vec<u8>>,
 }
 
 pub struct BinaryCasWriteFixture {
@@ -955,6 +961,47 @@ pub async fn prepare_changelog_append_changes(
     })
 }
 
+pub async fn prepare_changelog_append_tombstones(
+    config: StorageBenchConfig,
+) -> Result<ChangelogAppendFixture, LixError> {
+    Ok(ChangelogAppendFixture {
+        context: ChangelogContext::new(),
+        changes: changelog_tombstone_changes(config),
+    })
+}
+
+pub async fn prepare_changelog_append_metadata(
+    config: StorageBenchConfig,
+) -> Result<ChangelogAppendFixture, LixError> {
+    Ok(ChangelogAppendFixture {
+        context: ChangelogContext::new(),
+        changes: changelog_metadata_changes(config),
+    })
+}
+
+pub async fn prepare_changelog_append_composite_entity_ids(
+    config: StorageBenchConfig,
+) -> Result<ChangelogAppendFixture, LixError> {
+    Ok(ChangelogAppendFixture {
+        context: ChangelogContext::new(),
+        changes: changelog_composite_entity_id_changes(config),
+    })
+}
+
+pub async fn prepare_changelog_codec(
+    config: StorageBenchConfig,
+) -> Result<ChangelogCodecFixture, LixError> {
+    let changes = changelog_changes(config);
+    let encoded_changes = changes
+        .iter()
+        .map(crate::changelog::codec::encode_change)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ChangelogCodecFixture {
+        changes,
+        encoded_changes,
+    })
+}
+
 pub async fn changelog_append_changes_prepared(
     backend: &(dyn LixBackend + Send + Sync),
     fixture: &ChangelogAppendFixture,
@@ -979,6 +1026,78 @@ pub async fn prepare_changelog_read(
         context,
         rows: config.rows,
     })
+}
+
+pub async fn prepare_changelog_read_with_selectivity(
+    backend: &(dyn LixBackend + Send + Sync),
+    config: StorageBenchConfig,
+) -> Result<ChangelogReadFixture, LixError> {
+    let context = ChangelogContext::new();
+    let changes = changelog_selective_changes(config);
+    append_changelog_changes(backend, &context, &changes).await?;
+    Ok(ChangelogReadFixture {
+        context,
+        rows: config.rows,
+    })
+}
+
+pub async fn prepare_changelog_read_entity_history(
+    backend: &(dyn LixBackend + Send + Sync),
+    config: StorageBenchConfig,
+) -> Result<ChangelogReadFixture, LixError> {
+    let context = ChangelogContext::new();
+    let changes = changelog_entity_history_changes(config);
+    append_changelog_changes(backend, &context, &changes).await?;
+    Ok(ChangelogReadFixture {
+        context,
+        rows: config.rows,
+    })
+}
+
+pub async fn prepare_changelog_read_commit_facts(
+    backend: &(dyn LixBackend + Send + Sync),
+    config: StorageBenchConfig,
+) -> Result<ChangelogReadFixture, LixError> {
+    let context = ChangelogContext::new();
+    let changes = changelog_commit_fact_changes(config);
+    append_changelog_changes(backend, &context, &changes).await?;
+    Ok(ChangelogReadFixture {
+        context,
+        rows: config.rows,
+    })
+}
+
+pub async fn changelog_encode_only_prepared(
+    fixture: &ChangelogCodecFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let mut verified_rows = 0;
+    let mut encoded_bytes = 0;
+    for change in &fixture.changes {
+        encoded_bytes += crate::changelog::codec::encode_change(change)?.len();
+        verified_rows += 1;
+    }
+    Ok(report(
+        fixture.changes.len(),
+        verified_rows + usize::from(encoded_bytes == 0),
+        Duration::ZERO,
+    ))
+}
+
+pub async fn changelog_decode_only_prepared(
+    fixture: &ChangelogCodecFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let mut verified_rows = 0;
+    let mut decoded_bytes = 0;
+    for bytes in &fixture.encoded_changes {
+        let change = crate::changelog::codec::decode_change(bytes)?;
+        decoded_bytes += change.schema_key.len();
+        verified_rows += 1;
+    }
+    Ok(report(
+        fixture.encoded_changes.len(),
+        verified_rows + usize::from(decoded_bytes == 0),
+        Duration::ZERO,
+    ))
 }
 
 pub async fn changelog_load_change_hit_prepared(
@@ -1042,6 +1161,65 @@ pub async fn changelog_scan_limit_100_prepared(
         .await?
         .len();
     Ok(report(expected, verified_rows, Duration::ZERO))
+}
+
+pub async fn changelog_scan_schema_prepared(
+    backend: &(dyn LixBackend + Send + Sync),
+    fixture: &ChangelogReadFixture,
+    selectivity: StorageBenchSelectivity,
+) -> Result<StorageBenchReport, LixError> {
+    let reader = fixture.context.reader(backend);
+    let changes = reader
+        .scan_changes(&ChangelogScanRequest::default())
+        .await?;
+    let verified_rows = changes
+        .iter()
+        .filter(|change| change.schema_key == CHANGELOG_MATCH_SCHEMA_KEY)
+        .count();
+    Ok(report(
+        selectivity.expected_rows(fixture.rows),
+        verified_rows,
+        Duration::ZERO,
+    ))
+}
+
+pub async fn changelog_scan_entity_history_prepared(
+    backend: &(dyn LixBackend + Send + Sync),
+    fixture: &ChangelogReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let reader = fixture.context.reader(backend);
+    let changes = reader
+        .scan_changes(&ChangelogScanRequest::default())
+        .await?;
+    let target = EntityIdentity::single(CHANGELOG_HISTORY_ENTITY_ID);
+    let verified_rows = changes
+        .iter()
+        .filter(|change| change.entity_id == target)
+        .count();
+    Ok(report(
+        fixture.rows.div_ceil(10),
+        verified_rows,
+        Duration::ZERO,
+    ))
+}
+
+pub async fn changelog_scan_commit_facts_prepared(
+    backend: &(dyn LixBackend + Send + Sync),
+    fixture: &ChangelogReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let reader = fixture.context.reader(backend);
+    let changes = reader
+        .scan_changes(&ChangelogScanRequest::default())
+        .await?;
+    let verified_rows = changes
+        .iter()
+        .filter(|change| change.schema_key == "lix_commit")
+        .count();
+    Ok(report(
+        fixture.rows.div_ceil(10),
+        verified_rows,
+        Duration::ZERO,
+    ))
 }
 
 pub async fn prepare_binary_cas_write_blobs(
@@ -1988,6 +2166,9 @@ const TRACKED_MATCH_SCHEMA_KEY: &str = "bench_tracked_entity";
 const TRACKED_OTHER_SCHEMA_KEY: &str = "bench_tracked_other_entity";
 const UNTRACKED_MATCH_SCHEMA_KEY: &str = "bench_untracked_entity";
 const UNTRACKED_OTHER_SCHEMA_KEY: &str = "bench_untracked_other_entity";
+const CHANGELOG_MATCH_SCHEMA_KEY: &str = "bench_changelog_entity";
+const CHANGELOG_OTHER_SCHEMA_KEY: &str = "bench_changelog_other_entity";
+const CHANGELOG_HISTORY_ENTITY_ID: &str = "change-entity-history-target";
 
 fn tracked_rows(config: StorageBenchConfig, commit_id: &str) -> Vec<TrackedStateRow> {
     (0..config.rows)
@@ -2069,6 +2250,90 @@ fn changelog_changes(config: StorageBenchConfig) -> Vec<CanonicalChange> {
         .collect()
 }
 
+fn changelog_tombstone_changes(config: StorageBenchConfig) -> Vec<CanonicalChange> {
+    changelog_changes(config)
+        .into_iter()
+        .map(|mut change| {
+            change.snapshot_content = None;
+            change.metadata = None;
+            change
+        })
+        .collect()
+}
+
+fn changelog_metadata_changes(config: StorageBenchConfig) -> Vec<CanonicalChange> {
+    changelog_changes(config)
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut change)| {
+            change.metadata = Some(snapshot_content(index, config.state_payload_bytes));
+            change
+        })
+        .collect()
+}
+
+fn changelog_composite_entity_id_changes(config: StorageBenchConfig) -> Vec<CanonicalChange> {
+    changelog_changes(config)
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut change)| {
+            change.entity_id = EntityIdentity {
+                parts: vec![
+                    EntityIdentityPart::String(entity_id(
+                        "change-composite",
+                        index,
+                        config.key_pattern,
+                    )),
+                    EntityIdentityPart::Number(index.to_string()),
+                    EntityIdentityPart::Bool(index % 2 == 0),
+                ],
+            };
+            change
+        })
+        .collect()
+}
+
+fn changelog_selective_changes(config: StorageBenchConfig) -> Vec<CanonicalChange> {
+    changelog_changes(config)
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut change)| {
+            change.schema_key = changelog_schema_key(index, config.selectivity);
+            change
+        })
+        .collect()
+}
+
+fn changelog_entity_history_changes(config: StorageBenchConfig) -> Vec<CanonicalChange> {
+    changelog_changes(config)
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut change)| {
+            if index % 10 == 0 {
+                change.entity_id = EntityIdentity::single(CHANGELOG_HISTORY_ENTITY_ID);
+            }
+            change
+        })
+        .collect()
+}
+
+fn changelog_commit_fact_changes(config: StorageBenchConfig) -> Vec<CanonicalChange> {
+    changelog_changes(config)
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut change)| {
+            if index % 10 == 0 {
+                change.schema_key = "lix_commit".to_string();
+                change.entity_id = EntityIdentity::single(format!("bench-commit-{index}"));
+                change.snapshot_content = Some(format!(
+                    "{{\"id\":\"bench-commit-{index}\",\"parent_ids\":[]}}"
+                ));
+            }
+            change
+        })
+        .collect()
+}
+
 fn tracked_schema_key(index: usize, selectivity: StorageBenchSelectivity) -> String {
     if selectivity.matches(index) {
         TRACKED_MATCH_SCHEMA_KEY
@@ -2083,6 +2348,15 @@ fn untracked_schema_key(index: usize, selectivity: StorageBenchSelectivity) -> S
         UNTRACKED_MATCH_SCHEMA_KEY
     } else {
         UNTRACKED_OTHER_SCHEMA_KEY
+    }
+    .to_string()
+}
+
+fn changelog_schema_key(index: usize, selectivity: StorageBenchSelectivity) -> String {
+    if selectivity.matches(index) {
+        CHANGELOG_MATCH_SCHEMA_KEY
+    } else {
+        CHANGELOG_OTHER_SCHEMA_KEY
     }
     .to_string()
 }
