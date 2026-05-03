@@ -20,6 +20,8 @@ use crate::{LixError, NullableKeyFilter};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
+const VERSION_DESCRIPTOR_SCHEMA_KEY: &str = "lix_version_descriptor";
+const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
 const STATE_SURFACE_SCHEMA_KEY: &str = "lix_state";
 
 /// Immutable view of the final transaction write set before persistence.
@@ -106,6 +108,7 @@ pub(crate) async fn validate_staged_writes(
             .await?;
     reject_unresolved_foreign_keys(&unresolved_foreign_keys)?;
     validate_committed_delete_restrictions(&input, &schema_catalog, &pending_constraints).await?;
+    validate_version_ref_delete_restrictions(&input, &pending_constraints).await?;
     validate_committed_insert_identities(&input, &pending_constraints).await?;
     validate_committed_unique_constraints(&input, &pending_constraints).await?;
     Ok(())
@@ -145,6 +148,76 @@ async fn validate_committed_insert_identities(
         ));
     }
     Ok(())
+}
+
+async fn validate_version_ref_delete_restrictions(
+    input: &TransactionValidationInput<'_>,
+    pending_constraints: &PendingConstraintIndexes,
+) -> Result<(), LixError> {
+    for tombstone in &pending_constraints.tombstones {
+        if tombstone.identity.schema_key != VERSION_REF_SCHEMA_KEY {
+            continue;
+        }
+
+        let descriptor_identity = LiveStateRowIdentity {
+            version_id: tombstone.identity.version_id.clone(),
+            schema_key: VERSION_DESCRIPTOR_SCHEMA_KEY.to_string(),
+            entity_id: tombstone.identity.entity_id.clone(),
+            file_id: tombstone.identity.file_id.clone(),
+        };
+        if pending_constraints.tombstones_target_identity(&descriptor_identity) {
+            continue;
+        }
+        if pending_constraints.has_identity_target(&descriptor_identity) {
+            return Err(version_ref_delete_restriction_error(
+                &tombstone.identity,
+                &descriptor_identity,
+            )?);
+        }
+
+        let Some(descriptor_row) = input
+            .live_state
+            .load_row(&LiveStateRowRequest {
+                schema_key: descriptor_identity.schema_key.clone(),
+                version_id: descriptor_identity.version_id.clone(),
+                entity_id: descriptor_identity.entity_id.clone(),
+                file_id: nullable_filter_from_option(&descriptor_identity.file_id),
+            })
+            .await?
+        else {
+            continue;
+        };
+        if descriptor_row.snapshot_content.is_some()
+            && committed_row_is_exact_version_scoped(
+                &descriptor_row,
+                &descriptor_identity.version_id,
+            )
+            && !pending_constraints.tombstones_identity(&descriptor_row)
+        {
+            return Err(version_ref_delete_restriction_error(
+                &tombstone.identity,
+                &descriptor_identity,
+            )?);
+        }
+    }
+    Ok(())
+}
+
+fn version_ref_delete_restriction_error(
+    ref_identity: &LiveStateRowIdentity,
+    descriptor_identity: &LiveStateRowIdentity,
+) -> Result<LixError, LixError> {
+    Ok(LixError::new(
+        LixError::CODE_FOREIGN_KEY,
+        format!(
+            "cannot delete '{}' row '{}' in version '{}' because matching '{}' row '{}' would remain without a version ref",
+            ref_identity.schema_key,
+            ref_identity.entity_id.as_string()?,
+            ref_identity.version_id,
+            descriptor_identity.schema_key,
+            descriptor_identity.entity_id.as_string()?,
+        ),
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
