@@ -182,6 +182,38 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_directory_path_insert_rejects_dot_segments,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        for path in ["/a/../b/", "/a/%2e%2e/b/", "/a/./b/"] {
+            let error = session
+                .execute(
+                    "INSERT INTO lix_directory (path) VALUES ($1)",
+                    &[Value::Text(path.to_string())],
+                )
+                .await
+                .expect_err("directory path insert should reject dot segments");
+
+            assert_eq!(error.code, "LIX_ERROR_PATH_DOT_SEGMENT");
+        }
+
+        let result = session
+            .execute("SELECT path FROM lix_directory WHERE path = '/b/'", &[])
+            .await
+            .expect("directory read should succeed");
+        assert_eq!(result.len(), 0);
+    }
+);
+
+simulation_test!(
     lix_directory_delete_recursively_deletes_tree,
     |sim| async move {
         let engine = sim.boot_engine().await;
