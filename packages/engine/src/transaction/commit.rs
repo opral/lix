@@ -4,7 +4,7 @@ use crate::binary_cas::{BinaryBlobWrite, BinaryCasContext};
 use crate::changelog::{CanonicalChange, ChangelogContext};
 use crate::live_state::{LiveStateContext, LiveStateRow};
 use crate::transaction::staging::StagedWriteSet;
-use crate::transaction::types::{StagedCommitMembers, StagedStateRow};
+use crate::transaction::types::{StagedAdoptedStateRow, StagedCommitMembers, StagedStateRow};
 use crate::version_ref::VersionRefContext;
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError};
@@ -44,6 +44,7 @@ pub(crate) async fn commit_staged_writes(
         .state_rows
         .into_iter()
         .partition(|row| !row.untracked);
+    let adopted_rows = staged_writes.adopted_rows;
     let finalized = finalize_commit_rows(
         staged_writes.commit_members_by_version,
         staged_writes.extra_commit_parents_by_version,
@@ -54,19 +55,24 @@ pub(crate) async fn commit_staged_writes(
     changelog_rows.extend(finalized.commit_rows);
     let version_heads = finalized.version_heads;
 
-    if changelog_rows.is_empty() && untracked_rows.is_empty() && version_heads.is_empty() {
+    if changelog_rows.is_empty()
+        && adopted_rows.is_empty()
+        && untracked_rows.is_empty()
+        && version_heads.is_empty()
+    {
         return Ok(());
     }
 
     if !changelog_rows.is_empty() {
-        let canonical_changes = changelog_rows
-            .iter()
-            .map(canonical_change_from_staged_row)
-            .collect::<Result<Vec<_>, _>>()?;
+        let canonical_changes =
+            new_canonical_changes(changelog, transaction, &changelog_rows).await?;
         {
             let mut writer = changelog.writer(&mut *transaction);
             writer.append_changes(&canonical_changes).await?;
         }
+    }
+    if !adopted_rows.is_empty() {
+        validate_adopted_canonical_changes(changelog, transaction, &adopted_rows).await?;
     }
 
     // The serving projection is updated in the same backend transaction as the
@@ -74,8 +80,9 @@ pub(crate) async fn commit_staged_writes(
     // commit root; untracked rows remain in the separate local overlay store.
     let live_state_rows = changelog_rows
         .into_iter()
-        .chain(untracked_rows)
         .map(LiveStateRow::from)
+        .chain(adopted_rows.into_iter().map(LiveStateRow::from))
+        .chain(untracked_rows.into_iter().map(LiveStateRow::from))
         .collect::<Vec<_>>();
 
     {
@@ -92,6 +99,74 @@ pub(crate) async fn commit_staged_writes(
                 &version_head.timestamp,
             )
             .await?;
+    }
+    Ok(())
+}
+
+async fn new_canonical_changes(
+    changelog: &ChangelogContext,
+    transaction: &mut dyn LixBackendTransaction,
+    rows: &[StagedStateRow],
+) -> Result<Vec<CanonicalChange>, LixError> {
+    let reader = changelog.reader(&mut *transaction);
+    let mut changes = Vec::new();
+    for row in rows {
+        let change = canonical_change_from_staged_row(row)?;
+        match reader.load_change(&change.id).await? {
+            Some(existing) => {
+                let entity_id = existing
+                    .entity_id
+                    .as_string()
+                    .unwrap_or_else(|_| "<invalid entity_id>".to_string());
+                return Err(LixError::new(
+                    LixError::CODE_UNIQUE,
+                    format!(
+                        "canonical change id '{}' already exists with different content for schema '{}' entity '{}'",
+                        change.id,
+                        existing.schema_key,
+                        entity_id
+                    ),
+                ));
+            }
+            None => changes.push(change),
+        }
+    }
+    Ok(changes)
+}
+
+async fn validate_adopted_canonical_changes(
+    changelog: &ChangelogContext,
+    transaction: &mut dyn LixBackendTransaction,
+    rows: &[StagedAdoptedStateRow],
+) -> Result<(), LixError> {
+    let reader = changelog.reader(&mut *transaction);
+    for row in rows {
+        let expected = canonical_change_from_adopted_row(row);
+        match reader.load_change(&expected.id).await? {
+            Some(existing) if existing == expected => {}
+            Some(existing) => {
+                let entity_id = existing
+                    .entity_id
+                    .as_string()
+                    .unwrap_or_else(|_| "<invalid entity_id>".to_string());
+                return Err(LixError::new(
+                    LixError::CODE_UNIQUE,
+                    format!(
+                        "adopted canonical change id '{}' exists with different content for schema '{}' entity '{}'",
+                        expected.id, existing.schema_key, entity_id
+                    ),
+                ));
+            }
+            None => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "adopted canonical change id '{}' does not exist in the changelog",
+                        expected.id
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -116,10 +191,27 @@ fn canonical_change_from_staged_row(row: &StagedStateRow) -> Result<CanonicalCha
     })
 }
 
+fn canonical_change_from_adopted_row(row: &StagedAdoptedStateRow) -> CanonicalChange {
+    CanonicalChange {
+        id: row.change_id.clone(),
+        entity_id: row.entity_id.clone(),
+        schema_key: row.schema_key.clone(),
+        schema_version: row.schema_version.clone(),
+        file_id: row.file_id.clone(),
+        snapshot_content: row.snapshot_content.clone(),
+        metadata: row.metadata.clone(),
+        created_at: row.created_at.clone(),
+    }
+}
+
 /// Materializes tracked staged membership into `lix_commit` rows.
 ///
 /// Staging only accumulates `version_id -> change_ids` because commit ids,
 /// parent heads, and commit-row timestamps belong to transaction finalization.
+/// The `change_ids` list is the ordered set of canonical changes whose effects
+/// the commit introduces relative to its first parent; merge commits may later
+/// populate this list with existing source-parent changes instead of copied
+/// changelog facts.
 /// This function turns those membership sets into normal `StagedStateRow`s with
 /// `schema_key = "lix_commit"`, so the changelog/live_state flush can treat
 /// commit rows exactly like any other staged state row.
@@ -271,6 +363,7 @@ mod tests {
             StagedWriteSet {
                 insert_identities: BTreeSet::new(),
                 state_rows: vec![tracked_global_row("change-1")],
+                adopted_rows: Vec::new(),
                 commit_members_by_version: BTreeMap::from([(
                     GLOBAL_VERSION_ID.to_string(),
                     members(["change-1"]),
@@ -335,6 +428,7 @@ mod tests {
             StagedWriteSet {
                 insert_identities: BTreeSet::new(),
                 state_rows: vec![untracked_global_row("change-untracked")],
+                adopted_rows: Vec::new(),
                 commit_members_by_version: BTreeMap::new(),
                 extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
@@ -413,6 +507,7 @@ mod tests {
             StagedWriteSet {
                 insert_identities: BTreeSet::new(),
                 state_rows: vec![tracked_global_row("change-tracked")],
+                adopted_rows: Vec::new(),
                 commit_members_by_version: BTreeMap::from([(
                     GLOBAL_VERSION_ID.to_string(),
                     members(["change-tracked"]),
@@ -475,6 +570,7 @@ mod tests {
             StagedWriteSet {
                 insert_identities: BTreeSet::new(),
                 state_rows: vec![tracked_version_row("version-a", "change-version-a")],
+                adopted_rows: Vec::new(),
                 commit_members_by_version: BTreeMap::from([(
                     "version-a".to_string(),
                     members(["change-version-a"]),

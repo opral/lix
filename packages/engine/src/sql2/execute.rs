@@ -691,10 +691,12 @@ mod tests {
             let count = match &write {
                 StageWrite::Rows { rows, .. } => rows.len() as u64,
                 StageWrite::RowsWithFileData { count, .. } => *count,
+                StageWrite::AdoptedChanges { changes } => changes.len() as u64,
             };
             let rows = match write {
                 StageWrite::Rows { rows, .. } => rows,
                 StageWrite::RowsWithFileData { rows, .. } => rows,
+                StageWrite::AdoptedChanges { .. } => Vec::new(),
             };
             self.staged_writes
                 .lock()

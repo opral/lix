@@ -1,7 +1,6 @@
-use crate::tracked_state::{TrackedStateDiffRequest, TrackedStateMergePlan, TrackedStateRow};
-use crate::transaction::types::StageRow;
+use crate::tracked_state::{TrackedStateDiffRequest, TrackedStateMergePlan};
+use crate::transaction::types::{StageAdoptedChange, StageWrite};
 use crate::LixError;
-use crate::GLOBAL_VERSION_ID;
 
 use super::context::SessionContext;
 
@@ -36,12 +35,10 @@ pub enum MergeVersionOutcome {
 impl SessionContext {
     /// Merges `source_version_id` into this session's active version.
     ///
-    /// The merge is materialized as a normal tracked write in the target
-    /// version. The generated target commit keeps the previous target head as
-    /// its first parent and records the source head as an additional parent,
-    /// so the commit graph preserves branch ancestry while tracked-state
-    /// storage can still build the new root by applying source patches onto
-    /// the target root.
+    /// The generated target commit keeps the previous target head as its first
+    /// parent and records the source head as an additional parent, so the
+    /// commit graph preserves branch ancestry while tracked-state storage can
+    /// build the new root by applying source effects onto the target root.
     pub async fn merge_version(
         &self,
         options: MergeVersionOptions,
@@ -108,8 +105,9 @@ impl SessionContext {
                     ));
                 }
 
-                let rows = stage_rows_from_merge_plan(&merge_plan, &active_version_id);
-                if rows.is_empty() {
+                let adopted_changes =
+                    adopted_changes_from_merge_plan(&merge_plan, &active_version_id);
+                if adopted_changes.is_empty() {
                     return Ok(MergeVersionReceipt {
                         outcome: MergeVersionOutcome::AlreadyUpToDate,
                         target_version_id: active_version_id,
@@ -123,8 +121,10 @@ impl SessionContext {
                     });
                 }
 
-                let applied_change_count = rows.len();
-                transaction.stage_rows(rows)?;
+                let applied_change_count = adopted_changes.len();
+                transaction.stage_write(StageWrite::AdoptedChanges {
+                    changes: adopted_changes,
+                })?;
                 let created_merge_commit_id = transaction
                     .staged_commit_id(&active_version_id)?
                     .ok_or_else(|| {
@@ -152,30 +152,23 @@ impl SessionContext {
     }
 }
 
-fn stage_rows_from_merge_plan(
+fn adopted_changes_from_merge_plan(
     plan: &TrackedStateMergePlan,
     target_version_id: &str,
-) -> Vec<StageRow> {
+) -> Vec<StageAdoptedChange> {
     plan.patches
         .iter()
-        .map(|patch| stage_row_from_tracked_row(&patch.source_row, target_version_id))
+        .map(|patch| stage_adopted_change_from_patch(patch, target_version_id))
         .collect()
 }
 
-fn stage_row_from_tracked_row(row: &TrackedStateRow, target_version_id: &str) -> StageRow {
-    StageRow {
-        entity_id: Some(row.entity_id.clone()),
-        schema_key: row.schema_key.clone(),
-        file_id: row.file_id.clone(),
-        snapshot_content: row.snapshot_content.clone(),
-        metadata: row.metadata.clone(),
-        schema_version: row.schema_version.clone(),
-        created_at: None,
-        updated_at: None,
-        global: target_version_id == GLOBAL_VERSION_ID,
-        change_id: None,
-        commit_id: None,
-        untracked: false,
+fn stage_adopted_change_from_patch(
+    patch: &crate::tracked_state::TrackedStateMergePatch,
+    target_version_id: &str,
+) -> StageAdoptedChange {
+    StageAdoptedChange {
         version_id: target_version_id.to_string(),
+        change_id: patch.change_id().to_string(),
+        projected_row: patch.projected_row().clone(),
     }
 }

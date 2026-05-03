@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::KvStore;
 use crate::changelog::{CanonicalChange, ChangelogContext, ChangelogStoreReader};
@@ -53,8 +53,8 @@ where
     /// Returns the canonical entities that are effective at `head_commit_id`.
     ///
     /// Reachable commits are visited nearest-first. For each commit, the commit
-    /// row itself is visible, then member `change_ids` are visited in reverse
-    /// order so later writes in the same commit win.
+    /// row itself is visible, then introduced/adopted `change_ids` are visited
+    /// in reverse order so later writes in the same commit win.
     pub(crate) async fn entities_at(
         &mut self,
         head_commit_id: &str,
@@ -170,7 +170,7 @@ where
             .collect()
     }
 
-    /// Loads the canonical changes referenced by each commit's change set.
+    /// Loads the canonical changes introduced/adopted by each commit's change set.
     pub(crate) async fn change_set_elements(
         &mut self,
         commits: &[CommitGraphCommit],
@@ -190,11 +190,11 @@ where
         Ok(elements)
     }
 
-    /// Returns canonical member changes reachable from `start_commit_id`.
+    /// Returns canonical changes reachable from `start_commit_id`.
     ///
     /// This is the primitive history API. It reports the commit/depth where
-    /// each matching canonical change was observed and leaves row shaping to
-    /// callers such as SQL providers.
+    /// each matching canonical change was introduced or adopted during graph
+    /// traversal and leaves row shaping to callers such as SQL providers.
     pub(crate) async fn change_history_from_commit(
         &mut self,
         start_commit_id: &str,
@@ -202,6 +202,7 @@ where
     ) -> Result<Vec<CommitGraphChangeHistoryEntry>, LixError> {
         let commits = self.reachable_commits(start_commit_id).await?;
         let mut entries = Vec::new();
+        let mut seen_change_ids = BTreeSet::new();
 
         for reachable in commits {
             if !depth_matches(reachable.depth, request) {
@@ -210,11 +211,14 @@ where
 
             let commit_id = reachable.commit.commit_id;
             for change_id in reachable.commit.change_ids {
+                if !seen_change_ids.insert(change_id.clone()) {
+                    continue;
+                }
                 let change = self.load_member_change(&change_id, &commit_id).await?;
                 if change_matches_history_request(&change, request) {
                     entries.push(CommitGraphChangeHistoryEntry {
                         change,
-                        commit_id: commit_id.clone(),
+                        observed_commit_id: commit_id.clone(),
                         start_commit_id: start_commit_id.to_string(),
                         depth: reachable.depth,
                     });
@@ -840,7 +844,7 @@ mod tests {
                 .iter()
                 .map(|entry| (
                     entry.change.id.as_str(),
-                    entry.commit_id.as_str(),
+                    entry.observed_commit_id.as_str(),
                     entry.start_commit_id.as_str(),
                     entry.depth
                 ))

@@ -25,13 +25,38 @@ pub(crate) struct TrackedStateMergePlan {
 
 /// One source-side patch to apply to the target root.
 ///
-/// The patch carries the full source row, including tombstones. That keeps
-/// delete application explicit while leaving transaction hydration to the
-/// session/transaction layer.
+/// Merge patches are expressed as canonical change adoption, not as new row
+/// writes. The projected row carries the target-root materialization shape,
+/// including tombstones, while `change_id` preserves the source canonical
+/// change identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrackedStateMergePatch {
-    pub(crate) identity: TrackedStateDiffIdentity,
-    pub(crate) source_row: TrackedStateRow,
+pub(crate) enum TrackedStateMergePatch {
+    Adopt {
+        identity: TrackedStateDiffIdentity,
+        change_id: String,
+        projected_row: TrackedStateRow,
+    },
+}
+
+impl TrackedStateMergePatch {
+    #[cfg(test)]
+    pub(crate) fn identity(&self) -> &TrackedStateDiffIdentity {
+        match self {
+            Self::Adopt { identity, .. } => identity,
+        }
+    }
+
+    pub(crate) fn change_id(&self) -> &str {
+        match self {
+            Self::Adopt { change_id, .. } => change_id,
+        }
+    }
+
+    pub(crate) fn projected_row(&self) -> &TrackedStateRow {
+        match self {
+            Self::Adopt { projected_row, .. } => projected_row,
+        }
+    }
 }
 
 /// One identity that both sides changed incompatibly.
@@ -72,10 +97,8 @@ pub(crate) fn plan_merge(
                 // there is nothing to apply.
             }
             (None, Some(source)) => {
-                plan.patches.push(TrackedStateMergePatch {
-                    identity,
-                    source_row: source_row_for_patch(source)?,
-                });
+                plan.patches
+                    .push(adopt_source_change_patch(identity, source)?);
             }
             (Some(target), Some(source)) if same_final_state(target, source) => {
                 // Both sides reached the same visible state. Keep target to
@@ -113,7 +136,10 @@ fn diff_by_identity(
     Ok(entries)
 }
 
-fn source_row_for_patch(entry: &TrackedStateDiffEntry) -> Result<TrackedStateRow, LixError> {
+fn adopt_source_change_patch(
+    identity: TrackedStateDiffIdentity,
+    entry: &TrackedStateDiffEntry,
+) -> Result<TrackedStateMergePatch, LixError> {
     let Some(row) = entry.after.clone() else {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -124,7 +150,11 @@ fn source_row_for_patch(entry: &TrackedStateDiffEntry) -> Result<TrackedStateRow
             ),
         ));
     };
-    Ok(row)
+    Ok(TrackedStateMergePatch::Adopt {
+        identity,
+        change_id: row.change_id.clone(),
+        projected_row: row,
+    })
 }
 
 fn same_final_state(target: &TrackedStateDiffEntry, source: &TrackedStateDiffEntry) -> bool {
@@ -186,9 +216,10 @@ mod tests {
 
         assert_eq!(patch_ids(&plan), vec!["entity-a"]);
         assert_eq!(
-            plan.patches[0].source_row.snapshot_content.as_deref(),
+            plan.patches[0].projected_row().snapshot_content.as_deref(),
             Some("{\"value\":\"source\"}")
         );
+        assert_eq!(plan.patches[0].change_id(), "source");
     }
 
     #[test]
@@ -205,7 +236,8 @@ mod tests {
         .expect("merge should plan");
 
         assert_eq!(patch_ids(&plan), vec!["entity-a"]);
-        assert_eq!(plan.patches[0].source_row.snapshot_content, None);
+        assert_eq!(plan.patches[0].projected_row().snapshot_content, None);
+        assert_eq!(plan.patches[0].change_id(), "source-delete");
     }
 
     #[test]
@@ -404,7 +436,7 @@ mod tests {
     fn patch_ids(plan: &TrackedStateMergePlan) -> Vec<String> {
         plan.patches
             .iter()
-            .map(|entry| entry.identity.entity_id.as_string().expect("identity"))
+            .map(|entry| entry.identity().entity_id.as_string().expect("identity"))
             .collect()
     }
 

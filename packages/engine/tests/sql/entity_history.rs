@@ -62,7 +62,7 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, count, active, meta, lixcol_entity_id, lixcol_commit_id, lixcol_start_commit_id, lixcol_depth \
+                    "SELECT id, count, active, meta, lixcol_entity_id, lixcol_observed_commit_id, lixcol_start_commit_id, lixcol_depth \
                      FROM engine2_history_schema_history \
                      WHERE lixcol_start_commit_id = '{second_commit_id}' \
                        AND lixcol_entity_id = 'history-entity' \
