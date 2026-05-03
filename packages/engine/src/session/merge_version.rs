@@ -2,6 +2,7 @@ use serde_json::json;
 
 use crate::tracked_state::{TrackedStateDiffRequest, TrackedStateMergePlan};
 use crate::transaction::types::{StageAdoptedChange, StageWrite};
+use crate::version::VersionRefReader;
 use crate::LixError;
 
 use super::context::SessionContext;

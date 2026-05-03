@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use crate::backend::{LixBackend, TransactionBeginMode};
 use crate::tracked_state::{TrackedStateContext, TrackedStateRow};
 use crate::untracked_state::UntrackedStateContext;
-use crate::version_ref::VersionRefContext;
+use crate::version::VersionContext;
 use crate::GLOBAL_VERSION_ID;
 
 pub(crate) const TEST_EMPTY_ROOT_COMMIT_ID: &str = "test-empty-root";
@@ -36,9 +38,8 @@ pub(crate) async fn seed_version_head_with_rows(
         .begin_transaction(TransactionBeginMode::Write)
         .await
         .expect("seed transaction should open");
-    VersionRefContext::new(Arc::new(UntrackedStateContext::new()))
-        .writer(transaction.as_mut())
-        .advance_head(version_id, commit_id, TEST_TIMESTAMP)
+    VersionContext::new(Arc::new(UntrackedStateContext::new()))
+        .advance_ref(transaction.as_mut(), version_id, commit_id, TEST_TIMESTAMP)
         .await
         .expect("version ref should write");
     TrackedStateContext::new()
@@ -48,4 +49,3 @@ pub(crate) async fn seed_version_head_with_rows(
         .expect("tracked root should write");
     transaction.commit().await.expect("seed should commit");
 }
-use std::sync::Arc;

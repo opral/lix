@@ -11,7 +11,7 @@ use crate::schema_registry::SchemaRegistry;
 use crate::session::SessionContext;
 use crate::tracked_state::TrackedStateContext;
 use crate::untracked_state::UntrackedStateContext;
-use crate::version_ref::VersionRefContext;
+use crate::version::{VersionContext, VersionRefReader};
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, NullableKeyFilter, TransactionBeginMode};
 
@@ -20,7 +20,7 @@ pub struct Engine {
     backend: Arc<dyn LixBackend + Send + Sync>,
     tracked_state: Arc<TrackedStateContext>,
     live_state: Arc<LiveStateContext>,
-    version_ref: Arc<VersionRefContext>,
+    version_ctx: Arc<VersionContext>,
     binary_cas: Arc<BinaryCasContext>,
     changelog: Arc<ChangelogContext>,
     schema_registry: Arc<SchemaRegistry>,
@@ -61,7 +61,7 @@ impl Engine {
             *untracked_state,
             commit_graph,
         ));
-        let version_ref = Arc::new(VersionRefContext::new(Arc::clone(&untracked_state)));
+        let version_ctx = Arc::new(VersionContext::new(Arc::clone(&untracked_state)));
         assert_initialized(Arc::clone(&backend), live_state.as_ref()).await?;
 
         // SessionContext::execute later projects these stable state contexts into one
@@ -74,7 +74,7 @@ impl Engine {
             backend,
             tracked_state,
             live_state,
-            version_ref,
+            version_ctx,
             schema_registry: Arc::new(SchemaRegistry::new()),
         })
     }
@@ -88,11 +88,6 @@ impl Engine {
         Arc::clone(&self.tracked_state)
     }
 
-    #[cfg(test)]
-    pub(crate) fn version_ref(&self) -> Arc<VersionRefContext> {
-        Arc::clone(&self.version_ref)
-    }
-
     /// Loads the current commit head for a version.
     ///
     /// This is the public engine-level form of the typed `version_ref` context:
@@ -102,8 +97,8 @@ impl Engine {
         &self,
         version_id: &str,
     ) -> Result<Option<String>, LixError> {
-        self.version_ref
-            .reader(self.backend())
+        self.version_ctx
+            .ref_reader(self.backend())
             .load_head_commit_id(version_id)
             .await
     }
@@ -119,7 +114,7 @@ impl Engine {
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.changelog),
-            Arc::clone(&self.version_ref),
+            Arc::clone(&self.version_ctx),
             Arc::clone(&self.schema_registry),
         )
         .await
@@ -132,7 +127,7 @@ impl Engine {
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.changelog),
-            Arc::clone(&self.version_ref),
+            Arc::clone(&self.version_ctx),
             Arc::clone(&self.schema_registry),
         )
         .await

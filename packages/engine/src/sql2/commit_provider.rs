@@ -22,7 +22,7 @@ use tokio::sync::Mutex;
 
 use crate::commit_graph::{CommitGraphCommit, CommitGraphReader};
 use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
-use crate::version_ref::VersionRefReader;
+use crate::version::VersionRefReader;
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 

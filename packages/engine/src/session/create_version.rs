@@ -1,15 +1,8 @@
-use serde_json::json;
-
-use crate::transaction::types::{StageRow, StageWrite, StageWriteMode};
+use crate::transaction::types::{StageWrite, StageWriteMode};
+use crate::version::{version_descriptor_stage_row, version_ref_stage_row, VersionRefReader};
 use crate::LixError;
-use crate::GLOBAL_VERSION_ID;
 
 use super::context::SessionContext;
-
-const VERSION_DESCRIPTOR_SCHEMA_KEY: &str = "lix_version_descriptor";
-const VERSION_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
-const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
-const VERSION_REF_SCHEMA_VERSION: &str = "1";
 
 /// Options for creating a new version from the session's active version.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,8 +59,8 @@ impl SessionContext {
                 transaction.stage_write(StageWrite::Rows {
                     mode: StageWriteMode::Insert,
                     rows: vec![
-                        version_descriptor_stage_row(&version_id, &options.name)?,
-                        version_ref_stage_row(&version_id, &source_head)?,
+                        version_descriptor_stage_row(&version_id, &options.name, false),
+                        version_ref_stage_row(&version_id, &source_head),
                     ],
                 })?;
 
@@ -76,56 +69,4 @@ impl SessionContext {
         })
         .await
     }
-}
-
-fn version_descriptor_stage_row(version_id: &str, name: &str) -> Result<StageRow, LixError> {
-    Ok(StageRow {
-        entity_id: Some(crate::entity_identity::EntityIdentity::single(version_id)),
-        schema_key: VERSION_DESCRIPTOR_SCHEMA_KEY.to_string(),
-        file_id: None,
-        snapshot_content: Some(encode_snapshot(json!({
-            "id": version_id,
-            "name": name,
-            "hidden": false,
-        }))?),
-        metadata: None,
-        schema_version: VERSION_DESCRIPTOR_SCHEMA_VERSION.to_string(),
-        created_at: None,
-        updated_at: None,
-        global: true,
-        change_id: None,
-        commit_id: None,
-        untracked: false,
-        version_id: GLOBAL_VERSION_ID.to_string(),
-    })
-}
-
-fn version_ref_stage_row(version_id: &str, commit_id: &str) -> Result<StageRow, LixError> {
-    Ok(StageRow {
-        entity_id: Some(crate::entity_identity::EntityIdentity::single(version_id)),
-        schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
-        file_id: None,
-        snapshot_content: Some(encode_snapshot(json!({
-            "id": version_id,
-            "commit_id": commit_id,
-        }))?),
-        metadata: None,
-        schema_version: VERSION_REF_SCHEMA_VERSION.to_string(),
-        created_at: None,
-        updated_at: None,
-        global: true,
-        change_id: None,
-        commit_id: None,
-        untracked: true,
-        version_id: GLOBAL_VERSION_ID.to_string(),
-    })
-}
-
-fn encode_snapshot(value: serde_json::Value) -> Result<String, LixError> {
-    serde_json::to_string(&value).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("engine2 create_version snapshot serialization failed: {error}"),
-        )
-    })
 }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use crate::transaction::types::StageRow;
+use crate::version::VersionRefReader;
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 
@@ -71,7 +72,7 @@ impl SessionContext {
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.changelog),
-            Arc::clone(&self.version_ref),
+            Arc::clone(&self.version_ctx),
             Arc::clone(&self.schema_registry),
             self.closed_flag(),
         );
