@@ -624,3 +624,84 @@ Change: backend/storage get and scan results now return `KvRowBatch` / `BackendK
 Worked: the API now reads as logical KV batches, keeps physical pages/chunks out of the contributor-facing model, and improves most compact real-backend paths against a clean HEAD baseline.
 
 Did not work: the win is mostly boundary/allocation cleanup; the next scan optimization should target backend-owned borrowed page buffers or RocksDB iterator reuse, not more result-shape churn.
+
+## 2026-05-04 12:52 PDT: Owner Projection Decision Baseline
+
+Change: added fast owner-level projection benches to compare keys-only/header-only scans against full-row scans before changing the storage API layout again.
+
+| Benchmark / Workload                      | Baseline |
+| ----------------------------------------- | -------: |
+| `tracked_state/scan_keys_only/10k`        | ~11.4 ms |
+| `tracked_state/scan_headers_only/10k`     | ~10.5 ms |
+| `tracked_state/scan_full_rows/10k`        | ~10.5 ms |
+| `untracked_state/scan_keys_only/10k`      | ~12.5 ms |
+| `untracked_state/scan_headers_only/10k`   | ~12.2 ms |
+| `untracked_state/scan_full_rows/10k`      | ~12.1 ms |
+| `changelog/scan_change_ids_only/10k`      |  ~7.2 ms |
+| `changelog/scan_commit_facts/10k`         |  ~5.7 ms |
+| `changelog/scan_full_changes/10k`         |  ~6.3 ms |
+| `in_memory/get_kv_many_hit/10k`           |  ~2.8 ms |
+| `in_memory/get_kv_many_exists/10k`        |  ~2.5 ms |
+| `in_memory/scan_kv_prefix/10k`            |  ~901 us |
+| `in_memory/scan_kv_after_pages/10k`       |  ~986 us |
+| `sqlite_tempfile/get_kv_many_hit/10k`     |  ~7.3 ms |
+| `sqlite_tempfile/get_kv_many_exists/10k`  |  ~6.4 ms |
+| `sqlite_tempfile/scan_kv_prefix/10k`      |  ~3.0 ms |
+| `sqlite_tempfile/scan_kv_after_pages/10k` |  ~4.3 ms |
+| `rocksdb_tempdir/get_kv_many_hit/10k`     |  ~7.6 ms |
+| `rocksdb_tempdir/get_kv_many_exists/10k`  |  ~2.4 ms |
+| `rocksdb_tempdir/scan_kv_prefix/10k`      |  ~2.9 ms |
+| `rocksdb_tempdir/scan_kv_after_pages/10k` |  ~3.4 ms |
+
+Payload-sensitive owner projection baselines:
+
+| Benchmark / Workload                               | Baseline |
+| -------------------------------------------------- | -------: |
+| `tracked_state/scan_keys_only_payload_1k/10k`      |  ~9.1 ms |
+| `tracked_state/scan_headers_only_payload_1k/10k`   |  ~8.8 ms |
+| `tracked_state/scan_full_rows_payload_1k/10k`      | ~34.8 ms |
+| `tracked_state/scan_keys_only_payload_16k/1k`      |  ~908 us |
+| `tracked_state/scan_headers_only_payload_16k/1k`   |  ~980 us |
+| `tracked_state/scan_full_rows_payload_16k/1k`      | ~34.5 ms |
+| `untracked_state/scan_keys_only_payload_1k/10k`    | ~16.0 ms |
+| `untracked_state/scan_headers_only_payload_1k/10k` | ~16.2 ms |
+| `untracked_state/scan_full_rows_payload_1k/10k`    | ~16.6 ms |
+| `untracked_state/scan_keys_only_payload_16k/1k`    |  ~5.8 ms |
+| `untracked_state/scan_headers_only_payload_16k/1k` |  ~5.1 ms |
+| `untracked_state/scan_full_rows_payload_16k/1k`    |  ~5.2 ms |
+| `changelog/scan_change_ids_only_payload_1k/10k`    |  ~5.7 ms |
+| `changelog/scan_full_changes_payload_1k/10k`       |  ~5.3 ms |
+| `changelog/scan_change_ids_only_payload_16k/1k`    |  ~583 us |
+| `changelog/scan_full_changes_payload_16k/1k`       |  ~539 us |
+
+Binary CAS baselines:
+
+| Benchmark / Workload                             |  Baseline |
+| ------------------------------------------------ | --------: |
+| `binary_cas/write_blobs_1k/10k`                  |  ~86.7 ms |
+| `binary_cas/read_blob_hit_1k/10k`                | ~122.7 ms |
+| `binary_cas/read_blob_miss_1k/10k`               |   ~9.6 ms |
+| `binary_cas/write_duplicate_payload_1k/10k`      |  ~68.9 ms |
+| `binary_cas/write_half_duplicate_payload_1k/10k` |  ~85.0 ms |
+
+Worked: the fast matrix now compares backend projection paths with owner-level projection intent in one run.
+
+Did not work: owner-level projection is not meaningfully cheaper on small rows; payload variants show tracked_state can avoid snapshot materialization, but untracked_state and changelog still mostly pay full row decode even when callers ask for keys or headers. Binary CAS reads/writes are now baselined, but they are a separate blob-throughput optimization track.
+
+## 2026-05-04 13:08 PDT: Binary CAS Batched Writes
+
+Commit: `5c3f2c87`
+
+Change: Binary CAS now stages manifests, manifest chunks, and chunks into one `KvWriteBatch`; duplicate blob hashes are skipped once staged, and chunk payloads are deduped by chunk key before encoding/writing. Blob reads now batch chunk loads within each blob.
+
+| Benchmark / Workload                             |    Before |     After |        Delta |
+| ------------------------------------------------ | --------: | --------: | -----------: |
+| `binary_cas/write_blobs_1k/10k`                  |  ~86.7 ms |  ~78.3 ms |  ~10% faster |
+| `binary_cas/read_blob_hit_1k/10k`                | ~122.7 ms | ~125.5 ms |    unchanged |
+| `binary_cas/read_blob_miss_1k/10k`               |   ~9.6 ms |  ~10.2 ms |    unchanged |
+| `binary_cas/write_duplicate_payload_1k/10k`      |  ~68.9 ms |  ~11.3 ms | ~6.1x faster |
+| `binary_cas/write_half_duplicate_payload_1k/10k` |  ~85.0 ms |  ~44.7 ms |  ~47% faster |
+
+Worked: batching removes per-blob write calls and blob/chunk dedupe massively improves duplicate-heavy CAS writes.
+
+Did not work: the current read benchmark loads one 1KiB single-chunk blob at a time, so per-blob manifest lookup and manifest-chunk scan still dominate; the next read win needs a many-blob read path or a single-row small-blob format.
