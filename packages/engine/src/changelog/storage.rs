@@ -2,8 +2,8 @@ use crate::changelog::codec::{decode_change, encode_change};
 use crate::changelog::{CanonicalChange, ChangelogScanRequest};
 use crate::storage::KvScanRange;
 use crate::storage::{
-    KvGetGroup, KvGetProjection, KvGetRequest, KvPut, KvScanProjection, KvScanRequest,
-    KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
+    KvGetGroup, KvGetRequest, KvPut, KvScanRequest, KvWriteBatch, KvWriteGroup, StorageReader,
+    StorageWriter,
 };
 use crate::LixError;
 
@@ -14,20 +14,17 @@ pub(crate) async fn load_change(
     change_id: &str,
 ) -> Result<Option<CanonicalChange>, LixError> {
     let bytes = store
-        .get_kv_many(KvGetRequest {
+        .get_values(KvGetRequest {
             groups: vec![KvGetGroup {
                 namespace: CHANGELOG_CHANGE_NAMESPACE.to_string(),
                 keys: vec![encode_change_key(change_id)],
             }],
-            projection: KvGetProjection::Values,
         })
         .await?
         .groups
         .into_iter()
         .next()
-        .map(|mut group| group.pop_value())
-        .transpose()?
-        .flatten();
+        .and_then(|mut group| group.pop_value());
     let Some(bytes) = bytes else {
         return Ok(None);
     };
@@ -40,20 +37,15 @@ pub(crate) async fn scan_changes(
 ) -> Result<Vec<CanonicalChange>, LixError> {
     // TODO(engine2): scan by a durable append sequence instead of change id.
     // This first index is enough for exact lookup and deterministic debug scans.
-    store
-        .scan_kv(KvScanRequest {
+    let page = store
+        .scan_values(KvScanRequest {
             namespace: CHANGELOG_CHANGE_NAMESPACE.to_string(),
             range: KvScanRange::prefix(Vec::new()),
             after: None,
             limit: request.limit.unwrap_or(usize::MAX),
-            projection: KvScanProjection::KeysAndValues,
         })
-        .await?
-        .into_rows()
-        .into_values_required()?
-        .into_iter()
-        .map(|value| decode_change(&value))
-        .collect()
+        .await?;
+    page.values.iter().map(decode_change).collect()
 }
 
 pub(crate) async fn append_changes(

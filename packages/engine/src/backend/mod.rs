@@ -4,9 +4,9 @@ pub(crate) mod testing;
 mod types;
 
 pub use kv::{
-    BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetGroup, BackendKvGetProjection,
-    BackendKvGetRequest, BackendKvPut, BackendKvRowBatch, BackendKvScanBatch,
-    BackendKvScanProjection, BackendKvScanRange, BackendKvScanRequest, BackendKvWriteBatch,
-    BackendKvWriteGroup, BackendKvWriteStats,
+    BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetGroup,
+    BackendKvGetRequest, BackendKvKeyPage, BackendKvPut, BackendKvScanRange, BackendKvScanRequest,
+    BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
+    BackendKvWriteGroup, BackendKvWriteStats, BytePage, BytePageBuilder,
 };
 pub use types::{Backend, BackendReadTransaction, BackendWriteTransaction};

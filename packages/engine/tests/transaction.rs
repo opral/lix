@@ -4,10 +4,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lix_engine::{
-    Backend, BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetRequest, BackendKvRowBatch,
-    BackendKvScanBatch, BackendKvScanProjection, BackendKvScanRange, BackendKvScanRequest,
-    BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
-    Engine, LixError,
+    Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetRequest,
+    BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch,
+    BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteStats,
+    BackendReadTransaction, BackendWriteTransaction, BytePageBuilder, Engine, LixError,
 };
 
 type KvKey = (String, Vec<u8>);
@@ -202,96 +202,85 @@ enum RecordingTransactionMode {
 
 #[async_trait]
 impl BackendReadTransaction for RecordingTransaction {
-    async fn get_kv_many(
+    async fn get_values(
         &mut self,
         request: BackendKvGetRequest,
-    ) -> Result<BackendKvGetBatch, LixError> {
+    ) -> Result<BackendKvValueBatch, LixError> {
         let data = self.data.lock().expect("recording backend lock poisoned");
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
-            let mut rows = BackendKvRowBatch::with_capacity(group.keys.len());
+            let mut values = Vec::with_capacity(group.keys.len());
             for key in group.keys {
                 let identity = (group.namespace.clone(), key.clone());
-                rows.push_get_projection(
-                    key,
+                values.push(
                     self.pending
                         .get(&identity)
                         .cloned()
                         .unwrap_or_else(|| data.get(&identity).cloned()),
-                    request.projection,
                 );
             }
-            groups.push(BackendKvGetBatchGroup {
+            groups.push(BackendKvValueGroup {
                 namespace: group.namespace,
-                rows,
+                values,
             });
         }
-        Ok(BackendKvGetBatch { groups })
+        Ok(BackendKvValueBatch { groups })
     }
 
-    async fn scan_kv(
+    async fn exists_many(
+        &mut self,
+        request: BackendKvGetRequest,
+    ) -> Result<BackendKvExistsBatch, LixError> {
+        let data = self.data.lock().expect("recording backend lock poisoned");
+        let mut groups = Vec::with_capacity(request.groups.len());
+        for group in request.groups {
+            let mut exists = Vec::with_capacity(group.keys.len());
+            for key in group.keys {
+                let identity = (group.namespace.clone(), key.clone());
+                exists.push(
+                    self.pending
+                        .get(&identity)
+                        .map(|value| value.is_some())
+                        .unwrap_or_else(|| data.contains_key(&identity)),
+                );
+            }
+            groups.push(BackendKvExistsGroup {
+                namespace: group.namespace,
+                exists,
+            });
+        }
+        Ok(BackendKvExistsBatch { groups })
+    }
+
+    async fn scan_keys(
         &mut self,
         request: BackendKvScanRequest,
-    ) -> Result<BackendKvScanBatch, LixError> {
-        if self
-            .fail_scan_namespace
-            .lock()
-            .expect("fail namespace lock should not poison")
-            .as_deref()
-            == Some(request.namespace.as_str())
-        {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("forced scan failure for namespace {}", request.namespace),
-            ));
-        }
-
-        let mut visible = self
-            .data
-            .lock()
-            .expect("recording backend lock poisoned")
-            .clone();
-        for (key, value) in &self.pending {
-            match value {
-                Some(value) => {
-                    visible.insert(key.clone(), value.clone());
-                }
-                None => {
-                    visible.remove(key);
-                }
-            }
-        }
-
-        let scan_limit = request
-            .limit
-            .checked_add(1 + usize::from(request.after.is_some()))
-            .unwrap_or(request.limit);
-        let rows = scan_map(
-            &visible,
-            &request.namespace,
-            &request.range,
-            Some(scan_limit),
-        );
-        let mut filtered = BackendKvRowBatch::new();
-        for index in 0..rows.len() {
-            let key = rows.key(index).expect("row key exists");
-            if request.after.as_deref().is_none_or(|after| key > after) {
-                match request.projection {
-                    BackendKvScanProjection::KeysOnly => filtered.push_key_only(key.to_vec()),
-                    BackendKvScanProjection::KeysAndValues => filtered.push_value(
-                        key.to_vec(),
-                        rows.value(index).expect("scan value exists").to_vec(),
-                    ),
-                }
-            }
-        }
-        let has_more = filtered.len() > request.limit;
-        filtered.truncate(request.limit);
-        let resume_after = has_more.then(|| filtered.last_key_cloned()).flatten();
-        Ok(BackendKvScanBatch {
-            rows: filtered,
-            resume_after,
+    ) -> Result<BackendKvKeyPage, LixError> {
+        let entries = self.scan_visible_entries(request)?;
+        Ok(BackendKvKeyPage {
+            keys: entries.keys,
+            resume_after: entries.resume_after,
         })
+    }
+
+    async fn scan_values(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvValuePage, LixError> {
+        self.fail_if_scan_namespace_matches(&request)?;
+        let entries = self.scan_visible_entries(request)?;
+        Ok(BackendKvValuePage {
+            values: entries.values,
+            resume_after: entries.resume_after,
+        })
+    }
+
+    async fn scan_entries(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvEntryPage, LixError> {
+        self.fail_if_scan_namespace_matches(&request)?;
+        self.scan_visible_entries(request)
     }
 
     async fn rollback(self: Box<Self>) -> Result<(), LixError> {
@@ -347,30 +336,83 @@ impl BackendWriteTransaction for RecordingTransaction {
     }
 }
 
-fn scan_map(
-    map: &KvMap,
-    namespace: &str,
-    range: &BackendKvScanRange,
-    limit: Option<usize>,
-) -> BackendKvRowBatch {
+impl RecordingTransaction {
+    fn fail_if_scan_namespace_matches(
+        &self,
+        request: &BackendKvScanRequest,
+    ) -> Result<(), LixError> {
+        if self
+            .fail_scan_namespace
+            .lock()
+            .expect("fail namespace lock should not poison")
+            .as_deref()
+            == Some(request.namespace.as_str())
+        {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("forced scan failure for namespace {}", request.namespace),
+            ));
+        }
+        Ok(())
+    }
+
+    fn scan_visible_entries(
+        &self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvEntryPage, LixError> {
+        let mut visible = self
+            .data
+            .lock()
+            .expect("recording backend lock poisoned")
+            .clone();
+        for (key, value) in &self.pending {
+            match value {
+                Some(value) => {
+                    visible.insert(key.clone(), value.clone());
+                }
+                None => {
+                    visible.remove(key);
+                }
+            }
+        }
+        Ok(scan_map(&visible, &request))
+    }
+}
+
+fn scan_map(map: &KvMap, request: &BackendKvScanRequest) -> BackendKvEntryPage {
     let mut pairs = map
         .iter()
         .filter_map(|((entry_namespace, key), value)| {
-            if entry_namespace != namespace || !key_in_range(key, range) {
+            if entry_namespace != &request.namespace || !key_in_range(key, &request.range) {
+                return None;
+            }
+            if request
+                .after
+                .as_deref()
+                .is_some_and(|after| key.as_slice() <= after)
+            {
                 return None;
             }
             Some((key.clone(), value.clone()))
         })
         .collect::<Vec<_>>();
     pairs.sort_by(|left, right| left.0.cmp(&right.0));
-    if let Some(limit) = limit {
-        pairs.truncate(limit);
-    }
-    let mut rows = BackendKvRowBatch::with_capacity(pairs.len());
+    let has_more = pairs.len() > request.limit;
+    pairs.truncate(request.limit);
+    let resume_after = has_more
+        .then(|| pairs.last().map(|(key, _)| key.clone()))
+        .flatten();
+    let mut keys = BytePageBuilder::with_capacity(pairs.len(), 0);
+    let mut values = BytePageBuilder::with_capacity(pairs.len(), 0);
     for (key, value) in pairs {
-        rows.push_value(key, value);
+        keys.push(key);
+        values.push(value);
     }
-    rows
+    BackendKvEntryPage {
+        keys: keys.finish(),
+        values: values.finish(),
+        resume_after,
+    }
 }
 
 fn key_in_range(key: &[u8], range: &BackendKvScanRange) -> bool {

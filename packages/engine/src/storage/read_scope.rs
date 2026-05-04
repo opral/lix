@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use crate::storage::{
-    KvGetBatch, KvGetRequest, KvScanBatch, KvScanRequest, StorageReadTransaction, StorageReader,
+    KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch, KvValuePage,
+    StorageReadTransaction, StorageReader,
 };
 use crate::LixError;
 use tokio::sync::Mutex;
@@ -60,13 +61,28 @@ impl<S> StorageReader for ScopedStorageReader<S>
 where
     S: StorageReader,
 {
-    async fn get_kv_many(&mut self, request: KvGetRequest) -> Result<KvGetBatch, LixError> {
+    async fn get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, LixError> {
         let mut store = self.store.lock().await;
-        store.get_kv_many(request).await
+        store.get_values(request).await
     }
 
-    async fn scan_kv(&mut self, request: KvScanRequest) -> Result<KvScanBatch, LixError> {
+    async fn exists_many(&mut self, request: KvGetRequest) -> Result<KvExistsBatch, LixError> {
         let mut store = self.store.lock().await;
-        store.scan_kv(request).await
+        store.exists_many(request).await
+    }
+
+    async fn scan_keys(&mut self, request: KvScanRequest) -> Result<KvKeyPage, LixError> {
+        let mut store = self.store.lock().await;
+        store.scan_keys(request).await
+    }
+
+    async fn scan_values(&mut self, request: KvScanRequest) -> Result<KvValuePage, LixError> {
+        let mut store = self.store.lock().await;
+        store.scan_values(request).await
+    }
+
+    async fn scan_entries(&mut self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
+        let mut store = self.store.lock().await;
+        store.scan_entries(request).await
     }
 }
