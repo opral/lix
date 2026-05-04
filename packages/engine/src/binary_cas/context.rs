@@ -21,11 +21,10 @@ impl BinaryCasContext {
         Self
     }
 
-    /// Creates a Binary CAS reader over any backend KV store.
+    /// Creates a Binary CAS reader over any storage reader.
     ///
-    /// The store can be the shared backend outside a transaction or the active
-    /// transaction handle when reads must participate in transaction-local
-    /// visibility.
+    /// The reader can be a read transaction or the active write transaction
+    /// when reads must participate in transaction-local visibility.
     pub(crate) fn reader<S>(&self, store: S) -> BinaryCasStoreReader<S>
     where
         S: StorageReader,
