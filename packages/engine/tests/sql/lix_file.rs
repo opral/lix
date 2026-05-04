@@ -5,6 +5,72 @@ use lix_engine::Value;
 use super::assert_rows_eq;
 
 simulation_test!(
+    lix_file_path_insert_rejects_overlong_paths_and_segments,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let long_segment = "a".repeat(256);
+        let segment_error = session
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ('file-long-segment', $1)",
+                &[Value::Text(format!("/{long_segment}"))],
+            )
+            .await
+            .expect_err("overlong file path segment should be rejected");
+        assert_eq!(segment_error.code, "LIX_ERROR_PATH_SEGMENT_TOO_LONG");
+
+        let long_path = format!("/{}", ["abcd"; 820].join("/"));
+        let path_error = session
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ('file-long-path', $1)",
+                &[Value::Text(long_path)],
+            )
+            .await
+            .expect_err("overlong file path should be rejected");
+        assert_eq!(path_error.code, "LIX_ERROR_PATH_TOO_LONG");
+
+        let encoded_segment_at_limit = "%61".repeat(255);
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ('file-encoded-limit', $1)",
+                &[Value::Text(format!("/{encoded_segment_at_limit}"))],
+            )
+            .await
+            .expect("percent-encoded segment should be measured after canonicalization");
+
+        let encoded_segment_over_limit = "%61".repeat(256);
+        let encoded_segment_error = session
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ('file-encoded-over-limit', $1)",
+                &[Value::Text(format!("/{encoded_segment_over_limit}"))],
+            )
+            .await
+            .expect_err("overlong canonical segment should be rejected");
+        assert_eq!(
+            encoded_segment_error.code,
+            "LIX_ERROR_PATH_SEGMENT_TOO_LONG"
+        );
+
+        let huge_path = format!("/{}", "a".repeat(1024 * 1024));
+        let huge_error = session
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ('file-huge-path', $1)",
+                &[Value::Text(huge_path)],
+            )
+            .await
+            .expect_err("huge path input should be rejected without runtime internals");
+        assert_eq!(huge_error.code, "LIX_ERROR_PATH_INPUT_TOO_LONG");
+    }
+);
+
+simulation_test!(
     lix_file_path_insert_rejects_percent_encoded_forbidden_code_points,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -485,11 +551,7 @@ simulation_test!(lix_file_insert_rejects_null_data, |sim| async move {
         .await
         .expect_err("explicit NULL data should be rejected");
 
-    assert!(
-        error.message.contains("requires binary data")
-            && error.message.contains("use X'' for an empty file"),
-        "unexpected error: {error}"
-    );
+    assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
 
     let parameter_error = session
         .execute(
@@ -500,13 +562,7 @@ simulation_test!(lix_file_insert_rejects_null_data, |sim| async move {
         .await
         .expect_err("parameterized NULL data should be rejected");
 
-    assert!(
-        parameter_error.message.contains("requires binary data")
-            && parameter_error
-                .message
-                .contains("use X'' for an empty file"),
-        "unexpected error: {parameter_error}"
-    );
+    assert_eq!(parameter_error.code, LixError::CODE_TYPE_MISMATCH);
 
     let result = session
         .execute(
@@ -518,6 +574,129 @@ simulation_test!(lix_file_insert_rejects_null_data, |sim| async move {
         .expect("file read should succeed");
     assert_eq!(result.len(), 0);
 });
+
+simulation_test!(
+    lix_file_insert_rejects_non_binary_data_literals,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        for (id, sql) in [
+            (
+                "text-data-file",
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('text-data-file', '/text.bin', 'hello')",
+            ),
+            (
+                "int-data-file",
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('int-data-file', '/int.bin', 12345)",
+            ),
+            (
+                "float-data-file",
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('float-data-file', '/float.bin', 1.5)",
+            ),
+            (
+                "bool-data-file",
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('bool-data-file', '/bool.bin', true)",
+            ),
+        ] {
+            let error = session
+                .execute(sql, &[])
+                .await
+                .expect_err("non-binary data literal should be rejected");
+
+            assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH, "{id}");
+        }
+
+        let result = session
+            .execute(
+                "SELECT id FROM lix_file \
+                 WHERE id IN (\
+                   'text-data-file',\
+                   'int-data-file',\
+                   'float-data-file',\
+                   'bool-data-file'\
+                 )",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        assert_eq!(result.len(), 0);
+    }
+);
+
+simulation_test!(
+    lix_file_insert_rejects_non_binary_data_from_select,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 SELECT 'select-text-data-file', '/select-text.bin', 'hello'",
+                &[],
+            )
+            .await
+            .expect_err("non-binary data from SELECT should be rejected");
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+
+        let result = session
+            .execute(
+                "SELECT id FROM lix_file WHERE id = 'select-text-data-file'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        assert_eq!(result.len(), 0);
+    }
+);
+
+simulation_test!(
+    lix_file_insert_rejects_non_binary_data_parameters,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        for (id, value) in [
+            ("text-param-data-file", Value::Text("hello".to_string())),
+            ("int-param-data-file", Value::Integer(12345)),
+        ] {
+            let error = session
+                .execute(
+                    &format!(
+                        "INSERT INTO lix_file (id, path, data) \
+                         VALUES ('{id}', '/{id}.bin', $1)"
+                    ),
+                    &[value],
+                )
+                .await
+                .expect_err("non-binary data parameter should be rejected");
+            assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH, "{id}");
+        }
+    }
+);
 
 simulation_test!(lix_file_insert_accepts_empty_blob_data, |sim| async move {
     let engine = sim.boot_engine().await;
@@ -1179,11 +1358,7 @@ simulation_test!(
             .await
             .expect_err("explicit NULL data update should be rejected");
 
-        assert!(
-            error.message.contains("requires binary data")
-                && error.message.contains("use X'' for an empty file"),
-            "unexpected error: {error}"
-        );
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
 
         let parameter_error = session
             .execute(
@@ -1193,13 +1368,7 @@ simulation_test!(
             .await
             .expect_err("parameterized NULL data update should be rejected");
 
-        assert!(
-            parameter_error.message.contains("requires binary data")
-                && parameter_error
-                    .message
-                    .contains("use X'' for an empty file"),
-            "unexpected error: {parameter_error}"
-        );
+        assert_eq!(parameter_error.code, LixError::CODE_TYPE_MISMATCH);
 
         let result = session
             .execute(
@@ -1210,6 +1379,147 @@ simulation_test!(
             .expect("file read should succeed");
         assert_eq!(result.len(), 1);
         assert_eq!(result.rows()[0].values(), &[Value::Blob(b"hello".to_vec())]);
+    }
+);
+
+simulation_test!(
+    lix_file_update_rejects_non_binary_data_literals_and_preserves_existing_data,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        for (id, assignment) in [
+            ("update-text-file", "'hello'"),
+            ("update-int-file", "12345"),
+            ("update-float-file", "1.5"),
+            ("update-bool-file", "true"),
+        ] {
+            session
+                .execute(
+                    &format!(
+                        "INSERT INTO lix_file (id, path, data) \
+                         VALUES ('{id}', '/{id}.bin', X'68656C6C6F')"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("file insert should succeed");
+
+            let error = session
+                .execute(
+                    &format!("UPDATE lix_file SET data = {assignment} WHERE id = '{id}'"),
+                    &[],
+                )
+                .await
+                .expect_err("non-binary data literal update should be rejected");
+
+            assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH, "{id}");
+        }
+
+        let result = session
+            .execute(
+                "SELECT id, data FROM lix_file \
+                 WHERE id IN (\
+                   'update-text-file',\
+                   'update-int-file',\
+                   'update-float-file',\
+                   'update-bool-file'\
+                 ) \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+
+        assert_rows_eq(
+            result,
+            vec![
+                vec![
+                    Value::Text("update-bool-file".to_string()),
+                    Value::Blob(b"hello".to_vec()),
+                ],
+                vec![
+                    Value::Text("update-float-file".to_string()),
+                    Value::Blob(b"hello".to_vec()),
+                ],
+                vec![
+                    Value::Text("update-int-file".to_string()),
+                    Value::Blob(b"hello".to_vec()),
+                ],
+                vec![
+                    Value::Text("update-text-file".to_string()),
+                    Value::Blob(b"hello".to_vec()),
+                ],
+            ],
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_update_rejects_non_binary_data_parameters_and_preserves_existing_data,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        for (id, value) in [
+            ("update-text-param-file", Value::Text("hello".to_string())),
+            ("update-int-param-file", Value::Integer(12345)),
+        ] {
+            session
+                .execute(
+                    &format!(
+                        "INSERT INTO lix_file (id, path, data) \
+                         VALUES ('{id}', '/{id}.bin', X'68656C6C6F')"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("file insert should succeed");
+
+            let error = session
+                .execute(
+                    &format!("UPDATE lix_file SET data = $1 WHERE id = '{id}'"),
+                    &[value],
+                )
+                .await
+                .expect_err("non-binary data parameter update should be rejected");
+            assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH, "{id}");
+        }
+
+        let result = session
+            .execute(
+                "SELECT id, data FROM lix_file \
+                 WHERE id IN ('update-text-param-file', 'update-int-param-file') \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        assert_rows_eq(
+            result,
+            vec![
+                vec![
+                    Value::Text("update-int-param-file".to_string()),
+                    Value::Blob(b"hello".to_vec()),
+                ],
+                vec![
+                    Value::Text("update-text-param-file".to_string()),
+                    Value::Blob(b"hello".to_vec()),
+                ],
+            ],
+        );
     }
 );
 
