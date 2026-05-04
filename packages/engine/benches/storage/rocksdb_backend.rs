@@ -71,14 +71,23 @@ impl BackendReadTransaction for RocksDbBenchTransaction {
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
             let mut values = Vec::with_capacity(group.keys.len());
+            let mut committed_positions = Vec::new();
+            let mut committed_keys = Vec::new();
             for key in group.keys {
                 let encoded_key = encode_key(&group.namespace, &key);
-                let value = match self.pending.get(&encoded_key) {
-                    Some(PendingWrite::Put(value)) => Some(value.clone()),
-                    Some(PendingWrite::Delete) => None,
-                    None => self.inner.db.get(encoded_key).map_err(rocksdb_error)?,
-                };
-                values.push(value);
+                match self.pending.get(&encoded_key) {
+                    Some(PendingWrite::Put(value)) => values.push(Some(value.clone())),
+                    Some(PendingWrite::Delete) => values.push(None),
+                    None => {
+                        committed_positions.push(values.len());
+                        committed_keys.push(encoded_key);
+                        values.push(None);
+                    }
+                }
+            }
+            let committed_values = self.inner.db.multi_get(committed_keys);
+            for (position, value) in committed_positions.into_iter().zip(committed_values) {
+                values[position] = value.map_err(rocksdb_error)?;
             }
             groups.push(BackendKvGetResultGroup {
                 namespace: group.namespace,
