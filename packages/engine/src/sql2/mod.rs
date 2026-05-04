@@ -12,6 +12,7 @@ mod execute;
 mod file_history_provider;
 mod file_provider;
 mod filesystem_planner;
+mod filesystem_predicates;
 mod filesystem_visibility;
 mod history_projection;
 mod history_provider;
