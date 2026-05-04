@@ -104,7 +104,7 @@ mod tests {
         assert_eq!(row.schema_key, "test_schema");
         assert_eq!(row.file_id.as_deref(), Some("file-1"));
         assert_eq!(row.snapshot_content.as_deref(), Some("{}"));
-        assert_eq!(row.metadata.as_deref(), Some("{\"m\":1}"));
+        assert_eq!(row.metadata.as_ref(), Some(&json!({"m": 1})));
         assert_eq!(row.schema_version, "1");
         assert_eq!(row.change_id, "change-1");
         assert_eq!(row.commit_id, "commit-1");
@@ -496,7 +496,7 @@ mod tests {
                 schema_version: "1".to_string(),
                 file_id: Some("file-1".to_string()),
                 snapshot_content: snapshot_content.map(str::to_string),
-                metadata: Some("{\"m\":1}".to_string()),
+                metadata: Some(json!({"m": 1})),
                 created_at: "ignored-change-created-at".to_string(),
             },
             source_commit_id: "commit-1".to_string(),

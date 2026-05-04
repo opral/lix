@@ -22,6 +22,7 @@ use tokio::sync::Mutex;
 
 use crate::changelog::MaterializedCanonicalChange;
 use crate::commit_graph::CommitGraphReader;
+use crate::serialize_row_metadata;
 use crate::LixError;
 
 use super::entity_provider::{
@@ -396,7 +397,11 @@ fn entity_history_system_column_array(
             rows.iter()
                 .map(|row| row.change.snapshot_content.as_deref()),
         ),
-        "metadata" => string_array(rows.iter().map(|row| row.change.metadata.as_deref())),
+        "metadata" => Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.change.metadata.as_ref().map(serialize_row_metadata))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef,
         "schema_version" => string_array(
             rows.iter()
                 .map(|row| Some(row.change.schema_version.as_str())),

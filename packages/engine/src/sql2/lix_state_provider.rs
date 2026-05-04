@@ -36,7 +36,7 @@ use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValu
 use crate::transaction::types::StageRow;
 use crate::version::VersionRefReader;
 use crate::GLOBAL_VERSION_ID;
-use crate::{LixError, NullableKeyFilter};
+use crate::{parse_row_metadata, serialize_row_metadata, LixError, NullableKeyFilter, RowMetadata};
 
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
@@ -807,11 +807,12 @@ fn lix_state_update_write_rows_from_batch(
                     row_index,
                     "snapshot_content",
                 )?,
-                metadata: update_optional_string_value(
+                metadata: update_optional_metadata_value(
                     batch,
                     &assignment_values,
                     row_index,
                     "metadata",
+                    "lix_state",
                 )?,
                 schema_version: required_string_value(batch, row_index, "schema_version")?,
                 created_at: None,
@@ -854,6 +855,20 @@ fn update_optional_string_value(
             "UPDATE lix_state expected text-compatible column '{column_name}', got {other:?}"
         ))),
     }
+}
+
+fn update_optional_metadata_value(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    row_index: usize,
+    column_name: &str,
+    context: &str,
+) -> Result<Option<RowMetadata>> {
+    update_optional_string_value(batch, assignment_values, row_index, column_name)?
+        .map(|value| {
+            parse_row_metadata(&value, context).map_err(super::error::lix_error_to_datafusion_error)
+        })
+        .transpose()
 }
 
 fn dml_count_schema() -> SchemaRef {
@@ -904,7 +919,7 @@ fn lix_state_write_rows_from_batch(
                 schema_key: required_string_value(batch, row_index, "schema_key")?,
                 file_id: optional_string_value(batch, row_index, "file_id")?,
                 snapshot_content: optional_string_value(batch, row_index, "snapshot_content")?,
-                metadata: optional_string_value(batch, row_index, "metadata")?,
+                metadata: optional_metadata_value(batch, row_index, "metadata", "lix_state")?,
                 schema_version: required_string_value(batch, row_index, "schema_version")?,
                 created_at: optional_string_value(batch, row_index, "created_at")?,
                 updated_at: optional_string_value(batch, row_index, "updated_at")?,
@@ -948,6 +963,19 @@ fn optional_string_value(
             "INSERT into lix_state expected text-compatible column '{column_name}', got {other:?}"
         ))),
     }
+}
+
+fn optional_metadata_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+    context: &str,
+) -> Result<Option<RowMetadata>> {
+    optional_string_value(batch, row_index, column_name)?
+        .map(|value| {
+            parse_row_metadata(&value, context).map_err(super::error::lix_error_to_datafusion_error)
+        })
+        .transpose()
 }
 
 fn optional_bool_value(
@@ -1428,7 +1456,11 @@ fn lix_state_record_batch(
                 "snapshot_content" => {
                     string_array(rows.iter().map(|row| row.snapshot_content.as_deref()))
                 }
-                "metadata" => string_array(rows.iter().map(|row| row.metadata.as_deref())),
+                "metadata" => Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|row| row.metadata.as_ref().map(serialize_row_metadata))
+                        .collect::<Vec<_>>(),
+                )),
                 "schema_version" => {
                     string_array(rows.iter().map(|row| Some(row.schema_version.as_str())))
                 }
@@ -1528,6 +1560,7 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use datafusion::scalar::ScalarValue;
     use futures_util::stream;
+    use serde_json::json;
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
@@ -1839,7 +1872,9 @@ mod tests {
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
-            metadata: metadata.map(ToOwned::to_owned),
+            metadata: metadata.map(|value| {
+                serde_json::from_str(value).expect("test metadata should be valid JSON")
+            }),
             schema_version: "1".to_string(),
             version_id: "version-a".to_string(),
             change_id: Some(format!("change-{entity_id}")),
@@ -2158,7 +2193,7 @@ mod tests {
                 schema_key: "lix_key_value".to_string(),
                 file_id: None,
                 snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
-                metadata: Some("{\"source\":\"test\"}".to_string()),
+                metadata: Some(json!({"source": "test"})),
                 schema_version: "1".to_string(),
                 created_at: Some("2026-04-23T00:00:00Z".to_string()),
                 updated_at: Some("2026-04-23T01:00:00Z".to_string()),
@@ -2205,7 +2240,7 @@ mod tests {
                     schema_key: "lix_key_value".to_string(),
                     file_id: None,
                     snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
-                    metadata: Some("{\"source\":\"test\"}".to_string()),
+                    metadata: Some(json!({"source": "test"})),
                     schema_version: "1".to_string(),
                     created_at: Some("2026-04-23T00:00:00Z".to_string()),
                     updated_at: Some("2026-04-23T01:00:00Z".to_string()),
@@ -2273,7 +2308,10 @@ mod tests {
                         "snapshot_content".to_string(),
                         str_lit("{\"key\":\"hello\",\"value\":\"updated\"}"),
                     ),
-                    ("metadata".to_string(), col("schema_key")),
+                    (
+                        "metadata".to_string(),
+                        str_lit("{\"schema_key\":\"lix_key_value\"}"),
+                    ),
                 ],
                 vec![Expr::BinaryExpr(BinaryExpr::new(
                     Box::new(col("metadata")),
@@ -2306,7 +2344,7 @@ mod tests {
                     schema_key: "lix_key_value".to_string(),
                     file_id: None,
                     snapshot_content: Some("{\"key\":\"hello\",\"value\":\"updated\"}".to_string()),
-                    metadata: Some("lix_key_value".to_string()),
+                    metadata: Some(json!({"schema_key": "lix_key_value"})),
                     schema_version: "1".to_string(),
                     created_at: None,
                     updated_at: None,
@@ -2361,7 +2399,7 @@ mod tests {
                         schema_key: "lix_key_value".to_string(),
                         file_id: None,
                         snapshot_content: None,
-                        metadata: Some("{\"source\":\"one\"}".to_string()),
+                        metadata: Some(json!({"source": "one"})),
                         schema_version: "1".to_string(),
                         created_at: None,
                         updated_at: None,
@@ -2376,7 +2414,7 @@ mod tests {
                         schema_key: "lix_key_value".to_string(),
                         file_id: None,
                         snapshot_content: None,
-                        metadata: Some("{\"source\":\"two\"}".to_string()),
+                        metadata: Some(json!({"source": "two"})),
                         schema_version: "1".to_string(),
                         created_at: None,
                         updated_at: None,

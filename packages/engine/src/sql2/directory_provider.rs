@@ -37,8 +37,8 @@ use crate::sql2::version_scope::{
 use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValues};
 use crate::transaction::types::StageRow;
 use crate::version::VersionRefReader;
-use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
+use crate::{parse_row_metadata, serialize_row_metadata, LixError, RowMetadata};
 
 use super::filesystem_planner::{
     directory_descriptor_write_row, directory_path_resolvers_from_state_rows,
@@ -1165,7 +1165,7 @@ fn directory_row_context_from_batch(
         global,
         untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
-        metadata: optional_string_value(batch, row_index, "lixcol_metadata")?,
+        metadata: optional_metadata_value(batch, row_index, "lixcol_metadata", "lix_directory")?,
     })
 }
 
@@ -1193,11 +1193,12 @@ fn directory_row_context_from_update(
         global,
         untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
-        metadata: update_optional_string_value(
+        metadata: update_optional_metadata_value(
             batch,
             assignment_values,
             row_index,
             "lixcol_metadata",
+            "lix_directory",
         )?,
     })
 }
@@ -1308,7 +1309,7 @@ fn lix_directory_record_batch(
         updated_ats.push(directory.live.updated_at);
         commit_ids.push(directory.live.commit_id);
         untracked_values.push(Some(directory.live.untracked));
-        metadata_values.push(directory.live.metadata);
+        metadata_values.push(directory.live.metadata.as_ref().map(serialize_row_metadata));
         version_ids.push(Some(directory.live.version_id));
     }
 
@@ -1605,6 +1606,20 @@ fn update_optional_string_value(
     }
 }
 
+fn update_optional_metadata_value(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    row_index: usize,
+    column_name: &str,
+    context: &str,
+) -> Result<Option<RowMetadata>> {
+    update_optional_string_value(batch, assignment_values, row_index, column_name)?
+        .map(|value| {
+            parse_row_metadata(&value, context).map_err(super::error::lix_error_to_datafusion_error)
+        })
+        .transpose()
+}
+
 fn update_optional_bool_value(
     batch: &RecordBatch,
     assignment_values: &UpdateAssignmentValues,
@@ -1638,6 +1653,19 @@ fn optional_string_value(
             "INSERT into lix_directory expected text-compatible column '{column_name}', got {other:?}"
         ))),
     }
+}
+
+fn optional_metadata_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+    context: &str,
+) -> Result<Option<RowMetadata>> {
+    optional_string_value(batch, row_index, column_name)?
+        .map(|value| {
+            parse_row_metadata(&value, context).map_err(super::error::lix_error_to_datafusion_error)
+        })
+        .transpose()
 }
 
 fn optional_bool_value(
@@ -1732,6 +1760,7 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::physical_plan::SendableRecordBatchStream;
     use futures_util::stream;
+    use serde_json::json;
 
     use crate::binary_cas::BlobDataReader;
     use crate::functions::{
@@ -1867,7 +1896,7 @@ mod tests {
             schema_key: schema_key.to_string(),
             file_id: file_id.map(ToOwned::to_owned),
             snapshot_content: Some(snapshot_content.to_string()),
-            metadata: Some("{\"source\":\"test\"}".to_string()),
+            metadata: Some(json!({"source": "test"})),
             schema_version: "1".to_string(),
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
@@ -2078,7 +2107,7 @@ mod tests {
                     "{\"hidden\":false,\"id\":\"dir-docs\",\"name\":\"docs\",\"parent_id\":null}"
                         .to_string()
                 ),
-                metadata: Some("{\"source\":\"directory\"}".to_string()),
+                metadata: Some(json!({"source": "directory"})),
                 schema_version: "1".to_string(),
                 created_at: None,
                 updated_at: None,
@@ -2240,7 +2269,7 @@ mod tests {
                         "{\"hidden\":false,\"id\":\"dir-docs\",\"name\":\"docs\",\"parent_id\":null}"
                             .to_string()
                     ),
-                    metadata: Some("{\"source\":\"directory\"}".to_string()),
+                    metadata: Some(json!({"source": "directory"})),
                     schema_version: "1".to_string(),
                     created_at: None,
                     updated_at: None,

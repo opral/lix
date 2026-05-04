@@ -11,7 +11,7 @@ use crate::common::{
 };
 use crate::entity_identity::EntityIdentity;
 use crate::live_state::LiveStateRow;
-use crate::LixError;
+use crate::{LixError, RowMetadata};
 
 use super::filesystem_visibility::VisibleFilesystem;
 use crate::transaction::types::{StageFileData, StageRow};
@@ -51,7 +51,7 @@ pub(crate) struct FilesystemRowContext {
     pub(crate) global: bool,
     pub(crate) untracked: bool,
     pub(crate) file_id: Option<String>,
-    pub(crate) metadata: Option<String>,
+    pub(crate) metadata: Option<RowMetadata>,
 }
 
 impl FilesystemRowContext {

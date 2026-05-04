@@ -40,8 +40,8 @@ use crate::sql2::write_normalization::{
 };
 use crate::transaction::types::StageRow;
 use crate::version::VersionRefReader;
-use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
+use crate::{parse_row_metadata, serialize_row_metadata, LixError, RowMetadata};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
@@ -1450,7 +1450,7 @@ fn file_row_context_from_batch(
         global,
         untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
-        metadata: optional_string_value(batch, row_index, "lixcol_metadata")?,
+        metadata: optional_metadata_value(batch, row_index, "lixcol_metadata", "lix_file")?,
     })
 }
 
@@ -1478,11 +1478,12 @@ fn file_row_context_from_update(
         global,
         untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
-        metadata: update_optional_string_value(
+        metadata: update_optional_metadata_value(
             batch,
             assignment_values,
             row_index,
             "lixcol_metadata",
+            "lix_file",
         )?,
     })
 }
@@ -1677,7 +1678,7 @@ async fn lix_file_record_batch(
         updated_ats.push(file.live.updated_at);
         commit_ids.push(file.live.commit_id);
         untracked_values.push(Some(file.live.untracked));
-        metadata_values.push(file.live.metadata);
+        metadata_values.push(file.live.metadata.as_ref().map(serialize_row_metadata));
         version_ids.push(Some(version_id));
     }
 
@@ -1982,6 +1983,20 @@ fn update_optional_string_value(
     }
 }
 
+fn update_optional_metadata_value(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    row_index: usize,
+    column_name: &str,
+    context: &str,
+) -> Result<Option<RowMetadata>> {
+    update_optional_string_value(batch, assignment_values, row_index, column_name)?
+        .map(|value| {
+            parse_row_metadata(&value, context).map_err(super::error::lix_error_to_datafusion_error)
+        })
+        .transpose()
+}
+
 fn update_optional_bool_value(
     batch: &RecordBatch,
     assignment_values: &UpdateAssignmentValues,
@@ -2036,6 +2051,19 @@ fn optional_string_value(
             "INSERT into lix_file expected text-compatible column '{column_name}', got {other:?}"
         ))),
     }
+}
+
+fn optional_metadata_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+    context: &str,
+) -> Result<Option<RowMetadata>> {
+    optional_string_value(batch, row_index, column_name)?
+        .map(|value| {
+            parse_row_metadata(&value, context).map_err(super::error::lix_error_to_datafusion_error)
+        })
+        .transpose()
 }
 
 fn optional_bool_value(
@@ -2155,7 +2183,7 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::physical_plan::SendableRecordBatchStream;
     use futures_util::stream;
-    use serde_json::Value as JsonValue;
+    use serde_json::{json, Value as JsonValue};
 
     use crate::binary_cas::BlobDataReader;
     use crate::functions::{
@@ -2513,7 +2541,7 @@ mod tests {
         assert_eq!(rows[0].schema_key, "lix_file_descriptor");
         assert_eq!(rows[0].version_id, "version-b");
         assert_eq!(rows[0].schema_version.as_str(), "1");
-        assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"file\"}"));
+        assert_eq!(rows[0].metadata.as_ref(), Some(&json!({"source": "file"})));
         let snapshot: JsonValue =
             serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap())
                 .expect("descriptor snapshot JSON");
