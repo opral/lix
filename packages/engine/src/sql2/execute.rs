@@ -2143,6 +2143,7 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
+                live_directory_row("dir-docs", "version-a", None, "docs", false),
                 live_file_row(
                     "file-readme",
                     "version-a",
@@ -2210,14 +2211,17 @@ mod tests {
     async fn execute_sql_update_file_stages_data_blob_ref() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
-            rows: vec![live_file_row(
-                "file-readme",
-                "version-a",
-                Some("dir-docs"),
-                "readme",
-                Some("md"),
-                false,
-            )],
+            rows: vec![
+                live_directory_row("dir-docs", "version-a", None, "docs", false),
+                live_file_row(
+                    "file-readme",
+                    "version-a",
+                    Some("dir-docs"),
+                    "readme",
+                    Some("md"),
+                    false,
+                ),
+            ],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
@@ -2313,6 +2317,8 @@ mod tests {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
+                live_directory_row("dir-docs", "version-a", None, "docs", false),
+                live_directory_row("dir-docs", "version-b", None, "docs", false),
                 live_file_row(
                     "file-readme",
                     "version-a",
