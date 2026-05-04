@@ -32,6 +32,9 @@ use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
 use crate::sql2::dml::{InsertExec, InsertSink};
+use crate::sql2::filesystem_predicates::{
+    canonicalize_filesystem_path_filters, FilesystemPathKind,
+};
 use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
 };
@@ -222,13 +225,7 @@ impl TableProvider for LixFileProvider {
     ) -> Result<Vec<TableProviderFilterPushDown>> {
         Ok(filters
             .iter()
-            .map(|filter| {
-                if explicit_version_ids_from_dml_filters(&[(*filter).clone()]).is_empty() {
-                    TableProviderFilterPushDown::Unsupported
-                } else {
-                    TableProviderFilterPushDown::Inexact
-                }
-            })
+            .map(|_| TableProviderFilterPushDown::Exact)
             .collect())
     }
 
@@ -240,7 +237,9 @@ impl TableProvider for LixFileProvider {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let projected_schema = projected_schema(&self.schema, projection)?;
-        let mut request = lix_file_scan_request(self.version_binding.active_version_id(), limit);
+        let scan_limit = if filters.is_empty() { limit } else { None };
+        let mut request =
+            lix_file_scan_request(self.version_binding.active_version_id(), scan_limit);
         if self.write_access.is_write() && matches!(self.version_binding, VersionBinding::Explicit)
         {
             request.filter.version_ids = explicit_version_ids_from_dml_filters(filters);
@@ -258,11 +257,21 @@ impl TableProvider for LixFileProvider {
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
+        let filters = canonicalize_filesystem_path_filters(filters, FilesystemPathKind::File)?;
+        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        let physical_filters = filters
+            .iter()
+            .map(|expr| create_physical_expr(expr, &df_schema, _state.execution_props()))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Arc::new(LixFileScanExec::new(
             Arc::clone(&self.live_state),
             Arc::clone(&self.blob_reader),
+            Arc::clone(&self.schema),
             projected_schema,
+            projection.cloned(),
             request,
+            physical_filters,
+            limit,
         )))
     }
 
@@ -298,6 +307,7 @@ impl TableProvider for LixFileProvider {
         let write_ctx = self.write_access.require_write("DELETE FROM lix_file")?;
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        let filters = canonicalize_filesystem_path_filters(&filters, FilesystemPathKind::File)?;
         let physical_filters = filters
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
@@ -343,6 +353,7 @@ impl TableProvider for LixFileProvider {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
+        let filters = canonicalize_filesystem_path_filters(&filters, FilesystemPathKind::File)?;
         let physical_filters = filters
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
@@ -821,8 +832,12 @@ impl ExecutionPlan for LixFileUpdateExec {
 struct LixFileScanExec {
     live_state: Arc<dyn LiveStateReader>,
     blob_reader: Arc<dyn BlobDataReader>,
-    schema: SchemaRef,
+    batch_schema: SchemaRef,
+    output_schema: SchemaRef,
+    projection: Option<Vec<usize>>,
     request: LiveStateScanRequest,
+    filters: Vec<Arc<dyn PhysicalExpr>>,
+    limit: Option<usize>,
     properties: Arc<PlanProperties>,
 }
 
@@ -836,11 +851,15 @@ impl LixFileScanExec {
     fn new(
         live_state: Arc<dyn LiveStateReader>,
         blob_reader: Arc<dyn BlobDataReader>,
-        schema: SchemaRef,
+        batch_schema: SchemaRef,
+        output_schema: SchemaRef,
+        projection: Option<Vec<usize>>,
         request: LiveStateScanRequest,
+        filters: Vec<Arc<dyn PhysicalExpr>>,
+        limit: Option<usize>,
     ) -> Self {
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(schema.clone()),
+            EquivalenceProperties::new(output_schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -848,8 +867,12 @@ impl LixFileScanExec {
         Self {
             live_state,
             blob_reader,
-            schema,
+            batch_schema,
+            output_schema,
+            projection,
             request,
+            filters,
+            limit,
             properties: Arc::new(properties),
         }
     }
@@ -859,7 +882,7 @@ impl DisplayAs for LixFileScanExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "LixFileScanExec(limit={:?})", self.request.limit)
+                write!(f, "LixFileScanExec(limit={:?})", self.limit)
             }
             DisplayFormatType::TreeRender => write!(f, "LixFileScanExec"),
         }
@@ -909,8 +932,11 @@ impl ExecutionPlan for LixFileScanExec {
         let live_state = Arc::clone(&self.live_state);
         let blob_reader = Arc::clone(&self.blob_reader);
         let request = self.request.clone();
-        let schema = Arc::clone(&self.schema);
-        let batch_schema = Arc::clone(&schema);
+        let filters = self.filters.clone();
+        let limit = self.limit;
+        let output_schema = Arc::clone(&self.output_schema);
+        let batch_schema = Arc::clone(&self.batch_schema);
+        let projection = self.projection.clone();
         let fut = async move {
             let rows = live_state.scan_rows(&request).await.map_err(|error| {
                 DataFusionError::Execution(format!("sql2 lix_file scan failed: {error}"))
@@ -920,11 +946,19 @@ impl ExecutionPlan for LixFileScanExec {
                 .map_err(|error| {
                     DataFusionError::Execution(format!("sql2 lix_file batch build failed: {error}"))
                 })?;
-            Ok::<RecordBatch, DataFusionError>(batch)
+            let filtered = filter_lix_file_batch(batch, &filters)?;
+            let projected = match projection {
+                Some(indices) => filtered.project(&indices).map_err(DataFusionError::from),
+                None => Ok(filtered),
+            }?;
+            match limit {
+                Some(limit) => Ok(projected.slice(0, limit.min(projected.num_rows()))),
+                None => Ok(projected),
+            }
         };
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
+            output_schema,
             stream::once(fut).map_ok(|batch| batch),
         )))
     }
