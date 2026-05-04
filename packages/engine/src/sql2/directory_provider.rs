@@ -974,6 +974,7 @@ fn lix_directory_recursive_delete_rows_from_batch(
 ) -> Result<(Vec<StageRow>, u64)> {
     let mut rows = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut count = 0u64;
     for row_index in 0..batch.num_rows() {
         let directory_id = required_string_value(batch, row_index, "id")?;
         let context = directory_row_context_from_batch(batch, row_index, version_binding)?;
@@ -989,11 +990,9 @@ fn lix_directory_recursive_delete_rows_from_batch(
             &mut rows,
             &mut seen,
             plan_recursive_directory_delete(&directory_id, visible_filesystem, context),
+            &mut count,
         );
     }
-    let count = u64::try_from(batch.num_rows()).map_err(|_| {
-        DataFusionError::Execution("lix_directory DELETE row count overflow".into())
-    })?;
     Ok((rows, count))
 }
 
@@ -1001,12 +1000,23 @@ fn append_deduped_delete_plan(
     rows: &mut Vec<StageRow>,
     seen: &mut BTreeSet<StateRowDedupeKey>,
     plan: FilesystemDeletePlan,
+    count: &mut u64,
 ) {
     for row in plan.rows {
         if seen.insert(StateRowDedupeKey::from(&row)) {
+            if is_user_visible_filesystem_delete_row(&row) {
+                *count += 1;
+            }
             rows.push(row);
         }
     }
+}
+
+fn is_user_visible_filesystem_delete_row(row: &StageRow) -> bool {
+    matches!(
+        row.schema_key.as_str(),
+        "lix_directory_descriptor" | "lix_file_descriptor"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2144,7 +2154,7 @@ mod tests {
         )
         .expect("recursive directory delete should plan");
 
-        assert_eq!(count, 1);
+        assert_eq!(count, 4);
         assert_eq!(
             rows.iter()
                 .map(|row| {
@@ -2183,7 +2193,7 @@ mod tests {
         )
         .expect("recursive directory delete should plan");
 
-        assert_eq!(count, 2);
+        assert_eq!(count, 4);
         let identities = rows
             .iter()
             .map(|row| {

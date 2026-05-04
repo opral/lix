@@ -568,7 +568,7 @@ simulation_test!(
             .execute("DELETE FROM lix_directory WHERE path = '/docs/'", &[])
             .await
             .expect("recursive directory delete should succeed");
-        assert_eq!(delete_result, ExecuteResult::from_rows_affected(1));
+        assert_eq!(delete_result, ExecuteResult::from_rows_affected(3));
 
         let directories_result = session
             .execute(
