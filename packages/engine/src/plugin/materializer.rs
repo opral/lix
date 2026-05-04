@@ -204,10 +204,9 @@ mod tests {
         BINARY_CAS_MANIFEST_CHUNK_NAMESPACE, BINARY_CAS_MANIFEST_NAMESPACE,
     };
     use crate::{
-        BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetEntry, BackendKvGetRequest,
+        BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetRequest, BackendKvRowBatch,
         BackendKvScanBatch, BackendKvScanProjection, BackendKvScanRange, BackendKvScanRequest,
-        BackendKvScanRow, BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction,
-        BackendWriteTransaction,
+        BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
     };
     use async_trait::async_trait;
     use std::io::{Cursor, Write};
@@ -249,16 +248,17 @@ mod tests {
         ) -> Result<BackendKvGetBatch, LixError> {
             let mut groups = Vec::with_capacity(request.groups.len());
             for group in request.groups {
-                let mut entries = Vec::with_capacity(group.keys.len());
+                let mut rows = BackendKvRowBatch::with_capacity(group.keys.len());
                 for key in group.keys {
-                    entries.push(BackendKvGetEntry::for_projection(
+                    rows.push_get_projection(
+                        key.clone(),
                         test_kv_get(&self.archive_bytes, &group.namespace, &key)?,
                         request.projection,
-                    ));
+                    );
                 }
                 groups.push(BackendKvGetBatchGroup {
                     namespace: group.namespace,
-                    entries,
+                    rows,
                 });
             }
             Ok(BackendKvGetBatch { groups })
@@ -269,22 +269,22 @@ mod tests {
             request: BackendKvScanRequest,
         ) -> Result<BackendKvScanBatch, LixError> {
             let projection = request.projection;
-            let mut rows = test_kv_scan(&self.archive_bytes, request.namespace, request.range)?
-                .into_iter()
-                .map(|row| match projection {
-                    BackendKvScanProjection::KeysOnly => BackendKvScanRow::key_only(row.key),
-                    BackendKvScanProjection::KeysAndValues => row,
-                })
-                .filter(|row| {
-                    request
-                        .after
-                        .as_deref()
-                        .is_none_or(|after| row.key.as_slice() > after)
-                })
-                .collect::<Vec<_>>();
+            let mut rows = test_kv_scan(&self.archive_bytes, request.namespace, request.range)?;
+            for index in (0..rows.len()).rev() {
+                let keep = request
+                    .after
+                    .as_deref()
+                    .is_none_or(|after| rows.key(index).expect("row key exists") > after);
+                if !keep {
+                    rows.remove(index);
+                }
+            }
+            if projection == BackendKvScanProjection::KeysOnly {
+                rows.clear_values();
+            }
             let has_more = rows.len() > request.limit;
             rows.truncate(request.limit);
-            let resume_after = has_more.then(|| rows.last().map(|row| row.key.clone())).flatten();
+            let resume_after = has_more.then(|| rows.last_key_cloned()).flatten();
             Ok(BackendKvScanBatch { rows, resume_after })
         }
 
@@ -346,9 +346,9 @@ mod tests {
         archive_bytes: &[u8],
         namespace: String,
         range: BackendKvScanRange,
-    ) -> Result<Vec<BackendKvScanRow>, LixError> {
+    ) -> Result<BackendKvRowBatch, LixError> {
         if namespace != BINARY_CAS_MANIFEST_CHUNK_NAMESPACE {
-            return Ok(Vec::new());
+            return Ok(BackendKvRowBatch::new());
         }
         let key = b"blob-plugin-json/00000000000000000000".to_vec();
         let include = match range {
@@ -356,7 +356,7 @@ mod tests {
             BackendKvScanRange::Range { start, end } => key >= start && key < end,
         };
         if !include {
-            return Ok(Vec::new());
+            return Ok(BackendKvRowBatch::new());
         }
         let value = serde_json::to_vec(&KvBlobManifestChunk {
             chunk_hash: "chunk-plugin-json".to_string(),
@@ -368,7 +368,9 @@ mod tests {
                 format!("test manifest chunk encode failed: {error}"),
             )
         })?;
-        Ok(vec![BackendKvScanRow::new(key, value)])
+        let mut rows = BackendKvRowBatch::with_capacity(1);
+        rows.push_value(key, value);
+        Ok(rows)
     }
 
     fn build_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {

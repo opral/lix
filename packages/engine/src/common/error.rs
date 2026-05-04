@@ -129,6 +129,10 @@ impl LixError {
     /// A caller referenced a version id that has no matching version ref.
     pub const CODE_VERSION_NOT_FOUND: &'static str = "LIX_VERSION_NOT_FOUND";
 
+    /// A staged row's storage scope flags disagree, such as a global row not
+    /// using the reserved global version id.
+    pub const CODE_INVALID_STORAGE_SCOPE: &'static str = "LIX_ERROR_INVALID_STORAGE_SCOPE";
+
     /// Merge graph analysis found multiple equally valid merge bases.
     pub const CODE_AMBIGUOUS_MERGE_BASE: &'static str = "LIX_AMBIGUOUS_MERGE_BASE";
 

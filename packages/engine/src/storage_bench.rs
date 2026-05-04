@@ -16,8 +16,8 @@ use crate::tracked_state::{
     TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
 };
 use crate::untracked_state::{
-    UntrackedStateContext, UntrackedStateFilter, UntrackedStateRow, UntrackedStateRowRequest,
-    UntrackedStateScanRequest,
+    UntrackedStateContext, UntrackedStateFilter, UntrackedStateProjection, UntrackedStateRow,
+    UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
 use crate::{Backend, LixError, NullableKeyFilter};
 use std::sync::Arc;
@@ -336,11 +336,7 @@ pub async fn storage_api_get_kv_many_hits_prepared(
         })
         .await?;
     transaction.rollback().await?;
-    let verified_rows = result.groups[0]
-        .entries
-        .iter()
-        .filter(|entry| entry.value.is_some())
-        .count();
+    let verified_rows = result.groups[0].rows.value_count();
     Ok(StorageBenchReport {
         measured_rows: reads,
         verified_rows,
@@ -367,11 +363,7 @@ pub async fn storage_api_get_kv_many_exists_prepared(
         })
         .await?;
     transaction.rollback().await?;
-    let verified_rows = result.groups[0]
-        .entries
-        .iter()
-        .filter(|entry| entry.exists && entry.value.is_none())
-        .count();
+    let verified_rows = result.groups[0].rows.existence_count();
     Ok(StorageBenchReport {
         measured_rows: reads,
         verified_rows,
@@ -398,11 +390,7 @@ pub async fn storage_api_get_kv_many_misses_prepared(
         })
         .await?;
     transaction.rollback().await?;
-    let verified_rows = result.groups[0]
-        .entries
-        .iter()
-        .filter(|entry| !entry.exists)
-        .count();
+    let verified_rows = result.groups[0].rows.missing_count();
     Ok(StorageBenchReport {
         measured_rows: reads,
         verified_rows,
@@ -435,11 +423,7 @@ pub async fn storage_api_get_kv_many_mixed_hit_miss_prepared(
         })
         .await?;
     transaction.rollback().await?;
-    let verified_rows = result.groups[0]
-        .entries
-        .iter()
-        .filter(|entry| entry.value.is_some())
-        .count();
+    let verified_rows = result.groups[0].rows.value_count();
     Ok(StorageBenchReport {
         measured_rows: reads,
         verified_rows,
@@ -494,9 +478,8 @@ pub async fn storage_api_get_kv_many_multi_namespace(
     let verified_rows = result
         .groups
         .iter()
-        .flat_map(|group| group.entries.iter())
-        .filter(|entry| entry.value.is_some())
-        .count();
+        .map(|group| group.rows.value_count())
+        .sum();
     Ok(StorageBenchReport {
         measured_rows: reads,
         verified_rows,
@@ -523,11 +506,7 @@ pub async fn storage_api_get_kv_many_duplicate_keys_prepared(
         })
         .await?;
     transaction.rollback().await?;
-    let verified_rows = result.groups[0]
-        .entries
-        .iter()
-        .filter(|entry| entry.value.is_some())
-        .count();
+    let verified_rows = result.groups[0].rows.value_count();
     Ok(StorageBenchReport {
         measured_rows: reads,
         verified_rows,
@@ -987,6 +966,57 @@ pub async fn tracked_state_scan_all_prepared(
     Ok(report(fixture.rows, verified_rows, Duration::ZERO))
 }
 
+pub async fn tracked_state_scan_keys_only_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &TrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
+    let verified_rows = reader
+        .scan_rows_at_commit(
+            &fixture.commit_id,
+            &TrackedStateScanRequest {
+                projection: TrackedStateProjection {
+                    columns: vec!["entity_id".to_string()],
+                },
+                ..Default::default()
+            },
+        )
+        .await?
+        .len();
+    Ok(report(fixture.rows, verified_rows, Duration::ZERO))
+}
+
+pub async fn tracked_state_scan_headers_only_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &TrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
+    let verified_rows = reader
+        .scan_rows_at_commit(
+            &fixture.commit_id,
+            &TrackedStateScanRequest {
+                projection: TrackedStateProjection {
+                    columns: tracked_state_header_columns(),
+                },
+                ..Default::default()
+            },
+        )
+        .await?
+        .len();
+    Ok(report(fixture.rows, verified_rows, Duration::ZERO))
+}
+
+pub async fn tracked_state_scan_full_rows_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &TrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    tracked_state_scan_all_prepared(backend, fixture).await
+}
+
 pub async fn tracked_state_scan_schema_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &TrackedStateReadFixture,
@@ -1103,17 +1133,7 @@ pub async fn tracked_state_scan_file_header_selective_prepared(
                     ..Default::default()
                 },
                 projection: TrackedStateProjection {
-                    columns: vec![
-                        "entity_id".to_string(),
-                        "schema_key".to_string(),
-                        "schema_version".to_string(),
-                        "file_id".to_string(),
-                        "metadata".to_string(),
-                        "created_at".to_string(),
-                        "updated_at".to_string(),
-                        "change_id".to_string(),
-                        "commit_id".to_string(),
-                    ],
+                    columns: tracked_state_header_columns(),
                 },
                 ..Default::default()
             },
@@ -1454,6 +1474,51 @@ pub async fn untracked_state_scan_all_prepared(
     .await?
     .len();
     Ok(report(fixture.rows, verified_rows, Duration::ZERO))
+}
+
+pub async fn untracked_state_scan_keys_only_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &UntrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let verified_rows = scan_untracked(
+        backend,
+        &fixture.context,
+        UntrackedStateScanRequest {
+            projection: UntrackedStateProjection {
+                columns: vec!["entity_id".to_string()],
+            },
+            ..Default::default()
+        },
+    )
+    .await?
+    .len();
+    Ok(report(fixture.rows, verified_rows, Duration::ZERO))
+}
+
+pub async fn untracked_state_scan_headers_only_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &UntrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let verified_rows = scan_untracked(
+        backend,
+        &fixture.context,
+        UntrackedStateScanRequest {
+            projection: UntrackedStateProjection {
+                columns: untracked_state_header_columns(),
+            },
+            ..Default::default()
+        },
+    )
+    .await?
+    .len();
+    Ok(report(fixture.rows, verified_rows, Duration::ZERO))
+}
+
+pub async fn untracked_state_scan_full_rows_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &UntrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    untracked_state_scan_all_prepared(backend, fixture).await
 }
 
 pub async fn untracked_state_scan_version_prepared(
@@ -1800,6 +1865,30 @@ pub async fn changelog_scan_all_prepared(
         .await?
         .len();
     Ok(report(fixture.rows, verified_rows, Duration::ZERO))
+}
+
+pub async fn changelog_scan_change_ids_only_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &ChangelogReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
+    let changes = reader
+        .scan_changes(&ChangelogScanRequest::default())
+        .await?;
+    let verified_rows = changes
+        .iter()
+        .filter(|change| !change.id.is_empty())
+        .count();
+    Ok(report(fixture.rows, verified_rows, Duration::ZERO))
+}
+
+pub async fn changelog_scan_full_changes_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &ChangelogReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    changelog_scan_all_prepared(backend, fixture).await
 }
 
 pub async fn changelog_scan_limit_100_prepared(
@@ -3165,6 +3254,40 @@ fn snapshot_content(index: usize, target_bytes: usize) -> String {
 fn snapshot_metadata(index: usize, target_bytes: usize) -> serde_json::Value {
     serde_json::from_str(&snapshot_content(index, target_bytes))
         .expect("bench snapshot content should be valid JSON metadata")
+}
+
+fn tracked_state_header_columns() -> Vec<String> {
+    [
+        "entity_id",
+        "schema_key",
+        "schema_version",
+        "file_id",
+        "metadata",
+        "created_at",
+        "updated_at",
+        "change_id",
+        "commit_id",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn untracked_state_header_columns() -> Vec<String> {
+    [
+        "entity_id",
+        "schema_key",
+        "schema_version",
+        "file_id",
+        "metadata",
+        "created_at",
+        "updated_at",
+        "global",
+        "version_id",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 fn updated_snapshot_content(index: usize, target_bytes: usize) -> String {

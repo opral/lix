@@ -88,8 +88,9 @@ async fn scan_all_untracked_rows(
         })
         .await?
         .into_rows()
+        .into_values_required()?
         .into_iter()
-        .map(|pair| decode_untracked_state_row(&pair.into_value()?))
+        .map(|value| decode_untracked_state_row(&value))
         .collect()
 }
 

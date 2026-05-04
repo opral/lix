@@ -1753,9 +1753,12 @@ mod tests {
 
         async fn load_version_head(
             &mut self,
-            _version_id: &str,
+            version_id: &str,
         ) -> Result<Option<String>, LixError> {
-            Ok(None)
+            if version_id == "ghost-version" {
+                return Ok(None);
+            }
+            Ok(Some(format!("commit-{version_id}")))
         }
 
         async fn stage_write(&mut self, _write: StageWrite) -> Result<StageWriteOutcome, LixError> {
@@ -1793,9 +1796,12 @@ mod tests {
 
         async fn load_version_head(
             &mut self,
-            _version_id: &str,
+            version_id: &str,
         ) -> Result<Option<String>, LixError> {
-            Ok(None)
+            if version_id == "ghost-version" {
+                return Ok(None);
+            }
+            Ok(Some(format!("commit-{version_id}")))
         }
 
         async fn stage_write(&mut self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
