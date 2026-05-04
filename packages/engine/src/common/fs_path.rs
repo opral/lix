@@ -14,7 +14,8 @@
 //! Canonicalization order:
 //!
 //! 1. Normalize raw input to NFC.
-//! 2. Validate the normalized form and percent-encoding structure.
+//! 2. Validate the normalized form, percent-encoding structure, and decoded
+//!    percent-encoded byte stream for forbidden code points.
 //! 3. Apply percent-encoding normalization.
 //! 4. Reject dot segments.
 //!
@@ -256,6 +257,7 @@ fn validate_path_segment_chars(normalized: &str) -> PathResult<()> {
     if !segment_has_valid_percent_encoding(&normalized) {
         return Err(PathError::InvalidPercentEncoding);
     }
+    validate_percent_decoded_segment_chars(normalized)?;
     if normalized
         .chars()
         .any(|ch| is_disallowed_bidi_formatting_char(ch) || is_disallowed_zero_width_char(ch))
@@ -405,6 +407,45 @@ fn segment_has_valid_percent_encoding(segment: &str) -> bool {
         index += 1;
     }
     true
+}
+
+fn validate_percent_decoded_segment_chars(segment: &str) -> PathResult<()> {
+    let mut decoded = Vec::with_capacity(segment.len());
+    let bytes = segment.as_bytes();
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            decoded.push((hex_value(bytes[index + 1]) << 4) | hex_value(bytes[index + 2]));
+            index += 3;
+            continue;
+        }
+
+        let ch = segment[index..]
+            .chars()
+            .next()
+            .expect("slice at char boundary should yield a char");
+        let mut utf8 = [0u8; 4];
+        decoded.extend_from_slice(ch.encode_utf8(&mut utf8).as_bytes());
+        index += ch.len_utf8();
+    }
+
+    if decoded.contains(&0) {
+        return Err(PathError::NulByte);
+    }
+
+    let decoded = std::str::from_utf8(&decoded).map_err(|_| PathError::InvalidIriCodePoint)?;
+    for ch in decoded.chars() {
+        if ch.is_control()
+            || is_disallowed_bidi_formatting_char(ch)
+            || is_disallowed_zero_width_char(ch)
+            || (!ch.is_ascii() && !is_iunreserved_ucschar(ch))
+        {
+            return Err(PathError::InvalidIriCodePoint);
+        }
+    }
+
+    Ok(())
 }
 
 fn normalize_file_path_impl(path: &str) -> PathResult<String> {
@@ -970,6 +1011,36 @@ mod tests {
             normalize_file_path_impl("/docs/abc%2.md"),
             PathError::InvalidPercentEncoding,
         );
+    }
+
+    #[test]
+    fn rejects_percent_encoded_forbidden_code_points_in_file_paths() {
+        for (path, expected) in [
+            ("/docs/%00evil.md", PathError::NulByte),
+            ("/docs/%E2%80%AEevil.md", PathError::InvalidIriCodePoint),
+            ("/docs/%E2%80%8Eevil.md", PathError::InvalidIriCodePoint),
+            ("/docs/%EF%BB%BFevil.md", PathError::InvalidIriCodePoint),
+            ("/docs/%EF%B7%90evil.md", PathError::InvalidIriCodePoint),
+            ("/docs/%EE%80%80evil.md", PathError::InvalidIriCodePoint),
+            ("/docs/%FFevil.md", PathError::InvalidIriCodePoint),
+        ] {
+            assert_path_error(normalize_file_path_impl(path), expected);
+        }
+    }
+
+    #[test]
+    fn rejects_percent_encoded_forbidden_code_points_in_directory_paths() {
+        for (path, expected) in [
+            ("/docs/%00evil/", PathError::NulByte),
+            ("/docs/%E2%80%AEevil/", PathError::InvalidIriCodePoint),
+            ("/docs/%E2%80%8Eevil/", PathError::InvalidIriCodePoint),
+            ("/docs/%EF%BB%BFevil/", PathError::InvalidIriCodePoint),
+            ("/docs/%EF%B7%90evil/", PathError::InvalidIriCodePoint),
+            ("/docs/%EE%80%80evil/", PathError::InvalidIriCodePoint),
+            ("/docs/%FFevil/", PathError::InvalidIriCodePoint),
+        ] {
+            assert_path_error(normalize_directory_path_impl(path), expected);
+        }
     }
 
     #[test]

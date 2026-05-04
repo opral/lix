@@ -5,6 +5,42 @@ use lix_engine::Value;
 use super::assert_rows_eq;
 
 simulation_test!(
+    lix_file_path_insert_rejects_percent_encoded_forbidden_code_points,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        for (id, path, expected_code) in [
+            (
+                "file-percent-nul",
+                "/docs/%00evil.txt",
+                "LIX_ERROR_PATH_NUL_BYTE",
+            ),
+            (
+                "file-percent-bidi",
+                "/docs/%E2%80%AEevil.txt",
+                "LIX_ERROR_PATH_INVALID_IRI_CODE_POINT",
+            ),
+        ] {
+            let error = session
+                .execute(
+                    &format!("INSERT INTO lix_file (id, path) VALUES ('{id}', '{path}')"),
+                    &[],
+                )
+                .await
+                .expect_err("percent-encoded forbidden path code point should be rejected");
+            assert_eq!(error.code, expected_code);
+        }
+    }
+);
+
+simulation_test!(
     lix_file_path_insert_preserves_opaque_file_name_segments,
     |sim| async move {
         let engine = sim.boot_engine().await;
