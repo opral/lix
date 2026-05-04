@@ -259,6 +259,166 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_file_path_insert_rejects_existing_directory_entry,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute("INSERT INTO lix_directory (path) VALUES ('/foo/')", &[])
+            .await
+            .expect("directory insert should succeed");
+
+        let error = session
+            .execute("INSERT INTO lix_file (path) VALUES ('/foo')", &[])
+            .await
+            .expect_err("file should conflict with directory at same entry name");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert!(
+            error.message.contains("filesystem namespace conflict"),
+            "expected namespace conflict error: {error}"
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_path_insert_allows_extension_distinct_from_directory,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute("INSERT INTO lix_directory (path) VALUES ('/foo/')", &[])
+            .await
+            .expect("directory insert should succeed");
+        session
+            .execute("INSERT INTO lix_file (path) VALUES ('/foo.txt')", &[])
+            .await
+            .expect("file basename foo.txt should not conflict with directory foo");
+
+        let file_result = session
+            .execute("SELECT path FROM lix_file WHERE path = '/foo.txt'", &[])
+            .await
+            .expect("file path should query");
+        let directory_result = session
+            .execute("SELECT path FROM lix_directory WHERE path = '/foo/'", &[])
+            .await
+            .expect("directory path should query");
+
+        assert_eq!(file_result.len(), 1);
+        assert_eq!(directory_result.len(), 1);
+    }
+);
+
+simulation_test!(
+    lix_file_path_insert_rejects_file_as_implicit_ancestor,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute("INSERT INTO lix_file (path) VALUES ('/foo')", &[])
+            .await
+            .expect("file insert should succeed");
+
+        let error = session
+            .execute("INSERT INTO lix_file (path) VALUES ('/foo/bar.txt')", &[])
+            .await
+            .expect_err("implicit ancestor directory should conflict with existing file");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+    }
+);
+
+simulation_test!(
+    lix_file_descriptor_shape_insert_rejects_existing_directory_entry,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, parent_id, name) VALUES ('dir-foo', NULL, 'foo')",
+                &[],
+            )
+            .await
+            .expect("directory insert should succeed");
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_file (id, directory_id, name, extension) \
+                 VALUES ('file-foo', NULL, 'foo', NULL)",
+                &[],
+            )
+            .await
+            .expect_err("descriptor-shaped file insert should conflict with directory");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+    }
+);
+
+simulation_test!(
+    lix_file_update_rejects_existing_directory_entry,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ('file-foo', '/foo')",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+        session
+            .execute("INSERT INTO lix_directory (path) VALUES ('/bar/')", &[])
+            .await
+            .expect("directory insert should succeed");
+
+        let error = session
+            .execute(
+                "UPDATE lix_file SET path = '/bar' WHERE id = 'file-foo'",
+                &[],
+            )
+            .await
+            .expect_err("file path update should conflict with directory");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+    }
+);
+
+simulation_test!(
     lix_file_path_insert_rejects_dot_segments,
     |sim| async move {
         let engine = sim.boot_engine().await;

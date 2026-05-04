@@ -115,6 +115,33 @@ simulation_test!(read_only_file_descriptor_rejects_writes, |sim| async move {
 });
 
 simulation_test!(
+    read_only_directory_descriptor_rejects_writes,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        assert_read_only_error(
+            session
+                .execute(
+                    "INSERT INTO lix_directory_descriptor (id, parent_id, name) \
+                     VALUES ('dir-direct', NULL, 'direct')",
+                    &[],
+                )
+                .await
+                .expect_err("directory descriptor insert should be read-only"),
+            "lix_directory_descriptor",
+            "lix_directory",
+        );
+    }
+);
+
+simulation_test!(
     read_only_internal_state_rejects_lix_state_writes,
     |sim| async move {
         let engine = sim.boot_engine().await;

@@ -140,6 +140,20 @@ struct DirectoryDescriptorSnapshot {
     name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct FileDescriptorSnapshot {
+    id: String,
+    directory_id: Option<String>,
+    name: String,
+    extension: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FilesystemNamespaceEntry {
+    Directory(String),
+    File(String),
+}
+
 /// Resolves directory paths while planning filesystem writes.
 ///
 /// The resolver is seeded from the transaction-visible filesystem state and is
@@ -149,19 +163,50 @@ struct DirectoryDescriptorSnapshot {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DirectoryPathResolver {
     directory_ids_by_path: BTreeMap<String, String>,
+    entries_by_parent_and_name: BTreeMap<(Option<String>, String), FilesystemNamespaceEntry>,
 }
 
 impl DirectoryPathResolver {
     pub(crate) fn from_existing(
         existing_directories: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self, LixError> {
+        Self::from_existing_filesystem(existing_directories, std::iter::empty())
+    }
+
+    pub(crate) fn from_existing_filesystem(
+        existing_directories: impl IntoIterator<Item = (String, String)>,
+        existing_files: impl IntoIterator<Item = (Option<String>, String, String)>,
+    ) -> Result<Self, LixError> {
         let mut directory_ids_by_path = BTreeMap::new();
         for (path, id) in existing_directories {
             directory_ids_by_path.insert(normalize_directory_path(&path)?, id);
         }
-        Ok(Self {
+
+        let mut resolver = Self {
             directory_ids_by_path,
-        })
+            entries_by_parent_and_name: BTreeMap::new(),
+        };
+        let mut paths = resolver
+            .directory_ids_by_path
+            .iter()
+            .map(|(path, id)| (path.clone(), id.clone()))
+            .collect::<Vec<_>>();
+        paths.sort_by_key(|(path, _)| path.len());
+        for (path, id) in paths {
+            let parent_id = parent_directory_path(&path)
+                .and_then(|parent_path| resolver.directory_ids_by_path.get(&parent_path).cloned());
+            let name = directory_name_from_path(&path).ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("directory path '{path}' does not contain a directory name"),
+                )
+            })?;
+            resolver.reserve_directory(parent_id, name, id)?;
+        }
+        for (directory_id, entry_name, file_id) in existing_files {
+            resolver.reserve_file(directory_id, entry_name, file_id)?;
+        }
+        Ok(resolver)
     }
 
     pub(crate) fn directory_id(&self, path: &str) -> Result<Option<&str>, LixError> {
@@ -270,6 +315,7 @@ impl DirectoryPathResolver {
                     format!("directory path '{path}' does not contain a directory name"),
                 )
             })?;
+            self.reserve_directory(parent_id.clone(), name.clone(), id.clone())?;
 
             rows.push(directory_descriptor_row(DirectoryDescriptorRowInput {
                 id: id.clone(),
@@ -288,6 +334,50 @@ impl DirectoryPathResolver {
 
         Ok(rows)
     }
+
+    pub(crate) fn reserve_directory(
+        &mut self,
+        parent_id: Option<String>,
+        name: String,
+        directory_id: String,
+    ) -> Result<(), LixError> {
+        let key = (parent_id, name);
+        match self.entries_by_parent_and_name.get(&key) {
+            Some(FilesystemNamespaceEntry::Directory(existing_id))
+                if existing_id == &directory_id =>
+            {
+                Ok(())
+            }
+            Some(existing) => Err(filesystem_namespace_conflict_error(
+                &key.0, &key.1, existing,
+            )),
+            None => {
+                self.entries_by_parent_and_name
+                    .insert(key, FilesystemNamespaceEntry::Directory(directory_id));
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn reserve_file(
+        &mut self,
+        directory_id: Option<String>,
+        entry_name: String,
+        file_id: String,
+    ) -> Result<(), LixError> {
+        let key = (directory_id, entry_name);
+        match self.entries_by_parent_and_name.get(&key) {
+            Some(FilesystemNamespaceEntry::File(existing_id)) if existing_id == &file_id => Ok(()),
+            Some(existing) => Err(filesystem_namespace_conflict_error(
+                &key.0, &key.1, existing,
+            )),
+            None => {
+                self.entries_by_parent_and_name
+                    .insert(key, FilesystemNamespaceEntry::File(file_id));
+                Ok(())
+            }
+        }
+    }
 }
 
 fn duplicate_directory_path_error(path: &str) -> LixError {
@@ -295,6 +385,31 @@ fn duplicate_directory_path_error(path: &str) -> LixError {
         LixError::CODE_UNIQUE,
         format!("unique constraint violation on lix_directory.path for value {path:?}"),
     )
+}
+
+fn filesystem_namespace_conflict_error(
+    parent_id: &Option<String>,
+    entry_name: &str,
+    existing: &FilesystemNamespaceEntry,
+) -> LixError {
+    let parent = parent_id.as_deref().unwrap_or("<root>");
+    let existing_kind = match existing {
+        FilesystemNamespaceEntry::Directory(_) => "directory",
+        FilesystemNamespaceEntry::File(_) => "file",
+    };
+    LixError::new(
+        LixError::CODE_UNIQUE,
+        format!(
+            "filesystem namespace conflict: parent {parent:?} already contains {existing_kind} entry {entry_name:?}"
+        ),
+    )
+}
+
+pub(crate) fn file_entry_name(name: &str, extension: Option<&str>) -> String {
+    match extension {
+        Some(extension) => format!("{name}.{extension}"),
+        None => name.to_string(),
+    }
 }
 
 pub(crate) fn directory_descriptor_row(input: DirectoryDescriptorRowInput) -> StageRow {
@@ -433,11 +548,13 @@ pub(crate) fn plan_file_path_write(
         None => None,
     };
 
+    let entry_name = file_entry_name(&parsed.name, parsed.extension.as_deref());
+    resolver.reserve_file(directory_id.clone(), entry_name, file_id.clone())?;
     rows.push(file_descriptor_row(FileDescriptorRowInput {
         id: file_id.clone(),
         directory_id,
-        name: parsed.name,
-        extension: parsed.extension,
+        name: parsed.name.clone(),
+        extension: parsed.extension.clone(),
         hidden: input.hidden.unwrap_or(false),
         context: input.context.clone(),
     }));
@@ -495,11 +612,13 @@ pub(crate) fn plan_file_path_update(
         None => None,
     };
 
+    let entry_name = file_entry_name(&parsed.name, parsed.extension.as_deref());
+    resolver.reserve_file(directory_id.clone(), entry_name, existing_file_id.clone())?;
     rows.push(file_descriptor_row(FileDescriptorRowInput {
         id: existing_file_id,
         directory_id,
-        name: parsed.name,
-        extension: parsed.extension,
+        name: parsed.name.clone(),
+        extension: parsed.extension.clone(),
         hidden: existing_hidden,
         context,
     }));
@@ -578,28 +697,52 @@ pub(crate) fn directory_path_resolvers_from_state_rows(
     rows: Vec<LiveStateRow>,
 ) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
     let mut directory_rows = BTreeMap::<String, BTreeMap<String, DirectoryDescriptorSeed>>::new();
+    let mut file_rows = BTreeMap::<String, Vec<(Option<String>, String, String)>>::new();
     for row in rows {
-        if row.schema_key != DIRECTORY_DESCRIPTOR_SCHEMA_KEY {
-            continue;
-        }
         let Some(snapshot_content) = row.snapshot_content.as_deref() else {
             continue;
         };
-        let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
-            .map_err(|error| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("invalid lix_directory_descriptor snapshot JSON: {error}"),
-                )
-            })?;
-        directory_rows.entry(row.version_id).or_default().insert(
-            snapshot.id.clone(),
-            DirectoryDescriptorSeed {
-                id: snapshot.id,
-                parent_id: snapshot.parent_id,
-                name: snapshot.name,
-            },
+        let resolver_key = filesystem_storage_scope_key(
+            &row.version_id,
+            row.global,
+            row.untracked,
+            row.file_id.as_deref(),
         );
+        match row.schema_key.as_str() {
+            DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
+                let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
+                    .map_err(|error| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!("invalid lix_directory_descriptor snapshot JSON: {error}"),
+                        )
+                    })?;
+                directory_rows.entry(resolver_key).or_default().insert(
+                    snapshot.id.clone(),
+                    DirectoryDescriptorSeed {
+                        id: snapshot.id,
+                        parent_id: snapshot.parent_id,
+                        name: snapshot.name,
+                    },
+                );
+            }
+            FILE_DESCRIPTOR_SCHEMA_KEY => {
+                let snapshot: FileDescriptorSnapshot = serde_json::from_str(snapshot_content)
+                    .map_err(|error| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!("invalid lix_file_descriptor snapshot JSON: {error}"),
+                        )
+                    })?;
+                let entry_name = file_entry_name(&snapshot.name, snapshot.extension.as_deref());
+                file_rows.entry(resolver_key).or_default().push((
+                    snapshot.directory_id,
+                    entry_name,
+                    snapshot.id,
+                ));
+            }
+            _ => {}
+        }
     }
 
     let mut resolvers = BTreeMap::new();
@@ -612,9 +755,31 @@ pub(crate) fn directory_path_resolvers_from_state_rows(
             .into_iter()
             .map(|(directory_id, path)| (path, directory_id))
             .collect::<Vec<_>>();
-        resolvers.insert(version_id, DirectoryPathResolver::from_existing(seeds)?);
+        let files = file_rows.remove(&version_id).unwrap_or_default();
+        resolvers.insert(
+            version_id,
+            DirectoryPathResolver::from_existing_filesystem(seeds, files)?,
+        );
+    }
+    for (version_id, files) in file_rows {
+        resolvers.insert(
+            version_id,
+            DirectoryPathResolver::from_existing_filesystem(std::iter::empty(), files)?,
+        );
     }
     Ok(resolvers)
+}
+
+pub(crate) fn filesystem_storage_scope_key(
+    version_id: &str,
+    global: bool,
+    untracked: bool,
+    file_id: Option<&str>,
+) -> String {
+    format!(
+        "version={version_id}\0global={global}\0untracked={untracked}\0file_id={}",
+        file_id.unwrap_or("<null>")
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -1161,8 +1326,13 @@ mod tests {
         .expect("state rows should seed directory resolvers");
 
         let resolver = resolvers
-            .get("version-a")
-            .expect("version resolver should exist");
+            .get(&super::filesystem_storage_scope_key(
+                "version-a",
+                false,
+                false,
+                None,
+            ))
+            .expect("storage-scope resolver should exist");
         assert_eq!(resolver.directory_id("/docs/").unwrap(), Some("dir-docs"));
         assert_eq!(
             resolver.directory_id("/docs/guides/").unwrap(),

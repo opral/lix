@@ -182,6 +182,101 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_directory_path_insert_rejects_existing_file_entry,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute("INSERT INTO lix_file (path) VALUES ('/foo')", &[])
+            .await
+            .expect("file insert should succeed");
+
+        let error = session
+            .execute("INSERT INTO lix_directory (path) VALUES ('/foo/')", &[])
+            .await
+            .expect_err("directory should conflict with file at same entry name");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+    }
+);
+
+simulation_test!(
+    lix_directory_descriptor_shape_insert_rejects_existing_file_entry,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, directory_id, name, extension) \
+                 VALUES ('file-foo', NULL, 'foo', NULL)",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_directory (id, parent_id, name) VALUES ('dir-foo', NULL, 'foo')",
+                &[],
+            )
+            .await
+            .expect_err("descriptor-shaped directory insert should conflict with file");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+    }
+);
+
+simulation_test!(
+    lix_directory_update_rejects_existing_file_entry,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, parent_id, name) VALUES ('dir-bar', NULL, 'bar')",
+                &[],
+            )
+            .await
+            .expect("directory insert should succeed");
+        session
+            .execute("INSERT INTO lix_file (path) VALUES ('/foo')", &[])
+            .await
+            .expect("file insert should succeed");
+
+        let error = session
+            .execute(
+                "UPDATE lix_directory SET name = 'foo' WHERE id = 'dir-bar'",
+                &[],
+            )
+            .await
+            .expect_err("directory rename should conflict with file");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+    }
+);
+
+simulation_test!(
     lix_directory_path_insert_rejects_dot_segments,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -280,6 +375,95 @@ simulation_test!(
             .expect_err("descriptor cycles staged through lix_state must be rejected");
 
         assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+    }
+);
+
+simulation_test!(
+    lix_state_insert_rejects_directory_file_namespace_conflict,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute("INSERT INTO lix_file (path) VALUES ('/foo')", &[])
+            .await
+            .expect("file insert should succeed");
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+                 ) VALUES \
+                 ('dir-foo', 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-foo\",\"parent_id\":null,\"name\":\"foo\",\"hidden\":false}'), '1', false, false)",
+                &[],
+            )
+            .await
+            .expect_err("lix_state directory descriptor must not bypass filesystem namespace");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert!(
+            error.message.contains("filesystem namespace conflict"),
+            "expected namespace conflict error: {error}"
+        );
+    }
+);
+
+simulation_test!(
+    lix_directory_allows_version_local_entry_matching_global_file_entry,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, lixcol_global) \
+                 VALUES ('global-file-foo', '/foo', true)",
+                &[],
+            )
+            .await
+            .expect("global file insert should succeed");
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES ('version-dir-foo', '/foo/')",
+                &[],
+            )
+            .await
+            .expect("version-local directory should be a distinct storage namespace");
+
+        let global_file = session
+            .execute(
+                "SELECT id, path, lixcol_version_id, lixcol_global \
+                 FROM lix_file_by_version \
+                 WHERE id = 'global-file-foo' AND lixcol_version_id = 'global'",
+                &[],
+            )
+            .await
+            .expect("global file should query");
+        let version_directory = session
+            .execute(
+                "SELECT id, path \
+                 FROM lix_directory \
+                 WHERE id = 'version-dir-foo'",
+                &[],
+            )
+            .await
+            .expect("version directory should query");
+
+        assert_eq!(global_file.len(), 1);
+        assert_eq!(version_directory.len(), 1);
     }
 );
 
