@@ -81,7 +81,7 @@ impl TableProvider for LixStateHistoryProvider {
     }
 
     fn table_type(&self) -> TableType {
-        TableType::Base
+        TableType::View
     }
 
     fn supports_filters_pushdown(

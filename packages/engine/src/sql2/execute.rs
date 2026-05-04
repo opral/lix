@@ -3,10 +3,11 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::prelude::{SessionConfig, SessionContext};
-use serde_json::json;
+use serde_json::{json, Value as JsonValue};
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::schema::schema_key_from_definition;
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
 use super::change_provider::register_lix_change_provider;
@@ -90,6 +91,7 @@ pub(crate) async fn create_write_logical_plan(
     sql: &str,
 ) -> Result<SqlLogicalPlan, LixError> {
     super::validate_supported_statement_ast(sql)?;
+    reject_read_only_history_view_dml(sql, &ctx.list_visible_schemas()?)?;
     let session = build_write_session(ctx).await?;
     let plan = session
         .state()
@@ -211,6 +213,47 @@ fn sorted_parameter_names(parameter_names: &HashSet<String>) -> Vec<String> {
     let mut names = parameter_names.iter().cloned().collect::<Vec<_>>();
     names.sort();
     names
+}
+
+fn reject_read_only_history_view_dml(
+    sql: &str,
+    visible_schemas: &[JsonValue],
+) -> Result<(), LixError> {
+    let target_names = super::dml_target_table_names(sql)?;
+    for target_name in target_names {
+        if is_history_view_name(&target_name, visible_schemas)? {
+            return Err(read_only_history_view_error(&target_name));
+        }
+    }
+    Ok(())
+}
+
+fn is_history_view_name(table_name: &str, visible_schemas: &[JsonValue]) -> Result<bool, LixError> {
+    if matches!(
+        table_name,
+        "lix_state_history" | "lix_file_history" | "lix_directory_history"
+    ) {
+        return Ok(true);
+    }
+
+    for schema in visible_schemas {
+        let schema_key = schema_key_from_definition(schema)?;
+        if table_name == format!("{}_history", schema_key.schema_key) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn read_only_history_view_error(view_name: &str) -> LixError {
+    LixError::new(
+        LixError::CODE_READ_ONLY,
+        format!("DML cannot write read-only history view '{view_name}'"),
+    )
+    .with_hint(
+        "History views are query-only; write to the live surface such as lix_state, lix_file, lix_directory, or the typed entity table.",
+    )
 }
 
 async fn build_read_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, LixError> {

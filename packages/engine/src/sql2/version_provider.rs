@@ -23,6 +23,7 @@ use futures_util::{stream, StreamExt, TryStreamExt};
 use serde_json::Value as JsonValue;
 
 use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateScanRequest};
+use crate::sql2::record_batch::record_batch_with_row_count;
 use crate::sql2::write_normalization::UpdateAssignmentValues;
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
@@ -1134,7 +1135,7 @@ fn version_record_batch(projection: &[VersionColumn], rows: &[VersionRow]) -> Re
             }
         })
         .collect::<Vec<_>>();
-    RecordBatch::try_new(version_schema(projection), arrays).map_err(|error| {
+    record_batch_with_row_count(version_schema(projection), arrays, rows.len()).map_err(|error| {
         DataFusionError::Execution(format!("failed to build lix_version batch: {error}"))
     })
 }
