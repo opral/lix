@@ -1,16 +1,19 @@
 use datafusion::arrow::datatypes::Field;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
-use datafusion::logical_expr::{Expr, LogicalPlan};
+use datafusion::logical_expr::{Expr, LogicalPlan, WriteOp};
 use datafusion::prelude::SessionContext;
 use serde_json::{json, Value as JsonValue};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use crate::schema::schema_key_from_definition;
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
 use super::result_metadata::field_is_json;
 use super::session::{build_read_session, build_write_session};
+use super::write_normalization::{
+    is_binary_type, lix_file_data_type_lix_error, logical_expr_is_binary_or_null,
+};
 use super::{SqlExecutionContext, SqlStatementKind, SqlWriteExecutionContext};
 
 #[allow(dead_code)]
@@ -19,6 +22,7 @@ pub(crate) struct SqlLogicalPlan {
     plan: LogicalPlan,
     kind: SqlStatementKind,
     notices: Vec<LixNotice>,
+    strict_binary_params: BTreeSet<usize>,
 }
 
 impl SqlLogicalPlan {
@@ -69,6 +73,7 @@ pub(crate) async fn create_logical_plan(
         plan,
         kind,
         notices,
+        strict_binary_params: BTreeSet::new(),
     })
 }
 
@@ -86,6 +91,7 @@ pub(crate) async fn create_write_logical_plan(
         .await
         .map_err(datafusion_error_to_lix_error)?;
     validate_supported_logical_plan(&plan)?;
+    let strict_binary_params = validate_strict_lix_file_data_writes(&plan)?;
     let kind = classify_logical_plan(&plan);
 
     Ok(SqlLogicalPlan {
@@ -93,7 +99,109 @@ pub(crate) async fn create_write_logical_plan(
         plan,
         kind,
         notices: Vec::new(),
+        strict_binary_params,
     })
+}
+
+fn validate_strict_lix_file_data_writes(plan: &LogicalPlan) -> Result<BTreeSet<usize>, LixError> {
+    let mut strict_binary_params = BTreeSet::new();
+    let LogicalPlan::Dml(dml) = plan else {
+        return Ok(strict_binary_params);
+    };
+    if dml.table_name.table() != "lix_file"
+        || !matches!(dml.op, WriteOp::Insert(_) | WriteOp::Update)
+    {
+        return Ok(strict_binary_params);
+    }
+
+    reject_non_binary_lix_file_data_write(&dml.input, &mut strict_binary_params)?;
+    Ok(strict_binary_params)
+}
+
+fn reject_non_binary_lix_file_data_write(
+    input: &LogicalPlan,
+    strict_binary_params: &mut BTreeSet<usize>,
+) -> Result<(), LixError> {
+    let LogicalPlan::Projection(projection) = input else {
+        return Ok(());
+    };
+
+    let Some(data_expr) = projection.expr.iter().find_map(|expr| match expr {
+        Expr::Alias(alias) if alias.name == "data" => Some(alias.expr.as_ref()),
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+
+    validate_lix_file_data_expr(data_expr, strict_binary_params)?;
+
+    let Expr::Column(column) = data_expr else {
+        return Ok(());
+    };
+    let LogicalPlan::Values(values) = projection.input.as_ref() else {
+        return Ok(());
+    };
+    let Ok(column_index) = values.schema.index_of_column(column) else {
+        return Ok(());
+    };
+
+    for row in &values.values {
+        if let Some(value_expr) = row.get(column_index) {
+            validate_lix_file_data_expr(value_expr, strict_binary_params)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_lix_file_data_expr(
+    expr: &Expr,
+    strict_binary_params: &mut BTreeSet<usize>,
+) -> Result<(), LixError> {
+    match expr {
+        Expr::Cast(cast) if is_binary_type(&cast.data_type) => {
+            if collect_placeholder_param(&cast.expr, strict_binary_params)? {
+                return Ok(());
+            }
+            if !logical_expr_is_binary_or_null(&cast.expr) {
+                return Err(lix_file_data_type_lix_error());
+            }
+        }
+        Expr::Placeholder(_) => {
+            collect_placeholder_param(expr, strict_binary_params)?;
+        }
+        Expr::Alias(alias) => validate_lix_file_data_expr(&alias.expr, strict_binary_params)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn collect_placeholder_param(
+    expr: &Expr,
+    strict_binary_params: &mut BTreeSet<usize>,
+) -> Result<bool, LixError> {
+    match expr {
+        Expr::Placeholder(placeholder) => {
+            let index = placeholder_index(&placeholder.id)?;
+            strict_binary_params.insert(index);
+            Ok(true)
+        }
+        Expr::Alias(alias) => collect_placeholder_param(&alias.expr, strict_binary_params),
+        _ => Ok(false),
+    }
+}
+
+fn placeholder_index(id: &str) -> Result<usize, LixError> {
+    id.strip_prefix('$')
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|index| *index > 0)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_PARSE_ERROR,
+                format!("unsupported SQL parameter placeholder '{id}'"),
+            )
+            .with_hint("Use numbered placeholders like $1, $2, ...")
+        })
 }
 
 pub(crate) async fn execute_logical_plan(
@@ -105,8 +213,10 @@ pub(crate) async fn execute_logical_plan(
         plan,
         kind: _,
         notices,
+        strict_binary_params,
     } = plan;
     validate_parameter_count(&plan, params.len())?;
+    validate_strict_binary_params(&strict_binary_params, params)?;
 
     let mut dataframe = session
         .execute_logical_plan(plan)
@@ -135,6 +245,21 @@ pub(crate) async fn execute_logical_plan(
     let mut result = query_result_from_batches(&result_fields, &batches)?;
     result.notices = notices;
     Ok(result)
+}
+
+fn validate_strict_binary_params(
+    strict_binary_params: &BTreeSet<usize>,
+    params: &[Value],
+) -> Result<(), LixError> {
+    for index in strict_binary_params {
+        let Some(value) = params.get(index - 1) else {
+            continue;
+        };
+        if !matches!(value, Value::Blob(_)) {
+            return Err(lix_file_data_type_lix_error());
+        }
+    }
+    Ok(())
 }
 
 fn validate_parameter_count(plan: &LogicalPlan, param_count: usize) -> Result<(), LixError> {
