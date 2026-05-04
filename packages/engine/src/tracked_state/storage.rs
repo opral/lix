@@ -1,7 +1,7 @@
 use crate::storage::KvScanRange;
 use crate::storage::{
-    KvGetGroup, KvGetProjection, KvGetRequest, KvPut, KvRowBatch, KvScanProjection, KvScanRequest,
-    KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
+    KvEntryPage, KvGetGroup, KvGetRequest, KvPut, KvScanRequest, KvWriteBatch, KvWriteGroup,
+    StorageReader, StorageWriter,
 };
 use crate::tracked_state::codec::PendingChunkWrite;
 use crate::tracked_state::tree_types::{
@@ -29,20 +29,17 @@ async fn get_one(
     key: Vec<u8>,
 ) -> Result<Option<Vec<u8>>, LixError> {
     Ok(store
-        .get_kv_many(KvGetRequest {
+        .get_values(KvGetRequest {
             groups: vec![KvGetGroup {
                 namespace: namespace.to_string(),
                 keys: vec![key],
             }],
-            projection: KvGetProjection::Values,
         })
         .await?
         .groups
         .into_iter()
         .next()
-        .map(|mut group| group.pop_value())
-        .transpose()?
-        .flatten())
+        .and_then(|mut group| group.pop_value()))
 }
 
 async fn put_one(
@@ -67,17 +64,15 @@ async fn scan_all(
     store: &mut (impl StorageReader + ?Sized),
     namespace: &str,
     range: KvScanRange,
-) -> Result<KvRowBatch, LixError> {
+) -> Result<KvEntryPage, LixError> {
     Ok(store
-        .scan_kv(KvScanRequest {
+        .scan_entries(KvScanRequest {
             namespace: namespace.to_string(),
             range,
             after: None,
             limit: usize::MAX,
-            projection: KvScanProjection::KeysAndValues,
         })
-        .await?
-        .into_rows())
+        .await?)
 }
 
 pub(crate) async fn load_root(
@@ -760,15 +755,21 @@ pub(crate) async fn scan_roots(
     .await?;
     (0..pairs.len())
         .map(|index| {
-            let key = pairs.key(index).expect("scan row key exists").to_vec();
-            let commit_id = String::from_utf8(key).map_err(|error| {
+            let commit_id = String::from_utf8(
+                pairs
+                    .key(index)
+                    .expect("tracked-state root key exists")
+                    .to_vec(),
+            )
+            .map_err(|error| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!("tracked-state tree root key is invalid UTF-8: {error}"),
                 )
             })?;
-            let value = pairs.value_required(index)?;
-            let root_id = TrackedStateRootId::from_slice(&value)?;
+            let root_id = TrackedStateRootId::from_slice(
+                pairs.value(index).expect("tracked-state root value exists"),
+            )?;
             Ok((commit_id, root_id))
         })
         .collect()

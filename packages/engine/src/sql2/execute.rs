@@ -675,8 +675,8 @@ mod tests {
     };
     use crate::sql2::{ChangelogQuerySource, SqlChangelogQuerySource};
     use crate::storage::{
-        KvGetBatch, KvGetRequest, KvScanBatch, KvScanRequest, StorageContext, StorageReadScope,
-        StorageReadTransaction, StorageReader,
+        KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch,
+        KvValuePage, StorageContext, StorageReadScope, StorageReadTransaction, StorageReader,
     };
     use crate::tracked_state::TrackedStateContext;
     use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
@@ -704,12 +704,24 @@ mod tests {
 
     #[async_trait]
     impl StorageReader for TestReadTransaction {
-        async fn get_kv_many(&mut self, request: KvGetRequest) -> Result<KvGetBatch, LixError> {
-            self.0.get_kv_many(request).await
+        async fn get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, LixError> {
+            self.0.get_values(request).await
         }
 
-        async fn scan_kv(&mut self, request: KvScanRequest) -> Result<KvScanBatch, LixError> {
-            self.0.scan_kv(request).await
+        async fn exists_many(&mut self, request: KvGetRequest) -> Result<KvExistsBatch, LixError> {
+            self.0.exists_many(request).await
+        }
+
+        async fn scan_keys(&mut self, request: KvScanRequest) -> Result<KvKeyPage, LixError> {
+            self.0.scan_keys(request).await
+        }
+
+        async fn scan_values(&mut self, request: KvScanRequest) -> Result<KvValuePage, LixError> {
+            self.0.scan_values(request).await
+        }
+
+        async fn scan_entries(&mut self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
+            self.0.scan_entries(request).await
         }
     }
 

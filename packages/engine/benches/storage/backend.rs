@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use lix_engine::{
-    Backend, BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetRequest, BackendKvRowBatch,
-    BackendKvScanBatch, BackendKvScanRange, BackendKvScanRequest, BackendKvWriteBatch,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, LixError,
+    Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetRequest,
+    BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch,
+    BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteStats,
+    BackendReadTransaction, BackendWriteTransaction, BytePageBuilder, LixError,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -48,35 +49,68 @@ impl Backend for BenchBackend {
 
 #[async_trait]
 impl BackendReadTransaction for BenchTransaction {
-    async fn get_kv_many(
+    async fn get_values(
         &mut self,
         request: BackendKvGetRequest,
-    ) -> Result<BackendKvGetBatch, LixError> {
+    ) -> Result<BackendKvValueBatch, LixError> {
         let store = self.lock_store()?;
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
-            let mut rows = BackendKvRowBatch::with_capacity(group.keys.len());
-            for key in group.keys {
-                rows.push_get_projection(
-                    key.clone(),
-                    store.get(&(group.namespace.clone(), key)).cloned(),
-                    request.projection,
-                );
-            }
-            groups.push(BackendKvGetBatchGroup {
+            let values = group
+                .keys
+                .into_iter()
+                .map(|key| store.get(&(group.namespace.clone(), key)).cloned())
+                .collect();
+            groups.push(BackendKvValueGroup {
                 namespace: group.namespace,
-                rows,
+                values,
             });
         }
-        Ok(BackendKvGetBatch { groups })
+        Ok(BackendKvValueBatch { groups })
     }
 
-    async fn scan_kv(
+    async fn exists_many(
+        &mut self,
+        request: BackendKvGetRequest,
+    ) -> Result<BackendKvExistsBatch, LixError> {
+        let store = self.lock_store()?;
+        let mut groups = Vec::with_capacity(request.groups.len());
+        for group in request.groups {
+            let exists = group
+                .keys
+                .into_iter()
+                .map(|key| store.contains_key(&(group.namespace.clone(), key)))
+                .collect();
+            groups.push(BackendKvExistsGroup {
+                namespace: group.namespace,
+                exists,
+            });
+        }
+        Ok(BackendKvExistsBatch { groups })
+    }
+
+    async fn scan_keys(
         &mut self,
         request: BackendKvScanRequest,
-    ) -> Result<BackendKvScanBatch, LixError> {
+    ) -> Result<BackendKvKeyPage, LixError> {
         let store = self.lock_store()?;
-        Ok(scan_store_request(&store, request))
+        Ok(scan_store_keys(&store, request))
+    }
+
+    async fn scan_values(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvValuePage, LixError> {
+        let store = self.lock_store()?;
+        Ok(scan_store_values(&store, request))
+    }
+
+    async fn scan_entries(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvEntryPage, LixError> {
+        let store = self.lock_store()?;
+        Ok(scan_store_entries(&store, request))
     }
 
     async fn rollback(mut self: Box<Self>) -> Result<(), LixError> {
@@ -122,10 +156,48 @@ impl BenchTransaction {
     }
 }
 
-fn scan_store_request(store: &Store, request: BackendKvScanRequest) -> BackendKvScanBatch {
+fn scan_store_keys(store: &Store, request: BackendKvScanRequest) -> BackendKvKeyPage {
     let start_key = scan_start_key(&request);
     let lower_bound = (request.namespace.clone(), start_key);
-    let mut rows = BackendKvRowBatch::new();
+    let mut keys = BytePageBuilder::new();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
+    for ((row_namespace, key), _value) in store.range(lower_bound..) {
+        if row_namespace != &request.namespace {
+            break;
+        }
+        if let Some(after) = request.after.as_deref() {
+            if key.as_slice() <= after {
+                continue;
+            }
+        }
+        if !key_matches_range(key, &request.range) {
+            break;
+        }
+        if count < request.limit {
+            resume_after_candidate = Some(key.clone());
+            keys.push(key);
+        }
+        count += 1;
+        if count > request.limit {
+            break;
+        }
+    }
+    let resume_after = (count > request.limit)
+        .then_some(resume_after_candidate)
+        .flatten();
+    BackendKvKeyPage {
+        keys: keys.finish(),
+        resume_after,
+    }
+}
+
+fn scan_store_values(store: &Store, request: BackendKvScanRequest) -> BackendKvValuePage {
+    let start_key = scan_start_key(&request);
+    let lower_bound = (request.namespace.clone(), start_key);
+    let mut values = BytePageBuilder::new();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
     for ((row_namespace, key), value) in store.range(lower_bound..) {
         if row_namespace != &request.namespace {
             break;
@@ -135,24 +207,71 @@ fn scan_store_request(store: &Store, request: BackendKvScanRequest) -> BackendKv
                 continue;
             }
         }
-        let matches = match &request.range {
-            BackendKvScanRange::Prefix(prefix) => key.starts_with(prefix),
-            BackendKvScanRange::Range { start, end } => {
-                key.as_slice() >= start.as_slice() && key.as_slice() < end.as_slice()
-            }
-        };
-        if !matches {
+        if !key_matches_range(key, &request.range) {
             break;
         }
-        rows.push_scan_projection(key.clone(), value.clone(), request.projection);
-        if rows.len() > request.limit {
+        if count < request.limit {
+            resume_after_candidate = Some(key.clone());
+            values.push(value);
+        }
+        count += 1;
+        if count > request.limit {
             break;
         }
     }
-    let has_more = rows.len() > request.limit;
-    rows.truncate(request.limit);
-    let resume_after = has_more.then(|| rows.last_key_cloned()).flatten();
-    BackendKvScanBatch { rows, resume_after }
+    let resume_after = (count > request.limit)
+        .then_some(resume_after_candidate)
+        .flatten();
+    BackendKvValuePage {
+        values: values.finish(),
+        resume_after,
+    }
+}
+
+fn scan_store_entries(store: &Store, request: BackendKvScanRequest) -> BackendKvEntryPage {
+    let start_key = scan_start_key(&request);
+    let lower_bound = (request.namespace.clone(), start_key);
+    let mut keys = BytePageBuilder::new();
+    let mut values = BytePageBuilder::new();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
+    for ((row_namespace, key), value) in store.range(lower_bound..) {
+        if row_namespace != &request.namespace {
+            break;
+        }
+        if let Some(after) = request.after.as_deref() {
+            if key.as_slice() <= after {
+                continue;
+            }
+        }
+        if !key_matches_range(key, &request.range) {
+            break;
+        }
+        if count < request.limit {
+            resume_after_candidate = Some(key.clone());
+            keys.push(key);
+            values.push(value);
+        }
+        count += 1;
+        if count > request.limit {
+            break;
+        }
+    }
+    let resume_after = (count > request.limit)
+        .then_some(resume_after_candidate)
+        .flatten();
+    BackendKvEntryPage {
+        keys: keys.finish(),
+        values: values.finish(),
+        resume_after,
+    }
+}
+
+fn key_matches_range(key: &[u8], range: &BackendKvScanRange) -> bool {
+    match range {
+        BackendKvScanRange::Prefix(prefix) => key.starts_with(prefix),
+        BackendKvScanRange::Range { start, end } => key >= start.as_slice() && key < end.as_slice(),
+    }
 }
 
 fn scan_start_key(request: &BackendKvScanRequest) -> Vec<u8> {
