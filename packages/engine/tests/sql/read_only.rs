@@ -103,8 +103,8 @@ simulation_test!(read_only_file_descriptor_rejects_writes, |sim| async move {
     assert_read_only_error(
         session
             .execute(
-                "INSERT INTO lix_file_descriptor (id, directory_id, name, extension) \
-                 VALUES ('file-direct', NULL, 'direct', 'txt')",
+                "INSERT INTO lix_file_descriptor (id, directory_id, name) \
+                 VALUES ('file-direct', NULL, 'direct.txt')",
                 &[],
             )
             .await

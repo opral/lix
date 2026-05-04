@@ -49,7 +49,7 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, path, name, extension, hidden, data, lixcol_start_commit_id, lixcol_depth \
+                    "SELECT id, path, name, hidden, data, lixcol_start_commit_id, lixcol_depth \
                      FROM lix_file_history \
                      WHERE lixcol_start_commit_id = '{second_commit_id}' \
                        AND id = 'history-file' \
@@ -67,8 +67,7 @@ simulation_test!(
                 vec![
                     Value::Text("history-file".to_string()),
                     Value::Text("/docs/readme-renamed.md".to_string()),
-                    Value::Text("readme-renamed".to_string()),
-                    Value::Text("md".to_string()),
+                    Value::Text("readme-renamed.md".to_string()),
                     Value::Boolean(false),
                     Value::Blob(b"hello".to_vec()),
                     Value::Text(second_commit_id.clone()),
@@ -77,8 +76,7 @@ simulation_test!(
                 vec![
                     Value::Text("history-file".to_string()),
                     Value::Text("/docs/guides/readme.md".to_string()),
-                    Value::Text("readme".to_string()),
-                    Value::Text("md".to_string()),
+                    Value::Text("readme.md".to_string()),
                     Value::Boolean(false),
                     Value::Blob(b"hello".to_vec()),
                     Value::Text(second_commit_id.clone()),
@@ -106,8 +104,7 @@ simulation_test!(
         let Value::Json(snapshot) = snapshot else {
             panic!("snapshot_content should be semantic JSON, got {snapshot:?}");
         };
-        assert_eq!(snapshot["name"], json!("readme-renamed"));
-        assert_eq!(snapshot["extension"], json!("md"));
+        assert_eq!(snapshot["name"], json!("readme-renamed.md"));
         assert_eq!(snapshot["hidden"], json!(false));
 
         let result = session

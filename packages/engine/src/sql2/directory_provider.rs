@@ -1900,14 +1900,14 @@ mod tests {
                 "lix_file_descriptor",
                 None,
                 "version-a",
-                r#"{"id":"file-index","directory_id":"dir-docs","name":"index","extension":"md","hidden":false}"#,
+                r#"{"id":"file-index","directory_id":"dir-docs","name":"index.md","hidden":false}"#,
             ),
             live_filesystem_row(
                 "file-readme",
                 "lix_file_descriptor",
                 None,
                 "version-a",
-                r#"{"id":"file-readme","directory_id":"dir-guides","name":"readme","extension":"md","hidden":false}"#,
+                r#"{"id":"file-readme","directory_id":"dir-guides","name":"readme.md","hidden":false}"#,
             ),
             live_filesystem_row(
                 "file-readme",

@@ -286,7 +286,6 @@ struct FileHistoryDescriptorRecord {
     id: String,
     directory_id: Option<String>,
     name: Option<String>,
-    extension: Option<String>,
     hidden: Option<bool>,
     entry: HistoryEntry,
 }
@@ -324,7 +323,6 @@ struct FileHistoryOutputRow {
     path: Option<String>,
     directory_id: Option<String>,
     name: Option<String>,
-    extension: Option<String>,
     hidden: Option<bool>,
     data: Option<Vec<u8>>,
     descriptor_change: MaterializedCanonicalChange,
@@ -336,7 +334,6 @@ struct FileDescriptorSnapshot {
     id: String,
     directory_id: Option<String>,
     name: String,
-    extension: Option<String>,
     hidden: bool,
 }
 
@@ -435,7 +432,6 @@ async fn load_file_history_rows(
             path,
             directory_id: descriptor.directory_id.clone(),
             name: descriptor.name.clone(),
-            extension: descriptor.extension.clone(),
             hidden: descriptor.hidden,
             data,
             descriptor_change: descriptor.entry.change.clone(),
@@ -566,7 +562,6 @@ fn parse_file_history_descriptors(
                     id: entry.change.entity_id.as_string()?,
                     directory_id: None,
                     name: None,
-                    extension: None,
                     hidden: None,
                     entry: entry.clone(),
                 });
@@ -582,7 +577,6 @@ fn parse_file_history_descriptors(
                 id: snapshot.id,
                 directory_id: snapshot.directory_id,
                 name: Some(snapshot.name),
-                extension: snapshot.extension,
                 hidden: Some(snapshot.hidden),
                 entry: entry.clone(),
             })
@@ -701,12 +695,8 @@ fn resolve_file_history_path(
     target_depth: u32,
 ) -> Option<String> {
     let name = descriptor.name.as_ref()?;
-    let filename = match descriptor.extension.as_deref() {
-        Some(extension) if !extension.is_empty() => format!("{name}.{extension}"),
-        _ => name.clone(),
-    };
     let Some(directory_id) = descriptor.directory_id.as_deref() else {
-        return Some(format!("/{filename}"));
+        return Some(format!("/{name}"));
     };
     let directory_path = resolve_directory_history_path(
         directory_id,
@@ -716,7 +706,7 @@ fn resolve_file_history_path(
         &mut BTreeMap::new(),
         &mut BTreeSet::new(),
     )?;
-    Some(format!("{directory_path}{filename}"))
+    Some(format!("{directory_path}{name}"))
 }
 
 fn resolve_directory_history_path(
@@ -793,7 +783,6 @@ fn file_history_column_array(
         "path" => string_array(rows.iter().map(|row| row.path.as_deref())),
         "directory_id" => string_array(rows.iter().map(|row| row.directory_id.as_deref())),
         "name" => string_array(rows.iter().map(|row| row.name.as_deref())),
-        "extension" => string_array(rows.iter().map(|row| row.extension.as_deref())),
         "hidden" => Arc::new(BooleanArray::from(
             rows.iter().map(|row| row.hidden).collect::<Vec<_>>(),
         )) as ArrayRef,
@@ -856,7 +845,6 @@ fn lix_file_history_schema() -> SchemaRef {
         Field::new("path", DataType::Utf8, true),
         Field::new("directory_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, true),
-        Field::new("extension", DataType::Utf8, true),
         Field::new("hidden", DataType::Boolean, true),
         Field::new("data", DataType::Binary, true),
         Field::new(HISTORY_COL_ENTITY_ID, DataType::Utf8, false),

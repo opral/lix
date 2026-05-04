@@ -97,7 +97,6 @@ impl VisibleFilesystem {
                         id: snapshot.id,
                         directory_id: snapshot.directory_id,
                         name: snapshot.name,
-                        extension: snapshot.extension,
                         hidden: snapshot.hidden,
                         context: filesystem_row_context(&row),
                     };
@@ -147,7 +146,6 @@ pub(crate) struct VisibleFile {
     pub(crate) id: String,
     pub(crate) directory_id: Option<String>,
     pub(crate) name: String,
-    pub(crate) extension: Option<String>,
     pub(crate) hidden: bool,
     pub(crate) context: FilesystemRowContext,
 }
@@ -173,7 +171,6 @@ struct FileDescriptorSnapshot {
     id: String,
     directory_id: Option<String>,
     name: String,
-    extension: Option<String>,
     hidden: bool,
 }
 
@@ -247,7 +244,7 @@ mod tests {
         let filesystem = VisibleFilesystem::load(
             live_state(vec![file_row(
                 "file-readme",
-                r#"{"id":"file-readme","directory_id":"dir-guides","name":"readme","extension":"md","hidden":false}"#,
+                r#"{"id":"file-readme","directory_id":"dir-guides","name":"readme.md","hidden":false}"#,
             )]),
             "version-a",
         )
@@ -261,8 +258,7 @@ mod tests {
         let file = files
             .get("file-readme")
             .expect("file should be indexed by id inside directory");
-        assert_eq!(file.name, "readme");
-        assert_eq!(file.extension.as_deref(), Some("md"));
+        assert_eq!(file.name, "readme.md");
     }
 
     #[tokio::test]

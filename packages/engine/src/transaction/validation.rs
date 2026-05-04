@@ -136,7 +136,6 @@ struct DirectoryDescriptorSnapshot {
 struct FileDescriptorSnapshot {
     directory_id: Option<String>,
     name: String,
-    extension: Option<String>,
 }
 
 async fn validate_directory_descriptor_parent_graph(
@@ -481,7 +480,7 @@ fn file_namespace_occupant(
     Ok(FilesystemNamespaceOccupant::File {
         entity_id: entity_id.clone(),
         directory_id: snapshot.directory_id,
-        entry_name: file_entry_name(&snapshot.name, snapshot.extension.as_deref()),
+        entry_name: snapshot.name,
     })
 }
 
@@ -534,13 +533,6 @@ fn filesystem_namespace_conflict_error(
             conflicting_id
         ),
     )
-}
-
-fn file_entry_name(name: &str, extension: Option<&str>) -> String {
-    match extension {
-        Some(extension) => format!("{name}.{extension}"),
-        None => name.to_string(),
-    }
 }
 
 fn validate_directory_parent_map(
@@ -4645,7 +4637,6 @@ mod tests {
                     "id": file_id,
                     "directory_id": null,
                     "name": file_id,
-                    "extension": null,
                     "hidden": false,
                 })
                 .to_string(),

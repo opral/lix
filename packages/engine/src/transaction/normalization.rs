@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::common::{normalize_path_segment, ParsedFilePath};
+use crate::common::normalize_path_segment;
 use crate::entity_identity::{EntityIdentity, EntityIdentityError};
 use crate::functions::FunctionProviderHandle;
 use crate::schema::{
@@ -201,29 +201,7 @@ fn normalize_file_descriptor_snapshot(
         return Ok(());
     };
     let normalized_name = normalize_path_segment(name)?;
-
-    let normalized_extension = match optional_nullable_string_field(snapshot, "extension", row)? {
-        Some(extension) => {
-            let extension = normalize_path_segment(extension)?;
-            if extension.contains('.') {
-                return Err(LixError::new(
-                    LixError::CODE_SCHEMA_VALIDATION,
-                    "lix_file_descriptor extension must not contain '.' after path canonicalization",
-                ));
-            }
-            Some(extension)
-        }
-        None => None,
-    };
-
-    validate_file_descriptor_tuple(&normalized_name, normalized_extension.as_deref())?;
     snapshot.insert("name".to_string(), JsonValue::String(normalized_name));
-    snapshot.insert(
-        "extension".to_string(),
-        normalized_extension
-            .map(JsonValue::String)
-            .unwrap_or(JsonValue::Null),
-    );
     Ok(())
 }
 
@@ -244,46 +222,6 @@ fn optional_string_field<'a>(
             ),
         )
     })
-}
-
-fn optional_nullable_string_field<'a>(
-    snapshot: &'a JsonMap<String, JsonValue>,
-    field: &str,
-    row: &StageRow,
-) -> Result<Option<&'a str>, LixError> {
-    let Some(value) = snapshot.get(field) else {
-        return Ok(None);
-    };
-    if value.is_null() {
-        return Ok(None);
-    }
-    value.as_str().map(Some).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_SCHEMA_VALIDATION,
-            format!(
-                "snapshot_content for schema '{}' version '{}' field '{}' must be a string or null",
-                row.schema_key, row.schema_version, field
-            ),
-        )
-    })
-}
-
-fn validate_file_descriptor_tuple(name: &str, extension: Option<&str>) -> Result<(), LixError> {
-    let basename = match extension {
-        Some(extension) => format!("{name}.{extension}"),
-        None => name.to_string(),
-    };
-    let parsed = ParsedFilePath::try_from_path(&format!("/{basename}"))?;
-    if parsed.name == name && parsed.extension.as_deref() == extension {
-        return Ok(());
-    }
-    Err(LixError::new(
-        LixError::CODE_SCHEMA_VALIDATION,
-        format!(
-            "lix_file_descriptor name/extension tuple is not canonical for basename {basename:?}"
-        ),
-    )
-    .with_hint("Use the same name and extension split produced by the canonical path parser."))
 }
 
 fn resolve_entity_id(
@@ -736,8 +674,7 @@ mod tests {
                 json!({
                     "id": "file-cafe",
                     "directory_id": null,
-                    "name": "Cafe\u{301}",
-                    "extension": "txt",
+                    "name": "Cafe\u{301}.txt",
                 })
                 .to_string(),
             ),
@@ -747,8 +684,7 @@ mod tests {
         let file = normalize_stage_row(file, &mut catalog, functions()).expect("normalize file");
         let file_snapshot: JsonValue =
             serde_json::from_str(file.snapshot_content.as_deref().unwrap()).unwrap();
-        assert_eq!(file_snapshot["name"], "Café");
-        assert_eq!(file_snapshot["extension"], "txt");
+        assert_eq!(file_snapshot["name"], "Café.txt");
 
         let directory = StageRow {
             entity_id: None,
@@ -787,7 +723,6 @@ mod tests {
                         "id": "file-dotdot",
                         "directory_id": null,
                         "name": "..",
-                        "extension": null,
                     })
                     .to_string(),
                 ),
@@ -809,7 +744,6 @@ mod tests {
                         "id": "file-bidi",
                         "directory_id": null,
                         "name": "safe\u{202E}txt",
-                        "extension": null,
                     })
                     .to_string(),
                 ),
@@ -845,19 +779,18 @@ mod tests {
     }
 
     #[test]
-    fn normalization_rejects_noncanonical_file_descriptor_tuple() {
+    fn normalization_keeps_file_descriptor_name_opaque() {
         let mut catalog = catalog_with(vec![builtin_schema(FILE_DESCRIPTOR_SCHEMA_KEY)]);
 
-        let split_drift = normalize_stage_row(
+        let row = normalize_stage_row(
             StageRow {
                 entity_id: None,
                 schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 snapshot_content: Some(
                     json!({
-                        "id": "file-split-drift",
+                        "id": "file-opaque-name",
                         "directory_id": null,
                         "name": "foo.bar",
-                        "extension": null,
                     })
                     .to_string(),
                 ),
@@ -867,8 +800,11 @@ mod tests {
             &mut catalog,
             functions(),
         )
-        .expect_err("file descriptor tuple should use canonical path parser split");
-        assert_eq!(split_drift.code, LixError::CODE_SCHEMA_VALIDATION);
+        .expect("file descriptor name should be an opaque basename");
+
+        let snapshot: JsonValue =
+            serde_json::from_str(row.snapshot_content.as_deref().unwrap()).unwrap();
+        assert_eq!(snapshot["name"], "foo.bar");
     }
 
     fn catalog_with(schemas: Vec<JsonValue>) -> TransactionSchemaCatalog {

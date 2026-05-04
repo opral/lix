@@ -95,7 +95,7 @@ simulation_test!(
                'engine2_history_contract_schema_history'\
              ) \
                AND (\
-                 column_name IN ('path', 'directory_id', 'parent_id', 'name', 'extension', 'hidden', 'data', 'id', 'count', 'active', 'meta') \
+                 column_name IN ('path', 'directory_id', 'parent_id', 'name', 'hidden', 'data', 'id', 'count', 'active', 'meta') \
                  OR column_name = 'lixcol_snapshot_content'\
                ) \
              ORDER BY table_name, column_name",
@@ -120,7 +120,6 @@ simulation_test!(
             ("lix_directory_history", "path", "YES"),
             ("lix_file_history", "data", "YES"),
             ("lix_file_history", "directory_id", "YES"),
-            ("lix_file_history", "extension", "YES"),
             ("lix_file_history", "hidden", "YES"),
             ("lix_file_history", "id", "NO"),
             ("lix_file_history", "lixcol_snapshot_content", "YES"),
@@ -408,7 +407,7 @@ simulation_test!(
 
         let file_rows = select_rows(
             &session,
-            "SELECT id, path, name, extension, hidden, data, lixcol_entity_id, lixcol_file_id, lixcol_snapshot_content, lixcol_depth \
+            "SELECT id, path, name, hidden, data, lixcol_entity_id, lixcol_file_id, lixcol_snapshot_content, lixcol_depth \
              FROM lix_file_history \
              WHERE lixcol_start_commit_id = lix_active_version_commit_id() \
                AND id = 'history-conformance-file' \
@@ -419,7 +418,6 @@ simulation_test!(
             file_rows,
             vec![vec![
                 Value::Text("history-conformance-file".to_string()),
-                Value::Null,
                 Value::Null,
                 Value::Null,
                 Value::Null,

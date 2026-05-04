@@ -530,14 +530,7 @@ struct HistoryNoticeRule {
 const HISTORY_NOTICE_RULES: &[HistoryNoticeRule] = &[
     HistoryNoticeRule {
         table_name: "lix_file_history",
-        payload_columns: &[
-            "path",
-            "directory_id",
-            "name",
-            "extension",
-            "hidden",
-            "data",
-        ],
+        payload_columns: &["path", "directory_id", "name", "hidden", "data"],
         identity_columns: &["id", "lixcol_entity_id"],
     },
     HistoryNoticeRule {
@@ -1172,7 +1165,6 @@ mod tests {
         version_id: &str,
         directory_id: Option<&str>,
         name: &str,
-        extension: Option<&str>,
         hidden: bool,
     ) -> LiveStateRow {
         LiveStateRow {
@@ -1185,7 +1177,6 @@ mod tests {
                     "id": entity_id,
                     "directory_id": directory_id,
                     "name": name,
-                    "extension": extension,
                     "hidden": hidden
                 })
                 .to_string(),
@@ -2064,8 +2055,8 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_file_by_version (\
-             id, directory_id, name, extension, hidden, lixcol_version_id\
-             ) VALUES ('file-readme', 'dir-docs', 'readme', 'md', false, 'version-b')",
+             id, directory_id, name, hidden, lixcol_version_id\
+             ) VALUES ('file-readme', 'dir-docs', 'readme.md', false, 'version-b')",
             &[],
         )
         .await
@@ -2091,8 +2082,7 @@ mod tests {
                 .expect("descriptor snapshot JSON");
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-docs");
-        assert_eq!(snapshot["name"], "readme");
-        assert_eq!(snapshot["extension"], "md");
+        assert_eq!(snapshot["name"], "readme.md");
         assert_eq!(snapshot["hidden"], false);
     }
 
@@ -2111,8 +2101,8 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "INSERT INTO lix_file (id, directory_id, name, extension, hidden) \
-             VALUES ('file-readme', 'dir-docs', 'readme', 'md', false)",
+            "INSERT INTO lix_file (id, directory_id, name, hidden) \
+             VALUES ('file-readme', 'dir-docs', 'readme.md', false)",
             &[],
         )
         .await
@@ -2150,8 +2140,8 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO lix_file_by_version (\
-             id, directory_id, name, extension, hidden, data, lixcol_version_id\
-             ) VALUES ('file-readme', 'dir-docs', 'readme', 'md', false, X'4142', 'version-b')",
+             id, directory_id, name, hidden, data, lixcol_version_id\
+             ) VALUES ('file-readme', 'dir-docs', 'readme.md', false, X'4142', 'version-b')",
             &[],
         )
         .await
@@ -2193,16 +2183,14 @@ mod tests {
                     "file-readme",
                     "version-a",
                     Some("dir-docs"),
-                    "readme",
-                    Some("md"),
+                    "readme.md",
                     false,
                 ),
                 live_file_row(
                     "file-guide",
                     "version-a",
                     Some("dir-docs"),
-                    "guide",
-                    Some("md"),
+                    "guide.md",
                     false,
                 ),
             ],
@@ -2219,7 +2207,7 @@ mod tests {
         let result = execute_write_sql(
             &mut ctx,
             "UPDATE lix_file \
-             SET name = 'readme-updated', extension = 'txt', hidden = true, lixcol_metadata = '{\"source\":\"file-update\"}' \
+             SET name = 'readme-updated.txt', hidden = true, lixcol_metadata = '{\"source\":\"file-update\"}' \
              WHERE id = 'file-readme'",
             &[],
         )
@@ -2243,8 +2231,7 @@ mod tests {
                 .expect("descriptor snapshot JSON");
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-docs");
-        assert_eq!(snapshot["name"], "readme-updated");
-        assert_eq!(snapshot["extension"], "txt");
+        assert_eq!(snapshot["name"], "readme-updated.txt");
         assert_eq!(snapshot["hidden"], true);
         assert_eq!(
             rows[0].metadata.as_deref(),
@@ -2262,8 +2249,7 @@ mod tests {
                     "file-readme",
                     "version-a",
                     Some("dir-docs"),
-                    "readme",
-                    Some("md"),
+                    "readme.md",
                     false,
                 ),
             ],
@@ -2316,8 +2302,7 @@ mod tests {
                     "file-readme",
                     "version-a",
                     Some("dir-docs"),
-                    "readme",
-                    Some("md"),
+                    "readme.md",
                     false,
                 ),
             ],
@@ -2353,8 +2338,7 @@ mod tests {
             serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap())
                 .expect("descriptor snapshot JSON");
         assert_eq!(snapshot["directory_id"], "dir-docs");
-        assert_eq!(snapshot["name"], "renamed");
-        assert_eq!(snapshot["extension"], "md");
+        assert_eq!(snapshot["name"], "renamed.md");
     }
 
     #[tokio::test]
@@ -2368,16 +2352,14 @@ mod tests {
                     "file-readme",
                     "version-a",
                     Some("dir-docs"),
-                    "readme",
-                    Some("md"),
+                    "readme.md",
                     false,
                 ),
                 live_file_row(
                     "file-guide",
                     "version-b",
                     Some("dir-docs"),
-                    "guide",
-                    Some("md"),
+                    "guide.md",
                     false,
                 ),
             ],
@@ -3064,7 +3046,7 @@ mod tests {
 
                 let result = execute_sql(
                     &ctx,
-                    "SELECT path, name, extension, data, lixcol_version_id \
+                    "SELECT path, name, data, lixcol_version_id \
                      FROM lix_file_by_version \
                      WHERE id = 'file-a' AND lixcol_version_id = 'version-a'",
                     &[],
@@ -3074,17 +3056,16 @@ mod tests {
 
                 assert_eq!(
                     result.columns,
-                    vec!["path", "name", "extension", "data", "lixcol_version_id"]
+                    vec!["path", "name", "data", "lixcol_version_id"]
                 );
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(
                     result.rows[0][0],
                     Value::Text("/docs/readme.md".to_string())
                 );
-                assert_eq!(result.rows[0][1], Value::Text("readme".to_string()));
-                assert_eq!(result.rows[0][2], Value::Text("md".to_string()));
-                assert_eq!(result.rows[0][3], Value::Blob(vec![0x41, 0x42]));
-                assert_eq!(result.rows[0][4], Value::Text("version-a".to_string()));
+                assert_eq!(result.rows[0][1], Value::Text("readme.md".to_string()));
+                assert_eq!(result.rows[0][2], Value::Blob(vec![0x41, 0x42]));
+                assert_eq!(result.rows[0][3], Value::Text("version-a".to_string()));
             })
         });
     }
@@ -3111,7 +3092,7 @@ mod tests {
 
                 let result = execute_sql(
                     &ctx,
-                    "SELECT path, name, extension, data \
+                    "SELECT path, name, data \
                      FROM lix_file \
                      WHERE id = 'file-a'",
                     &[],
@@ -3119,15 +3100,14 @@ mod tests {
                 .await
                 .expect("sql2 execute should read lix_file");
 
-                assert_eq!(result.columns, vec!["path", "name", "extension", "data"]);
+                assert_eq!(result.columns, vec!["path", "name", "data"]);
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(
                     result.rows[0][0],
                     Value::Text("/docs/readme.md".to_string())
                 );
-                assert_eq!(result.rows[0][1], Value::Text("readme".to_string()));
-                assert_eq!(result.rows[0][2], Value::Text("md".to_string()));
-                assert_eq!(result.rows[0][3], Value::Blob(vec![0x41, 0x42]));
+                assert_eq!(result.rows[0][1], Value::Text("readme.md".to_string()));
+                assert_eq!(result.rows[0][2], Value::Blob(vec![0x41, 0x42]));
             })
         });
     }
