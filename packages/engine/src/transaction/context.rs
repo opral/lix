@@ -67,25 +67,43 @@ impl Transaction {
         schema_registry: Arc<SchemaRegistry>,
     ) -> Result<OpenTransaction, LixError> {
         let mut storage_transaction = storage.begin_write_transaction().await?;
-        let active_version_id = resolve_active_version_id(
-            mode,
-            live_state.as_ref(),
-            version_ctx.as_ref(),
-            storage_transaction.as_mut(),
-        )
-        .await?;
-        let runtime_functions = {
-            let runtime_live_state = live_state.reader(storage_transaction.as_mut());
-            FunctionContext::prepare(&runtime_live_state).await?
-        };
-        let functions = runtime_functions.provider();
-        let visible_schemas = {
-            let visible_live_state = live_state.reader(storage_transaction.as_mut());
-            schema_registry
-                .visible_schemas(&visible_live_state, &active_version_id)
-                .await?
-        };
-        let schema_catalog = TransactionSchemaCatalog::from_visible_schemas(&visible_schemas)?;
+        let setup_result = async {
+            let active_version_id = resolve_active_version_id(
+                mode,
+                live_state.as_ref(),
+                version_ctx.as_ref(),
+                storage_transaction.as_mut(),
+            )
+            .await?;
+            let runtime_functions = {
+                let runtime_live_state = live_state.reader(storage_transaction.as_mut());
+                FunctionContext::prepare(&runtime_live_state).await?
+            };
+            let functions = runtime_functions.provider();
+            let visible_schemas = {
+                let visible_live_state = live_state.reader(storage_transaction.as_mut());
+                schema_registry
+                    .visible_schemas(&visible_live_state, &active_version_id)
+                    .await?
+            };
+            let schema_catalog = TransactionSchemaCatalog::from_visible_schemas(&visible_schemas)?;
+            Ok::<_, LixError>((
+                active_version_id,
+                runtime_functions,
+                functions,
+                visible_schemas,
+                schema_catalog,
+            ))
+        }
+        .await;
+        let (active_version_id, runtime_functions, functions, visible_schemas, schema_catalog) =
+            match setup_result {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = storage_transaction.rollback().await;
+                    return Err(error);
+                }
+            };
         let staged_writes = Arc::new(TransactionStagedWrites::new(
             functions.clone(),
             schema_catalog,
