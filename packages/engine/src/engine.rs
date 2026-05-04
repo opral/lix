@@ -172,15 +172,24 @@ impl Engine {
         let storage = self.storage();
         let mut read_transaction = storage.begin_read_transaction().await?;
         let mut transaction = storage.begin_write_transaction().await?;
-        self.tracked_state
+        let rebuild_result = self
+            .tracked_state
             .rebuild_state_at_commit(
                 &commit_graph,
                 read_transaction.as_mut(),
                 transaction.as_mut(),
                 &head_commit_id,
             )
-            .await?;
-        read_transaction.rollback().await?;
+            .await;
+        if let Err(error) = rebuild_result {
+            let _ = read_transaction.rollback().await;
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
+        if let Err(error) = read_transaction.rollback().await {
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
         transaction.commit().await
     }
 }
