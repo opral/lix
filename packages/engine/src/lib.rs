@@ -33,10 +33,11 @@ pub use schema::{
 };
 
 pub use backend::{
-    Backend, BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetGroup, BackendKvGetProjection,
-    BackendKvGetRequest, BackendKvPut, BackendKvRowBatch, BackendKvScanBatch,
-    BackendKvScanProjection, BackendKvScanRange, BackendKvScanRequest, BackendKvWriteBatch,
-    BackendKvWriteGroup, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
+    Backend, BackendKvEntry, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup,
+    BackendKvGetGroup, BackendKvGetRequest, BackendKvKeyPage, BackendKvPut, BackendKvScanRange,
+    BackendKvScanRequest, BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage,
+    BackendKvWriteBatch, BackendKvWriteGroup, BackendKvWriteStats, BackendReadTransaction,
+    BackendWriteTransaction,
 };
 pub use common::LixError;
 pub(crate) use common::{

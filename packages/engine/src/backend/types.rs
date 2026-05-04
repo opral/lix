@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 
 use crate::backend::{
-    BackendKvGetBatch, BackendKvGetRequest, BackendKvScanBatch, BackendKvScanRequest,
-    BackendKvWriteBatch, BackendKvWriteStats,
+    BackendKvEntryPage, BackendKvExistsBatch, BackendKvGetRequest, BackendKvKeyPage,
+    BackendKvScanRequest, BackendKvValueBatch, BackendKvValuePage, BackendKvWriteBatch,
+    BackendKvWriteStats,
 };
 use crate::LixError;
 
@@ -56,15 +57,30 @@ pub trait Backend: Send + Sync {
 
 #[async_trait]
 pub trait BackendReadTransaction: Send + Sync {
-    async fn get_kv_many(
+    async fn get_values(
         &mut self,
         request: BackendKvGetRequest,
-    ) -> Result<BackendKvGetBatch, LixError>;
+    ) -> Result<BackendKvValueBatch, LixError>;
 
-    async fn scan_kv(
+    async fn exists_many(
+        &mut self,
+        request: BackendKvGetRequest,
+    ) -> Result<BackendKvExistsBatch, LixError>;
+
+    async fn scan_keys(
         &mut self,
         request: BackendKvScanRequest,
-    ) -> Result<BackendKvScanBatch, LixError>;
+    ) -> Result<BackendKvKeyPage, LixError>;
+
+    async fn scan_values(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvValuePage, LixError>;
+
+    async fn scan_entries(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvEntryPage, LixError>;
 
     async fn rollback(self: Box<Self>) -> Result<(), LixError>;
 }

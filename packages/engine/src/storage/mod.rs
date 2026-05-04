@@ -5,7 +5,8 @@ mod types;
 pub(crate) use context::StorageContext;
 pub(crate) use read_scope::{ScopedStorageReader, StorageReadScope};
 pub(crate) use types::{
-    KvGetBatch, KvGetBatchGroup, KvGetGroup, KvGetProjection, KvGetRequest, KvPut, KvRowBatch,
-    KvScanBatch, KvScanProjection, KvScanRange, KvScanRequest, KvWriteBatch, KvWriteGroup,
-    KvWriteStats, StorageReadTransaction, StorageReader, StorageWriteTransaction, StorageWriter,
+    KvEntry, KvEntryPage, KvExistsBatch, KvExistsGroup, KvGetGroup, KvGetRequest, KvKeyPage, KvPut,
+    KvScanRange, KvScanRequest, KvValueBatch, KvValueGroup, KvValuePage, KvWriteBatch,
+    KvWriteGroup, KvWriteStats, StorageReadTransaction, StorageReader, StorageWriteTransaction,
+    StorageWriter,
 };
