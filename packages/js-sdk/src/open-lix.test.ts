@@ -125,6 +125,15 @@ test("openLix accepts an explicit backend", async () => {
 	await second.close();
 });
 
+test("execute supports UNION ALL without trapping wasm", async () => {
+	const lix = await openLix();
+
+	const result = await lix.execute("SELECT 1 UNION ALL SELECT 2");
+
+	expect(result.rows.map((row) => row.get("Int64(1)"))).toEqual([1, 2]);
+	await lix.close();
+});
+
 test("createVersion can start from an explicit commit id", async () => {
 	const lix = await openLix();
 

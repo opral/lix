@@ -1,8 +1,13 @@
 use datafusion::arrow::datatypes::Field;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
+use datafusion::dataframe::DataFrame;
 use datafusion::logical_expr::{Expr, LogicalPlan};
+#[cfg(target_arch = "wasm32")]
+use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::prelude::{SessionConfig, SessionContext};
+#[cfg(target_arch = "wasm32")]
+use futures_util::TryStreamExt;
 use serde_json::{json, Value as JsonValue};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -142,13 +147,33 @@ pub(crate) async fn execute_logical_plan(
         .iter()
         .map(|field| field.as_ref().clone())
         .collect::<Vec<_>>();
-    let batches = dataframe
-        .collect()
+    let batches = collect_dataframe(dataframe)
         .await
         .map_err(datafusion_error_to_lix_error)?;
     let mut result = query_result_from_batches(&result_fields, &batches)?;
     result.notices = notices;
     Ok(result)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn collect_dataframe(dataframe: DataFrame) -> datafusion::error::Result<Vec<RecordBatch>> {
+    dataframe.collect().await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn collect_dataframe(dataframe: DataFrame) -> datafusion::error::Result<Vec<RecordBatch>> {
+    let task_ctx = Arc::new(dataframe.task_ctx());
+    let plan = dataframe.create_physical_plan().await?;
+    let partition_count = plan.output_partitioning().partition_count();
+    let mut batches = Vec::new();
+    for partition in 0..partition_count {
+        let partition_batches = plan
+            .execute(partition, Arc::clone(&task_ctx))?
+            .try_collect::<Vec<_>>()
+            .await?;
+        batches.extend(partition_batches);
+    }
+    Ok(batches)
 }
 
 fn validate_parameter_count(plan: &LogicalPlan, param_count: usize) -> Result<(), LixError> {
@@ -1210,6 +1235,26 @@ mod tests {
             .await
             .expect("sql2 execute should support literal-only queries");
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_collects_union_all_partitions() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            schema_definitions: vec![],
+        };
+
+        let result = execute_sql(&ctx, "SELECT 1 UNION ALL SELECT 2", &[])
+            .await
+            .expect("sql2 execute should collect UNION ALL partitions");
+        assert_eq!(
+            result.rows,
+            vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+        );
     }
 
     #[tokio::test]
