@@ -1,6 +1,7 @@
 use cel::Program;
 use jsonschema::{Draft, JSONSchema};
 use serde_json::Value as JsonValue;
+use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use crate::LixError;
@@ -42,8 +43,69 @@ pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError
     assert_unique_pointers(schema)?;
     assert_non_aliased_lix_foreign_key_references(schema)?;
     assert_known_x_lix_top_level_fields(schema)?;
+    assert_entity_properties_have_projectable_types(schema)?;
 
     Ok(())
+}
+
+fn assert_entity_properties_have_projectable_types(schema: &JsonValue) -> Result<(), LixError> {
+    let Some(schema_key) = schema.get("x-lix-key").and_then(JsonValue::as_str) else {
+        return Ok(());
+    };
+    let Some(properties) = schema.get("properties").and_then(JsonValue::as_object) else {
+        return Ok(());
+    };
+
+    for (property_name, property_schema) in properties {
+        if property_name.starts_with("lixcol_") {
+            continue;
+        }
+        if !schema_property_has_sql_projection_type(property_schema) {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                format!(
+                    "Invalid Lix schema definition: schema '{schema_key}' property '/{property_name}' must declare a SQL-projectable JSON Schema type"
+                ),
+            )
+            .with_hint("Use an explicit type such as string, number, integer, boolean, object, array, or a supported union of those types."));
+        }
+    }
+
+    Ok(())
+}
+
+fn schema_property_has_sql_projection_type(schema: &JsonValue) -> bool {
+    let mut kinds = BTreeSet::new();
+    collect_schema_type_kinds(schema, &mut kinds);
+    kinds.remove("null");
+    kinds.iter().any(|kind| {
+        matches!(
+            *kind,
+            "boolean" | "integer" | "number" | "string" | "object" | "array"
+        )
+    })
+}
+
+fn collect_schema_type_kinds<'a>(schema: &'a JsonValue, out: &mut BTreeSet<&'a str>) {
+    match schema.get("type") {
+        Some(JsonValue::String(kind)) => {
+            out.insert(kind.as_str());
+        }
+        Some(JsonValue::Array(kinds)) => {
+            for kind in kinds.iter().filter_map(JsonValue::as_str) {
+                out.insert(kind);
+            }
+        }
+        _ => {}
+    }
+
+    for keyword in ["anyOf", "oneOf", "allOf"] {
+        if let Some(JsonValue::Array(branches)) = schema.get(keyword) {
+            for branch in branches {
+                collect_schema_type_kinds(branch, out);
+            }
+        }
+    }
 }
 
 /// Detect the common no-leading-slash mistake in JSON-Pointer-valued fields

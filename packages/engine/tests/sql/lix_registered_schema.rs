@@ -280,6 +280,45 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_registered_schema_insert_rejects_unprojectable_entity_property,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine2_empty_property_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"kind\":{}},\"required\":[\"id\",\"kind\"],\"additionalProperties\":false}'),\
+                 true,\
+                 true\
+                 )",
+                &[],
+            )
+            .await
+            .expect_err("registered schema insert should reject properties without a SQL projection type");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            error.message.contains("property '/kind'"),
+            "message should identify the unprojectable property: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("SQL-projectable JSON Schema type"),
+            "message should explain the projection requirement: {}",
+            error.message
+        );
+    }
+);
+
+simulation_test!(
     entity_by_version_insert_rejects_target_version_without_schema,
     |sim| async move {
         let engine = sim.boot_engine().await;

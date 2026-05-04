@@ -17,6 +17,31 @@ fn validate_lix_schema_definition_passes_for_valid_schema() {
 }
 
 #[test]
+fn validate_lix_schema_definition_rejects_unprojectable_entity_properties() {
+    let schema = json!({
+        "x-lix-key": "test_entity",
+        "x-lix-version": "1",
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "kind": {}
+        },
+        "required": ["id", "kind"],
+        "additionalProperties": false
+    });
+
+    let err = validate_lix_schema_definition(&schema).unwrap_err();
+    assert!(
+        err.to_string().contains("property '/kind'"),
+        "error should identify the unprojectable property: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("SQL-projectable JSON Schema type"),
+        "error should explain the projection requirement: {err:?}"
+    );
+}
+
+#[test]
 fn validate_lix_schema_definition_throws_for_invalid_schema() {
     let invalid_schema = json!({
         "x-lix-version": "1",
