@@ -140,10 +140,9 @@ pub(crate) fn bench(c: &mut Criterion, runtime: &Runtime, args: Args) {
             BatchSize::LargeInput,
         )
     });
-    for (label, bytes, rows, row_label) in [
-        ("1k", 1024, 10_000, "10k"),
-        ("16k", 16 * 1024, 1_000, "1k"),
-    ] {
+    for (label, bytes, rows, row_label) in
+        [("1k", 1024, 10_000, "10k"), ("16k", 16 * 1024, 1_000, "1k")]
+    {
         let config = config(&args)
             .with_state_payload_bytes(bytes)
             .with_rows(rows);
@@ -543,9 +542,7 @@ fn prepare_read_with(
 ) {
     let backend = BenchBackend::new();
     let fixture = runtime
-        .block_on(storage_bench::prepare_changelog_read(
-            &backend, config,
-        ))
+        .block_on(storage_bench::prepare_changelog_read(&backend, config))
         .expect("prepare changelog/read variant");
     (backend, fixture)
 }
