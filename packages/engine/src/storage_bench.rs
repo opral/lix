@@ -1877,7 +1877,10 @@ pub async fn changelog_scan_change_ids_only_prepared(
     let changes = reader
         .scan_changes(&ChangelogScanRequest::default())
         .await?;
-    let verified_rows = changes.iter().filter(|change| !change.id.is_empty()).count();
+    let verified_rows = changes
+        .iter()
+        .filter(|change| !change.id.is_empty())
+        .count();
     Ok(report(fixture.rows, verified_rows, Duration::ZERO))
 }
 

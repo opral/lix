@@ -442,3 +442,85 @@ simulation_test!(
         assert_rows_eq(result, vec![vec![Value::Real(52000.0)]]);
     }
 );
+
+simulation_test!(
+    typed_entity_update_preserves_absent_optional_non_nullable_fields,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine2_optional_update_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"rank\":{\"type\":\"integer\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'),\
+                 true,\
+                 true\
+                 )",
+                &[],
+            )
+            .await
+            .expect("registered schema insert should succeed");
+
+        session
+            .execute(
+                "INSERT INTO engine2_optional_update_schema \
+                 (id, title, lixcol_global, lixcol_untracked) \
+                 VALUES ('row-1', 'before', false, false)",
+                &[],
+            )
+            .await
+            .expect("insert should omit the optional rank field");
+
+        session
+            .execute(
+                "UPDATE engine2_optional_update_schema \
+                 SET title = 'after' \
+                 WHERE id = 'row-1'",
+                &[],
+            )
+            .await
+            .expect("update should preserve absent optional fields");
+
+        let result = session
+            .execute(
+                "SELECT title, rank, lixcol_snapshot_content \
+                 FROM engine2_optional_update_schema \
+                 WHERE id = 'row-1'",
+                &[],
+            )
+            .await
+            .expect("typed entity query should succeed");
+        assert_rows_eq(
+            result,
+            vec![vec![
+                Value::Text("after".to_string()),
+                Value::Null,
+                Value::Json(json!({"id": "row-1", "title": "after"})),
+            ]],
+        );
+
+        let error = session
+            .execute(
+                "UPDATE engine2_optional_update_schema \
+                 SET rank = NULL \
+                 WHERE id = 'row-1'",
+                &[],
+            )
+            .await
+            .expect_err("explicit NULL should still be validated as JSON null");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        assert!(
+            error
+                .message
+                .contains("/rank null is not of type \"integer\""),
+            "expected rank validation error, got {error:?}"
+        );
+    }
+);

@@ -955,7 +955,7 @@ fn update_string_value(
     column_name: &str,
 ) -> Result<String> {
     let column_index = table_schema.index_of(column_name)?;
-    match assignment_values.effective_cell(batch, row_index, column_name)? {
+    match assignment_values.assigned_or_existing_cell(batch, row_index, column_name)? {
         InsertCell::Omitted => required_string_value(batch, row_index, column_name, "UPDATE"),
         InsertCell::Provided(SqlCell::Value(
             ScalarValue::Utf8(Some(value))
@@ -988,7 +988,7 @@ fn update_bool_value(
     column_name: &str,
 ) -> Result<bool> {
     let column_index = table_schema.index_of(column_name)?;
-    match assignment_values.effective_cell(batch, row_index, column_name)? {
+    match assignment_values.assigned_or_existing_cell(batch, row_index, column_name)? {
         InsertCell::Omitted => required_bool_value(batch, row_index, column_name, "UPDATE"),
         InsertCell::Provided(SqlCell::Value(ScalarValue::Boolean(Some(value)))) => Ok(value),
         InsertCell::Provided(SqlCell::Null) => Err(DataFusionError::Execution(format!(
