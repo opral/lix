@@ -2,28 +2,30 @@
 //!
 //! Contract:
 //!
-//! - Canonical internal form is an RFC 3987 `ipath-absolute` IRI path.
-//! - The engine stores an internal IRI, not a WHATWG URL.
-//! - ASCII-only URI spelling is a boundary serialization, not the internal form.
-//! - Unicode is normalized with UAX #15 NFC.
-//! - Canonicalization uses RFC 3986-compatible percent-encoding normalization.
+//! - Canonical internal form is an absolute slash-separated Lix filesystem
+//!   path, structurally aligned with RFC 3986 `path-absolute` / RFC 8089 file
+//!   URI paths.
+//! - RFC 3986/8089 URI spelling is a boundary serialization, not the internal
+//!   identity form.
+//! - Each non-empty segment is enforced with an RFC 8264 PRECIS
+//!   `IdentifierClass` profile, case-preserved and NFC-normalized.
+//! - Percent encoding is accepted only as boundary input. Canonical internal
+//!   paths store decoded Unicode segments, never percent triplets.
 //! - Dot segments are rejected rather than rewritten because Lix paths are
 //!   stable logical identities, not URI references being resolved against a
 //!   base path.
 //!
 //! Canonicalization order:
 //!
-//! 1. Normalize raw input to NFC.
-//! 2. Validate the normalized form, percent-encoding structure, and decoded
-//!    percent-encoded byte stream for forbidden code points.
-//! 3. Apply percent-encoding normalization.
-//! 4. Reject dot segments.
+//! 1. Validate and decode RFC 3986 percent triplets in each segment.
+//! 2. Normalize decoded segment text to NFC.
+//! 3. Apply PRECIS IdentifierClass enforcement.
+//! 4. Reject Lix structural sentinels and separators.
 //!
-//! Fixed RFC-derived rules:
+//! Fixed standard-derived rules:
 //!
-//! - Percent triplets use uppercase hex digits per RFC 3986 §6.2.2.1.
-//! - Percent-encoded unreserved characters are decoded to raw form per
-//!   RFC 3986 §6.2.2.2.
+//! - Path shape follows the absolute-path grammar used by RFC 3986/RFC 8089.
+//! - Segment text follows RFC 8264 PRECIS IdentifierClass semantics.
 //! - Comparison is exact-string and case-sensitive after canonicalization.
 //!
 //! Lix profile rules:
@@ -31,6 +33,11 @@
 //! - File paths never end with `/`.
 //! - Directory paths always end with `/`.
 //! - `NUL` is rejected in all segments.
+//! - `/`, `\`, empty segments, `.`, and `..` are rejected in all non-root
+//!   segments.
+//! - `%`, `?`, and `#` are reserved for URI boundary syntax and are rejected
+//!   in canonical internal segments.
+//! - Segments cannot begin with a combining mark.
 //! - Root is represented as the normalized directory path `/`.
 //! - Git/CLI import and ASCII-only URI serialization are boundary adapters,
 //!   not part of the core `fs_path` contract.
@@ -41,8 +48,10 @@
 //!
 //! Runtime strategy:
 //!
-//! - This module keeps a small engine-local validator/normalizer at runtime.
-//! - `iref` is the RFC 3987 / RFC 3986 oracle in tests, not the runtime parser.
+//! - This module keeps Lix structural checks local and delegates Unicode
+//!   segment validity to the PRECIS implementation.
+//! - `iref` is an RFC 3987 / RFC 3986 shape oracle in tests, not the runtime
+//!   segment authority.
 //!
 //! Glossary:
 //!
@@ -51,14 +60,14 @@
 //! - Canonical path: stored path after full normalization/canonicalization.
 //! - File path: canonical path naming a file, without a trailing slash.
 //! - Directory path: canonical path naming a directory, with a trailing slash.
-//! - Internal IRI form: the canonical Unicode-bearing representation used by
+//! - Internal path form: the canonical Unicode-bearing representation used by
 //!   the engine.
 //! - Boundary URI form: an ASCII-only serialization used when interoperating
 //!   with URI-only systems.
-//!
-//! This module is being aligned to this contract in Plan 119.
 
-use unicode_normalization::UnicodeNormalization;
+use precis_profiles::precis_core::profile::Profile;
+use precis_profiles::UsernameCasePreserved;
+use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 use crate::LixError;
 use std::fmt;
@@ -147,7 +156,7 @@ enum PathError {
     SlashInSegment,
     Backslash,
     InvalidPercentEncoding,
-    InvalidIriCodePoint,
+    InvalidPathSegmentCodePoint,
     NulByte,
     InvalidRootUsage,
     #[cfg(test)]
@@ -195,12 +204,12 @@ impl PathError {
             Self::InvalidPercentEncoding => (
                 "LIX_ERROR_PATH_INVALID_PERCENT_ENCODING",
                 "path contains invalid percent encoding",
-                Some("use percent triplets like %20 and escape '%' as %25"),
+                Some("use valid percent triplets only for URI boundary input; '%' is not allowed in canonical path segments"),
             ),
-            Self::InvalidIriCodePoint => (
-                "LIX_ERROR_PATH_INVALID_IRI_CODE_POINT",
-                "path contains a raw character that is not allowed in canonical Lix paths",
-                Some("canonical paths allow Unicode, but raw spaces, '?' and '#' must be percent-encoded at boundaries"),
+            Self::InvalidPathSegmentCodePoint => (
+                "LIX_ERROR_PATH_INVALID_SEGMENT_CODE_POINT",
+                "path segment contains a character that is not allowed in canonical Lix paths",
+                Some("canonical paths use RFC 8264 PRECIS IdentifierClass segments; use URI percent encoding only at boundaries"),
             ),
             Self::NulByte => (
                 "LIX_ERROR_PATH_NUL_BYTE",
@@ -257,109 +266,25 @@ fn validate_path_segment_chars(normalized: &str) -> PathResult<()> {
     if !segment_has_valid_percent_encoding(&normalized) {
         return Err(PathError::InvalidPercentEncoding);
     }
-    validate_percent_decoded_segment_chars(normalized)?;
-    if normalized
-        .chars()
-        .any(|ch| is_disallowed_bidi_formatting_char(ch) || is_disallowed_zero_width_char(ch))
-    {
-        return Err(PathError::InvalidIriCodePoint);
-    }
-    if !normalized.chars().all(is_allowed_segment_char) {
-        return Err(PathError::InvalidIriCodePoint);
-    }
+    let decoded = decode_percent_encoded_segment(normalized)?;
+    validate_decoded_path_segment_chars(&decoded)?;
     Ok(())
 }
 
 fn normalize_validated_path_segment(normalized: &str) -> PathResult<String> {
     validate_path_segment_chars(normalized)?;
-    Ok(canonicalize_percent_encoding(normalized))
+    let decoded = decode_percent_encoded_segment(normalized)?;
+    enforce_precis_segment(&decoded)
 }
 
-fn is_allowed_segment_char(ch: char) -> bool {
-    is_pchar_ascii(ch) || is_iunreserved_ucschar(ch)
-}
-
-fn is_unreserved(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.' | '_' | '~')
-}
-
-fn is_sub_delim(ch: char) -> bool {
-    matches!(
-        ch,
-        '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '='
-    )
-}
-
-fn is_pchar_ascii(ch: char) -> bool {
-    is_unreserved(ch) || is_sub_delim(ch) || matches!(ch, ':' | '@' | '%')
-}
-
-fn is_iunreserved_ucschar(ch: char) -> bool {
-    let cp = ch as u32;
-    matches!(
-        cp,
-        0x00A0..=0xD7FF
-            | 0xF900..=0xFDCF
-            | 0xFDF0..=0xFFEF
-            | 0x10000..=0x1FFFD
-            | 0x20000..=0x2FFFD
-            | 0x30000..=0x3FFFD
-            | 0x40000..=0x4FFFD
-            | 0x50000..=0x5FFFD
-            | 0x60000..=0x6FFFD
-            | 0x70000..=0x7FFFD
-            | 0x80000..=0x8FFFD
-            | 0x90000..=0x9FFFD
-            | 0xA0000..=0xAFFFD
-            | 0xB0000..=0xBFFFD
-            | 0xC0000..=0xCFFFD
-            | 0xD0000..=0xDFFFD
-            | 0xE1000..=0xEFFFD
-    )
-}
-
-fn is_disallowed_bidi_formatting_char(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{061C}'
-            | '\u{200E}'
-            | '\u{200F}'
-            | '\u{202A}'
-            | '\u{202B}'
-            | '\u{202C}'
-            | '\u{202D}'
-            | '\u{202E}'
-            | '\u{2066}'
-            | '\u{2067}'
-            | '\u{2068}'
-            | '\u{2069}'
-    )
-}
-
-fn is_disallowed_zero_width_char(ch: char) -> bool {
-    matches!(ch, '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}')
-}
-
-fn canonicalize_percent_encoding(segment: &str) -> String {
+fn decode_percent_encoded_segment(segment: &str) -> PathResult<String> {
     let bytes = segment.as_bytes();
-    let mut normalized = String::with_capacity(segment.len());
+    let mut decoded = Vec::with_capacity(segment.len());
     let mut index = 0usize;
 
     while index < bytes.len() {
         if bytes[index] == b'%' {
-            let hi = bytes[index + 1];
-            let lo = bytes[index + 2];
-            let decoded = (hex_value(hi) << 4) | hex_value(lo);
-            let decoded_char = decoded as char;
-
-            if is_unreserved(decoded_char) {
-                normalized.push(decoded_char);
-            } else {
-                normalized.push('%');
-                normalized.push(upper_hex_digit(hi));
-                normalized.push(upper_hex_digit(lo));
-            }
-
+            decoded.push((hex_value(bytes[index + 1]) << 4) | hex_value(bytes[index + 2]));
             index += 3;
             continue;
         }
@@ -368,11 +293,12 @@ fn canonicalize_percent_encoding(segment: &str) -> String {
             .chars()
             .next()
             .expect("slice at char boundary should yield a char");
-        normalized.push(ch);
+        let mut utf8 = [0u8; 4];
+        decoded.extend_from_slice(ch.encode_utf8(&mut utf8).as_bytes());
         index += ch.len_utf8();
     }
 
-    normalized
+    String::from_utf8(decoded).map_err(|_| PathError::InvalidPathSegmentCodePoint)
 }
 
 fn hex_value(byte: u8) -> u8 {
@@ -382,10 +308,6 @@ fn hex_value(byte: u8) -> u8 {
         b'A'..=b'F' => 10 + (byte - b'A'),
         _ => unreachable!("hex_value only called after percent validation"),
     }
-}
-
-fn upper_hex_digit(byte: u8) -> char {
-    (byte as char).to_ascii_uppercase()
 }
 
 fn segment_has_valid_percent_encoding(segment: &str) -> bool {
@@ -409,43 +331,31 @@ fn segment_has_valid_percent_encoding(segment: &str) -> bool {
     true
 }
 
-fn validate_percent_decoded_segment_chars(segment: &str) -> PathResult<()> {
-    let mut decoded = Vec::with_capacity(segment.len());
-    let bytes = segment.as_bytes();
-    let mut index = 0usize;
-
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            decoded.push((hex_value(bytes[index + 1]) << 4) | hex_value(bytes[index + 2]));
-            index += 3;
-            continue;
-        }
-
-        let ch = segment[index..]
-            .chars()
-            .next()
-            .expect("slice at char boundary should yield a char");
-        let mut utf8 = [0u8; 4];
-        decoded.extend_from_slice(ch.encode_utf8(&mut utf8).as_bytes());
-        index += ch.len_utf8();
-    }
-
-    if decoded.contains(&0) {
+fn validate_decoded_path_segment_chars(segment: &str) -> PathResult<()> {
+    if segment.contains('\0') {
         return Err(PathError::NulByte);
     }
-
-    let decoded = std::str::from_utf8(&decoded).map_err(|_| PathError::InvalidIriCodePoint)?;
-    for ch in decoded.chars() {
-        if ch.is_control()
-            || is_disallowed_bidi_formatting_char(ch)
-            || is_disallowed_zero_width_char(ch)
-            || (!ch.is_ascii() && !is_iunreserved_ucschar(ch))
-        {
-            return Err(PathError::InvalidIriCodePoint);
-        }
+    if segment.contains('/') {
+        return Err(PathError::SlashInSegment);
     }
-
+    if segment.contains('\\') {
+        return Err(PathError::Backslash);
+    }
+    if segment.contains('%') || segment.contains('?') || segment.contains('#') {
+        return Err(PathError::InvalidPathSegmentCodePoint);
+    }
+    if segment.chars().next().is_some_and(is_combining_mark) {
+        return Err(PathError::InvalidPathSegmentCodePoint);
+    }
+    enforce_precis_segment(segment)?;
     Ok(())
+}
+
+fn enforce_precis_segment(segment: &str) -> PathResult<String> {
+    UsernameCasePreserved::new()
+        .enforce(segment)
+        .map(|segment| segment.into_owned())
+        .map_err(|_| PathError::InvalidPathSegmentCodePoint)
 }
 
 fn normalize_file_path_impl(path: &str) -> PathResult<String> {
@@ -716,10 +626,6 @@ mod tests {
             input: "/unicodé/段落.md",
         },
         RfcFixture {
-            label: "absolute path with pct-encoded space",
-            input: "/docs/%20notes.md",
-        },
-        RfcFixture {
             label: "path with pchar punctuation",
             input: "/docs/hello:world@x!$&'()*+,;=.md",
         },
@@ -809,11 +715,18 @@ mod tests {
             expected: Err(PathError::InvalidRootUsage),
         },
         LixProfileFixture {
+            label: "percent-encoded spaces are valid URI syntax but not Lix segment identity",
+            kind: LixFixtureKind::File,
+            input: "/docs/%20notes.md",
+            oracle_accepts: true,
+            expected: Err(PathError::InvalidPathSegmentCodePoint),
+        },
+        LixProfileFixture {
             label: "bidi formatting is rejected by the Lix validator even though iref accepts it",
             kind: LixFixtureKind::File,
             input: "/docs/\u{202E}.md",
             oracle_accepts: true,
-            expected: Err(PathError::InvalidIriCodePoint),
+            expected: Err(PathError::InvalidPathSegmentCodePoint),
         },
         LixProfileFixture {
             label: "dot segments are valid RFC syntax but banned by the Lix profile",
@@ -832,10 +745,10 @@ mod tests {
             expected: "/Café.md",
         },
         NormalizationFixture {
-            label: "percent triplets are uppercased when preserved",
+            label: "percent-encoded segment text is decoded before storage",
             kind: NormalizationKind::Directory,
-            input: "/docs/%2fkept/",
-            expected: "/docs/%2Fkept/",
+            input: "/docs/%43afe%CC%81/",
+            expected: "/docs/Café/",
         },
         NormalizationFixture {
             label: "unreserved percent encoding is decoded",
@@ -927,7 +840,6 @@ mod tests {
             "/a/b/c.txt",
             "/dash--path",
             "/unicodé/段落.md",
-            "/docs/%20notes.md",
             "/docs/hello:world@x!$&'()*+,;=.md",
         ] {
             assert!(
@@ -971,7 +883,7 @@ mod tests {
         for path in ["/docs/file?.md", "/docs/#hash", "/docs/file name.md"] {
             assert_path_error(
                 normalize_file_path_impl(path),
-                PathError::InvalidIriCodePoint,
+                PathError::InvalidPathSegmentCodePoint,
             );
         }
     }
@@ -981,7 +893,7 @@ mod tests {
         for path in ["/docs/\u{E000}.md", "/docs/\u{FDD0}.md"] {
             assert_path_error(
                 normalize_file_path_impl(path),
-                PathError::InvalidIriCodePoint,
+                PathError::InvalidPathSegmentCodePoint,
             );
         }
     }
@@ -991,14 +903,51 @@ mod tests {
         for path in ["/docs/\u{200E}.md", "/docs/\u{202E}.md"] {
             assert_path_error(
                 normalize_file_path_impl(path),
-                PathError::InvalidIriCodePoint,
+                PathError::InvalidPathSegmentCodePoint,
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_default_ignorable_and_invisible_segment_characters() {
+        for path in [
+            "/docs/a\u{200B}b.md", // ZERO WIDTH SPACE
+            "/docs/a\u{200C}b.md", // ZERO WIDTH NON-JOINER
+            "/docs/a\u{200D}b.md", // ZERO WIDTH JOINER
+            "/docs/a\u{2060}b.md", // WORD JOINER
+            "/docs/a\u{00AD}b.md", // SOFT HYPHEN
+            "/docs/a\u{034F}b.md", // COMBINING GRAPHEME JOINER
+            "/docs/a\u{180E}b.md", // MONGOLIAN VOWEL SEPARATOR
+            "/docs/a\u{FEFF}b.md", // ZERO WIDTH NO-BREAK SPACE
+        ] {
+            assert_path_error(
+                normalize_file_path_impl(path),
+                PathError::InvalidPathSegmentCodePoint,
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unicode_separators_and_leading_combining_marks() {
+        for path in [
+            "/docs/a\u{00A0}b.md", // NO-BREAK SPACE
+            "/docs/a\u{2028}b.md", // LINE SEPARATOR
+            "/docs/a\u{2029}b.md", // PARAGRAPH SEPARATOR
+            "/docs/\u{0301}.md",   // COMBINING ACUTE ACCENT
+        ] {
+            assert_path_error(
+                normalize_file_path_impl(path),
+                PathError::InvalidPathSegmentCodePoint,
             );
         }
     }
 
     #[test]
     fn validates_percent_encoding_in_file_paths() {
-        assert!(normalize_file_path("/docs/%20notes.md").is_ok());
+        assert_eq!(
+            normalize_file_path("/docs/%43afe%CC%81.md").as_deref(),
+            Ok("/docs/Café.md")
+        );
         assert_path_error(
             normalize_file_path_impl("/docs/%zz.md"),
             PathError::InvalidPercentEncoding,
@@ -1017,12 +966,48 @@ mod tests {
     fn rejects_percent_encoded_forbidden_code_points_in_file_paths() {
         for (path, expected) in [
             ("/docs/%00evil.md", PathError::NulByte),
-            ("/docs/%E2%80%AEevil.md", PathError::InvalidIriCodePoint),
-            ("/docs/%E2%80%8Eevil.md", PathError::InvalidIriCodePoint),
-            ("/docs/%EF%BB%BFevil.md", PathError::InvalidIriCodePoint),
-            ("/docs/%EF%B7%90evil.md", PathError::InvalidIriCodePoint),
-            ("/docs/%EE%80%80evil.md", PathError::InvalidIriCodePoint),
-            ("/docs/%FFevil.md", PathError::InvalidIriCodePoint),
+            ("/docs/%2Fevil.md", PathError::SlashInSegment),
+            ("/docs/%5Cevil.md", PathError::Backslash),
+            ("/docs/%25evil.md", PathError::InvalidPathSegmentCodePoint),
+            ("/docs/%3Fevil.md", PathError::InvalidPathSegmentCodePoint),
+            ("/docs/%23evil.md", PathError::InvalidPathSegmentCodePoint),
+            (
+                "/docs/%E2%80%AEevil.md",
+                PathError::InvalidPathSegmentCodePoint,
+            ),
+            (
+                "/docs/%E2%80%8Eevil.md",
+                PathError::InvalidPathSegmentCodePoint,
+            ),
+            (
+                "/docs/%E2%81%A0evil.md",
+                PathError::InvalidPathSegmentCodePoint,
+            ),
+            (
+                "/docs/%C2%ADevil.md",
+                PathError::InvalidPathSegmentCodePoint,
+            ),
+            (
+                "/docs/%CD%8Fevil.md",
+                PathError::InvalidPathSegmentCodePoint,
+            ),
+            (
+                "/docs/%E1%A0%8Eevil.md",
+                PathError::InvalidPathSegmentCodePoint,
+            ),
+            (
+                "/docs/%EF%BB%BFevil.md",
+                PathError::InvalidPathSegmentCodePoint,
+            ),
+            (
+                "/docs/%EF%B7%90evil.md",
+                PathError::InvalidPathSegmentCodePoint,
+            ),
+            (
+                "/docs/%EE%80%80evil.md",
+                PathError::InvalidPathSegmentCodePoint,
+            ),
+            ("/docs/%FFevil.md", PathError::InvalidPathSegmentCodePoint),
         ] {
             assert_path_error(normalize_file_path_impl(path), expected);
         }
@@ -1032,12 +1017,33 @@ mod tests {
     fn rejects_percent_encoded_forbidden_code_points_in_directory_paths() {
         for (path, expected) in [
             ("/docs/%00evil/", PathError::NulByte),
-            ("/docs/%E2%80%AEevil/", PathError::InvalidIriCodePoint),
-            ("/docs/%E2%80%8Eevil/", PathError::InvalidIriCodePoint),
-            ("/docs/%EF%BB%BFevil/", PathError::InvalidIriCodePoint),
-            ("/docs/%EF%B7%90evil/", PathError::InvalidIriCodePoint),
-            ("/docs/%EE%80%80evil/", PathError::InvalidIriCodePoint),
-            ("/docs/%FFevil/", PathError::InvalidIriCodePoint),
+            ("/docs/%2Fevil/", PathError::SlashInSegment),
+            ("/docs/%5Cevil/", PathError::Backslash),
+            (
+                "/docs/%E2%80%AEevil/",
+                PathError::InvalidPathSegmentCodePoint,
+            ),
+            (
+                "/docs/%E2%80%8Eevil/",
+                PathError::InvalidPathSegmentCodePoint,
+            ),
+            (
+                "/docs/%E2%81%A0evil/",
+                PathError::InvalidPathSegmentCodePoint,
+            ),
+            (
+                "/docs/%EF%BB%BFevil/",
+                PathError::InvalidPathSegmentCodePoint,
+            ),
+            (
+                "/docs/%EF%B7%90evil/",
+                PathError::InvalidPathSegmentCodePoint,
+            ),
+            (
+                "/docs/%EE%80%80evil/",
+                PathError::InvalidPathSegmentCodePoint,
+            ),
+            ("/docs/%FFevil/", PathError::InvalidPathSegmentCodePoint),
         ] {
             assert_path_error(normalize_directory_path_impl(path), expected);
         }
@@ -1049,9 +1055,9 @@ mod tests {
             normalize_file_path("/docs/%7e%41%2e%2E.md").as_deref(),
             Ok("/docs/~A...md")
         );
-        assert_eq!(
-            normalize_file_path("/docs/%2fkept%3aencoded").as_deref(),
-            Ok("/docs/%2Fkept%3Aencoded")
+        assert_path_error(
+            normalize_file_path_impl("/docs/%2fkept%3aencoded"),
+            PathError::SlashInSegment,
         );
     }
 
@@ -1064,13 +1070,7 @@ mod tests {
 
     #[test]
     fn accepts_and_rejects_directory_paths_like_legacy_rules() {
-        for path in [
-            "/",
-            "/docs/",
-            "/docs/guides/",
-            "/unicodé/章节/",
-            "/docs/%20/",
-        ] {
+        for path in ["/", "/docs/", "/docs/guides/", "/unicodé/章节/"] {
             assert!(
                 normalize_directory_path(path).is_ok(),
                 "expected valid directory path {path}"
@@ -1090,7 +1090,7 @@ mod tests {
         );
         assert_path_error(
             normalize_directory_path_impl("/docs/ /"),
-            PathError::InvalidIriCodePoint,
+            PathError::InvalidPathSegmentCodePoint,
         );
         assert_path_error(
             normalize_directory_path_impl("no-leading"),
@@ -1105,8 +1105,8 @@ mod tests {
     #[test]
     fn canonicalizes_directory_paths() {
         assert_eq!(
-            normalize_directory_path("/docs/%7e%2fkept/").as_deref(),
-            Ok("/docs/~%2Fkept/")
+            normalize_directory_path("/docs/%43afe%CC%81/").as_deref(),
+            Ok("/docs/Café/")
         );
     }
 
@@ -1148,7 +1148,7 @@ mod tests {
         assert_eq!(bad_percent.code, "LIX_ERROR_PATH_INVALID_PERCENT_ENCODING");
         assert_eq!(
             bad_percent.hint(),
-            Some("use percent triplets like %20 and escape '%' as %25")
+            Some("use valid percent triplets only for URI boundary input; '%' is not allowed in canonical path segments")
         );
 
         let root_file = normalize_file_path("/").expect_err("root as file");

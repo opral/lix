@@ -98,6 +98,7 @@ fn workspace_version_stage_row(version_id: &str) -> Result<StageRow, LixError> {
             "value": version_id,
         }))?),
         metadata: None,
+        origin: None,
         schema_version: KEY_VALUE_SCHEMA_VERSION.to_string(),
         created_at: None,
         updated_at: None,
