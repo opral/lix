@@ -6,7 +6,8 @@ use crate::common::normalize_path_segment;
 use crate::entity_identity::{EntityIdentity, EntityIdentityError};
 use crate::functions::FunctionProviderHandle;
 use crate::schema::{
-    apply_schema_defaults_with_shared_runtime, schema_from_registered_snapshot,
+    apply_schema_defaults_with_shared_runtime, is_seed_schema_key,
+    reject_unsupported_registered_schema_version, schema_from_registered_snapshot,
     schema_key_from_definition, validate_lix_schema, validate_lix_schema_definition, SchemaKey,
 };
 use crate::transaction::types::StageRow;
@@ -45,9 +46,38 @@ impl TransactionSchemaCatalog {
         })
     }
 
-    fn insert_schema(&mut self, key: SchemaKey, schema: JsonValue) {
+    pub(crate) fn insert_schema(&mut self, key: SchemaKey, schema: JsonValue) {
         self.schemas_by_key
             .insert(SchemaCatalogKey::from_schema_key(key), schema);
+    }
+
+    pub(crate) fn contains(&self, schema_key: &str, schema_version: &str) -> bool {
+        self.schemas_by_key.contains_key(&SchemaCatalogKey {
+            schema_key: schema_key.to_string(),
+            schema_version: schema_version.to_string(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.schemas_by_key.len()
+    }
+
+    pub(crate) fn schema_by_key(&self, schema_key: &str) -> Option<&JsonValue> {
+        self.schemas_by_key
+            .iter()
+            .find_map(|(key, schema)| (key.schema_key == schema_key).then_some(schema))
+    }
+
+    pub(crate) fn schema_key_by_key(&self, schema_key: &str) -> Option<SchemaCatalogKey> {
+        self.schemas_by_key
+            .keys()
+            .find(|key| key.schema_key == schema_key)
+            .cloned()
+    }
+
+    pub(crate) fn schemas(&self) -> impl Iterator<Item = (&SchemaCatalogKey, &JsonValue)> {
+        self.schemas_by_key.iter()
     }
 }
 
@@ -108,7 +138,7 @@ pub(crate) fn normalize_stage_row(
     }
 
     if row.schema_key == REGISTERED_SCHEMA_KEY {
-        remember_pending_registered_schema(&row, schema_catalog)?;
+        remember_pending_registered_schema(row.snapshot_content.as_deref(), schema_catalog)?;
     }
 
     Ok(row)
@@ -373,12 +403,15 @@ fn format_json_pointer(segments: &[String]) -> String {
     )
 }
 
-fn remember_pending_registered_schema(
-    row: &StageRow,
+pub(crate) fn remember_pending_registered_schema(
+    snapshot_content: Option<&str>,
     schema_catalog: &mut TransactionSchemaCatalog,
 ) -> Result<(), LixError> {
-    let Some(snapshot_content) = row.snapshot_content.as_deref() else {
-        return Ok(());
+    let Some(snapshot_content) = snapshot_content else {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            "lix_registered_schema rows cannot be deleted yet; schema deletion is not supported",
+        ));
     };
     let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
         LixError::new(
@@ -386,19 +419,31 @@ fn remember_pending_registered_schema(
             format!("pending registered schema snapshot_content is invalid JSON: {error}"),
         )
     })?;
-    let registered_schema_definition =
-        crate::schema::builtin_schema_definition(REGISTERED_SCHEMA_KEY).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_SCHEMA_DEFINITION,
-                "missing builtin lix_registered_schema definition",
-            )
-        })?;
+    let registered_schema_definition = schema_catalog
+        .schema(REGISTERED_SCHEMA_KEY, "1")
+        .cloned()
+        .ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            "lix_registered_schema schema is not visible to this transaction",
+        )
+    })?;
     if !snapshot.get("value").is_some_and(JsonValue::is_object) {
-        validate_lix_schema(registered_schema_definition, &snapshot)?;
+        validate_lix_schema(&registered_schema_definition, &snapshot)?;
     }
     let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
+    reject_unsupported_registered_schema_version(&key)?;
+    if is_seed_schema_key(&key.schema_key) {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            format!(
+                "schema '{}' is a system schema and cannot be registered at runtime",
+                key.schema_key
+            ),
+        ));
+    }
     validate_lix_schema_definition(&schema)?;
-    validate_lix_schema(registered_schema_definition, &snapshot)?;
+    validate_lix_schema(&registered_schema_definition, &snapshot)?;
     schema_catalog.insert_schema(key, schema);
     Ok(())
 }
@@ -410,7 +455,7 @@ pub(crate) struct SchemaCatalogKey {
 }
 
 impl SchemaCatalogKey {
-    fn from_schema_key(key: SchemaKey) -> Self {
+    pub(crate) fn from_schema_key(key: SchemaKey) -> Self {
         Self {
             schema_key: key.schema_key,
             schema_version: key.schema_version,
@@ -424,7 +469,7 @@ mod tests {
 
     use super::*;
     use crate::functions::{FunctionProvider, SharedFunctionProvider};
-    use crate::schema::builtin_schema_definition;
+    use crate::schema::seed_schema_definition;
 
     #[test]
     fn normalization_derives_entity_id_from_primary_key() {
@@ -627,7 +672,7 @@ mod tests {
 
     #[test]
     fn normalization_makes_pending_registered_schema_visible_to_later_rows() {
-        let mut catalog = catalog_with(vec![builtin_schema_definition(REGISTERED_SCHEMA_KEY)
+        let mut catalog = catalog_with(vec![seed_schema_definition(REGISTERED_SCHEMA_KEY)
             .expect("registered schema builtin")
             .clone()]);
         let registered = StageRow {
@@ -812,7 +857,7 @@ mod tests {
     }
 
     fn builtin_schema(schema_key: &str) -> JsonValue {
-        builtin_schema_definition(schema_key)
+        seed_schema_definition(schema_key)
             .unwrap_or_else(|| panic!("{schema_key} builtin schema should exist"))
             .clone()
     }

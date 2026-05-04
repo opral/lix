@@ -932,6 +932,69 @@ simulation_test!(
 );
 
 simulation_test!(
+    merge_version_adopts_schema_registration_before_schema_rows,
+    |sim| async move {
+        let (engine, main, draft) = create_draft_from_main(&sim).await;
+
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('merge-schema-target-change', 'target')",
+            &[],
+        )
+        .await
+        .expect("main write should force a merge commit instead of fast-forward");
+
+        draft
+            .execute(
+                "INSERT INTO lix_registered_schema (value) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"merge_task_item\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}')\
+                 )",
+                &[],
+            )
+            .await
+            .expect("draft schema registration should succeed");
+
+        draft
+            .execute(
+                "INSERT INTO merge_task_item (id, title) \
+                 VALUES ('task-1', 'Adopted schema row')",
+                &[],
+            )
+            .await
+            .expect("draft row using newly registered schema should succeed");
+
+        main.merge_version(MergeVersionOptions {
+            source_version_id: "draft-version".to_string(),
+        })
+        .await
+        .expect("merge should adopt schema registration before rows that use it");
+
+        let reopened_main = sim.wrap_session(
+            engine
+                .open_session(sim.main_version_id())
+                .await
+                .expect("main session should reopen after merge"),
+            &engine,
+        );
+
+        let rows = reopened_main
+            .execute(
+                "SELECT id, title FROM merge_task_item WHERE id = 'task-1'",
+                &[],
+            )
+            .await
+            .expect("merged schema surface should be queryable");
+        assert_eq!(
+            rows.rows()[0].values(),
+            &[
+                Value::Text("task-1".to_string()),
+                Value::Text("Adopted schema row".to_string()),
+            ]
+        );
+    }
+);
+
+simulation_test!(
     merge_version_errors_on_divergent_same_entity_change,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;

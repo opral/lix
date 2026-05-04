@@ -7,6 +7,9 @@ use crate::functions::{
 };
 use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateRow};
+use crate::schema::{
+    registered_schema_entity_id, schema_key_from_definition, seed_schema_definitions,
+};
 use crate::storage::StorageContext;
 use crate::untracked_state::UntrackedStateRow;
 use crate::version::{
@@ -23,6 +26,8 @@ const LIX_ID_KEY: &str = "lix_id";
 const WORKSPACE_VERSION_KEY: &str = "lix_workspace_version_id";
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const COMMIT_SCHEMA_VERSION: &str = "1";
+const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
+const REGISTERED_SCHEMA_VERSION: &str = "1";
 
 /// Pure seed plan for initializing an engine2 repository.
 ///
@@ -55,6 +60,19 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     let initial_change_set_id = functions.call_uuid_v7();
     let timestamp = functions.call_timestamp();
 
+    let mut registered_schema_changes = Vec::new();
+    for schema in seed_schema_definitions() {
+        let key = schema_key_from_definition(schema)?;
+        registered_schema_changes.push(canonical_change(
+            functions.call_uuid_v7(),
+            registered_schema_entity_id(&key.schema_key, &key.schema_version)?,
+            REGISTERED_SCHEMA_KEY,
+            REGISTERED_SCHEMA_VERSION,
+            registered_schema_snapshot(schema)?,
+            &timestamp,
+        ));
+    }
+
     let global_version_descriptor_change = canonical_change(
         GLOBAL_VERSION_ID.to_string(),
         EntityIdentity::single(GLOBAL_VERSION_ID),
@@ -80,6 +98,16 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         &timestamp,
     );
 
+    let initial_commit_change_ids = registered_schema_changes
+        .iter()
+        .map(|change| change.id.clone())
+        .chain([
+            global_version_descriptor_change.id.clone(),
+            main_version_descriptor_change.id.clone(),
+            kv_lix_id_change.id.clone(),
+        ])
+        .collect::<Vec<_>>();
+
     let initial_commit_change = canonical_change(
         functions.call_uuid_v7(),
         EntityIdentity::single(&initial_commit_id),
@@ -88,11 +116,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         commit_snapshot(
             &initial_commit_id,
             &initial_change_set_id,
-            &[
-                global_version_descriptor_change.id.clone(),
-                main_version_descriptor_change.id.clone(),
-                kv_lix_id_change.id.clone(),
-            ],
+            &initial_commit_change_ids,
         )?,
         &timestamp,
     );
@@ -119,12 +143,15 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     );
 
     Ok(InitSeedPlan {
-        changes: vec![
-            global_version_descriptor_change,
-            main_version_descriptor_change,
-            kv_lix_id_change,
-            initial_commit_change,
-        ],
+        changes: registered_schema_changes
+            .into_iter()
+            .chain([
+                global_version_descriptor_change,
+                main_version_descriptor_change,
+                kv_lix_id_change,
+                initial_commit_change,
+            ])
+            .collect(),
         untracked_rows: vec![
             global_version_ref_row,
             main_version_ref_row,
@@ -263,6 +290,12 @@ fn key_value_snapshot(key: &str, value: &str) -> Result<String, LixError> {
     }))
 }
 
+fn registered_schema_snapshot(schema: &serde_json::Value) -> Result<String, LixError> {
+    encode_snapshot(json!({
+        "value": schema,
+    }))
+}
+
 fn commit_snapshot(
     id: &str,
     change_set_id: &str,
@@ -303,7 +336,7 @@ mod tests {
     fn plan_init_seed_returns_tracked_changes_and_untracked_workspace_state() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
 
-        assert_eq!(plan.changes.len(), 4);
+        assert_eq!(plan.changes.len(), seed_schema_definitions().len() + 4);
         assert_eq!(plan.untracked_rows.len(), 3);
         assert_eq!(plan.receipt.global_version_id, GLOBAL_VERSION_ID);
         assert_eq!(plan.receipt.main_version_id, "test-uuid-1");
@@ -312,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_init_seed_commit_tracks_only_descriptor_and_lix_id_changes() {
+    fn plan_init_seed_commit_tracks_schema_registrations_descriptor_and_lix_id_changes() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
         let commit_change = plan
             .changes
@@ -325,16 +358,52 @@ mod tests {
             commit_snapshot.get("id").and_then(JsonValue::as_str),
             Some(plan.receipt.initial_commit_id.as_str())
         );
+        let change_ids = commit_snapshot
+            .get("change_ids")
+            .and_then(JsonValue::as_array)
+            .expect("change_ids should be an array")
+            .iter()
+            .map(|value| value.as_str().expect("change id should be text"))
+            .collect::<Vec<_>>();
+        assert_eq!(change_ids.len(), seed_schema_definitions().len() + 3);
+        assert!(change_ids.contains(&"global"));
+
+        let registered_schema_change_ids = plan
+            .changes
+            .iter()
+            .filter(|change| change.schema_key == REGISTERED_SCHEMA_KEY)
+            .map(|change| change.id.as_str())
+            .collect::<Vec<_>>();
+        for change_id in registered_schema_change_ids {
+            assert!(change_ids.contains(&change_id));
+        }
+    }
+
+    #[test]
+    fn plan_init_seed_registers_seed_schemas_as_initial_commit_rows() {
+        let plan = plan_init_seed(test_functions()).expect("init seed should plan");
+        let registered_schema_changes = plan
+            .changes
+            .iter()
+            .filter(|change| change.schema_key == REGISTERED_SCHEMA_KEY)
+            .collect::<Vec<_>>();
+
         assert_eq!(
-            commit_snapshot
-                .get("change_ids")
-                .and_then(JsonValue::as_array)
-                .expect("change_ids should be an array")
-                .iter()
-                .map(|value| value.as_str().expect("change id should be text"))
-                .collect::<Vec<_>>(),
-            vec!["global", "test-uuid-5", "test-uuid-6"]
+            registered_schema_changes.len(),
+            seed_schema_definitions().len()
         );
+        assert!(registered_schema_changes.iter().any(|change| {
+            snapshot(change)
+                .pointer("/value/x-lix-key")
+                .and_then(JsonValue::as_str)
+                == Some(REGISTERED_SCHEMA_KEY)
+        }));
+        assert!(registered_schema_changes.iter().any(|change| {
+            snapshot(change)
+                .pointer("/value/x-lix-key")
+                .and_then(JsonValue::as_str)
+                == Some(KEY_VALUE_SCHEMA_KEY)
+        }));
     }
 
     #[test]

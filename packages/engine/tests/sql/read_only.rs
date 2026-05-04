@@ -304,7 +304,7 @@ simulation_test!(read_only_typed_history_views_reject_dml, |sim| async move {
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
              lix_json('{\"x-lix-key\":\"read_only_history_entity\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-             true,\
+             false,\
              true\
              )",
             &[],

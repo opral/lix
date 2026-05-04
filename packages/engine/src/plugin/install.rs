@@ -33,7 +33,6 @@ use crate::transaction::{
     PreparedResolvedWritePartition, PreparedResolvedWritePlan, PreparedWriteArtifact,
     PreparedWriteFunctionBindings, PreparedWriteStatement,
 };
-use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, Value};
 
 use crate::transaction::WriteCommand;
@@ -48,6 +47,7 @@ const FILESYSTEM_BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 pub(crate) struct PluginInstallWriteContext {
     function_bindings: PreparedWriteFunctionBindings,
     public_surface_registry: SurfaceRegistry,
+    target_version_id: String,
     active_account_ids: Vec<String>,
     origin_key: Option<String>,
 }
@@ -56,15 +56,21 @@ impl PluginInstallWriteContext {
     pub(crate) fn new(
         function_bindings: PreparedWriteFunctionBindings,
         public_surface_registry: SurfaceRegistry,
+        target_version_id: impl Into<String>,
         active_account_ids: Vec<String>,
         origin_key: Option<String>,
     ) -> Self {
         Self {
             function_bindings,
             public_surface_registry,
+            target_version_id: target_version_id.into(),
             active_account_ids,
             origin_key,
         }
+    }
+
+    fn target_version_id(&self) -> &str {
+        &self.target_version_id
     }
 }
 
@@ -157,7 +163,7 @@ fn prepare_registered_schema_write_statement_from_schemas(
         .collect::<Result<Vec<_>, _>>()?;
     let intended_post_state = schema_rows
         .iter()
-        .map(registered_schema_planned_row)
+        .map(|row| registered_schema_planned_row(row, context.target_version_id()))
         .collect::<Vec<_>>();
     let changes = schema_rows
         .iter()
@@ -169,7 +175,7 @@ fn prepare_registered_schema_write_statement_from_schemas(
             plugin_key: None,
             snapshot_content: Some(row.snapshot.to_string()),
             metadata: None,
-            version_id: GLOBAL_VERSION_ID.to_string(),
+            version_id: context.target_version_id().to_string(),
             origin_key: context.origin_key.clone(),
         })
         .collect::<Vec<_>>();
@@ -219,12 +225,13 @@ fn prepare_plugin_archive_write_statement(
         metadata: None,
         hidden: false,
     };
+    let target_version_id = context.target_version_id();
     let filesystem_state = PlannedFilesystemState {
         files: [(
-            (archive_id.clone(), GLOBAL_VERSION_ID.to_string()),
+            (archive_id.clone(), target_version_id.to_string()),
             PlannedFilesystemFile {
                 file_id: archive_id.clone(),
-                version_id: GLOBAL_VERSION_ID.to_string(),
+                version_id: target_version_id.to_string(),
                 untracked: false,
                 descriptor: Some(descriptor.clone()),
                 metadata_patch: OptionalTextPatch::Unchanged,
@@ -236,8 +243,8 @@ fn prepare_plugin_archive_write_statement(
         .collect(),
     };
     let intended_post_state = vec![
-        plugin_archive_file_descriptor_row(&archive_id, &descriptor),
-        plugin_archive_binary_blob_ref_row(&archive_id, archive_bytes)?,
+        plugin_archive_file_descriptor_row(&archive_id, target_version_id, &descriptor),
+        plugin_archive_binary_blob_ref_row(&archive_id, target_version_id, archive_bytes)?,
     ];
     let changes = intended_post_state
         .iter()
@@ -270,7 +277,10 @@ fn registered_schema_row_spec_from_json(
     })
 }
 
-fn registered_schema_planned_row(row: &RegisteredSchemaRowSpec) -> PlannedStateRow {
+fn registered_schema_planned_row(
+    row: &RegisteredSchemaRowSpec,
+    target_version_id: &str,
+) -> PlannedStateRow {
     let mut values = BTreeMap::new();
     values.insert("entity_id".to_string(), Value::Text(row.entity_id.clone()));
     values.insert(
@@ -289,12 +299,12 @@ fn registered_schema_planned_row(row: &RegisteredSchemaRowSpec) -> PlannedStateR
     );
     values.insert(
         "version_id".to_string(),
-        Value::Text(GLOBAL_VERSION_ID.to_string()),
+        Value::Text(target_version_id.to_string()),
     );
     PlannedStateRow {
         entity_id: row.entity_id.clone(),
         schema_key: REGISTERED_SCHEMA_STORAGE_SCHEMA_KEY.to_string(),
-        version_id: Some(GLOBAL_VERSION_ID.to_string()),
+        version_id: Some(target_version_id.to_string()),
         values,
         origin_key: None,
         tombstone: false,
@@ -303,6 +313,7 @@ fn registered_schema_planned_row(row: &RegisteredSchemaRowSpec) -> PlannedStateR
 
 fn plugin_archive_file_descriptor_row(
     archive_id: &str,
+    target_version_id: &str,
     descriptor: &PlannedFilesystemDescriptor,
 ) -> PlannedStateRow {
     let snapshot_content = json!({
@@ -330,12 +341,12 @@ fn plugin_archive_file_descriptor_row(
     );
     values.insert(
         "version_id".to_string(),
-        Value::Text(GLOBAL_VERSION_ID.to_string()),
+        Value::Text(target_version_id.to_string()),
     );
     PlannedStateRow {
         entity_id: archive_id.to_string(),
         schema_key: FILESYSTEM_DESCRIPTOR_SCHEMA_KEY.to_string(),
-        version_id: Some(GLOBAL_VERSION_ID.to_string()),
+        version_id: Some(target_version_id.to_string()),
         values,
         origin_key: None,
         tombstone: false,
@@ -344,6 +355,7 @@ fn plugin_archive_file_descriptor_row(
 
 fn plugin_archive_binary_blob_ref_row(
     archive_id: &str,
+    target_version_id: &str,
     archive_bytes: &[u8],
 ) -> Result<PlannedStateRow, LixError> {
     let size_bytes = u64::try_from(archive_bytes.len()).map_err(|_| {
@@ -379,12 +391,12 @@ fn plugin_archive_binary_blob_ref_row(
     );
     values.insert(
         "version_id".to_string(),
-        Value::Text(GLOBAL_VERSION_ID.to_string()),
+        Value::Text(target_version_id.to_string()),
     );
     Ok(PlannedStateRow {
         entity_id: archive_id.to_string(),
         schema_key: FILESYSTEM_BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
-        version_id: Some(GLOBAL_VERSION_ID.to_string()),
+        version_id: Some(target_version_id.to_string()),
         values,
         origin_key: None,
         tombstone: false,
@@ -418,7 +430,7 @@ fn prepare_public_tracked_write_statement(
                     operation_kind: PreparedWriteOperationKind::Insert,
                     target,
                     on_conflict_action: None,
-                    requested_version_id: Some(GLOBAL_VERSION_ID.to_string()),
+                    requested_version_id: Some(context.target_version_id().to_string()),
                     active_account_ids: context.active_account_ids.clone(),
                     origin_key: context.origin_key.clone(),
                     resolved_write_plan: Some(PreparedResolvedWritePlan {

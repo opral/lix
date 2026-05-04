@@ -5,7 +5,6 @@ use crate::functions::{FunctionProvider, FunctionProviderHandle};
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{LiveStateRow, LiveStateRowIdentity, LiveStateScanRequest};
-use crate::transaction::normalization::{normalize_stage_row, TransactionSchemaCatalog};
 use crate::transaction::types::{
     LogicalPrimaryKey, StageAdoptedChange, StageFileData, StageRow, StageRowOrigin, StageWrite,
     StageWriteMode, StageWriteOperation, StageWriteOutcome,
@@ -22,7 +21,6 @@ use crate::{LixError, NullableKeyFilter};
 /// and commit later drains the same rows.
 pub(crate) struct TransactionStagedWrites {
     functions: FunctionProviderHandle,
-    schema_catalog: Mutex<TransactionSchemaCatalog>,
     rows: Mutex<BTreeMap<StagedStateRowIdentity, StagedStateRow>>,
     adopted_rows: Mutex<BTreeMap<StagedStateRowIdentity, StagedAdoptedStateRow>>,
     insert_identities: Mutex<BTreeMap<LiveStateRowIdentity, Option<StageRowOrigin>>>,
@@ -52,13 +50,9 @@ impl StagedWriteSet {
 }
 
 impl TransactionStagedWrites {
-    pub(crate) fn new(
-        functions: FunctionProviderHandle,
-        schema_catalog: TransactionSchemaCatalog,
-    ) -> Self {
+    pub(crate) fn new(functions: FunctionProviderHandle) -> Self {
         Self {
             functions,
-            schema_catalog: Mutex::new(schema_catalog),
             rows: Mutex::new(BTreeMap::new()),
             adopted_rows: Mutex::new(BTreeMap::new()),
             insert_identities: Mutex::new(BTreeMap::new()),
@@ -336,14 +330,7 @@ impl TransactionStagedWrites {
         functions: &mut dyn FunctionProvider,
     ) -> Result<(), LixError> {
         state_rows.reserve(rows.len());
-        let mut schema_catalog = self.schema_catalog.lock().map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "failed to acquire transaction schema catalog lock",
-            )
-        })?;
         for row in rows {
-            let row = normalize_stage_row(row, &mut schema_catalog, self.functions.clone())?;
             state_rows.push(hydrate_state_write_row(row, functions)?);
         }
         Ok(())
@@ -876,7 +863,6 @@ mod tests {
     use super::*;
     use crate::functions::SharedFunctionProvider;
     use crate::live_state::{LiveStateFilter, LiveStateRowRequest};
-    use crate::schema::builtin_schema_definition;
 
     #[tokio::test]
     async fn staging_overlay_uses_last_staged_row_for_exact_load() {
@@ -1333,21 +1319,10 @@ mod tests {
     }
 
     fn test_staged_writes() -> TransactionStagedWrites {
-        let visible_schemas = vec![
-            builtin_schema_definition("lix_key_value")
-                .expect("lix_key_value schema")
-                .clone(),
-            test_schema_definition("other_schema", "1"),
-            test_schema_definition("lix_key_value", "2"),
-        ];
-        let schema_catalog = TransactionSchemaCatalog::from_visible_schemas(&visible_schemas)
-            .expect("schema catalog should build");
-        TransactionStagedWrites::new(
-            SharedFunctionProvider::new(
-                Box::new(TestFunctionProvider::default()) as Box<dyn FunctionProvider + Send>
-            ),
-            schema_catalog,
+        TransactionStagedWrites::new(SharedFunctionProvider::new(Box::new(
+            TestFunctionProvider::default(),
         )
+            as Box<dyn FunctionProvider + Send>))
     }
 
     #[derive(Default)]
@@ -1385,20 +1360,6 @@ mod tests {
             untracked: true,
             version_id: "global".to_string(),
         }
-    }
-
-    fn test_schema_definition(schema_key: &str, schema_version: &str) -> serde_json::Value {
-        serde_json::json!({
-            "x-lix-key": schema_key,
-            "x-lix-version": schema_version,
-            "type": "object",
-            "additionalProperties": true,
-            "properties": {
-                "key": { "type": "string" },
-                "value": { "type": "string" }
-            },
-            "x-lix-primary-key": ["/key"]
-        })
     }
 
     fn tombstone_row(key: &str) -> StageRow {

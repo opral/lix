@@ -4,17 +4,16 @@ use serde_json::Value as JsonValue;
 
 use crate::live_state::LiveStateRow;
 use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
-use crate::schema::{builtin_schema_definition, builtin_schema_keys, schema_key_from_definition};
-use crate::{LixError, NullableKeyFilter};
+use crate::schema::schema_key_from_definition;
+use crate::{LixError, NullableKeyFilter, GLOBAL_VERSION_ID};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Engine2 schema visibility boundary.
 ///
-/// SQL planning receives a schema snapshot from here instead of reaching into
-/// backend storage or hardcoding a small list of surfaces. Builtin schemas are
-/// the bootstrap base; registered-schema rows visible through live_state can
-/// extend or override that base for the requested version.
+/// SQL planning receives a schema snapshot from live state. System schemas are
+/// seeded as ordinary `lix_registered_schema` rows during initialization, so
+/// runtime schema visibility has one source of truth.
 pub(crate) struct SchemaRegistry;
 
 impl SchemaRegistry {
@@ -31,7 +30,7 @@ impl SchemaRegistry {
     where
         R: LiveStateReader + ?Sized,
     {
-        let mut schemas = builtin_schema_definitions()?;
+        let mut schemas = BTreeMap::new();
         for row in live_state
             .scan_rows(&LiveStateScanRequest {
                 filter: LiveStateFilter {
@@ -44,6 +43,8 @@ impl SchemaRegistry {
                 ..LiveStateScanRequest::default()
             })
             .await?
+            .into_iter()
+            .filter(|row| version_scoped_schema_row_is_visible(row, version_id))
         {
             let Some((key, schema)) = decode_registered_schema_row(&row)? else {
                 continue;
@@ -54,16 +55,8 @@ impl SchemaRegistry {
     }
 }
 
-fn builtin_schema_definitions(
-) -> Result<BTreeMap<String, (crate::schema::SchemaKey, JsonValue)>, LixError> {
-    let mut schemas = BTreeMap::new();
-    for schema_key in builtin_schema_keys() {
-        let schema = builtin_schema_definition(schema_key)
-            .ok_or_else(|| LixError::unknown(format!("missing builtin schema '{schema_key}'")))?;
-        let key = schema_key_from_definition(schema)?;
-        upsert_latest_schema(&mut schemas, key, schema.clone());
-    }
-    Ok(schemas)
+fn version_scoped_schema_row_is_visible(row: &LiveStateRow, requested_version_id: &str) -> bool {
+    requested_version_id == GLOBAL_VERSION_ID || !row.global
 }
 
 fn upsert_latest_schema(
@@ -132,11 +125,17 @@ mod tests {
     use crate::GLOBAL_VERSION_ID;
 
     #[tokio::test]
-    async fn visible_schemas_include_builtin_registered_schema() {
+    async fn visible_schemas_are_loaded_from_registered_schema_rows() {
         let registry = SchemaRegistry::new();
 
         let schemas = registry
-            .visible_schemas(&RowsLiveStateReader::new(Vec::new()), "global")
+            .visible_schemas(
+                &RowsLiveStateReader::new(vec![
+                    registered_schema_row("lix_registered_schema", "1"),
+                    registered_schema_row("lix_key_value", "1"),
+                ]),
+                "global",
+            )
             .await
             .expect("schema visibility should load");
 
@@ -166,6 +165,33 @@ mod tests {
         assert!(schemas.iter().any(|schema| {
             schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("engine2_dynamic_schema")
         }));
+    }
+
+    #[tokio::test]
+    async fn visible_schemas_ignore_projected_global_schema_rows_for_version_scope() {
+        let registry = SchemaRegistry::new();
+        let mut global_only = registered_schema_row("global_only_schema", "1");
+        global_only.global = true;
+        global_only.version_id = "main".to_string();
+
+        let schemas = registry
+            .visible_schemas(&RowsLiveStateReader::new(vec![global_only]), "main")
+            .await
+            .expect("schema visibility should load");
+
+        assert!(schemas.is_empty());
+    }
+
+    #[tokio::test]
+    async fn visible_schemas_are_empty_when_no_schema_rows_are_visible() {
+        let registry = SchemaRegistry::new();
+
+        let schemas = registry
+            .visible_schemas(&RowsLiveStateReader::new(Vec::new()), "global")
+            .await
+            .expect("schema visibility should load");
+
+        assert!(schemas.is_empty());
     }
 
     struct RowsLiveStateReader {

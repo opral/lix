@@ -1315,7 +1315,7 @@ mod tests {
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"}},\"required\":[\"value\",\"count\"],\"additionalProperties\":false}'),\
-                 true,\
+                 false,\
                  true\
                  )",
                 &[],
@@ -2872,18 +2872,29 @@ mod tests {
         let backend = crate::backend::testing::UnitTestBackend::new();
         let init_receipt = Engine::initialize(Box::new(backend.clone())).await?;
         let storage = crate::storage::StorageContext::new(std::sync::Arc::new(backend.clone()));
-        crate::test_support::seed_version_head(
-            storage.clone(),
-            "version-a",
-            &format!("{}-version-a-root", init_receipt.initial_commit_id),
-        )
-        .await;
-        crate::test_support::seed_version_head(
-            storage,
-            "version-b",
-            &format!("{}-version-b-root", init_receipt.initial_commit_id),
-        )
-        .await;
+        {
+            let mut transaction = storage.begin_write_transaction().await?;
+            let version_ctx = crate::version::VersionContext::new(Arc::new(
+                crate::untracked_state::UntrackedStateContext::new(),
+            ));
+            version_ctx
+                .advance_ref(
+                    transaction.as_mut(),
+                    "version-a",
+                    &init_receipt.initial_commit_id,
+                    "1970-01-01T00:00:00.000Z",
+                )
+                .await?;
+            version_ctx
+                .advance_ref(
+                    transaction.as_mut(),
+                    "version-b",
+                    &init_receipt.initial_commit_id,
+                    "1970-01-01T00:00:00.000Z",
+                )
+                .await?;
+            transaction.commit().await?;
+        }
         let engine = Engine::new(Box::new(backend.clone())).await?;
         let session_a = engine.open_session("version-a").await?;
         let session_b = engine.open_session("version-b").await?;
@@ -2902,7 +2913,18 @@ mod tests {
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}'),\
-                 true,\
+                 false,\
+                 true\
+                 )",
+                &[],
+            )
+            .await?;
+        session_b
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}'),\
+                 false,\
                  true\
                  )",
                 &[],

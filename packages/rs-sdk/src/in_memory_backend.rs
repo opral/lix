@@ -3,9 +3,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lix_engine::{
-    Backend, BackendKvGetRequest, BackendKvGetResult, BackendKvGetResultGroup, BackendKvPair,
-    BackendKvScanRange, BackendKvScanRequest, BackendKvScanResult, BackendKvWriteBatch,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, LixError,
+    Backend, BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetRequest, BackendKvRowBatch,
+    BackendKvScanBatch, BackendKvScanProjection, BackendKvScanRange, BackendKvScanRequest,
+    BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
+    LixError,
 };
 
 type KvKey = (String, Vec<u8>);
@@ -59,14 +60,14 @@ impl BackendReadTransaction for InMemoryReadTransaction {
     async fn get_kv_many(
         &mut self,
         request: BackendKvGetRequest,
-    ) -> Result<BackendKvGetResult, LixError> {
+    ) -> Result<BackendKvGetBatch, LixError> {
         Ok(get_many_from_map(&self.kv, request))
     }
 
     async fn scan_kv(
         &mut self,
         request: BackendKvScanRequest,
-    ) -> Result<BackendKvScanResult, LixError> {
+    ) -> Result<BackendKvScanBatch, LixError> {
         Ok(scan_map(&self.kv, request))
     }
 
@@ -85,14 +86,14 @@ impl BackendReadTransaction for InMemoryWriteTransaction {
     async fn get_kv_many(
         &mut self,
         request: BackendKvGetRequest,
-    ) -> Result<BackendKvGetResult, LixError> {
+    ) -> Result<BackendKvGetBatch, LixError> {
         Ok(get_many_from_map(&self.kv, request))
     }
 
     async fn scan_kv(
         &mut self,
         request: BackendKvScanRequest,
-    ) -> Result<BackendKvScanResult, LixError> {
+    ) -> Result<BackendKvScanBatch, LixError> {
         Ok(scan_map(&self.kv, request))
     }
 
@@ -133,47 +134,57 @@ impl BackendWriteTransaction for InMemoryWriteTransaction {
     }
 }
 
-fn get_many_from_map(kv: &KvMap, request: BackendKvGetRequest) -> BackendKvGetResult {
+fn get_many_from_map(kv: &KvMap, request: BackendKvGetRequest) -> BackendKvGetBatch {
     let mut groups = Vec::with_capacity(request.groups.len());
     for group in request.groups {
-        let mut values = Vec::with_capacity(group.keys.len());
+        let mut rows = BackendKvRowBatch::with_capacity(group.keys.len());
         for key in group.keys {
-            values.push(kv.get(&(group.namespace.clone(), key)).cloned());
+            rows.push_get_projection(
+                key.clone(),
+                kv.get(&(group.namespace.clone(), key)).cloned(),
+                request.projection,
+            );
         }
-        groups.push(BackendKvGetResultGroup {
+        groups.push(BackendKvGetBatchGroup {
             namespace: group.namespace,
-            values,
+            rows,
         });
     }
-    BackendKvGetResult { groups }
+    BackendKvGetBatch { groups }
 }
 
-fn scan_map(kv: &KvMap, request: BackendKvScanRequest) -> BackendKvScanResult {
+fn scan_map(kv: &KvMap, request: BackendKvScanRequest) -> BackendKvScanBatch {
     let scan_limit = request
         .limit
         .checked_add(1 + usize::from(request.after.is_some()))
         .unwrap_or(request.limit);
-    let mut rows = kv
+    let mut pairs = kv
         .iter()
         .filter(|((candidate_namespace, key), _)| {
             candidate_namespace == &request.namespace && key_matches_range(key, &request.range)
         })
-        .map(|((_, key), value)| BackendKvPair::new(key.clone(), value.clone()))
-        .filter(|row| {
+        .filter(|((_, key), _)| {
             request
                 .after
                 .as_deref()
-                .is_none_or(|after| row.key.as_slice() > after)
+                .is_none_or(|after| key.as_slice() > after)
         })
         .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left.key.cmp(&right.key));
-    rows.truncate(scan_limit);
-    let has_more = rows.len() > request.limit;
-    rows.truncate(request.limit);
-    let resume_after = has_more
-        .then(|| rows.last().map(|row| row.key.clone()))
-        .flatten();
-    BackendKvScanResult { rows, resume_after }
+    pairs.sort_by(|left, right| left.0 .1.cmp(&right.0 .1));
+    pairs.truncate(scan_limit);
+
+    let has_more = pairs.len() > request.limit;
+    pairs.truncate(request.limit);
+
+    let mut rows = BackendKvRowBatch::with_capacity(pairs.len());
+    for ((_, key), value) in pairs {
+        match request.projection {
+            BackendKvScanProjection::KeysOnly => rows.push_key_only(key.clone()),
+            BackendKvScanProjection::KeysAndValues => rows.push_value(key.clone(), value.clone()),
+        }
+    }
+    let resume_after = has_more.then(|| rows.last_key_cloned()).flatten();
+    BackendKvScanBatch { rows, resume_after }
 }
 
 fn key_matches_range(key: &[u8], range: &BackendKvScanRange) -> bool {

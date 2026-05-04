@@ -20,7 +20,7 @@ simulation_test!(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine2_history_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"active\":{\"type\":\"boolean\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"count\",\"active\",\"meta\"],\"additionalProperties\":false}'),\
-                 true,\
+                 false,\
                  true\
                  )",
                 &[],
@@ -118,7 +118,7 @@ simulation_test!(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine2_history_error_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-                 true,\
+                 false,\
                  true\
                  )",
                 &[],
@@ -167,7 +167,7 @@ simulation_test!(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine2_history_bare_error_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-                 true,\
+                 false,\
                  true\
                  )",
                 &[],
