@@ -6,9 +6,10 @@ use lix_engine::storage_bench::{
     StorageBenchSelectivity, StorageBenchUpdateFraction,
 };
 use lix_engine::{
-    Backend, BackendKvGetRequest, BackendKvGetResult, BackendKvGetResultGroup, BackendKvPair,
-    BackendKvScanRange, BackendKvScanRequest, BackendKvScanResult, BackendKvWriteBatch,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, LixError,
+    Backend, BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetRequest, BackendKvRowBatch,
+    BackendKvScanBatch, BackendKvScanProjection, BackendKvScanRange, BackendKvScanRequest,
+    BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
+    LixError,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -725,52 +726,62 @@ impl BackendReadTransaction for AccountingTransaction {
     async fn get_kv_many(
         &mut self,
         request: BackendKvGetRequest,
-    ) -> Result<BackendKvGetResult, LixError> {
+    ) -> Result<BackendKvGetBatch, LixError> {
         let store = self.lock_store()?;
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
-            let mut values = Vec::with_capacity(group.keys.len());
+            let mut rows = BackendKvRowBatch::with_capacity(group.keys.len());
             for key in group.keys {
-                values.push(store.get(&(group.namespace.clone(), key)).cloned());
+                rows.push_get_projection(
+                    key.clone(),
+                    store.get(&(group.namespace.clone(), key)).cloned(),
+                    request.projection,
+                );
             }
-            groups.push(BackendKvGetResultGroup {
+            groups.push(BackendKvGetBatchGroup {
                 namespace: group.namespace,
-                values,
+                rows,
             });
         }
-        Ok(BackendKvGetResult { groups })
+        Ok(BackendKvGetBatch { groups })
     }
 
     async fn scan_kv(
         &mut self,
         request: BackendKvScanRequest,
-    ) -> Result<BackendKvScanResult, LixError> {
+    ) -> Result<BackendKvScanBatch, LixError> {
         let store = self.lock_store()?;
-        let mut rows = scan_store(
+        let rows = scan_store(
             &store,
             &request.namespace,
-            request.range,
+            &request.range,
             Some(
                 request
                     .limit
                     .checked_add(1 + usize::from(request.after.is_some()))
                     .unwrap_or(request.limit),
             ),
-        )
-        .into_iter()
-        .filter(|row| {
-            request
-                .after
-                .as_deref()
-                .is_none_or(|after| row.key.as_slice() > after)
+        );
+        let mut filtered = BackendKvRowBatch::new();
+        for index in 0..rows.len() {
+            let key = rows.key(index).expect("row key exists");
+            if request.after.as_deref().is_none_or(|after| key > after) {
+                match request.projection {
+                    BackendKvScanProjection::KeysOnly => filtered.push_key_only(key.to_vec()),
+                    BackendKvScanProjection::KeysAndValues => filtered.push_value(
+                        key.to_vec(),
+                        rows.value(index).expect("scan value exists").to_vec(),
+                    ),
+                }
+            }
+        }
+        let has_more = filtered.len() > request.limit;
+        filtered.truncate(request.limit);
+        let resume_after = has_more.then(|| filtered.last_key_cloned()).flatten();
+        Ok(BackendKvScanBatch {
+            rows: filtered,
+            resume_after,
         })
-        .collect::<Vec<_>>();
-        let has_more = rows.len() > request.limit;
-        rows.truncate(request.limit);
-        let resume_after = has_more
-            .then(|| rows.last().map(|row| row.key.clone()))
-            .flatten();
-        Ok(BackendKvScanResult { rows, resume_after })
     }
 
     async fn rollback(mut self: Box<Self>) -> Result<(), LixError> {
@@ -811,24 +822,28 @@ impl BackendWriteTransaction for AccountingTransaction {
 fn scan_store(
     store: &Store,
     namespace: &str,
-    range: BackendKvScanRange,
+    range: &BackendKvScanRange,
     limit: Option<usize>,
-) -> Vec<BackendKvPair> {
+) -> BackendKvRowBatch {
     let mut pairs = Vec::new();
     for ((row_namespace, key), value) in store.iter() {
         if row_namespace != namespace {
             continue;
         }
-        let matches = match &range {
+        let matches = match range {
             BackendKvScanRange::Prefix(prefix) => key.starts_with(prefix),
             BackendKvScanRange::Range { start, end } => key >= start && key < end,
         };
         if matches {
-            pairs.push(BackendKvPair::new(key.clone(), value.clone()));
+            pairs.push((key.clone(), value.clone()));
         }
         if limit.is_some_and(|limit| pairs.len() >= limit) {
             break;
         }
     }
-    pairs
+    let mut rows = BackendKvRowBatch::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        rows.push_value(key, value);
+    }
+    rows
 }

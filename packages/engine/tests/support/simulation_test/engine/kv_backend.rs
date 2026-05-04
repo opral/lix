@@ -3,10 +3,11 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lix_engine::{
-    Backend, BackendKvGetGroup, BackendKvGetRequest, BackendKvGetResult, BackendKvGetResultGroup,
-    BackendKvPair, BackendKvPut, BackendKvScanRange, BackendKvScanRequest, BackendKvScanResult,
-    BackendKvWriteBatch, BackendKvWriteGroup, BackendKvWriteStats, BackendReadTransaction,
-    BackendWriteTransaction, LixError,
+    Backend, BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetGroup, BackendKvGetProjection,
+    BackendKvGetRequest, BackendKvPut, BackendKvRowBatch, BackendKvScanBatch,
+    BackendKvScanProjection, BackendKvScanRange, BackendKvScanRequest, BackendKvWriteBatch,
+    BackendKvWriteGroup, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
+    LixError,
 };
 
 pub(crate) type KvKey = (String, Vec<u8>);
@@ -71,32 +72,34 @@ impl BackendReadTransaction for InMemoryKvTransaction {
     async fn get_kv_many(
         &mut self,
         request: BackendKvGetRequest,
-    ) -> Result<BackendKvGetResult, LixError> {
+    ) -> Result<BackendKvGetBatch, LixError> {
         let data = self.data.lock().expect("in-memory backend lock poisoned");
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
-            let mut values = Vec::with_capacity(group.keys.len());
+            let mut rows = BackendKvRowBatch::with_capacity(group.keys.len());
             for key in group.keys {
-                let identity = (group.namespace.clone(), key);
-                values.push(
+                let identity = (group.namespace.clone(), key.clone());
+                rows.push_get_projection(
+                    key,
                     self.pending
                         .get(&identity)
                         .cloned()
                         .unwrap_or_else(|| data.get(&identity).cloned()),
+                    request.projection,
                 );
             }
-            groups.push(BackendKvGetResultGroup {
+            groups.push(BackendKvGetBatchGroup {
                 namespace: group.namespace,
-                values,
+                rows,
             });
         }
-        Ok(BackendKvGetResult { groups })
+        Ok(BackendKvGetBatch { groups })
     }
 
     async fn scan_kv(
         &mut self,
         request: BackendKvScanRequest,
-    ) -> Result<BackendKvScanResult, LixError> {
+    ) -> Result<BackendKvScanBatch, LixError> {
         let mut visible = self
             .data
             .lock()
@@ -122,21 +125,26 @@ impl BackendReadTransaction for InMemoryKvTransaction {
             &request.range,
             Some(scan_limit),
         );
-        let mut rows = rows
-            .into_iter()
-            .filter(|row| {
-                request
-                    .after
-                    .as_deref()
-                    .is_none_or(|after| row.key.as_slice() > after)
-            })
-            .collect::<Vec<_>>();
-        let has_more = rows.len() > request.limit;
-        rows.truncate(request.limit);
-        let resume_after = has_more
-            .then(|| rows.last().map(|row| row.key.clone()))
-            .flatten();
-        Ok(BackendKvScanResult { rows, resume_after })
+        let mut filtered = BackendKvRowBatch::new();
+        for index in 0..rows.len() {
+            let key = rows.key(index).expect("row key exists");
+            if request.after.as_deref().is_none_or(|after| key > after) {
+                match request.projection {
+                    BackendKvScanProjection::KeysOnly => filtered.push_key_only(key.to_vec()),
+                    BackendKvScanProjection::KeysAndValues => filtered.push_value(
+                        key.to_vec(),
+                        rows.value(index).expect("scan value exists").to_vec(),
+                    ),
+                }
+            }
+        }
+        let has_more = filtered.len() > request.limit;
+        filtered.truncate(request.limit);
+        let resume_after = has_more.then(|| filtered.last_key_cloned()).flatten();
+        Ok(BackendKvScanBatch {
+            rows: filtered,
+            resume_after,
+        })
     }
 
     async fn rollback(mut self: Box<Self>) -> Result<(), LixError> {
@@ -194,21 +202,25 @@ fn scan_map(
     namespace: &str,
     range: &BackendKvScanRange,
     limit: Option<usize>,
-) -> Vec<BackendKvPair> {
+) -> BackendKvRowBatch {
     let mut pairs = map
         .iter()
         .filter_map(|((entry_namespace, key), value)| {
             if entry_namespace != namespace || !key_in_range(key, range) {
                 return None;
             }
-            Some(BackendKvPair::new(key.clone(), value.clone()))
+            Some((key.clone(), value.clone()))
         })
         .collect::<Vec<_>>();
-    pairs.sort_by(|left, right| left.key.cmp(&right.key));
+    pairs.sort_by(|left, right| left.0.cmp(&right.0));
     if let Some(limit) = limit {
         pairs.truncate(limit);
     }
-    pairs
+    let mut rows = BackendKvRowBatch::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        rows.push_value(key, value);
+    }
+    rows
 }
 
 fn key_in_range(key: &[u8], range: &BackendKvScanRange) -> bool {
@@ -268,13 +280,14 @@ mod tests {
                 namespace: namespace.to_string(),
                 keys: vec![key.to_vec()],
             }],
+            projection: BackendKvGetProjection::Values,
         })
         .await
         .expect("get should succeed")
         .groups
         .remove(0)
-        .values
-        .remove(0)
+        .rows
+        .pop_value()
     }
 
     async fn committed_get(
@@ -296,12 +309,13 @@ mod tests {
         namespace: &str,
         range: BackendKvScanRange,
         limit: Option<usize>,
-    ) -> Vec<BackendKvPair> {
+    ) -> BackendKvRowBatch {
         tx.scan_kv(BackendKvScanRequest {
             namespace: namespace.to_string(),
             range,
             after: None,
             limit: limit.unwrap_or(usize::MAX),
+            projection: BackendKvScanProjection::KeysAndValues,
         })
         .await
         .expect("scan should succeed")
@@ -366,12 +380,9 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(
-            rows,
-            vec![
-                BackendKvPair::new(b"a".to_vec(), b"new".to_vec()),
-                BackendKvPair::new(b"c".to_vec(), b"three".to_vec()),
-            ]
-        );
+        assert_eq!(rows.key(0), Some(&b"a"[..]));
+        assert_eq!(rows.value(0), Some(&b"new"[..]));
+        assert_eq!(rows.key(1), Some(&b"c"[..]));
+        assert_eq!(rows.value(1), Some(&b"three"[..]));
     }
 }
