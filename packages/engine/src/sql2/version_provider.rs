@@ -24,7 +24,7 @@ use serde_json::Value as JsonValue;
 
 use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateScanRequest};
 use crate::sql2::record_batch::record_batch_with_row_count;
-use crate::sql2::write_normalization::UpdateAssignmentValues;
+use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValues};
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
@@ -932,18 +932,17 @@ fn update_string_value(
     column_name: &str,
 ) -> Result<String> {
     let column_index = table_schema.index_of(column_name)?;
-    match assignment_values.scalar_value(batch, row_index, column_name)? {
-        None => required_string_value(batch, row_index, column_name, "UPDATE"),
-        Some(ScalarValue::Utf8(Some(value)))
-        | Some(ScalarValue::Utf8View(Some(value)))
-        | Some(ScalarValue::LargeUtf8(Some(value))) => Ok(value),
-        Some(ScalarValue::Null)
-        | Some(ScalarValue::Utf8(None))
-        | Some(ScalarValue::Utf8View(None))
-        | Some(ScalarValue::LargeUtf8(None)) => Err(DataFusionError::Execution(format!(
+    match assignment_values.effective_cell(batch, row_index, column_name)? {
+        InsertCell::Omitted => required_string_value(batch, row_index, column_name, "UPDATE"),
+        InsertCell::Provided(SqlCell::Value(
+            ScalarValue::Utf8(Some(value))
+            | ScalarValue::Utf8View(Some(value))
+            | ScalarValue::LargeUtf8(Some(value)),
+        )) => Ok(value),
+        InsertCell::Provided(SqlCell::Null) => Err(DataFusionError::Execution(format!(
             "UPDATE lix_version requires non-null text column '{column_name}'"
         ))),
-        Some(other) => Err(DataFusionError::Execution(format!(
+        InsertCell::Provided(SqlCell::Value(other)) => Err(DataFusionError::Execution(format!(
             "UPDATE lix_version expected text-compatible column '{column_name}', got {other:?}"
         ))),
     }
@@ -966,15 +965,13 @@ fn update_bool_value(
     column_name: &str,
 ) -> Result<bool> {
     let column_index = table_schema.index_of(column_name)?;
-    match assignment_values.scalar_value(batch, row_index, column_name)? {
-        None => required_bool_value(batch, row_index, column_name, "UPDATE"),
-        Some(ScalarValue::Boolean(Some(value))) => Ok(value),
-        Some(ScalarValue::Null) | Some(ScalarValue::Boolean(None)) => {
-            Err(DataFusionError::Execution(format!(
-                "UPDATE lix_version requires non-null boolean column '{column_name}'"
-            )))
-        }
-        Some(other) => Err(DataFusionError::Execution(format!(
+    match assignment_values.effective_cell(batch, row_index, column_name)? {
+        InsertCell::Omitted => required_bool_value(batch, row_index, column_name, "UPDATE"),
+        InsertCell::Provided(SqlCell::Value(ScalarValue::Boolean(Some(value)))) => Ok(value),
+        InsertCell::Provided(SqlCell::Null) => Err(DataFusionError::Execution(format!(
+            "UPDATE lix_version requires non-null boolean column '{column_name}'"
+        ))),
+        InsertCell::Provided(SqlCell::Value(other)) => Err(DataFusionError::Execution(format!(
             "UPDATE lix_version expected boolean column '{column_name}', got {other:?}"
         ))),
     }

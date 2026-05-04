@@ -36,7 +36,9 @@ use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
 };
-use crate::sql2::write_normalization::UpdateAssignmentValues;
+use crate::sql2::write_normalization::{
+    InsertCell, InsertColumnIntents, SqlCell, UpdateAssignmentValues,
+};
 use crate::transaction::types::StageRow;
 use crate::version::VersionRefReader;
 use crate::LixError;
@@ -173,7 +175,6 @@ pub(super) struct EntitySurfaceSpec {
     pub(super) primary_key_paths: Vec<Vec<String>>,
     pub(super) visible_columns: Vec<String>,
     pub(super) column_types: BTreeMap<String, EntityColumnType>,
-    defaulted_columns: BTreeSet<String>,
 }
 
 pub(crate) struct EntityProvider {
@@ -355,6 +356,7 @@ impl TableProvider for EntityProvider {
         let sink = EntityInsertSink::new(
             Arc::clone(&self.spec),
             input.schema(),
+            InsertColumnIntents::from_input(&input),
             write_ctx.clone(),
             insert_version_binding,
         );
@@ -468,6 +470,7 @@ impl TableProvider for EntityProvider {
 struct EntityInsertSink {
     spec: Arc<EntitySurfaceSpec>,
     schema: SchemaRef,
+    insert_column_intents: InsertColumnIntents,
     write_ctx: SqlWriteContext,
     version_binding: VersionBinding,
 }
@@ -484,12 +487,14 @@ impl EntityInsertSink {
     fn new(
         spec: Arc<EntitySurfaceSpec>,
         schema: SchemaRef,
+        insert_column_intents: InsertColumnIntents,
         write_ctx: SqlWriteContext,
         version_binding: VersionBinding,
     ) -> Self {
         Self {
             spec,
             schema,
+            insert_column_intents,
             write_ctx,
             version_binding,
         }
@@ -527,6 +532,7 @@ impl DataSink for EntityInsertSink {
             rows.extend(entity_lix_state_write_rows_from_batch(
                 &self.spec,
                 &batch,
+                &self.insert_column_intents,
                 self.version_binding.active_version_id(),
             )?);
         }
@@ -1018,11 +1024,13 @@ fn entity_update_snapshot_content_from_batch(
                 spec.schema_key, column_name
             ))
         })?;
-        let value = entity_update_scalar_value(batch, assignment_values, row_index, column_name)?;
-        let value = entity_json_value_from_scalar(value, *column_type)?;
-        if value.is_null() && spec.defaulted_columns.contains(column_name) {
-            continue;
-        }
+        let value = entity_update_json_value(
+            batch,
+            assignment_values,
+            row_index,
+            column_name,
+            *column_type,
+        )?;
         object.insert(column_name.clone(), value);
     }
     serde_json::to_string(&JsonValue::Object(object)).map_err(|error| {
@@ -1039,28 +1047,32 @@ fn entity_update_optional_string_value(
     row_index: usize,
     column_name: &str,
 ) -> Result<Option<String>> {
-    match entity_update_scalar_value(batch, assignment_values, row_index, column_name)? {
-        None
-        | Some(ScalarValue::Null)
-        | Some(ScalarValue::Utf8(None))
-        | Some(ScalarValue::Utf8View(None))
-        | Some(ScalarValue::LargeUtf8(None)) => Ok(None),
-        Some(ScalarValue::Utf8(Some(value)))
-        | Some(ScalarValue::Utf8View(Some(value)))
-        | Some(ScalarValue::LargeUtf8(Some(value))) => Ok(Some(value)),
-        Some(other) => Err(DataFusionError::Execution(format!(
+    match assignment_values.effective_cell(batch, row_index, column_name)? {
+        InsertCell::Omitted | InsertCell::Provided(SqlCell::Null) => Ok(None),
+        InsertCell::Provided(SqlCell::Value(
+            ScalarValue::Utf8(Some(value))
+            | ScalarValue::Utf8View(Some(value))
+            | ScalarValue::LargeUtf8(Some(value)),
+        )) => Ok(Some(value)),
+        InsertCell::Provided(SqlCell::Value(other)) => Err(DataFusionError::Execution(format!(
             "UPDATE entity surface expected text-compatible column '{column_name}', got {other:?}"
         ))),
     }
 }
 
-fn entity_update_scalar_value(
+fn entity_update_json_value(
     batch: &RecordBatch,
     assignment_values: &UpdateAssignmentValues,
     row_index: usize,
     column_name: &str,
-) -> Result<Option<ScalarValue>> {
-    assignment_values.scalar_value(batch, row_index, column_name)
+    column_type: EntityColumnType,
+) -> Result<JsonValue> {
+    match assignment_values.effective_cell(batch, row_index, column_name)? {
+        InsertCell::Omitted | InsertCell::Provided(SqlCell::Null) => Ok(JsonValue::Null),
+        InsertCell::Provided(SqlCell::Value(value)) => {
+            entity_json_value_from_scalar(Some(value), column_type)
+        }
+    }
 }
 
 fn dml_count_schema() -> SchemaRef {
@@ -1082,9 +1094,16 @@ fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
 fn entity_lix_state_write_rows_from_batch(
     spec: &EntitySurfaceSpec,
     batch: &RecordBatch,
+    insert_column_intents: &InsertColumnIntents,
     version_binding: Option<&str>,
 ) -> Result<Vec<StageRow>> {
-    entity_lix_state_write_rows_from_batch_with_options(spec, batch, version_binding, true)
+    entity_lix_state_write_rows_from_batch_with_options(
+        spec,
+        batch,
+        insert_column_intents,
+        version_binding,
+        true,
+    )
 }
 
 fn entity_existing_lix_state_write_rows_from_batch(
@@ -1092,12 +1111,19 @@ fn entity_existing_lix_state_write_rows_from_batch(
     batch: &RecordBatch,
     version_binding: Option<&str>,
 ) -> Result<Vec<StageRow>> {
-    entity_lix_state_write_rows_from_batch_with_options(spec, batch, version_binding, false)
+    entity_lix_state_write_rows_from_batch_with_options(
+        spec,
+        batch,
+        &InsertColumnIntents::all_explicit(),
+        version_binding,
+        false,
+    )
 }
 
 fn entity_lix_state_write_rows_from_batch_with_options(
     spec: &EntitySurfaceSpec,
     batch: &RecordBatch,
+    insert_column_intents: &InsertColumnIntents,
     version_binding: Option<&str>,
     reject_read_only_fields: bool,
 ) -> Result<Vec<StageRow>> {
@@ -1144,7 +1170,8 @@ fn entity_lix_state_write_rows_from_batch_with_options(
                         spec.schema_key
                     ))
                 })?;
-            let snapshot_content = entity_snapshot_content_from_batch(spec, batch, row_index)?;
+            let snapshot_content =
+                entity_snapshot_content_from_batch(spec, batch, insert_column_intents, row_index)?;
             let explicit_entity_id = optional_string_value(batch, row_index, "lixcol_entity_id")?;
             let entity_id = if spec.primary_key_paths.is_empty() {
                 let entity_id = explicit_entity_id.ok_or_else(|| {
@@ -1195,29 +1222,26 @@ fn entity_lix_state_write_rows_from_batch_with_options(
 fn entity_snapshot_content_from_batch(
     spec: &EntitySurfaceSpec,
     batch: &RecordBatch,
+    insert_column_intents: &InsertColumnIntents,
     row_index: usize,
 ) -> Result<String> {
     let mut object = serde_json::Map::new();
     for column_name in &spec.visible_columns {
-        if !batch
-            .schema()
-            .fields()
-            .iter()
-            .any(|field| field.name() == column_name)
-        {
-            continue;
-        }
         let column_type = spec.column_types.get(column_name).ok_or_else(|| {
             DataFusionError::Execution(format!(
                 "entity surface '{}' is missing type metadata for '{}'",
                 spec.schema_key, column_name
             ))
         })?;
-        let value = optional_scalar_value(batch, row_index, column_name)?;
-        let value = entity_json_value_from_scalar(value, *column_type)?;
-        if value.is_null() && spec.defaulted_columns.contains(column_name) {
-            continue;
-        }
+        let value = match insert_column_intents.cell(batch, row_index, column_name)? {
+            InsertCell::Omitted => {
+                continue;
+            }
+            InsertCell::Provided(SqlCell::Null) => JsonValue::Null,
+            InsertCell::Provided(SqlCell::Value(value)) => {
+                entity_json_value_from_scalar(Some(value), *column_type)?
+            }
+        };
         object.insert(column_name.clone(), value);
     }
     serde_json::to_string(&JsonValue::Object(object)).map_err(|error| {
@@ -1818,19 +1842,6 @@ fn derive_entity_surface_spec_from_schema(
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
-    let defaulted_columns = schema
-        .get("properties")
-        .and_then(JsonValue::as_object)
-        .map(|properties| {
-            properties
-                .iter()
-                .filter(|(key, property_schema)| {
-                    !key.starts_with("lixcol_") && property_schema_has_default(property_schema)
-                })
-                .map(|(key, _)| key.clone())
-                .collect::<BTreeSet<_>>()
-        })
-        .unwrap_or_default();
     let primary_key_paths = parse_primary_key_paths(schema)?;
 
     Ok(EntitySurfaceSpec {
@@ -1839,12 +1850,7 @@ fn derive_entity_surface_spec_from_schema(
         primary_key_paths,
         visible_columns,
         column_types,
-        defaulted_columns,
     })
-}
-
-fn property_schema_has_default(schema: &JsonValue) -> bool {
-    schema.get("x-lix-default").is_some() || schema.get("default").is_some()
 }
 
 fn parse_primary_key_paths(schema: &JsonValue) -> std::result::Result<Vec<Vec<String>>, LixError> {
@@ -2004,6 +2010,7 @@ mod tests {
     use crate::live_state::{
         LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
+    use crate::sql2::write_normalization::InsertColumnIntents;
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
     use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWriteOutcome};
     use crate::version::{VersionHead, VersionRefReader};
@@ -2419,9 +2426,13 @@ mod tests {
     #[test]
     fn decodes_by_version_entity_insert_into_lix_state_write_row() {
         let spec = entity_insert_spec();
-        let rows =
-            entity_lix_state_write_rows_from_batch(&spec, &entity_insert_batch(true, false), None)
-                .expect("entity batch should decode");
+        let rows = entity_lix_state_write_rows_from_batch(
+            &spec,
+            &entity_insert_batch(true, false),
+            &InsertColumnIntents::all_explicit(),
+            None,
+        )
+        .expect("entity batch should decode");
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
@@ -2457,6 +2468,7 @@ mod tests {
         let rows = entity_lix_state_write_rows_from_batch(
             &spec,
             &primary_key_entity_insert_batch(false),
+            &InsertColumnIntents::all_explicit(),
             None,
         )
         .expect("entity batch should decode");
@@ -2484,6 +2496,7 @@ mod tests {
         let rows = entity_lix_state_write_rows_from_batch(
             &spec,
             &primary_key_entity_insert_batch(true),
+            &InsertColumnIntents::all_explicit(),
             None,
         )
         .expect("primary-key entity insert should stage explicit lixcol_entity_id");
@@ -2501,6 +2514,7 @@ mod tests {
         let rows = entity_lix_state_write_rows_from_batch(
             &spec,
             &entity_insert_batch(false, false),
+            &InsertColumnIntents::all_explicit(),
             Some("version-active"),
         )
         .expect("active entity batch should decode");
@@ -2513,9 +2527,13 @@ mod tests {
     #[test]
     fn by_version_entity_insert_requires_version_id_for_non_global_rows() {
         let spec = entity_insert_spec();
-        let error =
-            entity_lix_state_write_rows_from_batch(&spec, &entity_insert_batch(false, false), None)
-                .expect_err("by-version entity insert should require version id");
+        let error = entity_lix_state_write_rows_from_batch(
+            &spec,
+            &entity_insert_batch(false, false),
+            &InsertColumnIntents::all_explicit(),
+            None,
+        )
+        .expect_err("by-version entity insert should require version id");
 
         assert!(
             error.to_string().contains("requires lixcol_version_id"),
@@ -2526,9 +2544,13 @@ mod tests {
     #[test]
     fn by_version_entity_insert_global_row_uses_global_version() {
         let spec = entity_insert_spec();
-        let rows =
-            entity_lix_state_write_rows_from_batch(&spec, &entity_insert_batch(false, true), None)
-                .expect("global entity batch should decode");
+        let rows = entity_lix_state_write_rows_from_batch(
+            &spec,
+            &entity_insert_batch(false, true),
+            &InsertColumnIntents::all_explicit(),
+            None,
+        )
+        .expect("global entity batch should decode");
 
         assert_eq!(rows.len(), 1);
         assert!(rows[0].global);
@@ -2544,6 +2566,7 @@ mod tests {
         let sink = EntityInsertSink::new(
             Arc::clone(&spec),
             batch.schema(),
+            InsertColumnIntents::all_explicit(),
             write_ctx,
             super::VersionBinding::explicit(),
         );

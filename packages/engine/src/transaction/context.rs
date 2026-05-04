@@ -308,7 +308,10 @@ impl SqlWriteExecutionContext for Transaction {
         Ok(self.visible_schemas.clone())
     }
 
-    async fn load_blob_data_by_hash(&mut self, blob_hash: &str) -> Result<Option<Vec<u8>>, LixError> {
+    async fn load_blob_data_by_hash(
+        &mut self,
+        blob_hash: &str,
+    ) -> Result<Option<Vec<u8>>, LixError> {
         self.binary_cas
             .reader(self.storage_transaction.as_mut())
             .load_blob_data_by_hash(blob_hash)
