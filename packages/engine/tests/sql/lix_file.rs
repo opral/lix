@@ -5,6 +5,72 @@ use lix_engine::Value;
 use super::assert_rows_eq;
 
 simulation_test!(
+    lix_file_path_insert_rejects_overlong_paths_and_segments,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let long_segment = "a".repeat(256);
+        let segment_error = session
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ('file-long-segment', $1)",
+                &[Value::Text(format!("/{long_segment}"))],
+            )
+            .await
+            .expect_err("overlong file path segment should be rejected");
+        assert_eq!(segment_error.code, "LIX_ERROR_PATH_SEGMENT_TOO_LONG");
+
+        let long_path = format!("/{}", ["abcd"; 820].join("/"));
+        let path_error = session
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ('file-long-path', $1)",
+                &[Value::Text(long_path)],
+            )
+            .await
+            .expect_err("overlong file path should be rejected");
+        assert_eq!(path_error.code, "LIX_ERROR_PATH_TOO_LONG");
+
+        let encoded_segment_at_limit = "%61".repeat(255);
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ('file-encoded-limit', $1)",
+                &[Value::Text(format!("/{encoded_segment_at_limit}"))],
+            )
+            .await
+            .expect("percent-encoded segment should be measured after canonicalization");
+
+        let encoded_segment_over_limit = "%61".repeat(256);
+        let encoded_segment_error = session
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ('file-encoded-over-limit', $1)",
+                &[Value::Text(format!("/{encoded_segment_over_limit}"))],
+            )
+            .await
+            .expect_err("overlong canonical segment should be rejected");
+        assert_eq!(
+            encoded_segment_error.code,
+            "LIX_ERROR_PATH_SEGMENT_TOO_LONG"
+        );
+
+        let huge_path = format!("/{}", "a".repeat(1024 * 1024));
+        let huge_error = session
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ('file-huge-path', $1)",
+                &[Value::Text(huge_path)],
+            )
+            .await
+            .expect_err("huge path input should be rejected without runtime internals");
+        assert_eq!(huge_error.code, "LIX_ERROR_PATH_INPUT_TOO_LONG");
+    }
+);
+
+simulation_test!(
     lix_file_path_insert_rejects_percent_encoded_forbidden_code_points,
     |sim| async move {
         let engine = sim.boot_engine().await;

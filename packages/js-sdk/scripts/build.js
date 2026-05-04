@@ -77,8 +77,9 @@ async function normalizeWasmBindgenOutput(outputDir) {
 	const generatedWasmTypes = join(outputDir, `${wasmBindgenOutName}_bg.wasm.d.ts`);
 	const normalizedWasm = join(outputDir, `${wasmBindgenOutName}.wasm`);
 	const normalizedWasmTypes = join(outputDir, `${wasmBindgenOutName}.wasm.d.ts`);
-	await rename(generatedWasm, normalizedWasm);
-	await rename(generatedWasmTypes, normalizedWasmTypes);
+	const fsmod = await import("node:fs");
+	if (fsmod.existsSync(generatedWasm)) await rename(generatedWasm, normalizedWasm);
+	if (fsmod.existsSync(generatedWasmTypes)) await rename(generatedWasmTypes, normalizedWasmTypes);
 
 	const jsPath = join(outputDir, `${wasmBindgenOutName}.js`);
 	const js = await readFile(jsPath, "utf8");
