@@ -10,6 +10,7 @@ use crate::storage::{
     KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
 };
 use crate::LixError;
+use std::collections::HashSet;
 
 pub(crate) const BINARY_CAS_MANIFEST_NAMESPACE: &str = "binary_cas.manifest";
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifest_chunk";
@@ -209,8 +210,38 @@ pub(crate) async fn load_blob_data_by_hash(
     }
 
     let mut out = Vec::with_capacity(manifest.size_bytes as usize);
-    for manifest_chunk in manifest_chunks {
-        let Some(chunk) = load_chunk(store, &manifest_chunk.chunk_hash).await? else {
+    let chunk_keys = manifest_chunks
+        .iter()
+        .map(|manifest_chunk| chunk_key(&manifest_chunk.chunk_hash))
+        .collect::<Vec<_>>();
+    let chunk_rows = store
+        .get_kv_many(KvGetRequest {
+            groups: vec![KvGetGroup {
+                namespace: BINARY_CAS_CHUNK_NAMESPACE.to_string(),
+                keys: chunk_keys,
+            }],
+            projection: KvGetProjection::Values,
+        })
+        .await?
+        .groups
+        .into_iter()
+        .next()
+        .map(|group| group.rows)
+        .unwrap_or_default();
+    if chunk_rows.len() != manifest_chunks.len() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "binary CAS blob '{}' expected {} chunk rows, got {}",
+                blob_hash,
+                manifest_chunks.len(),
+                chunk_rows.len()
+            ),
+        ));
+    }
+
+    for (index, manifest_chunk) in manifest_chunks.iter().enumerate() {
+        let Some(chunk_bytes) = chunk_rows.value(index) else {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!(
@@ -219,6 +250,7 @@ pub(crate) async fn load_blob_data_by_hash(
                 ),
             ));
         };
+        let chunk = decode_json::<KvChunk>(chunk_bytes, "binary CAS chunk")?;
         let decoded = decode_binary_chunk_payload(
             &chunk.data,
             Some(&chunk.codec),
@@ -255,52 +287,75 @@ pub(crate) async fn persist_blob_writes_in_transaction(
     writer: &mut impl StorageWriter,
     writes: &[BinaryBlobWrite<'_>],
 ) -> Result<(), LixError> {
+    let mut batch = KvWriteBatch::new();
+    let mut blob_hashes = HashSet::new();
+    let mut chunk_keys = HashSet::new();
+
     for write in writes {
-        persist_one_blob_write(writer, write).await?;
+        stage_blob_write(&mut batch, &mut blob_hashes, &mut chunk_keys, write)?;
+    }
+    if !batch.is_empty() {
+        writer.write_kv_batch(batch).await?;
     }
     Ok(())
 }
 
-async fn persist_one_blob_write(
-    writer: &mut impl StorageWriter,
+fn stage_blob_write(
+    batch: &mut KvWriteBatch,
+    blob_hashes: &mut HashSet<String>,
+    chunk_keys: &mut HashSet<Vec<u8>>,
     write: &BinaryBlobWrite<'_>,
 ) -> Result<(), LixError> {
     let blob_hash = binary_blob_hash_hex(write.data);
+    if !blob_hashes.insert(blob_hash.clone()) {
+        return Ok(());
+    }
+
     let chunk_ranges = fastcdc_chunk_ranges(write.data);
-    put_manifest(
-        writer,
-        &blob_hash,
-        &KvBlobManifest {
-            size_bytes: write.data.len() as u64,
-            chunk_count: chunk_ranges.len() as u64,
-        },
-    )
-    .await?;
+    let manifest_key = manifest_key(&blob_hash);
+    batch.put(
+        BINARY_CAS_MANIFEST_NAMESPACE,
+        manifest_key,
+        encode_json(
+            &KvBlobManifest {
+                size_bytes: write.data.len() as u64,
+                chunk_count: chunk_ranges.len() as u64,
+            },
+            "binary CAS manifest",
+        )?,
+    );
 
     for (chunk_index, (start, end)) in chunk_ranges.into_iter().enumerate() {
         let chunk_data = &write.data[start..end];
-        let encoded_chunk = encode_binary_chunk_payload(chunk_data)?;
         let chunk_hash = binary_blob_hash_hex(chunk_data);
-        put_chunk(
-            writer,
-            &chunk_hash,
-            &KvChunk {
-                codec: encoded_chunk.codec.to_string(),
-                codec_dict_id: encoded_chunk.codec_dict_id,
-                data: encoded_chunk.data,
-            },
-        )
-        .await?;
-        put_manifest_chunk(
-            writer,
-            &blob_hash,
-            chunk_index as u64,
-            &KvBlobManifestChunk {
-                chunk_hash,
-                chunk_size: chunk_data.len() as u64,
-            },
-        )
-        .await?;
+        let chunk_key = chunk_key(&chunk_hash);
+        if chunk_keys.insert(chunk_key.clone()) {
+            let encoded_chunk = encode_binary_chunk_payload(chunk_data)?;
+            batch.put(
+                BINARY_CAS_CHUNK_NAMESPACE,
+                chunk_key,
+                encode_json(
+                    &KvChunk {
+                        codec: encoded_chunk.codec.to_string(),
+                        codec_dict_id: encoded_chunk.codec_dict_id,
+                        data: encoded_chunk.data,
+                    },
+                    "binary CAS chunk",
+                )?,
+            );
+        }
+
+        batch.put(
+            BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
+            manifest_chunk_key(&blob_hash, chunk_index as u64),
+            encode_json(
+                &KvBlobManifestChunk {
+                    chunk_hash,
+                    chunk_size: chunk_data.len() as u64,
+                },
+                "binary CAS manifest chunk",
+            )?,
+        );
     }
     Ok(())
 }
