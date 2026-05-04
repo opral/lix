@@ -470,6 +470,13 @@ function normalizeThrownError(error: unknown): LixError {
 		return createLixError(error.code, message, { hint, details });
 	}
 
+	if (error instanceof WebAssembly.RuntimeError) {
+		return createLixError("LIX_WASM_RUNTIME_ERROR", error.message, {
+			hint: "The Lix engine encountered a WebAssembly runtime trap. Please report this as an engine bug with the SQL statement or API call that triggered it.",
+			cause: error,
+		});
+	}
+
 	if (error instanceof Error) {
 		return createLixError("LIX_ERROR_UNKNOWN", error.message, { cause: error });
 	}

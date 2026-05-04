@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lix_engine::{
-    Backend, BackendTransaction, CreateVersionOptions, CreateVersionReceipt as CreateVersionResult,
-    Engine, ExecuteResult, KvPair, KvScanRange, LixError, MergeVersionOptions,
-    MergeVersionReceipt as MergeVersionResult, SessionContext, SwitchVersionOptions,
-    SwitchVersionReceipt as SwitchVersionResult, TransactionBeginMode, Value,
+    Backend, BackendReadTransaction, BackendWriteTransaction, CreateVersionOptions,
+    CreateVersionReceipt as CreateVersionResult, Engine, ExecuteResult, LixError,
+    MergeVersionOptions, MergeVersionReceipt as MergeVersionResult, SessionContext,
+    SwitchVersionOptions, SwitchVersionReceipt as SwitchVersionResult, Value,
 };
 
 use crate::in_memory_backend::InMemoryBackend;
@@ -118,24 +118,16 @@ impl SharedBackend {
 
 #[async_trait]
 impl Backend for SharedBackend {
-    async fn begin_transaction(
+    async fn begin_read_transaction(
         &self,
-        mode: TransactionBeginMode,
-    ) -> Result<Box<dyn BackendTransaction + Send + Sync + 'static>, LixError> {
-        self.inner.begin_transaction(mode).await
+    ) -> Result<Box<dyn BackendReadTransaction + Send + Sync + 'static>, LixError> {
+        self.inner.begin_read_transaction().await
     }
 
-    async fn kv_get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
-        self.inner.kv_get(namespace, key).await
-    }
-
-    async fn kv_scan(
+    async fn begin_write_transaction(
         &self,
-        namespace: &str,
-        range: KvScanRange,
-        limit: Option<usize>,
-    ) -> Result<Vec<KvPair>, LixError> {
-        self.inner.kv_scan(namespace, range, limit).await
+    ) -> Result<Box<dyn BackendWriteTransaction + Send + Sync + 'static>, LixError> {
+        self.inner.begin_write_transaction().await
     }
 
     async fn destroy(&self) -> Result<(), LixError> {
