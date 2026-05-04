@@ -7,7 +7,8 @@ mod wasm {
         BackendKvGetResultGroup, BackendKvPair, BackendKvScanRange, BackendKvScanRequest,
         BackendKvScanResult, BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction,
         BackendWriteTransaction, CreateVersionOptions, ExecuteResult, Lix as RsLix, LixError,
-        MergeVersionOptions, OpenLixOptions, SwitchVersionOptions, Value,
+        MergeVersionOptions, MergeVersionPreviewOptions, OpenLixOptions, SwitchVersionOptions,
+        Value,
     };
     use serde::Serialize;
     use serde_json::json;
@@ -111,12 +112,45 @@ export type MergeVersionResult = {
   outcome: MergeVersionOutcome;
   targetVersionId: string;
   sourceVersionId: string;
-  mergeBaseCommitId: string | null;
+  baseCommitId: string;
   targetHeadBeforeCommitId: string;
   sourceHeadBeforeCommitId: string;
   targetHeadAfterCommitId: string;
   createdMergeCommitId: string | null;
-  appliedChangeCount: number;
+  changeStats: MergeChangeStats;
+};
+
+export type MergeVersionPreviewResult = {
+  outcome: MergeVersionOutcome;
+  targetVersionId: string;
+  sourceVersionId: string;
+  baseCommitId: string;
+  targetHeadCommitId: string;
+  sourceHeadCommitId: string;
+  changeStats: MergeChangeStats;
+  conflicts: MergeConflict[];
+};
+
+export type MergeChangeStats = {
+  total: number;
+  added: number;
+  modified: number;
+  removed: number;
+};
+
+export type MergeConflict = {
+  kind: "sameEntityChanged";
+  schemaKey: string;
+  entityId: string;
+  fileId: string | null;
+  target: MergeConflictSide;
+  source: MergeConflictSide;
+};
+
+export type MergeConflictSide = {
+  kind: "added" | "modified" | "removed";
+  beforeChangeId: string | null;
+  afterChangeId: string | null;
 };
 "#;
 
@@ -186,6 +220,17 @@ export type MergeVersionResult = {
             Ok(object.into())
         }
 
+        #[wasm_bindgen(js_name = mergeVersionPreview)]
+        pub async fn merge_version_preview(&self, args: JsValue) -> Result<JsValue, JsValue> {
+            let options = parse_merge_version_preview_options(args).map_err(js_error)?;
+            let result = self
+                .inner
+                .merge_version_preview(options)
+                .await
+                .map_err(js_error)?;
+            merge_version_preview_to_js(result).map_err(js_error)
+        }
+
         #[wasm_bindgen(js_name = mergeVersion)]
         pub async fn merge_version(&self, args: JsValue) -> Result<JsValue, JsValue> {
             let options = parse_merge_version_options(args).map_err(js_error)?;
@@ -199,12 +244,7 @@ export type MergeVersionResult = {
             set_string(&object, "outcome", outcome).map_err(js_error)?;
             set_string(&object, "targetVersionId", &result.target_version_id).map_err(js_error)?;
             set_string(&object, "sourceVersionId", &result.source_version_id).map_err(js_error)?;
-            set_optional_string(
-                &object,
-                "mergeBaseCommitId",
-                result.merge_base_commit_id.as_deref(),
-            )
-            .map_err(js_error)?;
+            set_string(&object, "baseCommitId", &result.base_commit_id).map_err(js_error)?;
             set_string(
                 &object,
                 "targetHeadBeforeCommitId",
@@ -229,12 +269,12 @@ export type MergeVersionResult = {
                 result.created_merge_commit_id.as_deref(),
             )
             .map_err(js_error)?;
-            set_number(
+            Reflect::set(
                 &object,
-                "appliedChangeCount",
-                result.applied_change_count as f64,
+                &JsValue::from_str("changeStats"),
+                &merge_change_stats_to_js(&result.change_stats).map_err(js_error)?,
             )
-            .map_err(js_error)?;
+            .map_err(|_| js_error(js_sdk_error("could not set changeStats")))?;
             Ok(object.into())
         }
 
@@ -671,6 +711,14 @@ export type MergeVersionResult = {
         Ok(MergeVersionOptions { source_version_id })
     }
 
+    fn parse_merge_version_preview_options(
+        value: JsValue,
+    ) -> Result<MergeVersionPreviewOptions, LixError> {
+        let object = expect_object(value, "mergeVersionPreview")?;
+        let source_version_id = required_string(&object, "sourceVersionId", "mergeVersionPreview")?;
+        Ok(MergeVersionPreviewOptions { source_version_id })
+    }
+
     fn expect_object(value: JsValue, method: &str) -> Result<Object, LixError> {
         if value.is_null() || value.is_undefined() || !value.is_object() {
             return Err(LixError::new(
@@ -886,6 +934,84 @@ export type MergeVersionResult = {
         }
         Reflect::set(&object, &JsValue::from_str("notices"), &notices)
             .map_err(|_| js_sdk_error("could not set notices"))?;
+        Ok(object.into())
+    }
+
+    fn merge_version_preview_to_js(
+        result: lix_rs_sdk::MergeVersionPreview,
+    ) -> Result<JsValue, LixError> {
+        let object = Object::new();
+        let outcome = match result.outcome {
+            lix_rs_sdk::MergeVersionOutcome::AlreadyUpToDate => "alreadyUpToDate",
+            lix_rs_sdk::MergeVersionOutcome::FastForward => "fastForward",
+            lix_rs_sdk::MergeVersionOutcome::MergeCommitted => "mergeCommitted",
+        };
+        set_string(&object, "outcome", outcome)?;
+        set_string(&object, "targetVersionId", &result.target_version_id)?;
+        set_string(&object, "sourceVersionId", &result.source_version_id)?;
+        set_string(&object, "baseCommitId", &result.base_commit_id)?;
+        set_string(&object, "targetHeadCommitId", &result.target_head_commit_id)?;
+        set_string(&object, "sourceHeadCommitId", &result.source_head_commit_id)?;
+        Reflect::set(
+            &object,
+            &JsValue::from_str("changeStats"),
+            &merge_change_stats_to_js(&result.change_stats)?,
+        )
+        .map_err(|_| js_sdk_error("could not set changeStats"))?;
+        let conflicts = Array::new();
+        for conflict in result.conflicts {
+            conflicts.push(&merge_conflict_to_js(&conflict)?);
+        }
+        Reflect::set(&object, &JsValue::from_str("conflicts"), &conflicts)
+            .map_err(|_| js_sdk_error("could not set conflicts"))?;
+        Ok(object.into())
+    }
+
+    fn merge_change_stats_to_js(stats: &lix_rs_sdk::MergeChangeStats) -> Result<JsValue, LixError> {
+        let object = Object::new();
+        set_number(&object, "total", stats.total as f64)?;
+        set_number(&object, "added", stats.added as f64)?;
+        set_number(&object, "modified", stats.modified as f64)?;
+        set_number(&object, "removed", stats.removed as f64)?;
+        Ok(object.into())
+    }
+
+    fn merge_conflict_to_js(conflict: &lix_rs_sdk::MergeConflict) -> Result<JsValue, LixError> {
+        let object = Object::new();
+        let kind = match conflict.kind {
+            lix_rs_sdk::MergeConflictKind::SameEntityChanged => "sameEntityChanged",
+        };
+        set_string(&object, "kind", kind)?;
+        set_string(&object, "schemaKey", &conflict.schema_key)?;
+        set_string(&object, "entityId", &conflict.entity_id)?;
+        set_optional_string(&object, "fileId", conflict.file_id.as_deref())?;
+        Reflect::set(
+            &object,
+            &JsValue::from_str("target"),
+            &merge_conflict_side_to_js(&conflict.target)?,
+        )
+        .map_err(|_| js_sdk_error("could not set target conflict side"))?;
+        Reflect::set(
+            &object,
+            &JsValue::from_str("source"),
+            &merge_conflict_side_to_js(&conflict.source)?,
+        )
+        .map_err(|_| js_sdk_error("could not set source conflict side"))?;
+        Ok(object.into())
+    }
+
+    fn merge_conflict_side_to_js(
+        side: &lix_rs_sdk::MergeConflictSide,
+    ) -> Result<JsValue, LixError> {
+        let object = Object::new();
+        let kind = match side.kind {
+            lix_rs_sdk::MergeConflictChangeKind::Added => "added",
+            lix_rs_sdk::MergeConflictChangeKind::Modified => "modified",
+            lix_rs_sdk::MergeConflictChangeKind::Removed => "removed",
+        };
+        set_string(&object, "kind", kind)?;
+        set_optional_string(&object, "beforeChangeId", side.before_change_id.as_deref())?;
+        set_optional_string(&object, "afterChangeId", side.after_change_id.as_deref())?;
         Ok(object.into())
     }
 

@@ -1,8 +1,8 @@
 use lix_engine::{Backend, LixError, Value};
 use lix_engine::{
     CreateVersionOptions, CreateVersionReceipt, Engine, ExecuteResult, InitReceipt,
-    MergeVersionOptions, MergeVersionReceipt, SessionContext, SwitchVersionOptions,
-    SwitchVersionReceipt,
+    MergeVersionOptions, MergeVersionPreview, MergeVersionPreviewOptions, MergeVersionReceipt,
+    SessionContext, SwitchVersionOptions, SwitchVersionReceipt,
 };
 
 use super::expect_same::SimulationAssertions;
@@ -160,6 +160,13 @@ impl SimSession {
             self.sim.rebuild_tracked_state.after_successful_write();
         }
         result
+    }
+
+    pub async fn merge_version_preview(
+        &self,
+        options: MergeVersionPreviewOptions,
+    ) -> Result<MergeVersionPreview, LixError> {
+        self.session.merge_version_preview(options).await
     }
 
     pub async fn switch_version(

@@ -264,6 +264,10 @@ impl UpdateAssignmentValues {
         Self { values }
     }
 
+    /// Returns only the value explicitly assigned by SQL UPDATE.
+    ///
+    /// Use this for document-patch semantics where `Unassigned` must remain
+    /// distinct from `Assigned(NULL)`.
     pub(crate) fn assigned_cell(&self, row_index: usize, column_name: &str) -> Result<UpdateCell> {
         let Some(array) = self.values.get(column_name) else {
             return Ok(UpdateCell::Unassigned);
@@ -279,7 +283,13 @@ impl UpdateAssignmentValues {
             })
     }
 
-    pub(crate) fn effective_cell(
+    /// Returns the assigned SQL UPDATE value, or falls back to the existing row
+    /// column value when the column was not assigned.
+    ///
+    /// Use this for scalar row-column semantics. Do not use it to reconstruct
+    /// JSON documents from projected property columns, because projection can
+    /// erase the difference between an absent property and an explicit null.
+    pub(crate) fn assigned_or_existing_cell(
         &self,
         batch: &RecordBatch,
         row_index: usize,

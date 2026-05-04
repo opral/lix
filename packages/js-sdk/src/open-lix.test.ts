@@ -90,13 +90,33 @@ test("openLix exposes the rs-sdk e2e flow", async () => {
 
 	expect(await taskDone(lix, "task-1")).toBe(false);
 
+	const preview = await lix.mergeVersionPreview({
+		sourceVersionId: draft.id,
+	});
+	expect(preview.outcome).toBe("fastForward");
+	expect(preview.targetVersionId).toBe(mainVersionId);
+	expect(preview.sourceVersionId).toBe(draft.id);
+	expect(preview.changeStats).toEqual({
+		total: 1,
+		added: 0,
+		modified: 1,
+		removed: 0,
+	});
+	expect(preview.conflicts).toEqual([]);
+	expect(await taskDone(lix, "task-1")).toBe(false);
+
 	const merge = await lix.mergeVersion({
 		sourceVersionId: draft.id,
 	});
 
 	expect(merge.outcome).toBe("fastForward");
 	expect(merge.targetVersionId).toBe(mainVersionId);
-	expect(merge.appliedChangeCount).toBe(0);
+	expect(merge.changeStats).toEqual({
+		total: 1,
+		added: 0,
+		modified: 1,
+		removed: 0,
+	});
 	expect(merge.createdMergeCommitId).toBeNull();
 	expect(await taskDone(lix, "task-1")).toBe(true);
 
@@ -274,16 +294,16 @@ test("merge conflicts expose structured details", async () => {
 		).toBe(false);
 		const details = error.details as {
 			conflicts?: Array<{
-				schema_key?: string;
-				entity_id?: string;
+				schemaKey?: string;
+				entityId?: string;
 				target?: unknown;
 				source?: unknown;
 			}>;
 		};
 		expect(details.conflicts).toHaveLength(1);
 		expect(details.conflicts?.[0]).toMatchObject({
-			schema_key: "crm_task",
-			entity_id: "conflict-task",
+			schemaKey: "crm_task",
+			entityId: "conflict-task",
 		});
 		expect(details.conflicts?.[0]?.target).toBeDefined();
 		expect(details.conflicts?.[0]?.source).toBeDefined();
