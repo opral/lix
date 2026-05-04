@@ -35,12 +35,12 @@ use crate::sql2::filesystem_predicates::{
     canonicalize_filesystem_path_filters, FilesystemPathKind,
 };
 use crate::sql2::version_scope::{
-    explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
+    explicit_version_ids_from_dml_filters, resolve_provider_version_ids,
+    resolve_write_version_scope, VersionBinding,
 };
 use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValues};
 use crate::transaction::types::{LogicalPrimaryKey, StageRow, StageRowOrigin, StageWriteOperation};
 use crate::version::VersionRefReader;
-use crate::GLOBAL_VERSION_ID;
 use crate::{parse_row_metadata, serialize_row_metadata, LixError, RowMetadata};
 
 use super::filesystem_planner::{
@@ -1227,22 +1227,17 @@ fn directory_row_context_from_batch(
     row_index: usize,
     version_binding: Option<&str>,
 ) -> Result<FilesystemRowContext> {
-    let global = optional_bool_value(batch, row_index, "lixcol_global")?.unwrap_or(false);
-    let version_id = if global {
-        GLOBAL_VERSION_ID.to_string()
-    } else {
-        optional_string_value(batch, row_index, "lixcol_version_id")?
-            .or_else(|| version_binding.map(ToOwned::to_owned))
-            .ok_or_else(|| {
-                DataFusionError::Execution(
-                    "INSERT into lix_directory_by_version requires lixcol_version_id".to_string(),
-                )
-            })?
-    };
+    let scope = resolve_write_version_scope(
+        optional_bool_value(batch, row_index, "lixcol_global")?,
+        optional_string_value(batch, row_index, "lixcol_version_id")?,
+        version_binding,
+        "INSERT into lix_directory_by_version",
+        "lix_directory",
+    )?;
 
     Ok(FilesystemRowContext {
-        version_id,
-        global,
+        version_id: scope.version_id,
+        global: scope.global,
         untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         metadata: optional_metadata_value(batch, row_index, "lixcol_metadata", "lix_directory")?,
@@ -1255,22 +1250,17 @@ fn directory_row_context_from_update(
     row_index: usize,
     version_binding: Option<&str>,
 ) -> Result<FilesystemRowContext> {
-    let global = optional_bool_value(batch, row_index, "lixcol_global")?.unwrap_or(false);
-    let version_id = if global {
-        GLOBAL_VERSION_ID.to_string()
-    } else {
-        optional_string_value(batch, row_index, "lixcol_version_id")?
-            .or_else(|| version_binding.map(ToOwned::to_owned))
-            .ok_or_else(|| {
-                DataFusionError::Execution(
-                    "UPDATE into lix_directory_by_version requires lixcol_version_id".to_string(),
-                )
-            })?
-    };
+    let scope = resolve_write_version_scope(
+        optional_bool_value(batch, row_index, "lixcol_global")?,
+        optional_string_value(batch, row_index, "lixcol_version_id")?,
+        version_binding,
+        "UPDATE into lix_directory_by_version",
+        "lix_directory",
+    )?;
 
     Ok(FilesystemRowContext {
-        version_id,
-        global,
+        version_id: scope.version_id,
+        global: scope.global,
         untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
         file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
         metadata: update_optional_metadata_value(
@@ -1916,9 +1906,12 @@ mod tests {
 
         async fn load_version_head(
             &mut self,
-            _version_id: &str,
+            version_id: &str,
         ) -> Result<Option<String>, LixError> {
-            Ok(None)
+            if version_id == "ghost-version" {
+                return Ok(None);
+            }
+            Ok(Some(format!("commit-{version_id}")))
         }
 
         async fn stage_write(&mut self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
@@ -2217,6 +2210,19 @@ mod tests {
 
         assert!(
             error.to_string().contains("requires lixcol_version_id"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn directory_insert_rejects_global_with_non_global_version_id() {
+        let error = lix_directory_write_rows_from_batch(&directory_insert_batch(true, true), None)
+            .expect_err("global directory write should reject conflicting version id");
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot set lixcol_global=true with non-global lixcol_version_id"),
             "unexpected error: {error}"
         );
     }
