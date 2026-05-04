@@ -32,7 +32,7 @@ use crate::live_state::{
 };
 use crate::sql2::read_only::reject_read_only_stage_rows;
 use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
-use crate::sql2::write_normalization::UpdateAssignmentValues;
+use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValues};
 use crate::transaction::types::StageRow;
 use crate::version::VersionRefReader;
 use crate::GLOBAL_VERSION_ID;
@@ -843,16 +843,14 @@ fn update_optional_string_value(
     row_index: usize,
     column_name: &str,
 ) -> Result<Option<String>> {
-    match assignment_values.scalar_value(batch, row_index, column_name)? {
-        None
-        | Some(ScalarValue::Null)
-        | Some(ScalarValue::Utf8(None))
-        | Some(ScalarValue::Utf8View(None))
-        | Some(ScalarValue::LargeUtf8(None)) => Ok(None),
-        Some(ScalarValue::Utf8(Some(value)))
-        | Some(ScalarValue::Utf8View(Some(value)))
-        | Some(ScalarValue::LargeUtf8(Some(value))) => Ok(Some(value)),
-        Some(other) => Err(DataFusionError::Execution(format!(
+    match assignment_values.effective_cell(batch, row_index, column_name)? {
+        InsertCell::Omitted | InsertCell::Provided(SqlCell::Null) => Ok(None),
+        InsertCell::Provided(SqlCell::Value(
+            ScalarValue::Utf8(Some(value))
+            | ScalarValue::Utf8View(Some(value))
+            | ScalarValue::LargeUtf8(Some(value)),
+        )) => Ok(Some(value)),
+        InsertCell::Provided(SqlCell::Value(other)) => Err(DataFusionError::Execution(format!(
             "UPDATE lix_state expected text-compatible column '{column_name}', got {other:?}"
         ))),
     }
