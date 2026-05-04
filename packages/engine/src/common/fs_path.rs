@@ -44,7 +44,11 @@
 //!
 //! Length policy:
 //!
-//! - Paths are unbounded at the `fs_path` spec layer.
+//! - Each canonical segment is capped at 255 bytes, matching common
+//!   filesystem component limits.
+//! - Each full canonical path is capped at 4096 bytes.
+//! - Raw boundary input is separately capped before normalization so oversized
+//!   URI spellings cannot reach Unicode processing.
 //!
 //! Runtime strategy:
 //!
@@ -72,6 +76,10 @@ use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 use crate::LixError;
 use std::fmt;
 use std::ops::Deref;
+
+const MAX_CANONICAL_PATH_BYTES: usize = 4096;
+const MAX_CANONICAL_PATH_SEGMENT_BYTES: usize = 255;
+const MAX_RAW_PATH_INPUT_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NormalizedDirectoryPath(String);
@@ -157,6 +165,9 @@ enum PathError {
     Backslash,
     InvalidPercentEncoding,
     InvalidPathSegmentCodePoint,
+    PathTooLong,
+    RawPathInputTooLong,
+    SegmentTooLong,
     NulByte,
     InvalidRootUsage,
     #[cfg(test)]
@@ -211,6 +222,21 @@ impl PathError {
                 "path segment contains a character that is not allowed in canonical Lix paths",
                 Some("canonical paths use RFC 8264 PRECIS IdentifierClass segments; use URI percent encoding only at boundaries"),
             ),
+            Self::PathTooLong => (
+                "LIX_ERROR_PATH_TOO_LONG",
+                "path is too long",
+                Some("keep canonical paths at or below 4096 bytes"),
+            ),
+            Self::RawPathInputTooLong => (
+                "LIX_ERROR_PATH_INPUT_TOO_LONG",
+                "path input is too long",
+                Some("keep raw path input at or below 16384 bytes"),
+            ),
+            Self::SegmentTooLong => (
+                "LIX_ERROR_PATH_SEGMENT_TOO_LONG",
+                "path segment is too long",
+                Some("keep each canonical path segment at or below 255 bytes"),
+            ),
             Self::NulByte => (
                 "LIX_ERROR_PATH_NUL_BYTE",
                 "path must not contain a NUL byte",
@@ -242,6 +268,7 @@ pub(crate) fn normalize_path_segment(raw: &str) -> Result<String, LixError> {
 }
 
 fn normalize_path_segment_impl(raw: &str) -> PathResult<String> {
+    ensure_raw_path_input_len(raw)?;
     let normalized = raw.nfc().collect::<String>();
     let canonical = normalize_validated_path_segment(&normalized)?;
     if canonical == "." || canonical == ".." {
@@ -250,7 +277,7 @@ fn normalize_path_segment_impl(raw: &str) -> PathResult<String> {
     Ok(canonical)
 }
 
-fn validate_path_segment_chars(normalized: &str) -> PathResult<()> {
+fn validate_path_segment_chars(normalized: &str) -> PathResult<String> {
     if normalized.is_empty() {
         return Err(PathError::EmptySegment);
     }
@@ -267,14 +294,16 @@ fn validate_path_segment_chars(normalized: &str) -> PathResult<()> {
         return Err(PathError::InvalidPercentEncoding);
     }
     let decoded = decode_percent_encoded_segment(normalized)?;
-    validate_decoded_path_segment_chars(&decoded)?;
-    Ok(())
+    validate_decoded_path_segment_structure(&decoded)?;
+    Ok(decoded)
 }
 
 fn normalize_validated_path_segment(normalized: &str) -> PathResult<String> {
-    validate_path_segment_chars(normalized)?;
-    let decoded = decode_percent_encoded_segment(normalized)?;
-    enforce_precis_segment(&decoded)
+    let decoded = validate_path_segment_chars(normalized)?;
+    ensure_canonical_segment_len(&decoded)?;
+    let canonical = enforce_precis_segment(&decoded)?;
+    ensure_canonical_segment_len(&canonical)?;
+    Ok(canonical)
 }
 
 fn decode_percent_encoded_segment(segment: &str) -> PathResult<String> {
@@ -331,7 +360,7 @@ fn segment_has_valid_percent_encoding(segment: &str) -> bool {
     true
 }
 
-fn validate_decoded_path_segment_chars(segment: &str) -> PathResult<()> {
+fn validate_decoded_path_segment_structure(segment: &str) -> PathResult<()> {
     if segment.contains('\0') {
         return Err(PathError::NulByte);
     }
@@ -347,7 +376,6 @@ fn validate_decoded_path_segment_chars(segment: &str) -> PathResult<()> {
     if segment.chars().next().is_some_and(is_combining_mark) {
         return Err(PathError::InvalidPathSegmentCodePoint);
     }
-    enforce_precis_segment(segment)?;
     Ok(())
 }
 
@@ -359,6 +387,7 @@ fn enforce_precis_segment(segment: &str) -> PathResult<String> {
 }
 
 fn normalize_file_path_impl(path: &str) -> PathResult<String> {
+    ensure_raw_path_input_len(path)?;
     let normalized = path.nfc().collect::<String>();
     if !normalized.starts_with('/') {
         return Err(PathError::MissingLeadingSlash);
@@ -386,7 +415,9 @@ fn normalize_file_path_impl(path: &str) -> PathResult<String> {
     if canonical_segments.is_empty() {
         return Err(PathError::InvalidRootUsage);
     }
-    Ok(format!("/{}", canonical_segments.join("/")))
+    let canonical = format!("/{}", canonical_segments.join("/"));
+    ensure_canonical_path_len(&canonical)?;
+    Ok(canonical)
 }
 
 pub(crate) fn normalize_directory_path(path: &str) -> Result<String, LixError> {
@@ -394,6 +425,7 @@ pub(crate) fn normalize_directory_path(path: &str) -> Result<String, LixError> {
 }
 
 fn normalize_directory_path_impl(path: &str) -> PathResult<String> {
+    ensure_raw_path_input_len(path)?;
     let normalized = path.nfc().collect::<String>();
     if !normalized.starts_with('/') {
         return Err(PathError::MissingLeadingSlash);
@@ -418,7 +450,9 @@ fn normalize_directory_path_impl(path: &str) -> PathResult<String> {
     if normalized_segments.is_empty() {
         return Ok("/".to_string());
     }
-    Ok(format!("/{}/", normalized_segments.join("/")))
+    let canonical = format!("/{}/", normalized_segments.join("/"));
+    ensure_canonical_path_len(&canonical)?;
+    Ok(canonical)
 }
 
 fn canonicalize_path_segments(segments: &[&str]) -> PathResult<Vec<String>> {
@@ -433,6 +467,30 @@ fn canonicalize_path_segments(segments: &[&str]) -> PathResult<Vec<String>> {
     }
 
     Ok(canonical_segments)
+}
+
+fn ensure_canonical_path_len(path: &str) -> PathResult<()> {
+    if path.len() > MAX_CANONICAL_PATH_BYTES {
+        Err(PathError::PathTooLong)
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_raw_path_input_len(path: &str) -> PathResult<()> {
+    if path.len() > MAX_RAW_PATH_INPUT_BYTES {
+        Err(PathError::RawPathInputTooLong)
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_canonical_segment_len(segment: &str) -> PathResult<()> {
+    if segment.len() > MAX_CANONICAL_PATH_SEGMENT_BYTES {
+        Err(PathError::SegmentTooLong)
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn parse_file_path(path: &str) -> Result<ParsedFilePath, LixError> {
@@ -889,6 +947,37 @@ mod tests {
     }
 
     #[test]
+    fn rejects_file_paths_and_segments_over_length_limits() {
+        let segment_at_limit = "a".repeat(MAX_CANONICAL_PATH_SEGMENT_BYTES);
+        let path_at_limit = format!("/{segment_at_limit}");
+        assert_eq!(
+            normalize_file_path(&path_at_limit).as_deref(),
+            Ok(path_at_limit.as_str())
+        );
+
+        let segment_over_limit = "a".repeat(MAX_CANONICAL_PATH_SEGMENT_BYTES + 1);
+        assert_path_error(
+            normalize_file_path_impl(&format!("/{segment_over_limit}")),
+            PathError::SegmentTooLong,
+        );
+        assert_path_error(
+            normalize_path_segment_impl(&segment_over_limit),
+            PathError::SegmentTooLong,
+        );
+
+        let mut segments = Vec::new();
+        let mut raw_len = 1usize;
+        while raw_len <= MAX_CANONICAL_PATH_BYTES {
+            segments.push("abcd");
+            raw_len = 1 + segments.join("/").len();
+        }
+        assert_path_error(
+            normalize_file_path_impl(&format!("/{}", segments.join("/"))),
+            PathError::PathTooLong,
+        );
+    }
+
+    #[test]
     fn rejects_file_paths_with_private_use_and_noncharacter_code_points() {
         for path in ["/docs/\u{E000}.md", "/docs/\u{FDD0}.md"] {
             assert_path_error(
@@ -959,6 +1048,45 @@ mod tests {
         assert_path_error(
             normalize_file_path_impl("/docs/abc%2.md"),
             PathError::InvalidPercentEncoding,
+        );
+    }
+
+    #[test]
+    fn applies_segment_length_limit_to_canonical_text_not_percent_encoded_boundary_spelling() {
+        let encoded_segment_at_limit = "%61".repeat(MAX_CANONICAL_PATH_SEGMENT_BYTES);
+        let canonical_segment_at_limit = "a".repeat(MAX_CANONICAL_PATH_SEGMENT_BYTES);
+        assert_eq!(
+            normalize_file_path(&format!("/{encoded_segment_at_limit}")).as_deref(),
+            Ok(format!("/{canonical_segment_at_limit}").as_str())
+        );
+        assert_eq!(
+            normalize_directory_path(&format!("/{encoded_segment_at_limit}/")).as_deref(),
+            Ok(format!("/{canonical_segment_at_limit}/").as_str())
+        );
+
+        let encoded_segment_over_limit = "%61".repeat(MAX_CANONICAL_PATH_SEGMENT_BYTES + 1);
+        assert_path_error(
+            normalize_file_path_impl(&format!("/{encoded_segment_over_limit}")),
+            PathError::SegmentTooLong,
+        );
+        assert_path_error(
+            normalize_directory_path_impl(&format!("/{encoded_segment_over_limit}/")),
+            PathError::SegmentTooLong,
+        );
+    }
+
+    #[test]
+    fn rejects_raw_path_input_over_length_budget_before_unicode_processing() {
+        let huge_file_path = format!("/{}", "a".repeat(1024 * 1024));
+        assert_path_error(
+            normalize_file_path_impl(&huge_file_path),
+            PathError::RawPathInputTooLong,
+        );
+
+        let huge_directory_path = format!("/{}/", "a".repeat(1024 * 1024));
+        assert_path_error(
+            normalize_directory_path_impl(&huge_directory_path),
+            PathError::RawPathInputTooLong,
         );
     }
 
@@ -1111,6 +1239,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_directory_paths_and_segments_over_length_limits() {
+        let segment_at_limit = "a".repeat(MAX_CANONICAL_PATH_SEGMENT_BYTES);
+        let path_at_limit = format!("/{segment_at_limit}/");
+        assert_eq!(
+            normalize_directory_path(&path_at_limit).as_deref(),
+            Ok(path_at_limit.as_str())
+        );
+
+        let segment_over_limit = "a".repeat(MAX_CANONICAL_PATH_SEGMENT_BYTES + 1);
+        assert_path_error(
+            normalize_directory_path_impl(&format!("/{segment_over_limit}/")),
+            PathError::SegmentTooLong,
+        );
+
+        let mut segments = Vec::new();
+        let mut raw_len = 1usize;
+        while raw_len <= MAX_CANONICAL_PATH_BYTES {
+            segments.push("abcd");
+            raw_len = 2 + segments.join("/").len();
+        }
+        assert_path_error(
+            normalize_directory_path_impl(&format!("/{}/", segments.join("/"))),
+            PathError::PathTooLong,
+        );
+    }
+
+    #[test]
     fn rejects_directory_paths_with_dot_segments() {
         for path in ["/docs/./", "/docs/../", "/docs/%2e/", "/docs/%2E%2E/"] {
             assert_path_error(normalize_directory_path_impl(path), PathError::DotSegment);
@@ -1156,6 +1311,26 @@ mod tests {
         assert_eq!(
             root_file.hint(),
             Some("use '/' as a directory path, never as a file path")
+        );
+
+        let long_segment = normalize_file_path(&format!(
+            "/{}",
+            "a".repeat(MAX_CANONICAL_PATH_SEGMENT_BYTES + 1)
+        ))
+        .expect_err("long segment");
+        assert_eq!(long_segment.code, "LIX_ERROR_PATH_SEGMENT_TOO_LONG");
+        assert_eq!(
+            long_segment.hint(),
+            Some("keep each canonical path segment at or below 255 bytes")
+        );
+
+        let long_input =
+            normalize_file_path(&format!("/{}", "a".repeat(MAX_RAW_PATH_INPUT_BYTES + 1)))
+                .expect_err("long raw input");
+        assert_eq!(long_input.code, "LIX_ERROR_PATH_INPUT_TOO_LONG");
+        assert_eq!(
+            long_input.hint(),
+            Some("keep raw path input at or below 16384 bytes")
         );
     }
 }
