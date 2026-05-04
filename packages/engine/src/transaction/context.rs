@@ -598,9 +598,7 @@ mod tests {
             .await
             .expect_err("validation should reject before persistence");
         assert!(
-            error
-                .description
-                .contains("snapshot_content validation failed"),
+            error.message.contains("snapshot_content validation failed"),
             "validation error should explain the rejected schema data: {error:?}"
         );
 
@@ -640,7 +638,7 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
         assert!(
             error
-                .description
+                .message
                 .contains("schema 'missing_schema' version '1' is not visible"),
             "error should explain missing schema visibility: {error:?}"
         );
@@ -662,7 +660,7 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
         assert!(
             error
-                .description
+                .message
                 .contains("schema 'lix_key_value' version '999' is not visible"),
             "error should explain missing schema version visibility: {error:?}"
         );
@@ -683,7 +681,7 @@ mod tests {
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
         assert!(
-            error.description.contains("invalid JSON"),
+            error.message.contains("invalid JSON"),
             "error should explain invalid JSON: {error:?}"
         );
     }
@@ -708,9 +706,7 @@ mod tests {
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
         assert!(
-            error
-                .description
-                .contains("snapshot_content validation failed"),
+            error.message.contains("snapshot_content validation failed"),
             "error should explain JSON Schema validation: {error:?}"
         );
         assert_no_persistence_after_validation_failure(
@@ -746,8 +742,8 @@ mod tests {
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
         assert!(
-            error.description.contains("x-lix-version")
-                || error.description.contains("primary-key pointer"),
+            error.message.contains("x-lix-version")
+                || error.message.contains("primary-key pointer"),
             "error should explain malformed registered schema: {error:?}"
         );
     }
@@ -768,7 +764,7 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
         assert!(
             error
-                .description
+                .message
                 .contains("does not match x-lix-primary-key derived entity_id"),
             "error should explain entity id mismatch: {error:?}"
         );

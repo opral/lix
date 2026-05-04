@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -91,7 +91,7 @@ impl TableProvider for LixDirectoryHistoryProvider {
     }
 
     fn table_type(&self) -> TableType {
-        TableType::Base
+        TableType::View
     }
 
     fn supports_filters_pushdown(
@@ -331,6 +331,7 @@ async fn load_directory_history_rows(
                 event.depth,
                 &descriptors,
                 &mut BTreeMap::new(),
+                &mut BTreeSet::new(),
             )
         } else {
             None
@@ -453,9 +454,14 @@ fn resolve_directory_history_path(
     target_depth: u32,
     directories: &[DirectoryHistoryRecord],
     cache: &mut BTreeMap<String, Option<String>>,
+    visiting: &mut BTreeSet<String>,
 ) -> Option<String> {
     if let Some(path) = cache.get(directory_id) {
         return path.clone();
+    }
+    if !visiting.insert(directory_id.to_string()) {
+        cache.insert(directory_id.to_string(), None);
+        return None;
     }
     let directory = directories
         .iter()
@@ -480,11 +486,13 @@ fn resolve_directory_history_path(
                 target_depth,
                 directories,
                 cache,
+                visiting,
             )?;
             format!("{parent_path}{name}/")
         }
         None => format!("/{name}/"),
     };
+    visiting.remove(directory_id);
     cache.insert(directory_id.to_string(), Some(path.clone()));
     Some(path)
 }

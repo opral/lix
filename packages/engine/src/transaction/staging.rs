@@ -1121,9 +1121,7 @@ mod tests {
 
         assert_eq!(error.code, LixError::CODE_UNIQUE);
         assert!(
-            error
-                .description
-                .contains("primary-key constraint violation"),
+            error.message.contains("primary-key constraint violation"),
             "error should explain the duplicate primary key: {error:?}"
         );
     }
@@ -1168,7 +1166,7 @@ mod tests {
             .expect_err("global row with non-global version should fail");
 
         assert!(error
-            .description
+            .message
             .contains("global staged rows must use the global version id"));
     }
 

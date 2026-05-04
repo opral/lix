@@ -47,9 +47,10 @@ const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
 use super::filesystem_planner::{
     blob_ref_row, directory_path_resolvers_from_state_rows, file_descriptor_row,
-    file_descriptor_write_row, plan_file_delete, plan_file_path_update, BlobRefRowInput,
-    DirectoryPathResolver, FileDeleteInput, FileDescriptorRowInput, FileDescriptorWriteIntent,
-    FilePathWriteInput, FilesystemDeletePlan, FilesystemRowContext,
+    file_descriptor_write_row, file_entry_name, filesystem_storage_scope_key, plan_file_delete,
+    plan_file_path_update, BlobRefRowInput, DirectoryPathResolver, FileDeleteInput,
+    FileDescriptorRowInput, FileDescriptorWriteIntent, FilePathWriteInput, FilesystemDeletePlan,
+    FilesystemRowContext,
 };
 use super::result_metadata::json_field;
 use crate::sql2::{
@@ -412,17 +413,17 @@ impl DataSink for LixFileInsertSink {
         let mut staged = LixFileStagedBatch::default();
         let mut path_resolvers = None;
         while let Some(batch) = data.next().await.transpose()? {
+            if path_resolvers.is_none() {
+                path_resolvers = Some(
+                    file_path_resolvers_from_live_state(
+                        Arc::new(WriteContextLiveStateReader::new(self.write_ctx.clone())),
+                        self.version_binding.active_version_id(),
+                    )
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?,
+                );
+            }
             if record_batch_has_non_null_column(&batch, "path")? {
-                if path_resolvers.is_none() {
-                    path_resolvers = Some(
-                        file_path_resolvers_from_live_state(
-                            Arc::new(WriteContextLiveStateReader::new(self.write_ctx.clone())),
-                            self.version_binding.active_version_id(),
-                        )
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?,
-                    );
-                }
                 staged.extend(lix_file_insert_stage_from_batch_with_path_resolvers(
                     &batch,
                     self.version_binding.active_version_id(),
@@ -432,11 +433,16 @@ impl DataSink for LixFileInsertSink {
                     &mut || self.functions.call_uuid_v7(),
                 )?);
             } else {
-                staged.extend(lix_file_insert_stage_from_batch_with_id_generator(
-                    &batch,
-                    self.version_binding.active_version_id(),
-                    &mut || self.functions.call_uuid_v7(),
-                )?);
+                staged.extend(
+                    lix_file_insert_stage_from_batch_with_id_generator_and_path_resolvers(
+                        &batch,
+                        self.version_binding.active_version_id(),
+                        path_resolvers
+                            .as_mut()
+                            .expect("path resolver should be initialized"),
+                        &mut || self.functions.call_uuid_v7(),
+                    )?,
+                );
             }
         }
 
@@ -744,7 +750,7 @@ impl ExecutionPlan for LixFileUpdateExec {
             let assignment_values = UpdateAssignmentValues::evaluate(&matched_batch, &assignments)?;
             let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
             let mut path_resolvers = None;
-            if update_columns.path {
+            if update_columns.path || update_columns.descriptor {
                 path_resolvers = Some(
                     file_path_resolvers_from_live_state(
                         Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
@@ -1037,9 +1043,10 @@ fn lix_file_insert_stage_from_batch(
     lix_file_stage_from_batch_with_options(batch, version_binding, true, true, true)
 }
 
-fn lix_file_insert_stage_from_batch_with_id_generator(
+fn lix_file_insert_stage_from_batch_with_id_generator_and_path_resolvers(
     batch: &RecordBatch,
     version_binding: Option<&str>,
+    path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
     generate_id: &mut dyn FnMut() -> String,
 ) -> Result<LixFileStagedBatch> {
     lix_file_stage_from_batch_with_options_and_path_resolvers(
@@ -1048,7 +1055,7 @@ fn lix_file_insert_stage_from_batch_with_id_generator(
         true,
         true,
         true,
-        None,
+        Some(path_resolvers),
         Some(generate_id),
     )
 }
@@ -1076,8 +1083,10 @@ fn lix_file_existing_update_stage_from_batch(
     version_binding: Option<&str>,
     include_descriptor_writes: bool,
     include_data_writes: bool,
+    path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
 ) -> Result<LixFileStagedBatch> {
     let mut staged = LixFileStagedBatch::default();
+    let mut path_resolvers = path_resolvers;
 
     for row_index in 0..batch.num_rows() {
         let id = required_string_value(batch, row_index, "id")?;
@@ -1087,28 +1096,30 @@ fn lix_file_existing_update_stage_from_batch(
             file_row_context_from_update(batch, assignment_values, row_index, version_binding)?;
 
         if include_descriptor_writes {
+            let directory_id =
+                update_optional_string_value(batch, assignment_values, row_index, "directory_id")?;
+            let name = update_required_string_value(batch, assignment_values, row_index, "name")?;
+            let extension =
+                update_optional_string_value(batch, assignment_values, row_index, "extension")?;
+            if let Some(path_resolvers) = path_resolvers.as_deref_mut() {
+                let resolver = path_resolvers
+                    .entry(file_path_resolver_key(&context))
+                    .or_insert_with(DirectoryPathResolver::default);
+                resolver
+                    .reserve_file(
+                        directory_id.clone(),
+                        file_entry_name(&name, extension.as_deref()),
+                        id.clone(),
+                    )
+                    .map_err(lix_error_to_datafusion_error)?;
+            }
             staged
                 .state_rows
                 .push(file_descriptor_row(FileDescriptorRowInput {
                     id: id.clone(),
-                    directory_id: update_optional_string_value(
-                        batch,
-                        assignment_values,
-                        row_index,
-                        "directory_id",
-                    )?,
-                    name: update_required_string_value(
-                        batch,
-                        assignment_values,
-                        row_index,
-                        "name",
-                    )?,
-                    extension: update_optional_string_value(
-                        batch,
-                        assignment_values,
-                        row_index,
-                        "extension",
-                    )?,
+                    directory_id,
+                    name,
+                    extension,
                     hidden,
                     context: context.clone(),
                 }));
@@ -1165,29 +1176,41 @@ fn lix_file_update_stage_from_batch(
     path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<LixFileStagedBatch> {
-    if update_columns.path {
+    if update_columns.path || update_columns.descriptor {
         let Some(path_resolvers) = path_resolvers else {
             return Err(DataFusionError::Execution(
-                "UPDATE lix_file with path requires directory path resolver".to_string(),
+                "UPDATE lix_file requires filesystem path resolver".to_string(),
             ));
         };
-        lix_file_path_update_stage_from_batch(
-            batch,
-            assignment_values,
-            version_binding,
-            update_columns,
-            path_resolvers,
-            generate_directory_id,
-        )
-    } else {
-        lix_file_existing_update_stage_from_batch(
-            batch,
-            assignment_values,
-            version_binding,
-            update_columns.descriptor,
-            update_columns.data,
-        )
+        return if update_columns.path {
+            lix_file_path_update_stage_from_batch(
+                batch,
+                assignment_values,
+                version_binding,
+                update_columns,
+                path_resolvers,
+                generate_directory_id,
+            )
+        } else {
+            lix_file_existing_update_stage_from_batch(
+                batch,
+                assignment_values,
+                version_binding,
+                update_columns.descriptor,
+                update_columns.data,
+                Some(path_resolvers),
+            )
+        };
     }
+
+    lix_file_existing_update_stage_from_batch(
+        batch,
+        assignment_values,
+        version_binding,
+        update_columns.descriptor,
+        update_columns.data,
+        None,
+    )
 }
 
 fn lix_file_path_update_stage_from_batch(
@@ -1340,6 +1363,20 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
         };
 
         if include_descriptor_writes {
+            if let Some(path_resolvers) = path_resolvers.as_deref_mut() {
+                if let Some(file_id) = id.as_ref() {
+                    let resolver = path_resolvers
+                        .entry(file_path_resolver_key(&context))
+                        .or_insert_with(DirectoryPathResolver::default);
+                    resolver
+                        .reserve_file(
+                            directory_id.clone(),
+                            file_entry_name(&name, extension.as_deref()),
+                            file_id.clone(),
+                        )
+                        .map_err(lix_error_to_datafusion_error)?;
+                }
+            }
             staged
                 .state_rows
                 .push(file_descriptor_write_row(FileDescriptorWriteIntent {
@@ -1452,9 +1489,12 @@ fn file_row_context_from_update(
 }
 
 fn file_path_resolver_key(context: &FilesystemRowContext) -> String {
-    // TODO(engine2): make this lane-aware if filesystem path uniqueness needs
-    // to distinguish tracked/untracked/global rows inside the same version.
-    context.version_id.clone()
+    filesystem_storage_scope_key(
+        &context.version_id,
+        context.global,
+        context.untracked,
+        context.file_id.as_deref(),
+    )
 }
 
 async fn file_path_resolvers_from_live_state(
@@ -1464,7 +1504,10 @@ async fn file_path_resolvers_from_live_state(
     let rows = live_state
         .scan_rows(&LiveStateScanRequest {
             filter: LiveStateFilter {
-                schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
+                schema_keys: vec![
+                    DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                    FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                ],
                 version_ids: version_binding
                     .map(|version_id| vec![version_id.to_string()])
                     .unwrap_or_default(),
@@ -1475,8 +1518,9 @@ async fn file_path_resolvers_from_live_state(
         .await?;
     let mut resolvers = directory_path_resolvers_from_state_rows(rows)?;
     if let Some(version_id) = version_binding {
+        let key = filesystem_storage_scope_key(version_id, false, false, None);
         resolvers
-            .entry(version_id.to_string())
+            .entry(key)
             .or_insert_with(DirectoryPathResolver::default);
     }
     Ok(resolvers)
@@ -1565,7 +1609,7 @@ async fn lix_file_record_batch(
         }
     }
 
-    let directory_paths = derive_directory_paths(&directory_rows);
+    let directory_paths = derive_directory_paths(&directory_rows)?;
     let mut ids = Vec::new();
     let mut paths = Vec::new();
     let mut directory_ids = Vec::new();
@@ -1682,7 +1726,7 @@ async fn lix_file_record_batch(
 
 fn derive_directory_paths(
     rows: &[DirectoryDescriptorRecord],
-) -> BTreeMap<(String, String), String> {
+) -> Result<BTreeMap<(String, String), String>, LixError> {
     let mut by_version = BTreeMap::<String, BTreeMap<String, &DirectoryDescriptorRecord>>::new();
     for row in rows {
         by_version
@@ -1694,10 +1738,16 @@ fn derive_directory_paths(
     let mut paths = BTreeMap::<(String, String), String>::new();
     for (version_id, records) in by_version {
         for directory_id in records.keys() {
-            derive_directory_path_for(&version_id, directory_id, &records, &mut paths);
+            derive_directory_path_for(
+                &version_id,
+                directory_id,
+                &records,
+                &mut paths,
+                &mut BTreeSet::new(),
+            )?;
         }
     }
-    paths
+    Ok(paths)
 }
 
 fn derive_directory_path_for(
@@ -1705,23 +1755,45 @@ fn derive_directory_path_for(
     directory_id: &str,
     records: &BTreeMap<String, &DirectoryDescriptorRecord>,
     paths: &mut BTreeMap<(String, String), String>,
-) -> Option<String> {
+    visiting: &mut BTreeSet<String>,
+) -> Result<Option<String>, LixError> {
     if let Some(path) = paths.get(&(version_id.to_string(), directory_id.to_string())) {
-        return Some(path.clone());
+        return Ok(Some(path.clone()));
     }
-    let row = records.get(directory_id)?;
+    if !visiting.insert(directory_id.to_string()) {
+        return Err(directory_parent_cycle_error(version_id, directory_id));
+    }
+    let Some(row) = records.get(directory_id) else {
+        visiting.remove(directory_id);
+        return Ok(None);
+    };
     let path = match row.parent_id.as_deref() {
         Some(parent_id) => {
-            let parent_path = derive_directory_path_for(version_id, parent_id, records, paths)?;
+            let Some(parent_path) =
+                derive_directory_path_for(version_id, parent_id, records, paths, visiting)?
+            else {
+                visiting.remove(directory_id);
+                return Ok(None);
+            };
             format!("{parent_path}{}/", row.name)
         }
         None => format!("/{}/", row.name),
     };
+    visiting.remove(directory_id);
     paths.insert(
         (version_id.to_string(), directory_id.to_string()),
         path.clone(),
     );
-    Some(path)
+    Ok(Some(path))
+}
+
+fn directory_parent_cycle_error(version_id: &str, directory_id: &str) -> LixError {
+    LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        format!(
+            "lix_directory_descriptor parent_id cycle in version '{version_id}' while resolving directory '{directory_id}'"
+        ),
+    )
 }
 
 fn projected_schema(base_schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Result<SchemaRef> {
@@ -2369,7 +2441,14 @@ mod tests {
         let mut paths = BTreeMap::new();
 
         assert_eq!(
-            derive_directory_path_for("version-a", "dir-guides", &records, &mut paths),
+            derive_directory_path_for(
+                "version-a",
+                "dir-guides",
+                &records,
+                &mut paths,
+                &mut BTreeSet::new()
+            )
+            .expect("path derivation should succeed"),
             Some("/docs/guides/".to_string())
         );
     }
@@ -2438,7 +2517,7 @@ mod tests {
     fn file_path_update_stages_descriptor_from_new_path() {
         let mut resolvers = BTreeMap::new();
         resolvers.insert(
-            "version-b".to_string(),
+            super::filesystem_storage_scope_key("version-b", false, false, None),
             super::DirectoryPathResolver::from_existing([(
                 "/docs/".to_string(),
                 "dir-docs".to_string(),
@@ -2481,7 +2560,7 @@ mod tests {
     fn file_path_update_preserves_existing_data_unless_data_is_assigned() {
         let mut resolvers = BTreeMap::new();
         resolvers.insert(
-            "version-b".to_string(),
+            super::filesystem_storage_scope_key("version-b", false, false, None),
             super::DirectoryPathResolver::from_existing([(
                 "/docs/".to_string(),
                 "dir-docs".to_string(),
@@ -2618,7 +2697,7 @@ mod tests {
     fn file_path_update_with_data_assignment_stages_blob_ref_and_payload() {
         let mut resolvers = BTreeMap::new();
         resolvers.insert(
-            "version-b".to_string(),
+            super::filesystem_storage_scope_key("version-b", false, false, None),
             super::DirectoryPathResolver::from_existing([(
                 "/docs/".to_string(),
                 "dir-docs".to_string(),
@@ -2768,7 +2847,7 @@ mod tests {
     fn file_path_insert_reuses_existing_parent_directory() {
         let mut resolvers = BTreeMap::new();
         resolvers.insert(
-            "version-b".to_string(),
+            super::filesystem_storage_scope_key("version-b", false, false, None),
             super::DirectoryPathResolver::from_existing([
                 ("/docs/".to_string(), "dir-docs".to_string()),
                 ("/docs/guides/".to_string(), "dir-guides".to_string()),

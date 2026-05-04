@@ -66,11 +66,14 @@ export class Value {
 	}
 
 	static text(value: string): Value {
+		if (!isWellFormedUtf16(value)) {
+			throw new TypeError("Value.text() requires a well-formed UTF-16 string");
+		}
 		return new Value("text", value);
 	}
 
 	static json(value: JsonValue): Value {
-		return new Value("json", value);
+		return new Value("json", normalizeJsonValue(value));
 	}
 
 	static blob(value: Uint8Array): Value {
@@ -97,23 +100,33 @@ export class Value {
 					return new Value("blob", undefined, raw.base64);
 			}
 		}
-		if (raw === null || raw === undefined) return Value.null();
+		if (raw === null) return Value.null();
+		if (raw === undefined) {
+			throw new TypeError("undefined is not a valid SQL parameter");
+		}
 		if (typeof raw === "number") {
 			return Number.isInteger(raw) ? Value.integer(raw) : Value.real(raw);
 		}
 		if (typeof raw === "boolean") return Value.boolean(raw);
 		if (typeof raw === "string") return Value.text(raw);
 		if (raw instanceof Uint8Array) return Value.blob(raw);
-	if (raw instanceof ArrayBuffer) return Value.blob(new Uint8Array(raw));
+		if (raw instanceof ArrayBuffer) return Value.blob(new Uint8Array(raw));
 		if (ArrayBuffer.isView(raw)) {
-			return Value.blob(
-				new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength),
+			throw new TypeError(
+				"typed array SQL parameters must be Uint8Array; other ArrayBuffer views are ambiguous",
 			);
 		}
-	if (isJsonValue(raw)) return Value.json(raw);
-	throw new TypeError(
+		if (raw instanceof Date) {
+			throw new TypeError(
+				"Date is not a valid SQL parameter; pass date.toISOString() or date.getTime() explicitly",
+			);
+		}
+		if (raw && typeof raw === "object") {
+			return Value.json(normalizeJsonValue(raw));
+		}
+		throw new TypeError(
 			"Value.from() requires a LixValue, JSON value, or binary value",
-	);
+		);
 	}
 
 	asInteger(): number | undefined {
@@ -197,6 +210,9 @@ type _LixErrorHasDetails = Assert<
 type _LixErrorDoesNotHaveData = Assert<
 	"data" extends keyof LixError ? false : true
 >;
+type _LixErrorDoesNotHaveDescription = Assert<
+	"description" extends keyof LixError ? false : true
+>;
 
 /**
  * Type guard: returns `true` when `err` is a Lix-produced error carrying a
@@ -232,7 +248,8 @@ function isLixValue(value: unknown): value is LixValue {
 		return true;
 	}
 	if (kind === "text") {
-		return typeof (value as { value?: unknown }).value === "string";
+		const raw = (value as { value?: unknown }).value;
+		return typeof raw === "string" && isWellFormedUtf16(raw);
 	}
 	if (kind === "json") {
 		return isJsonValue((value as { value?: unknown }).value);
@@ -244,54 +261,84 @@ function isLixValue(value: unknown): value is LixValue {
 }
 
 function isJsonValue(value: unknown): value is JsonValue {
-	if (
-		value === null ||
-		typeof value === "boolean" ||
-		typeof value === "string"
-	) {
+	try {
+		normalizeJsonValue(value);
 		return true;
-	}
-	if (typeof value === "number") {
-		return Number.isFinite(value);
-	}
-	if (Array.isArray(value)) {
-		return value.every((item) => isJsonValue(item));
-	}
-	if (!value || typeof value !== "object") {
+	} catch {
 		return false;
 	}
-	return Object.values(value).every((entry) => isJsonValue(entry));
 }
 
-function normalizeJsonValue(value: unknown): JsonValue {
-	if (value === null) return null;
+function normalizeJsonValue(value: unknown, seen = new WeakSet<object>()): JsonValue {
 	if (
-		typeof value === "boolean" ||
-		typeof value === "number" ||
-		typeof value === "string"
+		value === null ||
+		typeof value === "boolean"
 	) {
 		return value;
 	}
+	if (typeof value === "string") {
+		if (!isWellFormedUtf16(value)) {
+			throw new TypeError("JSON strings must be well-formed UTF-16");
+		}
+		return value;
+	}
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) {
+			throw new TypeError("JSON numbers must be finite");
+		}
+		return value;
+	}
 	if (Array.isArray(value)) {
-		return value.map((item) => normalizeJsonValue(item));
+		if (seen.has(value)) {
+			throw new TypeError("JSON values must not contain circular references");
+		}
+		seen.add(value);
+		const normalized = value.map((item) => normalizeJsonValue(item, seen));
+		seen.delete(value);
+		return normalized;
 	}
-	if (value instanceof Map) {
-		return Object.fromEntries(
-			Array.from(value.entries()).map(([key, entry]) => [
-				String(key),
-				normalizeJsonValue(entry),
-			]),
-		);
+	if (!value || typeof value !== "object") {
+		throw new TypeError("expected a JSON-compatible value");
 	}
-	if (value && typeof value === "object") {
-		return Object.fromEntries(
-			Object.entries(value).map(([key, entry]) => [
-				key,
-				normalizeJsonValue(entry),
-			]),
-		);
+
+	if (value instanceof Date) {
+		throw new TypeError("Date is not a JSON value");
 	}
-	throw new TypeError("expected a JSON-compatible value");
+	const prototype = Object.getPrototypeOf(value);
+	if (prototype !== Object.prototype && prototype !== null) {
+		throw new TypeError("JSON objects must be plain objects");
+	}
+	if (seen.has(value)) {
+		throw new TypeError("JSON values must not contain circular references");
+	}
+	seen.add(value);
+	const normalized: { [key: string]: JsonValue } = {};
+	for (const [key, entry] of Object.entries(value)) {
+		if (!isWellFormedUtf16(key)) {
+			throw new TypeError("JSON object keys must be well-formed UTF-16");
+		}
+		normalized[key] = normalizeJsonValue(entry, seen);
+	}
+	seen.delete(value);
+	return normalized;
+}
+
+function isWellFormedUtf16(value: string): boolean {
+	for (let index = 0; index < value.length; index += 1) {
+		const code = value.charCodeAt(index);
+		if (code >= 0xd800 && code <= 0xdbff) {
+			const next = value.charCodeAt(index + 1);
+			if (next < 0xdc00 || next > 0xdfff) {
+				return false;
+			}
+			index += 1;
+			continue;
+		}
+		if (code >= 0xdc00 && code <= 0xdfff) {
+			return false;
+		}
+	}
+	return true;
 }
 
 function bytesToBase64(bytes: Uint8Array): string {

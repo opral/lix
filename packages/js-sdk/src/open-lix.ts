@@ -305,8 +305,12 @@ function createLixHandle(wasmLix: WasmLix): Lix {
 			sql: string,
 			params: ReadonlyArray<LixRuntimeValue> = [],
 		): Promise<ExecuteResult> {
+			validateExecuteArguments(sql, params);
+			const values = params.map((param, index) =>
+				valueFromExecuteParam(param, index),
+			);
 			const result = await runQueued(() =>
-				wasmLix.execute(sql, params.map((param) => Value.from(param))),
+				wasmLix.execute(sql, values),
 			);
 			return normalizeExecuteResult(result);
 		},
@@ -335,6 +339,83 @@ function createLixHandle(wasmLix: WasmLix): Lix {
 			await runQueued(() => wasmLix.close());
 		},
 	};
+}
+
+function validateExecuteArguments(
+	sql: unknown,
+	params: unknown,
+): asserts sql is string {
+	if (typeof sql !== "string") {
+		throw invalidArgumentError("execute", "sql", "string", sql);
+	}
+	if (!Array.isArray(params)) {
+		throw invalidArgumentError("execute", "params", "array", params);
+	}
+}
+
+function invalidArgumentError(
+	operation: string,
+	argument: string,
+	expected: string,
+	actualValue: unknown,
+): LixError {
+	return createLixError(
+		"LIX_INVALID_ARGUMENT",
+		`lix.${operation}() expected ${argument} to be ${expectedArticle(expected)} ${expected}`,
+		{
+			details: {
+				operation,
+				argument,
+				expected,
+				actual: runtimeTypeName(actualValue),
+			},
+		},
+	);
+}
+
+function valueFromExecuteParam(param: LixRuntimeValue, index: number): Value {
+	try {
+		return Value.from(param);
+	} catch (error) {
+		throw invalidParamError(index, param, error);
+	}
+}
+
+function invalidParamError(
+	index: number,
+	actualValue: unknown,
+	cause: unknown,
+): LixError {
+	const message =
+		cause instanceof Error && cause.message
+			? cause.message
+			: "parameter is not a valid Lix SQL value";
+	return createLixError(
+		"LIX_INVALID_PARAM",
+		`lix.execute() invalid parameter $${index + 1}: ${message}`,
+		{
+			details: {
+				operation: "execute",
+				parameter_index: index + 1,
+				argument: `params[${index}]`,
+				actual: runtimeTypeName(actualValue),
+			},
+			cause,
+		},
+	);
+}
+
+function expectedArticle(expected: string): "a" | "an" {
+	return /^[aeiou]/i.test(expected) ? "an" : "a";
+}
+
+function runtimeTypeName(value: unknown): string {
+	if (value === null) return "null";
+	if (Array.isArray(value)) return "array";
+	if (value instanceof Date) return "Date";
+	if (value instanceof ArrayBuffer) return "ArrayBuffer";
+	if (ArrayBuffer.isView(value)) return value.constructor.name;
+	return typeof value;
 }
 
 function normalizeExecuteResult(result: WasmExecuteResult): ExecuteResult {
@@ -385,12 +466,7 @@ function normalizeThrownError(error: unknown): LixError {
 			}
 			return error;
 		}
-		const message =
-			typeof error.message === "string"
-				? error.message
-				: typeof error.description === "string"
-					? error.description
-					: error.code;
+		const message = typeof error.message === "string" ? error.message : error.code;
 		return createLixError(error.code, message, { hint, details });
 	}
 
@@ -410,7 +486,6 @@ function extractHintFromMessage(message: unknown): string | undefined {
 function isLixErrorLike(error: unknown): error is {
 	code: string;
 	message?: string;
-	description?: string;
 	hint?: string;
 	details?: unknown;
 } {

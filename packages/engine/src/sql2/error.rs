@@ -29,21 +29,21 @@ fn lix_error_from_datafusion_error(error: &DataFusionError) -> Option<LixError> 
 }
 
 fn classify_datafusion_error(error: &DataFusionError) -> LixError {
-    let description = format!("sql2 DataFusion error: {error}");
-    let lower = description.to_ascii_lowercase();
+    let message = format!("sql2 DataFusion error: {error}");
+    let lower = message.to_ascii_lowercase();
 
     if looks_like_json_udf_miss(&lower) {
-        return LixError::new(LixError::CODE_UDF_NOT_FOUND, description)
+        return LixError::new(LixError::CODE_UDF_NOT_FOUND, message)
             .with_hint("Use lix_json_get(json, key_or_index, ...) for JSON values or lix_json_get_text(json, key_or_index, ...) for text.");
     }
 
     if looks_like_unsupported_dialect(&lower) {
-        return LixError::new(LixError::CODE_DIALECT_UNSUPPORTED, description)
+        return LixError::new(LixError::CODE_DIALECT_UNSUPPORTED, message)
             .with_hint("Lix SQL uses DataFusion syntax. Use lix_json_get(...) or lix_json_get_text(...) for JSON access, and numbered placeholders like $1, $2, ...");
     }
 
     if lower.contains("uses variadic path segments") {
-        return LixError::new(LixError::CODE_INVALID_JSON_PATH, description)
+        return LixError::new(LixError::CODE_INVALID_JSON_PATH, message)
             .with_hint("Pass path segments as separate arguments, for example lix_json_get_text(document, 'user', 'name'), not '$.user.name' or '/user/name'.");
     }
 
@@ -51,7 +51,7 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
         || lower.contains("placeholder")
         || lower.contains("bind")
     {
-        return LixError::new(LixError::CODE_PARSE_ERROR, description).with_hint(
+        return LixError::new(LixError::CODE_PARSE_ERROR, message).with_hint(
             "Use numbered placeholders like $1, $2, ...; '?' placeholders are not supported.",
         );
     }
@@ -60,7 +60,7 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
         || lower.contains("history filter")
         || lower.contains("history table")
     {
-        return LixError::new(LixError::CODE_HISTORY_FILTER_REQUIRED, description)
+        return LixError::new(LixError::CODE_HISTORY_FILTER_REQUIRED, message)
             .with_hint("Add a commit/version range predicate before querying history tables.");
     }
 
@@ -71,7 +71,7 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
         || lower.contains("could not find table")
         || (lower.contains("relation") && lower.contains("not found"))
     {
-        return LixError::new(LixError::CODE_TABLE_NOT_FOUND, description)
+        return LixError::new(LixError::CODE_TABLE_NOT_FOUND, message)
             .with_hint("Use information_schema.tables to inspect available Lix SQL tables.");
     }
 
@@ -80,15 +80,41 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
             || lower.contains("does not exist")
             || lower.contains("no field named"))
     {
-        return LixError::new(LixError::CODE_COLUMN_NOT_FOUND, description);
+        return LixError::new(LixError::CODE_COLUMN_NOT_FOUND, message);
     }
 
     if lower.contains("schema validation") {
-        return LixError::new(LixError::CODE_SCHEMA_VALIDATION, description);
+        return LixError::new(LixError::CODE_SCHEMA_VALIDATION, message);
     }
 
     if lower.contains("schema definition") {
-        return LixError::new(LixError::CODE_SCHEMA_DEFINITION, description);
+        return LixError::new(LixError::CODE_SCHEMA_DEFINITION, message);
+    }
+
+    if lower.contains("unsupported sql type json") {
+        return LixError::new(LixError::CODE_DIALECT_UNSUPPORTED, message)
+            .with_hint("Declare JSON/object columns through lix.registerSchema(...) or lix_registered_schema; SQL type JSON is not supported.");
+    }
+
+    if looks_like_type_mismatch(&lower) {
+        if lower.contains("encountered non utf-8 data") {
+            return LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                "Lix SQL string functions require valid UTF-8 text; blob data could not be decoded as UTF-8",
+            )
+            .with_hint(
+                "Pass text to string functions. Raw blob parameters stay binary and are not implicitly decoded as UTF-8.",
+            );
+        }
+        return LixError::new(LixError::CODE_TYPE_MISMATCH, message)
+            .with_hint("Check the SQL function argument types. JSON text can be converted with lix_json(...); JSON fields can be read with lix_json_get(...) or lix_json_get_text(...).");
+    }
+
+    if matches!(
+        error,
+        DataFusionError::Plan(_) | DataFusionError::SchemaError(_, _)
+    ) {
+        return LixError::new(LixError::CODE_PARSE_ERROR, message);
     }
 
     if lower.contains("constraint")
@@ -99,32 +125,22 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
         || lower.contains("primary key")
         || lower.contains("foreign key")
     {
-        return LixError::new(LixError::CODE_CONSTRAINT_VIOLATION, description);
-    }
-
-    if lower.contains("unsupported sql type json") {
-        return LixError::new(LixError::CODE_DIALECT_UNSUPPORTED, description)
-            .with_hint("Declare JSON/object columns through lix.registerSchema(...) or lix_registered_schema; SQL type JSON is not supported.");
-    }
-
-    if looks_like_type_mismatch(&lower) {
-        return LixError::new(LixError::CODE_TYPE_MISMATCH, description)
-            .with_hint("Check the SQL function argument types. JSON text can be converted with lix_json(...); JSON fields can be read with lix_json_get(...) or lix_json_get_text(...).");
+        return LixError::new(LixError::CODE_CONSTRAINT_VIOLATION, message);
     }
 
     match error {
-        DataFusionError::SQL(_, _) => LixError::new(LixError::CODE_PARSE_ERROR, description),
+        DataFusionError::SQL(_, _) => LixError::new(LixError::CODE_PARSE_ERROR, message),
         DataFusionError::NotImplemented(_) => {
-            LixError::new(LixError::CODE_DIALECT_UNSUPPORTED, description)
+            LixError::new(LixError::CODE_DIALECT_UNSUPPORTED, message)
         }
         DataFusionError::Plan(_) | DataFusionError::SchemaError(_, _) => {
-            LixError::new(LixError::CODE_PARSE_ERROR, description)
+            LixError::new(LixError::CODE_PARSE_ERROR, message)
         }
         DataFusionError::IoError(_) | DataFusionError::ObjectStore(_) => {
-            LixError::new(LixError::CODE_STORAGE_ERROR, description)
+            LixError::new(LixError::CODE_STORAGE_ERROR, message)
         }
-        DataFusionError::Internal(_) => LixError::new(LixError::CODE_INTERNAL_ERROR, description),
-        _ => LixError::new(LixError::CODE_UNKNOWN, description),
+        DataFusionError::Internal(_) => LixError::new(LixError::CODE_INTERNAL_ERROR, message),
+        _ => LixError::new(LixError::CODE_UNKNOWN, message),
     }
 }
 

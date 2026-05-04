@@ -430,7 +430,7 @@ mod tests {
 
         let missing = row.get::<String>("missing").unwrap_err();
         assert_eq!(missing.code, LixError::CODE_COLUMN_NOT_FOUND);
-        assert!(missing.description.contains("available columns: title"));
+        assert!(missing.message.contains("available columns: title"));
 
         let wrong_type = row.get::<bool>("title").unwrap_err();
         assert_eq!(wrong_type.code, "LIX_ERROR_VALUE_TYPE");

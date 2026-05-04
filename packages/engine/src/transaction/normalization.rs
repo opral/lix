@@ -500,12 +500,8 @@ mod tests {
         let error =
             normalize_stage_row(row, &mut catalog, functions()).expect_err("default should fail");
 
-        assert!(error
-            .description
-            .contains("failed to evaluate x-lix-default"));
-        assert!(error
-            .description
-            .contains("unknown_cel_default_schema.slug"));
+        assert!(error.message.contains("failed to evaluate x-lix-default"));
+        assert!(error.message.contains("unknown_cel_default_schema.slug"));
     }
 
     #[test]
@@ -523,7 +519,7 @@ mod tests {
             normalize_stage_row(row, &mut catalog, functions()).expect_err("id mismatch fails");
 
         assert!(error
-            .description
+            .message
             .contains("does not match x-lix-primary-key derived entity_id"));
     }
 

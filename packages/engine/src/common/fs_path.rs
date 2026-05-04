@@ -6,19 +6,20 @@
 //! - The engine stores an internal IRI, not a WHATWG URL.
 //! - ASCII-only URI spelling is a boundary serialization, not the internal form.
 //! - Unicode is normalized with UAX #15 NFC.
-//! - Canonicalization uses RFC 3986 rules for dot-segment removal and
-//!   percent-encoding normalization.
+//! - Canonicalization uses RFC 3986-compatible percent-encoding normalization.
+//! - Dot segments are rejected rather than rewritten because Lix paths are
+//!   stable logical identities, not URI references being resolved against a
+//!   base path.
 //!
 //! Canonicalization order:
 //!
 //! 1. Normalize raw input to NFC.
 //! 2. Validate the normalized form and percent-encoding structure.
 //! 3. Apply percent-encoding normalization.
-//! 4. Remove dot segments.
+//! 4. Reject dot segments.
 //!
 //! Fixed RFC-derived rules:
 //!
-//! - Dot segments are removed before storage per RFC 3986 §5.2.4.
 //! - Percent triplets use uppercase hex digits per RFC 3986 §6.2.2.1.
 //! - Percent-encoded unreserved characters are decoded to raw form per
 //!   RFC 3986 §6.2.2.2.
@@ -142,7 +143,6 @@ enum PathError {
     UnexpectedTrailingSlashOnFilePath,
     MissingTrailingSlashOnDirectoryPath,
     EmptySegment,
-    #[cfg(test)]
     DotSegment,
     SlashInSegment,
     Backslash,
@@ -156,7 +156,7 @@ enum PathError {
 
 impl PathError {
     fn into_lix_error(self) -> LixError {
-        let (code, description, hint) = match self {
+        let (code, message, hint) = match self {
             Self::MissingLeadingSlash => (
                 "LIX_ERROR_PATH_MISSING_LEADING_SLASH",
                 "path must start with '/'",
@@ -177,7 +177,6 @@ impl PathError {
                 "path must not contain empty segments",
                 Some("remove duplicate slashes like '//'"),
             ),
-            #[cfg(test)]
             Self::DotSegment => (
                 "LIX_ERROR_PATH_DOT_SEGMENT",
                 "path segment cannot be '.' or '..'",
@@ -221,7 +220,7 @@ impl PathError {
             ),
         };
 
-        let err = LixError::new(code, description);
+        let err = LixError::new(code, message);
         match hint {
             Some(hint) => err.with_hint(hint),
             None => err,
@@ -462,10 +461,7 @@ fn canonicalize_path_segments(segments: &[&str]) -> PathResult<Vec<String>> {
     for segment in segments {
         let normalized_segment = normalize_validated_path_segment(segment)?;
         match normalized_segment.as_str() {
-            "." => {}
-            ".." => {
-                canonical_segments.pop();
-            }
+            "." | ".." => return Err(PathError::DotSegment),
             _ => canonical_segments.push(normalized_segment),
         }
     }
@@ -684,10 +680,6 @@ mod tests {
             label: "path with pchar punctuation",
             input: "/docs/hello:world@x!$&'()*+,;=.md",
         },
-        RfcFixture {
-            label: "path with dot segments is still valid syntax",
-            input: "/docs/../guide.md",
-        },
     ];
 
     const RFC_NEGATIVE_FIXTURES: &[RfcFixture] = &[
@@ -780,6 +772,13 @@ mod tests {
             oracle_accepts: true,
             expected: Err(PathError::InvalidIriCodePoint),
         },
+        LixProfileFixture {
+            label: "dot segments are valid RFC syntax but banned by the Lix profile",
+            kind: LixFixtureKind::File,
+            input: "/docs/../guide.md",
+            oracle_accepts: true,
+            expected: Err(PathError::DotSegment),
+        },
     ];
 
     const NORMALIZATION_FIXTURES: &[NormalizationFixture] = &[
@@ -788,12 +787,6 @@ mod tests {
             kind: NormalizationKind::File,
             input: "/Cafe\u{0301}.md",
             expected: "/Café.md",
-        },
-        NormalizationFixture {
-            label: "dot segments are removed in file paths",
-            kind: NormalizationKind::File,
-            input: "/docs/./../guide.md",
-            expected: "/guide.md",
         },
         NormalizationFixture {
             label: "percent triplets are uppercased when preserved",
@@ -812,12 +805,6 @@ mod tests {
             kind: NormalizationKind::Directory,
             input: "/",
             expected: "/",
-        },
-        NormalizationFixture {
-            label: "directory trailing slash typing is preserved",
-            kind: NormalizationKind::Directory,
-            input: "/docs/%2e/guide/",
-            expected: "/docs/guide/",
         },
         NormalizationFixture {
             label: "segment normalization decodes unreserved percent triplets",
@@ -926,11 +913,13 @@ mod tests {
 
     #[test]
     fn rejects_file_paths_with_dot_segments() {
-        for (path, expected) in [("/docs/./file", "/docs/file"), ("/docs/../file", "/file")] {
-            assert!(
-                normalize_file_path(path).as_deref() == Ok(expected),
-                "expected canonicalized dot-segment path {path}"
-            );
+        for path in [
+            "/docs/./file",
+            "/docs/../file",
+            "/docs/%2e/file",
+            "/docs/%2E%2E/file",
+        ] {
+            assert_path_error(normalize_file_path_impl(path), PathError::DotSegment);
         }
     }
 
@@ -991,15 +980,11 @@ mod tests {
             normalize_file_path("/docs/%2fkept%3aencoded").as_deref(),
             Ok("/docs/%2Fkept%3Aencoded")
         );
-        assert_eq!(
-            normalize_file_path("/docs/%2e/file").as_deref(),
-            Ok("/docs/file")
-        );
     }
 
     #[test]
     fn normalization_is_stable_on_renormalization() {
-        let once = normalize_file_path("/docs/%7e%2E/../%41.md").expect("first normalization");
+        let once = normalize_file_path("/docs/%7e/%41.md").expect("first normalization");
         let twice = normalize_file_path(&once).expect("second normalization");
         assert_eq!(once, twice);
     }
@@ -1047,13 +1032,16 @@ mod tests {
     #[test]
     fn canonicalizes_directory_paths() {
         assert_eq!(
-            normalize_directory_path("/docs/%2e/guide/").as_deref(),
-            Ok("/docs/guide/")
-        );
-        assert_eq!(
             normalize_directory_path("/docs/%7e%2fkept/").as_deref(),
             Ok("/docs/~%2Fkept/")
         );
+    }
+
+    #[test]
+    fn rejects_directory_paths_with_dot_segments() {
+        for path in ["/docs/./", "/docs/../", "/docs/%2e/", "/docs/%2E%2E/"] {
+            assert_path_error(normalize_directory_path_impl(path), PathError::DotSegment);
+        }
     }
 
     #[test]

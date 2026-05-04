@@ -292,7 +292,7 @@ mod tests {
             .await
             .expect_err("missing parent should fail");
 
-        assert!(error.description.contains("missing-parent"));
+        assert!(error.message.contains("missing-parent"));
     }
 
     #[tokio::test]
@@ -317,7 +317,7 @@ mod tests {
             .await
             .expect_err("cycle should fail");
 
-        assert!(error.description.contains("cycle"));
+        assert!(error.message.contains("cycle"));
     }
 
     #[tokio::test]
@@ -454,7 +454,7 @@ mod tests {
             .await
             .expect_err("missing head should fail");
 
-        assert!(error.description.contains("missing-head"));
+        assert!(error.message.contains("missing-head"));
     }
 
     #[tokio::test]
@@ -659,7 +659,7 @@ mod tests {
             .await
             .expect_err("unrelated histories should not have a merge base");
 
-        assert!(error.description.contains("no common history"));
+        assert!(error.message.contains("no common history"));
     }
 
     #[tokio::test]

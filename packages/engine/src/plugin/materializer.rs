@@ -50,7 +50,7 @@ pub(crate) async fn load_installed_plugins_with_runtime_cache(
         .read()
         .map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "installed plugin cache lock poisoned".to_string(),
+            message: "installed plugin cache lock poisoned".to_string(),
             hint: None,
             details: None,
         })?
@@ -65,7 +65,7 @@ pub(crate) async fn load_installed_plugins_with_runtime_cache(
         .write()
         .map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "installed plugin cache lock poisoned".to_string(),
+            message: "installed plugin cache lock poisoned".to_string(),
             hint: None,
             details: None,
         })?;
@@ -99,7 +99,7 @@ pub(crate) async fn load_installed_plugin_from_archive_ref_with_backend(
     let Some(plugin_key) = plugin_key_from_archive_path(&archive_ref.path) else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
+            message: format!(
                 "plugin materialization: unsupported plugin archive path '{}'",
                 archive_ref.path
             ),
@@ -114,7 +114,7 @@ pub(crate) async fn load_installed_plugin_from_archive_ref_with_backend(
         .await?
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
+            message: format!(
                 "plugin materialization: missing plugin archive blob '{}' for file '{}' ({})",
                 archive_ref.blob_hash, archive_ref.path, archive_ref.file_id
             ),
@@ -124,7 +124,7 @@ pub(crate) async fn load_installed_plugin_from_archive_ref_with_backend(
     if archive_bytes.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
+            message: format!(
                 "plugin materialization: archive '{}' is empty",
                 archive_ref.path
             ),
@@ -163,14 +163,14 @@ pub(crate) fn invalidate_installed_plugins_cache(
         .write()
         .map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "installed plugin cache lock poisoned".to_string(),
+            message: "installed plugin cache lock poisoned".to_string(),
             hint: None,
             details: None,
         })?;
     *guard = None;
     let mut component_guard = host.plugin_component_cache().lock().map_err(|_| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "plugin component cache lock poisoned".to_string(),
+        message: "plugin component cache lock poisoned".to_string(),
         hint: None,
             details: None,
     })?;

@@ -3,10 +3,10 @@ use serde_json::{json, Value as JsonValue};
 /// Structured error type surfaced by Lix to every SDK binding.
 ///
 /// Carries a machine-readable [`code`](Self::code), a human-readable
-/// [`description`](Self::description), and an optional
-/// [`hint`](Self::hint) suggesting how to recover. Hints follow the
-/// Postgres/rustc convention: `description` states what went wrong in
-/// factual terms, and `hint` offers a possible fix when one is known.
+/// [`message`](Self::message), and an optional [`hint`](Self::hint)
+/// suggesting how to recover. Hints follow the Postgres/rustc convention:
+/// `message` states what went wrong in factual terms, and `hint` offers a
+/// possible fix when one is known.
 ///
 /// ```
 /// use lix_engine::LixError;
@@ -22,7 +22,7 @@ use serde_json::{json, Value as JsonValue};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LixError {
     pub code: String,
-    pub description: String,
+    pub message: String,
     pub hint: Option<String>,
     pub details: Option<JsonValue>,
 }
@@ -53,6 +53,9 @@ impl LixError {
 
     /// SQL parameters could not be bound to placeholders.
     pub const CODE_BINDING_ERROR: &'static str = "LIX_BINDING_ERROR";
+
+    /// A caller supplied an invalid SQL parameter value or parameter list.
+    pub const CODE_INVALID_PARAM: &'static str = "LIX_INVALID_PARAM";
 
     /// A SQL table or view name could not be resolved.
     pub const CODE_TABLE_NOT_FOUND: &'static str = "LIX_TABLE_NOT_FOUND";
@@ -129,17 +132,17 @@ impl LixError {
     /// such as merging a version into itself.
     pub const CODE_INVALID_MERGE: &'static str = "LIX_INVALID_MERGE";
 
-    pub fn new(code: impl Into<String>, description: impl Into<String>) -> Self {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
-            description: description.into(),
+            message: message.into(),
             hint: None,
             details: None,
         }
     }
 
-    pub fn unknown(description: impl Into<String>) -> Self {
-        Self::new("LIX_ERROR_UNKNOWN", description)
+    pub fn unknown(message: impl Into<String>) -> Self {
+        Self::new("LIX_ERROR_UNKNOWN", message)
     }
 
     pub fn version_not_found(
@@ -232,15 +235,15 @@ impl LixError {
         self.hint.as_deref()
     }
 
-    pub fn description_with_hint(&self) -> String {
+    pub fn message_with_hint(&self) -> String {
         match self.hint() {
-            Some(hint) => format!("{}\nhint: {hint}", self.description),
-            None => self.description.clone(),
+            Some(hint) => format!("{}\nhint: {hint}", self.message),
+            None => self.message.clone(),
         }
     }
 
     pub fn format(&self) -> String {
-        let mut s = format!("code: {}\ndescription: {}", self.code, self.description);
+        let mut s = format!("code: {}\nmessage: {}", self.code, self.message);
         if let Some(hint) = &self.hint {
             s.push_str(&format!("\nhint: {hint}"));
         }
@@ -265,7 +268,7 @@ mod tests {
         let err = LixError::new("LIX_ERROR_FOO", "something went wrong");
         assert_eq!(
             err.format(),
-            "code: LIX_ERROR_FOO\ndescription: something went wrong"
+            "code: LIX_ERROR_FOO\nmessage: something went wrong"
         );
         assert!(err.hint.is_none());
     }
@@ -275,7 +278,7 @@ mod tests {
         let err = LixError::new("LIX_ERROR_FOO", "something went wrong").with_hint("try the fix");
         assert_eq!(
             err.format(),
-            "code: LIX_ERROR_FOO\ndescription: something went wrong\nhint: try the fix"
+            "code: LIX_ERROR_FOO\nmessage: something went wrong\nhint: try the fix"
         );
     }
 

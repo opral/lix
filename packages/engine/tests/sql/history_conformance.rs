@@ -3,6 +3,64 @@ use lix_engine::Value;
 use super::select_rows;
 
 simulation_test!(
+    history_surfaces_are_introspected_as_views,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+        .execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"engine2_history_table_type\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+             true,\
+             true\
+             )",
+            &[],
+        )
+        .await
+        .expect("registered schema insert should succeed");
+
+        let rows = select_rows(
+            &session,
+            "SELECT table_name, table_type \
+         FROM information_schema.tables \
+         WHERE table_name IN (\
+           'lix_state_history',\
+           'lix_file_history',\
+           'lix_directory_history',\
+           'engine2_history_table_type_history'\
+         ) \
+         ORDER BY table_name",
+        )
+        .await;
+
+        let expected = [
+            "engine2_history_table_type_history",
+            "lix_directory_history",
+            "lix_file_history",
+            "lix_state_history",
+        ]
+        .into_iter()
+        .map(|table| {
+            vec![
+                Value::Text(table.to_string()),
+                Value::Text("VIEW".to_string()),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+        assert_eq!(rows, expected);
+    }
+);
+
+simulation_test!(
     history_view_schemas_expose_tombstone_contract,
     |sim| async move {
         let engine = sim.boot_engine().await;

@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lix_rs_sdk::{
-    open_lix, CreateVersionOptions, KvPair, KvScanRange, Backend, BackendTransaction,
-    LixError, MergeVersionOptions, MergeVersionOutcome, OpenLixOptions, SwitchVersionOptions,
+    open_lix, Backend, BackendTransaction, CreateVersionOptions, KvPair, KvScanRange, LixError,
+    MergeVersionOptions, MergeVersionOutcome, OpenLixOptions, SwitchVersionOptions,
     TransactionBeginMode, Value,
 };
 
