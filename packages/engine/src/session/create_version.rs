@@ -57,13 +57,15 @@ impl SessionContext {
                         })?
                 };
 
-                transaction.stage_write(StageWrite::Rows {
-                    mode: StageWriteMode::Insert,
-                    rows: vec![
-                        version_descriptor_stage_row(&version_id, &options.name, false),
-                        version_ref_stage_row(&version_id, &source_head),
-                    ],
-                })?;
+                transaction
+                    .stage_write(StageWrite::Rows {
+                        mode: StageWriteMode::Insert,
+                        rows: vec![
+                            version_descriptor_stage_row(&version_id, &options.name, false),
+                            version_ref_stage_row(&version_id, &source_head),
+                        ],
+                    })
+                    .await?;
 
                 Ok(CreateVersionReceipt {
                     id: version_id,
