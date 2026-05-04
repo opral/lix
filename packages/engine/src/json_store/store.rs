@@ -2,8 +2,7 @@ use crate::json_store::compression::{compress_json_payload, decode_json_zstd_pay
 use crate::json_store::encoded::{EncodedJson, JsonCodec};
 use crate::json_store::types::JsonRef;
 use crate::storage::{
-    KvGetGroup, KvGetProjection, KvGetRequest, KvPut, KvWriteBatch, KvWriteGroup, StorageReader,
-    StorageWriter,
+    KvGetGroup, KvGetRequest, KvPut, KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
 };
 use crate::LixError;
 use std::borrow::Cow;
@@ -122,20 +121,17 @@ pub(crate) async fn load_json_bytes(
     json_ref: &JsonRef,
 ) -> Result<Option<Vec<u8>>, LixError> {
     let result = store
-        .get_kv_many(KvGetRequest {
+        .get_values(KvGetRequest {
             groups: vec![KvGetGroup {
                 namespace: JSON_NAMESPACE.to_string(),
                 keys: vec![json_ref.as_hash_bytes().to_vec()],
             }],
-            projection: KvGetProjection::Values,
         })
         .await?
         .groups
         .into_iter()
         .next()
-        .map(|mut group| group.pop_value())
-        .transpose()?
-        .flatten();
+        .and_then(|mut group| group.pop_value());
     let Some(bytes) = result else {
         return Ok(None);
     };

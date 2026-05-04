@@ -6,8 +6,8 @@ use crate::binary_cas::codec::{
 };
 use crate::binary_cas::BinaryBlobWrite;
 use crate::storage::{
-    KvGetGroup, KvGetProjection, KvGetRequest, KvPut, KvScanProjection, KvScanRange, KvScanRequest,
-    KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
+    KvGetGroup, KvGetRequest, KvPut, KvScanRange, KvScanRequest, KvWriteBatch, KvWriteGroup,
+    StorageReader, StorageWriter,
 };
 use crate::LixError;
 use std::collections::HashSet;
@@ -137,20 +137,17 @@ async fn get_one(
     key: Vec<u8>,
 ) -> Result<Option<Vec<u8>>, LixError> {
     Ok(store
-        .get_kv_many(KvGetRequest {
+        .get_values(KvGetRequest {
             groups: vec![KvGetGroup {
                 namespace: namespace.to_string(),
                 keys: vec![key],
             }],
-            projection: KvGetProjection::Values,
         })
         .await?
         .groups
         .into_iter()
         .next()
-        .map(|mut group| group.pop_value())
-        .transpose()?
-        .flatten())
+        .and_then(|mut group| group.pop_value()))
 }
 
 async fn scan_all_values(
@@ -159,16 +156,14 @@ async fn scan_all_values(
     range: KvScanRange,
 ) -> Result<Vec<Vec<u8>>, LixError> {
     Ok(store
-        .scan_kv(KvScanRequest {
+        .scan_values(KvScanRequest {
             namespace: namespace.to_string(),
             range,
             after: None,
             limit: usize::MAX,
-            projection: KvScanProjection::KeysAndValues,
         })
         .await?
-        .into_rows()
-        .into_values_required()?)
+        .values)
 }
 
 async fn put_one(
@@ -215,18 +210,17 @@ pub(crate) async fn load_blob_data_by_hash(
         .map(|manifest_chunk| chunk_key(&manifest_chunk.chunk_hash))
         .collect::<Vec<_>>();
     let chunk_rows = store
-        .get_kv_many(KvGetRequest {
+        .get_values(KvGetRequest {
             groups: vec![KvGetGroup {
                 namespace: BINARY_CAS_CHUNK_NAMESPACE.to_string(),
                 keys: chunk_keys,
             }],
-            projection: KvGetProjection::Values,
         })
         .await?
         .groups
         .into_iter()
         .next()
-        .map(|group| group.rows)
+        .map(|group| group.values)
         .unwrap_or_default();
     if chunk_rows.len() != manifest_chunks.len() {
         return Err(LixError::new(
@@ -241,7 +235,7 @@ pub(crate) async fn load_blob_data_by_hash(
     }
 
     for (index, manifest_chunk) in manifest_chunks.iter().enumerate() {
-        let Some(chunk_bytes) = chunk_rows.value(index) else {
+        let Some(chunk_bytes) = chunk_rows[index].as_deref() else {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!(

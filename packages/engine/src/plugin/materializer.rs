@@ -204,9 +204,10 @@ mod tests {
         BINARY_CAS_MANIFEST_CHUNK_NAMESPACE, BINARY_CAS_MANIFEST_NAMESPACE,
     };
     use crate::{
-        BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetRequest, BackendKvRowBatch,
-        BackendKvScanBatch, BackendKvScanProjection, BackendKvScanRange, BackendKvScanRequest,
-        BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
+        BackendKvEntry, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup,
+        BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest,
+        BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
+        BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
     };
     use async_trait::async_trait;
     use std::io::{Cursor, Write};
@@ -242,50 +243,74 @@ mod tests {
 
     #[async_trait]
     impl BackendReadTransaction for PluginLookupTransaction {
-        async fn get_kv_many(
+        async fn get_values(
             &mut self,
             request: BackendKvGetRequest,
-        ) -> Result<BackendKvGetBatch, LixError> {
+        ) -> Result<BackendKvValueBatch, LixError> {
             let mut groups = Vec::with_capacity(request.groups.len());
             for group in request.groups {
-                let mut rows = BackendKvRowBatch::with_capacity(group.keys.len());
-                for key in group.keys {
-                    rows.push_get_projection(
-                        key.clone(),
-                        test_kv_get(&self.archive_bytes, &group.namespace, &key)?,
-                        request.projection,
-                    );
-                }
-                groups.push(BackendKvGetBatchGroup {
+                let values = group
+                    .keys
+                    .into_iter()
+                    .map(|key| test_kv_get(&self.archive_bytes, &group.namespace, &key))
+                    .collect::<Result<Vec<_>, LixError>>()?;
+                groups.push(BackendKvValueGroup {
                     namespace: group.namespace,
-                    rows,
+                    values,
                 });
             }
-            Ok(BackendKvGetBatch { groups })
+            Ok(BackendKvValueBatch { groups })
         }
 
-        async fn scan_kv(
+        async fn exists_many(
+            &mut self,
+            request: BackendKvGetRequest,
+        ) -> Result<BackendKvExistsBatch, LixError> {
+            let mut groups = Vec::with_capacity(request.groups.len());
+            for group in request.groups {
+                let exists = group
+                    .keys
+                    .iter()
+                    .map(|key| test_kv_get(&self.archive_bytes, &group.namespace, key))
+                    .collect::<Result<Vec<_>, LixError>>()?
+                    .into_iter()
+                    .map(|value| value.is_some())
+                    .collect();
+                groups.push(BackendKvExistsGroup {
+                    namespace: group.namespace,
+                    exists,
+                });
+            }
+            Ok(BackendKvExistsBatch { groups })
+        }
+
+        async fn scan_keys(
             &mut self,
             request: BackendKvScanRequest,
-        ) -> Result<BackendKvScanBatch, LixError> {
-            let projection = request.projection;
-            let mut rows = test_kv_scan(&self.archive_bytes, request.namespace, request.range)?;
-            for index in (0..rows.len()).rev() {
-                let keep = request
-                    .after
-                    .as_deref()
-                    .is_none_or(|after| rows.key(index).expect("row key exists") > after);
-                if !keep {
-                    rows.remove(index);
-                }
-            }
-            if projection == BackendKvScanProjection::KeysOnly {
-                rows.clear_values();
-            }
-            let has_more = rows.len() > request.limit;
-            rows.truncate(request.limit);
-            let resume_after = has_more.then(|| rows.last_key_cloned()).flatten();
-            Ok(BackendKvScanBatch { rows, resume_after })
+        ) -> Result<BackendKvKeyPage, LixError> {
+            let entries = test_kv_scan(&self.archive_bytes, request)?;
+            Ok(BackendKvKeyPage {
+                keys: entries.entries.into_iter().map(|entry| entry.key).collect(),
+                resume_after: entries.resume_after,
+            })
+        }
+
+        async fn scan_values(
+            &mut self,
+            request: BackendKvScanRequest,
+        ) -> Result<BackendKvValuePage, LixError> {
+            let entries = test_kv_scan(&self.archive_bytes, request)?;
+            Ok(BackendKvValuePage {
+                values: entries.entries.into_iter().map(|entry| entry.value).collect(),
+                resume_after: entries.resume_after,
+            })
+        }
+
+        async fn scan_entries(
+            &mut self,
+            request: BackendKvScanRequest,
+        ) -> Result<BackendKvEntryPage, LixError> {
+            test_kv_scan(&self.archive_bytes, request)
         }
 
         async fn rollback(self: Box<Self>) -> Result<(), LixError> {
@@ -344,19 +369,24 @@ mod tests {
 
     fn test_kv_scan(
         archive_bytes: &[u8],
-        namespace: String,
-        range: BackendKvScanRange,
-    ) -> Result<BackendKvRowBatch, LixError> {
-        if namespace != BINARY_CAS_MANIFEST_CHUNK_NAMESPACE {
-            return Ok(BackendKvRowBatch::new());
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvEntryPage, LixError> {
+        if request.namespace != BINARY_CAS_MANIFEST_CHUNK_NAMESPACE {
+            return Ok(BackendKvEntryPage {
+                entries: Vec::new(),
+                resume_after: None,
+            });
         }
         let key = b"blob-plugin-json/00000000000000000000".to_vec();
-        let include = match range {
+        let include = match request.range {
             BackendKvScanRange::Prefix(prefix) => key.starts_with(&prefix),
             BackendKvScanRange::Range { start, end } => key >= start && key < end,
         };
-        if !include {
-            return Ok(BackendKvRowBatch::new());
+        if !include || request.after.as_deref().is_some_and(|after| key.as_slice() <= after) {
+            return Ok(BackendKvEntryPage {
+                entries: Vec::new(),
+                resume_after: None,
+            });
         }
         let value = serde_json::to_vec(&KvBlobManifestChunk {
             chunk_hash: "chunk-plugin-json".to_string(),
@@ -368,9 +398,16 @@ mod tests {
                 format!("test manifest chunk encode failed: {error}"),
             )
         })?;
-        let mut rows = BackendKvRowBatch::with_capacity(1);
-        rows.push_value(key, value);
-        Ok(rows)
+        let mut entries = vec![BackendKvEntry { key, value }];
+        let has_more = entries.len() > request.limit;
+        entries.truncate(request.limit);
+        let resume_after = has_more
+            .then(|| entries.last().map(|entry| entry.key.clone()))
+            .flatten();
+        Ok(BackendKvEntryPage {
+            entries,
+            resume_after,
+        })
     }
 
     fn build_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {

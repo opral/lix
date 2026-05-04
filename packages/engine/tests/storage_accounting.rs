@@ -6,10 +6,10 @@ use lix_engine::storage_bench::{
     StorageBenchSelectivity, StorageBenchUpdateFraction,
 };
 use lix_engine::{
-    Backend, BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetRequest, BackendKvRowBatch,
-    BackendKvScanBatch, BackendKvScanProjection, BackendKvScanRange, BackendKvScanRequest,
-    BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
-    LixError,
+    Backend, BackendKvEntry, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup,
+    BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest,
+    BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
+    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, LixError,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -349,28 +349,29 @@ struct AccountingRow {
 }
 
 async fn run_workload(workload: AccountingWorkload) -> Result<AccountingRow, LixError> {
-    let backend = AccountingBackend::default();
+    let accounting_backend = AccountingBackend::default();
+    let backend: Arc<dyn Backend + Send + Sync> = Arc::new(accounting_backend.clone());
     let config = config_for(workload);
     let rows = workload_rows(workload);
     let snapshot = match workload {
         AccountingWorkload::WriteRoot { .. } => {
             let fixture = storage_bench::prepare_tracked_state_write_root(config).await?;
             storage_bench::tracked_state_write_root_prepared(&backend, &fixture).await?;
-            backend.accounting()?
+            accounting_backend.accounting()?
         }
         AccountingWorkload::UpdateOne { .. } => {
             let fixture =
                 storage_bench::prepare_tracked_state_update_rows(&backend, config, 1).await?;
-            let before = backend.accounting()?;
+            let before = accounting_backend.accounting()?;
             storage_bench::tracked_state_update_existing_prepared(&backend, &fixture).await?;
-            backend.accounting()?.saturating_sub(before)
+            accounting_backend.accounting()?.saturating_sub(before)
         }
         AccountingWorkload::AppendOne { .. } => {
             let fixture =
                 storage_bench::prepare_tracked_state_append_child_rows(&backend, config, 1).await?;
-            let before = backend.accounting()?;
+            let before = accounting_backend.accounting()?;
             storage_bench::tracked_state_update_existing_prepared(&backend, &fixture).await?;
-            backend.accounting()?.saturating_sub(before)
+            accounting_backend.accounting()?.saturating_sub(before)
         }
         AccountingWorkload::Update10Pct { rows } => {
             let fixture = storage_bench::prepare_tracked_state_update_rows(
@@ -379,9 +380,9 @@ async fn run_workload(workload: AccountingWorkload) -> Result<AccountingRow, Lix
                 rows.div_ceil(10),
             )
             .await?;
-            let before = backend.accounting()?;
+            let before = accounting_backend.accounting()?;
             storage_bench::tracked_state_update_existing_prepared(&backend, &fixture).await?;
-            backend.accounting()?.saturating_sub(before)
+            accounting_backend.accounting()?.saturating_sub(before)
         }
     };
     Ok(AccountingRow { rows, snapshot })
@@ -391,7 +392,8 @@ async fn run_write_root_workload_with_max_inline_encoded_value(
     workload: AccountingWorkload,
     max_inline_encoded_value_bytes: usize,
 ) -> Result<AccountingRow, LixError> {
-    let backend = AccountingBackend::default();
+    let accounting_backend = AccountingBackend::default();
+    let backend: Arc<dyn Backend + Send + Sync> = Arc::new(accounting_backend.clone());
     let config = config_for(workload);
     let rows = workload_rows(workload);
     let fixture =
@@ -403,12 +405,13 @@ async fn run_write_root_workload_with_max_inline_encoded_value(
     storage_bench::tracked_state_write_root_prepared(&backend, &fixture).await?;
     Ok(AccountingRow {
         rows,
-        snapshot: backend.accounting()?,
+        snapshot: accounting_backend.accounting()?,
     })
 }
 
 async fn run_json_workload(workload: JsonAccountingWorkload) -> Result<AccountingRow, LixError> {
-    let backend = AccountingBackend::default();
+    let accounting_backend = AccountingBackend::default();
+    let backend: Arc<dyn Backend + Send + Sync> = Arc::new(accounting_backend.clone());
     let rows = json_workload_rows(workload);
     let snapshot = match workload {
         JsonAccountingWorkload::Raw1k { rows } => {
@@ -416,7 +419,7 @@ async fn run_json_workload(workload: JsonAccountingWorkload) -> Result<Accountin
                 storage_bench::prepare_json_store_write(JsonStorePayloadShape::SmallRaw1k, rows)
                     .await?;
             storage_bench::json_store_write_prepared(&backend, &fixture).await?;
-            backend.accounting()?
+            accounting_backend.accounting()?
         }
         JsonAccountingWorkload::Structured16k { rows } => {
             let fixture = storage_bench::prepare_json_store_write(
@@ -425,7 +428,7 @@ async fn run_json_workload(workload: JsonAccountingWorkload) -> Result<Accountin
             )
             .await?;
             storage_bench::json_store_write_prepared(&backend, &fixture).await?;
-            backend.accounting()?
+            accounting_backend.accounting()?
         }
         JsonAccountingWorkload::Structured128k { rows } => {
             let fixture = storage_bench::prepare_json_store_write(
@@ -434,7 +437,7 @@ async fn run_json_workload(workload: JsonAccountingWorkload) -> Result<Accountin
             )
             .await?;
             storage_bench::json_store_write_prepared(&backend, &fixture).await?;
-            backend.accounting()?
+            accounting_backend.accounting()?
         }
         JsonAccountingWorkload::Array128k { rows } => {
             let fixture = storage_bench::prepare_json_store_write(
@@ -443,7 +446,7 @@ async fn run_json_workload(workload: JsonAccountingWorkload) -> Result<Accountin
             )
             .await?;
             storage_bench::json_store_write_prepared(&backend, &fixture).await?;
-            backend.accounting()?
+            accounting_backend.accounting()?
         }
         JsonAccountingWorkload::DedupeSame16k { rows } => {
             let fixture = storage_bench::prepare_json_store_write_dedupe(
@@ -452,22 +455,22 @@ async fn run_json_workload(workload: JsonAccountingWorkload) -> Result<Accountin
             )
             .await?;
             storage_bench::json_store_write_prepared(&backend, &fixture).await?;
-            backend.accounting()?
+            accounting_backend.accounting()?
         }
         JsonAccountingWorkload::BaseUpdateObject1Of1000 { rows } => {
             let fixture =
                 storage_bench::prepare_json_store_base_update_object(&backend, rows).await?;
-            let before = backend.accounting()?;
+            let before = accounting_backend.accounting()?;
             storage_bench::json_store_write_against_base_object_prepared(&backend, &fixture)
                 .await?;
-            backend.accounting()?.saturating_sub(before)
+            accounting_backend.accounting()?.saturating_sub(before)
         }
         JsonAccountingWorkload::BaseUpdateArray1Of1000 { rows } => {
             let fixture =
                 storage_bench::prepare_json_store_base_update_array(&backend, rows).await?;
-            let before = backend.accounting()?;
+            let before = accounting_backend.accounting()?;
             storage_bench::json_store_write_against_base_array_prepared(&backend, &fixture).await?;
-            backend.accounting()?.saturating_sub(before)
+            accounting_backend.accounting()?.saturating_sub(before)
         }
     };
     Ok(AccountingRow { rows, snapshot })
@@ -476,7 +479,8 @@ async fn run_json_workload(workload: JsonAccountingWorkload) -> Result<Accountin
 async fn run_changelog_workload(
     workload: ChangelogAccountingWorkload,
 ) -> Result<AccountingRow, LixError> {
-    let backend = AccountingBackend::default();
+    let accounting_backend = AccountingBackend::default();
+    let backend: Arc<dyn Backend + Send + Sync> = Arc::new(accounting_backend.clone());
     let rows = changelog_workload_rows(workload);
     let config = changelog_config_for(workload);
     let fixture = match workload {
@@ -498,7 +502,7 @@ async fn run_changelog_workload(
     storage_bench::changelog_append_changes_prepared(&backend, &fixture).await?;
     Ok(AccountingRow {
         rows,
-        snapshot: backend.accounting()?,
+        snapshot: accounting_backend.accounting()?,
     })
 }
 
@@ -719,67 +723,132 @@ impl AccountingTransaction {
             .lock()
             .map_err(|_| LixError::new("LIX_ERROR_UNKNOWN", "accounting store mutex poisoned"))
     }
+
+    fn scan_filtered_pairs(
+        &self,
+        request: &BackendKvScanRequest,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, LixError> {
+        let store = self.lock_store()?;
+        let scan_limit = request
+            .limit
+            .checked_add(1 + usize::from(request.after.is_some()))
+            .unwrap_or(request.limit);
+        let mut pairs = scan_store(&store, &request.namespace, &request.range, Some(scan_limit));
+        pairs.retain(|(key, _)| {
+            request
+                .after
+                .as_deref()
+                .is_none_or(|after| key.as_slice() > after)
+        });
+        Ok(pairs)
+    }
 }
 
 #[async_trait]
 impl BackendReadTransaction for AccountingTransaction {
-    async fn get_kv_many(
+    async fn get_values(
         &mut self,
         request: BackendKvGetRequest,
-    ) -> Result<BackendKvGetBatch, LixError> {
+    ) -> Result<BackendKvValueBatch, LixError> {
         let store = self.lock_store()?;
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
-            let mut rows = BackendKvRowBatch::with_capacity(group.keys.len());
+            let mut values = Vec::with_capacity(group.keys.len());
             for key in group.keys {
-                rows.push_get_projection(
-                    key.clone(),
-                    store.get(&(group.namespace.clone(), key)).cloned(),
-                    request.projection,
-                );
+                values.push(store.get(&(group.namespace.clone(), key)).cloned());
             }
-            groups.push(BackendKvGetBatchGroup {
+            groups.push(BackendKvValueGroup {
                 namespace: group.namespace,
-                rows,
+                values,
             });
         }
-        Ok(BackendKvGetBatch { groups })
+        Ok(BackendKvValueBatch { groups })
     }
 
-    async fn scan_kv(
+    async fn exists_many(
+        &mut self,
+        request: BackendKvGetRequest,
+    ) -> Result<BackendKvExistsBatch, LixError> {
+        let store = self.lock_store()?;
+        let mut groups = Vec::with_capacity(request.groups.len());
+        for group in request.groups {
+            let mut exists = Vec::with_capacity(group.keys.len());
+            for key in group.keys {
+                exists.push(store.contains_key(&(group.namespace.clone(), key)));
+            }
+            groups.push(BackendKvExistsGroup {
+                namespace: group.namespace,
+                exists,
+            });
+        }
+        Ok(BackendKvExistsBatch { groups })
+    }
+
+    async fn scan_keys(
         &mut self,
         request: BackendKvScanRequest,
-    ) -> Result<BackendKvScanBatch, LixError> {
-        let store = self.lock_store()?;
-        let rows = scan_store(
-            &store,
-            &request.namespace,
-            &request.range,
-            Some(
-                request
-                    .limit
-                    .checked_add(1 + usize::from(request.after.is_some()))
-                    .unwrap_or(request.limit),
-            ),
-        );
-        let mut filtered = BackendKvRowBatch::new();
-        for index in 0..rows.len() {
-            let key = rows.key(index).expect("row key exists");
-            if request.after.as_deref().is_none_or(|after| key > after) {
-                match request.projection {
-                    BackendKvScanProjection::KeysOnly => filtered.push_key_only(key.to_vec()),
-                    BackendKvScanProjection::KeysAndValues => filtered.push_value(
-                        key.to_vec(),
-                        rows.value(index).expect("scan value exists").to_vec(),
-                    ),
-                }
-            }
-        }
-        let has_more = filtered.len() > request.limit;
-        filtered.truncate(request.limit);
-        let resume_after = has_more.then(|| filtered.last_key_cloned()).flatten();
-        Ok(BackendKvScanBatch {
-            rows: filtered,
+    ) -> Result<BackendKvKeyPage, LixError> {
+        let pairs = self.scan_filtered_pairs(&request)?;
+        let has_more = pairs.len() > request.limit;
+        let resume_after = has_more
+            .then(|| {
+                pairs
+                    .get(request.limit.saturating_sub(1))
+                    .map(|(key, _)| key.clone())
+            })
+            .flatten();
+        Ok(BackendKvKeyPage {
+            keys: pairs
+                .into_iter()
+                .take(request.limit)
+                .map(|(key, _)| key)
+                .collect(),
+            resume_after,
+        })
+    }
+
+    async fn scan_values(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvValuePage, LixError> {
+        let pairs = self.scan_filtered_pairs(&request)?;
+        let has_more = pairs.len() > request.limit;
+        let resume_after = has_more
+            .then(|| {
+                pairs
+                    .get(request.limit.saturating_sub(1))
+                    .map(|(key, _)| key.clone())
+            })
+            .flatten();
+        Ok(BackendKvValuePage {
+            values: pairs
+                .into_iter()
+                .take(request.limit)
+                .map(|(_, value)| value)
+                .collect(),
+            resume_after,
+        })
+    }
+
+    async fn scan_entries(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvEntryPage, LixError> {
+        let pairs = self.scan_filtered_pairs(&request)?;
+        let has_more = pairs.len() > request.limit;
+        let resume_after = has_more
+            .then(|| {
+                pairs
+                    .get(request.limit.saturating_sub(1))
+                    .map(|(key, _)| key.clone())
+            })
+            .flatten();
+        Ok(BackendKvEntryPage {
+            entries: pairs
+                .into_iter()
+                .take(request.limit)
+                .map(|(key, value)| BackendKvEntry { key, value })
+                .collect(),
             resume_after,
         })
     }
@@ -824,7 +893,7 @@ fn scan_store(
     namespace: &str,
     range: &BackendKvScanRange,
     limit: Option<usize>,
-) -> BackendKvRowBatch {
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut pairs = Vec::new();
     for ((row_namespace, key), value) in store.iter() {
         if row_namespace != namespace {
@@ -841,9 +910,5 @@ fn scan_store(
             break;
         }
     }
-    let mut rows = BackendKvRowBatch::with_capacity(pairs.len());
-    for (key, value) in pairs {
-        rows.push_value(key, value);
-    }
-    rows
+    pairs
 }

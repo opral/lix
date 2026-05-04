@@ -4,8 +4,9 @@ use async_trait::async_trait;
 
 use crate::backend::{Backend, BackendReadTransaction, BackendWriteTransaction};
 use crate::storage::{
-    KvGetBatch, KvGetRequest, KvScanBatch, KvScanRequest, KvWriteBatch, KvWriteStats,
-    StorageReadTransaction, StorageReader, StorageWriteTransaction, StorageWriter,
+    KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch, KvValuePage,
+    KvWriteBatch, KvWriteStats, StorageReadTransaction, StorageReader, StorageWriteTransaction,
+    StorageWriter,
 };
 use crate::LixError;
 
@@ -45,9 +46,9 @@ impl StorageContext {
 #[cfg(any(test, feature = "storage-benches"))]
 #[async_trait]
 impl StorageReader for StorageContext {
-    async fn get_kv_many(&mut self, request: KvGetRequest) -> Result<KvGetBatch, LixError> {
+    async fn get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, LixError> {
         let mut transaction = self.begin_read_transaction().await?;
-        let result = transaction.get_kv_many(request).await;
+        let result = transaction.get_values(request).await;
         match result {
             Ok(result) => {
                 transaction.rollback().await?;
@@ -60,9 +61,54 @@ impl StorageReader for StorageContext {
         }
     }
 
-    async fn scan_kv(&mut self, request: KvScanRequest) -> Result<KvScanBatch, LixError> {
+    async fn exists_many(&mut self, request: KvGetRequest) -> Result<KvExistsBatch, LixError> {
         let mut transaction = self.begin_read_transaction().await?;
-        let result = transaction.scan_kv(request).await;
+        let result = transaction.exists_many(request).await;
+        match result {
+            Ok(result) => {
+                transaction.rollback().await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn scan_keys(&mut self, request: KvScanRequest) -> Result<KvKeyPage, LixError> {
+        let mut transaction = self.begin_read_transaction().await?;
+        let result = transaction.scan_keys(request).await;
+        match result {
+            Ok(result) => {
+                transaction.rollback().await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn scan_values(&mut self, request: KvScanRequest) -> Result<KvValuePage, LixError> {
+        let mut transaction = self.begin_read_transaction().await?;
+        let result = transaction.scan_values(request).await;
+        match result {
+            Ok(result) => {
+                transaction.rollback().await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn scan_entries(&mut self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
+        let mut transaction = self.begin_read_transaction().await?;
+        let result = transaction.scan_entries(request).await;
         match result {
             Ok(result) => {
                 transaction.rollback().await?;
@@ -86,16 +132,37 @@ struct StorageContextWriteTransaction {
 
 #[async_trait]
 impl StorageReader for StorageContextReadTransaction {
-    async fn get_kv_many(&mut self, request: KvGetRequest) -> Result<KvGetBatch, LixError> {
+    async fn get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, LixError> {
         self.transaction
-            .get_kv_many(request.into())
+            .get_values(request.into())
             .await
             .map(Into::into)
     }
 
-    async fn scan_kv(&mut self, request: KvScanRequest) -> Result<KvScanBatch, LixError> {
+    async fn exists_many(&mut self, request: KvGetRequest) -> Result<KvExistsBatch, LixError> {
         self.transaction
-            .scan_kv(request.into())
+            .exists_many(request.into())
+            .await
+            .map(Into::into)
+    }
+
+    async fn scan_keys(&mut self, request: KvScanRequest) -> Result<KvKeyPage, LixError> {
+        self.transaction
+            .scan_keys(request.into())
+            .await
+            .map(Into::into)
+    }
+
+    async fn scan_values(&mut self, request: KvScanRequest) -> Result<KvValuePage, LixError> {
+        self.transaction
+            .scan_values(request.into())
+            .await
+            .map(Into::into)
+    }
+
+    async fn scan_entries(&mut self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
+        self.transaction
+            .scan_entries(request.into())
             .await
             .map(Into::into)
     }
@@ -110,16 +177,37 @@ impl StorageReadTransaction for StorageContextReadTransaction {
 
 #[async_trait]
 impl StorageReader for StorageContextWriteTransaction {
-    async fn get_kv_many(&mut self, request: KvGetRequest) -> Result<KvGetBatch, LixError> {
+    async fn get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, LixError> {
         self.transaction
-            .get_kv_many(request.into())
+            .get_values(request.into())
             .await
             .map(Into::into)
     }
 
-    async fn scan_kv(&mut self, request: KvScanRequest) -> Result<KvScanBatch, LixError> {
+    async fn exists_many(&mut self, request: KvGetRequest) -> Result<KvExistsBatch, LixError> {
         self.transaction
-            .scan_kv(request.into())
+            .exists_many(request.into())
+            .await
+            .map(Into::into)
+    }
+
+    async fn scan_keys(&mut self, request: KvScanRequest) -> Result<KvKeyPage, LixError> {
+        self.transaction
+            .scan_keys(request.into())
+            .await
+            .map(Into::into)
+    }
+
+    async fn scan_values(&mut self, request: KvScanRequest) -> Result<KvValuePage, LixError> {
+        self.transaction
+            .scan_values(request.into())
+            .await
+            .map(Into::into)
+    }
+
+    async fn scan_entries(&mut self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
+        self.transaction
+            .scan_entries(request.into())
             .await
             .map(Into::into)
     }
@@ -154,9 +242,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::backend::testing::UnitTestBackend;
-    use crate::storage::{
-        KvGetGroup, KvGetProjection, KvScanProjection, KvScanRange, KvWriteBatch,
-    };
+    use crate::storage::{KvGetGroup, KvScanRange, KvWriteBatch};
 
     use super::*;
 
@@ -181,63 +267,50 @@ mod tests {
             .await
             .expect("read transaction opens");
         let result = tx
-            .get_kv_many(KvGetRequest {
+            .get_values(KvGetRequest {
                 groups: vec![KvGetGroup {
                     namespace: "ns".to_string(),
                     keys: vec![b"a".to_vec(), b"b".to_vec()],
                 }],
-                projection: KvGetProjection::Values,
             })
             .await
             .expect("batch reads");
-        assert_eq!(result.groups[0].rows.key(0), Some(&b"a"[..]));
-        assert_eq!(result.groups[0].rows.value(0), Some(&b"1"[..]));
-        assert_eq!(result.groups[0].rows.key(1), Some(&b"b"[..]));
-        assert_eq!(result.groups[0].rows.value(1), Some(&b"2"[..]));
+        assert_eq!(result.groups[0].values[0], Some(b"1".to_vec()));
+        assert_eq!(result.groups[0].values[1], Some(b"2".to_vec()));
 
         let exists = tx
-            .get_kv_many(KvGetRequest {
+            .exists_many(KvGetRequest {
                 groups: vec![KvGetGroup {
                     namespace: "ns".to_string(),
                     keys: vec![b"a".to_vec(), b"missing".to_vec()],
                 }],
-                projection: KvGetProjection::Existence,
             })
             .await
             .expect("existence reads");
-        assert_eq!(exists.groups[0].rows.key(0), Some(&b"a"[..]));
-        assert!(exists.groups[0].rows.exists(0));
-        assert_eq!(exists.groups[0].rows.value(0), None);
-        assert_eq!(exists.groups[0].rows.key(1), Some(&b"missing"[..]));
-        assert!(!exists.groups[0].rows.exists(1));
+        assert_eq!(exists.groups[0].exists, vec![true, false]);
 
         let result = tx
-            .scan_kv(KvScanRequest {
+            .scan_entries(KvScanRequest {
                 namespace: "ns".to_string(),
                 range: KvScanRange::prefix(Vec::new()),
                 after: Some(b"a".to_vec()),
                 limit: 1,
-                projection: KvScanProjection::KeysAndValues,
             })
             .await
             .expect("scan reads");
-        assert_eq!(result.rows.key(0), Some(&b"b"[..]));
-        assert_eq!(result.rows.value(0), Some(&b"2"[..]));
+        assert_eq!(result.entries[0].key, b"b".to_vec());
+        assert_eq!(result.entries[0].value, b"2".to_vec());
 
         let key_only = tx
-            .scan_kv(KvScanRequest {
+            .scan_keys(KvScanRequest {
                 namespace: "ns".to_string(),
                 range: KvScanRange::prefix(Vec::new()),
                 after: None,
                 limit: 2,
-                projection: KvScanProjection::KeysOnly,
             })
             .await
             .expect("key-only scan reads");
-        assert_eq!(key_only.rows.key(0), Some(&b"a"[..]));
-        assert_eq!(key_only.rows.value(0), None);
-        assert_eq!(key_only.rows.key(1), Some(&b"b"[..]));
-        assert_eq!(key_only.rows.value(1), None);
+        assert_eq!(key_only.keys, vec![b"a".to_vec(), b"b".to_vec()]);
         tx.rollback().await.expect("rollback succeeds");
     }
 }

@@ -173,17 +173,55 @@ fn bench_backend(c: &mut Criterion, runtime: &Runtime, args: Args, profile: Back
 
     for reads in [100usize, 1_000, args.rows] {
         group.bench_function(
-            format!("get_kv_many_hit/{reads_label}", reads_label = label(reads)),
+            format!("get_values_hit/{reads_label}", reads_label = label(reads)),
             |b| {
                 b.iter_batched(
                     || prepare_read(runtime, args.rows, profile.create),
                     |fixture| {
                         black_box(
                             runtime
-                                .block_on(storage_bench::storage_api_get_kv_many_hits_prepared(
+                                .block_on(storage_bench::storage_api_get_values_hits_prepared(
                                     &fixture, reads,
                                 ))
-                                .expect("storage/api get_kv_many_hit succeeds"),
+                                .expect("storage/api get_values_hit succeeds"),
+                        )
+                    },
+                    BatchSize::LargeInput,
+                )
+            },
+        );
+
+        group.bench_function(
+            format!("exists_many/{reads_label}", reads_label = label(reads)),
+            |b| {
+                b.iter_batched(
+                    || prepare_read(runtime, args.rows, profile.create),
+                    |fixture| {
+                        black_box(
+                            runtime
+                                .block_on(storage_bench::storage_api_exists_many_prepared(
+                                    &fixture, reads,
+                                ))
+                                .expect("storage/api exists_many succeeds"),
+                        )
+                    },
+                    BatchSize::LargeInput,
+                )
+            },
+        );
+
+        group.bench_function(
+            format!("get_values_miss/{reads_label}", reads_label = label(reads)),
+            |b| {
+                b.iter_batched(
+                    || prepare_read(runtime, args.rows, profile.create),
+                    |fixture| {
+                        black_box(
+                            runtime
+                                .block_on(storage_bench::storage_api_get_values_misses_prepared(
+                                    &fixture, reads,
+                                ))
+                                .expect("storage/api get_values_miss succeeds"),
                         )
                     },
                     BatchSize::LargeInput,
@@ -193,72 +231,7 @@ fn bench_backend(c: &mut Criterion, runtime: &Runtime, args: Args, profile: Back
 
         group.bench_function(
             format!(
-                "get_kv_many_exists/{reads_label}",
-                reads_label = label(reads)
-            ),
-            |b| {
-                b.iter_batched(
-                    || prepare_read(runtime, args.rows, profile.create),
-                    |fixture| {
-                        black_box(
-                            runtime
-                                .block_on(storage_bench::storage_api_get_kv_many_exists_prepared(
-                                    &fixture, reads,
-                                ))
-                                .expect("storage/api get_kv_many_exists succeeds"),
-                        )
-                    },
-                    BatchSize::LargeInput,
-                )
-            },
-        );
-
-        group.bench_function(
-            format!("get_kv_many_miss/{reads_label}", reads_label = label(reads)),
-            |b| {
-                b.iter_batched(
-                    || prepare_read(runtime, args.rows, profile.create),
-                    |fixture| {
-                        black_box(
-                            runtime
-                                .block_on(storage_bench::storage_api_get_kv_many_misses_prepared(
-                                    &fixture, reads,
-                                ))
-                                .expect("storage/api get_kv_many_miss succeeds"),
-                        )
-                    },
-                    BatchSize::LargeInput,
-                )
-            },
-        );
-
-        group.bench_function(
-            format!(
-                "get_kv_many_mixed_hit_miss/{reads_label}",
-                reads_label = label(reads)
-            ),
-            |b| {
-                b.iter_batched(
-                    || prepare_read(runtime, args.rows, profile.create),
-                    |fixture| {
-                        black_box(
-                            runtime
-                                .block_on(
-                                    storage_bench::storage_api_get_kv_many_mixed_hit_miss_prepared(
-                                        &fixture, reads,
-                                    ),
-                                )
-                                .expect("storage/api get_kv_many_mixed_hit_miss succeeds"),
-                        )
-                    },
-                    BatchSize::LargeInput,
-                )
-            },
-        );
-
-        group.bench_function(
-            format!(
-                "get_kv_many_duplicate_keys/{reads_label}",
+                "get_values_mixed_hit_miss/{reads_label}",
                 reads_label = label(reads)
             ),
             |b| {
@@ -268,11 +241,35 @@ fn bench_backend(c: &mut Criterion, runtime: &Runtime, args: Args, profile: Back
                         black_box(
                             runtime
                                 .block_on(
-                                    storage_bench::storage_api_get_kv_many_duplicate_keys_prepared(
+                                    storage_bench::storage_api_get_values_mixed_hit_miss_prepared(
                                         &fixture, reads,
                                     ),
                                 )
-                                .expect("storage/api get_kv_many_duplicate_keys succeeds"),
+                                .expect("storage/api get_values_mixed_hit_miss succeeds"),
+                        )
+                    },
+                    BatchSize::LargeInput,
+                )
+            },
+        );
+
+        group.bench_function(
+            format!(
+                "get_values_duplicate_keys/{reads_label}",
+                reads_label = label(reads)
+            ),
+            |b| {
+                b.iter_batched(
+                    || prepare_read(runtime, args.rows, profile.create),
+                    |fixture| {
+                        black_box(
+                            runtime
+                                .block_on(
+                                    storage_bench::storage_api_get_values_duplicate_keys_prepared(
+                                        &fixture, reads,
+                                    ),
+                                )
+                                .expect("storage/api get_values_duplicate_keys succeeds"),
                         )
                     },
                     BatchSize::LargeInput,
@@ -281,16 +278,16 @@ fn bench_backend(c: &mut Criterion, runtime: &Runtime, args: Args, profile: Back
         );
     }
 
-    group.bench_function("get_kv_many_multi_namespace/10k", |b| {
+    group.bench_function("get_values_multi_namespace/10k", |b| {
         b.iter_batched(
             || (profile.create)(),
             |backend| {
                 black_box(
                     runtime
-                        .block_on(storage_bench::storage_api_get_kv_many_multi_namespace(
+                        .block_on(storage_bench::storage_api_get_values_multi_namespace(
                             backend, args.rows,
                         ))
-                        .expect("storage/api get_kv_many_multi_namespace succeeds"),
+                        .expect("storage/api get_values_multi_namespace succeeds"),
                 )
             },
             BatchSize::LargeInput,
@@ -299,17 +296,17 @@ fn bench_backend(c: &mut Criterion, runtime: &Runtime, args: Args, profile: Back
 
     for limit in [100usize, 1_000, args.rows] {
         group.bench_function(
-            format!("scan_kv_prefix/{limit_label}", limit_label = label(limit)),
+            format!("scan_keys_prefix/{limit_label}", limit_label = label(limit)),
             |b| {
                 b.iter_batched(
                     || prepare_read(runtime, args.rows, profile.create),
                     |fixture| {
                         black_box(
                             runtime
-                                .block_on(storage_bench::storage_api_scan_kv_prefix_prepared(
+                                .block_on(storage_bench::storage_api_scan_keys_prefix_prepared(
                                     &fixture, limit,
                                 ))
-                                .expect("storage/api scan_kv_prefix succeeds"),
+                                .expect("storage/api scan_keys_prefix succeeds"),
                         )
                     },
                     BatchSize::LargeInput,
@@ -318,48 +315,48 @@ fn bench_backend(c: &mut Criterion, runtime: &Runtime, args: Args, profile: Back
         );
     }
 
-    group.bench_function("scan_kv_after_pages/10k", |b| {
+    group.bench_function("scan_keys_after_pages/10k", |b| {
         b.iter_batched(
             || prepare_read(runtime, args.rows, profile.create),
             |fixture| {
                 black_box(
                     runtime
-                        .block_on(storage_bench::storage_api_scan_kv_after_pages_prepared(
+                        .block_on(storage_bench::storage_api_scan_keys_after_pages_prepared(
                             &fixture, 100,
                         ))
-                        .expect("storage/api scan_kv_after_pages succeeds"),
+                        .expect("storage/api scan_keys_after_pages succeeds"),
                 )
             },
             BatchSize::LargeInput,
         )
     });
 
-    group.bench_function("scan_kv_small_limit_of_large_range/100_of_10k", |b| {
+    group.bench_function("scan_keys_small_limit_of_large_range/100_of_10k", |b| {
         b.iter_batched(
             || prepare_read(runtime, args.rows, profile.create),
             |fixture| {
                 black_box(
                     runtime
-                        .block_on(storage_bench::storage_api_scan_kv_prefix_prepared(
+                        .block_on(storage_bench::storage_api_scan_keys_prefix_prepared(
                             &fixture, 100,
                         ))
-                        .expect("storage/api scan_kv_small_limit_of_large_range succeeds"),
+                        .expect("storage/api scan_keys_small_limit_of_large_range succeeds"),
                 )
             },
             BatchSize::LargeInput,
         )
     });
 
-    group.bench_function("scan_kv_empty_range/10k", |b| {
+    group.bench_function("scan_keys_empty_range/10k", |b| {
         b.iter_batched(
             || prepare_read(runtime, args.rows, profile.create),
             |fixture| {
                 black_box(
                     runtime
-                        .block_on(storage_bench::storage_api_scan_kv_empty_range_prepared(
+                        .block_on(storage_bench::storage_api_scan_keys_empty_range_prepared(
                             &fixture,
                         ))
-                        .expect("storage/api scan_kv_empty_range succeeds"),
+                        .expect("storage/api scan_keys_empty_range succeeds"),
                 )
             },
             BatchSize::LargeInput,
@@ -371,19 +368,19 @@ fn bench_backend(c: &mut Criterion, runtime: &Runtime, args: Args, profile: Back
         ("10pct", StorageBenchSelectivity::Percent10),
         ("100pct", StorageBenchSelectivity::Percent100),
     ] {
-        group.bench_function(format!("scan_kv_prefix_selectivity_{label}/10k"), |b| {
+        group.bench_function(format!("scan_keys_prefix_selectivity_{label}/10k"), |b| {
             b.iter_batched(
                 || prepare_selective_scan(runtime, args.rows, selectivity, profile.create),
                 |fixture| {
                     black_box(
                         runtime
                             .block_on(
-                                storage_bench::storage_api_scan_kv_selective_prefix_prepared(
+                                storage_bench::storage_api_scan_keys_selective_prefix_prepared(
                                     &fixture,
                                     selectivity,
                                 ),
                             )
-                            .expect("storage/api scan_kv_prefix_selectivity succeeds"),
+                            .expect("storage/api scan_keys_prefix_selectivity succeeds"),
                     )
                 },
                 BatchSize::LargeInput,

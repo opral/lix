@@ -8,9 +8,8 @@ use crate::entity_identity::EntityIdentityPart;
 use crate::json_store::context::JsonStoreContext;
 use crate::json_store::types::{JsonProjectionPath, JsonRef};
 use crate::storage::{
-    KvGetGroup, KvGetProjection, KvGetRequest, KvScanRequest, KvWriteBatch, StorageContext,
+    KvGetGroup, KvGetRequest, KvScanRange, KvScanRequest, KvWriteBatch, StorageContext,
 };
-use crate::storage::{KvScanProjection, KvScanRange};
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateDiffRequest, TrackedStateFilter, TrackedStateProjection,
     TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
@@ -317,7 +316,7 @@ pub async fn prepare_storage_api_read(
     Ok(StorageApiFixture { storage, rows })
 }
 
-pub async fn storage_api_get_kv_many_hits_prepared(
+pub async fn storage_api_get_values_hits_prepared(
     fixture: &StorageApiFixture,
     reads: usize,
 ) -> Result<StorageBenchReport, LixError> {
@@ -327,16 +326,19 @@ pub async fn storage_api_get_kv_many_hits_prepared(
         .collect::<Vec<_>>();
     let started_at = Instant::now();
     let result = transaction
-        .get_kv_many(KvGetRequest {
+        .get_values(KvGetRequest {
             groups: vec![KvGetGroup {
                 namespace: STORAGE_API_NAMESPACE.to_string(),
                 keys,
             }],
-            projection: KvGetProjection::Values,
         })
         .await?;
     transaction.rollback().await?;
-    let verified_rows = result.groups[0].rows.value_count();
+    let verified_rows = result.groups[0]
+        .values
+        .iter()
+        .filter(|value| value.is_some())
+        .count();
     Ok(StorageBenchReport {
         measured_rows: reads,
         verified_rows,
@@ -344,7 +346,7 @@ pub async fn storage_api_get_kv_many_hits_prepared(
     })
 }
 
-pub async fn storage_api_get_kv_many_exists_prepared(
+pub async fn storage_api_exists_many_prepared(
     fixture: &StorageApiFixture,
     reads: usize,
 ) -> Result<StorageBenchReport, LixError> {
@@ -354,16 +356,19 @@ pub async fn storage_api_get_kv_many_exists_prepared(
         .collect::<Vec<_>>();
     let started_at = Instant::now();
     let result = transaction
-        .get_kv_many(KvGetRequest {
+        .exists_many(KvGetRequest {
             groups: vec![KvGetGroup {
                 namespace: STORAGE_API_NAMESPACE.to_string(),
                 keys,
             }],
-            projection: KvGetProjection::Existence,
         })
         .await?;
     transaction.rollback().await?;
-    let verified_rows = result.groups[0].rows.existence_count();
+    let verified_rows = result.groups[0]
+        .exists
+        .iter()
+        .filter(|exists| **exists)
+        .count();
     Ok(StorageBenchReport {
         measured_rows: reads,
         verified_rows,
@@ -371,7 +376,7 @@ pub async fn storage_api_get_kv_many_exists_prepared(
     })
 }
 
-pub async fn storage_api_get_kv_many_misses_prepared(
+pub async fn storage_api_get_values_misses_prepared(
     fixture: &StorageApiFixture,
     reads: usize,
 ) -> Result<StorageBenchReport, LixError> {
@@ -381,16 +386,19 @@ pub async fn storage_api_get_kv_many_misses_prepared(
         .collect::<Vec<_>>();
     let started_at = Instant::now();
     let result = transaction
-        .get_kv_many(KvGetRequest {
+        .get_values(KvGetRequest {
             groups: vec![KvGetGroup {
                 namespace: STORAGE_API_NAMESPACE.to_string(),
                 keys,
             }],
-            projection: KvGetProjection::Values,
         })
         .await?;
     transaction.rollback().await?;
-    let verified_rows = result.groups[0].rows.missing_count();
+    let verified_rows = result.groups[0]
+        .values
+        .iter()
+        .filter(|value| value.is_none())
+        .count();
     Ok(StorageBenchReport {
         measured_rows: reads,
         verified_rows,
@@ -398,7 +406,7 @@ pub async fn storage_api_get_kv_many_misses_prepared(
     })
 }
 
-pub async fn storage_api_get_kv_many_mixed_hit_miss_prepared(
+pub async fn storage_api_get_values_mixed_hit_miss_prepared(
     fixture: &StorageApiFixture,
     reads: usize,
 ) -> Result<StorageBenchReport, LixError> {
@@ -414,16 +422,19 @@ pub async fn storage_api_get_kv_many_mixed_hit_miss_prepared(
         .collect::<Vec<_>>();
     let started_at = Instant::now();
     let result = transaction
-        .get_kv_many(KvGetRequest {
+        .get_values(KvGetRequest {
             groups: vec![KvGetGroup {
                 namespace: STORAGE_API_NAMESPACE.to_string(),
                 keys,
             }],
-            projection: KvGetProjection::Values,
         })
         .await?;
     transaction.rollback().await?;
-    let verified_rows = result.groups[0].rows.value_count();
+    let verified_rows = result.groups[0]
+        .values
+        .iter()
+        .filter(|value| value.is_some())
+        .count();
     Ok(StorageBenchReport {
         measured_rows: reads,
         verified_rows,
@@ -431,7 +442,7 @@ pub async fn storage_api_get_kv_many_mixed_hit_miss_prepared(
     })
 }
 
-pub async fn storage_api_get_kv_many_multi_namespace(
+pub async fn storage_api_get_values_multi_namespace(
     backend: Arc<dyn Backend + Send + Sync>,
     reads: usize,
 ) -> Result<StorageBenchReport, LixError> {
@@ -460,7 +471,7 @@ pub async fn storage_api_get_kv_many_multi_namespace(
         .collect::<Vec<_>>();
     let started_at = Instant::now();
     let result = transaction
-        .get_kv_many(KvGetRequest {
+        .get_values(KvGetRequest {
             groups: vec![
                 KvGetGroup {
                     namespace: STORAGE_API_NAMESPACE.to_string(),
@@ -471,14 +482,13 @@ pub async fn storage_api_get_kv_many_multi_namespace(
                     keys: odd_keys,
                 },
             ],
-            projection: KvGetProjection::Values,
         })
         .await?;
     transaction.rollback().await?;
     let verified_rows = result
         .groups
         .iter()
-        .map(|group| group.rows.value_count())
+        .map(|group| group.values.iter().filter(|value| value.is_some()).count())
         .sum();
     Ok(StorageBenchReport {
         measured_rows: reads,
@@ -487,7 +497,7 @@ pub async fn storage_api_get_kv_many_multi_namespace(
     })
 }
 
-pub async fn storage_api_get_kv_many_duplicate_keys_prepared(
+pub async fn storage_api_get_values_duplicate_keys_prepared(
     fixture: &StorageApiFixture,
     reads: usize,
 ) -> Result<StorageBenchReport, LixError> {
@@ -497,16 +507,19 @@ pub async fn storage_api_get_kv_many_duplicate_keys_prepared(
         .collect::<Vec<_>>();
     let started_at = Instant::now();
     let result = transaction
-        .get_kv_many(KvGetRequest {
+        .get_values(KvGetRequest {
             groups: vec![KvGetGroup {
                 namespace: STORAGE_API_NAMESPACE.to_string(),
                 keys,
             }],
-            projection: KvGetProjection::Values,
         })
         .await?;
     transaction.rollback().await?;
-    let verified_rows = result.groups[0].rows.value_count();
+    let verified_rows = result.groups[0]
+        .values
+        .iter()
+        .filter(|value| value.is_some())
+        .count();
     Ok(StorageBenchReport {
         measured_rows: reads,
         verified_rows,
@@ -514,30 +527,29 @@ pub async fn storage_api_get_kv_many_duplicate_keys_prepared(
     })
 }
 
-pub async fn storage_api_scan_kv_prefix_prepared(
+pub async fn storage_api_scan_keys_prefix_prepared(
     fixture: &StorageApiFixture,
     limit: usize,
 ) -> Result<StorageBenchReport, LixError> {
     let mut transaction = fixture.storage.begin_read_transaction().await?;
     let started_at = Instant::now();
     let result = transaction
-        .scan_kv(KvScanRequest {
+        .scan_keys(KvScanRequest {
             namespace: STORAGE_API_NAMESPACE.to_string(),
             range: KvScanRange::prefix(b"key/".to_vec()),
             after: None,
             limit,
-            projection: KvScanProjection::KeysOnly,
         })
         .await?;
     transaction.rollback().await?;
     Ok(StorageBenchReport {
-        measured_rows: result.rows.len(),
+        measured_rows: result.keys.len(),
         verified_rows: limit.min(fixture.rows),
         elapsed: started_at.elapsed(),
     })
 }
 
-pub async fn storage_api_scan_kv_after_pages_prepared(
+pub async fn storage_api_scan_keys_after_pages_prepared(
     fixture: &StorageApiFixture,
     page_size: usize,
 ) -> Result<StorageBenchReport, LixError> {
@@ -547,18 +559,17 @@ pub async fn storage_api_scan_kv_after_pages_prepared(
     let mut measured_rows = 0usize;
     loop {
         let result = transaction
-            .scan_kv(KvScanRequest {
+            .scan_keys(KvScanRequest {
                 namespace: STORAGE_API_NAMESPACE.to_string(),
                 range: KvScanRange::prefix(b"key/".to_vec()),
                 after,
                 limit: page_size,
-                projection: KvScanProjection::KeysOnly,
             })
             .await?;
-        if result.rows.is_empty() {
+        if result.keys.is_empty() {
             break;
         }
-        measured_rows += result.rows.len();
+        measured_rows += result.keys.len();
         let Some(resume_after) = result.resume_after else {
             break;
         };
@@ -572,23 +583,22 @@ pub async fn storage_api_scan_kv_after_pages_prepared(
     })
 }
 
-pub async fn storage_api_scan_kv_empty_range_prepared(
+pub async fn storage_api_scan_keys_empty_range_prepared(
     fixture: &StorageApiFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let mut transaction = fixture.storage.begin_read_transaction().await?;
     let started_at = Instant::now();
     let result = transaction
-        .scan_kv(KvScanRequest {
+        .scan_keys(KvScanRequest {
             namespace: STORAGE_API_NAMESPACE.to_string(),
             range: KvScanRange::prefix(b"absent/".to_vec()),
             after: None,
             limit: fixture.rows,
-            projection: KvScanProjection::KeysOnly,
         })
         .await?;
     transaction.rollback().await?;
     Ok(StorageBenchReport {
-        measured_rows: result.rows.len(),
+        measured_rows: result.keys.len(),
         verified_rows: 0,
         elapsed: started_at.elapsed(),
     })
@@ -615,24 +625,23 @@ pub async fn prepare_storage_api_selective_scan(
     Ok(StorageApiFixture { storage, rows })
 }
 
-pub async fn storage_api_scan_kv_selective_prefix_prepared(
+pub async fn storage_api_scan_keys_selective_prefix_prepared(
     fixture: &StorageApiFixture,
     selectivity: StorageBenchSelectivity,
 ) -> Result<StorageBenchReport, LixError> {
     let mut transaction = fixture.storage.begin_read_transaction().await?;
     let started_at = Instant::now();
     let result = transaction
-        .scan_kv(KvScanRequest {
+        .scan_keys(KvScanRequest {
             namespace: STORAGE_API_NAMESPACE.to_string(),
             range: KvScanRange::prefix(b"selective/".to_vec()),
             after: None,
             limit: fixture.rows,
-            projection: KvScanProjection::KeysOnly,
         })
         .await?;
     transaction.rollback().await?;
     Ok(StorageBenchReport {
-        measured_rows: result.rows.len(),
+        measured_rows: result.keys.len(),
         verified_rows: selectivity.expected_rows(fixture.rows),
         elapsed: started_at.elapsed(),
     })

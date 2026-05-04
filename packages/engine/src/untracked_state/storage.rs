@@ -1,7 +1,7 @@
 use crate::storage::KvScanRange;
 use crate::storage::{
-    KvGetGroup, KvGetProjection, KvGetRequest, KvPut, KvScanProjection, KvScanRequest,
-    KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
+    KvGetGroup, KvGetRequest, KvPut, KvScanRequest, KvWriteBatch, KvWriteGroup, StorageReader,
+    StorageWriter,
 };
 use crate::untracked_state::{
     UntrackedStateIdentity, UntrackedStateRow, UntrackedStateRowRequest, UntrackedStateScanRequest,
@@ -30,20 +30,17 @@ pub(crate) async fn load_row(
         return Ok(None);
     };
     let bytes = store
-        .get_kv_many(KvGetRequest {
+        .get_values(KvGetRequest {
             groups: vec![KvGetGroup {
                 namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
                 keys: vec![encode_untracked_state_row_key(&identity)],
             }],
-            projection: KvGetProjection::Values,
         })
         .await?
         .groups
         .into_iter()
         .next()
-        .map(|mut group| group.pop_value())
-        .transpose()?
-        .flatten();
+        .and_then(|mut group| group.pop_value());
     let Some(bytes) = bytes else {
         return Ok(None);
     };
@@ -54,14 +51,20 @@ pub(crate) async fn write_rows(
     writer: &mut impl StorageWriter,
     rows: &[UntrackedStateRow],
 ) -> Result<(), LixError> {
+    let mut puts = Vec::with_capacity(rows.len());
+    let mut deletes = Vec::new();
     for row in rows {
         let identity = UntrackedStateIdentity::from_row(row);
         if row.snapshot_content.is_none() {
-            delete_untracked_row(writer, &identity).await?;
+            deletes.push(encode_untracked_state_row_key(&identity));
         } else {
-            put_untracked_row(writer, row, &identity).await?;
+            puts.push(KvPut {
+                key: encode_untracked_state_row_key(&identity),
+                value: encode_untracked_state_row(row)?,
+            });
         }
     }
+    write_untracked_batch(writer, puts, deletes).await?;
     Ok(())
 }
 
@@ -69,9 +72,11 @@ pub(crate) async fn delete_rows(
     writer: &mut impl StorageWriter,
     identities: &[UntrackedStateIdentity],
 ) -> Result<(), LixError> {
-    for identity in identities {
-        delete_untracked_row(writer, identity).await?;
-    }
+    let deletes = identities
+        .iter()
+        .map(encode_untracked_state_row_key)
+        .collect();
+    write_untracked_batch(writer, Vec::new(), deletes).await?;
     Ok(())
 }
 
@@ -79,16 +84,14 @@ async fn scan_all_untracked_rows(
     store: &mut impl StorageReader,
 ) -> Result<Vec<UntrackedStateRow>, LixError> {
     store
-        .scan_kv(KvScanRequest {
+        .scan_values(KvScanRequest {
             namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
             range: KvScanRange::prefix(Vec::new()),
             after: None,
             limit: usize::MAX,
-            projection: KvScanProjection::KeysAndValues,
         })
         .await?
-        .into_rows()
-        .into_values_required()?
+        .values
         .into_iter()
         .map(|value| decode_untracked_state_row(&value))
         .collect()
@@ -126,36 +129,20 @@ fn identity_from_request(request: &UntrackedStateRowRequest) -> Option<Untracked
     })
 }
 
-async fn put_untracked_row(
+async fn write_untracked_batch(
     writer: &mut impl StorageWriter,
-    row: &UntrackedStateRow,
-    identity: &UntrackedStateIdentity,
+    puts: Vec<KvPut>,
+    deletes: Vec<Vec<u8>>,
 ) -> Result<(), LixError> {
+    if puts.is_empty() && deletes.is_empty() {
+        return Ok(());
+    }
     writer
         .write_kv_batch(KvWriteBatch {
             groups: vec![KvWriteGroup {
                 namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
-                puts: vec![KvPut {
-                    key: encode_untracked_state_row_key(identity),
-                    value: encode_untracked_state_row(row)?,
-                }],
-                deletes: Vec::new(),
-            }],
-        })
-        .await?;
-    Ok(())
-}
-
-async fn delete_untracked_row(
-    writer: &mut impl StorageWriter,
-    identity: &UntrackedStateIdentity,
-) -> Result<(), LixError> {
-    writer
-        .write_kv_batch(KvWriteBatch {
-            groups: vec![KvWriteGroup {
-                namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
-                puts: Vec::new(),
-                deletes: vec![encode_untracked_state_row_key(identity)],
+                puts,
+                deletes,
             }],
         })
         .await?;
