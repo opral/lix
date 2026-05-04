@@ -113,6 +113,7 @@ pub(crate) async fn validate_staged_writes(
     validate_committed_insert_identities(&input, &pending_constraints).await?;
     validate_committed_unique_constraints(&input, &pending_constraints).await?;
     validate_directory_descriptor_parent_graph(&input, &staged_rows).await?;
+    validate_filesystem_namespace(&input, &staged_rows).await?;
     Ok(())
 }
 
@@ -128,6 +129,14 @@ struct DirectoryDescriptorScope {
 struct DirectoryDescriptorSnapshot {
     id: String,
     parent_id: Option<String>,
+    name: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct FileDescriptorSnapshot {
+    directory_id: Option<String>,
+    name: String,
+    extension: Option<String>,
 }
 
 async fn validate_directory_descriptor_parent_graph(
@@ -236,6 +245,302 @@ fn parse_directory_descriptor_snapshot(
             ),
         )
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FilesystemStorageScope {
+    version_id: String,
+    untracked: bool,
+    file_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FilesystemNamespaceIdentity {
+    schema_key: String,
+    entity_id: EntityIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FilesystemNamespaceOccupant {
+    Directory {
+        entity_id: EntityIdentity,
+        parent_id: Option<String>,
+        name: String,
+    },
+    File {
+        entity_id: EntityIdentity,
+        directory_id: Option<String>,
+        entry_name: String,
+    },
+}
+
+impl FilesystemNamespaceOccupant {
+    fn entity_id(&self) -> &EntityIdentity {
+        match self {
+            Self::Directory { entity_id, .. } | Self::File { entity_id, .. } => entity_id,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Directory { .. } => "directory",
+            Self::File { .. } => "file",
+        }
+    }
+
+    fn parent_id(&self) -> &Option<String> {
+        match self {
+            Self::Directory { parent_id, .. } => parent_id,
+            Self::File { directory_id, .. } => directory_id,
+        }
+    }
+
+    fn entry_name(&self) -> &str {
+        match self {
+            Self::Directory { name, .. } => name,
+            Self::File { entry_name, .. } => entry_name,
+        }
+    }
+}
+
+async fn validate_filesystem_namespace(
+    input: &TransactionValidationInput<'_>,
+    staged_rows: &[StagedStateRow],
+) -> Result<(), LixError> {
+    // Filesystem namespace constraints are storage-scope local. Global rows are
+    // validated in the global scope and may be projected into version reads, but
+    // projected globals do not participate in version-local constraint checks.
+    let scopes = staged_filesystem_namespace_scopes(staged_rows);
+    for scope in scopes {
+        let mut occupants =
+            committed_filesystem_namespace_occupants(input.live_state, &scope).await?;
+        apply_staged_filesystem_namespace_rows(staged_rows, &scope, &mut occupants)?;
+        validate_filesystem_namespace_occupants(&scope, occupants)?;
+    }
+    Ok(())
+}
+
+fn staged_filesystem_namespace_scopes(
+    staged_rows: &[StagedStateRow],
+) -> BTreeSet<FilesystemStorageScope> {
+    staged_rows
+        .iter()
+        .filter(|row| {
+            row.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                || row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+        })
+        .map(|row| FilesystemStorageScope {
+            version_id: row.version_id.clone(),
+            untracked: row.untracked,
+            file_id: row.file_id.clone(),
+        })
+        .collect()
+}
+
+async fn committed_filesystem_namespace_occupants(
+    live_state: &dyn LiveStateReader,
+    scope: &FilesystemStorageScope,
+) -> Result<BTreeMap<FilesystemNamespaceIdentity, FilesystemNamespaceOccupant>, LixError> {
+    let rows = live_state
+        .scan_rows(&LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec![
+                    DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                    FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                ],
+                version_ids: vec![scope.version_id.clone()],
+                file_ids: vec![nullable_filter_from_option(&scope.file_id)],
+                include_tombstones: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await?;
+    let mut occupants = BTreeMap::new();
+    for row in rows {
+        if !committed_filesystem_row_is_in_scope(&row, scope) {
+            continue;
+        }
+        if let Some((identity, occupant)) = filesystem_namespace_occupant_from_live_row(&row)? {
+            occupants.insert(identity, occupant);
+        }
+    }
+    Ok(occupants)
+}
+
+fn committed_filesystem_row_is_in_scope(
+    row: &LiveStateRow,
+    scope: &FilesystemStorageScope,
+) -> bool {
+    (row.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+        || row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
+        && row.untracked == scope.untracked
+        && row.file_id == scope.file_id
+        && committed_row_is_exact_version_scoped(row, &scope.version_id)
+}
+
+fn apply_staged_filesystem_namespace_rows(
+    staged_rows: &[StagedStateRow],
+    scope: &FilesystemStorageScope,
+    occupants: &mut BTreeMap<FilesystemNamespaceIdentity, FilesystemNamespaceOccupant>,
+) -> Result<(), LixError> {
+    for row in staged_rows {
+        if (row.schema_key != DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+            && row.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY)
+            || row.version_id != scope.version_id
+            || row.untracked != scope.untracked
+            || row.file_id != scope.file_id
+        {
+            continue;
+        }
+        let identity = FilesystemNamespaceIdentity {
+            schema_key: row.schema_key.clone(),
+            entity_id: row.entity_id.clone(),
+        };
+        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+            occupants.remove(&identity);
+            continue;
+        };
+        occupants.insert(
+            identity,
+            filesystem_namespace_occupant_from_staged_row(row, snapshot_content)?,
+        );
+    }
+    Ok(())
+}
+
+fn filesystem_namespace_occupant_from_live_row(
+    row: &LiveStateRow,
+) -> Result<Option<(FilesystemNamespaceIdentity, FilesystemNamespaceOccupant)>, LixError> {
+    let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+        return Ok(None);
+    };
+    let identity = FilesystemNamespaceIdentity {
+        schema_key: row.schema_key.clone(),
+        entity_id: row.entity_id.clone(),
+    };
+    let occupant = match row.schema_key.as_str() {
+        DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
+            directory_namespace_occupant(&row.schema_version, &row.entity_id, snapshot_content)?
+        }
+        FILE_DESCRIPTOR_SCHEMA_KEY => {
+            file_namespace_occupant(&row.schema_version, &row.entity_id, snapshot_content)?
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some((identity, occupant)))
+}
+
+fn filesystem_namespace_occupant_from_staged_row(
+    row: &StagedStateRow,
+    snapshot_content: &str,
+) -> Result<FilesystemNamespaceOccupant, LixError> {
+    match row.schema_key.as_str() {
+        DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
+            directory_namespace_occupant(&row.schema_version, &row.entity_id, snapshot_content)
+        }
+        FILE_DESCRIPTOR_SCHEMA_KEY => {
+            file_namespace_occupant(&row.schema_version, &row.entity_id, snapshot_content)
+        }
+        _ => Err(LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!(
+                "filesystem namespace validation cannot parse schema '{}'",
+                row.schema_key
+            ),
+        )),
+    }
+}
+
+fn directory_namespace_occupant(
+    schema_version: &str,
+    entity_id: &EntityIdentity,
+    snapshot_content: &str,
+) -> Result<FilesystemNamespaceOccupant, LixError> {
+    let snapshot = parse_directory_descriptor_snapshot(schema_version, snapshot_content)?;
+    Ok(FilesystemNamespaceOccupant::Directory {
+        entity_id: entity_id.clone(),
+        parent_id: snapshot.parent_id,
+        name: snapshot.name,
+    })
+}
+
+fn file_namespace_occupant(
+    schema_version: &str,
+    entity_id: &EntityIdentity,
+    snapshot_content: &str,
+) -> Result<FilesystemNamespaceOccupant, LixError> {
+    let snapshot = serde_json::from_str::<FileDescriptorSnapshot>(snapshot_content).map_err(|error| {
+        LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!(
+                "lix_file_descriptor version '{schema_version}' snapshot_content is invalid JSON: {error}"
+            ),
+        )
+    })?;
+    Ok(FilesystemNamespaceOccupant::File {
+        entity_id: entity_id.clone(),
+        directory_id: snapshot.directory_id,
+        entry_name: file_entry_name(&snapshot.name, snapshot.extension.as_deref()),
+    })
+}
+
+fn validate_filesystem_namespace_occupants(
+    scope: &FilesystemStorageScope,
+    occupants: BTreeMap<FilesystemNamespaceIdentity, FilesystemNamespaceOccupant>,
+) -> Result<(), LixError> {
+    let mut by_parent_and_name =
+        BTreeMap::<(Option<String>, String), FilesystemNamespaceOccupant>::new();
+    for occupant in occupants.into_values() {
+        let key = (
+            occupant.parent_id().clone(),
+            occupant.entry_name().to_string(),
+        );
+        if let Some(existing) = by_parent_and_name.insert(key.clone(), occupant.clone()) {
+            if existing != occupant {
+                return Err(filesystem_namespace_conflict_error(
+                    scope, &key.0, &key.1, &existing, &occupant,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn filesystem_namespace_conflict_error(
+    scope: &FilesystemStorageScope,
+    parent_id: &Option<String>,
+    entry_name: &str,
+    existing: &FilesystemNamespaceOccupant,
+    conflicting: &FilesystemNamespaceOccupant,
+) -> LixError {
+    let parent = parent_id.as_deref().unwrap_or("<root>");
+    let existing_id = existing
+        .entity_id()
+        .as_string()
+        .unwrap_or_else(|_| "<non-string-entity-id>".to_string());
+    let conflicting_id = conflicting
+        .entity_id()
+        .as_string()
+        .unwrap_or_else(|_| "<non-string-entity-id>".to_string());
+    LixError::new(
+        LixError::CODE_UNIQUE,
+        format!(
+            "filesystem namespace conflict in version '{}' for parent {parent:?} entry {entry_name:?}: {} '{}' conflicts with {} '{}'",
+            scope.version_id,
+            existing.kind(),
+            existing_id,
+            conflicting.kind(),
+            conflicting_id
+        ),
+    )
+}
+
+fn file_entry_name(name: &str, extension: Option<&str>) -> String {
+    match extension {
+        Some(extension) => format!("{name}.{extension}"),
+        None => name.to_string(),
+    }
 }
 
 fn validate_directory_parent_map(
