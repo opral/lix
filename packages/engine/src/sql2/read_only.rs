@@ -50,6 +50,9 @@ fn read_only_schema_message(schema_key: &str) -> Option<&'static str> {
         "lix_file_descriptor" => {
             Some("Use the writable lix_file surface to create, update, or delete files.")
         }
+        "lix_binary_blob_ref" => {
+            Some("Use the writable lix_file data column to create, update, or delete file contents.")
+        }
         "lix_commit"
         | "lix_commit_edge"
         | "lix_change"

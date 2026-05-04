@@ -114,6 +114,85 @@ simulation_test!(read_only_file_descriptor_rejects_writes, |sim| async move {
     );
 });
 
+simulation_test!(read_only_binary_blob_ref_rejects_writes, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+        &engine,
+    );
+
+    session
+        .execute(
+            "INSERT INTO lix_file (id, path, data) \
+             VALUES ('file-with-data', '/file.bin', X'4142')",
+            &[],
+        )
+        .await
+        .expect("file insert should create managed blob ref");
+
+    assert_read_only_error(
+        session
+            .execute(
+                "INSERT INTO lix_binary_blob_ref (id, blob_hash, size_bytes) \
+                 VALUES ('file-direct', 'fake-hash', 2)",
+                &[],
+            )
+            .await
+            .expect_err("blob ref insert should be read-only"),
+        "lix_binary_blob_ref",
+        "lix_file data column",
+    );
+
+    assert_read_only_error(
+        session
+            .execute(
+                "UPDATE lix_binary_blob_ref \
+                 SET blob_hash = 'other-hash' \
+                 WHERE id = 'file-with-data'",
+                &[],
+            )
+            .await
+            .expect_err("blob ref update should be read-only"),
+        "lix_binary_blob_ref",
+        "lix_file data column",
+    );
+
+    assert_read_only_error(
+        session
+            .execute(
+                "DELETE FROM lix_binary_blob_ref WHERE id = 'file-with-data'",
+                &[],
+            )
+            .await
+            .expect_err("blob ref delete should be read-only"),
+        "lix_binary_blob_ref",
+        "lix_file data column",
+    );
+
+    assert_read_only_error(
+        session
+            .execute(
+                "DELETE FROM lix_state \
+                 WHERE schema_key = 'lix_binary_blob_ref' \
+                   AND entity_id = 'file-with-data'",
+                &[],
+            )
+            .await
+            .expect_err("blob ref delete via lix_state should be read-only"),
+        "lix_binary_blob_ref",
+        "lix_file data column",
+    );
+
+    let data = session
+        .execute("SELECT data FROM lix_file WHERE id = 'file-with-data'", &[])
+        .await
+        .expect("file data should still be readable");
+    assert_eq!(data.rows()[0].values(), &[Value::Blob(vec![0x41, 0x42])]);
+});
+
 simulation_test!(
     read_only_directory_descriptor_rejects_writes,
     |sim| async move {
