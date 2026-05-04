@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use crate::common::{normalize_path_segment, ParsedFilePath};
 use crate::entity_identity::{EntityIdentity, EntityIdentityError};
 use crate::functions::FunctionProviderHandle;
 use crate::schema::{
@@ -12,6 +13,8 @@ use crate::transaction::types::StageRow;
 use crate::LixError;
 
 pub(crate) const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
+const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
+const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 
 /// Transaction-local schema catalog used while raw writes are staged.
 ///
@@ -82,6 +85,7 @@ pub(crate) fn normalize_stage_row(
     if let Some(snapshot_content) = row.snapshot_content.as_deref() {
         let mut snapshot = parse_snapshot_object(snapshot_content, &row)?;
         apply_defaults(&mut snapshot, &schema, &row, functions)?;
+        normalize_filesystem_descriptor_snapshot(&row, &mut snapshot)?;
         let snapshot = JsonValue::Object(snapshot);
         row.entity_id = Some(resolve_entity_id(&row, &schema, &snapshot)?);
         row.snapshot_content = Some(serde_json::to_string(&snapshot).map_err(|error| {
@@ -164,6 +168,122 @@ fn apply_defaults(
         &row.schema_version,
     )?;
     Ok(())
+}
+
+fn normalize_filesystem_descriptor_snapshot(
+    row: &StageRow,
+    snapshot: &mut JsonMap<String, JsonValue>,
+) -> Result<(), LixError> {
+    match row.schema_key.as_str() {
+        DIRECTORY_DESCRIPTOR_SCHEMA_KEY => normalize_directory_descriptor_snapshot(row, snapshot),
+        FILE_DESCRIPTOR_SCHEMA_KEY => normalize_file_descriptor_snapshot(row, snapshot),
+        _ => Ok(()),
+    }
+}
+
+fn normalize_directory_descriptor_snapshot(
+    row: &StageRow,
+    snapshot: &mut JsonMap<String, JsonValue>,
+) -> Result<(), LixError> {
+    let Some(name) = optional_string_field(snapshot, "name", row)? else {
+        return Ok(());
+    };
+    let normalized_name = normalize_path_segment(name)?;
+    snapshot.insert("name".to_string(), JsonValue::String(normalized_name));
+    Ok(())
+}
+
+fn normalize_file_descriptor_snapshot(
+    row: &StageRow,
+    snapshot: &mut JsonMap<String, JsonValue>,
+) -> Result<(), LixError> {
+    let Some(name) = optional_string_field(snapshot, "name", row)? else {
+        return Ok(());
+    };
+    let normalized_name = normalize_path_segment(name)?;
+
+    let normalized_extension = match optional_nullable_string_field(snapshot, "extension", row)? {
+        Some(extension) => {
+            let extension = normalize_path_segment(extension)?;
+            if extension.contains('.') {
+                return Err(LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    "lix_file_descriptor extension must not contain '.' after path canonicalization",
+                ));
+            }
+            Some(extension)
+        }
+        None => None,
+    };
+
+    validate_file_descriptor_tuple(&normalized_name, normalized_extension.as_deref())?;
+    snapshot.insert("name".to_string(), JsonValue::String(normalized_name));
+    snapshot.insert(
+        "extension".to_string(),
+        normalized_extension
+            .map(JsonValue::String)
+            .unwrap_or(JsonValue::Null),
+    );
+    Ok(())
+}
+
+fn optional_string_field<'a>(
+    snapshot: &'a JsonMap<String, JsonValue>,
+    field: &str,
+    row: &StageRow,
+) -> Result<Option<&'a str>, LixError> {
+    let Some(value) = snapshot.get(field) else {
+        return Ok(None);
+    };
+    value.as_str().map(Some).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!(
+                "snapshot_content for schema '{}' version '{}' field '{}' must be a string",
+                row.schema_key, row.schema_version, field
+            ),
+        )
+    })
+}
+
+fn optional_nullable_string_field<'a>(
+    snapshot: &'a JsonMap<String, JsonValue>,
+    field: &str,
+    row: &StageRow,
+) -> Result<Option<&'a str>, LixError> {
+    let Some(value) = snapshot.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value.as_str().map(Some).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!(
+                "snapshot_content for schema '{}' version '{}' field '{}' must be a string or null",
+                row.schema_key, row.schema_version, field
+            ),
+        )
+    })
+}
+
+fn validate_file_descriptor_tuple(name: &str, extension: Option<&str>) -> Result<(), LixError> {
+    let basename = match extension {
+        Some(extension) => format!("{name}.{extension}"),
+        None => name.to_string(),
+    };
+    let parsed = ParsedFilePath::try_from_path(&format!("/{basename}"))?;
+    if parsed.name == name && parsed.extension.as_deref() == extension {
+        return Ok(());
+    }
+    Err(LixError::new(
+        LixError::CODE_SCHEMA_VALIDATION,
+        format!(
+            "lix_file_descriptor name/extension tuple is not canonical for basename {basename:?}"
+        ),
+    )
+    .with_hint("Use the same name and extension split produced by the canonical path parser."))
 }
 
 fn resolve_entity_id(
@@ -602,8 +722,163 @@ mod tests {
         );
     }
 
+    #[test]
+    fn normalization_canonicalizes_filesystem_descriptor_segments() {
+        let mut catalog = catalog_with(vec![
+            builtin_schema(FILE_DESCRIPTOR_SCHEMA_KEY),
+            builtin_schema(DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
+        ]);
+
+        let file = StageRow {
+            entity_id: None,
+            schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+            snapshot_content: Some(
+                json!({
+                    "id": "file-cafe",
+                    "directory_id": null,
+                    "name": "Cafe\u{301}",
+                    "extension": "txt",
+                })
+                .to_string(),
+            ),
+            global: false,
+            ..base_stage_row()
+        };
+        let file = normalize_stage_row(file, &mut catalog, functions()).expect("normalize file");
+        let file_snapshot: JsonValue =
+            serde_json::from_str(file.snapshot_content.as_deref().unwrap()).unwrap();
+        assert_eq!(file_snapshot["name"], "Café");
+        assert_eq!(file_snapshot["extension"], "txt");
+
+        let directory = StageRow {
+            entity_id: None,
+            schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
+            snapshot_content: Some(
+                json!({
+                    "id": "dir-cafe",
+                    "parent_id": null,
+                    "name": "Cafe\u{301}",
+                })
+                .to_string(),
+            ),
+            global: false,
+            ..base_stage_row()
+        };
+        let directory =
+            normalize_stage_row(directory, &mut catalog, functions()).expect("normalize directory");
+        let directory_snapshot: JsonValue =
+            serde_json::from_str(directory.snapshot_content.as_deref().unwrap()).unwrap();
+        assert_eq!(directory_snapshot["name"], "Café");
+    }
+
+    #[test]
+    fn normalization_rejects_invalid_filesystem_descriptor_segments() {
+        let mut catalog = catalog_with(vec![
+            builtin_schema(FILE_DESCRIPTOR_SCHEMA_KEY),
+            builtin_schema(DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
+        ]);
+
+        let dot_segment = normalize_stage_row(
+            StageRow {
+                entity_id: None,
+                schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                snapshot_content: Some(
+                    json!({
+                        "id": "file-dotdot",
+                        "directory_id": null,
+                        "name": "..",
+                        "extension": null,
+                    })
+                    .to_string(),
+                ),
+                global: false,
+                ..base_stage_row()
+            },
+            &mut catalog,
+            functions(),
+        )
+        .expect_err("file descriptor name should reject dot segments");
+        assert_eq!(dot_segment.code, "LIX_ERROR_PATH_DOT_SEGMENT");
+
+        let bidi = normalize_stage_row(
+            StageRow {
+                entity_id: None,
+                schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                snapshot_content: Some(
+                    json!({
+                        "id": "file-bidi",
+                        "directory_id": null,
+                        "name": "safe\u{202E}txt",
+                        "extension": null,
+                    })
+                    .to_string(),
+                ),
+                global: false,
+                ..base_stage_row()
+            },
+            &mut catalog,
+            functions(),
+        )
+        .expect_err("file descriptor name should reject bidi formatting characters");
+        assert_eq!(bidi.code, "LIX_ERROR_PATH_INVALID_IRI_CODE_POINT");
+
+        let zero_width = normalize_stage_row(
+            StageRow {
+                entity_id: None,
+                schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                snapshot_content: Some(
+                    json!({
+                        "id": "dir-zero-width",
+                        "parent_id": null,
+                        "name": "zero\u{200D}width",
+                    })
+                    .to_string(),
+                ),
+                global: false,
+                ..base_stage_row()
+            },
+            &mut catalog,
+            functions(),
+        )
+        .expect_err("directory descriptor name should reject zero-width characters");
+        assert_eq!(zero_width.code, "LIX_ERROR_PATH_INVALID_IRI_CODE_POINT");
+    }
+
+    #[test]
+    fn normalization_rejects_noncanonical_file_descriptor_tuple() {
+        let mut catalog = catalog_with(vec![builtin_schema(FILE_DESCRIPTOR_SCHEMA_KEY)]);
+
+        let split_drift = normalize_stage_row(
+            StageRow {
+                entity_id: None,
+                schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                snapshot_content: Some(
+                    json!({
+                        "id": "file-split-drift",
+                        "directory_id": null,
+                        "name": "foo.bar",
+                        "extension": null,
+                    })
+                    .to_string(),
+                ),
+                global: false,
+                ..base_stage_row()
+            },
+            &mut catalog,
+            functions(),
+        )
+        .expect_err("file descriptor tuple should use canonical path parser split");
+        assert_eq!(split_drift.code, LixError::CODE_SCHEMA_VALIDATION);
+    }
+
     fn catalog_with(schemas: Vec<JsonValue>) -> TransactionSchemaCatalog {
         TransactionSchemaCatalog::from_visible_schemas(&schemas).expect("catalog")
+    }
+
+    fn builtin_schema(schema_key: &str) -> JsonValue {
+        builtin_schema_definition(schema_key)
+            .unwrap_or_else(|| panic!("{schema_key} builtin schema should exist"))
+            .clone()
     }
 
     fn base_stage_row() -> StageRow {

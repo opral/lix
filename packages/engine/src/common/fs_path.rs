@@ -228,12 +228,10 @@ impl PathError {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn normalize_path_segment(raw: &str) -> Result<String, LixError> {
     normalize_path_segment_impl(raw).map_err(PathError::into_lix_error)
 }
 
-#[cfg(test)]
 fn normalize_path_segment_impl(raw: &str) -> PathResult<String> {
     let normalized = raw.nfc().collect::<String>();
     let canonical = normalize_validated_path_segment(&normalized)?;
@@ -259,7 +257,10 @@ fn validate_path_segment_chars(normalized: &str) -> PathResult<()> {
     if !segment_has_valid_percent_encoding(&normalized) {
         return Err(PathError::InvalidPercentEncoding);
     }
-    if normalized.chars().any(is_disallowed_bidi_formatting_char) {
+    if normalized
+        .chars()
+        .any(|ch| is_disallowed_bidi_formatting_char(ch) || is_disallowed_zero_width_char(ch))
+    {
         return Err(PathError::InvalidIriCodePoint);
     }
     if !normalized.chars().all(is_allowed_segment_char) {
@@ -319,8 +320,23 @@ fn is_iunreserved_ucschar(ch: char) -> bool {
 fn is_disallowed_bidi_formatting_char(ch: char) -> bool {
     matches!(
         ch,
-        '\u{200E}' | '\u{200F}' | '\u{202A}' | '\u{202B}' | '\u{202C}' | '\u{202D}' | '\u{202E}'
+        '\u{061C}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'
+            | '\u{202B}'
+            | '\u{202C}'
+            | '\u{202D}'
+            | '\u{202E}'
+            | '\u{2066}'
+            | '\u{2067}'
+            | '\u{2068}'
+            | '\u{2069}'
     )
+}
+
+fn is_disallowed_zero_width_char(ch: char) -> bool {
+    matches!(ch, '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}')
 }
 
 fn canonicalize_percent_encoding(segment: &str) -> String {
