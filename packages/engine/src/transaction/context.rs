@@ -644,6 +644,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_rejects_non_object_metadata_without_sql() {
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
+        let (live_state, _binary_cas, changelog, version_ref, runtime_functions, transaction) =
+            open_test_transaction(&backend).await;
+
+        let mut row = key_value_stage_row("invalid-metadata", "value", false);
+        row.metadata = Some(json!("not-an-object"));
+        transaction
+            .stage_rows(vec![row])
+            .expect("row should stage before metadata validation");
+
+        let error = transaction
+            .commit(&runtime_functions)
+            .await
+            .expect_err("non-object metadata should fail commit validation");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        assert!(
+            error.message.contains("metadata") && error.message.contains("JSON object"),
+            "error should explain metadata object validation: {error:?}"
+        );
+        assert_no_persistence_after_validation_failure(
+            storage.clone(),
+            &live_state,
+            &changelog,
+            &version_ref,
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn stage_rows_rejects_unknown_schema_key_without_sql() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let (_live_state, _binary_cas, _changelog, _version_ref, _runtime_functions, transaction) =

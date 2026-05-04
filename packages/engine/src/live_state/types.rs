@@ -2,7 +2,7 @@ use crate::changelog::MaterializedCanonicalChange;
 use crate::entity_identity::EntityIdentity;
 use crate::tracked_state::TrackedStateRow;
 use crate::untracked_state::{UntrackedStateFilter, UntrackedStateRow, UntrackedStateRowRequest};
-use crate::{NullableKeyFilter, Value};
+use crate::{NullableKeyFilter, RowMetadata, Value};
 
 /// Durable row visible through live_state reads.
 ///
@@ -14,7 +14,7 @@ pub(crate) struct LiveStateRow {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<String>,
-    pub(crate) metadata: Option<String>,
+    pub(crate) metadata: Option<RowMetadata>,
     pub(crate) schema_version: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
