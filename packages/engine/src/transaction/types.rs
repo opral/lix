@@ -37,6 +37,16 @@ pub(crate) struct StageRow {
     pub(crate) version_id: String,
 }
 
+impl StageRow {
+    pub(crate) fn schema_scope_version_id(&self) -> &str {
+        if self.global {
+            crate::GLOBAL_VERSION_ID
+        } else {
+            self.version_id.as_str()
+        }
+    }
+}
+
 /// User-facing write operation that produced one physical staged row.
 ///
 /// Composite SQL surfaces such as `lix_file` lower one logical row into
@@ -136,6 +146,16 @@ pub(crate) struct StagedStateRow {
     pub(crate) version_id: String,
 }
 
+impl StagedStateRow {
+    pub(crate) fn schema_scope_version_id(&self) -> &str {
+        if self.global {
+            crate::GLOBAL_VERSION_ID
+        } else {
+            self.version_id.as_str()
+        }
+    }
+}
+
 /// Transaction-hydrated projection for an adopted canonical change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StagedAdoptedStateRow {
@@ -151,6 +171,16 @@ pub(crate) struct StagedAdoptedStateRow {
     pub(crate) change_id: String,
     pub(crate) commit_id: String,
     pub(crate) version_id: String,
+}
+
+impl StagedAdoptedStateRow {
+    pub(crate) fn schema_scope_version_id(&self) -> &str {
+        if self.global {
+            crate::GLOBAL_VERSION_ID
+        } else {
+            self.version_id.as_str()
+        }
+    }
 }
 
 impl From<StagedStateRow> for LiveStateRow {

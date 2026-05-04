@@ -1,5 +1,6 @@
 use serde_json::Value as JsonValue;
 
+use crate::entity_identity::EntityIdentity;
 use crate::LixError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -92,6 +93,47 @@ pub fn schema_from_registered_snapshot(
         SchemaKey::new(schema_key.to_string(), schema_version.to_string()),
         JsonValue::Object(value.clone()),
     ))
+}
+
+pub(crate) fn reject_unsupported_registered_schema_version(
+    key: &SchemaKey,
+) -> Result<(), LixError> {
+    if key.schema_version != "1" {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            format!(
+                "schema '{}' uses x-lix-version '{}', but schema evolution is not supported yet; register schemas with x-lix-version '1'",
+                key.schema_key, key.schema_version
+            ),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn registered_schema_entity_id(
+    schema_key: &str,
+    schema_version: &str,
+) -> Result<EntityIdentity, LixError> {
+    EntityIdentity::from_primary_key_paths(
+        &serde_json::json!({
+            "value": {
+                "x-lix-key": schema_key,
+                "x-lix-version": schema_version,
+            }
+        }),
+        &[
+            vec!["value".to_string(), "x-lix-key".to_string()],
+            vec!["value".to_string(), "x-lix-version".to_string()],
+        ],
+    )
+    .map_err(|error| {
+        LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            format!(
+                "registered schema identity could not be derived for schema '{schema_key}' version '{schema_version}': {error}"
+            ),
+        )
+    })
 }
 
 #[cfg(test)]

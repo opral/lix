@@ -9,13 +9,13 @@ mod lix;
 
 pub use lix::{open_lix, Lix, OpenLixOptions};
 pub use lix_engine::{
-    Backend, BackendKvGetGroup, BackendKvGetRequest, BackendKvGetResult, BackendKvGetResultGroup,
-    BackendKvPair, BackendKvPut, BackendKvScanRange, BackendKvScanRequest, BackendKvScanResult,
-    BackendKvWriteBatch, BackendKvWriteGroup, BackendKvWriteStats, BackendReadTransaction,
-    BackendWriteTransaction, CreateVersionOptions, CreateVersionReceipt as CreateVersionResult,
-    ExecuteResult, LixError, LixNotice, MergeChangeStats, MergeConflict, MergeConflictChangeKind,
-    MergeConflictKind, MergeConflictSide, MergeVersionOptions, MergeVersionOutcome,
-    MergeVersionPreview, MergeVersionPreviewOptions, MergeVersionReceipt as MergeVersionResult,
-    Row, SqlQueryResult, SwitchVersionOptions, SwitchVersionReceipt as SwitchVersionResult,
-    TryFromValue, Value,
+    Backend, BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetGroup, BackendKvGetProjection,
+    BackendKvGetRequest, BackendKvPut, BackendKvRowBatch, BackendKvScanBatch,
+    BackendKvScanProjection, BackendKvScanRange, BackendKvScanRequest, BackendKvWriteBatch,
+    BackendKvWriteGroup, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
+    CreateVersionOptions, CreateVersionReceipt as CreateVersionResult, ExecuteResult, LixError,
+    LixNotice, MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind,
+    MergeConflictSide, MergeVersionOptions, MergeVersionOutcome, MergeVersionPreview,
+    MergeVersionPreviewOptions, MergeVersionReceipt as MergeVersionResult, Row, SqlQueryResult,
+    SwitchVersionOptions, SwitchVersionReceipt as SwitchVersionResult, TryFromValue, Value,
 };

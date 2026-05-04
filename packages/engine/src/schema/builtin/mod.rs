@@ -79,8 +79,18 @@ const BUILTIN_SCHEMA_KEYS: &[&str] = &[
     LIX_BINARY_BLOB_REF_SCHEMA_KEY,
 ];
 
-pub(crate) fn builtin_schema_keys() -> &'static [&'static str] {
+pub(super) fn is_seed_schema_key(schema_key: &str) -> bool {
+    BUILTIN_SCHEMA_KEYS.contains(&schema_key)
+}
+
+pub(super) fn seed_schema_definitions() -> Vec<&'static JsonValue> {
     BUILTIN_SCHEMA_KEYS
+        .iter()
+        .map(|schema_key| {
+            seed_schema_definition(schema_key)
+                .unwrap_or_else(|| panic!("missing seed schema definition for '{schema_key}'"))
+        })
+        .collect()
 }
 
 // `lix_state` is a public SQL surface, not a stored builtin schema row, but
@@ -112,7 +122,7 @@ pub(crate) fn lix_state_surface_schema_definition() -> &'static JsonValue {
     })
 }
 
-pub(crate) fn builtin_schema_definition(schema_key: &str) -> Option<&'static JsonValue> {
+pub(super) fn seed_schema_definition(schema_key: &str) -> Option<&'static JsonValue> {
     match schema_key {
         LIX_REGISTERED_SCHEMA_KEY => Some(
             LIX_REGISTERED_SCHEMA.get_or_init(|| parse_registered_schema_with_inlined_definition()),
@@ -239,19 +249,18 @@ fn parse_registered_schema_with_inlined_definition() -> JsonValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{builtin_schema_definition, BUILTIN_SCHEMA_KEYS};
+    use super::{seed_schema_definition, BUILTIN_SCHEMA_KEYS};
 
     #[test]
     fn builtin_schemas_load_without_extra_override_metadata() {
         for schema_key in BUILTIN_SCHEMA_KEYS {
-            builtin_schema_definition(schema_key).expect("schema should exist");
+            seed_schema_definition(schema_key).expect("schema should exist");
         }
     }
 
     #[test]
     fn registered_schema_value_inlines_lix_schema_definition() {
-        let schema =
-            builtin_schema_definition("lix_registered_schema").expect("schema should exist");
+        let schema = seed_schema_definition("lix_registered_schema").expect("schema should exist");
         let all_of = schema
             .pointer("/properties/value/allOf")
             .and_then(|value| value.as_array())

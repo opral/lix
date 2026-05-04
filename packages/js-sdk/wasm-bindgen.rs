@@ -3,12 +3,12 @@ mod wasm {
     use async_trait::async_trait;
     use js_sys::{Array, Object, Reflect};
     use lix_rs_sdk::{
-        open_lix as open_lix_rs, Backend, BackendKvGetRequest, BackendKvGetResult,
-        BackendKvGetResultGroup, BackendKvPair, BackendKvScanRange, BackendKvScanRequest,
-        BackendKvScanResult, BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction,
-        BackendWriteTransaction, CreateVersionOptions, ExecuteResult, Lix as RsLix, LixError,
-        MergeVersionOptions, MergeVersionPreviewOptions, OpenLixOptions, SwitchVersionOptions,
-        Value,
+        open_lix as open_lix_rs, Backend, BackendKvGetBatch, BackendKvGetBatchGroup,
+        BackendKvGetRequest, BackendKvRowBatch, BackendKvScanBatch, BackendKvScanProjection,
+        BackendKvScanRange, BackendKvScanRequest, BackendKvWriteBatch, BackendKvWriteStats,
+        BackendReadTransaction, BackendWriteTransaction, CreateVersionOptions, ExecuteResult,
+        Lix as RsLix, LixError, MergeVersionOptions, MergeVersionPreviewOptions, OpenLixOptions,
+        SwitchVersionOptions, Value,
     };
     use serde::Serialize;
     use serde_json::json;
@@ -384,38 +384,42 @@ export type MergeConflictSide = {
         async fn get_kv_many(
             &mut self,
             request: BackendKvGetRequest,
-        ) -> Result<BackendKvGetResult, LixError> {
+        ) -> Result<BackendKvGetBatch, LixError> {
             let mut groups = Vec::with_capacity(request.groups.len());
             for group in request.groups {
-                let mut values = Vec::with_capacity(group.keys.len());
+                let mut rows = BackendKvRowBatch::with_capacity(group.keys.len());
                 for key in group.keys {
-                    values.push(js_value_to_optional_bytes(
-                        call_method2(
-                            &self.inner,
-                            "kvGet",
-                            &JsValue::from_str(&group.namespace),
-                            &bytes_to_js(&key),
+                    rows.push_get_projection(
+                        key.clone(),
+                        js_value_to_optional_bytes(
+                            call_method2(
+                                &self.inner,
+                                "kvGet",
+                                &JsValue::from_str(&group.namespace),
+                                &bytes_to_js(&key),
+                            )?,
+                            "transaction.kvGet",
                         )?,
-                        "transaction.kvGet",
-                    )?);
+                        request.projection,
+                    );
                 }
-                groups.push(BackendKvGetResultGroup {
+                groups.push(BackendKvGetBatchGroup {
                     namespace: group.namespace,
-                    values,
+                    rows,
                 });
             }
-            Ok(BackendKvGetResult { groups })
+            Ok(BackendKvGetBatch { groups })
         }
 
         async fn scan_kv(
             &mut self,
             request: BackendKvScanRequest,
-        ) -> Result<BackendKvScanResult, LixError> {
+        ) -> Result<BackendKvScanBatch, LixError> {
             let scan_limit = request
                 .limit
                 .checked_add(1 + usize::from(request.after.is_some()))
                 .unwrap_or(request.limit);
-            let mut rows = js_value_to_kv_pairs(
+            let mut pairs = js_value_to_kv_pairs(
                 call_method3(
                     &self.inner,
                     "kvScan",
@@ -426,19 +430,25 @@ export type MergeConflictSide = {
                 "transaction.kvScan",
             )?
             .into_iter()
-            .filter(|row| {
+            .filter(|(key, _)| {
                 request
                     .after
                     .as_deref()
-                    .is_none_or(|after| row.key.as_slice() > after)
+                    .is_none_or(|after| key.as_slice() > after)
             })
             .collect::<Vec<_>>();
-            let has_more = rows.len() > request.limit;
-            rows.truncate(request.limit);
-            let resume_after = has_more
-                .then(|| rows.last().map(|row| row.key.clone()))
-                .flatten();
-            Ok(BackendKvScanResult { rows, resume_after })
+            let has_more = pairs.len() > request.limit;
+            pairs.truncate(request.limit);
+
+            let mut rows = BackendKvRowBatch::with_capacity(pairs.len());
+            for (key, value) in pairs {
+                match request.projection {
+                    BackendKvScanProjection::KeysOnly => rows.push_key_only(key),
+                    BackendKvScanProjection::KeysAndValues => rows.push_value(key, value),
+                }
+            }
+            let resume_after = has_more.then(|| rows.last_key_cloned()).flatten();
+            Ok(BackendKvScanBatch { rows, resume_after })
         }
 
         async fn rollback(self: Box<Self>) -> Result<(), LixError> {
@@ -629,7 +639,10 @@ export type MergeConflictSide = {
         Ok(object.into())
     }
 
-    fn js_value_to_kv_pairs(value: JsValue, context: &str) -> Result<Vec<BackendKvPair>, LixError> {
+    fn js_value_to_kv_pairs(
+        value: JsValue,
+        context: &str,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, LixError> {
         if !Array::is_array(&value) {
             return Err(js_sdk_error(format!("{context} must return an array")));
         }
@@ -643,7 +656,7 @@ export type MergeConflictSide = {
                     .map_err(|_| js_sdk_error(format!("{context} row key could not be read")))?;
                 let value = Reflect::get(&row, &JsValue::from_str("value"))
                     .map_err(|_| js_sdk_error(format!("{context} row value could not be read")))?;
-                Ok(BackendKvPair::new(
+                Ok((
                     js_value_to_bytes(key, "kv pair key")?,
                     js_value_to_bytes(value, "kv pair value")?,
                 ))

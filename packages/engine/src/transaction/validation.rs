@@ -10,10 +10,14 @@ use crate::live_state::{
     LiveStateScanRequest,
 };
 use crate::schema::{
-    builtin_schema_definition, compile_lix_schema, format_lix_schema_validation_errors,
-    schema_from_registered_snapshot, schema_key_from_definition, validate_lix_schema,
+    compile_lix_schema, format_lix_schema_validation_errors, schema_from_registered_snapshot,
+};
+#[cfg(test)]
+use crate::schema::{
+    is_seed_schema_key, reject_unsupported_registered_schema_version, validate_lix_schema,
     validate_lix_schema_definition, SchemaKey,
 };
+use crate::transaction::normalization::{SchemaCatalogKey, TransactionSchemaCatalog};
 use crate::transaction::staging::duplicate_insert_identity_message;
 use crate::transaction::staging::StagedWriteSet;
 use crate::transaction::types::StagedStateRow;
@@ -33,21 +37,34 @@ const MAX_DIRECTORY_PARENT_DEPTH: usize = 1024;
 /// state, or binary CAS writes are flushed.
 pub(crate) struct TransactionValidationInput<'a> {
     staged_writes: &'a StagedWriteSet,
-    visible_schemas: &'a [JsonValue],
+    schema_catalog: &'a TransactionSchemaCatalog,
     live_state: &'a dyn LiveStateReader,
 }
 
 impl<'a> TransactionValidationInput<'a> {
     pub(crate) fn new(
         staged_writes: &'a StagedWriteSet,
-        visible_schemas: &'a [JsonValue],
+        schema_catalog: &'a TransactionSchemaCatalog,
         live_state: &'a dyn LiveStateReader,
     ) -> Self {
         Self {
             staged_writes,
-            visible_schemas,
+            schema_catalog,
             live_state,
         }
+    }
+
+    #[cfg(test)]
+    fn from_visible_schemas_for_tests(
+        staged_writes: &'a StagedWriteSet,
+        visible_schemas: &'a [JsonValue],
+        live_state: &'a dyn LiveStateReader,
+    ) -> Self {
+        let catalog = Box::leak(Box::new(
+            TransactionSchemaCatalog::from_visible_schemas(visible_schemas)
+                .expect("test schema catalog should build"),
+        ));
+        Self::new(staged_writes, catalog, live_state)
     }
 }
 
@@ -65,10 +82,12 @@ impl<'a> TransactionValidationInput<'a> {
 pub(crate) async fn validate_staged_writes(
     input: TransactionValidationInput<'_>,
 ) -> Result<(), LixError> {
-    let schema_catalog = SchemaCatalogSnapshot::from_transaction_input(&input)?;
+    validate_foreign_key_definitions(input.schema_catalog)?;
+    let schema_catalog = input.schema_catalog.clone();
     let pending_file_descriptors =
         PendingFileDescriptorIndex::from_staged_writes(input.staged_writes);
     let staged_rows = input.staged_writes.state_rows_for_validation();
+    validate_registered_schema_identity_is_canonical(&input, &staged_rows).await?;
     let mut compiled_schemas = CompiledSchemaCatalog::new(&schema_catalog);
     let mut pending_constraints = PendingConstraintIndexes::default();
     let mut staged_snapshots = Vec::new();
@@ -151,6 +170,77 @@ async fn validate_directory_descriptor_parent_graph(
         validate_directory_parent_map(&scope, &parents)?;
     }
     Ok(())
+}
+
+async fn validate_registered_schema_identity_is_canonical(
+    input: &TransactionValidationInput<'_>,
+    staged_rows: &[StagedStateRow],
+) -> Result<(), LixError> {
+    let pending_schema_rows = staged_rows
+        .iter()
+        .filter(|row| row.schema_key == REGISTERED_SCHEMA_KEY && row.snapshot_content.is_some())
+        .collect::<Vec<_>>();
+    if pending_schema_rows.is_empty() {
+        return Ok(());
+    }
+
+    let pending_entity_ids = pending_schema_rows
+        .iter()
+        .map(|row| row.entity_id.clone())
+        .collect::<Vec<_>>();
+    let committed_rows = input
+        .live_state
+        .scan_rows(&LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
+                entity_ids: pending_entity_ids,
+                file_ids: vec![NullableKeyFilter::Null],
+                include_tombstones: false,
+                ..LiveStateFilter::default()
+            },
+            ..LiveStateScanRequest::default()
+        })
+        .await?;
+
+    for row in committed_rows {
+        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+            continue;
+        };
+        let snapshot = parse_registered_schema_snapshot(snapshot_content)?;
+        let Some(pending_row) = pending_schema_rows
+            .iter()
+            .find(|pending_row| pending_row.entity_id == row.entity_id)
+        else {
+            continue;
+        };
+        let pending_snapshot = parse_registered_schema_snapshot(
+            pending_row
+                .snapshot_content
+                .as_deref()
+                .expect("pending registered schema row has snapshot_content"),
+        )?;
+        if snapshot != pending_snapshot {
+            let (key, _) = schema_from_registered_snapshot(&pending_snapshot)?;
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                format!(
+                    "schema '{}' version '{}' is already registered with a different definition; schema identity must be canonical",
+                    key.schema_key, key.schema_version
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_registered_schema_snapshot(snapshot_content: &str) -> Result<JsonValue, LixError> {
+    serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+        LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            format!("registered schema snapshot_content is invalid JSON: {error}"),
+        )
+    })
 }
 
 fn staged_directory_descriptor_scopes(
@@ -868,7 +958,7 @@ fn validate_staged_row_metadata(row: &StagedStateRow) -> Result<(), LixError> {
 
 fn validate_schema_exists(
     row: &StagedStateRow,
-    schema_catalog: &SchemaCatalogSnapshot,
+    schema_catalog: &TransactionSchemaCatalog,
 ) -> Result<(), LixError> {
     if !schema_catalog.contains(&row.schema_key, &row.schema_version) {
         return Err(LixError::new(
@@ -1061,7 +1151,7 @@ impl PendingConstraintIndexes {
 
     fn remember_foreign_key_references(
         &mut self,
-        schema_catalog: &SchemaCatalogSnapshot,
+        schema_catalog: &TransactionSchemaCatalog,
         row: &StagedStateRow,
         schema: &JsonValue,
         snapshot: &JsonValue,
@@ -1237,7 +1327,7 @@ enum PendingForeignKeyReferenceTarget {
 }
 
 fn validate_pending_delete_restrictions(
-    schema_catalog: &SchemaCatalogSnapshot,
+    schema_catalog: &TransactionSchemaCatalog,
     pending_constraints: &PendingConstraintIndexes,
 ) -> Result<(), LixError> {
     for tombstone in &pending_constraints.tombstones {
@@ -1314,7 +1404,7 @@ fn pending_foreign_key_reference_target_description(
 
 async fn validate_committed_delete_restrictions(
     input: &TransactionValidationInput<'_>,
-    schema_catalog: &SchemaCatalogSnapshot,
+    schema_catalog: &TransactionSchemaCatalog,
     pending_constraints: &PendingConstraintIndexes,
 ) -> Result<(), LixError> {
     for tombstone in &pending_constraints.tombstones {
@@ -1526,7 +1616,7 @@ enum UnresolvedForeignKeyTarget {
 }
 
 fn validate_pending_foreign_keys(
-    schema_catalog: &SchemaCatalogSnapshot,
+    schema_catalog: &TransactionSchemaCatalog,
     pending_constraints: &PendingConstraintIndexes,
     staged_snapshots: &[(&StagedStateRow, &JsonValue, JsonValue)],
 ) -> Result<Vec<UnresolvedForeignKeyCheck>, LixError> {
@@ -1565,7 +1655,7 @@ fn validate_pending_foreign_keys(
 }
 
 fn validate_pending_normal_foreign_key(
-    schema_catalog: &SchemaCatalogSnapshot,
+    schema_catalog: &TransactionSchemaCatalog,
     row: &StagedStateRow,
     foreign_key: &ForeignKeyDefinition,
     local_value: UniqueConstraintValue,
@@ -2268,7 +2358,7 @@ fn pointer_array(value: Option<&JsonValue>, label: &str) -> Result<Vec<Vec<Strin
 }
 
 fn validate_foreign_key_definition(
-    catalog: &SchemaCatalogSnapshot,
+    catalog: &TransactionSchemaCatalog,
     source_key: &SchemaCatalogKey,
     source_schema: &JsonValue,
     foreign_key: ForeignKeyDefinition,
@@ -2400,116 +2490,14 @@ fn referenced_properties_are_keyed(
         .any(|unique_group| unique_group == referenced_properties))
 }
 
-/// Transaction-visible schema definitions indexed by exact schema identity.
-///
-/// The snapshot starts from schemas visible before this write, then applies
-/// pending `lix_registered_schema` rows from the final staged write set. That
-/// lets one transaction register a schema and write rows for it without
-/// re-scanning schemas for every staged row.
-#[derive(Debug, Clone, Default)]
-struct SchemaCatalogSnapshot {
-    schemas_by_key: BTreeMap<SchemaCatalogKey, JsonValue>,
-}
-
-impl SchemaCatalogSnapshot {
-    fn from_transaction_input(input: &TransactionValidationInput<'_>) -> Result<Self, LixError> {
-        let mut snapshot = Self::default();
-        snapshot.remember_visible_schemas(input.visible_schemas)?;
-        let staged_rows = input.staged_writes.state_rows_for_validation();
-        snapshot.remember_pending_registered_schemas(&staged_rows)?;
-        snapshot.validate_foreign_key_definitions()?;
-        Ok(snapshot)
-    }
-
-    fn remember_visible_schemas(&mut self, visible_schemas: &[JsonValue]) -> Result<(), LixError> {
-        for schema in visible_schemas {
-            let key = schema_key_from_definition(schema)?;
-            self.insert_schema(key, schema.clone());
+fn validate_foreign_key_definitions(catalog: &TransactionSchemaCatalog) -> Result<(), LixError> {
+    for (key, schema) in catalog.schemas() {
+        let foreign_keys = foreign_key_definitions(schema)?;
+        for foreign_key in foreign_keys {
+            validate_foreign_key_definition(catalog, key, schema, foreign_key)?;
         }
-        Ok(())
     }
-
-    fn remember_pending_registered_schemas(
-        &mut self,
-        rows: &[StagedStateRow],
-    ) -> Result<(), LixError> {
-        let mut pending_keys =
-            BTreeMap::<SchemaCatalogKey, crate::entity_identity::EntityIdentity>::new();
-        for row in rows {
-            if row.schema_key != REGISTERED_SCHEMA_KEY {
-                continue;
-            }
-            let (key, schema) = validate_pending_registered_schema(row)?;
-            let catalog_key = SchemaCatalogKey::from_schema_key(key.clone());
-            if let Some(existing_entity_id) =
-                pending_keys.insert(catalog_key.clone(), row.entity_id.clone())
-            {
-                return Err(LixError::new(
-                    LixError::CODE_SCHEMA_DEFINITION,
-                    format!(
-                        "duplicate pending registered schema '{}' version '{}' in transaction: rows '{}' and '{}'",
-                        catalog_key.schema_key,
-                        catalog_key.schema_version,
-                        existing_entity_id.as_string()?,
-                        row.entity_id.as_string()?
-                    ),
-                ));
-            }
-            self.insert_schema(key, schema);
-        }
-        Ok(())
-    }
-
-    fn insert_schema(&mut self, key: SchemaKey, schema: JsonValue) {
-        self.schemas_by_key
-            .insert(SchemaCatalogKey::from_schema_key(key), schema);
-    }
-
-    fn contains(&self, schema_key: &str, schema_version: &str) -> bool {
-        self.schemas_by_key.contains_key(&SchemaCatalogKey {
-            schema_key: schema_key.to_string(),
-            schema_version: schema_version.to_string(),
-        })
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.schemas_by_key.len()
-    }
-
-    fn schema(&self, schema_key: &str, schema_version: &str) -> Option<&JsonValue> {
-        self.schemas_by_key.get(&SchemaCatalogKey {
-            schema_key: schema_key.to_string(),
-            schema_version: schema_version.to_string(),
-        })
-    }
-
-    fn schema_by_key(&self, schema_key: &str) -> Option<&JsonValue> {
-        self.schemas_by_key
-            .iter()
-            .find_map(|(key, schema)| (key.schema_key == schema_key).then_some(schema))
-    }
-
-    fn schema_key_by_key(&self, schema_key: &str) -> Option<SchemaCatalogKey> {
-        self.schemas_by_key
-            .keys()
-            .find(|key| key.schema_key == schema_key)
-            .cloned()
-    }
-
-    fn schemas(&self) -> impl Iterator<Item = (&SchemaCatalogKey, &JsonValue)> {
-        self.schemas_by_key.iter()
-    }
-
-    fn validate_foreign_key_definitions(&self) -> Result<(), LixError> {
-        for (key, schema) in &self.schemas_by_key {
-            let foreign_keys = foreign_key_definitions(schema)?;
-            for foreign_key in foreign_keys {
-                validate_foreign_key_definition(self, key, schema, foreign_key)?;
-            }
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
 /// Per-transaction compiled schema cache.
@@ -2518,12 +2506,12 @@ impl SchemaCatalogSnapshot {
 /// transaction that writes many rows for one schema pays the JSON Schema
 /// compilation cost only once.
 struct CompiledSchemaCatalog<'a> {
-    schema_catalog: &'a SchemaCatalogSnapshot,
+    schema_catalog: &'a TransactionSchemaCatalog,
     compiled_by_key: BTreeMap<SchemaCatalogKey, JSONSchema>,
 }
 
 impl<'a> CompiledSchemaCatalog<'a> {
-    fn new(schema_catalog: &'a SchemaCatalogSnapshot) -> Self {
+    fn new(schema_catalog: &'a TransactionSchemaCatalog) -> Self {
         Self {
             schema_catalog,
             compiled_by_key: BTreeMap::new(),
@@ -2570,23 +2558,10 @@ impl<'a> CompiledSchemaCatalog<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct SchemaCatalogKey {
-    schema_key: String,
-    schema_version: String,
-}
-
-impl SchemaCatalogKey {
-    fn from_schema_key(key: SchemaKey) -> Self {
-        Self {
-            schema_key: key.schema_key,
-            schema_version: key.schema_version,
-        }
-    }
-}
-
+#[cfg(test)]
 fn validate_pending_registered_schema(
     row: &StagedStateRow,
+    registered_schema_definition: &JsonValue,
 ) -> Result<(SchemaKey, JsonValue), LixError> {
     let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
         LixError::new(
@@ -2600,14 +2575,6 @@ fn validate_pending_registered_schema(
             format!("pending registered schema snapshot_content is invalid JSON: {error}"),
         )
     })?;
-
-    let registered_schema_definition = builtin_schema_definition(REGISTERED_SCHEMA_KEY)
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_SCHEMA_DEFINITION,
-                "missing builtin lix_registered_schema definition",
-            )
-        })?;
     if !snapshot.get("value").is_some_and(JsonValue::is_object) {
         validate_lix_schema(registered_schema_definition, &snapshot)?;
     }
@@ -2616,9 +2583,25 @@ fn validate_pending_registered_schema(
     // `lix_registered_schema` schema, and the inner definition must be a valid
     // Lix schema before it can extend the transaction-visible catalog.
     let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
+    reject_unsupported_registered_schema_version(&key)?;
+    reject_seed_schema_registration(&key)?;
     validate_lix_schema_definition(&schema)?;
     validate_lix_schema(registered_schema_definition, &snapshot)?;
     Ok((key, schema))
+}
+
+#[cfg(test)]
+fn reject_seed_schema_registration(key: &SchemaKey) -> Result<(), LixError> {
+    if is_seed_schema_key(&key.schema_key) {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            format!(
+                "schema '{}' is a system schema and cannot be registered at runtime",
+                key.schema_key
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2628,6 +2611,7 @@ mod tests {
 
     use super::*;
     use crate::live_state::{LiveStateRow, LiveStateRowRequest, LiveStateScanRequest};
+    use crate::schema::{schema_key_from_definition, seed_schema_definition};
 
     struct EmptyLiveStateReader;
 
@@ -2657,7 +2641,93 @@ mod tests {
         staged_writes: &'a StagedWriteSet,
         visible_schemas: &'a [JsonValue],
     ) -> TransactionValidationInput<'a> {
-        TransactionValidationInput::new(staged_writes, visible_schemas, &EmptyLiveStateReader)
+        let catalog = Box::leak(Box::new(
+            catalog_from_transaction_parts_unchecked(staged_writes, visible_schemas)
+                .expect("test schema catalog should build"),
+        ));
+        TransactionValidationInput::new(staged_writes, catalog, &EmptyLiveStateReader)
+    }
+
+    fn catalog_from_transaction_input(
+        input: &TransactionValidationInput<'_>,
+    ) -> Result<TransactionSchemaCatalog, LixError> {
+        let catalog = input.schema_catalog.clone();
+        validate_foreign_key_definitions(&catalog)?;
+        Ok(catalog)
+    }
+
+    fn catalog_from_transaction_parts(
+        staged_writes: &StagedWriteSet,
+        visible_schemas: &[JsonValue],
+    ) -> Result<TransactionSchemaCatalog, LixError> {
+        let catalog = catalog_from_transaction_parts_unchecked(staged_writes, visible_schemas)?;
+        let mut pending_keys =
+            BTreeMap::<SchemaCatalogKey, crate::entity_identity::EntityIdentity>::new();
+        for row in staged_writes
+            .state_rows_for_validation()
+            .iter()
+            .filter(|row| row.schema_key == REGISTERED_SCHEMA_KEY)
+        {
+            let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    "registered schema write requires snapshot_content",
+                )
+            })?;
+            let snapshot =
+                serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_DEFINITION,
+                        format!(
+                            "pending registered schema snapshot_content is invalid JSON: {error}"
+                        ),
+                    )
+                })?;
+            let (key, _) = schema_from_registered_snapshot(&snapshot)?;
+            let catalog_key = SchemaCatalogKey::from_schema_key(key);
+            if let Some(existing_entity_id) =
+                pending_keys.insert(catalog_key.clone(), row.entity_id.clone())
+            {
+                return Err(LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    format!(
+                        "duplicate pending registered schema '{}' version '{}' in transaction: rows '{}' and '{}'",
+                        catalog_key.schema_key,
+                        catalog_key.schema_version,
+                        existing_entity_id.as_string()?,
+                        row.entity_id.as_string()?
+                    ),
+                ));
+            }
+        }
+        validate_foreign_key_definitions(&catalog)?;
+        Ok(catalog)
+    }
+
+    fn catalog_from_transaction_parts_unchecked(
+        staged_writes: &StagedWriteSet,
+        visible_schemas: &[JsonValue],
+    ) -> Result<TransactionSchemaCatalog, LixError> {
+        let mut catalog = TransactionSchemaCatalog::from_visible_schemas(visible_schemas)?;
+        let staged_rows = staged_writes.state_rows_for_validation();
+        for row in staged_rows
+            .iter()
+            .filter(|row| row.schema_key == REGISTERED_SCHEMA_KEY)
+        {
+            let registered_schema_definition = catalog
+                .schema(REGISTERED_SCHEMA_KEY, "1")
+                .cloned()
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_DEFINITION,
+                        "lix_registered_schema schema is not visible to this transaction",
+                    )
+                })?;
+            let (key, schema) =
+                validate_pending_registered_schema(row, &registered_schema_definition)?;
+            catalog.insert_schema(key, schema);
+        }
+        Ok(catalog)
     }
 
     struct StaticLiveStateReader {
@@ -2771,8 +2841,7 @@ mod tests {
         let staged_writes = empty_staged_write_set();
         let input = validation_input(&staged_writes, &visible_schemas);
 
-        let catalog = SchemaCatalogSnapshot::from_transaction_input(&input)
-            .expect("schema catalog should build");
+        let catalog = catalog_from_transaction_input(&input).expect("schema catalog should build");
 
         assert_eq!(catalog.len(), 1);
         assert!(catalog.contains("visible_schema", "1"));
@@ -2780,36 +2849,41 @@ mod tests {
 
     #[test]
     fn schema_catalog_includes_pending_registered_schema_rows() {
-        let visible_schemas = vec![json!({
-            "x-lix-key": "visible_schema",
-            "x-lix-version": "1",
-            "type": "object",
-        })];
+        let visible_schemas = vec![
+            registered_schema(),
+            json!({
+                "x-lix-key": "visible_schema",
+                "x-lix-version": "1",
+                "type": "object",
+            }),
+        ];
         let staged_writes = StagedWriteSet {
-            state_rows: vec![pending_registered_schema_row("pending_schema", "2")],
+            state_rows: vec![pending_registered_schema_row("pending_schema", "1")],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
         let input = validation_input(&staged_writes, &visible_schemas);
 
-        let catalog = SchemaCatalogSnapshot::from_transaction_input(&input)
-            .expect("schema catalog should build");
+        let catalog = catalog_from_transaction_input(&input).expect("schema catalog should build");
 
-        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog.len(), 3);
         assert!(catalog.contains("visible_schema", "1"));
-        assert!(catalog.contains("pending_schema", "2"));
+        assert!(catalog.contains("pending_schema", "1"));
     }
 
     #[test]
     fn schema_catalog_pending_schema_overrides_same_visible_identity() {
-        let visible_schemas = vec![json!({
-            "x-lix-key": "same_schema",
-            "x-lix-version": "1",
-            "type": "object",
-            "properties": {
-                "old": { "type": "string" }
-            }
-        })];
+        let visible_schemas = vec![
+            registered_schema(),
+            json!({
+                "x-lix-key": "same_schema",
+                "x-lix-version": "1",
+                "type": "object",
+                "properties": {
+                    "old": { "type": "string" }
+                }
+            }),
+        ];
         let staged_writes = StagedWriteSet {
             state_rows: vec![pending_registered_schema_row("same_schema", "1")],
             adopted_rows: Vec::new(),
@@ -2817,10 +2891,9 @@ mod tests {
         };
         let input = validation_input(&staged_writes, &visible_schemas);
 
-        let catalog = SchemaCatalogSnapshot::from_transaction_input(&input)
-            .expect("schema catalog should build");
+        let catalog = catalog_from_transaction_input(&input).expect("schema catalog should build");
 
-        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog.len(), 2);
         assert!(catalog.contains("same_schema", "1"));
     }
 
@@ -2829,7 +2902,7 @@ mod tests {
         let mut row = pending_registered_schema_row("missing_snapshot", "1");
         row.snapshot_content = None;
 
-        let error = validate_pending_registered_schema(&row)
+        let error = validate_pending_registered_schema(&row, &registered_schema())
             .expect_err("registered schema writes require snapshot_content");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
@@ -2840,7 +2913,8 @@ mod tests {
         let mut row = pending_registered_schema_row("invalid_json", "1");
         row.snapshot_content = Some("{not-json".to_string());
 
-        let error = validate_pending_registered_schema(&row).expect_err("invalid JSON should fail");
+        let error = validate_pending_registered_schema(&row, &registered_schema())
+            .expect_err("invalid JSON should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
     }
@@ -2850,7 +2924,7 @@ mod tests {
         let mut row = pending_registered_schema_row("missing_value", "1");
         row.snapshot_content = Some(json!({}).to_string());
 
-        let error = validate_pending_registered_schema(&row)
+        let error = validate_pending_registered_schema(&row, &registered_schema())
             .expect_err("builtin lix_registered_schema validation should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
@@ -2875,7 +2949,7 @@ mod tests {
             .to_string(),
         );
 
-        let error = validate_pending_registered_schema(&row)
+        let error = validate_pending_registered_schema(&row, &registered_schema())
             .expect_err("nested Lix schema definition should be rejected");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
@@ -2892,10 +2966,9 @@ mod tests {
             ],
             ..empty_staged_write_set()
         };
-        let visible_schemas = Vec::new();
-        let input = validation_input(&staged_writes, &visible_schemas);
+        let visible_schemas = vec![registered_schema()];
 
-        let error = SchemaCatalogSnapshot::from_transaction_input(&input)
+        let error = catalog_from_transaction_parts(&staged_writes, &visible_schemas)
             .expect_err("duplicate pending schema keys should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
@@ -2910,9 +2983,10 @@ mod tests {
             ],
             ..empty_staged_write_set()
         };
-        let input = validation_input(&staged_writes, &[]);
+        let visible_schemas = vec![registered_schema()];
+        let input = validation_input(&staged_writes, &visible_schemas);
 
-        let catalog = SchemaCatalogSnapshot::from_transaction_input(&input)
+        let catalog = catalog_from_transaction_input(&input)
             .expect("pending parent schema should satisfy pending child foreign key");
 
         assert!(catalog.contains("fk_parent_schema", "1"));
@@ -2926,9 +3000,10 @@ mod tests {
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
-        let input = validation_input(&staged_writes, &[]);
+        let visible_schemas = vec![registered_schema()];
+        let input = validation_input(&staged_writes, &visible_schemas);
 
-        let error = SchemaCatalogSnapshot::from_transaction_input(&input)
+        let error = catalog_from_transaction_input(&input)
             .expect_err("missing referenced schema should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
@@ -2945,10 +3020,11 @@ mod tests {
             ],
             ..empty_staged_write_set()
         };
-        let input = validation_input(&staged_writes, &[]);
+        let visible_schemas = vec![registered_schema()];
+        let input = validation_input(&staged_writes, &visible_schemas);
 
-        let error = SchemaCatalogSnapshot::from_transaction_input(&input)
-            .expect_err("missing local FK field should fail");
+        let error =
+            catalog_from_transaction_input(&input).expect_err("missing local FK field should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
     }
@@ -2964,9 +3040,10 @@ mod tests {
             ],
             ..empty_staged_write_set()
         };
-        let input = validation_input(&staged_writes, &[]);
+        let visible_schemas = vec![registered_schema()];
+        let input = validation_input(&staged_writes, &visible_schemas);
 
-        let error = SchemaCatalogSnapshot::from_transaction_input(&input)
+        let error = catalog_from_transaction_input(&input)
             .expect_err("missing referenced FK field should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
@@ -2985,9 +3062,10 @@ mod tests {
             ],
             ..empty_staged_write_set()
         };
-        let input = validation_input(&staged_writes, &[]);
+        let visible_schemas = vec![registered_schema()];
+        let input = validation_input(&staged_writes, &visible_schemas);
 
-        let error = SchemaCatalogSnapshot::from_transaction_input(&input)
+        let error = catalog_from_transaction_input(&input)
             .expect_err("FK target must be primary-key or unique");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
@@ -3001,9 +3079,10 @@ mod tests {
             )],
             ..empty_staged_write_set()
         };
-        let input = validation_input(&staged_writes, &[]);
+        let visible_schemas = vec![registered_schema()];
+        let input = validation_input(&staged_writes, &visible_schemas);
 
-        let catalog = SchemaCatalogSnapshot::from_transaction_input(&input)
+        let catalog = catalog_from_transaction_input(&input)
             .expect("lix_state should validate as a state-surface FK target");
 
         assert!(catalog.contains("state_surface_ref_schema", "1"));
@@ -3019,9 +3098,10 @@ mod tests {
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
-        let input = validation_input(&staged_writes, &[]);
+        let visible_schemas = vec![registered_schema()];
+        let input = validation_input(&staged_writes, &visible_schemas);
 
-        let error = SchemaCatalogSnapshot::from_transaction_input(&input)
+        let error = catalog_from_transaction_input(&input)
             .expect_err("lix_state FK target must include schema identity");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
@@ -3162,13 +3242,14 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        let error = validate_staged_writes(TransactionValidationInput::new(
-            &staged_writes,
-            &visible_schemas,
-            &StrictEmptyLiveStateReader,
-        ))
-        .await
-        .expect_err("non-null file_id should require a file descriptor");
+        let error =
+            validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &StrictEmptyLiveStateReader,
+            ))
+            .await
+            .expect_err("non-null file_id should require a file descriptor");
 
         assert_eq!(error.code, LixError::CODE_FILE_NOT_FOUND);
     }
@@ -3188,7 +3269,7 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        validate_staged_writes(TransactionValidationInput::new(
+        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &StrictEmptyLiveStateReader,
@@ -3209,7 +3290,7 @@ mod tests {
             rows: vec![committed_file_descriptor_row("file-a", "version-a")],
         };
 
-        validate_staged_writes(TransactionValidationInput::new(
+        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3233,13 +3314,14 @@ mod tests {
             )],
         };
 
-        let error = validate_staged_writes(TransactionValidationInput::new(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect_err("global file descriptor should not satisfy a version-local row");
+        let error =
+            validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &live_state,
+            ))
+            .await
+            .expect_err("global file descriptor should not satisfy a version-local row");
 
         assert_eq!(error.code, LixError::CODE_FILE_NOT_FOUND);
     }
@@ -3397,13 +3479,14 @@ mod tests {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
-        let error = validate_staged_writes(TransactionValidationInput::new(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect_err("committed visible unique value should conflict");
+        let error =
+            validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &live_state,
+            ))
+            .await
+            .expect_err("committed visible unique value should conflict");
 
         assert_eq!(error.code, LixError::CODE_UNIQUE);
     }
@@ -3420,13 +3503,14 @@ mod tests {
             rows: vec![committed_nullable_unique_row("row-1", None, "root-name")],
         };
 
-        let error = validate_staged_writes(TransactionValidationInput::new(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect_err("committed duplicate nullable unique value should conflict");
+        let error =
+            validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &live_state,
+            ))
+            .await
+            .expect_err("committed duplicate nullable unique value should conflict");
 
         assert_eq!(error.code, LixError::CODE_UNIQUE);
     }
@@ -3443,13 +3527,14 @@ mod tests {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
-        let error = validate_staged_writes(TransactionValidationInput::new(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect_err("same unique value in the same version should conflict");
+        let error =
+            validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &live_state,
+            ))
+            .await
+            .expect_err("same unique value in the same version should conflict");
 
         assert_eq!(error.code, LixError::CODE_UNIQUE);
     }
@@ -3468,7 +3553,7 @@ mod tests {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
-        validate_staged_writes(TransactionValidationInput::new(
+        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3492,7 +3577,7 @@ mod tests {
             rows: vec![projected_overlay_row],
         };
 
-        validate_staged_writes(TransactionValidationInput::new(
+        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3513,7 +3598,7 @@ mod tests {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
-        validate_staged_writes(TransactionValidationInput::new(
+        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3536,7 +3621,7 @@ mod tests {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
-        validate_staged_writes(TransactionValidationInput::new(
+        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3561,7 +3646,7 @@ mod tests {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
-        validate_staged_writes(TransactionValidationInput::new(
+        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3632,7 +3717,7 @@ mod tests {
             rows: vec![LiveStateRow::from(fk_parent_row("parent-1", "version-a"))],
         };
 
-        validate_staged_writes(TransactionValidationInput::new(
+        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3653,15 +3738,16 @@ mod tests {
             rows: vec![LiveStateRow::from(fk_parent_row("parent-1", "version-b"))],
         };
 
-        let error = validate_staged_writes(TransactionValidationInput::new(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect_err(
-            "foreign key target in another committed version should not satisfy this version",
-        );
+        let error =
+            validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &live_state,
+            ))
+            .await
+            .expect_err(
+                "foreign key target in another committed version should not satisfy this version",
+            );
 
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
     }
@@ -3682,13 +3768,14 @@ mod tests {
             rows: vec![LiveStateRow::from(fk_parent_row("parent-1", "version-a"))],
         };
 
-        let error = validate_staged_writes(TransactionValidationInput::new(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect_err("same-transaction tombstone should hide the committed FK target");
+        let error =
+            validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &live_state,
+            ))
+            .await
+            .expect_err("same-transaction tombstone should hide the committed FK target");
 
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
     }
@@ -3709,13 +3796,14 @@ mod tests {
             rows: vec![LiveStateRow::from(fk_parent_row("parent-1", "version-a"))],
         };
 
-        let error = validate_staged_writes(TransactionValidationInput::new(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect_err("pending child reference should block parent delete");
+        let error =
+            validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &live_state,
+            ))
+            .await
+            .expect_err("pending child reference should block parent delete");
 
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
     }
@@ -3755,7 +3843,7 @@ mod tests {
             rows: vec![LiveStateRow::from(fk_parent_row("target-1", "version-a"))],
         };
 
-        validate_staged_writes(TransactionValidationInput::new(
+        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3781,13 +3869,14 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        let error = validate_staged_writes(TransactionValidationInput::new(
-            &staged_writes,
-            &visible_schemas,
-            &live_state,
-        ))
-        .await
-        .expect_err("delete should be restricted by same-version references");
+        let error =
+            validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &live_state,
+            ))
+            .await
+            .expect_err("delete should be restricted by same-version references");
 
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
     }
@@ -3809,7 +3898,7 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        validate_staged_writes(TransactionValidationInput::new(
+        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3837,7 +3926,7 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        validate_staged_writes(TransactionValidationInput::new(
+        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3851,8 +3940,7 @@ mod tests {
         let visible_schemas = vec![key_value_schema()];
         let staged_writes = empty_staged_write_set();
         let input = validation_input(&staged_writes, &visible_schemas);
-        let catalog = SchemaCatalogSnapshot::from_transaction_input(&input)
-            .expect("schema catalog should build");
+        let catalog = catalog_from_transaction_input(&input).expect("schema catalog should build");
         let mut compiled = CompiledSchemaCatalog::new(&catalog);
 
         compiled
@@ -3942,8 +4030,7 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = empty_staged_write_set();
         let input = validation_input(&staged_writes, &visible_schemas);
-        let catalog =
-            SchemaCatalogSnapshot::from_transaction_input(&input).expect("catalog should build");
+        let catalog = catalog_from_transaction_input(&input).expect("catalog should build");
 
         indexes
             .remember_foreign_key_references(&catalog, &row, &fk_child_schema(), &snapshot)
@@ -3984,8 +4071,7 @@ mod tests {
         let visible_schemas = vec![state_surface_ref_schema()];
         let staged_writes = empty_staged_write_set();
         let input = validation_input(&staged_writes, &visible_schemas);
-        let catalog =
-            SchemaCatalogSnapshot::from_transaction_input(&input).expect("catalog should build");
+        let catalog = catalog_from_transaction_input(&input).expect("catalog should build");
 
         indexes
             .remember_foreign_key_references(&catalog, &row, &state_surface_ref_schema(), &snapshot)
@@ -4017,8 +4103,7 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = empty_staged_write_set();
         let input = validation_input(&staged_writes, &visible_schemas);
-        let catalog =
-            SchemaCatalogSnapshot::from_transaction_input(&input).expect("catalog should build");
+        let catalog = catalog_from_transaction_input(&input).expect("catalog should build");
         indexes
             .remember_foreign_key_references(&catalog, &child, &fk_child_schema(), &child_snapshot)
             .expect("child row should index FK reference");
@@ -4044,8 +4129,7 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = empty_staged_write_set();
         let input = validation_input(&staged_writes, &visible_schemas);
-        let catalog =
-            SchemaCatalogSnapshot::from_transaction_input(&input).expect("catalog should build");
+        let catalog = catalog_from_transaction_input(&input).expect("catalog should build");
 
         let unresolved = validate_pending_foreign_keys(
             &catalog,
@@ -4109,8 +4193,7 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = empty_staged_write_set();
         let input = validation_input(&staged_writes, &visible_schemas);
-        let catalog =
-            SchemaCatalogSnapshot::from_transaction_input(&input).expect("catalog should build");
+        let catalog = catalog_from_transaction_input(&input).expect("catalog should build");
 
         let unresolved = validate_pending_foreign_keys(
             &catalog,
@@ -4151,8 +4234,7 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = empty_staged_write_set();
         let input = validation_input(&staged_writes, &visible_schemas);
-        let catalog =
-            SchemaCatalogSnapshot::from_transaction_input(&input).expect("catalog should build");
+        let catalog = catalog_from_transaction_input(&input).expect("catalog should build");
 
         let unresolved = validate_pending_foreign_keys(
             &catalog,
@@ -4184,8 +4266,7 @@ mod tests {
         let visible_schemas = vec![state_surface_ref_schema()];
         let staged_writes = empty_staged_write_set();
         let input = validation_input(&staged_writes, &visible_schemas);
-        let catalog =
-            SchemaCatalogSnapshot::from_transaction_input(&input).expect("catalog should build");
+        let catalog = catalog_from_transaction_input(&input).expect("catalog should build");
 
         let unresolved = validate_pending_foreign_keys(
             &catalog,
@@ -4236,8 +4317,7 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = empty_staged_write_set();
         let input = validation_input(&staged_writes, &visible_schemas);
-        let catalog =
-            SchemaCatalogSnapshot::from_transaction_input(&input).expect("catalog should build");
+        let catalog = catalog_from_transaction_input(&input).expect("catalog should build");
         let unresolved = validate_pending_foreign_keys(
             &catalog,
             &indexes,
@@ -4249,7 +4329,11 @@ mod tests {
         };
 
         let still_unresolved = validate_committed_foreign_keys(
-            &TransactionValidationInput::new(&staged_writes, &visible_schemas, &live_state),
+            &TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &live_state,
+            ),
             &indexes,
             &unresolved,
         )
@@ -4276,8 +4360,7 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = empty_staged_write_set();
         let input = validation_input(&staged_writes, &visible_schemas);
-        let catalog =
-            SchemaCatalogSnapshot::from_transaction_input(&input).expect("catalog should build");
+        let catalog = catalog_from_transaction_input(&input).expect("catalog should build");
         let unresolved = validate_pending_foreign_keys(
             &catalog,
             &indexes,
@@ -4289,7 +4372,11 @@ mod tests {
         };
 
         let still_unresolved = validate_committed_foreign_keys(
-            &TransactionValidationInput::new(&staged_writes, &visible_schemas, &live_state),
+            &TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &live_state,
+            ),
             &indexes,
             &unresolved,
         )
@@ -4316,8 +4403,7 @@ mod tests {
         let visible_schemas = vec![state_surface_ref_schema()];
         let staged_writes = empty_staged_write_set();
         let input = validation_input(&staged_writes, &visible_schemas);
-        let catalog =
-            SchemaCatalogSnapshot::from_transaction_input(&input).expect("catalog should build");
+        let catalog = catalog_from_transaction_input(&input).expect("catalog should build");
         let unresolved = validate_pending_foreign_keys(
             &catalog,
             &indexes,
@@ -4329,7 +4415,11 @@ mod tests {
         };
 
         let still_unresolved = validate_committed_foreign_keys(
-            &TransactionValidationInput::new(&staged_writes, &visible_schemas, &live_state),
+            &TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &live_state,
+            ),
             &indexes,
             &unresolved,
         )
@@ -4435,25 +4525,25 @@ mod tests {
     }
 
     fn key_value_schema() -> JsonValue {
-        builtin_schema_definition("lix_key_value")
+        seed_schema_definition("lix_key_value")
             .expect("lix_key_value builtin schema should exist")
             .clone()
     }
 
     fn registered_schema() -> JsonValue {
-        builtin_schema_definition(REGISTERED_SCHEMA_KEY)
+        seed_schema_definition(REGISTERED_SCHEMA_KEY)
             .expect("lix_registered_schema builtin schema should exist")
             .clone()
     }
 
     fn file_descriptor_schema() -> JsonValue {
-        builtin_schema_definition(FILE_DESCRIPTOR_SCHEMA_KEY)
+        seed_schema_definition(FILE_DESCRIPTOR_SCHEMA_KEY)
             .expect("lix_file_descriptor builtin schema should exist")
             .clone()
     }
 
     fn directory_descriptor_schema() -> JsonValue {
-        builtin_schema_definition(DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
+        seed_schema_definition(DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
             .expect("lix_directory_descriptor builtin schema should exist")
             .clone()
     }

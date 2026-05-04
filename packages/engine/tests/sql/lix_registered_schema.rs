@@ -1,3 +1,4 @@
+use lix_engine::CreateVersionOptions;
 use lix_engine::ExecuteResult;
 use lix_engine::LixError;
 use lix_engine::Value;
@@ -22,7 +23,7 @@ simulation_test!(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine2_dummy_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-             true,\
+             false,\
              true\
              )",
             &[],
@@ -98,6 +99,141 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_registered_schema_insert_rejects_system_schema_key,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"lix_change\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+                 false,\
+                 true\
+                 )",
+                &[],
+            )
+            .await
+            .expect_err("system schema keys should not be user-registerable");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            error.message.contains("system schema"),
+            "unexpected error: {error:?}"
+        );
+    }
+);
+
+simulation_test!(
+    lix_registered_schema_insert_rejects_schema_version_above_one,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine2_future_schema\",\"x-lix-version\":\"2\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+                 false,\
+                 true\
+                 )",
+                &[],
+            )
+            .await
+            .expect_err("schema evolution should not be accepted yet");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            error
+                .message
+                .contains("schema evolution is not supported yet"),
+            "unexpected error: {error:?}"
+        );
+    }
+);
+
+simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
+
+    session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine2_delete_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+                 false,\
+                 true\
+                 )",
+                &[],
+            )
+            .await
+            .expect("schema should register before delete attempt");
+
+    let registered_schema_rows = session
+        .execute(
+            "SELECT lixcol_entity_id, value \
+                 FROM lix_registered_schema",
+            &[],
+        )
+        .await
+        .expect("registered schema read should succeed");
+    let delete_schema_entity_id = registered_schema_rows
+        .rows()
+        .iter()
+        .find_map(|row| match row.values() {
+            [Value::Text(entity_id), Value::Json(value)]
+                if value.get("x-lix-key").and_then(serde_json::Value::as_str)
+                    == Some("engine2_delete_schema") =>
+            {
+                Some(entity_id.clone())
+            }
+            [Value::Text(entity_id), Value::Text(value)] => {
+                let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
+                (value.get("x-lix-key").and_then(serde_json::Value::as_str)
+                    == Some("engine2_delete_schema"))
+                .then_some(entity_id.clone())
+            }
+            _ => None,
+        })
+        .expect("registered schema entity id should be discoverable");
+
+    let error = session
+        .execute(
+            "DELETE FROM lix_registered_schema \
+                 WHERE lixcol_entity_id = $1",
+            &[Value::Text(delete_schema_entity_id)],
+        )
+        .await
+        .expect_err("schema deletion is not supported yet");
+
+    assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+    assert!(
+        error.message.contains("schema deletion is not supported"),
+        "unexpected error: {error:?}"
+    );
+});
+
+simulation_test!(
     lix_registered_schema_insert_rejects_primary_key_without_json_pointer_slash,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -114,7 +250,7 @@ simulation_test!(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine2_bad_pointer_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-                 true,\
+                 false,\
                  true\
                  )",
                 &[],
@@ -144,6 +280,200 @@ simulation_test!(
 );
 
 simulation_test!(
+    entity_by_version_insert_rejects_target_version_without_schema,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_version_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        main.create_version(CreateVersionOptions {
+            id: Some("schemaless-target".to_string()),
+            name: "Schemaless Target".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("target version should be created before schema registration");
+
+        main.execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"engine2_poison_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             false,\
+             true\
+             )",
+            &[],
+        )
+        .await
+        .expect("schema should be visible on active main");
+
+        let error = main
+            .execute(
+                "INSERT INTO engine2_poison_schema_by_version \
+                 (id, name, lixcol_version_id, lixcol_untracked) \
+                 VALUES ('poison-1', 'Poisoned', 'schemaless-target', true)",
+                &[],
+            )
+            .await
+            .expect_err("_by_version write must use the target version schema catalog");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            error.message.contains("engine2_poison_schema"),
+            "unexpected error: {error:?}"
+        );
+    }
+);
+
+simulation_test!(
+    registered_schema_insert_rejects_divergent_same_key_version_shape,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_version_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        main.create_version(CreateVersionOptions {
+            id: Some("divergent-target".to_string()),
+            name: "Divergent Target".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("target version should be created before schema divergence");
+
+        main.execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"engine2_divergent_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             false,\
+             true\
+             )",
+            &[],
+        )
+        .await
+        .expect("main schema should be registered");
+
+        let target = sim.wrap_session(
+            engine
+                .open_session("divergent-target")
+                .await
+                .expect("target session should open"),
+            &engine,
+        );
+
+        let error = target
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine2_divergent_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'),\
+                 false,\
+                 true\
+                 )",
+                &[],
+            )
+            .await
+            .expect_err("same schema key/version must have one canonical shape");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            error
+                .message
+                .contains("already registered with a different definition"),
+            "unexpected error: {error:?}"
+        );
+    }
+);
+
+simulation_test!(
+    entity_by_version_insert_rejects_fk_graph_when_target_version_lacks_schemas,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_version_id())
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        main.create_version(CreateVersionOptions {
+            id: Some("fk-schemaless-target".to_string()),
+            name: "FK Schemaless Target".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("target version should be created before FK schemas");
+
+        main.execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"engine2_fk_parent_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+             false,\
+             true\
+             )",
+            &[],
+        )
+        .await
+        .expect("parent schema should register on active main");
+
+        main.execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"engine2_fk_child_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_id\"],\"references\":{\"schemaKey\":\"engine2_fk_parent_schema\",\"properties\":[\"/id\"]}}],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"parent_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"parent_id\"],\"additionalProperties\":false}'),\
+             false,\
+             true\
+             )",
+            &[],
+        )
+        .await
+        .expect("child schema should register on active main");
+
+        let parent_result = main
+            .execute(
+                "INSERT INTO engine2_fk_parent_schema_by_version \
+                 (id, lixcol_version_id, lixcol_untracked) \
+                 VALUES ('parent-1', 'fk-schemaless-target', true)",
+                &[],
+            )
+            .await;
+
+        if let Err(error) = parent_result {
+            assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+            assert!(
+                error.message.contains("engine2_fk_parent_schema"),
+                "unexpected error: {error:?}"
+            );
+            return;
+        }
+
+        let error = main
+            .execute(
+                "INSERT INTO engine2_fk_child_schema_by_version \
+                 (id, parent_id, lixcol_version_id, lixcol_untracked) \
+                 VALUES ('child-1', 'parent-1', 'fk-schemaless-target', true)",
+                &[],
+            )
+            .await
+            .expect_err("FK-valid active graph must not be insertable into a schemaless target");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            error.message.contains("engine2_fk_child_schema")
+                || error.message.contains("engine2_fk_parent_schema"),
+            "unexpected error: {error:?}"
+        );
+    }
+);
+
+simulation_test!(
     registered_entity_insert_applies_defaulted_primary_key,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -160,7 +490,7 @@ simulation_test!(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine2_default_id_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
-                 true,\
+                 false,\
                  true\
                  )",
                 &[],
@@ -215,7 +545,7 @@ simulation_test!(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine2_nullable_default_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"status\":{\"type\":[\"string\",\"null\"],\"default\":\"computed\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
-                 true,\
+                 false,\
                  true\
                  )",
                 &[],
@@ -266,6 +596,13 @@ simulation_test!(
 
 simulation_test!(entity_by_version_expands_global_rows, |sim| async move {
     let engine = sim.boot_engine().await;
+    let global_session = sim.wrap_session(
+        engine
+            .open_session("global")
+            .await
+            .expect("global session should open"),
+        &engine,
+    );
     let session = sim.wrap_session(
         engine
             .open_workspace_session()
@@ -274,12 +611,25 @@ simulation_test!(entity_by_version_expands_global_rows, |sim| async move {
         &engine,
     );
 
-    session
+    global_session
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine2_overlay_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              true,\
+             true\
+             )",
+            &[],
+        )
+        .await
+        .expect("global registered schema insert should succeed");
+
+    session
+        .execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"engine2_overlay_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             false,\
              true\
              )",
             &[],
@@ -329,6 +679,49 @@ simulation_test!(entity_by_version_expands_global_rows, |sim| async move {
 });
 
 simulation_test!(
+    global_entity_insert_rejects_active_only_schema,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine2_global_poison_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 false,\
+                 true\
+                 )",
+                &[],
+            )
+            .await
+            .expect("main-local schema registration should succeed");
+
+        let error = session
+            .execute(
+                "INSERT INTO engine2_global_poison_schema \
+                 (id, name, lixcol_global, lixcol_untracked) \
+                 VALUES ('global-poison-1', 'Wrong Scope', true, false)",
+                &[],
+            )
+            .await
+            .expect_err("global writes must validate through the global schema catalog");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            error.message.contains("engine2_global_poison_schema"),
+            "unexpected error: {error:?}"
+        );
+    }
+);
+
+simulation_test!(
     registered_typed_entity_surface_uses_primary_key_columns,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -345,7 +738,7 @@ simulation_test!(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine2_typed_entity_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"count\":{\"type\":\"number\"}},\"required\":[\"id\",\"name\",\"count\"],\"additionalProperties\":false}'),\
-                 true,\
+                 false,\
                  true\
                  )",
                 &[],
@@ -402,7 +795,7 @@ simulation_test!(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine2_number_update_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"score\":{\"type\":\"number\"}},\"required\":[\"id\",\"score\"],\"additionalProperties\":false}'),\
-                 true,\
+                 false,\
                  true\
                  )",
                 &[],
@@ -460,7 +853,7 @@ simulation_test!(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine2_optional_update_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"rank\":{\"type\":\"integer\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'),\
-                 true,\
+                 false,\
                  true\
                  )",
                 &[],
