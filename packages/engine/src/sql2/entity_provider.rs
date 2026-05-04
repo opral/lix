@@ -38,7 +38,7 @@ use crate::sql2::version_scope::{
     resolve_write_version_scope, VersionBinding,
 };
 use crate::sql2::write_normalization::{
-    InsertCell, InsertColumnIntents, SqlCell, UpdateAssignmentValues,
+    InsertCell, InsertColumnIntents, SqlCell, UpdateAssignmentValues, UpdateCell,
 };
 use crate::transaction::types::StageRow;
 use crate::version::VersionRefReader;
@@ -1001,7 +1001,28 @@ fn entity_update_snapshot_content_from_batch(
     assignment_values: &UpdateAssignmentValues,
     row_index: usize,
 ) -> Result<String> {
-    let mut object = serde_json::Map::new();
+    let snapshot_content = optional_string_value(batch, row_index, "lixcol_snapshot_content")?
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "UPDATE entity surface '{}' requires existing lixcol_snapshot_content",
+                spec.schema_key
+            ))
+        })?;
+    let mut object = match serde_json::from_str::<JsonValue>(&snapshot_content).map_err(|error| {
+        DataFusionError::Execution(format!(
+            "UPDATE entity surface '{}' expected existing snapshot_content to be valid JSON: {error}",
+            spec.schema_key
+        ))
+    })? {
+        JsonValue::Object(object) => object,
+        other => {
+            return Err(DataFusionError::Execution(format!(
+                "UPDATE entity surface '{}' expected existing snapshot_content to be a JSON object, got {other}",
+                spec.schema_key
+            )))
+        }
+    };
+
     for column_name in &spec.visible_columns {
         let column_type = spec.column_types.get(column_name).ok_or_else(|| {
             DataFusionError::Execution(format!(
@@ -1009,13 +1030,15 @@ fn entity_update_snapshot_content_from_batch(
                 spec.schema_key, column_name
             ))
         })?;
-        let value = entity_update_json_value(
-            batch,
+        let value = match entity_update_json_value(
             assignment_values,
             row_index,
             column_name,
             *column_type,
-        )?;
+        )? {
+            Some(value) => value,
+            None => continue,
+        };
         object.insert(column_name.clone(), value);
     }
     serde_json::to_string(&JsonValue::Object(object)).map_err(|error| {
@@ -1032,7 +1055,7 @@ fn entity_update_optional_string_value(
     row_index: usize,
     column_name: &str,
 ) -> Result<Option<String>> {
-    match assignment_values.effective_cell(batch, row_index, column_name)? {
+    match assignment_values.assigned_or_existing_cell(batch, row_index, column_name)? {
         InsertCell::Omitted | InsertCell::Provided(SqlCell::Null) => Ok(None),
         InsertCell::Provided(SqlCell::Value(
             ScalarValue::Utf8(Some(value))
@@ -1060,16 +1083,16 @@ fn entity_update_optional_metadata_value(
 }
 
 fn entity_update_json_value(
-    batch: &RecordBatch,
     assignment_values: &UpdateAssignmentValues,
     row_index: usize,
     column_name: &str,
     column_type: EntityColumnType,
-) -> Result<JsonValue> {
-    match assignment_values.effective_cell(batch, row_index, column_name)? {
-        InsertCell::Omitted | InsertCell::Provided(SqlCell::Null) => Ok(JsonValue::Null),
-        InsertCell::Provided(SqlCell::Value(value)) => {
-            entity_json_value_from_scalar(Some(value), column_type)
+) -> Result<Option<JsonValue>> {
+    match assignment_values.assigned_cell(row_index, column_name)? {
+        UpdateCell::Unassigned => Ok(None),
+        UpdateCell::Assigned(SqlCell::Null) => Ok(Some(JsonValue::Null)),
+        UpdateCell::Assigned(SqlCell::Value(value)) => {
+            entity_json_value_from_scalar(Some(value), column_type).map(Some)
         }
     }
 }
