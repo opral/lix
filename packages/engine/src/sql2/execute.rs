@@ -1232,6 +1232,239 @@ mod tests {
         Ok((session, head_commit_id))
     }
 
+    #[tokio::test]
+    async fn lix_file_path_predicates_canonicalize_bound_values_like_writes() {
+        let backend = crate::backend::testing::UnitTestBackend::new();
+        let init_receipt = Engine::initialize(Box::new(backend.clone()))
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(Box::new(backend))
+            .await
+            .expect("engine should open");
+        let session = engine
+            .open_session(init_receipt.main_version_id)
+            .await
+            .expect("session should open");
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ('file-nfc', $1, X'41')",
+                &[Value::Text("/Cafe\u{301}.txt".to_string())],
+            )
+            .await
+            .expect("NFD path insert should canonicalize");
+
+        let nfd_result = session
+            .execute(
+                "SELECT id FROM lix_file WHERE path = $1",
+                &[Value::Text("/Cafe\u{301}.txt".to_string())],
+            )
+            .await
+            .expect("NFD path predicate should canonicalize");
+        assert_eq!(
+            rows_from_execute_result(nfd_result).1,
+            vec![vec![Value::Text("file-nfc".to_string())]]
+        );
+
+        let percent_result = session
+            .execute(
+                "SELECT id FROM lix_file WHERE path = '/%43afe%CC%81.txt'",
+                &[],
+            )
+            .await
+            .expect("percent-encoded path predicate should canonicalize");
+        assert_eq!(
+            rows_from_execute_result(percent_result).1,
+            vec![vec![Value::Text("file-nfc".to_string())]]
+        );
+
+        let reversed_result = session
+            .execute(
+                "SELECT id FROM lix_file WHERE $1 = path",
+                &[Value::Text("/Cafe\u{301}.txt".to_string())],
+            )
+            .await
+            .expect("reversed path predicate should canonicalize");
+        assert_eq!(
+            rows_from_execute_result(reversed_result).1,
+            vec![vec![Value::Text("file-nfc".to_string())]]
+        );
+
+        let or_result = session
+            .execute(
+                "SELECT id FROM lix_file WHERE path = $1 OR id = 'missing'",
+                &[Value::Text("/Cafe\u{301}.txt".to_string())],
+            )
+            .await
+            .expect("OR path predicate should canonicalize");
+        assert_eq!(
+            rows_from_execute_result(or_result).1,
+            vec![vec![Value::Text("file-nfc".to_string())]]
+        );
+
+        let not_result = session
+            .execute(
+                "SELECT id FROM lix_file WHERE NOT (path = $1)",
+                &[Value::Text("/Cafe\u{301}.txt".to_string())],
+            )
+            .await
+            .expect("NOT path predicate should canonicalize");
+        assert!(rows_from_execute_result(not_result).1.is_empty());
+
+        let not_in_result = session
+            .execute(
+                "SELECT id FROM lix_file WHERE path NOT IN ($1)",
+                &[Value::Text("/%43afe%CC%81.txt".to_string())],
+            )
+            .await
+            .expect("NOT IN path predicate should canonicalize");
+        assert!(rows_from_execute_result(not_in_result).1.is_empty());
+
+        let update_result = session
+            .execute(
+                "UPDATE lix_file SET hidden = true WHERE path = $1 OR id = 'missing'",
+                &[Value::Text("/Cafe\u{301}.txt".to_string())],
+            )
+            .await
+            .expect("update predicate should canonicalize through OR");
+        assert_eq!(update_result.rows_affected(), 1);
+
+        let delete_result = session
+            .execute(
+                "DELETE FROM lix_file WHERE path = $1",
+                &[Value::Text("/%43afe%CC%81.txt".to_string())],
+            )
+            .await
+            .expect("delete predicate should canonicalize");
+        assert_eq!(delete_result.rows_affected(), 1);
+    }
+
+    #[tokio::test]
+    async fn lix_file_path_predicates_reject_non_literal_path_values() {
+        let backend = crate::backend::testing::UnitTestBackend::new();
+        let init_receipt = Engine::initialize(Box::new(backend.clone()))
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(Box::new(backend))
+            .await
+            .expect("engine should open");
+        let session = engine
+            .open_session(init_receipt.main_version_id)
+            .await
+            .expect("session should open");
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ('file-nfc', $1, X'41')",
+                &[Value::Text("/Cafe\u{301}.txt".to_string())],
+            )
+            .await
+            .expect("NFD path insert should canonicalize");
+
+        let error = session
+            .execute("SELECT id FROM lix_file WHERE path = id", &[])
+            .await
+            .expect_err("computed path predicate values should be rejected");
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(
+            error
+                .message
+                .contains("filesystem path predicates only support literal path values"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lix_directory_path_predicates_canonicalize_bound_values_like_writes() {
+        let backend = crate::backend::testing::UnitTestBackend::new();
+        let init_receipt = Engine::initialize(Box::new(backend.clone()))
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(Box::new(backend))
+            .await
+            .expect("engine should open");
+        let session = engine
+            .open_session(init_receipt.main_version_id)
+            .await
+            .expect("session should open");
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES ('dir-nfc', $1)",
+                &[Value::Text("/Cafe\u{301}/".to_string())],
+            )
+            .await
+            .expect("NFD directory path insert should canonicalize");
+
+        let result = session
+            .execute(
+                "SELECT id FROM lix_directory WHERE path IN ($1)",
+                &[Value::Text("/%43afe%CC%81/".to_string())],
+            )
+            .await
+            .expect("directory path predicate should canonicalize");
+        assert_eq!(
+            rows_from_execute_result(result).1,
+            vec![vec![Value::Text("dir-nfc".to_string())]]
+        );
+
+        let or_result = session
+            .execute(
+                "SELECT id FROM lix_directory WHERE id = 'missing' OR path = $1",
+                &[Value::Text("/Cafe\u{301}/".to_string())],
+            )
+            .await
+            .expect("directory OR path predicate should canonicalize");
+        assert_eq!(
+            rows_from_execute_result(or_result).1,
+            vec![vec![Value::Text("dir-nfc".to_string())]]
+        );
+
+        let not_in_result = session
+            .execute(
+                "SELECT id FROM lix_directory WHERE path NOT IN ($1)",
+                &[Value::Text("/%43afe%CC%81/".to_string())],
+            )
+            .await
+            .expect("directory NOT IN path predicate should canonicalize");
+        assert!(rows_from_execute_result(not_in_result).1.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lix_directory_path_predicates_reject_non_literal_path_values() {
+        let backend = crate::backend::testing::UnitTestBackend::new();
+        let init_receipt = Engine::initialize(Box::new(backend.clone()))
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(Box::new(backend))
+            .await
+            .expect("engine should open");
+        let session = engine
+            .open_session(init_receipt.main_version_id)
+            .await
+            .expect("session should open");
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES ('dir-nfc', $1)",
+                &[Value::Text("/Cafe\u{301}/".to_string())],
+            )
+            .await
+            .expect("NFD directory path insert should canonicalize");
+
+        let error = session
+            .execute("SELECT id FROM lix_directory WHERE path IN (id)", &[])
+            .await
+            .expect_err("computed directory path predicate values should be rejected");
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(
+            error
+                .message
+                .contains("filesystem path predicates only support literal path values"),
+            "{error:?}"
+        );
+    }
+
     fn rows_from_execute_result(result: ExecuteResult) -> (Vec<String>, Vec<Vec<Value>>) {
         let rows = result;
         (
