@@ -1,4 +1,4 @@
-use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
+use crate::backend::testing::UnitTestBackend;
 use crate::changelog::ChangelogContext;
 use crate::commit_graph::CommitGraphContext;
 use crate::Value;
@@ -41,15 +41,16 @@ async fn tracked_state_rebuild_restores_sql_reads_from_changelog() {
     assert_key_value_missing(&session).await;
 
     let commit_graph = CommitGraphContext::new(ChangelogContext::new());
-    let mut rebuild_transaction = backend
-        .begin_transaction(TransactionBeginMode::Write)
+    let storage = engine.storage();
+    let mut rebuild_transaction = storage
+        .begin_write_transaction()
         .await
         .expect("rebuild transaction should open");
     let rebuild_report = engine
         .tracked_state()
         .rebuild_state_at_commit(
             &commit_graph,
-            &backend,
+            storage.clone(),
             rebuild_transaction.as_mut(),
             &head_commit_id,
         )
@@ -68,11 +69,12 @@ async fn tracked_state_rebuild_restores_sql_reads_from_changelog() {
 
 async fn delete_tracked_root_for_commit(
     engine: &Engine,
-    backend: &UnitTestBackend,
+    _backend: &UnitTestBackend,
     commit_id: &str,
 ) {
-    let mut transaction = backend
-        .begin_transaction(TransactionBeginMode::Write)
+    let mut transaction = engine
+        .storage()
+        .begin_write_transaction()
         .await
         .expect("delete transaction should open");
     let tracked_state = engine.tracked_state();

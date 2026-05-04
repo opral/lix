@@ -1,4 +1,4 @@
-use crate::backend::{KvStore, KvWriter};
+use crate::storage::{StorageReader, StorageWriter};
 use crate::tracked_state::codec::encoded_value_len;
 use crate::tracked_state::storage;
 use crate::tracked_state::tree_types::{StoredSnapshot, TrackedStateKey, TrackedStateValue};
@@ -30,7 +30,7 @@ impl SnapshotStore {
 
     pub(crate) async fn store_value(
         &self,
-        writer: &mut impl KvWriter,
+        writer: &mut impl StorageWriter,
         mut value: TrackedStateValue,
     ) -> Result<TrackedStateValue, LixError> {
         if let StoredSnapshot::Inline(snapshot_content) = &value.snapshot {
@@ -56,7 +56,7 @@ impl SnapshotStore {
     }
 
     pub(crate) async fn resolve_value(
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         mut value: TrackedStateValue,
     ) -> Result<TrackedStateValue, LixError> {
         if let StoredSnapshot::Ref(snapshot_ref) = &value.snapshot {
@@ -78,7 +78,7 @@ impl SnapshotStore {
     }
 
     pub(crate) async fn resolve_rows(
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         rows: Vec<(TrackedStateKey, TrackedStateValue)>,
         needs_snapshot_content: bool,
     ) -> Result<Vec<(TrackedStateKey, TrackedStateValue)>, LixError> {

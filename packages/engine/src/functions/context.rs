@@ -3,6 +3,7 @@ use crate::functions::{
     FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
 };
 use crate::live_state::{LiveStateReader, LiveStateWriter};
+use crate::storage::StorageWriter;
 use crate::LixError;
 
 /// Execution-scoped runtime function context.
@@ -59,7 +60,7 @@ impl FunctionContext {
         writer: &mut LiveStateWriter<S>,
     ) -> Result<(), LixError>
     where
-        S: crate::backend::KvWriter,
+        S: StorageWriter,
     {
         let Some(highest_seen) = self.functions.deterministic_sequence_persist_highest_seen()
         else {
@@ -78,10 +79,11 @@ impl FunctionContext {
 mod tests {
     use std::sync::Arc;
 
-    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
+    use crate::backend::testing::UnitTestBackend;
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
     use crate::functions::{state::load_sequence, DeterministicSequence};
     use crate::live_state::{LiveStateContext, LiveStateRow};
+    use crate::storage::StorageContext;
     use crate::GLOBAL_VERSION_ID;
 
     use super::*;
@@ -97,8 +99,9 @@ mod tests {
     #[tokio::test]
     async fn prepare_uses_system_functions_when_mode_missing() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let live_state = live_state_context();
-        let reader = live_state.reader(Arc::clone(&backend));
+        let reader = live_state.reader(storage.clone());
 
         let context = FunctionContext::prepare(&reader)
             .await
@@ -115,10 +118,11 @@ mod tests {
     #[tokio::test]
     async fn prepare_starts_deterministic_functions_at_sequence_zero() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let live_state = live_state_context();
-        crate::test_support::seed_global_version_head(backend.as_ref()).await;
+        crate::test_support::seed_global_version_head(storage.clone()).await;
         write_key_value(
-            Arc::clone(&backend),
+            storage.clone(),
             &live_state,
             DETERMINISTIC_MODE_KEY,
             serde_json::json!({
@@ -127,7 +131,7 @@ mod tests {
         )
         .await;
 
-        let reader = live_state.reader(Arc::clone(&backend));
+        let reader = live_state.reader(storage.clone());
         let context = FunctionContext::prepare(&reader)
             .await
             .expect("runtime context should prepare");
@@ -149,10 +153,11 @@ mod tests {
     #[tokio::test]
     async fn prepare_continues_from_persisted_sequence() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let live_state = live_state_context();
-        crate::test_support::seed_global_version_head(backend.as_ref()).await;
+        crate::test_support::seed_global_version_head(storage.clone()).await;
         write_key_value(
-            Arc::clone(&backend),
+            storage.clone(),
             &live_state,
             DETERMINISTIC_MODE_KEY,
             serde_json::json!({
@@ -161,14 +166,14 @@ mod tests {
         )
         .await;
         write_key_value(
-            Arc::clone(&backend),
+            storage.clone(),
             &live_state,
             DETERMINISTIC_SEQUENCE_KEY,
             serde_json::json!(41),
         )
         .await;
 
-        let reader = live_state.reader(Arc::clone(&backend));
+        let reader = live_state.reader(storage.clone());
         let context = FunctionContext::prepare(&reader)
             .await
             .expect("runtime context should prepare");
@@ -189,10 +194,11 @@ mod tests {
     #[tokio::test]
     async fn persist_if_needed_writes_sequence_when_deterministic_functions_advanced() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let live_state = live_state_context();
-        crate::test_support::seed_global_version_head(backend.as_ref()).await;
+        crate::test_support::seed_global_version_head(storage.clone()).await;
         write_key_value(
-            Arc::clone(&backend),
+            storage.clone(),
             &live_state,
             DETERMINISTIC_MODE_KEY,
             serde_json::json!({
@@ -202,15 +208,15 @@ mod tests {
         .await;
 
         let context = {
-            let reader = live_state.reader(Arc::clone(&backend));
+            let reader = live_state.reader(storage.clone());
             FunctionContext::prepare(&reader)
                 .await
                 .expect("runtime context should prepare")
         };
         context.provider().call_uuid_v7();
 
-        let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut tx = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         context
@@ -219,7 +225,7 @@ mod tests {
             .expect("sequence should persist");
         tx.commit().await.expect("transaction should commit");
 
-        let reader = live_state.reader(Arc::clone(&backend));
+        let reader = live_state.reader(storage.clone());
         let sequence = load_sequence(&reader).await.expect("sequence should load");
         assert_eq!(sequence, DeterministicSequence { highest_seen: 0 });
     }
@@ -227,14 +233,15 @@ mod tests {
     #[tokio::test]
     async fn persist_if_needed_is_noop_for_system_functions() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let live_state = live_state_context();
-        let reader = live_state.reader(Arc::clone(&backend));
+        let reader = live_state.reader(storage.clone());
         let context = FunctionContext::prepare(&reader)
             .await
             .expect("runtime context should prepare");
 
-        let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut tx = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         context
@@ -243,7 +250,7 @@ mod tests {
             .expect("persist should no-op");
         tx.commit().await.expect("transaction should commit");
 
-        let reader = live_state.reader(Arc::clone(&backend));
+        let reader = live_state.reader(storage.clone());
         let sequence = load_sequence(&reader)
             .await
             .expect("missing sequence should load");
@@ -251,13 +258,13 @@ mod tests {
     }
 
     async fn write_key_value(
-        backend: Arc<UnitTestBackend>,
+        storage: StorageContext,
         live_state: &LiveStateContext,
         key: &str,
         value: serde_json::Value,
     ) {
-        let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut tx = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let snapshot_content = serde_json::to_string(&serde_json::json!({

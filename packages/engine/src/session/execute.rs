@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use crate::backend::TransactionBeginMode;
 use crate::functions::FunctionContext;
 use crate::sql2;
+use crate::storage::StorageReadScope;
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
 use super::context::{SessionContext, SessionSqlExecutionContext};
@@ -315,28 +315,46 @@ impl SessionContext {
                 .await;
         }
 
+        let read_transaction = self.storage.begin_read_transaction().await?;
+        let read_scope = StorageReadScope::new(read_transaction);
+        let mut read_store = read_scope.store();
         let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-            Arc::new(self.live_state.reader(Arc::clone(&self.backend)));
+            Arc::new(self.live_state.reader(read_store.clone()));
         let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
         let functions = runtime_functions.provider();
-        let active_version_id = self.active_version_id().await?;
+        let active_version_id = self.active_version_id_from_reader(&mut read_store).await?;
         let visible_schemas = self
             .schema_registry
             .visible_schemas(live_state.as_ref(), &active_version_id)
             .await?;
-        let ctx = SessionSqlExecutionContext {
-            active_version_id: &active_version_id,
-            backend: Arc::clone(&self.backend),
-            live_state: Arc::clone(&self.live_state),
-            binary_cas: Arc::clone(&self.binary_cas),
-            changelog: Arc::clone(&self.changelog),
-            version_ctx: Arc::clone(&self.version_ctx),
-            visible_schemas,
-            functions: functions.clone(),
-        };
+        let result = {
+            let ctx = SessionSqlExecutionContext {
+                active_version_id: &active_version_id,
+                read_store,
+                live_state: Arc::clone(&self.live_state),
+                binary_cas: Arc::clone(&self.binary_cas),
+                changelog: Arc::clone(&self.changelog),
+                version_ctx: Arc::clone(&self.version_ctx),
+                visible_schemas,
+                functions: functions.clone(),
+            };
 
-        let plan = sql2::create_logical_plan(&ctx, sql).await?;
-        let result = sql2::execute_logical_plan(plan, params).await?;
+            match sql2::create_logical_plan(&ctx, sql).await {
+                Ok(plan) => sql2::execute_logical_plan(plan, params).await,
+                Err(error) => Err(error),
+            }
+        };
+        drop(live_state);
+        let result = match result {
+            Ok(result) => {
+                read_scope.rollback().await?;
+                result
+            }
+            Err(error) => {
+                let _ = read_scope.rollback().await;
+                return Err(error);
+            }
+        };
         self.persist_runtime_functions_if_needed(&runtime_functions)
             .await?;
         Ok(ExecuteResult::from_sql_query_result(result))
@@ -352,10 +370,7 @@ impl SessionContext {
         &self,
         runtime_functions: &FunctionContext,
     ) -> Result<(), LixError> {
-        let mut transaction = self
-            .backend
-            .begin_transaction(TransactionBeginMode::Write)
-            .await?;
+        let mut transaction = self.storage.begin_write_transaction().await?;
         runtime_functions
             .persist_if_needed(&mut self.live_state.writer(transaction.as_mut()))
             .await?;

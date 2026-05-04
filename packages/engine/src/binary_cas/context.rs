@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
-use crate::backend::{KvStore, KvWriter};
 use crate::binary_cas::BinaryBlobWrite;
+use crate::storage::{StorageReader, StorageWriter};
 use crate::LixError;
 
 #[async_trait]
@@ -28,14 +28,14 @@ impl BinaryCasContext {
     /// visibility.
     pub(crate) fn reader<S>(&self, store: S) -> BinaryCasStoreReader<S>
     where
-        S: KvStore,
+        S: StorageReader,
     {
         BinaryCasStoreReader { store }
     }
 
     pub(crate) fn writer<S>(&self, store: S) -> BinaryCasWriter<S>
     where
-        S: KvWriter,
+        S: StorageWriter,
     {
         BinaryCasWriter { store }
     }
@@ -44,7 +44,7 @@ impl BinaryCasContext {
 #[async_trait]
 impl<S> BlobDataReader for BinaryCasStoreReader<S>
 where
-    S: KvStore + Clone + Send + Sync,
+    S: StorageReader + Clone + Send + Sync,
 {
     async fn load_blob_data_by_hash(&self, blob_hash: &str) -> Result<Option<Vec<u8>>, LixError> {
         let mut reader = BinaryCasStoreReader {
@@ -71,7 +71,7 @@ pub(crate) struct BinaryCasStoreReader<S> {
 
 impl<S> BinaryCasStoreReader<S>
 where
-    S: KvStore,
+    S: StorageReader,
 {
     pub(crate) async fn load_blob_data_by_hash(
         &mut self,
@@ -89,7 +89,7 @@ where
 #[async_trait]
 impl<S> BinaryCasReader for BinaryCasStoreReader<S>
 where
-    S: KvStore + Send,
+    S: StorageReader + Send,
 {
     async fn load_blob_data_by_hash(
         &mut self,
@@ -109,7 +109,7 @@ pub(crate) struct BinaryCasWriter<S> {
 
 impl<S> BinaryCasWriter<S>
 where
-    S: KvWriter,
+    S: StorageWriter,
 {
     pub(crate) async fn put_blob_writes(
         &mut self,

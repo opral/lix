@@ -1,5 +1,5 @@
-use crate::backend::{KvStore, KvWriter};
 use crate::commit_graph::CommitGraphContext;
+use crate::storage::{StorageReader, StorageWriter};
 use crate::tracked_state::by_file_index::ByFileIndex;
 use crate::tracked_state::diff::{diff_commits, TrackedStateDiff, TrackedStateDiffRequest};
 use crate::tracked_state::merge::{self, TrackedStateMergePlan};
@@ -46,7 +46,7 @@ impl TrackedStateContext {
     /// Creates a commit-id-addressed tracked-state reader.
     pub(crate) fn reader<S>(&self, store: S) -> TrackedStateStoreReader<S>
     where
-        S: KvStore,
+        S: StorageReader,
     {
         TrackedStateStoreReader {
             store,
@@ -57,7 +57,7 @@ impl TrackedStateContext {
     /// Creates a tracked-state writer over a caller-provided KV writer.
     pub(crate) fn writer<S>(&self, store: S) -> TrackedStateWriter<S>
     where
-        S: KvWriter,
+        S: StorageWriter,
     {
         TrackedStateWriter {
             store,
@@ -75,8 +75,8 @@ impl TrackedStateContext {
         head_commit_id: &str,
     ) -> Result<TrackedStateRebuildReport, LixError>
     where
-        R: KvStore,
-        W: KvWriter,
+        R: StorageReader,
+        W: StorageWriter,
     {
         crate::tracked_state::rebuild::rebuild_state_at_commit(
             self,
@@ -97,7 +97,7 @@ pub(crate) struct TrackedStateStoreReader<S> {
 
 impl<S> TrackedStateStoreReader<S>
 where
-    S: KvStore,
+    S: StorageReader,
 {
     pub(crate) async fn scan_rows_at_commit(
         &mut self,
@@ -336,7 +336,7 @@ pub(crate) struct TrackedStateWriter<S> {
 
 impl<S> TrackedStateWriter<S>
 where
-    S: KvWriter,
+    S: StorageWriter,
 {
     /// Writes one root for `commit_id` from the provided row set.
     ///
@@ -491,16 +491,18 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
+    use crate::backend::{testing::UnitTestBackend, Backend};
+    use crate::storage::StorageContext;
     use crate::tracked_state::snapshot_store::DEFAULT_MAX_INLINE_ENCODED_VALUE_BYTES;
     use crate::NullableKeyFilter;
 
     #[tokio::test]
     async fn write_root_rejects_missing_parent_root() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let tracked_state = TrackedStateContext::new();
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
 
@@ -523,7 +525,7 @@ mod tests {
 
     #[tokio::test]
     async fn plan_merge_from_roots_applies_source_only_change() {
-        let (backend, tracked_state) = seed_merge_roots(
+        let (storage, tracked_state) = seed_merge_roots(
             &[row_with_value("entity-a", "change-base", "base", "base")],
             &[row_with_value("entity-a", "change-base", "base", "base")],
             &[row_with_value(
@@ -536,7 +538,7 @@ mod tests {
         .await;
 
         let plan = tracked_state
-            .reader(Arc::clone(&backend))
+            .reader(storage.clone())
             .plan_merge(
                 "base",
                 "target",
@@ -552,7 +554,7 @@ mod tests {
 
     #[tokio::test]
     async fn plan_merge_from_roots_keeps_target_only_change() {
-        let (backend, tracked_state) = seed_merge_roots(
+        let (storage, tracked_state) = seed_merge_roots(
             &[row("entity-a", "change-base", "base")],
             &[row("entity-a", "change-target", "target")],
             &[row("entity-a", "change-base", "base")],
@@ -560,7 +562,7 @@ mod tests {
         .await;
 
         let plan = tracked_state
-            .reader(Arc::clone(&backend))
+            .reader(storage.clone())
             .plan_merge(
                 "base",
                 "target",
@@ -576,7 +578,7 @@ mod tests {
 
     #[tokio::test]
     async fn plan_merge_from_roots_reports_divergent_modification_conflict() {
-        let (backend, tracked_state) = seed_merge_roots(
+        let (storage, tracked_state) = seed_merge_roots(
             &[row_with_value("entity-a", "change-base", "base", "base")],
             &[row_with_value(
                 "entity-a",
@@ -594,7 +596,7 @@ mod tests {
         .await;
 
         let plan = tracked_state
-            .reader(Arc::clone(&backend))
+            .reader(storage.clone())
             .plan_merge(
                 "base",
                 "target",
@@ -610,7 +612,7 @@ mod tests {
 
     #[tokio::test]
     async fn plan_merge_from_roots_applies_source_tombstone() {
-        let (backend, tracked_state) = seed_merge_roots(
+        let (storage, tracked_state) = seed_merge_roots(
             &[row("entity-a", "change-base", "base")],
             &[row("entity-a", "change-base", "base")],
             &[tombstone("entity-a", "change-source-delete", "source")],
@@ -618,7 +620,7 @@ mod tests {
         .await;
 
         let plan = tracked_state
-            .reader(Arc::clone(&backend))
+            .reader(storage.clone())
             .plan_merge(
                 "base",
                 "target",
@@ -636,14 +638,15 @@ mod tests {
     #[tokio::test]
     async fn scan_rows_by_file_uses_file_index_shape() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
         let mut file_a = row("entity-a", "change-a", "commit-1");
         file_a.file_id = Some("file-a.json".to_string());
         let mut file_b = row("entity-b", "change-b", "commit-1");
         file_b.file_id = Some("file-b.json".to_string());
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         tracked_state
@@ -657,7 +660,7 @@ mod tests {
             .expect("transaction should commit");
 
         let rows = tracked_state
-            .reader(Arc::clone(&backend))
+            .reader(storage.clone())
             .scan_rows_at_commit(
                 "commit-1",
                 &TrackedStateScanRequest {
@@ -682,13 +685,14 @@ mod tests {
     #[tokio::test]
     async fn by_file_header_index_fetches_primary_payload_only_when_requested() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
         let mut row = row("entity-a", "change-a", "commit-1");
         row.file_id = Some("file-a.json".to_string());
         let expected_snapshot = row.snapshot_content.clone();
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         tracked_state
@@ -701,7 +705,7 @@ mod tests {
             .await
             .expect("transaction should commit");
 
-        let mut reader = tracked_state.reader(Arc::clone(&backend));
+        let mut reader = tracked_state.reader(storage.clone());
         let header_rows = reader
             .scan_rows_at_commit(
                 "commit-1",
@@ -739,14 +743,15 @@ mod tests {
     #[tokio::test]
     async fn by_file_header_index_filters_tombstones_without_payload_sentinel() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
         let mut live = row("entity-live", "change-live", "commit-1");
         live.file_id = Some("file-a.json".to_string());
         let mut deleted = tombstone("entity-deleted", "change-delete", "commit-1");
         deleted.file_id = Some("file-a.json".to_string());
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         tracked_state
@@ -760,7 +765,7 @@ mod tests {
             .expect("transaction should commit");
 
         let rows = tracked_state
-            .reader(Arc::clone(&backend))
+            .reader(storage.clone())
             .scan_rows_at_commit(
                 "commit-1",
                 &TrackedStateScanRequest {
@@ -787,12 +792,13 @@ mod tests {
     #[tokio::test]
     async fn reads_resolve_large_snapshot_refs() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
         let large_value = "x".repeat(DEFAULT_MAX_INLINE_ENCODED_VALUE_BYTES + 512);
         let row = row_with_value("entity-a", "change-a", "commit-1", &large_value);
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         tracked_state
@@ -805,7 +811,7 @@ mod tests {
             .await
             .expect("transaction should commit");
 
-        let mut reader = tracked_state.reader(Arc::clone(&backend));
+        let mut reader = tracked_state.reader(storage.clone());
         let loaded = reader
             .load_row_at_commit(
                 "commit-1",
@@ -830,12 +836,13 @@ mod tests {
     #[tokio::test]
     async fn projected_scans_do_not_return_snapshot_refs_when_snapshot_content_is_omitted() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
         let large_value = "x".repeat(DEFAULT_MAX_INLINE_ENCODED_VALUE_BYTES + 512);
         let row = row_with_value("entity-a", "change-a", "commit-1", &large_value);
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         tracked_state
@@ -849,7 +856,7 @@ mod tests {
             .expect("transaction should commit");
 
         let rows = tracked_state
-            .reader(Arc::clone(&backend))
+            .reader(storage.clone())
             .scan_rows_at_commit(
                 "commit-1",
                 &TrackedStateScanRequest {
@@ -870,11 +877,12 @@ mod tests {
         base_rows: &[TrackedStateRow],
         target_rows: &[TrackedStateRow],
         source_rows: &[TrackedStateRow],
-    ) -> (Arc<UnitTestBackend>, TrackedStateContext) {
+    ) -> (StorageContext, TrackedStateContext) {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         tracked_state
@@ -896,7 +904,7 @@ mod tests {
             .commit()
             .await
             .expect("transaction should commit");
-        (backend, tracked_state)
+        (storage, tracked_state)
     }
 
     fn merge_patch_ids(plan: &TrackedStateMergePlan) -> Vec<String> {

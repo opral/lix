@@ -7,10 +7,15 @@ mod backend;
 mod binary_cas;
 mod changelog;
 mod json_store;
+mod rocksdb_backend;
+mod sqlite_backend;
+mod storage_api;
 mod tracked_state;
 mod untracked_state;
 
 use backend::BenchBackend;
+use rocksdb_backend::RocksDbBenchBackend;
+use sqlite_backend::SqliteBenchBackend;
 
 const BENCH_ROWS: usize = 10_000;
 const BENCH_BLOB_BYTES: usize = 1024;
@@ -53,6 +58,7 @@ fn storage_benches(c: &mut Criterion) {
         .expect("create tokio runtime for storage benchmarks");
     let args = Args::default();
 
+    storage_api::bench(c, &runtime, args);
     tracked_state::bench(c, &runtime, args);
     untracked_state::bench(c, &runtime, args);
     changelog::bench(c, &runtime, args);

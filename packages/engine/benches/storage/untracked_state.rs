@@ -324,7 +324,7 @@ fn prepare_read(
     runtime: &Runtime,
     args: Args,
 ) -> (
-    BenchBackend,
+    std::sync::Arc<dyn lix_engine::Backend + Send + Sync>,
     lix_engine::storage_bench::UntrackedStateReadFixture,
 ) {
     let backend = BenchBackend::new();
@@ -341,7 +341,7 @@ fn prepare_read_with(
     runtime: &Runtime,
     config: StorageBenchConfig,
 ) -> (
-    BenchBackend,
+    std::sync::Arc<dyn lix_engine::Backend + Send + Sync>,
     lix_engine::storage_bench::UntrackedStateReadFixture,
 ) {
     let backend = BenchBackend::new();

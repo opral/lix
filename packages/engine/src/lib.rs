@@ -15,6 +15,8 @@ mod schema;
 pub(crate) mod schema_registry;
 pub mod session;
 pub(crate) mod sql2;
+#[allow(dead_code, unused_imports)]
+pub(crate) mod storage;
 #[cfg(feature = "storage-benches")]
 pub mod storage_bench;
 #[cfg(test)]
@@ -33,8 +35,12 @@ pub use schema::{
     validate_lix_schema_definition,
 };
 
-pub use backend::TransactionBeginMode;
-pub use backend::{Backend, BackendTransaction, KvPair, KvScanRange};
+pub use backend::{
+    Backend, BackendKvGetGroup, BackendKvGetRequest, BackendKvGetResult, BackendKvGetResultGroup,
+    BackendKvPair, BackendKvPut, BackendKvScanRange, BackendKvScanRequest, BackendKvScanResult,
+    BackendKvWriteBatch, BackendKvWriteGroup, BackendKvWriteStats, BackendReadTransaction,
+    BackendWriteTransaction,
+};
 pub use common::LixError;
 pub use common::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,

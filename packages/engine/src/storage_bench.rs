@@ -7,6 +7,8 @@ use crate::entity_identity::EntityIdentity;
 use crate::entity_identity::EntityIdentityPart;
 use crate::json_store::context::JsonStoreContext;
 use crate::json_store::types::{JsonProjectionPath, JsonRef};
+use crate::storage::KvScanRange;
+use crate::storage::{KvGetGroup, KvGetRequest, KvScanRequest, KvWriteBatch, StorageContext};
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateDiffRequest, TrackedStateFilter, TrackedStateProjection,
     TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
@@ -15,7 +17,8 @@ use crate::untracked_state::{
     UntrackedStateContext, UntrackedStateFilter, UntrackedStateRow, UntrackedStateRowRequest,
     UntrackedStateScanRequest,
 };
-use crate::{Backend, LixError, NullableKeyFilter, TransactionBeginMode};
+use crate::{Backend, LixError, NullableKeyFilter};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const DEFAULT_MAX_INLINE_ENCODED_VALUE_BYTES: usize = 1024;
@@ -109,6 +112,553 @@ pub struct StorageBenchReport {
     pub measured_rows: usize,
     pub verified_rows: usize,
     pub elapsed: Duration,
+}
+
+pub struct StorageApiFixture {
+    storage: StorageContext,
+    rows: usize,
+}
+
+const STORAGE_API_NAMESPACE: &str = "bench.storage_api";
+const STORAGE_API_ALT_NAMESPACE: &str = "bench.storage_api.alt";
+
+pub async fn storage_api_write_kv_batch_puts(
+    backend: Arc<dyn Backend + Send + Sync>,
+    rows: usize,
+) -> Result<StorageBenchReport, LixError> {
+    let storage = StorageContext::new(backend);
+    let mut transaction = storage.begin_write_transaction().await?;
+    let mut batch = KvWriteBatch::new();
+    for index in 0..rows {
+        batch.put(
+            STORAGE_API_NAMESPACE,
+            storage_api_key(index),
+            storage_api_value(index),
+        );
+    }
+    let started_at = Instant::now();
+    let stats = transaction.write_kv_batch(batch).await?;
+    transaction.commit().await?;
+    Ok(StorageBenchReport {
+        measured_rows: stats.puts,
+        verified_rows: rows,
+        elapsed: started_at.elapsed(),
+    })
+}
+
+pub async fn storage_api_write_kv_batch_mixed_put_delete(
+    backend: Arc<dyn Backend + Send + Sync>,
+    rows: usize,
+) -> Result<StorageBenchReport, LixError> {
+    let fixture = prepare_storage_api_read(backend, rows).await?;
+    let mut transaction = fixture.storage.begin_write_transaction().await?;
+    let mut batch = KvWriteBatch::new();
+    for index in 0..rows {
+        if index % 2 == 0 {
+            batch.put(
+                STORAGE_API_NAMESPACE,
+                storage_api_key(index),
+                storage_api_updated_value(index),
+            );
+        } else {
+            batch.delete(STORAGE_API_NAMESPACE, storage_api_key(index));
+        }
+    }
+    let started_at = Instant::now();
+    let stats = transaction.write_kv_batch(batch).await?;
+    transaction.commit().await?;
+    Ok(StorageBenchReport {
+        measured_rows: stats.puts + stats.deletes,
+        verified_rows: rows,
+        elapsed: started_at.elapsed(),
+    })
+}
+
+pub async fn storage_api_write_kv_batch_multi_namespace(
+    backend: Arc<dyn Backend + Send + Sync>,
+    rows: usize,
+) -> Result<StorageBenchReport, LixError> {
+    let storage = StorageContext::new(backend);
+    let mut transaction = storage.begin_write_transaction().await?;
+    let mut batch = KvWriteBatch::new();
+    for index in 0..rows {
+        let namespace = if index % 2 == 0 {
+            STORAGE_API_NAMESPACE
+        } else {
+            STORAGE_API_ALT_NAMESPACE
+        };
+        batch.put(namespace, storage_api_key(index), storage_api_value(index));
+    }
+    let started_at = Instant::now();
+    let stats = transaction.write_kv_batch(batch).await?;
+    transaction.commit().await?;
+    Ok(StorageBenchReport {
+        measured_rows: stats.puts,
+        verified_rows: rows,
+        elapsed: started_at.elapsed(),
+    })
+}
+
+pub async fn storage_api_write_kv_batch_duplicate_keys(
+    backend: Arc<dyn Backend + Send + Sync>,
+    rows: usize,
+) -> Result<StorageBenchReport, LixError> {
+    let storage = StorageContext::new(backend);
+    let mut transaction = storage.begin_write_transaction().await?;
+    let mut batch = KvWriteBatch::new();
+    for index in 0..rows {
+        batch.put(
+            STORAGE_API_NAMESPACE,
+            storage_api_key(index % 100),
+            storage_api_value(index),
+        );
+    }
+    let started_at = Instant::now();
+    let stats = transaction.write_kv_batch(batch).await?;
+    transaction.commit().await?;
+    Ok(StorageBenchReport {
+        measured_rows: stats.puts,
+        verified_rows: rows,
+        elapsed: started_at.elapsed(),
+    })
+}
+
+pub async fn storage_api_write_kv_batch_value_size(
+    backend: Arc<dyn Backend + Send + Sync>,
+    rows: usize,
+    value_bytes: usize,
+) -> Result<StorageBenchReport, LixError> {
+    let storage = StorageContext::new(backend);
+    let mut transaction = storage.begin_write_transaction().await?;
+    let mut batch = KvWriteBatch::new();
+    for index in 0..rows {
+        batch.put(
+            STORAGE_API_NAMESPACE,
+            storage_api_key(index),
+            storage_api_value_with_bytes(index, value_bytes),
+        );
+    }
+    let started_at = Instant::now();
+    let stats = transaction.write_kv_batch(batch).await?;
+    transaction.commit().await?;
+    Ok(StorageBenchReport {
+        measured_rows: stats.puts,
+        verified_rows: rows,
+        elapsed: started_at.elapsed(),
+    })
+}
+
+pub async fn storage_api_write_and_commit(
+    backend: Arc<dyn Backend + Send + Sync>,
+    rows: usize,
+) -> Result<StorageBenchReport, LixError> {
+    let storage = StorageContext::new(backend);
+    let started_at = Instant::now();
+    let mut transaction = storage.begin_write_transaction().await?;
+    let mut batch = KvWriteBatch::new();
+    for index in 0..rows {
+        batch.put(
+            STORAGE_API_NAMESPACE,
+            storage_api_key(index),
+            storage_api_value(index),
+        );
+    }
+    let stats = transaction.write_kv_batch(batch).await?;
+    transaction.commit().await?;
+    Ok(StorageBenchReport {
+        measured_rows: stats.puts,
+        verified_rows: rows,
+        elapsed: started_at.elapsed(),
+    })
+}
+
+pub async fn storage_api_rollback_after_write(
+    backend: Arc<dyn Backend + Send + Sync>,
+    rows: usize,
+) -> Result<StorageBenchReport, LixError> {
+    let storage = StorageContext::new(backend);
+    let started_at = Instant::now();
+    let mut transaction = storage.begin_write_transaction().await?;
+    let mut batch = KvWriteBatch::new();
+    for index in 0..rows {
+        batch.put(
+            STORAGE_API_NAMESPACE,
+            storage_api_key(index),
+            storage_api_value(index),
+        );
+    }
+    let stats = transaction.write_kv_batch(batch).await?;
+    transaction.rollback().await?;
+    Ok(StorageBenchReport {
+        measured_rows: stats.puts,
+        verified_rows: rows,
+        elapsed: started_at.elapsed(),
+    })
+}
+
+pub async fn prepare_storage_api_read(
+    backend: Arc<dyn Backend + Send + Sync>,
+    rows: usize,
+) -> Result<StorageApiFixture, LixError> {
+    let storage = StorageContext::new(backend);
+    let mut transaction = storage.begin_write_transaction().await?;
+    let mut batch = KvWriteBatch::new();
+    for index in 0..rows {
+        batch.put(
+            STORAGE_API_NAMESPACE,
+            storage_api_key(index),
+            storage_api_value(index),
+        );
+    }
+    transaction.write_kv_batch(batch).await?;
+    transaction.commit().await?;
+    Ok(StorageApiFixture { storage, rows })
+}
+
+pub async fn storage_api_get_kv_many_hits_prepared(
+    fixture: &StorageApiFixture,
+    reads: usize,
+) -> Result<StorageBenchReport, LixError> {
+    let mut transaction = fixture.storage.begin_read_transaction().await?;
+    let keys = (0..reads)
+        .map(|index| storage_api_key(index % fixture.rows))
+        .collect::<Vec<_>>();
+    let started_at = Instant::now();
+    let result = transaction
+        .get_kv_many(KvGetRequest {
+            groups: vec![KvGetGroup {
+                namespace: STORAGE_API_NAMESPACE.to_string(),
+                keys,
+            }],
+        })
+        .await?;
+    transaction.rollback().await?;
+    let verified_rows = result.groups[0]
+        .values
+        .iter()
+        .filter(|value| value.is_some())
+        .count();
+    Ok(StorageBenchReport {
+        measured_rows: reads,
+        verified_rows,
+        elapsed: started_at.elapsed(),
+    })
+}
+
+pub async fn storage_api_get_kv_many_misses_prepared(
+    fixture: &StorageApiFixture,
+    reads: usize,
+) -> Result<StorageBenchReport, LixError> {
+    let mut transaction = fixture.storage.begin_read_transaction().await?;
+    let keys = (0..reads)
+        .map(|index| storage_api_missing_key(index))
+        .collect::<Vec<_>>();
+    let started_at = Instant::now();
+    let result = transaction
+        .get_kv_many(KvGetRequest {
+            groups: vec![KvGetGroup {
+                namespace: STORAGE_API_NAMESPACE.to_string(),
+                keys,
+            }],
+        })
+        .await?;
+    transaction.rollback().await?;
+    let verified_rows = result.groups[0]
+        .values
+        .iter()
+        .filter(|value| value.is_none())
+        .count();
+    Ok(StorageBenchReport {
+        measured_rows: reads,
+        verified_rows,
+        elapsed: started_at.elapsed(),
+    })
+}
+
+pub async fn storage_api_get_kv_many_mixed_hit_miss_prepared(
+    fixture: &StorageApiFixture,
+    reads: usize,
+) -> Result<StorageBenchReport, LixError> {
+    let mut transaction = fixture.storage.begin_read_transaction().await?;
+    let keys = (0..reads)
+        .map(|index| {
+            if index % 2 == 0 {
+                storage_api_key(index % fixture.rows)
+            } else {
+                storage_api_missing_key(index)
+            }
+        })
+        .collect::<Vec<_>>();
+    let started_at = Instant::now();
+    let result = transaction
+        .get_kv_many(KvGetRequest {
+            groups: vec![KvGetGroup {
+                namespace: STORAGE_API_NAMESPACE.to_string(),
+                keys,
+            }],
+        })
+        .await?;
+    transaction.rollback().await?;
+    let verified_rows = result.groups[0]
+        .values
+        .iter()
+        .filter(|value| value.is_some())
+        .count();
+    Ok(StorageBenchReport {
+        measured_rows: reads,
+        verified_rows,
+        elapsed: started_at.elapsed(),
+    })
+}
+
+pub async fn storage_api_get_kv_many_multi_namespace(
+    backend: Arc<dyn Backend + Send + Sync>,
+    reads: usize,
+) -> Result<StorageBenchReport, LixError> {
+    let storage = StorageContext::new(backend);
+    let mut transaction = storage.begin_write_transaction().await?;
+    let mut batch = KvWriteBatch::new();
+    for index in 0..reads {
+        let namespace = if index % 2 == 0 {
+            STORAGE_API_NAMESPACE
+        } else {
+            STORAGE_API_ALT_NAMESPACE
+        };
+        batch.put(namespace, storage_api_key(index), storage_api_value(index));
+    }
+    transaction.write_kv_batch(batch).await?;
+    transaction.commit().await?;
+
+    let mut transaction = storage.begin_read_transaction().await?;
+    let even_keys = (0..reads)
+        .step_by(2)
+        .map(storage_api_key)
+        .collect::<Vec<_>>();
+    let odd_keys = (1..reads)
+        .step_by(2)
+        .map(storage_api_key)
+        .collect::<Vec<_>>();
+    let started_at = Instant::now();
+    let result = transaction
+        .get_kv_many(KvGetRequest {
+            groups: vec![
+                KvGetGroup {
+                    namespace: STORAGE_API_NAMESPACE.to_string(),
+                    keys: even_keys,
+                },
+                KvGetGroup {
+                    namespace: STORAGE_API_ALT_NAMESPACE.to_string(),
+                    keys: odd_keys,
+                },
+            ],
+        })
+        .await?;
+    transaction.rollback().await?;
+    let verified_rows = result
+        .groups
+        .iter()
+        .flat_map(|group| group.values.iter())
+        .filter(|value| value.is_some())
+        .count();
+    Ok(StorageBenchReport {
+        measured_rows: reads,
+        verified_rows,
+        elapsed: started_at.elapsed(),
+    })
+}
+
+pub async fn storage_api_get_kv_many_duplicate_keys_prepared(
+    fixture: &StorageApiFixture,
+    reads: usize,
+) -> Result<StorageBenchReport, LixError> {
+    let mut transaction = fixture.storage.begin_read_transaction().await?;
+    let keys = (0..reads)
+        .map(|index| storage_api_key(index % 100))
+        .collect::<Vec<_>>();
+    let started_at = Instant::now();
+    let result = transaction
+        .get_kv_many(KvGetRequest {
+            groups: vec![KvGetGroup {
+                namespace: STORAGE_API_NAMESPACE.to_string(),
+                keys,
+            }],
+        })
+        .await?;
+    transaction.rollback().await?;
+    let verified_rows = result.groups[0]
+        .values
+        .iter()
+        .filter(|value| value.is_some())
+        .count();
+    Ok(StorageBenchReport {
+        measured_rows: reads,
+        verified_rows,
+        elapsed: started_at.elapsed(),
+    })
+}
+
+pub async fn storage_api_scan_kv_prefix_prepared(
+    fixture: &StorageApiFixture,
+    limit: usize,
+) -> Result<StorageBenchReport, LixError> {
+    let mut transaction = fixture.storage.begin_read_transaction().await?;
+    let started_at = Instant::now();
+    let result = transaction
+        .scan_kv(KvScanRequest {
+            namespace: STORAGE_API_NAMESPACE.to_string(),
+            range: KvScanRange::prefix(b"key/".to_vec()),
+            after: None,
+            limit,
+        })
+        .await?;
+    transaction.rollback().await?;
+    Ok(StorageBenchReport {
+        measured_rows: result.rows.len(),
+        verified_rows: limit.min(fixture.rows),
+        elapsed: started_at.elapsed(),
+    })
+}
+
+pub async fn storage_api_scan_kv_after_pages_prepared(
+    fixture: &StorageApiFixture,
+    page_size: usize,
+) -> Result<StorageBenchReport, LixError> {
+    let mut transaction = fixture.storage.begin_read_transaction().await?;
+    let started_at = Instant::now();
+    let mut after = None;
+    let mut measured_rows = 0usize;
+    loop {
+        let result = transaction
+            .scan_kv(KvScanRequest {
+                namespace: STORAGE_API_NAMESPACE.to_string(),
+                range: KvScanRange::prefix(b"key/".to_vec()),
+                after,
+                limit: page_size,
+            })
+            .await?;
+        if result.rows.is_empty() {
+            break;
+        }
+        measured_rows += result.rows.len();
+        let Some(resume_after) = result.resume_after else {
+            break;
+        };
+        after = Some(resume_after);
+    }
+    transaction.rollback().await?;
+    Ok(StorageBenchReport {
+        measured_rows,
+        verified_rows: fixture.rows,
+        elapsed: started_at.elapsed(),
+    })
+}
+
+pub async fn storage_api_scan_kv_empty_range_prepared(
+    fixture: &StorageApiFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let mut transaction = fixture.storage.begin_read_transaction().await?;
+    let started_at = Instant::now();
+    let result = transaction
+        .scan_kv(KvScanRequest {
+            namespace: STORAGE_API_NAMESPACE.to_string(),
+            range: KvScanRange::prefix(b"absent/".to_vec()),
+            after: None,
+            limit: fixture.rows,
+        })
+        .await?;
+    transaction.rollback().await?;
+    Ok(StorageBenchReport {
+        measured_rows: result.rows.len(),
+        verified_rows: 0,
+        elapsed: started_at.elapsed(),
+    })
+}
+
+pub async fn prepare_storage_api_selective_scan(
+    backend: Arc<dyn Backend + Send + Sync>,
+    rows: usize,
+    selectivity: StorageBenchSelectivity,
+) -> Result<StorageApiFixture, LixError> {
+    let storage = StorageContext::new(backend);
+    let mut transaction = storage.begin_write_transaction().await?;
+    let mut batch = KvWriteBatch::new();
+    for index in 0..rows {
+        let key = if selectivity.matches(index) {
+            storage_api_selective_key(index)
+        } else {
+            storage_api_key(index)
+        };
+        batch.put(STORAGE_API_NAMESPACE, key, storage_api_value(index));
+    }
+    transaction.write_kv_batch(batch).await?;
+    transaction.commit().await?;
+    Ok(StorageApiFixture { storage, rows })
+}
+
+pub async fn storage_api_scan_kv_selective_prefix_prepared(
+    fixture: &StorageApiFixture,
+    selectivity: StorageBenchSelectivity,
+) -> Result<StorageBenchReport, LixError> {
+    let mut transaction = fixture.storage.begin_read_transaction().await?;
+    let started_at = Instant::now();
+    let result = transaction
+        .scan_kv(KvScanRequest {
+            namespace: STORAGE_API_NAMESPACE.to_string(),
+            range: KvScanRange::prefix(b"selective/".to_vec()),
+            after: None,
+            limit: fixture.rows,
+        })
+        .await?;
+    transaction.rollback().await?;
+    Ok(StorageBenchReport {
+        measured_rows: result.rows.len(),
+        verified_rows: selectivity.expected_rows(fixture.rows),
+        elapsed: started_at.elapsed(),
+    })
+}
+
+pub async fn storage_api_transaction_commit_empty(
+    backend: Arc<dyn Backend + Send + Sync>,
+) -> Result<StorageBenchReport, LixError> {
+    let storage = StorageContext::new(backend);
+    let started_at = Instant::now();
+    let transaction = storage.begin_write_transaction().await?;
+    transaction.commit().await?;
+    Ok(StorageBenchReport {
+        measured_rows: 0,
+        verified_rows: 0,
+        elapsed: started_at.elapsed(),
+    })
+}
+
+fn storage_api_key(index: usize) -> Vec<u8> {
+    format!("key/{index:08}").into_bytes()
+}
+
+fn storage_api_selective_key(index: usize) -> Vec<u8> {
+    format!("selective/{index:08}").into_bytes()
+}
+
+fn storage_api_missing_key(index: usize) -> Vec<u8> {
+    format!("missing/{index:08}").into_bytes()
+}
+
+fn storage_api_value(index: usize) -> Vec<u8> {
+    format!("value/{index:08}/{}", "x".repeat(64)).into_bytes()
+}
+
+fn storage_api_value_with_bytes(index: usize, value_bytes: usize) -> Vec<u8> {
+    let prefix = format!("value/{index:08}/");
+    if value_bytes <= prefix.len() {
+        return prefix.into_bytes();
+    }
+    let mut value = prefix.into_bytes();
+    value.extend(std::iter::repeat_n(b'x', value_bytes - value.len()));
+    value
+}
+
+fn storage_api_updated_value(index: usize) -> Vec<u8> {
+    format!("updated/{index:08}/{}", "y".repeat(64)).into_bytes()
 }
 
 pub struct TrackedStateWriteRootFixture {
@@ -226,7 +776,7 @@ pub async fn prepare_tracked_state_write_root_with_max_inline_encoded_value_byte
 }
 
 pub async fn tracked_state_write_root_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &TrackedStateWriteRootFixture,
 ) -> Result<StorageBenchReport, LixError> {
     write_tracked_root(
@@ -245,7 +795,7 @@ pub async fn tracked_state_write_root_prepared(
 }
 
 pub async fn prepare_tracked_state_read(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<TrackedStateReadFixture, LixError> {
     let context = TrackedStateContext::new();
@@ -261,7 +811,7 @@ pub async fn prepare_tracked_state_read(
 }
 
 pub async fn prepare_tracked_state_read_file_selective(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<TrackedStateReadFixture, LixError> {
     prepare_tracked_state_read_file_selective_with_max_inline_encoded_value_bytes(
@@ -273,7 +823,7 @@ pub async fn prepare_tracked_state_read_file_selective(
 }
 
 pub async fn prepare_tracked_state_read_file_selective_with_max_inline_encoded_value_bytes(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
     max_inline_encoded_value_bytes: usize,
 ) -> Result<TrackedStateReadFixture, LixError> {
@@ -292,11 +842,13 @@ pub async fn prepare_tracked_state_read_file_selective_with_max_inline_encoded_v
 }
 
 pub async fn tracked_state_read_point_hit_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &TrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let mut verified_rows = 0;
-    let mut reader = fixture.context.reader(backend);
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     for index in 0..fixture.rows {
         if reader
             .load_row_at_commit(
@@ -321,12 +873,14 @@ pub async fn tracked_state_read_point_hit_prepared(
 }
 
 pub async fn tracked_state_read_point_hit_constant_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &TrackedStateReadFixture,
     measured_reads: usize,
 ) -> Result<StorageBenchReport, LixError> {
     let mut verified_rows = 0;
-    let mut reader = fixture.context.reader(backend);
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     for index in 0..measured_reads.min(fixture.rows) {
         if reader
             .load_row_at_commit(
@@ -355,11 +909,13 @@ pub async fn tracked_state_read_point_hit_constant_prepared(
 }
 
 pub async fn tracked_state_read_point_miss_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &TrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let mut misses = 0;
-    let mut reader = fixture.context.reader(backend);
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     for index in 0..fixture.rows {
         if reader
             .load_row_at_commit(
@@ -380,7 +936,7 @@ pub async fn tracked_state_read_point_miss_prepared(
 }
 
 pub async fn tracked_state_scan_all_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &TrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let verified_rows = scan_tracked(backend, &fixture.context, &fixture.commit_id)
@@ -390,10 +946,12 @@ pub async fn tracked_state_scan_all_prepared(
 }
 
 pub async fn tracked_state_scan_schema_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &TrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let mut reader = fixture.context.reader(backend);
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     let verified_rows = reader
         .scan_rows_at_commit(
             &fixture.commit_id,
@@ -411,10 +969,12 @@ pub async fn tracked_state_scan_schema_prepared(
 }
 
 pub async fn tracked_state_scan_schema_selective_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &TrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let mut reader = fixture.context.reader(backend);
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     let verified_rows = reader
         .scan_rows_at_commit(
             &fixture.commit_id,
@@ -436,10 +996,12 @@ pub async fn tracked_state_scan_schema_selective_prepared(
 }
 
 pub async fn tracked_state_scan_file_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &TrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let mut reader = fixture.context.reader(backend);
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     let verified_rows = reader
         .scan_rows_at_commit(
             &fixture.commit_id,
@@ -457,10 +1019,12 @@ pub async fn tracked_state_scan_file_prepared(
 }
 
 pub async fn tracked_state_scan_file_selective_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &TrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let mut reader = fixture.context.reader(backend);
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     let verified_rows = reader
         .scan_rows_at_commit(
             &fixture.commit_id,
@@ -482,10 +1046,12 @@ pub async fn tracked_state_scan_file_selective_prepared(
 }
 
 pub async fn tracked_state_scan_file_header_selective_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &TrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let mut reader = fixture.context.reader(backend);
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     let verified_rows = reader
         .scan_rows_at_commit(
             &fixture.commit_id,
@@ -520,7 +1086,7 @@ pub async fn tracked_state_scan_file_header_selective_prepared(
 }
 
 pub async fn prepare_tracked_state_update(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<TrackedStateUpdateFixture, LixError> {
     prepare_tracked_state_update_rows(backend, config, config.update_fraction.rows(config.rows))
@@ -528,7 +1094,7 @@ pub async fn prepare_tracked_state_update(
 }
 
 pub async fn prepare_tracked_state_update_rows(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
     updated_rows: usize,
 ) -> Result<TrackedStateUpdateFixture, LixError> {
@@ -549,7 +1115,7 @@ pub async fn prepare_tracked_state_update_rows(
 }
 
 pub async fn prepare_tracked_state_partial_snapshot_update_rows(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
     updated_rows: usize,
 ) -> Result<TrackedStateUpdateFixture, LixError> {
@@ -573,14 +1139,14 @@ pub async fn prepare_tracked_state_partial_snapshot_update_rows(
 }
 
 pub async fn prepare_tracked_state_append_child(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<TrackedStateUpdateFixture, LixError> {
     prepare_tracked_state_append_child_rows(backend, config, config.rows).await
 }
 
 pub async fn prepare_tracked_state_append_child_rows(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
     appended_rows: usize,
 ) -> Result<TrackedStateUpdateFixture, LixError> {
@@ -602,7 +1168,7 @@ pub async fn prepare_tracked_state_append_child_rows(
 }
 
 pub async fn prepare_tracked_state_tombstone_rows(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
     tombstone_rows: usize,
 ) -> Result<TrackedStateUpdateFixture, LixError> {
@@ -623,7 +1189,7 @@ pub async fn prepare_tracked_state_tombstone_rows(
 }
 
 pub async fn tracked_state_update_existing_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &TrackedStateUpdateFixture,
 ) -> Result<StorageBenchReport, LixError> {
     write_tracked_root(
@@ -642,7 +1208,7 @@ pub async fn tracked_state_update_existing_prepared(
 }
 
 pub async fn prepare_tracked_state_diff_update_rows(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
     updated_rows: usize,
 ) -> Result<TrackedStateDiffFixture, LixError> {
@@ -657,7 +1223,7 @@ pub async fn prepare_tracked_state_diff_update_rows(
 }
 
 pub async fn prepare_tracked_state_diff_tombstone_rows(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
     tombstone_rows: usize,
 ) -> Result<TrackedStateDiffFixture, LixError> {
@@ -672,7 +1238,7 @@ pub async fn prepare_tracked_state_diff_tombstone_rows(
 }
 
 pub async fn prepare_tracked_state_diff_equal(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<TrackedStateDiffFixture, LixError> {
     let context = TrackedStateContext::new();
@@ -687,10 +1253,12 @@ pub async fn prepare_tracked_state_diff_equal(
 }
 
 pub async fn tracked_state_diff_commits_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &TrackedStateDiffFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let mut reader = fixture.context.reader(backend);
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     let diff = reader
         .diff_commits(
             &fixture.left_commit_id,
@@ -715,7 +1283,7 @@ pub async fn prepare_untracked_state_write_rows(
 }
 
 pub async fn untracked_state_write_rows_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &UntrackedStateWriteFixture,
 ) -> Result<StorageBenchReport, LixError> {
     write_untracked_rows(backend, &fixture.context, &fixture.rows).await?;
@@ -730,7 +1298,7 @@ pub async fn untracked_state_write_rows_prepared(
 }
 
 pub async fn prepare_untracked_state_read(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<UntrackedStateReadFixture, LixError> {
     let context = UntrackedStateContext::new();
@@ -745,11 +1313,13 @@ pub async fn prepare_untracked_state_read(
 }
 
 pub async fn untracked_state_read_point_hit_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &UntrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let mut verified_rows = 0;
-    let mut reader = fixture.context.reader(backend);
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     for index in 0..fixture.rows {
         if reader
             .load_row(&UntrackedStateRowRequest {
@@ -772,12 +1342,14 @@ pub async fn untracked_state_read_point_hit_prepared(
 }
 
 pub async fn untracked_state_read_point_hit_constant_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &UntrackedStateReadFixture,
     measured_reads: usize,
 ) -> Result<StorageBenchReport, LixError> {
     let mut verified_rows = 0;
-    let mut reader = fixture.context.reader(backend);
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     for index in 0..measured_reads.min(fixture.rows) {
         if reader
             .load_row(&UntrackedStateRowRequest {
@@ -804,11 +1376,13 @@ pub async fn untracked_state_read_point_hit_constant_prepared(
 }
 
 pub async fn untracked_state_read_point_miss_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &UntrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let mut misses = 0;
-    let mut reader = fixture.context.reader(backend);
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     for index in 0..fixture.rows {
         if reader
             .load_row(&UntrackedStateRowRequest {
@@ -827,7 +1401,7 @@ pub async fn untracked_state_read_point_miss_prepared(
 }
 
 pub async fn untracked_state_scan_all_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &UntrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let verified_rows = scan_untracked(
@@ -841,7 +1415,7 @@ pub async fn untracked_state_scan_all_prepared(
 }
 
 pub async fn untracked_state_scan_version_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &UntrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let verified_rows = scan_untracked(
@@ -861,7 +1435,7 @@ pub async fn untracked_state_scan_version_prepared(
 }
 
 pub async fn untracked_state_scan_schema_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &UntrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let verified_rows = scan_untracked(
@@ -881,7 +1455,7 @@ pub async fn untracked_state_scan_schema_prepared(
 }
 
 pub async fn untracked_state_scan_schema_selective_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &UntrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let verified_rows = scan_untracked(
@@ -905,7 +1479,7 @@ pub async fn untracked_state_scan_schema_selective_prepared(
 }
 
 pub async fn prepare_untracked_state_overwrite(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<UntrackedStateWriteFixture, LixError> {
     let context = UntrackedStateContext::new();
@@ -923,7 +1497,7 @@ pub async fn prepare_untracked_state_overwrite(
 }
 
 pub async fn prepare_untracked_state_insert_new_keys(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<UntrackedStateWriteFixture, LixError> {
     let context = UntrackedStateContext::new();
@@ -941,7 +1515,7 @@ pub async fn prepare_untracked_state_insert_new_keys(
 }
 
 pub async fn untracked_state_overwrite_existing_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &UntrackedStateWriteFixture,
 ) -> Result<StorageBenchReport, LixError> {
     write_untracked_rows(backend, &fixture.context, &fixture.rows).await?;
@@ -1033,11 +1607,13 @@ pub async fn prepare_changelog_codec(
 }
 
 pub async fn changelog_append_changes_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &ChangelogAppendFixture,
 ) -> Result<StorageBenchReport, LixError> {
     append_changelog_changes(backend, &fixture.context, &fixture.changes).await?;
-    let reader = fixture.context.reader(backend);
+    let reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     let verified_rows = reader
         .scan_changes(&ChangelogScanRequest::default())
         .await?
@@ -1046,7 +1622,7 @@ pub async fn changelog_append_changes_prepared(
 }
 
 pub async fn prepare_changelog_read(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<ChangelogReadFixture, LixError> {
     let context = ChangelogContext::new();
@@ -1059,7 +1635,7 @@ pub async fn prepare_changelog_read(
 }
 
 pub async fn prepare_changelog_read_with_selectivity(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<ChangelogReadFixture, LixError> {
     let context = ChangelogContext::new();
@@ -1072,7 +1648,7 @@ pub async fn prepare_changelog_read_with_selectivity(
 }
 
 pub async fn prepare_changelog_read_entity_history(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<ChangelogReadFixture, LixError> {
     let context = ChangelogContext::new();
@@ -1085,7 +1661,7 @@ pub async fn prepare_changelog_read_entity_history(
 }
 
 pub async fn prepare_changelog_read_commit_facts(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<ChangelogReadFixture, LixError> {
     let context = ChangelogContext::new();
@@ -1131,10 +1707,12 @@ pub async fn changelog_decode_only_prepared(
 }
 
 pub async fn changelog_load_change_hit_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &ChangelogReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let reader = fixture.context.reader(backend);
+    let reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     let mut verified_rows = 0;
     for index in 0..fixture.rows {
         if reader
@@ -1149,10 +1727,12 @@ pub async fn changelog_load_change_hit_prepared(
 }
 
 pub async fn changelog_load_change_miss_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &ChangelogReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let reader = fixture.context.reader(backend);
+    let reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     let mut misses = 0;
     for index in 0..fixture.rows {
         if reader
@@ -1167,10 +1747,12 @@ pub async fn changelog_load_change_miss_prepared(
 }
 
 pub async fn changelog_scan_all_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &ChangelogReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let reader = fixture.context.reader(backend);
+    let reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     let verified_rows = reader
         .scan_changes(&ChangelogScanRequest::default())
         .await?
@@ -1179,10 +1761,12 @@ pub async fn changelog_scan_all_prepared(
 }
 
 pub async fn changelog_scan_limit_100_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &ChangelogReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let reader = fixture.context.reader(backend);
+    let reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     let expected = fixture.rows.min(100);
     let verified_rows = reader
         .scan_changes(&ChangelogScanRequest {
@@ -1194,11 +1778,13 @@ pub async fn changelog_scan_limit_100_prepared(
 }
 
 pub async fn changelog_scan_schema_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &ChangelogReadFixture,
     selectivity: StorageBenchSelectivity,
 ) -> Result<StorageBenchReport, LixError> {
-    let reader = fixture.context.reader(backend);
+    let reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     let changes = reader
         .scan_changes(&ChangelogScanRequest::default())
         .await?;
@@ -1214,10 +1800,12 @@ pub async fn changelog_scan_schema_prepared(
 }
 
 pub async fn changelog_scan_entity_history_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &ChangelogReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let reader = fixture.context.reader(backend);
+    let reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     let changes = reader
         .scan_changes(&ChangelogScanRequest::default())
         .await?;
@@ -1234,10 +1822,12 @@ pub async fn changelog_scan_entity_history_prepared(
 }
 
 pub async fn changelog_scan_commit_facts_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &ChangelogReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let reader = fixture.context.reader(backend);
+    let reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     let changes = reader
         .scan_changes(&ChangelogScanRequest::default())
         .await?;
@@ -1284,7 +1874,7 @@ pub async fn prepare_binary_cas_write_half_duplicate_payload(
 }
 
 pub async fn binary_cas_write_blobs_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &BinaryCasWriteFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let writes = binary_blob_writes(&fixture.file_ids, &fixture.payloads);
@@ -1294,7 +1884,7 @@ pub async fn binary_cas_write_blobs_prepared(
 }
 
 pub async fn prepare_binary_cas_read(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<BinaryCasReadFixture, LixError> {
     let context = BinaryCasContext::new();
@@ -1314,11 +1904,13 @@ pub async fn prepare_binary_cas_read(
 }
 
 pub async fn binary_cas_read_blob_hit_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &BinaryCasReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let mut verified_rows = 0;
-    let mut reader = fixture.context.reader(backend);
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     for hash in &fixture.hashes {
         if reader.load_blob_data_by_hash(hash).await?.is_some() {
             verified_rows += 1;
@@ -1328,11 +1920,13 @@ pub async fn binary_cas_read_blob_hit_prepared(
 }
 
 pub async fn binary_cas_read_blob_miss_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &BinaryCasReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let mut misses = 0;
-    let mut reader = fixture.context.reader(backend);
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     for index in 0..fixture.rows {
         let missing_hash = format!("{index:064x}");
         if reader
@@ -1368,12 +1962,11 @@ pub async fn prepare_json_store_write_dedupe(
 }
 
 pub async fn json_store_write_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &JsonStoreWriteFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let mut transaction = backend
-        .begin_transaction(TransactionBeginMode::Write)
-        .await?;
+    let storage = StorageContext::new(Arc::clone(backend));
+    let mut transaction = storage.begin_write_transaction().await?;
     {
         let mut writer = fixture.context.writer();
         for document in &fixture.documents {
@@ -1391,7 +1984,7 @@ pub async fn json_store_write_prepared(
 }
 
 pub async fn prepare_json_store_read(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     shape: JsonStorePayloadShape,
     rows: usize,
 ) -> Result<JsonStoreReadFixture, LixError> {
@@ -1405,7 +1998,7 @@ pub async fn prepare_json_store_read(
 }
 
 pub async fn prepare_json_store_projection_read(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     shape: JsonStorePayloadShape,
     rows: usize,
     projection: JsonStoreProjectionShape,
@@ -1413,9 +2006,8 @@ pub async fn prepare_json_store_projection_read(
     let context = JsonStoreContext::new();
     let documents = json_documents(shape, rows);
     let mut refs = Vec::with_capacity(documents.len());
-    let mut transaction = backend
-        .begin_transaction(TransactionBeginMode::Write)
-        .await?;
+    let storage = StorageContext::new(Arc::clone(backend));
+    let mut transaction = storage.begin_write_transaction().await?;
     {
         let mut writer = context.writer();
         for document in documents {
@@ -1433,11 +2025,13 @@ pub async fn prepare_json_store_projection_read(
 }
 
 pub async fn json_store_read_bytes_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &JsonStoreReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let mut verified_rows = 0;
-    let mut reader = fixture.context.reader(backend);
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     for json_ref in &fixture.refs {
         if reader.load_bytes(json_ref).await?.is_some() {
             verified_rows += 1;
@@ -1447,11 +2041,13 @@ pub async fn json_store_read_bytes_prepared(
 }
 
 pub async fn json_store_read_value_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &JsonStoreReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let mut verified_rows = 0;
-    let mut reader = fixture.context.reader(backend);
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     for json_ref in &fixture.refs {
         if reader.load_json_value(json_ref).await?.is_some() {
             verified_rows += 1;
@@ -1461,11 +2057,13 @@ pub async fn json_store_read_value_prepared(
 }
 
 pub async fn json_store_read_projection_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &JsonStoreReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let mut verified_rows = 0;
-    let mut reader = fixture.context.reader(backend);
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
     for json_ref in &fixture.refs {
         if reader
             .load_json_projection(json_ref, &fixture.paths)
@@ -1479,30 +2077,29 @@ pub async fn json_store_read_projection_prepared(
 }
 
 pub async fn prepare_json_store_base_update_object(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     rows: usize,
 ) -> Result<JsonStoreReadFixture, LixError> {
     prepare_json_store_base_update(backend, JsonStorePayloadShape::LargeStructured128k, rows).await
 }
 
 pub async fn prepare_json_store_base_update_array(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     rows: usize,
 ) -> Result<JsonStoreReadFixture, LixError> {
     prepare_json_store_base_update(backend, JsonStorePayloadShape::LargeArray128k, rows).await
 }
 
 async fn prepare_json_store_base_update(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     shape: JsonStorePayloadShape,
     rows: usize,
 ) -> Result<JsonStoreReadFixture, LixError> {
     let context = JsonStoreContext::new();
     let documents = json_documents(shape, rows);
     let mut refs = Vec::with_capacity(documents.len());
-    let mut transaction = backend
-        .begin_transaction(TransactionBeginMode::Write)
-        .await?;
+    let storage = StorageContext::new(Arc::clone(backend));
+    let mut transaction = storage.begin_write_transaction().await?;
     {
         let mut writer = context.writer();
         for document in documents {
@@ -1520,7 +2117,7 @@ async fn prepare_json_store_base_update(
 }
 
 pub async fn json_store_write_against_base_object_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &JsonStoreReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     json_store_write_against_base_prepared(
@@ -1532,7 +2129,7 @@ pub async fn json_store_write_against_base_object_prepared(
 }
 
 pub async fn json_store_write_against_base_array_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &JsonStoreReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     json_store_write_against_base_prepared(backend, fixture, JsonStorePayloadShape::LargeArray128k)
@@ -1540,13 +2137,12 @@ pub async fn json_store_write_against_base_array_prepared(
 }
 
 async fn json_store_write_against_base_prepared(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &JsonStoreReadFixture,
     shape: JsonStorePayloadShape,
 ) -> Result<StorageBenchReport, LixError> {
-    let mut transaction = backend
-        .begin_transaction(TransactionBeginMode::Write)
-        .await?;
+    let storage = StorageContext::new(Arc::clone(backend));
+    let mut transaction = storage.begin_write_transaction().await?;
     {
         let mut writer = fixture.context.writer();
         for (index, _json_ref) in fixture.refs.iter().enumerate() {
@@ -1565,7 +2161,7 @@ async fn json_store_write_against_base_prepared(
 }
 
 pub async fn tracked_state_write_root(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let rows = tracked_rows(config, "bench-tracked-commit");
@@ -1580,7 +2176,7 @@ pub async fn tracked_state_write_root(
 }
 
 pub async fn tracked_state_read_point_hit(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = TrackedStateContext::new();
@@ -1589,7 +2185,7 @@ pub async fn tracked_state_read_point_hit(
 
     let started = Instant::now();
     let mut verified_rows = 0;
-    let mut reader = context.reader(backend);
+    let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
     for index in 0..config.rows {
         if reader
             .load_row_at_commit(
@@ -1614,7 +2210,7 @@ pub async fn tracked_state_read_point_hit(
 }
 
 pub async fn tracked_state_read_point_miss(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = TrackedStateContext::new();
@@ -1623,7 +2219,7 @@ pub async fn tracked_state_read_point_miss(
 
     let started = Instant::now();
     let mut misses = 0;
-    let mut reader = context.reader(backend);
+    let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
     for index in 0..config.rows {
         if reader
             .load_row_at_commit(
@@ -1644,7 +2240,7 @@ pub async fn tracked_state_read_point_miss(
 }
 
 pub async fn tracked_state_scan_all(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = TrackedStateContext::new();
@@ -1659,7 +2255,7 @@ pub async fn tracked_state_scan_all(
 }
 
 pub async fn tracked_state_scan_schema(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = TrackedStateContext::new();
@@ -1667,7 +2263,7 @@ pub async fn tracked_state_scan_schema(
     write_tracked_root(backend, &context, "bench-tracked-commit", None, &rows).await?;
 
     let started = Instant::now();
-    let mut reader = context.reader(backend);
+    let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
     let verified_rows = reader
         .scan_rows_at_commit(
             "bench-tracked-commit",
@@ -1685,7 +2281,7 @@ pub async fn tracked_state_scan_schema(
 }
 
 pub async fn tracked_state_scan_file(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = TrackedStateContext::new();
@@ -1693,7 +2289,7 @@ pub async fn tracked_state_scan_file(
     write_tracked_root(backend, &context, "bench-tracked-commit", None, &rows).await?;
 
     let started = Instant::now();
-    let mut reader = context.reader(backend);
+    let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
     let verified_rows = reader
         .scan_rows_at_commit(
             "bench-tracked-commit",
@@ -1711,7 +2307,7 @@ pub async fn tracked_state_scan_file(
 }
 
 pub async fn tracked_state_update_existing(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = TrackedStateContext::new();
@@ -1739,7 +2335,7 @@ pub async fn tracked_state_update_existing(
 }
 
 pub async fn untracked_state_write_rows(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let rows = untracked_rows(config);
@@ -1754,7 +2350,7 @@ pub async fn untracked_state_write_rows(
 }
 
 pub async fn untracked_state_read_point_hit(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = UntrackedStateContext::new();
@@ -1763,7 +2359,7 @@ pub async fn untracked_state_read_point_hit(
 
     let started = Instant::now();
     let mut verified_rows = 0;
-    let mut reader = context.reader(backend);
+    let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
     for index in 0..config.rows {
         if reader
             .load_row(&UntrackedStateRowRequest {
@@ -1786,7 +2382,7 @@ pub async fn untracked_state_read_point_hit(
 }
 
 pub async fn untracked_state_read_point_miss(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = UntrackedStateContext::new();
@@ -1795,7 +2391,7 @@ pub async fn untracked_state_read_point_miss(
 
     let started = Instant::now();
     let mut misses = 0;
-    let mut reader = context.reader(backend);
+    let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
     for index in 0..config.rows {
         if reader
             .load_row(&UntrackedStateRowRequest {
@@ -1814,7 +2410,7 @@ pub async fn untracked_state_read_point_miss(
 }
 
 pub async fn untracked_state_scan_all(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = UntrackedStateContext::new();
@@ -1829,7 +2425,7 @@ pub async fn untracked_state_scan_all(
 }
 
 pub async fn untracked_state_scan_version(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = UntrackedStateContext::new();
@@ -1854,7 +2450,7 @@ pub async fn untracked_state_scan_version(
 }
 
 pub async fn untracked_state_scan_schema(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = UntrackedStateContext::new();
@@ -1879,7 +2475,7 @@ pub async fn untracked_state_scan_schema(
 }
 
 pub async fn untracked_state_overwrite_existing(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = UntrackedStateContext::new();
@@ -1900,7 +2496,7 @@ pub async fn untracked_state_overwrite_existing(
 }
 
 pub async fn changelog_append_changes(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let changes = changelog_materialized_changes(config);
@@ -1908,7 +2504,7 @@ pub async fn changelog_append_changes(
     let started = Instant::now();
     append_changelog_changes(backend, &context, &changes).await?;
     let elapsed = started.elapsed();
-    let reader = context.reader(backend);
+    let reader = context.reader(StorageContext::new(Arc::clone(backend)));
     let verified_rows = reader
         .scan_changes(&ChangelogScanRequest::default())
         .await?
@@ -1917,13 +2513,13 @@ pub async fn changelog_append_changes(
 }
 
 pub async fn changelog_load_change_hit(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = ChangelogContext::new();
     let changes = changelog_materialized_changes(config);
     append_changelog_changes(backend, &context, &changes).await?;
-    let reader = context.reader(backend);
+    let reader = context.reader(StorageContext::new(Arc::clone(backend)));
 
     let started = Instant::now();
     let mut verified_rows = 0;
@@ -1940,13 +2536,13 @@ pub async fn changelog_load_change_hit(
 }
 
 pub async fn changelog_load_change_miss(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = ChangelogContext::new();
     let changes = changelog_materialized_changes(config);
     append_changelog_changes(backend, &context, &changes).await?;
-    let reader = context.reader(backend);
+    let reader = context.reader(StorageContext::new(Arc::clone(backend)));
 
     let started = Instant::now();
     let mut misses = 0;
@@ -1963,13 +2559,13 @@ pub async fn changelog_load_change_miss(
 }
 
 pub async fn changelog_scan_all(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = ChangelogContext::new();
     let changes = changelog_materialized_changes(config);
     append_changelog_changes(backend, &context, &changes).await?;
-    let reader = context.reader(backend);
+    let reader = context.reader(StorageContext::new(Arc::clone(backend)));
 
     let started = Instant::now();
     let verified_rows = reader
@@ -1980,13 +2576,13 @@ pub async fn changelog_scan_all(
 }
 
 pub async fn changelog_scan_limit_100(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = ChangelogContext::new();
     let changes = changelog_materialized_changes(config);
     append_changelog_changes(backend, &context, &changes).await?;
-    let reader = context.reader(backend);
+    let reader = context.reader(StorageContext::new(Arc::clone(backend)));
     let expected = config.rows.min(100);
 
     let started = Instant::now();
@@ -2000,7 +2596,7 @@ pub async fn changelog_scan_limit_100(
 }
 
 pub async fn binary_cas_write_blobs(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let payloads = binary_payloads(config.rows, config.blob_bytes);
@@ -2016,7 +2612,7 @@ pub async fn binary_cas_write_blobs(
 }
 
 pub async fn binary_cas_read_blob_hit(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = BinaryCasContext::new();
@@ -2031,7 +2627,7 @@ pub async fn binary_cas_read_blob_hit(
 
     let started = Instant::now();
     let mut verified_rows = 0;
-    let mut reader = context.reader(backend);
+    let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
     for hash in &hashes {
         if reader.load_blob_data_by_hash(hash).await?.is_some() {
             verified_rows += 1;
@@ -2041,7 +2637,7 @@ pub async fn binary_cas_read_blob_hit(
 }
 
 pub async fn binary_cas_read_blob_miss(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let context = BinaryCasContext::new();
@@ -2052,7 +2648,7 @@ pub async fn binary_cas_read_blob_miss(
 
     let started = Instant::now();
     let mut misses = 0;
-    let mut reader = context.reader(backend);
+    let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
     for index in 0..config.rows {
         let missing_hash = format!("{index:064x}");
         if reader
@@ -2067,7 +2663,7 @@ pub async fn binary_cas_read_blob_miss(
 }
 
 pub async fn binary_cas_write_duplicate_payload(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let payload = binary_payload(0, config.blob_bytes);
@@ -2086,15 +2682,14 @@ pub async fn binary_cas_write_duplicate_payload(
 }
 
 async fn write_tracked_root(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     context: &TrackedStateContext,
     commit_id: &str,
     parent_commit_id: Option<&str>,
     rows: &[TrackedStateRow],
 ) -> Result<(), LixError> {
-    let mut transaction = backend
-        .begin_transaction(TransactionBeginMode::Write)
-        .await?;
+    let storage = StorageContext::new(Arc::clone(backend));
+    let mut transaction = storage.begin_write_transaction().await?;
     {
         let mut writer = context.writer(transaction.as_mut());
         writer.write_root(commit_id, parent_commit_id, rows).await?;
@@ -2103,24 +2698,23 @@ async fn write_tracked_root(
 }
 
 async fn scan_tracked(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     context: &TrackedStateContext,
     commit_id: &str,
 ) -> Result<Vec<TrackedStateRow>, LixError> {
-    let mut reader = context.reader(backend);
+    let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
     reader
         .scan_rows_at_commit(commit_id, &TrackedStateScanRequest::default())
         .await
 }
 
 async fn write_untracked_rows(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     context: &UntrackedStateContext,
     rows: &[UntrackedStateRow],
 ) -> Result<(), LixError> {
-    let mut transaction = backend
-        .begin_transaction(TransactionBeginMode::Write)
-        .await?;
+    let storage = StorageContext::new(Arc::clone(backend));
+    let mut transaction = storage.begin_write_transaction().await?;
     {
         let mut writer = context.writer(transaction.as_mut());
         writer.write_rows(rows).await?;
@@ -2129,22 +2723,21 @@ async fn write_untracked_rows(
 }
 
 async fn scan_untracked(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     context: &UntrackedStateContext,
     request: UntrackedStateScanRequest,
 ) -> Result<Vec<UntrackedStateRow>, LixError> {
-    let mut reader = context.reader(backend);
+    let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
     reader.scan_rows(&request).await
 }
 
 async fn append_changelog_changes(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     context: &ChangelogContext,
     changes: &[MaterializedCanonicalChange],
 ) -> Result<(), LixError> {
-    let mut transaction = backend
-        .begin_transaction(TransactionBeginMode::Write)
-        .await?;
+    let storage = StorageContext::new(Arc::clone(backend));
+    let mut transaction = storage.begin_write_transaction().await?;
     {
         let mut json_writer = JsonStoreContext::new().writer();
         let canonical_changes = changes
@@ -2159,13 +2752,12 @@ async fn append_changelog_changes(
 }
 
 async fn write_binary_blob_writes(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
     context: &BinaryCasContext,
     writes: &[BinaryBlobWrite<'_>],
 ) -> Result<(), LixError> {
-    let mut transaction = backend
-        .begin_transaction(TransactionBeginMode::Write)
-        .await?;
+    let storage = StorageContext::new(Arc::clone(backend));
+    let mut transaction = storage.begin_write_transaction().await?;
     {
         let mut writer = context.writer(transaction.as_mut());
         writer.put_blob_writes(writes).await?;
@@ -2174,10 +2766,10 @@ async fn write_binary_blob_writes(
 }
 
 async fn count_binary_cas_manifests(
-    backend: &(dyn Backend + Send + Sync),
+    backend: &Arc<dyn Backend + Send + Sync>,
 ) -> Result<usize, LixError> {
     let context = BinaryCasContext::new();
-    let mut reader = context.reader(backend);
+    let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
     reader.count_blob_manifests().await
 }
 

@@ -203,7 +203,10 @@ mod tests {
         KvBlobManifest, KvBlobManifestChunk, KvChunk, BINARY_CAS_CHUNK_NAMESPACE,
         BINARY_CAS_MANIFEST_CHUNK_NAMESPACE, BINARY_CAS_MANIFEST_NAMESPACE,
     };
-    use crate::{KvPair, KvScanRange, BackendTransaction, SqlDialect, SqlQueryResult, Value};
+    use crate::{
+        BackendReadTransaction, BackendWriteTransaction, BackendKvGetRequest, BackendKvGetResult, BackendKvGetResultGroup, BackendKvPair, BackendKvScanRange,
+        BackendKvScanRequest, BackendKvScanResult, BackendKvWriteBatch, BackendKvWriteStats,
+    };
     use async_trait::async_trait;
     use std::io::{Cursor, Write};
     use zip::write::SimpleFileOptions;
@@ -213,142 +216,143 @@ mod tests {
         archive_bytes: Vec<u8>,
     }
 
-    struct UnusedTransaction;
+    struct PluginLookupTransaction {
+        archive_bytes: Vec<u8>,
+    }
 
     #[async_trait]
     impl Backend for InstalledPluginLookupBackend {
-        fn dialect(&self) -> SqlDialect {
-            SqlDialect::Sqlite
-        }
-
-        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<SqlQueryResult, LixError> {
-            if sql.contains("LIKE '/.lix/plugins/%.lixplugin'") {
-                return Ok(SqlQueryResult {
-                    rows: vec![vec![
-                        Value::Text("lix_plugin_archive::plugin_json".to_string()),
-                        Value::Text("global".to_string()),
-                        Value::Text("/.lix/plugins/plugin_json.lixplugin".to_string()),
-                        Value::Text("blob-plugin-json".to_string()),
-                    ]],
-                    columns: Vec::new(),
-                    notices: Vec::new(),
-                });
-            }
-            Ok(SqlQueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-                notices: Vec::new(),
-            })
-        }
-
-        async fn kv_get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
-            match (namespace, key) {
-                (BINARY_CAS_MANIFEST_NAMESPACE, b"blob-plugin-json") => {
-                    serde_json::to_vec(&KvBlobManifest {
-                        size_bytes: self.archive_bytes.len() as u64,
-                        chunk_count: 1,
-                    })
-                    .map(Some)
-                    .map_err(|error| {
-                        LixError::new(
-                            "LIX_ERROR_UNKNOWN",
-                            format!("test manifest encode failed: {error}"),
-                        )
-                    })
-                }
-                (BINARY_CAS_CHUNK_NAMESPACE, b"chunk-plugin-json") => {
-                    serde_json::to_vec(&KvChunk {
-                        codec: "raw".to_string(),
-                        codec_dict_id: None,
-                        data: self.archive_bytes.clone(),
-                    })
-                    .map(Some)
-                    .map_err(|error| {
-                        LixError::new(
-                            "LIX_ERROR_UNKNOWN",
-                            format!("test chunk encode failed: {error}"),
-                        )
-                    })
-                }
-                _ => Ok(None),
-            }
-        }
-
-        async fn kv_scan(
+        async fn begin_read_transaction(
             &self,
-            namespace: &str,
-            range: KvScanRange,
-            _limit: Option<usize>,
-        ) -> Result<Vec<KvPair>, LixError> {
-            if namespace != BINARY_CAS_MANIFEST_CHUNK_NAMESPACE {
-                return Ok(Vec::new());
-            }
-            let key = b"blob-plugin-json/00000000000000000000".to_vec();
-            let include = match range {
-                KvScanRange::Prefix(prefix) => key.starts_with(&prefix),
-                KvScanRange::Range { start, end } => key >= start && key < end,
-            };
-            if !include {
-                return Ok(Vec::new());
-            }
-            let value = serde_json::to_vec(&KvBlobManifestChunk {
-                chunk_hash: "chunk-plugin-json".to_string(),
-                chunk_size: self.archive_bytes.len() as u64,
-            })
-            .map_err(|error| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("test manifest chunk encode failed: {error}"),
-                )
-            })?;
-            Ok(vec![KvPair::new(key, value)])
+        ) -> Result<Box<dyn BackendReadTransaction + Send + Sync + 'static>, LixError> {
+            Ok(Box::new(PluginLookupTransaction {
+                archive_bytes: self.archive_bytes.clone(),
+            }))
         }
 
-        async fn begin_transaction(
+        async fn begin_write_transaction(
             &self,
-            _mode: crate::backend::TransactionBeginMode,
-        ) -> Result<Box<dyn BackendTransaction + '_>, LixError> {
-            Ok(Box::new(UnusedTransaction))
-        }
-
-        async fn begin_savepoint(
-            &self,
-            _name: &str,
-        ) -> Result<Box<dyn BackendTransaction + '_>, LixError> {
-            self.begin_transaction(crate::backend::TransactionBeginMode::Write)
-                .await
+        ) -> Result<Box<dyn BackendWriteTransaction + Send + Sync + 'static>, LixError> {
+            Ok(Box::new(PluginLookupTransaction {
+                archive_bytes: self.archive_bytes.clone(),
+            }))
         }
     }
 
     #[async_trait]
-    impl BackendTransaction for UnusedTransaction {
-        fn dialect(&self) -> SqlDialect {
-            SqlDialect::Sqlite
+    impl BackendReadTransaction for PluginLookupTransaction {
+        async fn get_kv_many(&mut self, request: BackendKvGetRequest) -> Result<BackendKvGetResult, LixError> {
+            let mut groups = Vec::with_capacity(request.groups.len());
+            for group in request.groups {
+                let mut values = Vec::with_capacity(group.keys.len());
+                for key in group.keys {
+                    values.push(test_kv_get(&self.archive_bytes, &group.namespace, &key)?);
+                }
+                groups.push(BackendKvGetResultGroup {
+                    namespace: group.namespace,
+                    values,
+                });
+            }
+            Ok(BackendKvGetResult { groups })
         }
 
-        fn mode(&self) -> crate::backend::TransactionBeginMode {
-            crate::backend::TransactionBeginMode::Write
-        }
-
-        async fn execute(
-            &mut self,
-            _sql: &str,
-            _params: &[Value],
-        ) -> Result<SqlQueryResult, LixError> {
-            Ok(SqlQueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-                notices: Vec::new(),
-            })
-        }
-
-        async fn commit(self: Box<Self>) -> Result<(), LixError> {
-            Ok(())
+        async fn scan_kv(&mut self, request: BackendKvScanRequest) -> Result<BackendKvScanResult, LixError> {
+            let mut rows = test_kv_scan(&self.archive_bytes, request.namespace, request.range)?
+                .into_iter()
+                .filter(|row| {
+                    request
+                        .after
+                        .as_deref()
+                        .is_none_or(|after| row.key.as_slice() > after)
+                })
+                .collect::<Vec<_>>();
+            let has_more = rows.len() > request.limit;
+            rows.truncate(request.limit);
+            let resume_after = has_more.then(|| rows.last().map(|row| row.key.clone())).flatten();
+            Ok(BackendKvScanResult { rows, resume_after })
         }
 
         async fn rollback(self: Box<Self>) -> Result<(), LixError> {
             Ok(())
         }
+    }
+
+    #[async_trait]
+    impl BackendWriteTransaction for PluginLookupTransaction {
+        async fn write_kv_batch(&mut self, _batch: BackendKvWriteBatch) -> Result<BackendKvWriteStats, LixError> {
+            Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "plugin lookup test backend is read-only",
+            ))
+        }
+
+        async fn commit(self: Box<Self>) -> Result<(), LixError> {
+            Ok(())
+        }
+    }
+
+    fn test_kv_get(
+        archive_bytes: &[u8],
+        namespace: &str,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, LixError> {
+        match (namespace, key) {
+            (BINARY_CAS_MANIFEST_NAMESPACE, b"blob-plugin-json") => serde_json::to_vec(
+                &KvBlobManifest {
+                    size_bytes: archive_bytes.len() as u64,
+                    chunk_count: 1,
+                },
+            )
+            .map(Some)
+            .map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("test manifest encode failed: {error}"),
+                )
+            }),
+            (BINARY_CAS_CHUNK_NAMESPACE, b"chunk-plugin-json") => serde_json::to_vec(&KvChunk {
+                codec: "raw".to_string(),
+                codec_dict_id: None,
+                data: archive_bytes.to_vec(),
+            })
+            .map(Some)
+            .map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("test chunk encode failed: {error}"),
+                )
+            }),
+            _ => Ok(None),
+        }
+    }
+
+    fn test_kv_scan(
+        archive_bytes: &[u8],
+        namespace: String,
+        range: BackendKvScanRange,
+    ) -> Result<Vec<BackendKvPair>, LixError> {
+        if namespace != BINARY_CAS_MANIFEST_CHUNK_NAMESPACE {
+            return Ok(Vec::new());
+        }
+        let key = b"blob-plugin-json/00000000000000000000".to_vec();
+        let include = match range {
+            BackendKvScanRange::Prefix(prefix) => key.starts_with(&prefix),
+            BackendKvScanRange::Range { start, end } => key >= start && key < end,
+        };
+        if !include {
+            return Ok(Vec::new());
+        }
+        let value = serde_json::to_vec(&KvBlobManifestChunk {
+            chunk_hash: "chunk-plugin-json".to_string(),
+            chunk_size: archive_bytes.len() as u64,
+        })
+        .map_err(|error| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("test manifest chunk encode failed: {error}"),
+            )
+        })?;
+        Ok(vec![BackendKvPair::new(key, value)])
     }
 
     fn build_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {

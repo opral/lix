@@ -58,7 +58,7 @@ pub(crate) async fn diff_commits<S>(
     request: &TrackedStateDiffRequest,
 ) -> Result<TrackedStateDiff, LixError>
 where
-    S: crate::backend::KvStore,
+    S: crate::storage::StorageReader,
 {
     let scan_request = scan_request_for_diff(request);
     let mut entries = Vec::new();
@@ -173,15 +173,16 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
+    use crate::backend::testing::UnitTestBackend;
+    use crate::storage::StorageContext;
     use crate::tracked_state::TrackedStateContext;
     use crate::NullableKeyFilter;
 
     #[tokio::test]
     async fn diff_commits_reports_added_rows() {
-        let (backend, tracked_state) = seed_roots(&[], &[row("entity-a", None, "after")]).await;
+        let (storage, tracked_state) = seed_roots(&[], &[row("entity-a", None, "after")]).await;
 
-        let diff = diff(&backend, &tracked_state).await;
+        let diff = diff(storage.clone(), &tracked_state).await;
 
         assert_eq!(
             kinds(&diff),
@@ -201,9 +202,9 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_reports_removed_rows_when_right_side_is_absent() {
-        let (backend, tracked_state) = seed_roots(&[row("entity-a", None, "before")], &[]).await;
+        let (storage, tracked_state) = seed_roots(&[row("entity-a", None, "before")], &[]).await;
 
-        let diff = diff(&backend, &tracked_state).await;
+        let diff = diff(storage.clone(), &tracked_state).await;
 
         assert_eq!(
             kinds(&diff),
@@ -223,13 +224,13 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_reports_removed_rows_when_right_side_is_tombstone() {
-        let (backend, tracked_state) = seed_roots(
+        let (storage, tracked_state) = seed_roots(
             &[row("entity-a", None, "before")],
             &[tombstone("entity-a", None, "delete")],
         )
         .await;
 
-        let diff = diff(&backend, &tracked_state).await;
+        let diff = diff(storage.clone(), &tracked_state).await;
 
         assert_eq!(
             kinds(&diff),
@@ -253,13 +254,13 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_reports_added_rows_when_left_side_is_tombstone() {
-        let (backend, tracked_state) = seed_roots(
+        let (storage, tracked_state) = seed_roots(
             &[tombstone("entity-a", None, "delete")],
             &[row("entity-a", None, "after")],
         )
         .await;
 
-        let diff = diff(&backend, &tracked_state).await;
+        let diff = diff(storage.clone(), &tracked_state).await;
 
         assert_eq!(
             kinds(&diff),
@@ -283,13 +284,13 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_reports_modified_rows_for_changed_payload() {
-        let (backend, tracked_state) = seed_roots(
+        let (storage, tracked_state) = seed_roots(
             &[row_with_value("entity-a", None, "before", "one")],
             &[row_with_value("entity-a", None, "after", "two")],
         )
         .await;
 
-        let diff = diff(&backend, &tracked_state).await;
+        let diff = diff(storage.clone(), &tracked_state).await;
 
         assert_eq!(
             kinds(&diff),
@@ -301,20 +302,20 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_omits_unchanged_rows_even_when_metadata_differs_only_by_commit() {
-        let (backend, tracked_state) = seed_roots(
+        let (storage, tracked_state) = seed_roots(
             &[row_with_value("entity-a", None, "before", "same")],
             &[row_with_value("entity-a", None, "after", "same")],
         )
         .await;
 
-        let diff = diff(&backend, &tracked_state).await;
+        let diff = diff(storage.clone(), &tracked_state).await;
 
         assert!(diff.entries.is_empty());
     }
 
     #[tokio::test]
     async fn diff_commits_distinguishes_same_entity_with_different_file_id() {
-        let (backend, tracked_state) = seed_roots(
+        let (storage, tracked_state) = seed_roots(
             &[row("entity-a", Some("file-a"), "before-a")],
             &[
                 row("entity-a", Some("file-a"), "before-a"),
@@ -323,7 +324,7 @@ mod tests {
         )
         .await;
 
-        let diff = diff(&backend, &tracked_state).await;
+        let diff = diff(storage.clone(), &tracked_state).await;
 
         assert_eq!(diff.entries.len(), 1);
         assert_eq!(diff.entries[0].identity.file_id.as_deref(), Some("file-b"));
@@ -332,7 +333,7 @@ mod tests {
 
     #[tokio::test]
     async fn diff_commits_filters_by_schema_entity_and_file_id() {
-        let (backend, tracked_state) = seed_roots(
+        let (storage, tracked_state) = seed_roots(
             &[],
             &[
                 row_with_schema("entity-a", Some("file-a"), "schema-a", "change-a"),
@@ -340,7 +341,7 @@ mod tests {
             ],
         )
         .await;
-        let mut reader = tracked_state.reader(Arc::clone(&backend));
+        let mut reader = tracked_state.reader(storage.clone());
         let diff = reader
             .diff_commits(
                 "left",
@@ -366,11 +367,11 @@ mod tests {
     }
 
     async fn diff(
-        backend: &Arc<UnitTestBackend>,
+        storage: StorageContext,
         tracked_state: &TrackedStateContext,
     ) -> TrackedStateDiff {
         tracked_state
-            .reader(Arc::clone(backend))
+            .reader(storage)
             .diff_commits("left", "right", &TrackedStateDiffRequest::default())
             .await
             .expect("diff should load")
@@ -379,11 +380,12 @@ mod tests {
     async fn seed_roots(
         left_rows: &[TrackedStateRow],
         right_rows: &[TrackedStateRow],
-    ) -> (Arc<UnitTestBackend>, TrackedStateContext) {
+    ) -> (StorageContext, TrackedStateContext) {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
-        let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut tx = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         tracked_state
@@ -397,7 +399,7 @@ mod tests {
             .await
             .expect("right root should write");
         tx.commit().await.expect("transaction should commit");
-        (backend, tracked_state)
+        (storage, tracked_state)
     }
 
     fn kinds(diff: &TrackedStateDiff) -> Vec<(String, TrackedStateDiffKind)> {

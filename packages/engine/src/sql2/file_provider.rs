@@ -2157,12 +2157,15 @@ mod tests {
             test_functions()
         }
 
-        fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
-            Arc::new(CapturingWriteContext::default())
-        }
-
         fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
             Ok(Vec::new())
+        }
+
+        async fn load_blob_data_by_hash(
+            &mut self,
+            blob_hash: &str,
+        ) -> Result<Option<Vec<u8>>, LixError> {
+            BlobDataReader::load_blob_data_by_hash(self, blob_hash).await
         }
 
         async fn scan_live_state(

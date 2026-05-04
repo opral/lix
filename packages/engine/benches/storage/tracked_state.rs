@@ -691,7 +691,7 @@ fn prepare_read(
     runtime: &Runtime,
     args: Args,
 ) -> (
-    BenchBackend,
+    std::sync::Arc<dyn lix_engine::Backend + Send + Sync>,
     lix_engine::storage_bench::TrackedStateReadFixture,
 ) {
     let backend = BenchBackend::new();
@@ -709,7 +709,7 @@ fn prepare_read_with(
     args: Args,
     config: StorageBenchConfig,
 ) -> (
-    BenchBackend,
+    std::sync::Arc<dyn lix_engine::Backend + Send + Sync>,
     lix_engine::storage_bench::TrackedStateReadFixture,
 ) {
     let _ = args;
@@ -725,7 +725,7 @@ fn prepare_read_file_selective_with(
     args: Args,
     config: StorageBenchConfig,
 ) -> (
-    BenchBackend,
+    std::sync::Arc<dyn lix_engine::Backend + Send + Sync>,
     lix_engine::storage_bench::TrackedStateReadFixture,
 ) {
     let _ = args;
@@ -744,7 +744,7 @@ fn prepare_read_file_selective_with_max_inline_encoded_value(
     config: StorageBenchConfig,
     max_inline_encoded_value_bytes: usize,
 ) -> (
-    BenchBackend,
+    std::sync::Arc<dyn lix_engine::Backend + Send + Sync>,
     lix_engine::storage_bench::TrackedStateReadFixture,
 ) {
     let _ = args;

@@ -7,6 +7,8 @@ without going through SQL or the SDK:
 - `untracked_state`
 - `changelog`
 - `binary_cas`
+- `json_store`
+- `storage/api`
 
 The benchmark target uses `codspeed-criterion-compat`, so it works with normal
 `cargo bench` and with CodSpeed.
@@ -74,6 +76,45 @@ storage/binary_cas/write_blobs_1k/10k
 storage/binary_cas/read_blob_hit_1k/10k
 storage/binary_cas/read_blob_miss_1k/10k
 storage/binary_cas/write_duplicate_payload_1k/10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/write_kv_batch_put/1
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/write_kv_batch_put/10
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/write_kv_batch_put/100
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/write_kv_batch_put/1k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/write_kv_batch_put/10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/write_kv_batch_mixed_put_delete/10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/write_kv_batch_multi_namespace/10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/write_kv_batch_duplicate_keys/10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/write_kv_batch_value_size/64b
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/write_kv_batch_value_size/1k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/write_kv_batch_value_size/16k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/write_kv_batch_value_size/128k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/transaction_write_and_commit/1
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/transaction_write_and_commit/100
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/transaction_write_and_commit/10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/transaction_rollback_after_write/10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/get_kv_many_hit/100
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/get_kv_many_hit/1k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/get_kv_many_hit/10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/get_kv_many_miss/100
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/get_kv_many_miss/1k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/get_kv_many_miss/10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/get_kv_many_mixed_hit_miss/100
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/get_kv_many_mixed_hit_miss/1k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/get_kv_many_mixed_hit_miss/10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/get_kv_many_duplicate_keys/100
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/get_kv_many_duplicate_keys/1k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/get_kv_many_duplicate_keys/10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/get_kv_many_multi_namespace/10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/scan_kv_prefix/100
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/scan_kv_prefix/1k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/scan_kv_prefix/10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/scan_kv_after_pages/10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/scan_kv_small_limit_of_large_range/100_of_10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/scan_kv_empty_range/10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/scan_kv_prefix_selectivity_1pct/10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/scan_kv_prefix_selectivity_10pct/10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/scan_kv_prefix_selectivity_100pct/10k
+storage/api/{in_memory,sqlite_memory,rocksdb_tempdir}/transaction_commit_empty
 ```
 
 Additional high-signal variants are registered for:

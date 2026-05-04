@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
-use crate::backend::ScopedKvStore;
 use crate::binary_cas::BlobDataReader;
 use crate::changelog::ChangelogReader;
 use crate::commit_graph::CommitGraphReader;
@@ -14,17 +13,20 @@ use crate::json_store::JsonStoreReader;
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
 };
+use crate::storage::{ScopedStorageReader, StorageReadTransaction};
 use crate::transaction::types::{StageWrite, StageWriteOutcome};
 use crate::version::{VersionHead, VersionRefReader};
-use crate::{Backend, LixError};
+use crate::LixError;
 
-pub(crate) type SqlChangelogQuerySource = ChangelogQuerySource<Arc<dyn Backend + Send + Sync>>;
-pub(crate) type SqlJsonReader = JsonStoreReader<ScopedKvStore<Arc<dyn Backend + Send + Sync>>>;
+pub(crate) type SqlReadStore =
+    ScopedStorageReader<Box<dyn StorageReadTransaction + Send + Sync + 'static>>;
+pub(crate) type SqlChangelogQuerySource = ChangelogQuerySource<SqlReadStore>;
+pub(crate) type SqlJsonReader = JsonStoreReader<ScopedStorageReader<SqlReadStore>>;
 
 #[derive(Clone)]
 pub(crate) struct ChangelogQuerySource<S> {
     pub(crate) changelog_reader: Arc<dyn ChangelogReader>,
-    pub(crate) json_reader: JsonStoreReader<ScopedKvStore<S>>,
+    pub(crate) json_reader: JsonStoreReader<ScopedStorageReader<S>>,
 }
 
 /// Read-only execution boundary for `sql2::execute_sql(...)`.
@@ -59,8 +61,10 @@ pub(crate) trait SqlExecutionContext {
 pub(crate) trait SqlWriteExecutionContext {
     fn active_version_id(&self) -> &str;
     fn functions(&self) -> FunctionProviderHandle;
-    fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
+
+    async fn load_blob_data_by_hash(&mut self, blob_hash: &str)
+        -> Result<Option<Vec<u8>>, LixError>;
 
     async fn scan_live_state(
         &mut self,
@@ -106,7 +110,7 @@ impl SqlWriteContext {
     }
 
     pub(crate) fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
-        unsafe { self.ptr.0.as_ref().blob_reader() }
+        Arc::new(WriteContextBlobDataReader::new(self.clone()))
     }
 
     pub(crate) fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
@@ -129,6 +133,22 @@ impl SqlWriteContext {
                 .as_mut()
                 .unwrap()
                 .scan_live_state(request)
+                .await
+        }
+    }
+
+    pub(crate) async fn load_blob_data_by_hash(
+        &self,
+        blob_hash: &str,
+    ) -> Result<Option<Vec<u8>>, LixError> {
+        let _guard = self.gate.lock().await;
+        unsafe {
+            self.ptr
+                .0
+                .as_ptr()
+                .as_mut()
+                .unwrap()
+                .load_blob_data_by_hash(blob_hash)
                 .await
         }
     }
@@ -163,6 +183,23 @@ impl SqlWriteContext {
                 .stage_write(write)
                 .await
         }
+    }
+}
+
+pub(crate) struct WriteContextBlobDataReader {
+    ctx: SqlWriteContext,
+}
+
+impl WriteContextBlobDataReader {
+    pub(crate) fn new(ctx: SqlWriteContext) -> Self {
+        Self { ctx }
+    }
+}
+
+#[async_trait]
+impl BlobDataReader for WriteContextBlobDataReader {
+    async fn load_blob_data_by_hash(&self, blob_hash: &str) -> Result<Option<Vec<u8>>, LixError> {
+        self.ctx.load_blob_data_by_hash(blob_hash).await
     }
 }
 

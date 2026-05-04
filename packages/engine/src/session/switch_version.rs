@@ -68,7 +68,7 @@ impl SessionContext {
 
         let session = SessionContext::new_with_closed(
             next_mode,
-            Arc::clone(&self.backend),
+            self.storage.clone(),
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),

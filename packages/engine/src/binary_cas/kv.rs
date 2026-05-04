@@ -1,12 +1,15 @@
 #![allow(dead_code)]
 
-use crate::backend::{KvStore, KvWriter};
 use crate::binary_cas::chunking::fastcdc_chunk_ranges;
 use crate::binary_cas::codec::{
     binary_blob_hash_hex, decode_binary_chunk_payload, encode_binary_chunk_payload,
 };
 use crate::binary_cas::BinaryBlobWrite;
-use crate::{KvScanRange, LixError};
+use crate::storage::{
+    KvGetGroup, KvGetRequest, KvPair, KvPut, KvScanRange, KvScanRequest, KvWriteBatch,
+    KvWriteGroup, StorageReader, StorageWriter,
+};
+use crate::LixError;
 
 pub(crate) const BINARY_CAS_MANIFEST_NAMESPACE: &str = "binary_cas.manifest";
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifest_chunk";
@@ -32,15 +35,15 @@ pub(crate) struct KvChunk {
 }
 
 pub(crate) async fn load_manifest(
-    store: &mut impl KvStore,
+    store: &mut impl StorageReader,
     blob_hash: &str,
 ) -> Result<Option<KvBlobManifest>, LixError> {
-    let Some(bytes) = store
-        .kv_get(
-            BINARY_CAS_MANIFEST_NAMESPACE,
-            manifest_key(blob_hash).as_slice(),
-        )
-        .await?
+    let Some(bytes) = get_one(
+        store,
+        BINARY_CAS_MANIFEST_NAMESPACE,
+        manifest_key(blob_hash),
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -48,69 +51,65 @@ pub(crate) async fn load_manifest(
 }
 
 #[cfg(feature = "storage-benches")]
-pub(crate) async fn count_manifests(store: &mut impl KvStore) -> Result<usize, LixError> {
-    Ok(store
-        .kv_scan(
-            BINARY_CAS_MANIFEST_NAMESPACE,
-            KvScanRange::Prefix(Vec::new()),
-            None,
-        )
-        .await?
-        .len())
+pub(crate) async fn count_manifests(store: &mut impl StorageReader) -> Result<usize, LixError> {
+    Ok(scan_all(
+        store,
+        BINARY_CAS_MANIFEST_NAMESPACE,
+        KvScanRange::Prefix(Vec::new()),
+    )
+    .await?
+    .len())
 }
 
 pub(crate) async fn put_manifest(
-    writer: &mut impl KvWriter,
+    writer: &mut impl StorageWriter,
     blob_hash: &str,
     manifest: &KvBlobManifest,
 ) -> Result<(), LixError> {
-    writer
-        .kv_put(
-            BINARY_CAS_MANIFEST_NAMESPACE,
-            manifest_key(blob_hash).as_slice(),
-            &encode_json(manifest, "binary CAS manifest")?,
-        )
-        .await
+    put_one(
+        writer,
+        BINARY_CAS_MANIFEST_NAMESPACE,
+        manifest_key(blob_hash),
+        encode_json(manifest, "binary CAS manifest")?,
+    )
+    .await
 }
 
 pub(crate) async fn scan_manifest_chunks(
-    store: &mut impl KvStore,
+    store: &mut impl StorageReader,
     blob_hash: &str,
 ) -> Result<Vec<KvBlobManifestChunk>, LixError> {
-    store
-        .kv_scan(
-            BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
-            KvScanRange::Prefix(manifest_chunk_prefix(blob_hash)),
-            None,
-        )
-        .await?
-        .into_iter()
-        .map(|pair| decode_json(&pair.value, "binary CAS manifest chunk"))
-        .collect()
+    scan_all(
+        store,
+        BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
+        KvScanRange::Prefix(manifest_chunk_prefix(blob_hash)),
+    )
+    .await?
+    .into_iter()
+    .map(|pair| decode_json(&pair.value, "binary CAS manifest chunk"))
+    .collect()
 }
 
 pub(crate) async fn put_manifest_chunk(
-    writer: &mut impl KvWriter,
+    writer: &mut impl StorageWriter,
     blob_hash: &str,
     chunk_index: u64,
     chunk: &KvBlobManifestChunk,
 ) -> Result<(), LixError> {
-    writer
-        .kv_put(
-            BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
-            manifest_chunk_key(blob_hash, chunk_index).as_slice(),
-            &encode_json(chunk, "binary CAS manifest chunk")?,
-        )
-        .await
+    put_one(
+        writer,
+        BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
+        manifest_chunk_key(blob_hash, chunk_index),
+        encode_json(chunk, "binary CAS manifest chunk")?,
+    )
+    .await
 }
 
 pub(crate) async fn load_chunk(
-    store: &mut impl KvStore,
+    store: &mut impl StorageReader,
     chunk_hash: &str,
 ) -> Result<Option<KvChunk>, LixError> {
-    let Some(bytes) = store
-        .kv_get(BINARY_CAS_CHUNK_NAMESPACE, chunk_key(chunk_hash).as_slice())
-        .await?
+    let Some(bytes) = get_one(store, BINARY_CAS_CHUNK_NAMESPACE, chunk_key(chunk_hash)).await?
     else {
         return Ok(None);
     };
@@ -118,21 +117,75 @@ pub(crate) async fn load_chunk(
 }
 
 pub(crate) async fn put_chunk(
-    writer: &mut impl KvWriter,
+    writer: &mut impl StorageWriter,
     chunk_hash: &str,
     chunk: &KvChunk,
 ) -> Result<(), LixError> {
+    put_one(
+        writer,
+        BINARY_CAS_CHUNK_NAMESPACE,
+        chunk_key(chunk_hash),
+        encode_json(chunk, "binary CAS chunk")?,
+    )
+    .await
+}
+
+async fn get_one(
+    store: &mut impl StorageReader,
+    namespace: &str,
+    key: Vec<u8>,
+) -> Result<Option<Vec<u8>>, LixError> {
+    Ok(store
+        .get_kv_many(KvGetRequest {
+            groups: vec![KvGetGroup {
+                namespace: namespace.to_string(),
+                keys: vec![key],
+            }],
+        })
+        .await?
+        .groups
+        .into_iter()
+        .next()
+        .and_then(|mut group| group.values.pop())
+        .flatten())
+}
+
+async fn scan_all(
+    store: &mut impl StorageReader,
+    namespace: &str,
+    range: KvScanRange,
+) -> Result<Vec<KvPair>, LixError> {
+    Ok(store
+        .scan_kv(KvScanRequest {
+            namespace: namespace.to_string(),
+            range,
+            after: None,
+            limit: usize::MAX,
+        })
+        .await?
+        .rows)
+}
+
+async fn put_one(
+    writer: &mut impl StorageWriter,
+    namespace: &str,
+    key: Vec<u8>,
+    value: Vec<u8>,
+) -> Result<(), LixError> {
     writer
-        .kv_put(
-            BINARY_CAS_CHUNK_NAMESPACE,
-            chunk_key(chunk_hash).as_slice(),
-            &encode_json(chunk, "binary CAS chunk")?,
-        )
-        .await
+        .write_kv_batch(KvWriteBatch {
+            groups: vec![KvWriteGroup {
+                namespace: namespace.to_string(),
+                puts: vec![KvPut { key, value }],
+                deletes: Vec::new(),
+            }],
+        })
+        .await?;
+    Ok(())
 }
 
 pub(crate) async fn load_blob_data_by_hash(
-    store: &mut impl KvStore,
+    store: &mut impl StorageReader,
     blob_hash: &str,
 ) -> Result<Option<Vec<u8>>, LixError> {
     let Some(manifest) = load_manifest(store, blob_hash).await? else {
@@ -188,14 +241,14 @@ pub(crate) async fn load_blob_data_by_hash(
 }
 
 pub(crate) async fn blob_exists(
-    store: &mut impl KvStore,
+    store: &mut impl StorageReader,
     blob_hash: &str,
 ) -> Result<bool, LixError> {
     Ok(load_manifest(store, blob_hash).await?.is_some())
 }
 
 pub(crate) async fn persist_blob_writes_in_transaction(
-    writer: &mut impl KvWriter,
+    writer: &mut impl StorageWriter,
     writes: &[BinaryBlobWrite<'_>],
 ) -> Result<(), LixError> {
     for write in writes {
@@ -205,7 +258,7 @@ pub(crate) async fn persist_blob_writes_in_transaction(
 }
 
 async fn persist_one_blob_write(
-    writer: &mut impl KvWriter,
+    writer: &mut impl StorageWriter,
     write: &BinaryBlobWrite<'_>,
 ) -> Result<(), LixError> {
     let blob_hash = binary_blob_hash_hex(write.data);
@@ -287,13 +340,13 @@ fn decode_json<T: serde::de::DeserializeOwned>(bytes: &[u8], label: &str) -> Res
 mod tests {
     use super::*;
     use crate::backend::testing::UnitTestBackend;
-    use crate::backend::{Backend, TransactionBeginMode};
+    use crate::storage::StorageContext;
 
     #[tokio::test]
     async fn stores_manifest_chunks_in_scan_order() {
-        let backend = UnitTestBackend::new();
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let storage = StorageContext::new(std::sync::Arc::new(UnitTestBackend::new()));
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
 
@@ -334,7 +387,7 @@ mod tests {
         }
         transaction.commit().await.expect("commit should succeed");
 
-        let mut store = &backend;
+        let mut store = storage.clone();
         assert_eq!(
             load_manifest(&mut store, "blob-a")
                 .await
@@ -344,7 +397,7 @@ mod tests {
                 chunk_count: 2,
             })
         );
-        let mut store = &backend;
+        let mut store = storage.clone();
         assert_eq!(
             scan_manifest_chunks(&mut store, "blob-a")
                 .await
@@ -364,9 +417,9 @@ mod tests {
 
     #[tokio::test]
     async fn stores_encoded_chunks_by_chunk_hash() {
-        let backend = UnitTestBackend::new();
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let storage = StorageContext::new(std::sync::Arc::new(UnitTestBackend::new()));
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let chunk = KvChunk {
@@ -383,7 +436,7 @@ mod tests {
         }
         transaction.commit().await.expect("commit should succeed");
 
-        let mut store = &backend;
+        let mut store = storage.clone();
         assert_eq!(
             load_chunk(&mut store, "chunk-a")
                 .await
@@ -394,11 +447,11 @@ mod tests {
 
     #[tokio::test]
     async fn public_kv_api_roundtrips_blob_bytes() {
-        let backend = UnitTestBackend::new();
+        let storage = StorageContext::new(std::sync::Arc::new(UnitTestBackend::new()));
         let data = b"hello chunked kv cas";
         let blob_hash = binary_blob_hash_hex(data);
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
 
@@ -417,14 +470,14 @@ mod tests {
         }
         transaction.commit().await.expect("commit should succeed");
 
-        let mut store = &backend;
+        let mut store = storage.clone();
         assert_eq!(
             load_blob_data_by_hash(&mut store, &blob_hash)
                 .await
                 .expect("blob should load"),
             Some(data.to_vec())
         );
-        let mut store = &backend;
+        let mut store = storage.clone();
         assert!(blob_exists(&mut store, &blob_hash)
             .await
             .expect("blob exists should succeed"));
@@ -432,11 +485,11 @@ mod tests {
 
     #[tokio::test]
     async fn public_kv_api_roundtrips_empty_blob() {
-        let backend = UnitTestBackend::new();
+        let storage = StorageContext::new(std::sync::Arc::new(UnitTestBackend::new()));
         let data = b"";
         let blob_hash = binary_blob_hash_hex(data);
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
 
@@ -455,14 +508,14 @@ mod tests {
         }
         transaction.commit().await.expect("commit should succeed");
 
-        let mut store = &backend;
+        let mut store = storage.clone();
         assert_eq!(
             load_blob_data_by_hash(&mut store, &blob_hash)
                 .await
                 .expect("empty blob should load"),
             Some(Vec::new())
         );
-        let mut store = &backend;
+        let mut store = storage.clone();
         assert_eq!(
             scan_manifest_chunks(&mut store, &blob_hash)
                 .await
@@ -473,13 +526,13 @@ mod tests {
 
     #[tokio::test]
     async fn public_kv_api_roundtrips_multi_chunk_blob() {
-        let backend = UnitTestBackend::new();
+        let storage = StorageContext::new(std::sync::Arc::new(UnitTestBackend::new()));
         let data = (0..600_000)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
         let blob_hash = binary_blob_hash_hex(&data);
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
 
@@ -498,14 +551,14 @@ mod tests {
         }
         transaction.commit().await.expect("commit should succeed");
 
-        let mut store = &backend;
+        let mut store = storage.clone();
         assert_eq!(
             load_blob_data_by_hash(&mut store, &blob_hash)
                 .await
                 .expect("large blob should load"),
             Some(data)
         );
-        let mut store = &backend;
+        let mut store = storage.clone();
         assert!(
             scan_manifest_chunks(&mut store, &blob_hash)
                 .await

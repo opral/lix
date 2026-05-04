@@ -1,4 +1,4 @@
-use crate::backend::{KvStore, KvWriter};
+use crate::storage::{StorageReader, StorageWriter};
 use crate::untracked_state::{
     UntrackedStateIdentity, UntrackedStateRow, UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
@@ -22,7 +22,7 @@ impl UntrackedStateContext {
     /// The caller decides which KV store supplies visibility for the read.
     pub(crate) fn reader<S>(&self, store: S) -> UntrackedStateStoreReader<S>
     where
-        S: KvStore,
+        S: StorageReader,
     {
         UntrackedStateStoreReader { store }
     }
@@ -33,7 +33,7 @@ impl UntrackedStateContext {
     /// ownership controls commit or rollback behavior.
     pub(crate) fn writer<S>(&self, store: S) -> UntrackedStateWriter<S>
     where
-        S: KvWriter,
+        S: StorageWriter,
     {
         UntrackedStateWriter { store }
     }
@@ -46,7 +46,7 @@ pub(crate) struct UntrackedStateStoreReader<S> {
 
 impl<S> UntrackedStateStoreReader<S>
 where
-    S: KvStore,
+    S: StorageReader,
 {
     pub(crate) async fn scan_rows(
         &mut self,
@@ -70,7 +70,7 @@ pub(crate) struct UntrackedStateWriter<S> {
 
 impl<S> UntrackedStateWriter<S>
 where
-    S: KvWriter,
+    S: StorageWriter,
 {
     /// Writes the latest untracked rows for their identities.
     ///

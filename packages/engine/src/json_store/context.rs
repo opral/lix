@@ -1,6 +1,6 @@
-use crate::backend::{KvStore, KvWriter};
 use crate::json_store::store;
 use crate::json_store::types::{JsonProjection, JsonProjectionPath, JsonRef};
+use crate::storage::{StorageReader, StorageWriter};
 use crate::LixError;
 use std::collections::HashSet;
 
@@ -14,7 +14,7 @@ impl JsonStoreContext {
 
     pub(crate) fn reader<S>(&self, store: S) -> JsonStoreReader<S>
     where
-        S: KvStore,
+        S: StorageReader,
     {
         JsonStoreReader { store }
     }
@@ -25,7 +25,7 @@ impl JsonStoreContext {
 
     pub(crate) async fn load_bytes(
         &self,
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         json_ref: &JsonRef,
     ) -> Result<Option<Vec<u8>>, LixError> {
         store::load_json_bytes(store, json_ref).await
@@ -49,7 +49,7 @@ where
 
 impl<S> JsonStoreReader<S>
 where
-    S: KvStore,
+    S: StorageReader,
 {
     pub(crate) async fn load_bytes(
         &mut self,
@@ -129,7 +129,10 @@ impl JsonStoreWriter {
         Ok(json_ref)
     }
 
-    pub(crate) async fn flush(self, store: &mut (impl KvWriter + ?Sized)) -> Result<(), LixError> {
+    pub(crate) async fn flush(
+        self,
+        store: &mut (impl StorageWriter + ?Sized),
+    ) -> Result<(), LixError> {
         for staged in self.staged {
             store::persist_stored_json_payload(store, &staged.json_ref, &staged.stored_payload)
                 .await?;
