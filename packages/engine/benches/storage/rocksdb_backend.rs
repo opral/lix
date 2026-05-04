@@ -1,13 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use lix_engine::{
-    Backend, BackendKvEntry, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup,
-    BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest,
-    BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, LixError,
+    Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetRequest,
+    BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch,
+    BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteStats,
+    BackendReadTransaction, BackendWriteTransaction, BytePageBuilder, LixError,
 };
 use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
 use tempfile::TempDir;
@@ -111,26 +111,14 @@ impl BackendReadTransaction for RocksDbBenchTransaction {
         &mut self,
         request: BackendKvScanRequest,
     ) -> Result<BackendKvKeyPage, LixError> {
-        let entries = rocksdb_scan_entries(&self.inner.db, &self.pending, request)?;
-        Ok(BackendKvKeyPage {
-            keys: entries.entries.into_iter().map(|entry| entry.key).collect(),
-            resume_after: entries.resume_after,
-        })
+        rocksdb_scan_keys(&self.inner.db, &self.pending, request)
     }
 
     async fn scan_values(
         &mut self,
         request: BackendKvScanRequest,
     ) -> Result<BackendKvValuePage, LixError> {
-        let entries = rocksdb_scan_entries(&self.inner.db, &self.pending, request)?;
-        Ok(BackendKvValuePage {
-            values: entries
-                .entries
-                .into_iter()
-                .map(|entry| entry.value)
-                .collect(),
-            resume_after: entries.resume_after,
-        })
+        rocksdb_scan_values(&self.inner.db, &self.pending, request)
     }
 
     async fn scan_entries(
@@ -264,55 +252,285 @@ fn fill_committed_exists(
     Ok(())
 }
 
+fn rocksdb_scan_keys(
+    db: &DB,
+    pending: &BTreeMap<Vec<u8>, PendingWrite>,
+    request: BackendKvScanRequest,
+) -> Result<BackendKvKeyPage, LixError> {
+    let bounds = ScanBounds::new(&request);
+    if pending.is_empty() {
+        return rocksdb_scan_committed_keys(db, request, bounds);
+    }
+
+    let mut merged = BTreeSet::new();
+    let mut iter = db.raw_iterator();
+    iter.seek(&bounds.start_encoded);
+    while iter.valid() {
+        let Some(encoded_key) = iter.key() else {
+            break;
+        };
+        if !bounds.contains_encoded(encoded_key) {
+            break;
+        }
+        let logical_key = decode_key(&request.namespace, encoded_key)?;
+        if !key_after_cursor(&request, &logical_key) {
+            iter.next();
+            continue;
+        }
+        merged.insert(logical_key);
+        iter.next();
+    }
+    iter.status().map_err(rocksdb_error)?;
+
+    for (encoded_key, write) in
+        pending.range(bounds.start_encoded.clone()..bounds.end_encoded.clone())
+    {
+        if !bounds.contains_encoded(encoded_key) {
+            continue;
+        }
+        let logical_key = decode_key(&request.namespace, encoded_key)?;
+        if !key_in_range(&logical_key, &request.range) || !key_after_cursor(&request, &logical_key)
+        {
+            continue;
+        }
+        match write {
+            PendingWrite::Put(_) => {
+                merged.insert(logical_key);
+            }
+            PendingWrite::Delete => {
+                merged.remove(&logical_key);
+            }
+        }
+    }
+    Ok(key_page_from_iter(merged, request.limit))
+}
+
+fn rocksdb_scan_values(
+    db: &DB,
+    pending: &BTreeMap<Vec<u8>, PendingWrite>,
+    request: BackendKvScanRequest,
+) -> Result<BackendKvValuePage, LixError> {
+    let bounds = ScanBounds::new(&request);
+    if pending.is_empty() {
+        return rocksdb_scan_committed_values(db, request, bounds);
+    }
+
+    let mut merged = BTreeMap::new();
+    for item in db.iterator(IteratorMode::From(
+        &bounds.start_encoded,
+        Direction::Forward,
+    )) {
+        let (encoded_key, value) = item.map_err(rocksdb_error)?;
+        let encoded_key = encoded_key.as_ref();
+        if !bounds.contains_encoded(encoded_key) {
+            break;
+        }
+        let logical_key = decode_key(&request.namespace, encoded_key)?;
+        if !key_after_cursor(&request, &logical_key) {
+            continue;
+        }
+        merged.insert(logical_key, value.to_vec());
+    }
+    overlay_pending_values(&mut merged, pending, &request, &bounds)?;
+    Ok(value_page_from_iter(merged, request.limit))
+}
+
 fn rocksdb_scan_entries(
     db: &DB,
     pending: &BTreeMap<Vec<u8>, PendingWrite>,
     request: BackendKvScanRequest,
 ) -> Result<BackendKvEntryPage, LixError> {
-    let start = scan_start_key(&request);
-    let start_encoded = encode_key(&request.namespace, &start);
-    let end = scan_end_key(&request.range);
-    let end_encoded = end
-        .as_ref()
-        .map(|end| encode_key(&request.namespace, end))
-        .unwrap_or_else(|| namespace_end_key(&request.namespace));
-    let namespace_prefix = namespace_prefix(&request.namespace);
+    let bounds = ScanBounds::new(&request);
     if pending.is_empty() {
-        return rocksdb_scan_committed_entries(
-            db,
-            request,
-            start_encoded,
-            end_encoded,
-            namespace_prefix,
-        );
+        return rocksdb_scan_committed_entries(db, request, bounds);
     }
     let mut merged = BTreeMap::new();
-    for item in db.iterator(IteratorMode::From(&start_encoded, Direction::Forward)) {
+    for item in db.iterator(IteratorMode::From(
+        &bounds.start_encoded,
+        Direction::Forward,
+    )) {
         let (key, value) = item.map_err(rocksdb_error)?;
         let key = key.as_ref();
-        if key >= end_encoded.as_slice() || !key.starts_with(&namespace_prefix) {
+        if !bounds.contains_encoded(key) {
             break;
         }
         let logical_key = decode_key(&request.namespace, key)?;
-        if let Some(after) = request.after.as_deref() {
-            if logical_key.as_slice() <= after {
-                continue;
-            }
+        if !key_after_cursor(&request, &logical_key) {
+            continue;
         }
         merged.insert(logical_key, value.to_vec());
     }
-    for (encoded_key, write) in pending.range(start_encoded..end_encoded) {
-        if !encoded_key.starts_with(&namespace_prefix) {
+    overlay_pending_values(&mut merged, pending, &request, &bounds)?;
+    Ok(entry_page_from_iter(merged, request.limit))
+}
+
+struct ScanBounds {
+    start_encoded: Vec<u8>,
+    end_encoded: Vec<u8>,
+    namespace_prefix: Vec<u8>,
+}
+
+impl ScanBounds {
+    fn new(request: &BackendKvScanRequest) -> Self {
+        let start = scan_start_key(request);
+        let start_encoded = encode_key(&request.namespace, &start);
+        let end = scan_end_key(&request.range);
+        let end_encoded = end
+            .as_ref()
+            .map(|end| encode_key(&request.namespace, end))
+            .unwrap_or_else(|| namespace_end_key(&request.namespace));
+        let namespace_prefix = namespace_prefix(&request.namespace);
+        Self {
+            start_encoded,
+            end_encoded,
+            namespace_prefix,
+        }
+    }
+
+    fn contains_encoded(&self, encoded_key: &[u8]) -> bool {
+        encoded_key < self.end_encoded.as_slice()
+            && encoded_key.starts_with(self.namespace_prefix.as_slice())
+    }
+}
+
+fn rocksdb_scan_committed_keys(
+    db: &DB,
+    request: BackendKvScanRequest,
+    bounds: ScanBounds,
+) -> Result<BackendKvKeyPage, LixError> {
+    let mut keys = BytePageBuilder::new();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
+    let mut iter = db.raw_iterator();
+    iter.seek(&bounds.start_encoded);
+    while iter.valid() {
+        let Some(encoded_key) = iter.key() else {
+            break;
+        };
+        if !bounds.contains_encoded(encoded_key) {
+            break;
+        }
+        let logical_key = decode_key(&request.namespace, encoded_key)?;
+        if !key_after_cursor(&request, &logical_key) {
+            iter.next();
+            continue;
+        }
+        if count < request.limit {
+            resume_after_candidate = Some(logical_key.clone());
+            keys.push(&logical_key);
+        }
+        count += 1;
+        if count > request.limit {
+            break;
+        }
+        iter.next();
+    }
+    iter.status().map_err(rocksdb_error)?;
+    let resume_after = (count > request.limit)
+        .then_some(resume_after_candidate)
+        .flatten();
+    Ok(BackendKvKeyPage {
+        keys: keys.finish(),
+        resume_after,
+    })
+}
+
+fn rocksdb_scan_committed_values(
+    db: &DB,
+    request: BackendKvScanRequest,
+    bounds: ScanBounds,
+) -> Result<BackendKvValuePage, LixError> {
+    let mut values = BytePageBuilder::new();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
+    for item in db.iterator(IteratorMode::From(
+        &bounds.start_encoded,
+        Direction::Forward,
+    )) {
+        let (encoded_key, value) = item.map_err(rocksdb_error)?;
+        let encoded_key = encoded_key.as_ref();
+        if !bounds.contains_encoded(encoded_key) {
+            break;
+        }
+        let logical_key = decode_key(&request.namespace, encoded_key)?;
+        if !key_after_cursor(&request, &logical_key) {
+            continue;
+        }
+        if count < request.limit {
+            resume_after_candidate = Some(logical_key);
+            values.push(value.as_ref());
+        }
+        count += 1;
+        if count > request.limit {
+            break;
+        }
+    }
+    let resume_after = (count > request.limit)
+        .then_some(resume_after_candidate)
+        .flatten();
+    Ok(BackendKvValuePage {
+        values: values.finish(),
+        resume_after,
+    })
+}
+
+fn rocksdb_scan_committed_entries(
+    db: &DB,
+    request: BackendKvScanRequest,
+    bounds: ScanBounds,
+) -> Result<BackendKvEntryPage, LixError> {
+    let mut keys = BytePageBuilder::new();
+    let mut values = BytePageBuilder::new();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
+    for item in db.iterator(IteratorMode::From(
+        &bounds.start_encoded,
+        Direction::Forward,
+    )) {
+        let (key, value) = item.map_err(rocksdb_error)?;
+        let key = key.as_ref();
+        if !bounds.contains_encoded(key) {
+            break;
+        }
+        let logical_key = decode_key(&request.namespace, key)?;
+        if !key_after_cursor(&request, &logical_key) {
+            continue;
+        }
+        if count < request.limit {
+            resume_after_candidate = Some(logical_key.clone());
+            keys.push(&logical_key);
+            values.push(value.as_ref());
+        }
+        count += 1;
+        if count > request.limit {
+            break;
+        }
+    }
+    let resume_after = (count > request.limit)
+        .then_some(resume_after_candidate)
+        .flatten();
+    Ok(BackendKvEntryPage {
+        keys: keys.finish(),
+        values: values.finish(),
+        resume_after,
+    })
+}
+
+fn overlay_pending_values(
+    merged: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+    pending: &BTreeMap<Vec<u8>, PendingWrite>,
+    request: &BackendKvScanRequest,
+    bounds: &ScanBounds,
+) -> Result<(), LixError> {
+    for (encoded_key, write) in
+        pending.range(bounds.start_encoded.clone()..bounds.end_encoded.clone())
+    {
+        if !bounds.contains_encoded(encoded_key) {
             continue;
         }
         let logical_key = decode_key(&request.namespace, encoded_key)?;
-        if !key_in_range(&logical_key, &request.range) {
+        if !key_in_range(&logical_key, &request.range) || !key_after_cursor(request, &logical_key) {
             continue;
-        }
-        if let Some(after) = request.after.as_deref() {
-            if logical_key.as_slice() <= after {
-                continue;
-            }
         }
         match write {
             PendingWrite::Put(value) => {
@@ -323,61 +541,82 @@ fn rocksdb_scan_entries(
             }
         }
     }
-    let mut entries = Vec::new();
-    for (key, value) in merged {
-        if entries.len() > request.limit {
-            break;
-        }
-        entries.push(BackendKvEntry { key, value });
-    }
-    let has_more = entries.len() > request.limit;
-    entries.truncate(request.limit);
-    let resume_after = has_more
-        .then(|| entries.last().map(|entry| entry.key.clone()))
-        .flatten();
-    Ok(BackendKvEntryPage {
-        entries,
-        resume_after,
-    })
+    Ok(())
 }
 
-fn rocksdb_scan_committed_entries(
-    db: &DB,
-    request: BackendKvScanRequest,
-    start_encoded: Vec<u8>,
-    end_encoded: Vec<u8>,
-    namespace_prefix: Vec<u8>,
-) -> Result<BackendKvEntryPage, LixError> {
-    let mut entries = Vec::new();
-    for item in db.iterator(IteratorMode::From(&start_encoded, Direction::Forward)) {
-        let (key, value) = item.map_err(rocksdb_error)?;
-        let key = key.as_ref();
-        if key >= end_encoded.as_slice() || !key.starts_with(&namespace_prefix) {
-            break;
+fn key_page_from_iter(
+    keys_iter: impl IntoIterator<Item = Vec<u8>>,
+    limit: usize,
+) -> BackendKvKeyPage {
+    let mut keys = BytePageBuilder::new();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
+    for key in keys_iter {
+        if count < limit {
+            resume_after_candidate = Some(key.clone());
+            keys.push(&key);
         }
-        let logical_key = decode_key(&request.namespace, key)?;
-        if let Some(after) = request.after.as_deref() {
-            if logical_key.as_slice() <= after {
-                continue;
-            }
-        }
-        entries.push(BackendKvEntry {
-            key: logical_key,
-            value: value.to_vec(),
-        });
-        if entries.len() > request.limit {
+        count += 1;
+        if count > limit {
             break;
         }
     }
-    let has_more = entries.len() > request.limit;
-    entries.truncate(request.limit);
-    let resume_after = has_more
-        .then(|| entries.last().map(|entry| entry.key.clone()))
-        .flatten();
-    Ok(BackendKvEntryPage {
-        entries,
+    let resume_after = (count > limit).then_some(resume_after_candidate).flatten();
+    BackendKvKeyPage {
+        keys: keys.finish(),
         resume_after,
-    })
+    }
+}
+
+fn value_page_from_iter(
+    values_iter: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
+    limit: usize,
+) -> BackendKvValuePage {
+    let mut values = BytePageBuilder::new();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
+    for (key, value) in values_iter {
+        if count < limit {
+            resume_after_candidate = Some(key);
+            values.push(&value);
+        }
+        count += 1;
+        if count > limit {
+            break;
+        }
+    }
+    let resume_after = (count > limit).then_some(resume_after_candidate).flatten();
+    BackendKvValuePage {
+        values: values.finish(),
+        resume_after,
+    }
+}
+
+fn entry_page_from_iter(
+    entries_iter: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
+    limit: usize,
+) -> BackendKvEntryPage {
+    let mut keys = BytePageBuilder::new();
+    let mut values = BytePageBuilder::new();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
+    for (key, value) in entries_iter {
+        if count < limit {
+            resume_after_candidate = Some(key.clone());
+            keys.push(&key);
+            values.push(&value);
+        }
+        count += 1;
+        if count > limit {
+            break;
+        }
+    }
+    let resume_after = (count > limit).then_some(resume_after_candidate).flatten();
+    BackendKvEntryPage {
+        keys: keys.finish(),
+        values: values.finish(),
+        resume_after,
+    }
 }
 
 fn scan_start_key(request: &BackendKvScanRequest) -> Vec<u8> {
@@ -403,6 +642,10 @@ fn key_in_range(key: &[u8], range: &BackendKvScanRange) -> bool {
         BackendKvScanRange::Prefix(prefix) => key.starts_with(prefix),
         BackendKvScanRange::Range { start, end } => key >= start.as_slice() && key < end.as_slice(),
     }
+}
+
+fn key_after_cursor(request: &BackendKvScanRequest, key: &[u8]) -> bool {
+    request.after.as_deref().is_none_or(|after| key > after)
 }
 
 fn encode_key(namespace: &str, key: &[u8]) -> Vec<u8> {

@@ -155,7 +155,7 @@ async fn scan_all_values(
     namespace: &str,
     range: KvScanRange,
 ) -> Result<Vec<Vec<u8>>, LixError> {
-    Ok(store
+    let page = store
         .scan_values(KvScanRequest {
             namespace: namespace.to_string(),
             range,
@@ -163,7 +163,8 @@ async fn scan_all_values(
             limit: usize::MAX,
         })
         .await?
-        .values)
+        .values;
+    Ok(page.iter().map(<[u8]>::to_vec).collect())
 }
 
 async fn put_one(

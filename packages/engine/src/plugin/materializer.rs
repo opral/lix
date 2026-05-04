@@ -204,10 +204,10 @@ mod tests {
         BINARY_CAS_MANIFEST_CHUNK_NAMESPACE, BINARY_CAS_MANIFEST_NAMESPACE,
     };
     use crate::{
-        BackendKvEntry, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup,
+        BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup,
         BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest,
         BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
-        BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
+        BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, BytePageBuilder,
     };
     use async_trait::async_trait;
     use std::io::{Cursor, Write};
@@ -290,7 +290,7 @@ mod tests {
         ) -> Result<BackendKvKeyPage, LixError> {
             let entries = test_kv_scan(&self.archive_bytes, request)?;
             Ok(BackendKvKeyPage {
-                keys: entries.entries.into_iter().map(|entry| entry.key).collect(),
+                keys: entries.keys,
                 resume_after: entries.resume_after,
             })
         }
@@ -301,7 +301,7 @@ mod tests {
         ) -> Result<BackendKvValuePage, LixError> {
             let entries = test_kv_scan(&self.archive_bytes, request)?;
             Ok(BackendKvValuePage {
-                values: entries.entries.into_iter().map(|entry| entry.value).collect(),
+                values: entries.values,
                 resume_after: entries.resume_after,
             })
         }
@@ -373,7 +373,8 @@ mod tests {
     ) -> Result<BackendKvEntryPage, LixError> {
         if request.namespace != BINARY_CAS_MANIFEST_CHUNK_NAMESPACE {
             return Ok(BackendKvEntryPage {
-                entries: Vec::new(),
+                keys: BytePageBuilder::new().finish(),
+                values: BytePageBuilder::new().finish(),
                 resume_after: None,
             });
         }
@@ -384,7 +385,8 @@ mod tests {
         };
         if !include || request.after.as_deref().is_some_and(|after| key.as_slice() <= after) {
             return Ok(BackendKvEntryPage {
-                entries: Vec::new(),
+                keys: BytePageBuilder::new().finish(),
+                values: BytePageBuilder::new().finish(),
                 resume_after: None,
             });
         }
@@ -398,14 +400,18 @@ mod tests {
                 format!("test manifest chunk encode failed: {error}"),
             )
         })?;
-        let mut entries = vec![BackendKvEntry { key, value }];
-        let has_more = entries.len() > request.limit;
-        entries.truncate(request.limit);
-        let resume_after = has_more
-            .then(|| entries.last().map(|entry| entry.key.clone()))
-            .flatten();
+        let mut keys = BytePageBuilder::with_capacity(1, key.len());
+        let mut values = BytePageBuilder::with_capacity(1, value.len());
+        let mut resume_after = None;
+        if request.limit > 0 {
+            resume_after = Some(key.clone());
+            keys.push(&key);
+            values.push(&value);
+        }
+        let resume_after = (request.limit == 0).then_some(resume_after).flatten();
         Ok(BackendKvEntryPage {
-            entries,
+            keys: keys.finish(),
+            values: values.finish(),
             resume_after,
         })
     }

@@ -298,8 +298,8 @@ mod tests {
             })
             .await
             .expect("scan reads");
-        assert_eq!(result.entries[0].key, b"b".to_vec());
-        assert_eq!(result.entries[0].value, b"2".to_vec());
+        assert_eq!(result.key(0).expect("key exists"), b"b");
+        assert_eq!(result.value(0).expect("value exists"), b"2");
 
         let key_only = tx
             .scan_keys(KvScanRequest {
@@ -310,7 +310,7 @@ mod tests {
             })
             .await
             .expect("key-only scan reads");
-        assert_eq!(key_only.keys, vec![b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(key_only.keys.iter().collect::<Vec<_>>(), vec![b"a", b"b"]);
         tx.rollback().await.expect("rollback succeeds");
     }
 }

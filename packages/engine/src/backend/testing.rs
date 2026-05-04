@@ -4,10 +4,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::backend::{
-    Backend, BackendKvEntry, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup,
-    BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest,
-    BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
+    Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetRequest,
+    BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch,
+    BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteStats,
+    BackendReadTransaction, BackendWriteTransaction, BytePageBuilder,
 };
 use crate::LixError;
 
@@ -203,32 +203,37 @@ fn scan_pairs<'a>(
 pub(crate) fn scan_map_keys(kv: &KvMap, request: BackendKvScanRequest) -> BackendKvKeyPage {
     let pairs = scan_filtered_pairs(kv, &request);
     let has_more = pairs.len() > request.limit;
-    let keys = pairs
-        .iter()
-        .take(request.limit)
-        .map(|(key, _)| (*key).clone())
-        .collect::<Vec<_>>();
-    let resume_after = has_more.then(|| keys.last().cloned()).flatten();
-    BackendKvKeyPage { keys, resume_after }
+    let mut keys = BytePageBuilder::with_capacity(request.limit.min(pairs.len()), 0);
+    let mut resume_after = None;
+    for (index, (key, _)) in pairs.into_iter().enumerate() {
+        if index >= request.limit {
+            break;
+        }
+        resume_after = Some(key.clone());
+        keys.push(key);
+    }
+    let resume_after = has_more.then_some(resume_after).flatten();
+    BackendKvKeyPage {
+        keys: keys.finish(),
+        resume_after,
+    }
 }
 
 pub(crate) fn scan_map_values(kv: &KvMap, request: BackendKvScanRequest) -> BackendKvValuePage {
     let pairs = scan_filtered_pairs(kv, &request);
     let has_more = pairs.len() > request.limit;
-    let resume_after = has_more
-        .then(|| {
-            pairs
-                .get(request.limit.saturating_sub(1))
-                .map(|(key, _)| (*key).clone())
-        })
-        .flatten();
-    let values = pairs
-        .into_iter()
-        .take(request.limit)
-        .map(|(_, value)| value.clone())
-        .collect();
+    let mut values = BytePageBuilder::with_capacity(request.limit.min(pairs.len()), 0);
+    let mut resume_after = None;
+    for (index, (key, value)) in pairs.into_iter().enumerate() {
+        if index >= request.limit {
+            break;
+        }
+        resume_after = Some(key.clone());
+        values.push(value);
+    }
+    let resume_after = has_more.then_some(resume_after).flatten();
     BackendKvValuePage {
-        values,
+        values: values.finish(),
         resume_after,
     }
 }
@@ -236,19 +241,21 @@ pub(crate) fn scan_map_values(kv: &KvMap, request: BackendKvScanRequest) -> Back
 pub(crate) fn scan_map_entries(kv: &KvMap, request: BackendKvScanRequest) -> BackendKvEntryPage {
     let pairs = scan_filtered_pairs(kv, &request);
     let has_more = pairs.len() > request.limit;
-    let entries = pairs
-        .iter()
-        .take(request.limit)
-        .map(|(key, value)| BackendKvEntry {
-            key: (*key).clone(),
-            value: (*value).clone(),
-        })
-        .collect::<Vec<_>>();
-    let resume_after = has_more
-        .then(|| entries.last().map(|entry| entry.key.clone()))
-        .flatten();
+    let mut keys = BytePageBuilder::with_capacity(request.limit.min(pairs.len()), 0);
+    let mut values = BytePageBuilder::with_capacity(request.limit.min(pairs.len()), 0);
+    let mut resume_after = None;
+    for (index, (key, value)) in pairs.into_iter().enumerate() {
+        if index >= request.limit {
+            break;
+        }
+        resume_after = Some(key.clone());
+        keys.push(key);
+        values.push(value);
+    }
+    let resume_after = has_more.then_some(resume_after).flatten();
     BackendKvEntryPage {
-        entries,
+        keys: keys.finish(),
+        values: values.finish(),
         resume_after,
     }
 }
@@ -381,10 +388,10 @@ mod tests {
     }
 
     fn assert_entries(page: &BackendKvEntryPage, expected: &[(&[u8], &[u8])]) {
-        assert_eq!(page.entries.len(), expected.len());
-        for (entry, (key, value)) in page.entries.iter().zip(expected) {
-            assert_eq!(entry.key, *key);
-            assert_eq!(entry.value, *value);
+        assert_eq!(page.len(), expected.len());
+        for (index, (key, value)) in expected.iter().enumerate() {
+            assert_eq!(page.key(index).expect("key exists"), *key);
+            assert_eq!(page.value(index).expect("value exists"), *value);
         }
     }
 
@@ -576,7 +583,7 @@ mod tests {
         transaction.commit().await.unwrap();
 
         let page = scan_keys_request(&backend, None, 2).await;
-        assert_eq!(page.keys, vec![b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(page.keys.iter().collect::<Vec<_>>(), vec![b"a", b"b"]);
         assert_eq!(page.resume_after, None);
     }
 

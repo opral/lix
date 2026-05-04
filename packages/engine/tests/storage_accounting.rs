@@ -6,15 +6,25 @@ use lix_engine::storage_bench::{
     StorageBenchSelectivity, StorageBenchUpdateFraction,
 };
 use lix_engine::{
-    Backend, BackendKvEntry, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup,
-    BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest,
-    BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, LixError,
+    Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetRequest,
+    BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch,
+    BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteStats,
+    BackendReadTransaction, BackendWriteTransaction, BytePageBuilder, LixError,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 type Store = BTreeMap<(String, Vec<u8>), Vec<u8>>;
+
+fn byte_page_from_iter(values: impl IntoIterator<Item = Vec<u8>>) -> lix_engine::BytePage {
+    let values = values.into_iter();
+    let (lower_bound, _) = values.size_hint();
+    let mut page = BytePageBuilder::with_capacity(lower_bound, 0);
+    for value in values {
+        page.push(&value);
+    }
+    page.finish()
+}
 
 #[derive(Clone, Default)]
 struct AccountingBackend {
@@ -798,11 +808,7 @@ impl BackendReadTransaction for AccountingTransaction {
             })
             .flatten();
         Ok(BackendKvKeyPage {
-            keys: pairs
-                .into_iter()
-                .take(request.limit)
-                .map(|(key, _)| key)
-                .collect(),
+            keys: byte_page_from_iter(pairs.into_iter().take(request.limit).map(|(key, _)| key)),
             resume_after,
         })
     }
@@ -821,11 +827,12 @@ impl BackendReadTransaction for AccountingTransaction {
             })
             .flatten();
         Ok(BackendKvValuePage {
-            values: pairs
-                .into_iter()
-                .take(request.limit)
-                .map(|(_, value)| value)
-                .collect(),
+            values: byte_page_from_iter(
+                pairs
+                    .into_iter()
+                    .take(request.limit)
+                    .map(|(_, value)| value),
+            ),
             resume_after,
         })
     }
@@ -843,12 +850,15 @@ impl BackendReadTransaction for AccountingTransaction {
                     .map(|(key, _)| key.clone())
             })
             .flatten();
+        let mut keys = BytePageBuilder::with_capacity(request.limit.min(pairs.len()), 0);
+        let mut values = BytePageBuilder::with_capacity(request.limit.min(pairs.len()), 0);
+        for (key, value) in pairs.into_iter().take(request.limit) {
+            keys.push(&key);
+            values.push(&value);
+        }
         Ok(BackendKvEntryPage {
-            entries: pairs
-                .into_iter()
-                .take(request.limit)
-                .map(|(key, value)| BackendKvEntry { key, value })
-                .collect(),
+            keys: keys.finish(),
+            values: values.finish(),
             resume_after,
         })
     }

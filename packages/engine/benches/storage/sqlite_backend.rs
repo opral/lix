@@ -2,10 +2,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lix_engine::{
-    Backend, BackendKvEntry, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup,
-    BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest,
-    BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, LixError,
+    Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetRequest,
+    BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch,
+    BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteStats,
+    BackendReadTransaction, BackendWriteTransaction, BytePageBuilder, LixError,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use tempfile::TempDir;
@@ -290,14 +290,24 @@ fn sqlite_scan_keys(
             limit,
         ])
         .map_err(sqlite_error)?;
-    let mut keys = Vec::new();
+    let mut keys = BytePageBuilder::new();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
     while let Some(row) = cursor.next().map_err(sqlite_error)? {
-        keys.push(row.get::<_, Vec<u8>>(0).map_err(sqlite_error)?);
+        let key = row.get::<_, Vec<u8>>(0).map_err(sqlite_error)?;
+        if count < request.limit {
+            resume_after_candidate = Some(key.clone());
+            keys.push(&key);
+        }
+        count += 1;
     }
-    let has_more = keys.len() > request.limit;
-    keys.truncate(request.limit);
-    let resume_after = has_more.then(|| keys.last().cloned()).flatten();
-    Ok(BackendKvKeyPage { keys, resume_after })
+    let resume_after = (count > request.limit)
+        .then_some(resume_after_candidate)
+        .flatten();
+    Ok(BackendKvKeyPage {
+        keys: keys.finish(),
+        resume_after,
+    })
 }
 
 fn sqlite_scan_values(
@@ -329,19 +339,22 @@ fn sqlite_scan_values(
             limit,
         ])
         .map_err(sqlite_error)?;
-    let mut values = Vec::new();
+    let mut values = BytePageBuilder::new();
+    let mut count = 0;
     let mut resume_after_candidate = None;
     while let Some(row) = cursor.next().map_err(sqlite_error)? {
-        if values.len() < request.limit {
+        if count < request.limit {
             resume_after_candidate = Some(row.get::<_, Vec<u8>>(0).map_err(sqlite_error)?);
+            let value = row.get::<_, Vec<u8>>(1).map_err(sqlite_error)?;
+            values.push(&value);
         }
-        values.push(row.get::<_, Vec<u8>>(1).map_err(sqlite_error)?);
+        count += 1;
     }
-    let has_more = values.len() > request.limit;
-    values.truncate(request.limit);
-    let resume_after = has_more.then_some(resume_after_candidate).flatten();
+    let resume_after = (count > request.limit)
+        .then_some(resume_after_candidate)
+        .flatten();
     Ok(BackendKvValuePage {
-        values,
+        values: values.finish(),
         resume_after,
     })
 }
@@ -375,21 +388,26 @@ fn sqlite_scan_entries(
             limit,
         ])
         .map_err(sqlite_error)?;
-    let mut entries = Vec::new();
+    let mut keys = BytePageBuilder::new();
+    let mut values = BytePageBuilder::new();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
     while let Some(row) = cursor.next().map_err(sqlite_error)? {
         let key = row.get::<_, Vec<u8>>(0).map_err(sqlite_error)?;
-        entries.push(BackendKvEntry {
-            key,
-            value: row.get::<_, Vec<u8>>(1).map_err(sqlite_error)?,
-        });
+        if count < request.limit {
+            let value = row.get::<_, Vec<u8>>(1).map_err(sqlite_error)?;
+            resume_after_candidate = Some(key.clone());
+            keys.push(&key);
+            values.push(&value);
+        }
+        count += 1;
     }
-    let has_more = entries.len() > request.limit;
-    entries.truncate(request.limit);
-    let resume_after = has_more
-        .then(|| entries.last().map(|entry| entry.key.clone()))
+    let resume_after = (count > request.limit)
+        .then_some(resume_after_candidate)
         .flatten();
     Ok(BackendKvEntryPage {
-        entries,
+        keys: keys.finish(),
+        values: values.finish(),
         resume_after,
     })
 }

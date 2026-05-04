@@ -37,18 +37,15 @@ pub(crate) async fn scan_changes(
 ) -> Result<Vec<CanonicalChange>, LixError> {
     // TODO(engine2): scan by a durable append sequence instead of change id.
     // This first index is enough for exact lookup and deterministic debug scans.
-    store
+    let page = store
         .scan_values(KvScanRequest {
             namespace: CHANGELOG_CHANGE_NAMESPACE.to_string(),
             range: KvScanRange::prefix(Vec::new()),
             after: None,
             limit: request.limit.unwrap_or(usize::MAX),
         })
-        .await?
-        .values
-        .into_iter()
-        .map(|value| decode_change(&value))
-        .collect()
+        .await?;
+    page.values.iter().map(decode_change).collect()
 }
 
 pub(crate) async fn append_changes(

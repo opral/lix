@@ -753,17 +753,23 @@ pub(crate) async fn scan_roots(
         KvScanRange::prefix(Vec::new()),
     )
     .await?;
-    pairs
-        .entries
-        .into_iter()
-        .map(|entry| {
-            let commit_id = String::from_utf8(entry.key).map_err(|error| {
+    (0..pairs.len())
+        .map(|index| {
+            let commit_id = String::from_utf8(
+                pairs
+                    .key(index)
+                    .expect("tracked-state root key exists")
+                    .to_vec(),
+            )
+            .map_err(|error| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!("tracked-state tree root key is invalid UTF-8: {error}"),
                 )
             })?;
-            let root_id = TrackedStateRootId::from_slice(&entry.value)?;
+            let root_id = TrackedStateRootId::from_slice(
+                pairs.value(index).expect("tracked-state root value exists"),
+            )?;
             Ok((commit_id, root_id))
         })
         .collect()

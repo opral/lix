@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 
 use crate::backend;
+use crate::backend::BytePage;
 use crate::LixError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,7 +245,7 @@ impl From<KvScanRequest> for backend::BackendKvScanRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KvKeyPage {
-    pub(crate) keys: Vec<Vec<u8>>,
+    pub(crate) keys: BytePage,
     pub(crate) resume_after: Option<Vec<u8>>,
 }
 
@@ -259,7 +260,7 @@ impl From<backend::BackendKvKeyPage> for KvKeyPage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KvValuePage {
-    pub(crate) values: Vec<Vec<u8>>,
+    pub(crate) values: BytePage,
     pub(crate) resume_after: Option<Vec<u8>>,
 }
 
@@ -274,31 +275,36 @@ impl From<backend::BackendKvValuePage> for KvValuePage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KvEntryPage {
-    pub(crate) entries: Vec<KvEntry>,
+    pub(crate) keys: BytePage,
+    pub(crate) values: BytePage,
     pub(crate) resume_after: Option<Vec<u8>>,
 }
 
 impl From<backend::BackendKvEntryPage> for KvEntryPage {
     fn from(result: backend::BackendKvEntryPage) -> Self {
         Self {
-            entries: result.entries.into_iter().map(Into::into).collect(),
+            keys: result.keys,
+            values: result.values,
             resume_after: result.resume_after,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct KvEntry {
-    pub(crate) key: Vec<u8>,
-    pub(crate) value: Vec<u8>,
-}
+impl KvEntryPage {
+    pub(crate) fn len(&self) -> usize {
+        self.keys.len()
+    }
 
-impl From<backend::BackendKvEntry> for KvEntry {
-    fn from(entry: backend::BackendKvEntry) -> Self {
-        Self {
-            key: entry.key,
-            value: entry.value,
-        }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    pub(crate) fn key(&self, index: usize) -> Option<&[u8]> {
+        self.keys.get(index)
+    }
+
+    pub(crate) fn value(&self, index: usize) -> Option<&[u8]> {
+        self.values.get(index)
     }
 }
 

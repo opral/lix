@@ -4,10 +4,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lix_engine::{
-    Backend, BackendKvEntry, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup,
-    BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest,
-    BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, Engine, LixError,
+    Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetRequest,
+    BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch,
+    BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteStats,
+    BackendReadTransaction, BackendWriteTransaction, BytePageBuilder, Engine, LixError,
 };
 
 type KvKey = (String, Vec<u8>);
@@ -258,7 +258,7 @@ impl BackendReadTransaction for RecordingTransaction {
     ) -> Result<BackendKvKeyPage, LixError> {
         let entries = self.scan_visible_entries(request)?;
         Ok(BackendKvKeyPage {
-            keys: entries.entries.into_iter().map(|entry| entry.key).collect(),
+            keys: entries.keys,
             resume_after: entries.resume_after,
         })
     }
@@ -270,11 +270,7 @@ impl BackendReadTransaction for RecordingTransaction {
         self.fail_if_scan_namespace_matches(&request)?;
         let entries = self.scan_visible_entries(request)?;
         Ok(BackendKvValuePage {
-            values: entries
-                .entries
-                .into_iter()
-                .map(|entry| entry.value)
-                .collect(),
+            values: entries.values,
             resume_after: entries.resume_after,
         })
     }
@@ -406,12 +402,15 @@ fn scan_map(map: &KvMap, request: &BackendKvScanRequest) -> BackendKvEntryPage {
     let resume_after = has_more
         .then(|| pairs.last().map(|(key, _)| key.clone()))
         .flatten();
-    let entries = pairs
-        .into_iter()
-        .map(|(key, value)| BackendKvEntry { key, value })
-        .collect();
+    let mut keys = BytePageBuilder::with_capacity(pairs.len(), 0);
+    let mut values = BytePageBuilder::with_capacity(pairs.len(), 0);
+    for (key, value) in pairs {
+        keys.push(key);
+        values.push(value);
+    }
     BackendKvEntryPage {
-        entries,
+        keys: keys.finish(),
+        values: values.finish(),
         resume_after,
     }
 }
