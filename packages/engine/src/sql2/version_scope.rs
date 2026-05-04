@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use datafusion::error::DataFusionError;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::scalar::ScalarValue;
@@ -23,6 +24,12 @@ pub(crate) enum SqlVersionScope {
 pub(crate) enum VersionBinding {
     Active { version_id: String },
     Explicit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WriteVersionScope {
+    pub(crate) version_id: String,
+    pub(crate) global: bool,
 }
 
 impl VersionBinding {
@@ -52,6 +59,44 @@ impl VersionBinding {
             )),
         }
     }
+}
+
+pub(crate) fn resolve_write_version_scope(
+    explicit_global: Option<bool>,
+    explicit_version_id: Option<String>,
+    fallback_version_id: Option<&str>,
+    operation: &str,
+    surface: &str,
+) -> Result<WriteVersionScope, DataFusionError> {
+    if explicit_global == Some(true) {
+        if explicit_version_id
+            .as_deref()
+            .is_some_and(|version_id| version_id != GLOBAL_VERSION_ID)
+        {
+            return Err(DataFusionError::Execution(format!(
+                "{surface} cannot set lixcol_global=true with non-global lixcol_version_id"
+            )));
+        }
+        return Ok(WriteVersionScope {
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            global: true,
+        });
+    }
+
+    let version_id = explicit_version_id
+        .or_else(|| fallback_version_id.map(ToOwned::to_owned))
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!("{operation} requires lixcol_version_id"))
+        })?;
+    if explicit_global == Some(false) && version_id == GLOBAL_VERSION_ID {
+        return Err(DataFusionError::Execution(format!(
+            "{surface} cannot set lixcol_global=false with global lixcol_version_id"
+        )));
+    }
+    Ok(WriteVersionScope {
+        global: explicit_global.unwrap_or(version_id == GLOBAL_VERSION_ID),
+        version_id,
+    })
 }
 
 impl SqlVersionScope {
@@ -238,6 +283,88 @@ mod tests {
                 "version-b".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn write_scope_uses_fallback_version_when_version_is_implicit() {
+        let scope = resolve_write_version_scope(
+            None,
+            None,
+            Some("active-version"),
+            "INSERT into surface",
+            "surface",
+        )
+        .expect("scope should resolve");
+
+        assert_eq!(
+            scope,
+            WriteVersionScope {
+                version_id: "active-version".to_string(),
+                global: false,
+            }
+        );
+    }
+
+    #[test]
+    fn write_scope_requires_version_without_fallback() {
+        let error = resolve_write_version_scope(None, None, None, "INSERT into surface", "surface")
+            .expect_err("missing version should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("INSERT into surface requires lixcol_version_id"));
+    }
+
+    #[test]
+    fn write_scope_derives_global_from_global_version_id() {
+        let scope = resolve_write_version_scope(
+            None,
+            Some(GLOBAL_VERSION_ID.to_string()),
+            None,
+            "INSERT into surface",
+            "surface",
+        )
+        .expect("scope should resolve");
+
+        assert_eq!(
+            scope,
+            WriteVersionScope {
+                version_id: GLOBAL_VERSION_ID.to_string(),
+                global: true,
+            }
+        );
+    }
+
+    #[test]
+    fn write_scope_rejects_non_global_with_global_version_id() {
+        let error = resolve_write_version_scope(
+            Some(false),
+            Some(GLOBAL_VERSION_ID.to_string()),
+            None,
+            "INSERT into surface",
+            "surface",
+        )
+        .expect_err("conflicting global/version scope should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("surface cannot set lixcol_global=false with global lixcol_version_id"));
+    }
+
+    #[test]
+    fn write_scope_rejects_global_with_non_global_version_id() {
+        let error = resolve_write_version_scope(
+            Some(true),
+            Some("version-a".to_string()),
+            None,
+            "INSERT into surface",
+            "surface",
+        )
+        .expect_err("conflicting global/version scope should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("surface cannot set lixcol_global=true with non-global lixcol_version_id"));
     }
 
     struct RowsVersionRefReader {

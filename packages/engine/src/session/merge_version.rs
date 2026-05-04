@@ -155,9 +155,11 @@ impl SessionContext {
                 }
 
                 let applied_change_count = adopted_changes.len();
-                transaction.stage_write(StageWrite::AdoptedChanges {
-                    changes: adopted_changes,
-                })?;
+                transaction
+                    .stage_write(StageWrite::AdoptedChanges {
+                        changes: adopted_changes,
+                    })
+                    .await?;
                 let created_merge_commit_id = transaction
                     .staged_commit_id(&active_version_id)?
                     .ok_or_else(|| {

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -20,7 +21,9 @@ use crate::transaction::commit;
 use crate::transaction::live_state_overlay::overlay_scan_rows;
 use crate::transaction::normalization::TransactionSchemaCatalog;
 use crate::transaction::staging::TransactionStagedWrites;
-use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWriteOutcome};
+use crate::transaction::types::{
+    StageFileData, StageRow, StageWrite, StageWriteMode, StageWriteOutcome,
+};
 use crate::transaction::validation::{validate_staged_writes, TransactionValidationInput};
 use crate::version::{VersionContext, VersionRefReader};
 use crate::GLOBAL_VERSION_ID;
@@ -193,18 +196,50 @@ impl Transaction {
     /// so generated timestamps, change ids, commit ids, and commit membership
     /// stay in one place.
     #[allow(dead_code)]
-    pub(crate) fn stage_write(&self, write: StageWrite) -> Result<(), LixError> {
-        self.staged_writes.stage_write(write)?;
-        Ok(())
+    pub(crate) async fn stage_write(
+        &mut self,
+        write: StageWrite,
+    ) -> Result<StageWriteOutcome, LixError> {
+        require_valid_stage_write_storage_scopes(&write)?;
+        self.require_existing_stage_write_version_ids(&write)
+            .await?;
+        self.staged_writes.stage_write(write)
     }
 
     /// Convenience helper for programmatic APIs that only stage state rows.
     #[allow(dead_code)]
-    pub(crate) fn stage_rows(&self, rows: Vec<StageRow>) -> Result<(), LixError> {
+    pub(crate) async fn stage_rows(
+        &mut self,
+        rows: Vec<StageRow>,
+    ) -> Result<StageWriteOutcome, LixError> {
         self.stage_write(StageWrite::Rows {
             mode: StageWriteMode::Replace,
             rows,
         })
+        .await
+    }
+
+    async fn require_existing_stage_write_version_ids(
+        &mut self,
+        write: &StageWrite,
+    ) -> Result<(), LixError> {
+        let version_ids = stage_write_version_ids(write);
+        let reader = self
+            .version_ctx
+            .ref_reader(self.storage_transaction.as_mut());
+        for version_id in version_ids {
+            if version_id == GLOBAL_VERSION_ID {
+                continue;
+            }
+            if reader.load_head_commit_id(&version_id).await?.is_none() {
+                return Err(LixError::version_not_found(
+                    version_id,
+                    "stage_write",
+                    "target",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Returns the active version resolved inside this write transaction.
@@ -353,8 +388,60 @@ impl SqlWriteExecutionContext for Transaction {
     }
 
     async fn stage_write(&mut self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
-        self.staged_writes.stage_write(write)
+        Transaction::stage_write(self, write).await
     }
+}
+
+fn stage_write_version_ids(write: &StageWrite) -> BTreeSet<String> {
+    match write {
+        StageWrite::Rows { rows, .. } => stage_row_version_ids(rows),
+        StageWrite::RowsWithFileData {
+            rows, file_data, ..
+        } => stage_row_version_ids(rows)
+            .into_iter()
+            .chain(stage_file_data_version_ids(file_data))
+            .collect(),
+        StageWrite::AdoptedChanges { changes } => changes
+            .iter()
+            .map(|change| change.version_id.clone())
+            .collect(),
+    }
+}
+
+fn require_valid_stage_write_storage_scopes(write: &StageWrite) -> Result<(), LixError> {
+    match write {
+        StageWrite::Rows { rows, .. } => require_valid_stage_row_storage_scopes(rows),
+        StageWrite::RowsWithFileData { rows, .. } => require_valid_stage_row_storage_scopes(rows),
+        StageWrite::AdoptedChanges { .. } => Ok(()),
+    }
+}
+
+fn require_valid_stage_row_storage_scopes(rows: &[StageRow]) -> Result<(), LixError> {
+    for row in rows {
+        require_valid_storage_scope(row.version_id.as_str(), row.global)?;
+    }
+    Ok(())
+}
+
+fn require_valid_storage_scope(version_id: &str, global: bool) -> Result<(), LixError> {
+    if global != (version_id == GLOBAL_VERSION_ID) {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_STORAGE_SCOPE,
+            format!("invalid storage scope: version_id='{version_id}', global={global}"),
+        ));
+    }
+    Ok(())
+}
+
+fn stage_row_version_ids(rows: &[StageRow]) -> BTreeSet<String> {
+    rows.iter().map(|row| row.version_id.clone()).collect()
+}
+
+fn stage_file_data_version_ids(file_data: &[StageFileData]) -> BTreeSet<String> {
+    file_data
+        .iter()
+        .map(|write| write.version_id.clone())
+        .collect()
 }
 
 async fn resolve_active_version_id(
@@ -477,7 +564,7 @@ mod tests {
         )
         .await
         .expect("transaction should open");
-        let transaction = opened.transaction;
+        let mut transaction = opened.transaction;
         let runtime_functions = opened.runtime_functions;
 
         transaction
@@ -485,6 +572,7 @@ mod tests {
                 key_value_stage_row("tracked-programmatic", "tracked", false),
                 key_value_stage_row("untracked-programmatic", "untracked", true),
             ])
+            .await
             .expect("programmatic rows should stage");
         transaction
             .commit(&runtime_functions)
@@ -605,13 +693,14 @@ mod tests {
         )
         .await
         .expect("transaction should open");
-        let transaction = opened.transaction;
+        let mut transaction = opened.transaction;
         let runtime_functions = opened.runtime_functions;
 
         let mut invalid_row = key_value_stage_row("invalid-programmatic", "invalid", false);
         invalid_row.snapshot_content = Some("{\"key\":\"invalid-programmatic\"}".to_string());
         transaction
             .stage_rows(vec![invalid_row])
+            .await
             .expect("invalid row should still reach commit validation");
 
         let error = transaction
@@ -647,13 +736,14 @@ mod tests {
     async fn commit_rejects_non_object_metadata_without_sql() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(Arc::clone(&backend));
-        let (live_state, _binary_cas, changelog, version_ref, runtime_functions, transaction) =
+        let (live_state, _binary_cas, changelog, version_ref, runtime_functions, mut transaction) =
             open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("invalid-metadata", "value", false);
         row.metadata = Some(json!("not-an-object"));
         transaction
             .stage_rows(vec![row])
+            .await
             .expect("row should stage before metadata validation");
 
         let error = transaction
@@ -678,14 +768,21 @@ mod tests {
     #[tokio::test]
     async fn stage_rows_rejects_unknown_schema_key_without_sql() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let (_live_state, _binary_cas, _changelog, _version_ref, _runtime_functions, transaction) =
-            open_test_transaction(&backend).await;
+        let (
+            _live_state,
+            _binary_cas,
+            _changelog,
+            _version_ref,
+            _runtime_functions,
+            mut transaction,
+        ) = open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("unknown-schema", "value", false);
         row.schema_key = "missing_schema".to_string();
 
         let error = transaction
             .stage_rows(vec![row])
+            .await
             .expect_err("unknown schema should be rejected while staging");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
@@ -698,16 +795,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stage_rows_rejects_missing_version_without_sql() {
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let (
+            _live_state,
+            _binary_cas,
+            _changelog,
+            _version_ref,
+            _runtime_functions,
+            mut transaction,
+        ) = open_test_transaction(&backend).await;
+
+        let mut row = key_value_stage_row("ghost-version-row", "value", false);
+        row.version_id = "ghost-version".to_string();
+        row.global = false;
+
+        let error = transaction
+            .stage_rows(vec![row])
+            .await
+            .expect_err("missing version should be rejected before staging");
+
+        assert_eq!(error.code, LixError::CODE_VERSION_NOT_FOUND);
+        assert!(
+            error
+                .message
+                .contains("version 'ghost-version' was not found"),
+            "error should explain missing version: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_rows_rejects_invalid_storage_scope_without_sql() {
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let (
+            _live_state,
+            _binary_cas,
+            _changelog,
+            _version_ref,
+            _runtime_functions,
+            mut transaction,
+        ) = open_test_transaction(&backend).await;
+
+        let mut row = key_value_stage_row("invalid-storage-scope", "value", false);
+        row.version_id = GLOBAL_VERSION_ID.to_string();
+        row.global = false;
+
+        let error = transaction
+            .stage_rows(vec![row])
+            .await
+            .expect_err("invalid storage scope should be rejected before staging");
+
+        assert_eq!(error.code, LixError::CODE_INVALID_STORAGE_SCOPE);
+        assert!(
+            error.message.contains("version_id='global', global=false"),
+            "error should explain invalid storage scope: {error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn stage_rows_rejects_unknown_schema_version_without_sql() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let (_live_state, _binary_cas, _changelog, _version_ref, _runtime_functions, transaction) =
-            open_test_transaction(&backend).await;
+        let (
+            _live_state,
+            _binary_cas,
+            _changelog,
+            _version_ref,
+            _runtime_functions,
+            mut transaction,
+        ) = open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("unknown-version", "value", false);
         row.schema_version = "999".to_string();
 
         let error = transaction
             .stage_rows(vec![row])
+            .await
             .expect_err("unknown schema version should be rejected while staging");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
@@ -722,14 +884,21 @@ mod tests {
     #[tokio::test]
     async fn stage_rows_rejects_invalid_snapshot_json_without_sql() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let (_live_state, _binary_cas, _changelog, _version_ref, _runtime_functions, transaction) =
-            open_test_transaction(&backend).await;
+        let (
+            _live_state,
+            _binary_cas,
+            _changelog,
+            _version_ref,
+            _runtime_functions,
+            mut transaction,
+        ) = open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("invalid-json", "value", false);
         row.snapshot_content = Some("{".to_string());
 
         let error = transaction
             .stage_rows(vec![row])
+            .await
             .expect_err("invalid JSON should be rejected while staging");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
@@ -743,13 +912,14 @@ mod tests {
     async fn commit_rejects_snapshot_that_violates_json_schema_without_sql() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(Arc::clone(&backend));
-        let (live_state, _binary_cas, changelog, version_ref, runtime_functions, transaction) =
+        let (live_state, _binary_cas, changelog, version_ref, runtime_functions, mut transaction) =
             open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("schema-mismatch", "value", false);
         row.snapshot_content = Some(r#"{"key":"schema-mismatch"}"#.to_string());
         transaction
             .stage_rows(vec![row])
+            .await
             .expect("row should stage before JSON Schema validation");
 
         let error = transaction
@@ -774,8 +944,14 @@ mod tests {
     #[tokio::test]
     async fn stage_rows_rejects_malformed_registered_schema_without_sql() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let (_live_state, _binary_cas, _changelog, _version_ref, _runtime_functions, transaction) =
-            open_test_transaction(&backend).await;
+        let (
+            _live_state,
+            _binary_cas,
+            _changelog,
+            _version_ref,
+            _runtime_functions,
+            mut transaction,
+        ) = open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("malformed-registered-schema", "value", false);
         row.schema_key = "lix_registered_schema".to_string();
@@ -791,6 +967,7 @@ mod tests {
 
         let error = transaction
             .stage_rows(vec![row])
+            .await
             .expect_err("malformed registered schema should be rejected while staging");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
@@ -804,14 +981,21 @@ mod tests {
     #[tokio::test]
     async fn stage_rows_rejects_primary_key_entity_id_mismatch_without_sql() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let (_live_state, _binary_cas, _changelog, _version_ref, _runtime_functions, transaction) =
-            open_test_transaction(&backend).await;
+        let (
+            _live_state,
+            _binary_cas,
+            _changelog,
+            _version_ref,
+            _runtime_functions,
+            mut transaction,
+        ) = open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("right-id", "value", false);
         row.entity_id = Some(crate::entity_identity::EntityIdentity::single("wrong-id"));
 
         let error = transaction
             .stage_rows(vec![row])
+            .await
             .expect_err("entity id mismatch should be rejected while staging");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
