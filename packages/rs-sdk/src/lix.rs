@@ -5,8 +5,9 @@ use async_trait::async_trait;
 use lix_engine::{
     Backend, BackendReadTransaction, BackendWriteTransaction, CreateVersionOptions,
     CreateVersionReceipt as CreateVersionResult, Engine, ExecuteResult, LixError,
-    MergeVersionOptions, MergeVersionReceipt as MergeVersionResult, SessionContext,
-    SwitchVersionOptions, SwitchVersionReceipt as SwitchVersionResult, Value,
+    MergeVersionOptions, MergeVersionPreview, MergeVersionPreviewOptions,
+    MergeVersionReceipt as MergeVersionResult, SessionContext, SwitchVersionOptions,
+    SwitchVersionReceipt as SwitchVersionResult, Value,
 };
 
 use crate::in_memory_backend::InMemoryBackend;
@@ -81,6 +82,13 @@ impl Lix {
         options: MergeVersionOptions,
     ) -> Result<MergeVersionResult, LixError> {
         self.session.merge_version(options).await
+    }
+
+    pub async fn merge_version_preview(
+        &self,
+        options: MergeVersionPreviewOptions,
+    ) -> Result<MergeVersionPreview, LixError> {
+        self.session.merge_version_preview(options).await
     }
 
     pub async fn close(&self) -> Result<(), LixError> {

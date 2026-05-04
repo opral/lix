@@ -74,6 +74,7 @@ type Lix = {
   activeVersionId(): Promise<string>;
   createVersion(options: { id?: string; name: string }): Promise<{ versionId: string }>;
   switchVersion(options: { versionId: string }): Promise<{ versionId: string }>;
+  mergeVersionPreview(options: { sourceVersionId: string }): Promise<MergeVersionPreviewResult>;
   mergeVersion(options: { sourceVersionId: string }): Promise<MergeVersionResult>;
   close(): Promise<void>;
 };
@@ -195,8 +196,8 @@ if (sideBySide.kind === "rows") {
 // 5. Merge Marketing and Legal into Published. Different entities → both succeed.
 const m1 = await lix.mergeVersion({ sourceVersionId: marketing.versionId });
 const m2 = await lix.mergeVersion({ sourceVersionId: legal.versionId });
-console.log(`\nMarketing merge: ${m1.outcome} (+${m1.appliedChangeCount} changes)`);
-console.log(`Legal merge:     ${m2.outcome} (+${m2.appliedChangeCount} changes)`);
+console.log(`\nMarketing merge: ${m1.outcome} (+${m1.changeStats.total} changes)`);
+console.log(`Legal merge:     ${m2.outcome} (+${m2.changeStats.total} changes)`);
 
 const finalState = await lix.execute(
   `SELECT kind, text FROM acme_section
@@ -242,7 +243,7 @@ await lix.close();
 What gets printed, in order:
 
 - One SELECT shows the same brochure across four versions, each section with its own per-version text — versioning lives *in the query layer*.
-- Two `mergeCommitted` outcomes with non-zero `appliedChangeCount`.
+- Two `mergeCommitted` outcomes with non-zero `changeStats.total`.
 - A final Published brochure with **Marketing's headline AND Legal's disclaimer** — clean per-row merge.
 - An audit trail straight out of `lix_change`, ordered by `created_at`.
 - A caught conflict from the version that re-edited Marketing's section.
@@ -377,20 +378,50 @@ The result is a structured receipt:
 
 ```ts
 type MergeVersionResult = {
-  outcome: "alreadyUpToDate" | "mergeCommitted";
-  appliedChangeCount: number;
+  outcome: "alreadyUpToDate" | "fastForward" | "mergeCommitted";
+  changeStats: {
+    total: number;
+    added: number;
+    modified: number;
+    removed: number;
+  };
   targetVersionId: string;
   sourceVersionId: string;
-  mergeBaseCommitId: string | null;
+  baseCommitId: string;
   targetHeadBeforeCommitId: string;
   sourceHeadBeforeCommitId: string;
   targetHeadAfterCommitId: string;
   createdMergeCommitId: string | null;
 };
+
+type MergeVersionPreviewResult = {
+  outcome: "alreadyUpToDate" | "fastForward" | "mergeCommitted";
+  changeStats: {
+    total: number;
+    added: number;
+    modified: number;
+    removed: number;
+  };
+  targetVersionId: string;
+  sourceVersionId: string;
+  baseCommitId: string;
+  targetHeadCommitId: string;
+  sourceHeadCommitId: string;
+  conflicts: Array<{
+    kind: "sameEntityChanged";
+    schemaKey: string;
+    entityId: string;
+    fileId: string | null;
+    target: { kind: "added" | "modified" | "removed"; beforeChangeId: string | null; afterChangeId: string | null };
+    source: { kind: "added" | "modified" | "removed"; beforeChangeId: string | null; afterChangeId: string | null };
+  }>;
+};
 ```
 
-- `outcome: "alreadyUpToDate"` — the source has no commits the target lacks (including self-merge). Nothing applied.
-- `outcome: "mergeCommitted"` — a new merge commit was created; `appliedChangeCount > 0` and `createdMergeCommitId` is set.
+- `outcome: "alreadyUpToDate"` — the source has no commits the target lacks. Nothing applied.
+- `mergeVersionPreview()` returns the same outcome and change stats without advancing refs, staging changes, or creating commits. Merge conflicts are returned as `conflicts` data in the preview.
+- `outcome: "fastForward"` — the target ref advanced to the source head without creating a merge commit; `changeStats` counts source-side tracked changes made visible in the target, and `createdMergeCommitId` is `null`.
+- `outcome: "mergeCommitted"` — a new merge commit was created; `changeStats` counts source-side tracked changes adopted into the target, and `createdMergeCommitId` is set.
 
 **Conflicts throw.** If both versions modified the same entity (the same row, identified by `x-lix-key` + primary key) since their merge base, `mergeVersion` raises a `LixError` with a message like `engine2 merge_version found N tracked-state conflict(s)`. Conflicts are detected at row identity, not at field level — disjoint-field edits to the same row still conflict. The current SDK does not expose programmatic conflict resolution — wrap in `try/catch` and surface the error to the user (see the canonical demo above).
 
