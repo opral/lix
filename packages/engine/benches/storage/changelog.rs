@@ -110,6 +110,76 @@ pub(crate) fn bench(c: &mut Criterion, runtime: &Runtime, args: Args) {
             BatchSize::LargeInput,
         )
     });
+    group.bench_function("scan_change_ids_only/10k", |b| {
+        b.iter_batched(
+            || prepare_read(runtime, args),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::changelog_scan_change_ids_only_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("changelog/scan_change_ids_only succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+    group.bench_function("scan_full_changes/10k", |b| {
+        b.iter_batched(
+            || prepare_read(runtime, args),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::changelog_scan_full_changes_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("changelog/scan_full_changes succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+    for (label, bytes, rows, row_label) in [
+        ("1k", 1024, 10_000, "10k"),
+        ("16k", 16 * 1024, 1_000, "1k"),
+    ] {
+        let config = config(&args)
+            .with_state_payload_bytes(bytes)
+            .with_rows(rows);
+        let name = format!("scan_change_ids_only_payload_{label}/{row_label}");
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || prepare_read_with(runtime, config),
+                |(backend, fixture)| {
+                    black_box(
+                        runtime
+                            .block_on(storage_bench::changelog_scan_change_ids_only_prepared(
+                                &backend, &fixture,
+                            ))
+                            .expect("changelog/scan_change_ids_only payload succeeds"),
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        });
+        let name = format!("scan_full_changes_payload_{label}/{row_label}");
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || prepare_read_with(runtime, config),
+                |(backend, fixture)| {
+                    black_box(
+                        runtime
+                            .block_on(storage_bench::changelog_scan_full_changes_prepared(
+                                &backend, &fixture,
+                            ))
+                            .expect("changelog/scan_full_changes payload succeeds"),
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        });
+    }
     group.bench_function("scan_limit_100/10k", |b| {
         b.iter_batched(
             || prepare_read(runtime, args),
@@ -461,6 +531,22 @@ fn prepare_read(
             config(&args),
         ))
         .expect("prepare changelog/read");
+    (backend, fixture)
+}
+
+fn prepare_read_with(
+    runtime: &Runtime,
+    config: StorageBenchConfig,
+) -> (
+    std::sync::Arc<dyn lix_engine::Backend + Send + Sync>,
+    lix_engine::storage_bench::ChangelogReadFixture,
+) {
+    let backend = BenchBackend::new();
+    let fixture = runtime
+        .block_on(storage_bench::prepare_changelog_read(
+            &backend, config,
+        ))
+        .expect("prepare changelog/read variant");
     (backend, fixture)
 }
 

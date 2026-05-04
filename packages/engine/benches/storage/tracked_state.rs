@@ -77,6 +77,107 @@ pub(crate) fn bench(c: &mut Criterion, runtime: &Runtime, args: Args) {
             BatchSize::LargeInput,
         )
     });
+    group.bench_function("scan_keys_only/10k", |b| {
+        b.iter_batched(
+            || prepare_read(runtime, args),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::tracked_state_scan_keys_only_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("tracked_state/scan_keys_only succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+    group.bench_function("scan_headers_only/10k", |b| {
+        b.iter_batched(
+            || prepare_read(runtime, args),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::tracked_state_scan_headers_only_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("tracked_state/scan_headers_only succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+    group.bench_function("scan_full_rows/10k", |b| {
+        b.iter_batched(
+            || prepare_read(runtime, args),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::tracked_state_scan_full_rows_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("tracked_state/scan_full_rows succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+    for (label, bytes, rows, row_label) in [
+        ("1k", 1024, 10_000, "10k"),
+        ("16k", 16 * 1024, 1_000, "1k"),
+    ] {
+        let config = config(&args)
+            .with_state_payload_bytes(bytes)
+            .with_rows(rows);
+        let name = format!("scan_keys_only_payload_{label}/{row_label}");
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || prepare_read_with(runtime, args, config),
+                |(backend, fixture)| {
+                    black_box(
+                        runtime
+                            .block_on(storage_bench::tracked_state_scan_keys_only_prepared(
+                                &backend, &fixture,
+                            ))
+                            .expect("tracked_state/scan_keys_only payload succeeds"),
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        });
+        let name = format!("scan_headers_only_payload_{label}/{row_label}");
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || prepare_read_with(runtime, args, config),
+                |(backend, fixture)| {
+                    black_box(
+                        runtime
+                            .block_on(storage_bench::tracked_state_scan_headers_only_prepared(
+                                &backend, &fixture,
+                            ))
+                            .expect("tracked_state/scan_headers_only payload succeeds"),
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        });
+        let name = format!("scan_full_rows_payload_{label}/{row_label}");
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || prepare_read_with(runtime, args, config),
+                |(backend, fixture)| {
+                    black_box(
+                        runtime
+                            .block_on(storage_bench::tracked_state_scan_full_rows_prepared(
+                                &backend, &fixture,
+                            ))
+                            .expect("tracked_state/scan_full_rows payload succeeds"),
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        });
+    }
     group.bench_function("scan_schema/10k", |b| {
         b.iter_batched(
             || prepare_read(runtime, args),
