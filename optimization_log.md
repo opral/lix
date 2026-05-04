@@ -606,6 +606,8 @@ Did not work: this is optimized for ordered/dense key batches; sparse random bat
 
 ## 2026-05-04 12:23 PDT: Storage KV RowBatch Boundary
 
+Commit: `f9890744`
+
 Change: backend/storage get and scan results now return `KvRowBatch` / `BackendKvRowBatch` with indexed accessors instead of public per-row/per-entry structs; the final representation uses one private row vector after a parallel-vector prototype regressed scan paths.
 
 | Benchmark / Workload                      |   Before |    After |       Delta |
