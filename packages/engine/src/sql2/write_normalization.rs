@@ -1,10 +1,95 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result, ScalarValue};
+use datafusion::physical_expr::expressions::{CastExpr, Literal};
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::ExecutionPlan;
+
+#[derive(Debug, Clone)]
+pub(crate) enum SqlCell {
+    Null,
+    Value(ScalarValue),
+}
+
+impl SqlCell {
+    pub(crate) fn from_scalar(value: ScalarValue) -> Self {
+        if value.is_null() {
+            Self::Null
+        } else {
+            Self::Value(value)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum InsertCell {
+    Omitted,
+    Provided(SqlCell),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum UpdateCell {
+    Unassigned,
+    Assigned(SqlCell),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InsertColumnIntents {
+    explicit_columns: Option<BTreeSet<String>>,
+}
+
+impl InsertColumnIntents {
+    pub(crate) fn all_explicit() -> Self {
+        Self {
+            explicit_columns: None,
+        }
+    }
+
+    pub(crate) fn from_input(input: &Arc<dyn ExecutionPlan>) -> Self {
+        let Some(projection) = input.as_any().downcast_ref::<ProjectionExec>() else {
+            return Self {
+                explicit_columns: None,
+            };
+        };
+
+        let explicit_columns = projection
+            .expr()
+            .iter()
+            .filter(|expr| !is_generated_null_default(expr.expr.as_ref()))
+            .map(|expr| expr.alias.clone())
+            .collect();
+
+        Self {
+            explicit_columns: Some(explicit_columns),
+        }
+    }
+
+    pub(crate) fn includes_column(&self, column_name: &str) -> bool {
+        self.explicit_columns
+            .as_ref()
+            .is_none_or(|columns| columns.contains(column_name))
+    }
+
+    pub(crate) fn cell(
+        &self,
+        batch: &RecordBatch,
+        row_index: usize,
+        column_name: &str,
+    ) -> Result<InsertCell> {
+        if !self.includes_column(column_name) {
+            return Ok(InsertCell::Omitted);
+        }
+
+        optional_scalar_value(batch, row_index, column_name).map(|value| match value {
+            None => InsertCell::Omitted,
+            Some(value) => InsertCell::Provided(SqlCell::from_scalar(value)),
+        })
+    }
+}
 
 pub(crate) struct UpdateAssignmentValues {
     values: BTreeMap<String, ArrayRef>,
@@ -25,22 +110,51 @@ impl UpdateAssignmentValues {
         Ok(Self { values })
     }
 
-    pub(crate) fn scalar_value(
+    #[cfg(test)]
+    pub(crate) fn from_batch_columns(batch: &RecordBatch, columns: &[&str]) -> Self {
+        let values = columns
+            .iter()
+            .filter_map(|column_name| {
+                let column_index = batch.schema().index_of(column_name).ok()?;
+                Some((
+                    (*column_name).to_string(),
+                    Arc::clone(batch.column(column_index)),
+                ))
+            })
+            .collect();
+        Self { values }
+    }
+
+    pub(crate) fn assigned_cell(&self, row_index: usize, column_name: &str) -> Result<UpdateCell> {
+        let Some(array) = self.values.get(column_name) else {
+            return Ok(UpdateCell::Unassigned);
+        };
+
+        ScalarValue::try_from_array(array.as_ref(), row_index)
+            .map(SqlCell::from_scalar)
+            .map(UpdateCell::Assigned)
+            .map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "failed to decode SQL UPDATE assignment for column '{column_name}' at row {row_index}: {error}"
+                ))
+            })
+    }
+
+    pub(crate) fn effective_cell(
         &self,
         batch: &RecordBatch,
         row_index: usize,
         column_name: &str,
-    ) -> Result<Option<ScalarValue>> {
-        if let Some(array) = self.values.get(column_name) {
-            return ScalarValue::try_from_array(array.as_ref(), row_index)
-                .map(Some)
-                .map_err(|error| {
-                    DataFusionError::Execution(format!(
-                        "failed to decode SQL UPDATE assignment for column '{column_name}' at row {row_index}: {error}"
-                    ))
-                });
+    ) -> Result<InsertCell> {
+        match self.assigned_cell(row_index, column_name)? {
+            UpdateCell::Assigned(value) => Ok(InsertCell::Provided(value)),
+            UpdateCell::Unassigned => {
+                optional_scalar_value(batch, row_index, column_name).map(|value| match value {
+                    None => InsertCell::Omitted,
+                    Some(value) => InsertCell::Provided(SqlCell::from_scalar(value)),
+                })
+            }
         }
-        optional_scalar_value(batch, row_index, column_name)
     }
 }
 
@@ -67,4 +181,16 @@ pub(crate) fn optional_scalar_value(
                 "failed to decode SQL write column '{column_name}' at row {row_index}: {error}"
             ))
         })
+}
+
+fn is_generated_null_default(expr: &dyn PhysicalExpr) -> bool {
+    if let Some(literal) = expr.as_any().downcast_ref::<Literal>() {
+        return literal.value().is_null();
+    }
+
+    if let Some(cast) = expr.as_any().downcast_ref::<CastExpr>() {
+        return is_generated_null_default(cast.expr().as_ref());
+    }
+
+    false
 }

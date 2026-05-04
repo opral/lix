@@ -226,6 +226,90 @@ simulation_test!(
     }
 );
 
+simulation_test!(lix_file_insert_rejects_null_data, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
+
+    let error = session
+        .execute(
+            "INSERT INTO lix_file (id, path, data) \
+             VALUES ('null-data-file', '/null.bin', NULL)",
+            &[],
+        )
+        .await
+        .expect_err("explicit NULL data should be rejected");
+
+    assert!(
+        error.message.contains("requires binary data")
+            && error.message.contains("use X'' for an empty file"),
+        "unexpected error: {error}"
+    );
+
+    let parameter_error = session
+        .execute(
+            "INSERT INTO lix_file (id, path, data) \
+             VALUES ('null-param-data-file', '/null-param.bin', $1)",
+            &[Value::Null],
+        )
+        .await
+        .expect_err("parameterized NULL data should be rejected");
+
+    assert!(
+        parameter_error.message.contains("requires binary data")
+            && parameter_error
+                .message
+                .contains("use X'' for an empty file"),
+        "unexpected error: {parameter_error}"
+    );
+
+    let result = session
+        .execute(
+            "SELECT id FROM lix_file \
+             WHERE id IN ('null-data-file', 'null-param-data-file')",
+            &[],
+        )
+        .await
+        .expect("file read should succeed");
+    assert_eq!(result.len(), 0);
+});
+
+simulation_test!(lix_file_insert_accepts_empty_blob_data, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
+
+    let insert_result = session
+        .execute(
+            "INSERT INTO lix_file (id, path, data) \
+             VALUES ('empty-data-file', '/empty.bin', X'')",
+            &[],
+        )
+        .await
+        .expect("empty blob data should be accepted");
+    assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
+
+    let result = session
+        .execute(
+            "SELECT data FROM lix_file WHERE id = 'empty-data-file'",
+            &[],
+        )
+        .await
+        .expect("file read should succeed");
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows()[0].values(), &[Value::Blob(Vec::new())]);
+});
+
 simulation_test!(
     lix_file_path_insert_rejects_duplicate_root_path,
     |sim| async move {
@@ -419,6 +503,86 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_file_insert_rejects_missing_directory_id,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_file (directory_id, name, extension) \
+                 VALUES ('missing-dir', 'readme', 'md')",
+                &[],
+            )
+            .await
+            .expect_err("file insert should reject missing directory_id");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+    }
+);
+
+simulation_test!(
+    lix_file_update_rejects_missing_directory_id_and_preserves_path,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES ('dir-docs', '/docs/')",
+                &[],
+            )
+            .await
+            .expect("directory insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, directory_id, name, extension) \
+                 VALUES ('file-readme', 'dir-docs', 'readme', 'md')",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+
+        let error = session
+            .execute(
+                "UPDATE lix_file SET directory_id = 'missing-dir' WHERE id = 'file-readme'",
+                &[],
+            )
+            .await
+            .expect_err("file update should reject missing directory_id");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+
+        let result = session
+            .execute(
+                "SELECT path, directory_id FROM lix_file WHERE id = 'file-readme'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Text("/docs/readme.md".to_string()),
+                Value::Text("dir-docs".to_string())
+            ]
+        );
+    }
+);
+
+simulation_test!(
     lix_file_path_insert_rejects_dot_segments,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -586,6 +750,108 @@ simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
         2,
         "path update should not stage an extra directory descriptor"
     );
+});
+
+simulation_test!(
+    lix_file_update_rejects_null_data_and_preserves_existing_data,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('update-null-file', '/update-null.bin', X'68656C6C6F')",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+
+        let error = session
+            .execute(
+                "UPDATE lix_file SET data = NULL WHERE id = 'update-null-file'",
+                &[],
+            )
+            .await
+            .expect_err("explicit NULL data update should be rejected");
+
+        assert!(
+            error.message.contains("requires binary data")
+                && error.message.contains("use X'' for an empty file"),
+            "unexpected error: {error}"
+        );
+
+        let parameter_error = session
+            .execute(
+                "UPDATE lix_file SET data = $1 WHERE id = 'update-null-file'",
+                &[Value::Null],
+            )
+            .await
+            .expect_err("parameterized NULL data update should be rejected");
+
+        assert!(
+            parameter_error.message.contains("requires binary data")
+                && parameter_error
+                    .message
+                    .contains("use X'' for an empty file"),
+            "unexpected error: {parameter_error}"
+        );
+
+        let result = session
+            .execute(
+                "SELECT data FROM lix_file WHERE id = 'update-null-file'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.rows()[0].values(), &[Value::Blob(b"hello".to_vec())]);
+    }
+);
+
+simulation_test!(lix_file_update_accepts_empty_blob_data, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open"),
+        &engine,
+    );
+
+    session
+        .execute(
+            "INSERT INTO lix_file (id, path, data) \
+             VALUES ('empty-update-file', '/empty-update.bin', X'68656C6C6F')",
+            &[],
+        )
+        .await
+        .expect("file insert should succeed");
+
+    let update_result = session
+        .execute(
+            "UPDATE lix_file SET data = X'' WHERE id = 'empty-update-file'",
+            &[],
+        )
+        .await
+        .expect("empty blob data update should be accepted");
+    assert_eq!(update_result, ExecuteResult::from_rows_affected(1));
+
+    let result = session
+        .execute(
+            "SELECT data FROM lix_file WHERE id = 'empty-update-file'",
+            &[],
+        )
+        .await
+        .expect("file read should succeed");
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows()[0].values(), &[Value::Blob(Vec::new())]);
 });
 
 simulation_test!(lix_file_by_version_expands_global_rows, |sim| async move {

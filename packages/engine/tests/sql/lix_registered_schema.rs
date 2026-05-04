@@ -198,6 +198,72 @@ simulation_test!(
     }
 );
 
+simulation_test!(
+    registered_entity_insert_preserves_explicit_null_for_defaulted_column,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine2_nullable_default_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"status\":{\"type\":[\"string\",\"null\"],\"default\":\"computed\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+                 true,\
+                 true\
+                 )",
+                &[],
+            )
+            .await
+            .expect("registered schema insert should succeed");
+
+        session
+            .execute(
+                "INSERT INTO engine2_nullable_default_schema (id, status) \
+                 VALUES ('explicit-null', NULL)",
+                &[],
+            )
+            .await
+            .expect("entity insert should preserve explicit null");
+
+        session
+            .execute(
+                "INSERT INTO engine2_nullable_default_schema (id) \
+                 VALUES ('omitted')",
+                &[],
+            )
+            .await
+            .expect("entity insert should apply default for omitted column");
+
+        let result = session
+            .execute(
+                "SELECT id, status \
+                 FROM engine2_nullable_default_schema \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("entity read should succeed");
+
+        assert_rows_eq(
+            result,
+            vec![
+                vec![Value::Text("explicit-null".to_string()), Value::Null],
+                vec![
+                    Value::Text("omitted".to_string()),
+                    Value::Text("computed".to_string()),
+                ],
+            ],
+        );
+    }
+);
+
 simulation_test!(entity_by_version_expands_global_rows, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
