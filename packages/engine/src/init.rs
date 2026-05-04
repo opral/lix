@@ -1,6 +1,3 @@
-use serde_json::json;
-use std::sync::Arc;
-
 use crate::changelog::{
     canonicalize_materialized_change, ChangelogContext, MaterializedCanonicalChange,
 };
@@ -10,13 +7,15 @@ use crate::functions::{
 };
 use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateRow};
+use crate::storage::StorageContext;
 use crate::untracked_state::UntrackedStateRow;
 use crate::version::{
     VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_DESCRIPTOR_SCHEMA_VERSION, VERSION_REF_SCHEMA_KEY,
     VERSION_REF_SCHEMA_VERSION,
 };
+use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
-use crate::{Backend, LixError, TransactionBeginMode};
+use serde_json::json;
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const KEY_VALUE_SCHEMA_VERSION: &str = "1";
@@ -147,7 +146,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 /// changelog for tracked changes, and live_state for the serving projection plus
 /// untracked moving refs.
 pub(crate) async fn initialize(
-    backend: Arc<dyn Backend + Send + Sync>,
+    storage: StorageContext,
     changelog: &ChangelogContext,
     live_state: &LiveStateContext,
 ) -> Result<InitReceipt, LixError> {
@@ -157,9 +156,7 @@ pub(crate) async fn initialize(
     let plan = plan_init_seed(functions)?;
     let receipt = plan.receipt.clone();
 
-    let mut transaction = backend
-        .begin_transaction(TransactionBeginMode::Write)
-        .await?;
+    let mut transaction = storage.begin_write_transaction().await?;
 
     {
         let mut json_writer = JsonStoreContext::new().writer();

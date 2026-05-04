@@ -2045,7 +2045,11 @@ fn current_engine_owned_persistence_raw_backend_type_violations() -> Vec<RawBack
         }
 
         let masked_source = mask_rust_source(&source);
-        for type_name in ["Backend", "BackendTransaction"] {
+        for type_name in [
+            "Backend",
+            "BackendReadTransaction",
+            "BackendWriteTransaction",
+        ] {
             if contains_identifier(&masked_source, type_name) {
                 violations.insert(RawBackendTypeViolation {
                     file: relative_path.clone(),
@@ -2081,8 +2085,36 @@ fn current_owner_persistence_backend_root_dependency_violations() -> Vec<ImportP
 
         let masked_source = mask_rust_source(&source);
         if !contains_identifier(&masked_source, "Backend")
-            && !contains_identifier(&masked_source, "BackendTransaction")
+            && !contains_identifier(&masked_source, "BackendReadTransaction")
+            && !contains_identifier(&masked_source, "BackendWriteTransaction")
         {
+            continue;
+        }
+
+        let current_module_path = module_path_for_file(&relative_path);
+        for imported_path in
+            collect_module_paths_from_source(&source, &current_module_path, &module_set)
+        {
+            if imported_path.first().is_none_or(|root| root != "backend") {
+                continue;
+            }
+
+            violations.insert(ImportPathViolation {
+                importer_file: relative_path.clone(),
+                imported_path: imported_path.join("::"),
+            });
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
+fn current_backend_import_outside_storage_violations() -> Vec<ImportPathViolation> {
+    let module_set = top_level_module_set();
+    let mut violations = BTreeSet::new();
+
+    for (relative_path, source) in production_source_files() {
+        if relative_path.starts_with("backend/") || relative_path.starts_with("storage/") {
             continue;
         }
 
@@ -2150,7 +2182,7 @@ fn current_owner_persistence_transaction_lifecycle_violations() -> Vec<Transacti
 
         let masked_source = mask_rust_source(&source);
         for pattern in [
-            ".begin_transaction(",
+            ".begin_read_transaction(",
             "begin_write_transaction(",
             ".commit().await",
             ".rollback().await",
@@ -2424,6 +2456,17 @@ fn owner_persistence_modules_do_not_depend_on_backend_root_outside_sql_adapters(
     assert!(
         violations.is_empty(),
         "owner persistence modules must not depend on `backend/*` outside owner-local SQL adapter files.\n\nCurrent violations:\n{}",
+        render_grouped_import_path_violations(&violations),
+    );
+}
+
+#[test]
+fn backend_imports_are_limited_to_storage_boundary() {
+    let violations = current_backend_import_outside_storage_violations();
+
+    assert!(
+        violations.is_empty(),
+        "`backend/*` may only be imported by `storage/*`; other engine modules must depend on storage-facing APIs.\n\nCurrent violations:\n{}",
         render_grouped_import_path_violations(&violations),
     );
 }

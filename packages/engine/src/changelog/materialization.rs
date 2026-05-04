@@ -1,6 +1,6 @@
-use crate::backend::KvStore;
 use crate::changelog::{CanonicalChange, MaterializedCanonicalChange};
 use crate::json_store::{JsonRef, JsonStoreReader, JsonStoreWriter};
+use crate::storage::StorageReader;
 use crate::LixError;
 
 pub(crate) fn canonicalize_materialized_change(
@@ -26,7 +26,7 @@ pub(crate) async fn materialize_change<S>(
     change: CanonicalChange,
 ) -> Result<MaterializedCanonicalChange, LixError>
 where
-    S: KvStore,
+    S: StorageReader,
 {
     let snapshot_content =
         load_optional_json(json_reader, change.snapshot_ref.as_ref(), "snapshot_ref").await?;
@@ -60,7 +60,7 @@ async fn load_optional_json<S>(
     field: &str,
 ) -> Result<Option<String>, LixError>
 where
-    S: KvStore,
+    S: StorageReader,
 {
     let Some(json_ref) = json_ref else {
         return Ok(None);

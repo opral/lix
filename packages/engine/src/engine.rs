@@ -9,15 +9,16 @@ use crate::live_state::LiveStateContext;
 use crate::live_state::LiveStateRowRequest;
 use crate::schema_registry::SchemaRegistry;
 use crate::session::SessionContext;
+use crate::storage::StorageContext;
 use crate::tracked_state::TrackedStateContext;
 use crate::untracked_state::UntrackedStateContext;
 use crate::version::{VersionContext, VersionRefReader};
 use crate::GLOBAL_VERSION_ID;
-use crate::{Backend, LixError, NullableKeyFilter, TransactionBeginMode};
+use crate::{Backend, LixError, NullableKeyFilter};
 
 #[derive(Clone)]
 pub struct Engine {
-    backend: Arc<dyn Backend + Send + Sync>,
+    storage: StorageContext,
     tracked_state: Arc<TrackedStateContext>,
     live_state: Arc<LiveStateContext>,
     version_ctx: Arc<VersionContext>,
@@ -36,13 +37,14 @@ impl Engine {
         backend: Box<dyn Backend + Send + Sync>,
     ) -> Result<InitReceipt, LixError> {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::from(backend);
+        let storage = StorageContext::new(backend);
         let changelog = ChangelogContext::new();
         let commit_graph = CommitGraphContext::new(changelog);
         let tracked_state = TrackedStateContext::new();
         let untracked_state = UntrackedStateContext::new();
         let live_state = LiveStateContext::new(tracked_state, untracked_state, commit_graph);
 
-        crate::init::initialize(backend, &changelog, &live_state).await
+        crate::init::initialize(storage, &changelog, &live_state).await
     }
 
     /// Creates a clean DataFusion-first engine over an initialized backend.
@@ -51,6 +53,7 @@ impl Engine {
     /// instance instead of being hidden behind a legacy boot path.
     pub async fn new(backend: Box<dyn Backend + Send + Sync>) -> Result<Self, LixError> {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::from(backend);
+        let storage = StorageContext::new(backend);
 
         let tracked_state = Arc::new(TrackedStateContext::new());
         let untracked_state = Arc::new(UntrackedStateContext::new());
@@ -62,7 +65,7 @@ impl Engine {
             commit_graph,
         ));
         let version_ctx = Arc::new(VersionContext::new(Arc::clone(&untracked_state)));
-        assert_initialized(Arc::clone(&backend), live_state.as_ref()).await?;
+        assert_initialized(storage.clone(), live_state.as_ref()).await?;
 
         // SessionContext::execute later projects these stable state contexts into one
         // execution-scoped SQL context, optionally wrapped by a transaction
@@ -71,7 +74,7 @@ impl Engine {
         Ok(Self {
             binary_cas: Arc::new(BinaryCasContext::new()),
             changelog,
-            backend,
+            storage,
             tracked_state,
             live_state,
             version_ctx,
@@ -79,8 +82,8 @@ impl Engine {
         })
     }
 
-    pub(crate) fn backend(&self) -> Arc<dyn Backend + Send + Sync> {
-        Arc::clone(&self.backend)
+    pub(crate) fn storage(&self) -> StorageContext {
+        self.storage.clone()
     }
 
     #[cfg(test)]
@@ -97,10 +100,22 @@ impl Engine {
         &self,
         version_id: &str,
     ) -> Result<Option<String>, LixError> {
-        self.version_ctx
-            .ref_reader(self.backend())
+        let mut transaction = self.storage.begin_read_transaction().await?;
+        let result = self
+            .version_ctx
+            .ref_reader(transaction.as_mut())
             .load_head_commit_id(version_id)
-            .await
+            .await;
+        match result {
+            Ok(result) => {
+                transaction.rollback().await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     pub async fn open_session(
@@ -109,7 +124,7 @@ impl Engine {
     ) -> Result<SessionContext, LixError> {
         SessionContext::open(
             active_version_id.into(),
-            self.backend(),
+            self.storage(),
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
@@ -122,7 +137,7 @@ impl Engine {
 
     pub async fn open_workspace_session(&self) -> Result<SessionContext, LixError> {
         SessionContext::open_workspace(
-            self.backend(),
+            self.storage(),
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
@@ -154,36 +169,46 @@ impl Engine {
                 )
             })?;
         let commit_graph = CommitGraphContext::new(ChangelogContext::new());
-        let mut transaction = self
-            .backend
-            .begin_transaction(TransactionBeginMode::Write)
-            .await?;
+        let storage = self.storage();
+        let mut read_transaction = storage.begin_read_transaction().await?;
+        let mut transaction = storage.begin_write_transaction().await?;
         self.tracked_state
             .rebuild_state_at_commit(
                 &commit_graph,
-                self.backend(),
+                read_transaction.as_mut(),
                 transaction.as_mut(),
                 &head_commit_id,
             )
             .await?;
+        read_transaction.rollback().await?;
         transaction.commit().await
     }
 }
 
 async fn assert_initialized(
-    backend: Arc<dyn Backend + Send + Sync>,
+    storage: StorageContext,
     live_state: &LiveStateContext,
 ) -> Result<(), LixError> {
-    let reader = live_state.reader(backend);
-    let initialized = reader
+    let mut transaction = storage.begin_read_transaction().await?;
+    let reader = live_state.reader(transaction.as_mut());
+    let result = reader
         .load_row(&LiveStateRowRequest {
             schema_key: "lix_key_value".to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
             entity_id: EntityIdentity::single("lix_id"),
             file_id: NullableKeyFilter::Null,
         })
-        .await?
-        .is_some();
+        .await;
+    let initialized = match result {
+        Ok(row) => {
+            transaction.rollback().await?;
+            row.is_some()
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
+    };
 
     if initialized {
         return Ok(());

@@ -5,21 +5,23 @@ use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
-use crate::backend::ReadScope;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::changelog::ChangelogContext;
 use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
 use crate::entity_identity::EntityIdentity;
-use crate::functions::{FunctionContext, FunctionProviderHandle};
+use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
 use crate::schema_registry::SchemaRegistry;
 use crate::sql2::{ChangelogQuerySource, SqlChangelogQuerySource, SqlExecutionContext};
+use crate::storage::{
+    ScopedStorageReader, StorageContext, StorageReadScope, StorageReadTransaction, StorageReader,
+};
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{open_transaction, Transaction};
 use crate::version::{VersionContext, VersionRefReader};
 use crate::GLOBAL_VERSION_ID;
-use crate::{Backend, LixError, NullableKeyFilter};
+use crate::{LixError, NullableKeyFilter};
 
 pub(crate) const WORKSPACE_VERSION_KEY: &str = "lix_workspace_version_id";
 
@@ -42,7 +44,7 @@ pub(crate) enum SessionMode {
 #[derive(Clone)]
 pub struct SessionContext {
     pub(super) mode: SessionMode,
-    pub(super) backend: Arc<dyn Backend + Send + Sync>,
+    pub(super) storage: StorageContext,
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) tracked_state: Arc<TrackedStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
@@ -54,7 +56,7 @@ pub struct SessionContext {
 
 impl SessionContext {
     pub(crate) async fn open_workspace(
-        backend: Arc<dyn Backend + Send + Sync>,
+        storage: StorageContext,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
@@ -64,7 +66,7 @@ impl SessionContext {
     ) -> Result<Self, LixError> {
         let session = Self::new(
             SessionMode::Workspace,
-            backend,
+            storage,
             live_state,
             tracked_state,
             binary_cas,
@@ -78,7 +80,7 @@ impl SessionContext {
 
     pub(crate) async fn open(
         active_version_id: String,
-        backend: Arc<dyn Backend + Send + Sync>,
+        storage: StorageContext,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
@@ -90,7 +92,7 @@ impl SessionContext {
             SessionMode::Pinned {
                 version_id: active_version_id,
             },
-            backend,
+            storage,
             live_state,
             tracked_state,
             binary_cas,
@@ -102,7 +104,7 @@ impl SessionContext {
 
     pub(super) fn new(
         mode: SessionMode,
-        backend: Arc<dyn Backend + Send + Sync>,
+        storage: StorageContext,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
@@ -112,7 +114,7 @@ impl SessionContext {
     ) -> Self {
         Self::new_with_closed(
             mode,
-            backend,
+            storage,
             live_state,
             tracked_state,
             binary_cas,
@@ -125,7 +127,7 @@ impl SessionContext {
 
     pub(super) fn new_with_closed(
         mode: SessionMode,
-        backend: Arc<dyn Backend + Send + Sync>,
+        storage: StorageContext,
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
@@ -136,7 +138,7 @@ impl SessionContext {
     ) -> Self {
         Self {
             mode,
-            backend,
+            storage,
             live_state,
             tracked_state,
             binary_cas,
@@ -180,17 +182,43 @@ impl SessionContext {
     /// `lix_key_value` state so multiple open app sessions can observe the same
     /// active workspace version.
     pub async fn active_version_id(&self) -> Result<String, LixError> {
-        self.ensure_open()?;
-        match &self.mode {
-            SessionMode::Pinned { version_id } => Ok(version_id.clone()),
-            SessionMode::Workspace => self.load_workspace_version_id().await,
+        let mut transaction = self.storage.begin_read_transaction().await?;
+        let result = self
+            .active_version_id_from_reader(transaction.as_mut())
+            .await;
+        match result {
+            Ok(version_id) => {
+                transaction.rollback().await?;
+                Ok(version_id)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
         }
     }
 
-    async fn load_workspace_version_id(&self) -> Result<String, LixError> {
+    pub(super) async fn active_version_id_from_reader<S>(
+        &self,
+        reader: &mut S,
+    ) -> Result<String, LixError>
+    where
+        S: StorageReader + ?Sized,
+    {
+        self.ensure_open()?;
+        match &self.mode {
+            SessionMode::Pinned { version_id } => Ok(version_id.clone()),
+            SessionMode::Workspace => self.load_workspace_version_id(reader).await,
+        }
+    }
+
+    async fn load_workspace_version_id<S>(&self, reader: &mut S) -> Result<String, LixError>
+    where
+        S: StorageReader + ?Sized,
+    {
         let row = self
             .live_state
-            .reader(Arc::clone(&self.backend))
+            .reader(&mut *reader)
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
@@ -230,7 +258,7 @@ impl SessionContext {
 
         let head = self
             .version_ctx
-            .ref_reader(Arc::clone(&self.backend))
+            .ref_reader(&mut *reader)
             .load_head_commit_id(&version_id)
             .await?;
         if head.is_none() {
@@ -247,25 +275,23 @@ impl SessionContext {
     pub(crate) async fn with_write_transaction<T, F>(&self, f: F) -> Result<T, LixError>
     where
         F: for<'tx> FnOnce(
-            &'tx mut Transaction<'_>,
+            &'tx mut Transaction,
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
         self.ensure_open()?;
-        let live_state: Arc<dyn LiveStateReader> =
-            Arc::new(self.live_state.reader(Arc::clone(&self.backend)));
-        let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
-        let mut transaction = open_transaction(
+        let opened = open_transaction(
             &self.mode,
-            &self.backend,
+            self.storage.clone(),
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.changelog),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.schema_registry),
-            runtime_functions.provider(),
         )
         .await?;
+        let mut transaction = opened.transaction;
+        let runtime_functions = opened.runtime_functions;
 
         match f(&mut transaction).await {
             Ok(value) => {
@@ -291,7 +317,8 @@ fn closed_error() -> LixError {
 /// has no write stager.
 pub(super) struct SessionSqlExecutionContext<'a> {
     pub(super) active_version_id: &'a str,
-    pub(super) backend: Arc<dyn Backend + Send + Sync>,
+    pub(super) read_store:
+        ScopedStorageReader<Box<dyn StorageReadTransaction + Send + Sync + 'static>>,
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) changelog: Arc<ChangelogContext>,
@@ -306,11 +333,11 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
     }
 
     fn live_state(&self) -> Arc<dyn LiveStateReader> {
-        Arc::new(self.live_state.reader(Arc::clone(&self.backend))) as Arc<dyn LiveStateReader>
+        Arc::new(self.live_state.reader(self.read_store.clone())) as Arc<dyn LiveStateReader>
     }
 
     fn changelog_query_source(&self) -> SqlChangelogQuerySource {
-        let read_scope = ReadScope::new(Arc::clone(&self.backend));
+        let read_scope = StorageReadScope::new(self.read_store.clone());
         ChangelogQuerySource {
             changelog_reader: Arc::new(self.changelog.reader(read_scope.store())),
             json_reader: JsonStoreContext::new().reader(read_scope.store()),
@@ -318,11 +345,11 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
     }
 
     fn commit_graph(&self) -> Box<dyn CommitGraphReader> {
-        Box::new(CommitGraphContext::new(ChangelogContext::new()).reader(Arc::clone(&self.backend)))
+        Box::new(CommitGraphContext::new(ChangelogContext::new()).reader(self.read_store.clone()))
     }
 
     fn version_ref(&self) -> Arc<dyn VersionRefReader> {
-        Arc::new(self.version_ctx.ref_reader(Arc::clone(&self.backend)))
+        Arc::new(self.version_ctx.ref_reader(self.read_store.clone()))
     }
 
     fn functions(&self) -> FunctionProviderHandle {
@@ -330,7 +357,7 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
     }
 
     fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
-        Arc::new(self.binary_cas.reader(Arc::clone(&self.backend))) as Arc<dyn BlobDataReader>
+        Arc::new(self.binary_cas.reader(self.read_store.clone())) as Arc<dyn BlobDataReader>
     }
 
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {

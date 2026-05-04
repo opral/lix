@@ -1710,12 +1710,15 @@ mod tests {
             test_functions()
         }
 
-        fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
-            Arc::new(DummyBlobReader)
-        }
-
         fn list_visible_schemas(&self) -> Result<Vec<serde_json::Value>, LixError> {
             Ok(Vec::new())
+        }
+
+        async fn load_blob_data_by_hash(
+            &mut self,
+            blob_hash: &str,
+        ) -> Result<Option<Vec<u8>>, LixError> {
+            DummyBlobReader.load_blob_data_by_hash(blob_hash).await
         }
 
         async fn scan_live_state(
@@ -1747,12 +1750,15 @@ mod tests {
             test_functions()
         }
 
-        fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
-            Arc::new(DummyBlobReader)
-        }
-
         fn list_visible_schemas(&self) -> Result<Vec<serde_json::Value>, LixError> {
             Ok(Vec::new())
+        }
+
+        async fn load_blob_data_by_hash(
+            &mut self,
+            blob_hash: &str,
+        ) -> Result<Option<Vec<u8>>, LixError> {
+            DummyBlobReader.load_blob_data_by_hash(blob_hash).await
         }
 
         async fn scan_live_state(

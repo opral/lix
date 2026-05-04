@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::backend::{Backend, TransactionBeginMode};
+use crate::storage::StorageContext;
 use crate::tracked_state::{TrackedStateContext, TrackedStateRow};
 use crate::untracked_state::UntrackedStateContext;
 use crate::version::VersionContext;
@@ -14,28 +14,24 @@ const TEST_TIMESTAMP: &str = "1970-01-01T00:00:00.000Z";
 /// A version ref that points at a commit without a tracked root is invalid for
 /// the serving projection. This helper keeps that invariant in one place while
 /// still letting low-level tests use synthetic commit ids.
-pub(crate) async fn seed_version_head(
-    backend: &(dyn Backend + Send + Sync),
-    version_id: &str,
-    commit_id: &str,
-) {
-    seed_version_head_with_rows(backend, version_id, commit_id, &[]).await;
+pub(crate) async fn seed_version_head(storage: StorageContext, version_id: &str, commit_id: &str) {
+    seed_version_head_with_rows(storage, version_id, commit_id, &[]).await;
 }
 
 /// Seeds the global version head to an empty tracked root for unit tests.
-pub(crate) async fn seed_global_version_head(backend: &(dyn Backend + Send + Sync)) {
-    seed_version_head(backend, GLOBAL_VERSION_ID, TEST_EMPTY_ROOT_COMMIT_ID).await;
+pub(crate) async fn seed_global_version_head(storage: StorageContext) {
+    seed_version_head(storage, GLOBAL_VERSION_ID, TEST_EMPTY_ROOT_COMMIT_ID).await;
 }
 
 /// Seeds a version head and writes the tracked root contents for its commit.
 pub(crate) async fn seed_version_head_with_rows(
-    backend: &(dyn Backend + Send + Sync),
+    storage: StorageContext,
     version_id: &str,
     commit_id: &str,
     rows: &[TrackedStateRow],
 ) {
-    let mut transaction = backend
-        .begin_transaction(TransactionBeginMode::Write)
+    let mut transaction = storage
+        .begin_write_transaction()
         .await
         .expect("seed transaction should open");
     VersionContext::new(Arc::new(UntrackedStateContext::new()))

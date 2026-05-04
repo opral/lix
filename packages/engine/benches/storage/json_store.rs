@@ -270,7 +270,10 @@ fn prepare_read(
     shape: JsonStorePayloadShape,
     rows: usize,
     projection: JsonStoreProjectionShape,
-) -> (BenchBackend, JsonStoreReadFixture) {
+) -> (
+    std::sync::Arc<dyn lix_engine::Backend + Send + Sync>,
+    JsonStoreReadFixture,
+) {
     let backend = BenchBackend::new();
     let fixture = runtime
         .block_on(storage_bench::prepare_json_store_projection_read(

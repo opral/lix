@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, future::Future, ops::Range, pin::Pin};
 
-use crate::backend::{KvStore, KvWriter};
+use crate::storage::{StorageReader, StorageWriter};
 use crate::tracked_state::codec::{
     boundary_trigger, child_summary_from_node, decode_key, decode_node, decode_value,
     encode_internal_node, encode_key, encode_leaf_node, encode_schema_file_prefix,
@@ -55,7 +55,7 @@ impl TrackedStateTree {
 
     pub(crate) async fn load_root(
         &self,
-        store: &mut (impl KvStore + ?Sized),
+        store: &mut (impl StorageReader + ?Sized),
         commit_id: &str,
     ) -> Result<Option<TrackedStateRootId>, LixError> {
         storage::load_root(store, commit_id).await
@@ -63,7 +63,7 @@ impl TrackedStateTree {
 
     pub(crate) async fn get(
         &self,
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         root_id: &TrackedStateRootId,
         key: &TrackedStateKey,
     ) -> Result<Option<TrackedStateValue>, LixError> {
@@ -99,7 +99,7 @@ impl TrackedStateTree {
 
     pub(crate) async fn get_many(
         &self,
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         root_id: &TrackedStateRootId,
         keys: &[TrackedStateKey],
     ) -> Result<Vec<Option<TrackedStateValue>>, LixError> {
@@ -122,7 +122,7 @@ impl TrackedStateTree {
 
     pub(crate) async fn row_count(
         &self,
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         root_id: &TrackedStateRootId,
     ) -> Result<usize, LixError> {
         match self.load_node(store, root_id.as_bytes()).await? {
@@ -137,7 +137,7 @@ impl TrackedStateTree {
 
     pub(crate) async fn scan(
         &self,
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         root_id: &TrackedStateRootId,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<Vec<(TrackedStateKey, TrackedStateValue)>, LixError> {
@@ -154,7 +154,7 @@ impl TrackedStateTree {
 
     pub(crate) async fn count_matching_keys(
         &self,
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         root_id: &TrackedStateRootId,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<usize, LixError> {
@@ -169,7 +169,7 @@ impl TrackedStateTree {
 
     pub(crate) async fn diff(
         &self,
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         left_root: Option<&TrackedStateRootId>,
         right_root: Option<&TrackedStateRootId>,
         request: &TrackedStateTreeScanRequest,
@@ -212,7 +212,7 @@ impl TrackedStateTree {
 
     pub(crate) async fn apply_mutations(
         &self,
-        writer: &mut impl KvWriter,
+        writer: &mut impl StorageWriter,
         base_root: Option<&TrackedStateRootId>,
         mutations: Vec<TrackedStateMutation>,
         commit_id: Option<&str>,
@@ -281,7 +281,7 @@ impl TrackedStateTree {
 
     async fn apply_single_mutation(
         &self,
-        writer: &mut impl KvWriter,
+        writer: &mut impl StorageWriter,
         root_id: &TrackedStateRootId,
         mutation: &TrackedStateMutation,
         commit_id: Option<&str>,
@@ -411,7 +411,7 @@ impl TrackedStateTree {
         out: &'a mut Vec<TrackedStateTreeDiffEntry>,
     ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + 'a>>
     where
-        S: KvStore + 'a,
+        S: StorageReader + 'a,
     {
         Box::pin(async move {
             if left_hash == right_hash {
@@ -452,7 +452,7 @@ impl TrackedStateTree {
 
     async fn diff_leaf_summary_cursors(
         &self,
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         left_hash: [u8; TRACKED_STATE_HASH_BYTES],
         right_hash: [u8; TRACKED_STATE_HASH_BYTES],
         request: &TrackedStateTreeScanRequest,
@@ -510,7 +510,7 @@ impl TrackedStateTree {
 
     async fn diff_leaf_summary_window(
         &self,
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         left_leaves: &[ChildSummary],
         right_leaves: &[ChildSummary],
         request: &TrackedStateTreeScanRequest,
@@ -622,7 +622,7 @@ impl TrackedStateTree {
 
     async fn apply_sorted_mutations_chunker(
         &self,
-        writer: &mut impl KvWriter,
+        writer: &mut impl StorageWriter,
         root_id: &TrackedStateRootId,
         mutations: &[TrackedStateMutation],
         commit_id: Option<&str>,
@@ -763,7 +763,7 @@ impl TrackedStateTree {
 
     async fn apply_single_mutation_from_seek_path(
         &self,
-        writer: &mut impl KvWriter,
+        writer: &mut impl StorageWriter,
         root_id: &TrackedStateRootId,
         encoded_key: &[u8],
         encoded_value: &[u8],
@@ -912,7 +912,7 @@ impl TrackedStateTree {
 
     async fn persist_built_tree(
         &self,
-        writer: &mut impl KvWriter,
+        writer: &mut impl StorageWriter,
         built: BuiltTree,
         commit_id: Option<&str>,
     ) -> Result<Option<TrackedStateApplyResult>, LixError> {
@@ -1192,7 +1192,7 @@ impl TrackedStateTree {
 
     async fn collect_leaf_entries(
         &self,
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         root_id: &TrackedStateRootId,
     ) -> Result<Vec<EncodedLeafEntry>, LixError> {
         let mut out = Vec::new();
@@ -1214,7 +1214,7 @@ impl TrackedStateTree {
 
     async fn collect_filtered_entries(
         &self,
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         root_id: &TrackedStateRootId,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<Vec<(TrackedStateKey, TrackedStateValue)>, LixError> {
@@ -1230,7 +1230,7 @@ impl TrackedStateTree {
         rows: &'a mut Vec<(TrackedStateKey, TrackedStateValue)>,
     ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
     where
-        S: KvStore + Send + 'a,
+        S: StorageReader + Send + 'a,
     {
         Box::pin(async move {
             match self.load_node(store, &hash).await? {
@@ -1276,7 +1276,7 @@ impl TrackedStateTree {
         values: &'a mut [Option<TrackedStateValue>],
     ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
     where
-        S: KvStore + Send + 'a,
+        S: StorageReader + Send + 'a,
     {
         Box::pin(async move {
             if encoded_keys.is_empty() {
@@ -1341,7 +1341,7 @@ impl TrackedStateTree {
         ranges: &'a [EncodedScanRange],
     ) -> Pin<Box<dyn Future<Output = Result<usize, LixError>> + Send + 'a>>
     where
-        S: KvStore + Send + 'a,
+        S: StorageReader + Send + 'a,
     {
         Box::pin(async move {
             let mut count = 0usize;
@@ -1377,7 +1377,7 @@ impl TrackedStateTree {
 
     async fn collect_entries_from_leaf_summaries(
         &self,
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         leaves: &[ChildSummary],
     ) -> Result<Vec<EncodedLeafEntry>, LixError> {
         let mut entries = Vec::new();
@@ -1389,7 +1389,7 @@ impl TrackedStateTree {
 
     async fn collect_summary_levels(
         &self,
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         root_id: &TrackedStateRootId,
     ) -> Result<Vec<Vec<ChildSummary>>, LixError> {
         let mut levels = Vec::new();
@@ -1405,7 +1405,7 @@ impl TrackedStateTree {
         levels: &'a mut Vec<Vec<ChildSummary>>,
     ) -> Pin<Box<dyn Future<Output = Result<(ChildSummary, usize), LixError>> + 'a>>
     where
-        S: KvStore + 'a,
+        S: StorageReader + 'a,
     {
         Box::pin(async move {
             match self.load_node(store, &hash).await? {
@@ -1453,7 +1453,7 @@ impl TrackedStateTree {
 
     async fn load_leaf_entries(
         &self,
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         hash: &[u8; TRACKED_STATE_HASH_BYTES],
     ) -> Result<Vec<EncodedLeafEntry>, LixError> {
         match self.load_node(store, hash).await? {
@@ -1467,7 +1467,7 @@ impl TrackedStateTree {
 
     async fn load_node(
         &self,
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         hash: &[u8; TRACKED_STATE_HASH_BYTES],
     ) -> Result<DecodedNode, LixError> {
         let bytes = storage::read_chunk(store, hash).await?.ok_or_else(|| {
@@ -1518,7 +1518,7 @@ struct LeafSummaryCursorFrame {
 impl LeafSummaryCursor {
     async fn new(
         tree: &TrackedStateTree,
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         root_hash: [u8; TRACKED_STATE_HASH_BYTES],
     ) -> Result<Self, LixError> {
         let mut cursor = Self {
@@ -1551,7 +1551,7 @@ impl LeafSummaryCursor {
     async fn advance(
         &mut self,
         tree: &TrackedStateTree,
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
     ) -> Result<(), LixError> {
         self.current = None;
         while let Some(frame) = self.stack.last_mut() {
@@ -1576,7 +1576,7 @@ impl LeafSummaryCursor {
     async fn descend_to_leaf(
         &mut self,
         tree: &TrackedStateTree,
-        store: &mut impl KvStore,
+        store: &mut impl StorageReader,
         mut summary: ChildSummary,
     ) -> Result<(), LixError> {
         loop {
@@ -1766,7 +1766,7 @@ fn internal_boundaries_match(left: &[ChildSummary], right: &[ChildSummary]) -> b
 
 async fn child_summaries_are_leaves(
     tree: &TrackedStateTree,
-    store: &mut impl KvStore,
+    store: &mut impl StorageReader,
     children: &[ChildSummary],
 ) -> Result<bool, LixError> {
     let Some(first_child) = children.first() else {
@@ -2027,18 +2027,19 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
+    use crate::backend::testing::UnitTestBackend;
     use crate::entity_identity::EntityIdentity;
+    use crate::storage::StorageContext;
 
     #[tokio::test]
     async fn exact_read_roundtrips_from_stored_root() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let tree = TrackedStateTree::new();
         let key = key("schema", None, "entity");
         let value = value("change-1", Some("{}"));
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let result = tree
@@ -2055,7 +2056,7 @@ mod tests {
             .await
             .expect("transaction should commit");
 
-        let mut store = Arc::clone(&backend);
+        let mut store = storage.clone();
         assert_eq!(
             tree.load_root(&mut store, "commit-1")
                 .await
@@ -2072,12 +2073,12 @@ mod tests {
 
     #[tokio::test]
     async fn latest_mutation_for_key_wins() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let tree = TrackedStateTree::new();
         let key = key("schema", None, "entity");
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let result = tree
@@ -2097,7 +2098,7 @@ mod tests {
             .await
             .expect("transaction should commit");
 
-        let mut store = Arc::clone(&backend);
+        let mut store = storage.clone();
         let loaded = tree
             .get(&mut store, &result.root_id, &key)
             .await
@@ -2109,11 +2110,11 @@ mod tests {
 
     #[tokio::test]
     async fn scan_filters_and_hides_tombstones_by_default() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let tree = TrackedStateTree::new();
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let result = tree
@@ -2140,7 +2141,7 @@ mod tests {
             .await
             .expect("transaction should commit");
 
-        let mut store = Arc::clone(&backend);
+        let mut store = storage.clone();
         let rows = tree
             .scan(
                 &mut store,
@@ -2161,11 +2162,11 @@ mod tests {
 
     #[tokio::test]
     async fn scan_filters_by_schema_entity_and_file() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let tree = TrackedStateTree::new();
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let result = tree
@@ -2199,7 +2200,7 @@ mod tests {
             .await
             .expect("transaction should commit");
 
-        let mut store = Arc::clone(&backend);
+        let mut store = storage.clone();
         let rows = tree
             .scan(
                 &mut store,
@@ -2225,13 +2226,13 @@ mod tests {
 
     #[tokio::test]
     async fn applying_to_base_root_reuses_existing_rows_and_overwrites_changed_rows() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let tree = TrackedStateTree::new();
         let unchanged_key = key("schema", None, "unchanged");
         let changed_key = key("schema", None, "changed");
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let base = tree
@@ -2266,7 +2267,7 @@ mod tests {
             .await
             .expect("transaction should commit");
 
-        let mut store = Arc::clone(&backend);
+        let mut store = storage.clone();
         assert_eq!(
             tree.get(&mut store, &next.root_id, &unchanged_key)
                 .await
@@ -2287,14 +2288,14 @@ mod tests {
 
     #[tokio::test]
     async fn two_commit_roots_can_share_unchanged_rows() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let tree = TrackedStateTree::new();
         let shared_key = key("schema", None, "shared");
         let branch_a_key = key("schema", None, "branch-a");
         let branch_b_key = key("schema", None, "branch-b");
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let base = tree
@@ -2339,7 +2340,7 @@ mod tests {
             .expect("transaction should commit");
 
         assert_ne!(branch_a.root_id, branch_b.root_id);
-        let mut store = Arc::clone(&backend);
+        let mut store = storage.clone();
         assert_eq!(
             tree.get(&mut store, &branch_a.root_id, &shared_key)
                 .await
@@ -2366,7 +2367,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_update_matches_full_canonical_rebuild() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
             target_chunk_bytes: 128,
             min_chunk_bytes: 64,
@@ -2383,8 +2384,8 @@ mod tests {
         let changed_key = key("schema", None, "entity-000");
         let changed_value = value("changed", Some("{\"v\":\"changed\"}"));
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let base = tree
@@ -2425,7 +2426,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_insert_matches_full_canonical_rebuild() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
             target_chunk_bytes: 128,
             min_chunk_bytes: 64,
@@ -2442,8 +2443,8 @@ mod tests {
         let inserted_key = key("schema", None, "entity-050a");
         let inserted_value = value("inserted", Some("{\"v\":\"inserted\"}"));
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let base = tree
@@ -2487,7 +2488,7 @@ mod tests {
 
     #[tokio::test]
     async fn batch_update_matches_full_canonical_rebuild() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
             target_chunk_bytes: 128,
             min_chunk_bytes: 64,
@@ -2513,8 +2514,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let base = tree
@@ -2552,7 +2553,7 @@ mod tests {
 
     #[tokio::test]
     async fn batch_insert_matches_full_canonical_rebuild() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
             target_chunk_bytes: 128,
             min_chunk_bytes: 64,
@@ -2580,8 +2581,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let base = tree

@@ -1,29 +1,20 @@
 use async_trait::async_trait;
 
-use crate::backend::{KvPair, KvScanRange, TransactionBeginMode};
+use crate::backend::{
+    BackendKvGetRequest, BackendKvGetResult, BackendKvScanRequest, BackendKvScanResult,
+    BackendKvWriteBatch, BackendKvWriteStats,
+};
 use crate::LixError;
 
 #[async_trait]
 pub trait Backend: Send + Sync {
-    async fn begin_transaction(
+    async fn begin_read_transaction(
         &self,
-        mode: TransactionBeginMode,
-    ) -> Result<Box<dyn BackendTransaction + Send + Sync + 'static>, LixError>;
+    ) -> Result<Box<dyn BackendReadTransaction + Send + Sync + 'static>, LixError>;
 
-    /// Reads one value from the backend key/value store.
-    async fn kv_get(&self, _namespace: &str, _key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
-        Err(kv_not_supported("kv_get"))
-    }
-
-    /// Scans key/value pairs in lexicographic key order.
-    async fn kv_scan(
+    async fn begin_write_transaction(
         &self,
-        _namespace: &str,
-        _range: KvScanRange,
-        _limit: Option<usize>,
-    ) -> Result<Vec<KvPair>, LixError> {
-        Err(kv_not_supported("kv_scan"))
-    }
+    ) -> Result<Box<dyn BackendWriteTransaction + Send + Sync + 'static>, LixError>;
 
     /// Releases physical resources held by this backend handle.
     ///
@@ -64,47 +55,26 @@ pub trait Backend: Send + Sync {
 }
 
 #[async_trait]
-pub trait BackendTransaction: Send + Sync {
-    fn mode(&self) -> TransactionBeginMode;
-
-    /// Reads one value from the backend key/value store inside this transaction.
-    async fn kv_get(&mut self, _namespace: &str, _key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
-        Err(kv_not_supported("transaction kv_get"))
-    }
-
-    /// Scans key/value pairs in lexicographic key order inside this transaction.
-    async fn kv_scan(
+pub trait BackendReadTransaction: Send + Sync {
+    async fn get_kv_many(
         &mut self,
-        _namespace: &str,
-        _range: KvScanRange,
-        _limit: Option<usize>,
-    ) -> Result<Vec<KvPair>, LixError> {
-        Err(kv_not_supported("transaction kv_scan"))
-    }
+        request: BackendKvGetRequest,
+    ) -> Result<BackendKvGetResult, LixError>;
 
-    /// Writes one key/value pair inside this transaction.
-    async fn kv_put(
+    async fn scan_kv(
         &mut self,
-        _namespace: &str,
-        _key: &[u8],
-        _value: &[u8],
-    ) -> Result<(), LixError> {
-        Err(kv_not_supported("transaction kv_put"))
-    }
-
-    /// Deletes one key/value pair inside this transaction.
-    async fn kv_delete(&mut self, _namespace: &str, _key: &[u8]) -> Result<(), LixError> {
-        Err(kv_not_supported("transaction kv_delete"))
-    }
-
-    async fn commit(self: Box<Self>) -> Result<(), LixError>;
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvScanResult, LixError>;
 
     async fn rollback(self: Box<Self>) -> Result<(), LixError>;
 }
 
-fn kv_not_supported(operation: &str) -> LixError {
-    LixError::new(
-        "LIX_ERROR_UNKNOWN",
-        format!("{operation} is not supported by this backend"),
-    )
+#[async_trait]
+pub trait BackendWriteTransaction: BackendReadTransaction {
+    async fn write_kv_batch(
+        &mut self,
+        batch: BackendKvWriteBatch,
+    ) -> Result<BackendKvWriteStats, LixError>;
+
+    async fn commit(self: Box<Self>) -> Result<(), LixError>;
 }

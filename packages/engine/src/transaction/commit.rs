@@ -4,11 +4,12 @@ use crate::binary_cas::{BinaryBlobWrite, BinaryCasContext};
 use crate::changelog::{CanonicalChange, ChangelogContext};
 use crate::json_store::{JsonRef, JsonStoreContext, JsonStoreWriter};
 use crate::live_state::{LiveStateContext, LiveStateRow};
+use crate::storage::{StorageReader, StorageWriter};
 use crate::transaction::staging::StagedWriteSet;
 use crate::transaction::types::{StagedAdoptedStateRow, StagedCommitMembers, StagedStateRow};
 use crate::version::{VersionContext, VersionRefReader};
+use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
-use crate::{BackendTransaction, LixError};
 
 /// Commits transaction-staged rows into durable tracked and untracked stores.
 ///
@@ -22,7 +23,7 @@ pub(crate) async fn commit_staged_writes(
     changelog: &ChangelogContext,
     live_state: &LiveStateContext,
     version_ctx: &VersionContext,
-    transaction: &mut dyn BackendTransaction,
+    transaction: &mut (impl StorageReader + StorageWriter + ?Sized),
     staged_writes: StagedWriteSet,
 ) -> Result<(), LixError> {
     if !staged_writes.file_data_writes.is_empty() {
@@ -70,8 +71,7 @@ pub(crate) async fn commit_staged_writes(
             new_canonical_changes(changelog, transaction, &mut json_writer, &changelog_rows)
                 .await?;
         {
-            let mut writer_store = &mut *transaction;
-            json_writer.flush(&mut writer_store).await?;
+            json_writer.flush(transaction).await?;
         }
         {
             let mut writer = changelog.writer(&mut *transaction);
@@ -112,7 +112,7 @@ pub(crate) async fn commit_staged_writes(
 
 async fn new_canonical_changes(
     changelog: &ChangelogContext,
-    transaction: &mut dyn BackendTransaction,
+    transaction: &mut (impl StorageReader + StorageWriter + ?Sized),
     json_writer: &mut JsonStoreWriter,
     rows: &[StagedStateRow],
 ) -> Result<Vec<CanonicalChange>, LixError> {
@@ -144,7 +144,7 @@ async fn new_canonical_changes(
 
 async fn validate_adopted_canonical_changes(
     changelog: &ChangelogContext,
-    transaction: &mut dyn BackendTransaction,
+    transaction: &mut (impl StorageReader + StorageWriter + ?Sized),
     rows: &[StagedAdoptedStateRow],
 ) -> Result<(), LixError> {
     let mut json_writer = JsonStoreContext::new().writer();
@@ -263,7 +263,7 @@ async fn finalize_commit_rows(
     commit_members_by_version: BTreeMap<String, StagedCommitMembers>,
     extra_commit_parents_by_version: BTreeMap<String, Vec<String>>,
     version_ctx: &VersionContext,
-    transaction: &mut dyn BackendTransaction,
+    transaction: &mut (impl StorageReader + ?Sized),
 ) -> Result<FinalizedCommitRows, LixError> {
     let mut commit_rows = Vec::new();
     let mut version_heads = Vec::new();
@@ -350,9 +350,10 @@ mod tests {
     use serde_json::Value as JsonValue;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
+    use crate::backend::{testing::UnitTestBackend, Backend};
     use crate::changelog::ChangelogContext;
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
+    use crate::storage::StorageContext;
     use crate::untracked_state::{
         UntrackedStateContext, UntrackedStateRow, UntrackedStateRowRequest,
     };
@@ -370,12 +371,13 @@ mod tests {
     #[tokio::test]
     async fn commit_staged_writes_appends_changelog_and_updates_serving_projection() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
         let live_state = Arc::new(live_state_context());
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
 
@@ -405,7 +407,7 @@ mod tests {
             .expect("commit should persist kv");
 
         let changes = {
-            let reader = changelog.reader(Arc::clone(&backend));
+            let reader = changelog.reader(storage.clone());
             reader
                 .scan_changes(&crate::changelog::ChangelogScanRequest::default())
                 .await
@@ -424,7 +426,7 @@ mod tests {
             .any(|change| change.schema_key == "lix_version_ref"));
 
         let loaded_head = version_ctx
-            .ref_reader(Arc::clone(&backend))
+            .ref_reader(storage.clone())
             .load_head_commit_id(GLOBAL_VERSION_ID)
             .await
             .expect("version ref load should succeed");
@@ -434,13 +436,14 @@ mod tests {
     #[tokio::test]
     async fn commit_with_only_untracked_writes_does_not_create_lix_commit() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
         let live_state = Arc::new(live_state_context());
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
         let untracked_state = UntrackedStateContext::new();
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
 
@@ -467,7 +470,7 @@ mod tests {
             .expect("commit should persist kv");
 
         let changes = {
-            let reader = changelog.reader(Arc::clone(&backend));
+            let reader = changelog.reader(storage.clone());
             reader
                 .scan_changes(&crate::changelog::ChangelogScanRequest::default())
                 .await
@@ -476,7 +479,7 @@ mod tests {
         assert!(changes.is_empty());
 
         let loaded = {
-            let mut untracked_reader = untracked_state.reader(Arc::clone(&backend));
+            let mut untracked_reader = untracked_state.reader(storage.clone());
             untracked_reader
                 .load_row(&UntrackedStateRowRequest {
                     schema_key: "test_schema".to_string(),
@@ -497,14 +500,15 @@ mod tests {
     #[tokio::test]
     async fn tracked_write_deletes_matching_untracked_overlay() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
         let untracked_state = UntrackedStateContext::new();
         let live_state = Arc::new(live_state_context());
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
 
-        let mut seed_transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut seed_transaction = storage
+            .begin_write_transaction()
             .await
             .expect("seed transaction should open");
         untracked_state
@@ -519,8 +523,8 @@ mod tests {
             .await
             .expect("seed transaction should persist");
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         commit_staged_writes(
@@ -549,14 +553,14 @@ mod tests {
             .expect("commit should persist kv");
 
         let untracked = {
-            let mut untracked_reader = untracked_state.reader(Arc::clone(&backend));
+            let mut untracked_reader = untracked_state.reader(storage.clone());
             untracked_reader.load_row(&untracked_request()).await
         }
         .expect("untracked load should succeed");
         assert_eq!(untracked, None);
 
         let visible = live_state
-            .reader(Arc::clone(&backend))
+            .reader(storage.clone())
             .load_row(&live_state_request())
             .await
             .expect("live-state load should succeed")
@@ -569,21 +573,18 @@ mod tests {
     #[tokio::test]
     async fn non_global_tracked_write_creates_one_commit_and_advances_only_touched_version() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let binary_cas = BinaryCasContext::new();
         let changelog = ChangelogContext::new();
         let live_state = Arc::new(live_state_context());
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
-        crate::test_support::seed_version_head(
-            backend.as_ref(),
-            GLOBAL_VERSION_ID,
-            "global-before",
-        )
-        .await;
-        crate::test_support::seed_version_head(backend.as_ref(), "version-a", "version-a-before")
+        crate::test_support::seed_version_head(storage.clone(), GLOBAL_VERSION_ID, "global-before")
+            .await;
+        crate::test_support::seed_version_head(storage.clone(), "version-a", "version-a-before")
             .await;
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         commit_staged_writes(
@@ -612,7 +613,7 @@ mod tests {
             .expect("commit should persist kv");
 
         let changes = changelog
-            .reader(Arc::clone(&backend))
+            .reader(storage.clone())
             .scan_changes(&crate::changelog::ChangelogScanRequest::default())
             .await
             .expect("changelog scan should succeed");
@@ -638,12 +639,12 @@ mod tests {
             .any(|change| change.schema_key == "lix_version_ref"));
 
         let global_head = version_ctx
-            .ref_reader(Arc::clone(&backend))
+            .ref_reader(storage.clone())
             .load_head_commit_id(GLOBAL_VERSION_ID)
             .await
             .expect("global head should load");
         let version_head = version_ctx
-            .ref_reader(Arc::clone(&backend))
+            .ref_reader(storage.clone())
             .load_head_commit_id("version-a")
             .await
             .expect("version head should load");
@@ -654,16 +655,17 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_parents_global_commit_to_existing_version_ref() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
         crate::test_support::seed_version_head(
-            backend.as_ref(),
+            storage.clone(),
             GLOBAL_VERSION_ID,
             "initial-commit",
         )
         .await;
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let rows = finalize_commit_rows(
@@ -731,9 +733,10 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_skips_empty_members() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let rows = finalize_commit_rows(
@@ -755,18 +758,15 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_uses_existing_version_ref_as_parent() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
-        crate::test_support::seed_version_head(
-            backend.as_ref(),
-            GLOBAL_VERSION_ID,
-            "global-before",
-        )
-        .await;
-        crate::test_support::seed_version_head(backend.as_ref(), "version-a", "previous-commit")
+        crate::test_support::seed_version_head(storage.clone(), GLOBAL_VERSION_ID, "global-before")
+            .await;
+        crate::test_support::seed_version_head(storage.clone(), "version-a", "previous-commit")
             .await;
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let rows = finalize_commit_rows(
@@ -801,11 +801,12 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_appends_extra_merge_parent_after_target_head() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
-        crate::test_support::seed_version_head(backend.as_ref(), "version-a", "target-head").await;
+        crate::test_support::seed_version_head(storage.clone(), "version-a", "target-head").await;
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let rows = finalize_commit_rows(

@@ -1,57 +1,79 @@
-use crate::backend::{KvScanRange, KvStore, KvWriter};
 use crate::changelog::codec::{decode_change, encode_change};
 use crate::changelog::{CanonicalChange, ChangelogScanRequest};
+use crate::storage::KvScanRange;
+use crate::storage::{
+    KvGetGroup, KvGetRequest, KvPut, KvScanRequest, KvWriteBatch, KvWriteGroup, StorageReader,
+    StorageWriter,
+};
 use crate::LixError;
 
 const CHANGELOG_CHANGE_NAMESPACE: &str = "changelog.change";
 
 pub(crate) async fn load_change(
-    store: &mut impl KvStore,
+    store: &mut impl StorageReader,
     change_id: &str,
 ) -> Result<Option<CanonicalChange>, LixError> {
-    let Some(bytes) = store
-        .kv_get(
-            CHANGELOG_CHANGE_NAMESPACE,
-            encode_change_key(change_id).as_slice(),
-        )
+    let bytes = store
+        .get_kv_many(KvGetRequest {
+            groups: vec![KvGetGroup {
+                namespace: CHANGELOG_CHANGE_NAMESPACE.to_string(),
+                keys: vec![encode_change_key(change_id)],
+            }],
+        })
         .await?
-    else {
+        .groups
+        .into_iter()
+        .next()
+        .and_then(|mut group| group.values.pop())
+        .flatten();
+    let Some(bytes) = bytes else {
         return Ok(None);
     };
     decode_change(&bytes).map(Some)
 }
 
 pub(crate) async fn scan_changes(
-    store: &mut impl KvStore,
+    store: &mut impl StorageReader,
     request: &ChangelogScanRequest,
 ) -> Result<Vec<CanonicalChange>, LixError> {
     // TODO(engine2): scan by a durable append sequence instead of change id.
     // This first index is enough for exact lookup and deterministic debug scans.
     store
-        .kv_scan(
-            CHANGELOG_CHANGE_NAMESPACE,
-            KvScanRange::prefix(Vec::new()),
-            request.limit,
-        )
+        .scan_kv(KvScanRequest {
+            namespace: CHANGELOG_CHANGE_NAMESPACE.to_string(),
+            range: KvScanRange::prefix(Vec::new()),
+            after: None,
+            limit: request.limit.unwrap_or(usize::MAX),
+        })
         .await?
+        .rows
         .into_iter()
         .map(|pair| decode_change(&pair.value))
         .collect()
 }
 
 pub(crate) async fn append_changes(
-    writer: &mut impl KvWriter,
+    writer: &mut (impl StorageWriter + ?Sized),
     changes: &[CanonicalChange],
 ) -> Result<(), LixError> {
-    for change in changes {
-        writer
-            .kv_put(
-                CHANGELOG_CHANGE_NAMESPACE,
-                encode_change_key(&change.id).as_slice(),
-                encode_change(change)?.as_slice(),
-            )
-            .await?;
-    }
+    let puts = changes
+        .iter()
+        .map(|change| {
+            Ok(KvPut {
+                key: encode_change_key(&change.id),
+                value: encode_change(change)?,
+            })
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    writer
+        .write_kv_batch(KvWriteBatch {
+            groups: vec![KvWriteGroup {
+                namespace: CHANGELOG_CHANGE_NAMESPACE.to_string(),
+                puts,
+                deletes: Vec::new(),
+            }],
+        })
+        .await?;
     Ok(())
 }
 
@@ -63,35 +85,36 @@ fn encode_change_key(change_id: &str) -> Vec<u8> {
 mod tests {
     use std::sync::Arc;
 
-    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
+    use crate::backend::testing::UnitTestBackend;
     use crate::changelog::{
         canonicalize_materialized_change, materialize_change, ChangelogContext,
         ChangelogScanRequest, MaterializedCanonicalChange,
     };
     use crate::json_store::JsonStoreContext;
+    use crate::storage::{StorageContext, StorageWriteTransaction};
 
     use super::*;
 
     #[tokio::test]
     async fn append_and_load_change_roundtrips() {
-        let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let changelog = ChangelogContext::new();
         let change = test_change("change-1");
 
-        let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut tx = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
-        append_test_changes(&changelog, tx.as_mut(), std::slice::from_ref(&change)).await;
+        append_test_changes(&changelog, &mut tx, std::slice::from_ref(&change)).await;
         tx.commit().await.expect("commit should succeed");
 
-        let loaded = load_test_change(&changelog, Arc::clone(&backend), "change-1").await;
+        let loaded = load_test_change(&changelog, storage, "change-1").await;
         assert_eq!(loaded, Some(change));
     }
 
     #[tokio::test]
     async fn append_and_load_composite_entity_identity_roundtrips() {
-        let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let changelog = ChangelogContext::new();
         let mut change = test_change("change-composite");
         change.entity_id = crate::entity_identity::EntityIdentity::tuple(vec![
@@ -101,14 +124,14 @@ mod tests {
         ])
         .expect("composite identity should be valid");
 
-        let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut tx = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
-        append_test_changes(&changelog, tx.as_mut(), std::slice::from_ref(&change)).await;
+        append_test_changes(&changelog, &mut tx, std::slice::from_ref(&change)).await;
         tx.commit().await.expect("commit should succeed");
 
-        let loaded = load_test_change(&changelog, Arc::clone(&backend), "change-composite").await;
+        let loaded = load_test_change(&changelog, storage, "change-composite").await;
         assert_eq!(loaded, Some(change));
     }
 
@@ -126,29 +149,28 @@ mod tests {
 
     #[tokio::test]
     async fn scan_changes_respects_limit() {
-        let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let changelog = ChangelogContext::new();
-        let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut tx = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         append_test_changes(
             &changelog,
-            tx.as_mut(),
+            &mut tx,
             &[test_change("change-1"), test_change("change-2")],
         )
         .await;
         tx.commit().await.expect("commit should succeed");
 
         let canonical_changes = {
-            let reader = changelog.reader(Arc::clone(&backend));
+            let reader = changelog.reader(storage.clone());
             reader
                 .scan_changes(&ChangelogScanRequest { limit: Some(1) })
                 .await
         }
         .expect("scan should succeed");
-        let materialize_store = Arc::clone(&backend);
-        let mut json_reader = JsonStoreContext::new().reader(materialize_store);
+        let mut json_reader = JsonStoreContext::new().reader(storage);
         let mut changes = Vec::new();
         for change in canonical_changes {
             changes.push(
@@ -175,7 +197,7 @@ mod tests {
 
     async fn append_test_changes(
         changelog: &ChangelogContext,
-        tx: &mut (dyn crate::BackendTransaction + Send + Sync),
+        tx: &mut Box<dyn StorageWriteTransaction + Send + Sync + 'static>,
         changes: &[MaterializedCanonicalChange],
     ) {
         let mut json_writer = JsonStoreContext::new().writer();
@@ -185,14 +207,14 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("changes should canonicalize");
         {
-            let mut writer_store = &mut *tx;
+            let mut writer_store = tx.as_mut();
             json_writer
                 .flush(&mut writer_store)
                 .await
                 .expect("json should flush");
         }
-        changelog
-            .writer(tx)
+        let mut writer = changelog.writer(tx.as_mut());
+        writer
             .append_changes(&canonical_changes)
             .await
             .expect("append should succeed");
@@ -200,17 +222,17 @@ mod tests {
 
     async fn load_test_change(
         changelog: &ChangelogContext,
-        backend: Arc<UnitTestBackend>,
+        storage: StorageContext,
         change_id: &str,
     ) -> Option<MaterializedCanonicalChange> {
         let canonical = {
-            let reader = changelog.reader(Arc::clone(&backend));
+            let reader = changelog.reader(storage.clone());
             reader
                 .load_change(change_id)
                 .await
                 .expect("load should succeed")
         }?;
-        let mut json_reader = JsonStoreContext::new().reader(backend);
+        let mut json_reader = JsonStoreContext::new().reader(storage);
         materialize_change(&mut json_reader, canonical)
             .await
             .map(Some)

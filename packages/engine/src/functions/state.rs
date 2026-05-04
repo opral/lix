@@ -3,6 +3,7 @@ use serde_json::Value as JsonValue;
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::live_state::{LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateWriter};
+use crate::storage::StorageWriter;
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
@@ -50,7 +51,7 @@ pub(crate) async fn write_sequence<S>(
     timestamp: &str,
 ) -> Result<(), LixError>
 where
-    S: crate::backend::KvWriter,
+    S: StorageWriter,
 {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "key": DETERMINISTIC_SEQUENCE_KEY,
@@ -173,8 +174,9 @@ fn deterministic_key_value_row(
 mod tests {
     use std::sync::Arc;
 
-    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
+    use crate::backend::testing::UnitTestBackend;
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
+    use crate::storage::StorageContext;
 
     use super::*;
 
@@ -189,8 +191,9 @@ mod tests {
     #[tokio::test]
     async fn missing_mode_is_disabled() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let live_state = live_state_context();
-        let reader = live_state.reader(Arc::clone(&backend));
+        let reader = live_state.reader(storage.clone());
 
         let mode = load_mode(&reader)
             .await
@@ -202,10 +205,11 @@ mod tests {
     #[tokio::test]
     async fn valid_mode_decodes_flags() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let live_state = live_state_context();
-        crate::test_support::seed_global_version_head(backend.as_ref()).await;
+        crate::test_support::seed_global_version_head(storage.clone()).await;
         write_test_key_value(
-            Arc::clone(&backend),
+            storage.clone(),
             &live_state,
             DETERMINISTIC_MODE_KEY,
             serde_json::json!({
@@ -215,7 +219,7 @@ mod tests {
         )
         .await;
 
-        let reader = live_state.reader(Arc::clone(&backend));
+        let reader = live_state.reader(storage.clone());
         let mode = load_mode(&reader).await.expect("valid mode should decode");
 
         assert_eq!(
@@ -230,8 +234,9 @@ mod tests {
     #[tokio::test]
     async fn missing_sequence_is_uninitialized() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let live_state = live_state_context();
-        let reader = live_state.reader(Arc::clone(&backend));
+        let reader = live_state.reader(storage.clone());
 
         let sequence = load_sequence(&reader)
             .await
@@ -243,17 +248,18 @@ mod tests {
     #[tokio::test]
     async fn valid_sequence_decodes_highest_seen() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let live_state = live_state_context();
-        crate::test_support::seed_global_version_head(backend.as_ref()).await;
+        crate::test_support::seed_global_version_head(storage.clone()).await;
         write_test_key_value(
-            Arc::clone(&backend),
+            storage.clone(),
             &live_state,
             DETERMINISTIC_SEQUENCE_KEY,
             serde_json::json!(41),
         )
         .await;
 
-        let reader = live_state.reader(Arc::clone(&backend));
+        let reader = live_state.reader(storage.clone());
         let sequence = load_sequence(&reader)
             .await
             .expect("valid sequence should decode");
@@ -265,10 +271,11 @@ mod tests {
     #[tokio::test]
     async fn write_sequence_persists_untracked_global_key_value() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let live_state = live_state_context();
-        crate::test_support::seed_global_version_head(backend.as_ref()).await;
-        let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        crate::test_support::seed_global_version_head(storage.clone()).await;
+        let mut tx = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let mut writer = live_state.writer(tx.as_mut());
@@ -282,7 +289,7 @@ mod tests {
         .expect("sequence should persist");
         tx.commit().await.expect("transaction should commit");
 
-        let reader = live_state.reader(Arc::clone(&backend));
+        let reader = live_state.reader(storage.clone());
         let row = reader
             .load_row(&LiveStateRowRequest {
                 schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
@@ -306,13 +313,13 @@ mod tests {
     }
 
     async fn write_test_key_value(
-        backend: Arc<UnitTestBackend>,
+        storage: StorageContext,
         live_state: &LiveStateContext,
         key: &str,
         value: JsonValue,
     ) {
-        let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut tx = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let snapshot_content = serde_json::to_string(&serde_json::json!({

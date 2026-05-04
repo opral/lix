@@ -1,4 +1,8 @@
-use crate::backend::{KvScanRange, KvStore, KvWriter};
+use crate::storage::KvScanRange;
+use crate::storage::{
+    KvGetGroup, KvGetRequest, KvPair, KvPut, KvScanRequest, KvWriteBatch, KvWriteGroup,
+    StorageReader, StorageWriter,
+};
 use crate::tracked_state::codec::PendingChunkWrite;
 use crate::tracked_state::tree_types::{
     SnapshotCodec, SnapshotRef, TrackedStateRootId, TRACKED_STATE_HASH_BYTES,
@@ -19,13 +23,70 @@ pub(crate) const TRACKED_STATE_SNAPSHOT_NAMESPACE: &str = "tracked_state.snapsho
 pub(crate) const TRACKED_STATE_JSON_SNAPSHOT_CHUNK_NAMESPACE: &str =
     "tracked_state.snapshot.json_chunk";
 
+async fn get_one(
+    store: &mut (impl StorageReader + ?Sized),
+    namespace: &str,
+    key: Vec<u8>,
+) -> Result<Option<Vec<u8>>, LixError> {
+    Ok(store
+        .get_kv_many(KvGetRequest {
+            groups: vec![KvGetGroup {
+                namespace: namespace.to_string(),
+                keys: vec![key],
+            }],
+        })
+        .await?
+        .groups
+        .into_iter()
+        .next()
+        .and_then(|mut group| group.values.pop())
+        .flatten())
+}
+
+async fn put_one(
+    writer: &mut (impl StorageWriter + ?Sized),
+    namespace: &str,
+    key: Vec<u8>,
+    value: Vec<u8>,
+) -> Result<(), LixError> {
+    writer
+        .write_kv_batch(KvWriteBatch {
+            groups: vec![KvWriteGroup {
+                namespace: namespace.to_string(),
+                puts: vec![KvPut { key, value }],
+                deletes: Vec::new(),
+            }],
+        })
+        .await?;
+    Ok(())
+}
+
+async fn scan_all(
+    store: &mut (impl StorageReader + ?Sized),
+    namespace: &str,
+    range: KvScanRange,
+) -> Result<Vec<KvPair>, LixError> {
+    Ok(store
+        .scan_kv(KvScanRequest {
+            namespace: namespace.to_string(),
+            range,
+            after: None,
+            limit: usize::MAX,
+        })
+        .await?
+        .rows)
+}
+
 pub(crate) async fn load_root(
-    store: &mut (impl KvStore + ?Sized),
+    store: &mut (impl StorageReader + ?Sized),
     commit_id: &str,
 ) -> Result<Option<TrackedStateRootId>, LixError> {
-    let Some(bytes) = store
-        .kv_get(TRACKED_STATE_ROOT_NAMESPACE, commit_id.as_bytes())
-        .await?
+    let Some(bytes) = get_one(
+        store,
+        TRACKED_STATE_ROOT_NAMESPACE,
+        commit_id.as_bytes().to_vec(),
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -33,26 +94,29 @@ pub(crate) async fn load_root(
 }
 
 pub(crate) async fn store_root(
-    writer: &mut impl KvWriter,
+    writer: &mut impl StorageWriter,
     commit_id: &str,
     root_id: &TrackedStateRootId,
 ) -> Result<(), LixError> {
-    writer
-        .kv_put(
-            TRACKED_STATE_ROOT_NAMESPACE,
-            commit_id.as_bytes(),
-            root_id.as_bytes(),
-        )
-        .await
+    put_one(
+        writer,
+        TRACKED_STATE_ROOT_NAMESPACE,
+        commit_id.as_bytes().to_vec(),
+        root_id.as_bytes().to_vec(),
+    )
+    .await
 }
 
 pub(crate) async fn load_by_file_root(
-    store: &mut (impl KvStore + ?Sized),
+    store: &mut (impl StorageReader + ?Sized),
     commit_id: &str,
 ) -> Result<Option<TrackedStateRootId>, LixError> {
-    let Some(bytes) = store
-        .kv_get(TRACKED_STATE_BY_FILE_ROOT_NAMESPACE, commit_id.as_bytes())
-        .await?
+    let Some(bytes) = get_one(
+        store,
+        TRACKED_STATE_BY_FILE_ROOT_NAMESPACE,
+        commit_id.as_bytes().to_vec(),
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -60,17 +124,17 @@ pub(crate) async fn load_by_file_root(
 }
 
 pub(crate) async fn store_by_file_root(
-    writer: &mut impl KvWriter,
+    writer: &mut impl StorageWriter,
     commit_id: &str,
     root_id: &TrackedStateRootId,
 ) -> Result<(), LixError> {
-    writer
-        .kv_put(
-            TRACKED_STATE_BY_FILE_ROOT_NAMESPACE,
-            commit_id.as_bytes(),
-            root_id.as_bytes(),
-        )
-        .await
+    put_one(
+        writer,
+        TRACKED_STATE_BY_FILE_ROOT_NAMESPACE,
+        commit_id.as_bytes().to_vec(),
+        root_id.as_bytes().to_vec(),
+    )
+    .await
 }
 
 /// Deletes the root pointer for a commit.
@@ -80,32 +144,47 @@ pub(crate) async fn store_by_file_root(
 /// changelog.
 #[cfg(test)]
 pub(crate) async fn delete_root(
-    writer: &mut (impl KvWriter + ?Sized),
+    writer: &mut (impl StorageWriter + ?Sized),
     commit_id: &str,
 ) -> Result<(), LixError> {
     writer
-        .kv_delete(TRACKED_STATE_ROOT_NAMESPACE, commit_id.as_bytes())
+        .write_kv_batch(KvWriteBatch {
+            groups: vec![
+                KvWriteGroup {
+                    namespace: TRACKED_STATE_ROOT_NAMESPACE.to_string(),
+                    puts: Vec::new(),
+                    deletes: vec![commit_id.as_bytes().to_vec()],
+                },
+                KvWriteGroup {
+                    namespace: TRACKED_STATE_BY_FILE_ROOT_NAMESPACE.to_string(),
+                    puts: Vec::new(),
+                    deletes: vec![commit_id.as_bytes().to_vec()],
+                },
+            ],
+        })
         .await?;
-    writer
-        .kv_delete(TRACKED_STATE_BY_FILE_ROOT_NAMESPACE, commit_id.as_bytes())
-        .await
+    Ok(())
 }
 
 pub(crate) async fn read_chunk(
-    store: &mut impl KvStore,
+    store: &mut impl StorageReader,
     hash: &[u8; TRACKED_STATE_HASH_BYTES],
 ) -> Result<Option<Vec<u8>>, LixError> {
-    store.kv_get(TRACKED_STATE_CHUNK_NAMESPACE, hash).await
+    get_one(store, TRACKED_STATE_CHUNK_NAMESPACE, hash.to_vec()).await
 }
 
 pub(crate) async fn write_chunks(
-    writer: &mut impl KvWriter,
+    writer: &mut impl StorageWriter,
     chunks: &[PendingChunkWrite],
 ) -> Result<(), LixError> {
     for chunk in chunks {
-        writer
-            .kv_put(TRACKED_STATE_CHUNK_NAMESPACE, &chunk.hash, &chunk.data)
-            .await?;
+        put_one(
+            writer,
+            TRACKED_STATE_CHUNK_NAMESPACE,
+            chunk.hash.to_vec(),
+            chunk.data.clone(),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -176,17 +255,17 @@ pub(crate) fn encode_snapshot_content_with_ref(
 }
 
 pub(crate) async fn store_encoded_snapshot(
-    writer: &mut impl KvWriter,
+    writer: &mut impl StorageWriter,
     encoded_snapshot: &EncodedSnapshot<'_>,
 ) -> Result<(), LixError> {
     for chunk in &encoded_snapshot.json_chunks {
-        writer
-            .kv_put(
-                TRACKED_STATE_JSON_SNAPSHOT_CHUNK_NAMESPACE,
-                chunk.hash_hex.as_bytes(),
-                chunk.data.as_bytes(),
-            )
-            .await?;
+        put_one(
+            writer,
+            TRACKED_STATE_JSON_SNAPSHOT_CHUNK_NAMESPACE,
+            chunk.hash_hex.as_bytes().to_vec(),
+            chunk.data.as_bytes().to_vec(),
+        )
+        .await?;
     }
     store_snapshot_ref(
         writer,
@@ -197,29 +276,29 @@ pub(crate) async fn store_encoded_snapshot(
 }
 
 pub(crate) async fn store_snapshot_ref(
-    writer: &mut impl KvWriter,
+    writer: &mut impl StorageWriter,
     snapshot_ref: &SnapshotRef,
     snapshot_data: &[u8],
 ) -> Result<(), LixError> {
-    writer
-        .kv_put(
-            TRACKED_STATE_SNAPSHOT_NAMESPACE,
-            snapshot_ref.hash_hex.as_bytes(),
-            snapshot_data,
-        )
-        .await
+    put_one(
+        writer,
+        TRACKED_STATE_SNAPSHOT_NAMESPACE,
+        snapshot_ref.hash_hex.as_bytes().to_vec(),
+        snapshot_data.to_vec(),
+    )
+    .await
 }
 
 pub(crate) async fn load_snapshot(
-    store: &mut impl KvStore,
+    store: &mut impl StorageReader,
     snapshot_ref: &SnapshotRef,
 ) -> Result<Option<String>, LixError> {
-    let Some(bytes) = store
-        .kv_get(
-            TRACKED_STATE_SNAPSHOT_NAMESPACE,
-            snapshot_ref.hash_hex.as_bytes(),
-        )
-        .await?
+    let Some(bytes) = get_one(
+        store,
+        TRACKED_STATE_SNAPSHOT_NAMESPACE,
+        snapshot_ref.hash_hex.as_bytes().to_vec(),
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -233,7 +312,7 @@ pub(crate) async fn load_snapshot(
 }
 
 async fn decode_snapshot_payload(
-    store: &mut impl KvStore,
+    store: &mut impl StorageReader,
     snapshot_ref: &SnapshotRef,
     bytes: &[u8],
 ) -> Result<Vec<u8>, LixError> {
@@ -489,7 +568,7 @@ fn read_manifest_part<'a>(manifest: &'a str, cursor: &mut usize) -> Option<&'a s
 }
 
 async fn decode_json_chunked_snapshot(
-    store: &mut impl KvStore,
+    store: &mut impl StorageReader,
     snapshot_ref: &SnapshotRef,
     manifest_bytes: &[u8],
 ) -> Result<Vec<u8>, LixError> {
@@ -497,12 +576,12 @@ async fn decode_json_chunked_snapshot(
     let mut out = String::new();
     let mut close_delimiter = None;
     for (index, chunk_ref) in manifest.chunks.iter().enumerate() {
-        let Some(chunk_bytes) = store
-            .kv_get(
-                TRACKED_STATE_JSON_SNAPSHOT_CHUNK_NAMESPACE,
-                chunk_ref.hash_hex.as_bytes(),
-            )
-            .await?
+        let Some(chunk_bytes) = get_one(
+            store,
+            TRACKED_STATE_JSON_SNAPSHOT_CHUNK_NAMESPACE,
+            chunk_ref.hash_hex.as_bytes().to_vec(),
+        )
+        .await?
         else {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -668,15 +747,14 @@ fn decode_snapshot_zstd_payload(
 
 #[allow(dead_code)]
 pub(crate) async fn scan_roots(
-    store: &mut impl KvStore,
+    store: &mut impl StorageReader,
 ) -> Result<Vec<(String, TrackedStateRootId)>, LixError> {
-    let pairs = store
-        .kv_scan(
-            TRACKED_STATE_ROOT_NAMESPACE,
-            KvScanRange::prefix(Vec::new()),
-            None,
-        )
-        .await?;
+    let pairs = scan_all(
+        store,
+        TRACKED_STATE_ROOT_NAMESPACE,
+        KvScanRange::prefix(Vec::new()),
+    )
+    .await?;
     pairs
         .into_iter()
         .map(|pair| {
@@ -712,15 +790,16 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
+    use crate::backend::testing::UnitTestBackend;
+    use crate::storage::StorageContext;
 
     #[tokio::test]
     async fn root_roundtrips_through_kv_storage() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let root = TrackedStateRootId::new([7_u8; TRACKED_STATE_HASH_BYTES]);
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         store_root(&mut transaction.as_mut(), "commit-1", &root)
@@ -731,7 +810,7 @@ mod tests {
             .await
             .expect("transaction should commit");
 
-        let mut store = Arc::clone(&backend);
+        let mut store = storage.clone();
         assert_eq!(
             load_root(&mut store, "commit-1")
                 .await
@@ -742,15 +821,15 @@ mod tests {
 
     #[tokio::test]
     async fn chunk_roundtrips_through_kv_storage() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let data = b"chunk-data".to_vec();
         let chunk = PendingChunkWrite {
             hash: crate::tracked_state::codec::hash_bytes(&data),
             data: data.clone(),
         };
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         write_chunks(&mut transaction.as_mut(), std::slice::from_ref(&chunk))
@@ -761,7 +840,7 @@ mod tests {
             .await
             .expect("transaction should commit");
 
-        let mut store = Arc::clone(&backend);
+        let mut store = storage.clone();
         assert_eq!(
             read_chunk(&mut store, &chunk.hash)
                 .await
@@ -772,13 +851,13 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_roundtrips_raw_payload() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let snapshot_content = "{\"value\":\"small\"}";
         let encoded = encode_snapshot_content(snapshot_content).expect("snapshot should encode");
         assert_eq!(encoded.snapshot_ref.codec, SnapshotCodec::Raw);
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         store_snapshot_ref(
@@ -793,7 +872,7 @@ mod tests {
             .await
             .expect("transaction should commit");
 
-        let mut store = Arc::clone(&backend);
+        let mut store = storage.clone();
         assert_eq!(
             load_snapshot(&mut store, &encoded.snapshot_ref)
                 .await
@@ -804,14 +883,14 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_roundtrips_zstd_payload() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let snapshot_content = "zstd-friendly text ".repeat(2048);
         let encoded = encode_snapshot_content(&snapshot_content).expect("snapshot should encode");
         assert_eq!(encoded.snapshot_ref.codec, SnapshotCodec::Zstd);
         assert!(encoded.data.len() < snapshot_content.len());
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         store_snapshot_ref(
@@ -826,7 +905,7 @@ mod tests {
             .await
             .expect("transaction should commit");
 
-        let mut store = Arc::clone(&backend);
+        let mut store = storage.clone();
         assert_eq!(
             load_snapshot(&mut store, &encoded.snapshot_ref)
                 .await
@@ -837,7 +916,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_roundtrips_json_chunks_and_shares_unchanged_chunks() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let before = large_json_array(None);
         let after = large_json_array(Some((128, "changed")));
         let expected_before = canonical_json(&before);
@@ -861,8 +940,8 @@ mod tests {
         let shared_chunks = before_chunks.intersection(&after_chunks).count();
         assert!(shared_chunks > before_chunks.len() / 2);
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         store_encoded_snapshot(&mut transaction.as_mut(), &encoded_before)
@@ -876,7 +955,7 @@ mod tests {
             .await
             .expect("transaction should commit");
 
-        let mut store = Arc::clone(&backend);
+        let mut store = storage.clone();
         assert_eq!(
             load_snapshot(&mut store, &encoded_before.snapshot_ref)
                 .await

@@ -3,7 +3,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lix_engine::{
-    Backend, BackendTransaction, KvPair, KvScanRange, LixError, TransactionBeginMode,
+    Backend, BackendKvGetGroup, BackendKvGetRequest, BackendKvGetResult, BackendKvGetResultGroup,
+    BackendKvPair, BackendKvPut, BackendKvScanRange, BackendKvScanRequest, BackendKvScanResult,
+    BackendKvWriteBatch, BackendKvWriteGroup, BackendKvWriteStats, BackendReadTransaction,
+    BackendWriteTransaction, LixError,
 };
 
 pub(crate) type KvKey = (String, Vec<u8>);
@@ -36,70 +39,64 @@ impl InMemoryKvBackend {
 
 #[async_trait]
 impl Backend for InMemoryKvBackend {
-    async fn begin_transaction(
+    async fn begin_read_transaction(
         &self,
-        mode: TransactionBeginMode,
-    ) -> Result<Box<dyn BackendTransaction + Send + Sync + 'static>, LixError> {
+    ) -> Result<Box<dyn BackendReadTransaction + Send + Sync + 'static>, LixError> {
         Ok(Box::new(InMemoryKvTransaction {
             data: Arc::clone(&self.data),
             pending: BTreeMap::new(),
-            mode,
             closed: false,
         }))
     }
 
-    async fn kv_get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
-        Ok(self
-            .data
-            .lock()
-            .expect("in-memory backend lock poisoned")
-            .get(&(namespace.to_string(), key.to_vec()))
-            .cloned())
-    }
-
-    async fn kv_scan(
+    async fn begin_write_transaction(
         &self,
-        namespace: &str,
-        range: KvScanRange,
-        limit: Option<usize>,
-    ) -> Result<Vec<KvPair>, LixError> {
-        let guard = self.data.lock().expect("in-memory backend lock poisoned");
-        Ok(scan_map(&guard, namespace, &range, limit))
+    ) -> Result<Box<dyn BackendWriteTransaction + Send + Sync + 'static>, LixError> {
+        Ok(Box::new(InMemoryKvTransaction {
+            data: Arc::clone(&self.data),
+            pending: BTreeMap::new(),
+            closed: false,
+        }))
     }
 }
 
 struct InMemoryKvTransaction {
     data: Arc<Mutex<KvMap>>,
     pending: BTreeMap<KvKey, Option<Vec<u8>>>,
-    mode: TransactionBeginMode,
     closed: bool,
 }
 
 #[async_trait]
-impl BackendTransaction for InMemoryKvTransaction {
-    fn mode(&self) -> TransactionBeginMode {
-        self.mode
-    }
-
-    async fn kv_get(&mut self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
-        let identity = (namespace.to_string(), key.to_vec());
-        if let Some(value) = self.pending.get(&identity) {
-            return Ok(value.clone());
-        }
-        Ok(self
-            .data
-            .lock()
-            .expect("in-memory backend lock poisoned")
-            .get(&identity)
-            .cloned())
-    }
-
-    async fn kv_scan(
+impl BackendReadTransaction for InMemoryKvTransaction {
+    async fn get_kv_many(
         &mut self,
-        namespace: &str,
-        range: KvScanRange,
-        limit: Option<usize>,
-    ) -> Result<Vec<KvPair>, LixError> {
+        request: BackendKvGetRequest,
+    ) -> Result<BackendKvGetResult, LixError> {
+        let data = self.data.lock().expect("in-memory backend lock poisoned");
+        let mut groups = Vec::with_capacity(request.groups.len());
+        for group in request.groups {
+            let mut values = Vec::with_capacity(group.keys.len());
+            for key in group.keys {
+                let identity = (group.namespace.clone(), key);
+                values.push(
+                    self.pending
+                        .get(&identity)
+                        .cloned()
+                        .unwrap_or_else(|| data.get(&identity).cloned()),
+                );
+            }
+            groups.push(BackendKvGetResultGroup {
+                namespace: group.namespace,
+                values,
+            });
+        }
+        Ok(BackendKvGetResult { groups })
+    }
+
+    async fn scan_kv(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvScanResult, LixError> {
         let mut visible = self
             .data
             .lock()
@@ -115,19 +112,61 @@ impl BackendTransaction for InMemoryKvTransaction {
                 }
             }
         }
-        Ok(scan_map(&visible, namespace, &range, limit))
+        let scan_limit = request
+            .limit
+            .checked_add(1 + usize::from(request.after.is_some()))
+            .unwrap_or(request.limit);
+        let rows = scan_map(
+            &visible,
+            &request.namespace,
+            &request.range,
+            Some(scan_limit),
+        );
+        let mut rows = rows
+            .into_iter()
+            .filter(|row| {
+                request
+                    .after
+                    .as_deref()
+                    .is_none_or(|after| row.key.as_slice() > after)
+            })
+            .collect::<Vec<_>>();
+        let has_more = rows.len() > request.limit;
+        rows.truncate(request.limit);
+        let resume_after = has_more
+            .then(|| rows.last().map(|row| row.key.clone()))
+            .flatten();
+        Ok(BackendKvScanResult { rows, resume_after })
     }
 
-    async fn kv_put(&mut self, namespace: &str, key: &[u8], value: &[u8]) -> Result<(), LixError> {
-        self.pending
-            .insert((namespace.to_string(), key.to_vec()), Some(value.to_vec()));
+    async fn rollback(mut self: Box<Self>) -> Result<(), LixError> {
+        self.pending.clear();
+        self.closed = true;
         Ok(())
     }
+}
 
-    async fn kv_delete(&mut self, namespace: &str, key: &[u8]) -> Result<(), LixError> {
-        self.pending
-            .insert((namespace.to_string(), key.to_vec()), None);
-        Ok(())
+#[async_trait]
+impl BackendWriteTransaction for InMemoryKvTransaction {
+    async fn write_kv_batch(
+        &mut self,
+        batch: BackendKvWriteBatch,
+    ) -> Result<BackendKvWriteStats, LixError> {
+        let mut stats = BackendKvWriteStats::default();
+        for group in batch.groups {
+            for put in group.puts {
+                stats.puts += 1;
+                stats.bytes_written += put.key.len() + put.value.len();
+                self.pending
+                    .insert((group.namespace.clone(), put.key), Some(put.value));
+            }
+            for key in group.deletes {
+                stats.deletes += 1;
+                stats.bytes_written += key.len();
+                self.pending.insert((group.namespace.clone(), key), None);
+            }
+        }
+        Ok(stats)
     }
 
     async fn commit(mut self: Box<Self>) -> Result<(), LixError> {
@@ -148,27 +187,21 @@ impl BackendTransaction for InMemoryKvTransaction {
         self.closed = true;
         Ok(())
     }
-
-    async fn rollback(mut self: Box<Self>) -> Result<(), LixError> {
-        self.pending.clear();
-        self.closed = true;
-        Ok(())
-    }
 }
 
 fn scan_map(
     map: &KvMap,
     namespace: &str,
-    range: &KvScanRange,
+    range: &BackendKvScanRange,
     limit: Option<usize>,
-) -> Vec<KvPair> {
+) -> Vec<BackendKvPair> {
     let mut pairs = map
         .iter()
         .filter_map(|((entry_namespace, key), value)| {
             if entry_namespace != namespace || !key_in_range(key, range) {
                 return None;
             }
-            Some(KvPair::new(key.clone(), value.clone()))
+            Some(BackendKvPair::new(key.clone(), value.clone()))
         })
         .collect::<Vec<_>>();
     pairs.sort_by(|left, right| left.key.cmp(&right.key));
@@ -178,10 +211,10 @@ fn scan_map(
     pairs
 }
 
-fn key_in_range(key: &[u8], range: &KvScanRange) -> bool {
+fn key_in_range(key: &[u8], range: &BackendKvScanRange) -> bool {
     match range {
-        KvScanRange::Prefix(prefix) => key.starts_with(prefix),
-        KvScanRange::Range { start, end } => key >= start.as_slice() && key < end.as_slice(),
+        BackendKvScanRange::Prefix(prefix) => key.starts_with(prefix),
+        BackendKvScanRange::Range { start, end } => key >= start.as_slice() && key < end.as_slice(),
     }
 }
 
@@ -189,22 +222,106 @@ fn key_in_range(key: &[u8], range: &KvScanRange) -> bool {
 mod tests {
     use super::*;
 
+    async fn put(
+        tx: &mut Box<dyn BackendWriteTransaction + Send + Sync>,
+        namespace: &str,
+        key: &[u8],
+        value: &[u8],
+    ) {
+        tx.write_kv_batch(BackendKvWriteBatch {
+            groups: vec![BackendKvWriteGroup {
+                namespace: namespace.to_string(),
+                puts: vec![BackendKvPut {
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                }],
+                deletes: Vec::new(),
+            }],
+        })
+        .await
+        .expect("put should succeed");
+    }
+
+    async fn delete(
+        tx: &mut Box<dyn BackendWriteTransaction + Send + Sync>,
+        namespace: &str,
+        key: &[u8],
+    ) {
+        tx.write_kv_batch(BackendKvWriteBatch {
+            groups: vec![BackendKvWriteGroup {
+                namespace: namespace.to_string(),
+                puts: Vec::new(),
+                deletes: vec![key.to_vec()],
+            }],
+        })
+        .await
+        .expect("delete should succeed");
+    }
+
+    async fn get(
+        tx: &mut (dyn BackendReadTransaction + Send + Sync),
+        namespace: &str,
+        key: &[u8],
+    ) -> Option<Vec<u8>> {
+        tx.get_kv_many(BackendKvGetRequest {
+            groups: vec![BackendKvGetGroup {
+                namespace: namespace.to_string(),
+                keys: vec![key.to_vec()],
+            }],
+        })
+        .await
+        .expect("get should succeed")
+        .groups
+        .remove(0)
+        .values
+        .remove(0)
+    }
+
+    async fn committed_get(
+        backend: &InMemoryKvBackend,
+        namespace: &str,
+        key: &[u8],
+    ) -> Option<Vec<u8>> {
+        let mut tx = backend
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
+        let value = get(tx.as_mut(), namespace, key).await;
+        tx.rollback().await.expect("rollback should succeed");
+        value
+    }
+
+    async fn scan(
+        tx: &mut (dyn BackendReadTransaction + Send + Sync),
+        namespace: &str,
+        range: BackendKvScanRange,
+        limit: Option<usize>,
+    ) -> Vec<BackendKvPair> {
+        tx.scan_kv(BackendKvScanRequest {
+            namespace: namespace.to_string(),
+            range,
+            after: None,
+            limit: limit.unwrap_or(usize::MAX),
+        })
+        .await
+        .expect("scan should succeed")
+        .rows
+    }
+
     #[tokio::test]
     async fn transaction_put_commit_makes_value_visible() {
         let backend = InMemoryKvBackend::new();
         let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
 
-        tx.kv_put("ns", b"a", b"one")
-            .await
-            .expect("put should succeed");
-        assert_eq!(tx.kv_get("ns", b"a").await.unwrap(), Some(b"one".to_vec()));
+        put(&mut tx, "ns", b"a", b"one").await;
+        assert_eq!(get(tx.as_mut(), "ns", b"a").await, Some(b"one".to_vec()));
         tx.commit().await.expect("commit should succeed");
 
         assert_eq!(
-            backend.kv_get("ns", b"a").await.unwrap(),
+            committed_get(&backend, "ns", b"a").await,
             Some(b"one".to_vec())
         );
     }
@@ -213,46 +330,47 @@ mod tests {
     async fn rollback_discards_pending_values() {
         let backend = InMemoryKvBackend::new();
         let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
 
-        tx.kv_put("ns", b"a", b"one")
-            .await
-            .expect("put should succeed");
+        put(&mut tx, "ns", b"a", b"one").await;
         tx.rollback().await.expect("rollback should succeed");
 
-        assert_eq!(backend.kv_get("ns", b"a").await.unwrap(), None);
+        assert_eq!(committed_get(&backend, "ns", b"a").await, None);
     }
 
     #[tokio::test]
     async fn scan_overlays_pending_write_and_delete() {
         let backend = InMemoryKvBackend::new();
         let mut seed = backend
-            .begin_transaction(TransactionBeginMode::Write)
+            .begin_write_transaction()
             .await
             .expect("seed transaction should open");
-        seed.kv_put("ns", b"a", b"old").await.unwrap();
-        seed.kv_put("ns", b"b", b"two").await.unwrap();
+        put(&mut seed, "ns", b"a", b"old").await;
+        put(&mut seed, "ns", b"b", b"two").await;
         seed.commit().await.unwrap();
 
         let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
-        tx.kv_put("ns", b"a", b"new").await.unwrap();
-        tx.kv_delete("ns", b"b").await.unwrap();
-        tx.kv_put("ns", b"c", b"three").await.unwrap();
+        put(&mut tx, "ns", b"a", b"new").await;
+        delete(&mut tx, "ns", b"b").await;
+        put(&mut tx, "ns", b"c", b"three").await;
 
-        let rows = tx
-            .kv_scan("ns", KvScanRange::Prefix(Vec::new()), None)
-            .await
-            .unwrap();
+        let rows = scan(
+            tx.as_mut(),
+            "ns",
+            BackendKvScanRange::Prefix(Vec::new()),
+            None,
+        )
+        .await;
         assert_eq!(
             rows,
             vec![
-                KvPair::new(b"a".to_vec(), b"new".to_vec()),
-                KvPair::new(b"c".to_vec(), b"three".to_vec()),
+                BackendKvPair::new(b"a".to_vec(), b"new".to_vec()),
+                BackendKvPair::new(b"c".to_vec(), b"three".to_vec()),
             ]
         );
     }

@@ -1,7 +1,9 @@
-use crate::backend::{KvStore, KvWriter};
 use crate::json_store::compression::{compress_json_payload, decode_json_zstd_payload};
 use crate::json_store::encoded::{EncodedJson, JsonCodec};
 use crate::json_store::types::JsonRef;
+use crate::storage::{
+    KvGetGroup, KvGetRequest, KvPut, KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
+};
 use crate::LixError;
 use std::borrow::Cow;
 
@@ -58,7 +60,7 @@ fn encode_json_for_storage_with_ref(
 }
 
 pub(crate) async fn persist_json_bytes(
-    writer: &mut (impl KvWriter + ?Sized),
+    writer: &mut (impl StorageWriter + ?Sized),
     bytes: &[u8],
 ) -> Result<JsonRef, LixError> {
     let (json_ref, stored_payload) = encode_json_bytes_for_storage(bytes)?;
@@ -87,37 +89,51 @@ pub(crate) fn encode_json_str_for_storage_with_ref(
 }
 
 async fn persist_encoded_json(
-    writer: &mut (impl KvWriter + ?Sized),
+    writer: &mut (impl StorageWriter + ?Sized),
     encoded_json: &EncodedJson<'_>,
 ) -> Result<(), LixError> {
     let stored_payload = encode_stored_json_payload(encoded_json);
-    writer
-        .kv_put(
-            JSON_NAMESPACE,
-            encoded_json.json_ref.as_hash_bytes(),
-            stored_payload.as_slice(),
-        )
-        .await
+    persist_stored_json_payload(writer, &encoded_json.json_ref, &stored_payload).await
 }
 
 pub(crate) async fn persist_stored_json_payload(
-    writer: &mut (impl KvWriter + ?Sized),
+    writer: &mut (impl StorageWriter + ?Sized),
     json_ref: &JsonRef,
     stored_payload: &[u8],
 ) -> Result<(), LixError> {
     writer
-        .kv_put(JSON_NAMESPACE, json_ref.as_hash_bytes(), stored_payload)
-        .await
+        .write_kv_batch(KvWriteBatch {
+            groups: vec![KvWriteGroup {
+                namespace: JSON_NAMESPACE.to_string(),
+                puts: vec![KvPut {
+                    key: json_ref.as_hash_bytes().to_vec(),
+                    value: stored_payload.to_vec(),
+                }],
+                deletes: Vec::new(),
+            }],
+        })
+        .await?;
+    Ok(())
 }
 
 pub(crate) async fn load_json_bytes(
-    store: &mut impl KvStore,
+    store: &mut impl StorageReader,
     json_ref: &JsonRef,
 ) -> Result<Option<Vec<u8>>, LixError> {
-    let Some(bytes) = store
-        .kv_get(JSON_NAMESPACE, json_ref.as_hash_bytes())
+    let result = store
+        .get_kv_many(KvGetRequest {
+            groups: vec![KvGetGroup {
+                namespace: JSON_NAMESPACE.to_string(),
+                keys: vec![json_ref.as_hash_bytes().to_vec()],
+            }],
+        })
         .await?
-    else {
+        .groups
+        .into_iter()
+        .next()
+        .and_then(|mut group| group.values.pop())
+        .flatten();
+    let Some(bytes) = result else {
         return Ok(None);
     };
     let stored_payload = decode_stored_json_payload(&bytes)?;
@@ -182,7 +198,7 @@ fn read_json_codec(byte: u8) -> Result<JsonCodec, LixError> {
 }
 
 async fn decode_json_payload(
-    _store: &mut impl KvStore,
+    _store: &mut impl StorageReader,
     json_ref: &JsonRef,
     stored_payload: StoredJsonPayload<'_>,
 ) -> Result<Vec<u8>, LixError> {
@@ -220,17 +236,18 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
+    use crate::backend::testing::UnitTestBackend;
+    use crate::storage::StorageContext;
 
     #[tokio::test]
     async fn json_roundtrips_raw_payload() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let json = "{\"value\":\"small\"}";
         let encoded = encode_json(json).expect("json should encode");
         assert_eq!(encoded.codec, JsonCodec::Raw);
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         persist_encoded_json(&mut transaction.as_mut(), &encoded)
@@ -241,7 +258,7 @@ mod tests {
             .await
             .expect("transaction should commit");
 
-        let mut store = Arc::clone(&backend);
+        let mut store = storage.clone();
         assert_eq!(
             load_json_bytes(&mut store, &encoded.json_ref)
                 .await

@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::backend::{KvStore, ReadScope, ScopedKvStore};
 use crate::changelog::{
     materialize_change, CanonicalChange, ChangelogContext, ChangelogStoreReader,
     MaterializedCanonicalChange,
@@ -13,6 +12,8 @@ use crate::commit_graph::{
 };
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::{JsonStoreContext, JsonStoreReader};
+use crate::storage::StorageReader;
+use crate::storage::{ScopedStorageReader, StorageReadScope};
 use crate::LixError;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
@@ -34,9 +35,9 @@ impl CommitGraphContext {
     /// Creates a graph reader over a caller-provided KV store.
     pub(crate) fn reader<S>(&self, store: S) -> CommitGraphStoreReader<S>
     where
-        S: KvStore,
+        S: StorageReader,
     {
-        let read_scope = ReadScope::new(store);
+        let read_scope = StorageReadScope::new(store);
         CommitGraphStoreReader {
             changelog_reader: self.changelog.reader(read_scope.store()),
             json_reader: JsonStoreContext::new().reader(read_scope.store()),
@@ -47,15 +48,15 @@ impl CommitGraphContext {
 /// Commit-graph reader that resolves changelog entities at a commit head.
 pub(crate) struct CommitGraphStoreReader<S>
 where
-    S: KvStore,
+    S: StorageReader,
 {
-    changelog_reader: ChangelogStoreReader<ScopedKvStore<S>>,
-    json_reader: JsonStoreReader<ScopedKvStore<S>>,
+    changelog_reader: ChangelogStoreReader<ScopedStorageReader<S>>,
+    json_reader: JsonStoreReader<ScopedStorageReader<S>>,
 }
 
 impl<S> CommitGraphStoreReader<S>
 where
-    S: KvStore,
+    S: StorageReader,
 {
     /// Returns the canonical entities that are effective at `head_commit_id`.
     ///
@@ -355,7 +356,7 @@ where
 #[async_trait::async_trait]
 impl<S> CommitGraphReader for CommitGraphStoreReader<S>
 where
-    S: KvStore,
+    S: StorageReader,
 {
     async fn load_commit(
         &mut self,
@@ -614,19 +615,21 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
+    use crate::backend::testing::UnitTestBackend;
     use crate::changelog::{
         canonicalize_materialized_change, ChangelogContext, MaterializedCanonicalChange,
     };
     use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphContext};
     use crate::json_store::JsonStoreContext;
+    use crate::storage::StorageContext;
 
     #[tokio::test]
     async fn load_commit_parses_commit_snapshot() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let changelog = ChangelogContext::new();
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &changelog,
             &[commit_change(
                 "commit-1-change",
@@ -638,7 +641,7 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new(changelog);
-        let mut reader = graph.reader(backend);
+        let mut reader = graph.reader(storage);
         let commit = reader
             .load_commit("commit-1")
             .await
@@ -655,8 +658,9 @@ mod tests {
     #[tokio::test]
     async fn load_commit_returns_none_for_missing_commit() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let graph = CommitGraphContext::new(ChangelogContext::new());
-        let mut reader = graph.reader(backend);
+        let mut reader = graph.reader(storage);
 
         let commit = reader
             .load_commit("missing")
@@ -669,9 +673,10 @@ mod tests {
     #[tokio::test]
     async fn load_commit_rejects_malformed_snapshot() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let changelog = ChangelogContext::new();
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &changelog,
             &[MaterializedCanonicalChange {
                 id: "commit-1-change".to_string(),
@@ -687,7 +692,7 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new(changelog);
-        let mut reader = graph.reader(backend);
+        let mut reader = graph.reader(storage);
         let error = reader
             .load_commit("commit-1")
             .await
@@ -699,9 +704,10 @@ mod tests {
     #[tokio::test]
     async fn all_commits_returns_parsed_commits_sorted_by_id() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let changelog = ChangelogContext::new();
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &changelog,
             &[
                 commit_change("commit-b-change", "commit-b", &[], &[]),
@@ -712,7 +718,7 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new(changelog);
-        let mut reader = graph.reader(backend);
+        let mut reader = graph.reader(storage);
         let commits = reader
             .all_commits()
             .await
@@ -730,9 +736,10 @@ mod tests {
     #[tokio::test]
     async fn entities_at_walks_ancestors_and_computes_nearest_depth() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let changelog = ChangelogContext::new();
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &changelog,
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
@@ -749,7 +756,7 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new(changelog);
-        let mut reader = graph.reader(backend);
+        let mut reader = graph.reader(storage);
         let entities = reader
             .entities_at("commit-head")
             .await
@@ -773,7 +780,7 @@ mod tests {
     #[tokio::test]
     async fn commit_edges_are_derived_from_parent_commit_ids() {
         let graph = CommitGraphContext::new(ChangelogContext::new());
-        let reader = graph.reader(Arc::new(UnitTestBackend::new()));
+        let reader = graph.reader(StorageContext::new(Arc::new(UnitTestBackend::new())));
         let commits = vec![parsed_commit(
             "commit-head",
             &[],
@@ -800,7 +807,7 @@ mod tests {
     #[tokio::test]
     async fn change_sets_are_derived_from_commits() {
         let graph = CommitGraphContext::new(ChangelogContext::new());
-        let reader = graph.reader(Arc::new(UnitTestBackend::new()));
+        let reader = graph.reader(StorageContext::new(Arc::new(UnitTestBackend::new())));
         let commits = vec![parsed_commit("commit-1", &[], &[])];
 
         let change_sets = reader.change_sets(&commits);
@@ -813,9 +820,10 @@ mod tests {
     #[tokio::test]
     async fn change_set_elements_load_member_changes() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let changelog = ChangelogContext::new();
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &changelog,
             &[
                 entity_change("change-1", "entity-1", "example", "{}"),
@@ -825,7 +833,7 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new(changelog);
-        let mut reader = graph.reader(backend);
+        let mut reader = graph.reader(storage);
         let commits = reader
             .all_commits()
             .await
@@ -851,9 +859,10 @@ mod tests {
     #[tokio::test]
     async fn change_history_from_commit_reports_matching_canonical_changes_with_depth() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let changelog = ChangelogContext::new();
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &changelog,
             &[
                 entity_change("change-root", "entity-root", "test_schema", "{}"),
@@ -870,7 +879,7 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new(changelog);
-        let mut reader = graph.reader(backend);
+        let mut reader = graph.reader(storage);
         let history = reader
             .change_history_from_commit(
                 "commit-head",
@@ -903,9 +912,10 @@ mod tests {
     #[tokio::test]
     async fn change_history_from_commit_filters_depth_entity_file_and_tombstones() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let changelog = ChangelogContext::new();
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &changelog,
             &[
                 entity_change_with_file(
@@ -935,7 +945,7 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new(changelog);
-        let mut reader = graph.reader(backend);
+        let mut reader = graph.reader(storage);
         let history = reader
             .change_history_from_commit(
                 "commit-head",
@@ -959,9 +969,10 @@ mod tests {
     #[tokio::test]
     async fn change_history_from_commit_includes_tombstones_when_requested() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let changelog = ChangelogContext::new();
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &changelog,
             &[
                 entity_tombstone("change-deleted", "entity-1", "test_schema"),
@@ -976,7 +987,7 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new(changelog);
-        let mut reader = graph.reader(backend);
+        let mut reader = graph.reader(storage);
         let hidden = reader
             .change_history_from_commit("commit-head", &CommitGraphChangeHistoryRequest::default())
             .await
@@ -1000,9 +1011,10 @@ mod tests {
     #[tokio::test]
     async fn entities_at_selects_nearest_member_change_for_identity() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let changelog = ChangelogContext::new();
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &changelog,
             &[
                 entity_change(
@@ -1029,7 +1041,7 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new(changelog);
-        let mut reader = graph.reader(backend);
+        let mut reader = graph.reader(storage);
         let entities = reader
             .entities_at("commit-head")
             .await
@@ -1044,9 +1056,10 @@ mod tests {
     #[tokio::test]
     async fn entities_at_reports_created_at_from_oldest_reachable_change() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let changelog = ChangelogContext::new();
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &changelog,
             &[
                 entity_change_at(
@@ -1080,7 +1093,7 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new(changelog);
-        let mut reader = graph.reader(backend);
+        let mut reader = graph.reader(storage);
         let entities = reader
             .entities_at("commit-head")
             .await
@@ -1098,9 +1111,10 @@ mod tests {
     #[tokio::test]
     async fn entities_at_uses_reverse_change_order_within_commit() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let changelog = ChangelogContext::new();
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &changelog,
             &[
                 entity_change(
@@ -1126,7 +1140,7 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new(changelog);
-        let mut reader = graph.reader(backend);
+        let mut reader = graph.reader(storage);
         let entities = reader
             .entities_at("commit-head")
             .await
@@ -1141,9 +1155,10 @@ mod tests {
     #[tokio::test]
     async fn entities_at_head_change_overrides_both_merge_parents() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let changelog = ChangelogContext::new();
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &changelog,
             &[
                 entity_change(
@@ -1182,7 +1197,7 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new(changelog);
-        let mut reader = graph.reader(backend);
+        let mut reader = graph.reader(storage);
         let entities = reader
             .entities_at("commit-head")
             .await
@@ -1197,9 +1212,10 @@ mod tests {
     #[tokio::test]
     async fn entities_at_distinguishes_same_entity_with_different_file_id() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let changelog = ChangelogContext::new();
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &changelog,
             &[
                 entity_change_with_file(
@@ -1227,7 +1243,7 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new(changelog);
-        let mut reader = graph.reader(backend);
+        let mut reader = graph.reader(storage);
         let entities = reader
             .entities_at("commit-head")
             .await
@@ -1245,9 +1261,10 @@ mod tests {
     #[tokio::test]
     async fn entities_at_uses_latest_change_for_same_entity_identity() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let changelog = ChangelogContext::new();
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &changelog,
             &[
                 entity_change_with_file(
@@ -1275,7 +1292,7 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new(changelog);
-        let mut reader = graph.reader(backend);
+        let mut reader = graph.reader(storage);
         let entities = reader
             .entities_at("commit-head")
             .await
@@ -1298,9 +1315,10 @@ mod tests {
     #[tokio::test]
     async fn entities_at_head_tombstone_hides_parent_entity() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let changelog = ChangelogContext::new();
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &changelog,
             &[
                 entity_change(
@@ -1327,7 +1345,7 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new(changelog);
-        let mut reader = graph.reader(backend);
+        let mut reader = graph.reader(storage);
         let entities = reader
             .entities_at("commit-head")
             .await
@@ -1347,9 +1365,10 @@ mod tests {
     #[tokio::test]
     async fn entities_at_includes_reachable_commit_rows() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let changelog = ChangelogContext::new();
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &changelog,
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
@@ -1359,7 +1378,7 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new(changelog);
-        let mut reader = graph.reader(backend);
+        let mut reader = graph.reader(storage);
         let entities = reader
             .entities_at("commit-head")
             .await
@@ -1385,9 +1404,10 @@ mod tests {
     #[tokio::test]
     async fn entities_at_errors_on_missing_member_change() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let changelog = ChangelogContext::new();
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &changelog,
             &[commit_change(
                 "commit-head-change",
@@ -1399,7 +1419,7 @@ mod tests {
         .await;
 
         let graph = CommitGraphContext::new(changelog);
-        let mut reader = graph.reader(backend);
+        let mut reader = graph.reader(storage);
         let error = reader
             .entities_at("commit-head")
             .await
@@ -1409,12 +1429,12 @@ mod tests {
     }
 
     async fn append_changes(
-        backend: Arc<UnitTestBackend>,
+        storage: StorageContext,
         changelog: &ChangelogContext,
         changes: &[MaterializedCanonicalChange],
     ) {
-        let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut tx = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let mut json_writer = JsonStoreContext::new().writer();

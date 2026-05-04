@@ -1,5 +1,5 @@
-use crate::backend::{KvStore, KvWriter};
 use crate::changelog::{CanonicalChange, ChangelogReader, ChangelogScanRequest};
+use crate::storage::{StorageReader, StorageWriter};
 use crate::LixError;
 use tokio::sync::Mutex;
 
@@ -21,7 +21,7 @@ impl ChangelogContext {
     /// The caller decides which KV store supplies visibility for the read.
     pub(crate) fn reader<S>(&self, store: S) -> ChangelogStoreReader<S>
     where
-        S: KvStore,
+        S: StorageReader,
     {
         ChangelogStoreReader {
             store: Mutex::new(store),
@@ -31,7 +31,7 @@ impl ChangelogContext {
     /// Creates a changelog writer over a caller-provided KV writer.
     pub(crate) fn writer<S>(&self, store: S) -> ChangelogWriter<S>
     where
-        S: KvWriter,
+        S: StorageWriter,
     {
         ChangelogWriter { store }
     }
@@ -44,7 +44,7 @@ pub(crate) struct ChangelogStoreReader<S> {
 
 impl<S> ChangelogStoreReader<S>
 where
-    S: KvStore,
+    S: StorageReader,
 {
     #[allow(dead_code)]
     pub(crate) async fn load_change(
@@ -68,7 +68,7 @@ where
 #[async_trait::async_trait]
 impl<S> ChangelogReader for ChangelogStoreReader<S>
 where
-    S: KvStore,
+    S: StorageReader,
 {
     async fn load_change(&self, change_id: &str) -> Result<Option<CanonicalChange>, LixError> {
         ChangelogStoreReader::load_change(self, change_id).await
@@ -89,7 +89,7 @@ pub(crate) struct ChangelogWriter<S> {
 
 impl<S> ChangelogWriter<S>
 where
-    S: KvWriter,
+    S: StorageWriter,
 {
     #[allow(dead_code)]
     pub(crate) async fn append_changes(

@@ -1,12 +1,12 @@
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use crate::backend::{KvStore, KvWriter};
 use crate::commit_graph::{CommitGraphCommit, CommitGraphContext};
 use crate::live_state::visibility;
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
 };
+use crate::storage::{StorageReader, StorageWriter};
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateFilter, TrackedStateProjection, TrackedStateRow,
     TrackedStateRowRequest, TrackedStateScanRequest,
@@ -46,7 +46,7 @@ impl LiveStateContext {
     /// Creates a visible live-state reader over a caller-provided KV store.
     pub(crate) fn reader<S>(&self, store: S) -> LiveStateStoreReader<S>
     where
-        S: KvStore,
+        S: StorageReader,
     {
         LiveStateStoreReader {
             store: Mutex::new(store),
@@ -63,7 +63,7 @@ impl LiveStateContext {
     /// untracked rows update only the local untracked overlay.
     pub(crate) fn writer<S>(&self, store: S) -> LiveStateWriter<S>
     where
-        S: KvWriter,
+        S: StorageWriter,
     {
         LiveStateWriter {
             store,
@@ -83,7 +83,7 @@ pub(crate) struct LiveStateStoreReader<S> {
 
 impl<S> LiveStateStoreReader<S>
 where
-    S: KvStore,
+    S: StorageReader,
 {
     pub(crate) async fn scan_rows(
         &self,
@@ -100,7 +100,7 @@ where
             };
             let tracked_request = tracked_scan_request_from_live(request);
             let source = tracked_source_from_version_id(version_id);
-            let store: &mut dyn KvStore = &mut *store;
+            let store: &mut dyn StorageReader = &mut *store;
             tracked_rows.extend(
                 self.tracked_state
                     .reader(store)
@@ -112,7 +112,7 @@ where
         }
 
         let untracked_rows = {
-            let store: &mut dyn KvStore = &mut *store;
+            let store: &mut dyn StorageReader = &mut *store;
             self.untracked_state
                 .reader(store)
                 .scan_rows(&untracked_scan_request_from_live(
@@ -126,7 +126,7 @@ where
         .collect::<Vec<_>>();
 
         let mut commit_rows = if scope.includes_commit_graph_projection {
-            let store: &mut dyn KvStore = &mut *store;
+            let store: &mut dyn StorageReader = &mut *store;
             self.commit_graph
                 .reader(store)
                 .all_commits()
@@ -162,13 +162,13 @@ where
             return Ok(None);
         }
         if request.schema_key == COMMIT_SCHEMA_KEY {
-            let store: &mut dyn KvStore = &mut *store;
+            let store: &mut dyn StorageReader = &mut *store;
             return self.load_commit_row(store, request).await;
         }
         for candidate in load_row_candidates(request) {
             match candidate.source {
                 LiveStateLookupSource::Untracked => {
-                    let store: &mut dyn KvStore = &mut *store;
+                    let store: &mut dyn StorageReader = &mut *store;
                     if let Some(row) = self
                         .untracked_state
                         .reader(store)
@@ -195,7 +195,7 @@ where
                     else {
                         continue;
                     };
-                    let store: &mut dyn KvStore = &mut *store;
+                    let store: &mut dyn StorageReader = &mut *store;
                     if let Some(row) = self
                         .tracked_state
                         .reader(store)
@@ -216,7 +216,7 @@ where
 
     async fn load_commit_row(
         &self,
-        store: &mut dyn KvStore,
+        store: &mut dyn StorageReader,
         request: &LiveStateRowRequest,
     ) -> Result<Option<LiveStateRow>, LixError> {
         if !nullable_filter_matches(&request.file_id, &None) {
@@ -242,7 +242,7 @@ where
 #[async_trait]
 impl<S> LiveStateReader for LiveStateStoreReader<S>
 where
-    S: KvStore + Sync,
+    S: StorageReader + Sync,
 {
     async fn scan_rows(
         &self,
@@ -268,7 +268,7 @@ pub(crate) struct LiveStateWriter<S> {
 
 impl<S> LiveStateWriter<S>
 where
-    S: KvWriter,
+    S: StorageWriter,
 {
     pub(crate) async fn write_rows(&mut self, rows: &[LiveStateRow]) -> Result<(), LixError> {
         let (tracked_rows, untracked_rows): (Vec<_>, Vec<_>) =
@@ -279,7 +279,7 @@ where
                 .into_iter()
                 .map(UntrackedStateRow::from)
                 .collect::<Vec<_>>();
-            let store: &mut dyn KvWriter = &mut self.store;
+            let store: &mut dyn StorageWriter = &mut self.store;
             self.untracked_state
                 .writer(store)
                 .write_rows(&untracked_rows)
@@ -302,7 +302,7 @@ where
             })
             .collect::<Result<Vec<_>, LixError>>()?;
         {
-            let store: &mut dyn KvWriter = &mut self.store;
+            let store: &mut dyn StorageWriter = &mut self.store;
             self.untracked_state
                 .writer(store)
                 .delete_rows(&identities)
@@ -320,7 +320,7 @@ where
                 .filter(|row| row.schema_key != COMMIT_SCHEMA_KEY)
                 .map(|row| TrackedStateRow::try_from(*row))
                 .collect::<Result<Vec<_>, _>>()?;
-            let store: &mut dyn KvWriter = &mut self.store;
+            let store: &mut dyn StorageWriter = &mut self.store;
             self.tracked_state
                 .writer(store)
                 .write_root(commit_id, parent_commit_id.as_deref(), &root_rows)
@@ -372,7 +372,7 @@ struct LiveStateScanScope {
 }
 
 async fn scan_scope(
-    store: &mut dyn KvStore,
+    store: &mut dyn StorageReader,
     untracked_state: &UntrackedStateContext,
     request: &LiveStateScanRequest,
 ) -> Result<LiveStateScanScope, LixError> {
@@ -400,7 +400,7 @@ async fn scan_scope(
 }
 
 async fn all_version_ref_ids(
-    store: &mut dyn KvStore,
+    store: &mut dyn StorageReader,
     untracked_state: &UntrackedStateContext,
 ) -> Result<Vec<String>, LixError> {
     let rows = untracked_state
@@ -420,7 +420,7 @@ async fn all_version_ref_ids(
 }
 
 async fn load_version_ref_commit_id(
-    store: &mut dyn KvStore,
+    store: &mut dyn StorageReader,
     untracked_state: &UntrackedStateContext,
     version_id: &str,
 ) -> Result<Option<String>, LixError> {
@@ -453,7 +453,7 @@ async fn load_version_ref_commit_id(
 }
 
 async fn version_ref_exists(
-    store: &mut dyn KvStore,
+    store: &mut dyn StorageReader,
     untracked_state: &UntrackedStateContext,
     version_id: &str,
 ) -> Result<bool, LixError> {
@@ -744,11 +744,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
+    use crate::backend::{testing::UnitTestBackend, Backend};
     use crate::changelog::{canonicalize_materialized_change, MaterializedCanonicalChange};
     use crate::entity_identity::EntityIdentity;
     use crate::json_store::JsonStoreContext;
     use crate::live_state::LiveStateFilter;
+    use crate::storage::StorageContext;
     use crate::tracked_state::TrackedStateScanRequest;
     use crate::untracked_state::{UntrackedStateContext, UntrackedStateRow};
     use crate::NullableKeyFilter;
@@ -765,11 +766,12 @@ mod tests {
     #[tokio::test]
     async fn live_state_overlays_untracked_rows() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
         let untracked_state = UntrackedStateContext::new();
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         live_state
@@ -791,7 +793,7 @@ mod tests {
             .expect("untracked row should write");
         transaction.commit().await.expect("commit should persist");
 
-        let rows = scan_selected_tab_at(&live_state, Arc::clone(&backend), "global", false)
+        let rows = scan_selected_tab_at(&live_state, storage.clone(), "global", false)
             .await
             .expect("scan should succeed");
         assert_eq!(rows.len(), 1);
@@ -803,7 +805,7 @@ mod tests {
         assert_eq!(rows[0].change_id, None);
 
         let loaded = live_state
-            .reader(Arc::clone(&backend))
+            .reader(storage.clone())
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: "global".to_string(),
@@ -823,10 +825,11 @@ mod tests {
     #[tokio::test]
     async fn tracked_row_is_visible_without_untracked_overlay() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         live_state
@@ -845,7 +848,7 @@ mod tests {
             .expect("version ref should write");
         transaction.commit().await.expect("commit should persist");
 
-        let loaded = load_selected_tab(&live_state, Arc::clone(&backend))
+        let loaded = load_selected_tab(&live_state, storage.clone())
             .await
             .expect("load should succeed")
             .expect("tracked row should be visible");
@@ -860,11 +863,12 @@ mod tests {
     #[tokio::test]
     async fn deleting_untracked_row_reveals_tracked_row() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
         let untracked_state = UntrackedStateContext::new();
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         live_state
@@ -895,7 +899,7 @@ mod tests {
             .expect("untracked row should delete");
         transaction.commit().await.expect("commit should persist");
 
-        let loaded = load_selected_tab(&live_state, Arc::clone(&backend))
+        let loaded = load_selected_tab(&live_state, storage.clone())
             .await
             .expect("load should succeed")
             .expect("tracked row should be visible again");
@@ -910,10 +914,11 @@ mod tests {
     #[tokio::test]
     async fn load_row_falls_back_to_global_tracked_row_for_requested_version() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         live_state
@@ -935,7 +940,7 @@ mod tests {
             .expect("version refs should write");
         transaction.commit().await.expect("commit should persist");
 
-        let loaded = load_selected_tab_at(&live_state, Arc::clone(&backend), "version-a")
+        let loaded = load_selected_tab_at(&live_state, storage.clone(), "version-a")
             .await
             .expect("load should succeed")
             .expect("global row should be visible for requested version");
@@ -952,6 +957,7 @@ mod tests {
     #[tokio::test]
     async fn main_sees_global_row_by_reading_global_root_separately() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let tracked_state = TrackedStateContext::new();
         let live_state = LiveStateContext::new(
             tracked_state.clone(),
@@ -959,8 +965,8 @@ mod tests {
             crate::commit_graph::CommitGraphContext::new(crate::changelog::ChangelogContext::new()),
         );
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         live_state
@@ -982,7 +988,7 @@ mod tests {
             .expect("global version ref should write");
         transaction.commit().await.expect("commit should persist");
 
-        let loaded = load_selected_tab_at(&live_state, Arc::clone(&backend), "main")
+        let loaded = load_selected_tab_at(&live_state, storage.clone(), "main")
             .await
             .expect("load should succeed")
             .expect("global row should be projected into main");
@@ -994,7 +1000,7 @@ mod tests {
         );
 
         let main_root_rows =
-            scan_tracked_root(&tracked_state, Arc::clone(&backend), "commit-main").await;
+            scan_tracked_root(&tracked_state, storage.clone(), "commit-main").await;
         assert_eq!(
             main_root_rows.len(),
             0,
@@ -1005,10 +1011,11 @@ mod tests {
     #[tokio::test]
     async fn load_row_prefers_requested_version_over_global() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         live_state
@@ -1034,7 +1041,7 @@ mod tests {
             .expect("version refs should write");
         transaction.commit().await.expect("commit should persist");
 
-        let loaded = load_selected_tab_at(&live_state, Arc::clone(&backend), "version-a")
+        let loaded = load_selected_tab_at(&live_state, storage.clone(), "version-a")
             .await
             .expect("load should succeed")
             .expect("version row should be visible");
@@ -1050,10 +1057,11 @@ mod tests {
     #[tokio::test]
     async fn main_override_hides_global_row() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         live_state
@@ -1079,7 +1087,7 @@ mod tests {
             .expect("version refs should write");
         transaction.commit().await.expect("commit should persist");
 
-        let loaded = load_selected_tab_at(&live_state, Arc::clone(&backend), "main")
+        let loaded = load_selected_tab_at(&live_state, storage.clone(), "main")
             .await
             .expect("load should succeed")
             .expect("main row should be visible");
@@ -1095,11 +1103,12 @@ mod tests {
     #[tokio::test]
     async fn load_row_prefers_requested_untracked_over_requested_tracked_and_global_rows() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
         let untracked_state = UntrackedStateContext::new();
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         live_state
@@ -1127,7 +1136,7 @@ mod tests {
             .expect("untracked rows should write");
         transaction.commit().await.expect("commit should persist");
 
-        let loaded = load_selected_tab_at(&live_state, Arc::clone(&backend), "version-a")
+        let loaded = load_selected_tab_at(&live_state, storage.clone(), "version-a")
             .await
             .expect("load should succeed")
             .expect("version untracked row should be visible");
@@ -1143,10 +1152,11 @@ mod tests {
     #[tokio::test]
     async fn scan_rows_overlays_requested_version_over_global() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         live_state
@@ -1172,7 +1182,7 @@ mod tests {
             .expect("version refs should write");
         transaction.commit().await.expect("commit should persist");
 
-        let rows = scan_selected_tab_at(&live_state, Arc::clone(&backend), "version-a", false)
+        let rows = scan_selected_tab_at(&live_state, storage.clone(), "version-a", false)
             .await
             .expect("scan should succeed");
 
@@ -1187,10 +1197,11 @@ mod tests {
     #[tokio::test]
     async fn scan_rows_projects_global_row_into_requested_version() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         live_state
@@ -1212,7 +1223,7 @@ mod tests {
             .expect("version refs should write");
         transaction.commit().await.expect("commit should persist");
 
-        let rows = scan_selected_tab_at(&live_state, Arc::clone(&backend), "version-a", false)
+        let rows = scan_selected_tab_at(&live_state, storage.clone(), "version-a", false)
             .await
             .expect("scan should succeed");
 
@@ -1228,10 +1239,11 @@ mod tests {
     #[tokio::test]
     async fn scan_rows_does_not_project_global_rows_into_missing_version() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         live_state
@@ -1250,10 +1262,9 @@ mod tests {
             .expect("global version ref should write");
         transaction.commit().await.expect("commit should persist");
 
-        let rows =
-            scan_selected_tab_at(&live_state, Arc::clone(&backend), "missing-version", false)
-                .await
-                .expect("scan should succeed");
+        let rows = scan_selected_tab_at(&live_state, storage.clone(), "missing-version", false)
+            .await
+            .expect("scan should succeed");
 
         assert_eq!(
             rows.len(),
@@ -1265,10 +1276,11 @@ mod tests {
     #[tokio::test]
     async fn winning_tombstone_hides_row_unless_tombstones_are_included() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         live_state
@@ -1293,15 +1305,14 @@ mod tests {
             .expect("version refs should write");
         transaction.commit().await.expect("commit should persist");
 
-        let hidden = scan_selected_tab_at(&live_state, Arc::clone(&backend), "version-a", false)
+        let hidden = scan_selected_tab_at(&live_state, storage.clone(), "version-a", false)
             .await
             .expect("scan should succeed");
         assert_eq!(hidden.len(), 0);
 
-        let with_tombstone =
-            scan_selected_tab_at(&live_state, Arc::clone(&backend), "version-a", true)
-                .await
-                .expect("scan should succeed");
+        let with_tombstone = scan_selected_tab_at(&live_state, storage.clone(), "version-a", true)
+            .await
+            .expect("scan should succeed");
         assert_eq!(with_tombstone.len(), 1);
         assert_eq!(with_tombstone[0].version_id, "version-a");
         assert_eq!(with_tombstone[0].snapshot_content, None);
@@ -1310,10 +1321,11 @@ mod tests {
     #[tokio::test]
     async fn main_tombstone_hides_global_row() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         live_state
@@ -1338,12 +1350,12 @@ mod tests {
             .expect("version refs should write");
         transaction.commit().await.expect("commit should persist");
 
-        let hidden = scan_selected_tab_at(&live_state, Arc::clone(&backend), "main", false)
+        let hidden = scan_selected_tab_at(&live_state, storage.clone(), "main", false)
             .await
             .expect("scan should succeed");
         assert_eq!(hidden.len(), 0);
 
-        let tombstones = scan_selected_tab_at(&live_state, Arc::clone(&backend), "main", true)
+        let tombstones = scan_selected_tab_at(&live_state, storage.clone(), "main", true)
             .await
             .expect("scan should succeed");
         assert_eq!(tombstones.len(), 1);
@@ -1355,16 +1367,13 @@ mod tests {
     #[tokio::test]
     async fn scan_rows_projects_commit_graph_facts_as_global_rows() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
-        append_commit_change(Arc::clone(&backend), "commit-a").await;
-        write_version_refs(
-            Arc::clone(&backend),
-            &[version_ref_row("version-a", "commit-a")],
-        )
-        .await;
+        append_commit_change(storage.clone(), "commit-a").await;
+        write_version_refs(storage.clone(), &[version_ref_row("version-a", "commit-a")]).await;
 
         let rows = live_state
-            .reader(Arc::clone(&backend))
+            .reader(storage.clone())
             .scan_rows(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec![COMMIT_SCHEMA_KEY.to_string()],
@@ -1389,16 +1398,13 @@ mod tests {
     #[tokio::test]
     async fn load_row_reads_commit_graph_fact() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
-        append_commit_change(Arc::clone(&backend), "commit-a").await;
-        write_version_refs(
-            Arc::clone(&backend),
-            &[version_ref_row("version-a", "commit-a")],
-        )
-        .await;
+        append_commit_change(storage.clone(), "commit-a").await;
+        write_version_refs(storage.clone(), &[version_ref_row("version-a", "commit-a")]).await;
 
         let row = live_state
-            .reader(Arc::clone(&backend))
+            .reader(storage.clone())
             .load_row(&LiveStateRowRequest {
                 schema_key: COMMIT_SCHEMA_KEY.to_string(),
                 version_id: "version-a".to_string(),
@@ -1419,11 +1425,12 @@ mod tests {
     #[tokio::test]
     async fn load_commit_row_does_not_project_into_missing_version() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
-        append_commit_change(Arc::clone(&backend), "commit-a").await;
+        append_commit_change(storage.clone(), "commit-a").await;
 
         let row = live_state
-            .reader(Arc::clone(&backend))
+            .reader(storage.clone())
             .load_row(&LiveStateRowRequest {
                 schema_key: COMMIT_SCHEMA_KEY.to_string(),
                 version_id: "missing-version".to_string(),
@@ -1442,9 +1449,10 @@ mod tests {
     #[tokio::test]
     async fn writer_rejects_tracked_root_batches_that_mix_global_and_version_rows() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
 
@@ -1476,12 +1484,13 @@ mod tests {
     #[tokio::test]
     async fn writer_rejects_tracked_rows_with_invalid_storage_scope() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
         let mut invalid_row =
             tracked_row_at_with_commit("version-a", "bad-row", Some("change-bad"), "commit-bad");
         invalid_row.global = true;
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
 
@@ -1500,9 +1509,10 @@ mod tests {
     #[tokio::test]
     async fn writer_allows_commit_fact_to_share_the_touched_version_commit_id() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
 
@@ -1526,7 +1536,7 @@ mod tests {
             .expect("version ref should write");
         transaction.commit().await.expect("commit should persist");
 
-        let loaded = load_selected_tab_at(&live_state, Arc::clone(&backend), "version-a")
+        let loaded = load_selected_tab_at(&live_state, storage.clone(), "version-a")
             .await
             .expect("load should succeed")
             .expect("version row should be visible");
@@ -1539,9 +1549,10 @@ mod tests {
     #[tokio::test]
     async fn writer_uses_first_parent_as_merge_root_base() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
-        let mut seed_transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut seed_transaction = storage
+            .begin_write_transaction()
             .await
             .expect("seed transaction should open");
         TrackedStateContext::new()
@@ -1554,8 +1565,8 @@ mod tests {
             .await
             .expect("seed transaction should commit");
 
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
 
@@ -1580,9 +1591,10 @@ mod tests {
     #[tokio::test]
     async fn writer_rejects_commit_root_with_missing_parent_commit_ids() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
 
@@ -1616,9 +1628,10 @@ mod tests {
     #[tokio::test]
     async fn writer_rejects_commit_root_with_non_array_parent_commit_ids() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
 
@@ -1655,14 +1668,15 @@ mod tests {
     #[tokio::test]
     async fn non_global_root_does_not_store_global_rows() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
         let tracked_state = TrackedStateContext::new();
         let live_state = LiveStateContext::new(
             tracked_state.clone(),
             UntrackedStateContext::new(),
             crate::commit_graph::CommitGraphContext::new(crate::changelog::ChangelogContext::new()),
         );
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
 
@@ -1682,7 +1696,7 @@ mod tests {
         transaction.commit().await.expect("commit should persist");
 
         let global_root_rows =
-            scan_tracked_root(&tracked_state, Arc::clone(&backend), "commit-global").await;
+            scan_tracked_root(&tracked_state, storage.clone(), "commit-global").await;
         assert_eq!(global_root_rows.len(), 1);
         assert_eq!(
             global_root_rows[0].snapshot_content.as_deref(),
@@ -1690,7 +1704,7 @@ mod tests {
         );
 
         let main_root_rows =
-            scan_tracked_root(&tracked_state, Arc::clone(&backend), "commit-main").await;
+            scan_tracked_root(&tracked_state, storage.clone(), "commit-main").await;
         assert_eq!(main_root_rows.len(), 1);
         assert_eq!(
             main_root_rows[0].snapshot_content.as_deref(),
@@ -1700,10 +1714,10 @@ mod tests {
 
     async fn load_selected_tab(
         live_state: &LiveStateContext,
-        backend: Arc<dyn Backend + Send + Sync>,
+        storage: StorageContext,
     ) -> Result<Option<LiveStateRow>, LixError> {
         live_state
-            .reader(backend)
+            .reader(storage)
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: "global".to_string(),
@@ -1715,11 +1729,11 @@ mod tests {
 
     async fn load_selected_tab_at(
         live_state: &LiveStateContext,
-        backend: Arc<dyn Backend + Send + Sync>,
+        storage: StorageContext,
         version_id: &str,
     ) -> Result<Option<LiveStateRow>, LixError> {
         live_state
-            .reader(backend)
+            .reader(storage)
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: version_id.to_string(),
@@ -1731,12 +1745,12 @@ mod tests {
 
     async fn scan_selected_tab_at(
         live_state: &LiveStateContext,
-        backend: Arc<dyn Backend + Send + Sync>,
+        storage: StorageContext,
         version_id: &str,
         include_tombstones: bool,
     ) -> Result<Vec<LiveStateRow>, LixError> {
         live_state
-            .reader(backend)
+            .reader(storage)
             .scan_rows(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec!["lix_key_value".to_string()],
@@ -1755,11 +1769,11 @@ mod tests {
 
     async fn scan_tracked_root(
         tracked_state: &TrackedStateContext,
-        backend: Arc<dyn Backend + Send + Sync>,
+        storage: StorageContext,
         commit_id: &str,
     ) -> Vec<TrackedStateRow> {
         tracked_state
-            .reader(backend)
+            .reader(storage)
             .scan_rows_at_commit(
                 commit_id,
                 &TrackedStateScanRequest {
@@ -1856,12 +1870,9 @@ mod tests {
         }
     }
 
-    async fn write_version_refs(
-        backend: Arc<dyn Backend + Send + Sync>,
-        refs: &[UntrackedStateRow],
-    ) {
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+    async fn write_version_refs(storage: StorageContext, refs: &[UntrackedStateRow]) {
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("version-ref transaction should open");
         UntrackedStateContext::new()
@@ -1917,10 +1928,10 @@ mod tests {
         }
     }
 
-    async fn append_commit_change(backend: Arc<dyn Backend + Send + Sync>, commit_id: &str) {
+    async fn append_commit_change(storage: StorageContext, commit_id: &str) {
         let changelog = crate::changelog::ChangelogContext::new();
-        let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut transaction = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let change = MaterializedCanonicalChange {

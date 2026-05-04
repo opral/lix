@@ -1,6 +1,6 @@
-use crate::backend::{KvStore, KvWriter};
 use crate::commit_graph::CommitGraphContext;
 use crate::commit_graph::CommitGraphEntity;
+use crate::storage::{StorageReader, StorageWriter};
 use crate::tracked_state::{TrackedStateContext, TrackedStateRow};
 use crate::LixError;
 
@@ -22,8 +22,8 @@ pub(super) async fn rebuild_state_at_commit<R, W>(
     head_commit_id: &str,
 ) -> Result<TrackedStateRebuildReport, LixError>
 where
-    R: KvStore,
-    W: KvWriter,
+    R: StorageReader,
+    W: StorageWriter,
 {
     let entities = commit_graph
         .reader(read_store)
@@ -81,12 +81,13 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use crate::backend::{testing::UnitTestBackend, Backend, TransactionBeginMode};
+    use crate::backend::testing::UnitTestBackend;
     use crate::changelog::{
         canonicalize_materialized_change, ChangelogContext, MaterializedCanonicalChange,
     };
     use crate::commit_graph::CommitGraphContext;
     use crate::json_store::JsonStoreContext;
+    use crate::storage::StorageContext;
     use crate::tracked_state::{TrackedStateFilter, TrackedStateScanRequest};
     use serde_json::json;
 
@@ -145,11 +146,12 @@ mod tests {
     #[tokio::test]
     async fn rebuild_state_at_commit_writes_rows_from_commit_graph() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
         let changelog = ChangelogContext::new();
         let commit_graph = CommitGraphContext::new(changelog);
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &[
                 entity_change("change-1", "entity-1", "test_schema", Some("{}")),
                 commit_change("commit-1-change", "commit-1", &["change-1"], &[]),
@@ -157,14 +159,14 @@ mod tests {
         )
         .await;
 
-        let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut tx = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let report = rebuild_state_at_commit(
             &tracked_state,
             &commit_graph,
-            Arc::clone(&backend),
+            storage.clone(),
             tx.as_mut(),
             "commit-1",
         )
@@ -173,7 +175,7 @@ mod tests {
         tx.commit().await.expect("transaction should commit");
 
         assert_eq!(report, TrackedStateRebuildReport { written_rows: 1 });
-        let rows = scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "commit-1").await;
+        let rows = scan_rows_at_commit(&tracked_state, storage.clone(), "commit-1").await;
         assert_eq!(rows.len(), 1);
         assert!(rows.iter().any(|row| row.schema_key == "test_schema"
             && row.entity_id == crate::entity_identity::EntityIdentity::single("entity-1")));
@@ -182,11 +184,12 @@ mod tests {
     #[tokio::test]
     async fn rebuild_state_at_commit_writes_replacement_root_for_head_commit() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
         let changelog = ChangelogContext::new();
         let commit_graph = CommitGraphContext::new(changelog);
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &[
                 entity_change("change-new", "entity-new", "test_schema", Some("{}")),
                 commit_change("commit-1-change", "commit-1", &["change-new"], &[]),
@@ -195,20 +198,20 @@ mod tests {
         .await;
         seed_tracked_root(
             &tracked_state,
-            Arc::clone(&backend),
+            storage.clone(),
             "stale-commit",
             &[stale_row("version-b", "stale-other")],
         )
         .await;
 
-        let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut tx = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let report = rebuild_state_at_commit(
             &tracked_state,
             &commit_graph,
-            Arc::clone(&backend),
+            storage.clone(),
             tx.as_mut(),
             "commit-1",
         )
@@ -218,8 +221,7 @@ mod tests {
 
         assert_eq!(report.written_rows, 1);
 
-        let version_a_rows =
-            scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "commit-1").await;
+        let version_a_rows = scan_rows_at_commit(&tracked_state, storage.clone(), "commit-1").await;
         assert!(!version_a_rows
             .iter()
             .any(|row| row.entity_id
@@ -229,7 +231,7 @@ mod tests {
         ));
 
         let version_b_rows =
-            scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "stale-commit").await;
+            scan_rows_at_commit(&tracked_state, storage.clone(), "stale-commit").await;
         assert_eq!(version_b_rows.len(), 1);
         assert_eq!(
             version_b_rows[0].entity_id,
@@ -240,11 +242,12 @@ mod tests {
     #[tokio::test]
     async fn rebuild_state_at_commit_is_content_address_deterministic() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
         let changelog = ChangelogContext::new();
         let commit_graph = CommitGraphContext::new(changelog);
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &[
                 entity_change("change-1", "entity-1", "test_schema", Some("{\"v\":1}")),
                 entity_change("change-2", "entity-2", "test_schema", Some("{\"v\":2}")),
@@ -261,20 +264,20 @@ mod tests {
         rebuild_state_at_commit_for_test(
             &tracked_state,
             &commit_graph,
-            Arc::clone(&backend),
+            storage.clone(),
             "commit-1",
         )
         .await;
-        let first_root = load_root(&tracked_state, Arc::clone(&backend), "commit-1").await;
-        delete_root(&tracked_state, Arc::clone(&backend), "commit-1").await;
+        let first_root = load_root(&tracked_state, storage.clone(), "commit-1").await;
+        delete_root(&tracked_state, storage.clone(), "commit-1").await;
         rebuild_state_at_commit_for_test(
             &tracked_state,
             &commit_graph,
-            Arc::clone(&backend),
+            storage.clone(),
             "commit-1",
         )
         .await;
-        let second_root = load_root(&tracked_state, Arc::clone(&backend), "commit-1").await;
+        let second_root = load_root(&tracked_state, storage.clone(), "commit-1").await;
 
         assert_eq!(
             first_root, second_root,
@@ -285,11 +288,12 @@ mod tests {
     #[tokio::test]
     async fn rebuild_state_at_commit_uses_latest_change_across_commits() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
         let changelog = ChangelogContext::new();
         let commit_graph = CommitGraphContext::new(changelog);
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &[
                 entity_change_at(
                     "change-old",
@@ -319,12 +323,12 @@ mod tests {
         rebuild_state_at_commit_for_test(
             &tracked_state,
             &commit_graph,
-            Arc::clone(&backend),
+            storage.clone(),
             "commit-head",
         )
         .await;
 
-        let rows = scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "commit-head").await;
+        let rows = scan_rows_at_commit(&tracked_state, storage.clone(), "commit-head").await;
         let row = rows
             .iter()
             .find(|row| {
@@ -342,11 +346,12 @@ mod tests {
     #[tokio::test]
     async fn rebuild_state_at_commit_preserves_tombstone_winner() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
         let changelog = ChangelogContext::new();
         let commit_graph = CommitGraphContext::new(changelog);
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &[
                 entity_change_at(
                     "change-created",
@@ -381,12 +386,12 @@ mod tests {
         rebuild_state_at_commit_for_test(
             &tracked_state,
             &commit_graph,
-            Arc::clone(&backend),
+            storage.clone(),
             "commit-head",
         )
         .await;
 
-        let rows = scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "commit-head").await;
+        let rows = scan_rows_at_commit(&tracked_state, storage.clone(), "commit-head").await;
         let row = rows
             .iter()
             .find(|row| {
@@ -402,11 +407,12 @@ mod tests {
     #[tokio::test]
     async fn rebuild_state_at_commit_can_rebuild_global_commit_state() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
         let changelog = ChangelogContext::new();
         let commit_graph = CommitGraphContext::new(changelog);
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &[
                 entity_change("change-1", "entity-1", "test_schema", Some("{}")),
                 commit_change("commit-1-change", "commit-1", &["change-1"], &[]),
@@ -417,12 +423,12 @@ mod tests {
         rebuild_state_at_commit_for_test(
             &tracked_state,
             &commit_graph,
-            Arc::clone(&backend),
+            storage.clone(),
             "commit-1",
         )
         .await;
 
-        let rows = scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "commit-1").await;
+        let rows = scan_rows_at_commit(&tracked_state, storage.clone(), "commit-1").await;
         assert!(!rows.is_empty());
         assert!(rows.iter().any(|row| row.schema_key == "test_schema"
             && row.entity_id == crate::entity_identity::EntityIdentity::single("entity-1")));
@@ -431,11 +437,12 @@ mod tests {
     #[tokio::test]
     async fn rebuilding_one_commit_state_does_not_rewrite_another_commit_root() {
         let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
         let changelog = ChangelogContext::new();
         let commit_graph = CommitGraphContext::new(changelog);
         append_changes(
-            Arc::clone(&backend),
+            storage.clone(),
             &[
                 entity_change("change-global", "entity-global", "test_schema", Some("{}")),
                 entity_change("change-main", "entity-main", "test_schema", Some("{}")),
@@ -453,29 +460,26 @@ mod tests {
         rebuild_state_at_commit_for_test(
             &tracked_state,
             &commit_graph,
-            Arc::clone(&backend),
+            storage.clone(),
             "commit-global",
         )
         .await;
-        let global_root_before =
-            load_root(&tracked_state, Arc::clone(&backend), "commit-global").await;
+        let global_root_before = load_root(&tracked_state, storage.clone(), "commit-global").await;
 
         rebuild_state_at_commit_for_test(
             &tracked_state,
             &commit_graph,
-            Arc::clone(&backend),
+            storage.clone(),
             "commit-main",
         )
         .await;
-        let global_root_after =
-            load_root(&tracked_state, Arc::clone(&backend), "commit-global").await;
+        let global_root_after = load_root(&tracked_state, storage.clone(), "commit-global").await;
 
         assert_eq!(
             global_root_after, global_root_before,
             "rebuilding one commit state must not rewrite another commit root"
         );
-        let main_rows =
-            scan_rows_at_commit(&tracked_state, Arc::clone(&backend), "commit-main").await;
+        let main_rows = scan_rows_at_commit(&tracked_state, storage.clone(), "commit-main").await;
         assert_eq!(main_rows.len(), 1);
         assert_eq!(
             main_rows[0].entity_id,
@@ -517,13 +521,10 @@ mod tests {
         }
     }
 
-    async fn append_changes(
-        backend: Arc<UnitTestBackend>,
-        changes: &[MaterializedCanonicalChange],
-    ) {
+    async fn append_changes(storage: StorageContext, changes: &[MaterializedCanonicalChange]) {
         let changelog = ChangelogContext::new();
-        let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut tx = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let mut json_writer = JsonStoreContext::new().writer();
@@ -546,12 +547,12 @@ mod tests {
 
     async fn seed_tracked_root(
         tracked_state: &TrackedStateContext,
-        backend: Arc<UnitTestBackend>,
+        storage: StorageContext,
         commit_id: &str,
         rows: &[TrackedStateRow],
     ) {
-        let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut tx = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         tracked_state
@@ -565,17 +566,17 @@ mod tests {
     async fn rebuild_state_at_commit_for_test(
         tracked_state: &TrackedStateContext,
         commit_graph: &CommitGraphContext,
-        backend: Arc<UnitTestBackend>,
+        storage: StorageContext,
         head_commit_id: &str,
     ) -> TrackedStateRebuildReport {
-        let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut tx = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         let report = rebuild_state_at_commit(
             tracked_state,
             commit_graph,
-            Arc::clone(&backend),
+            storage.clone(),
             tx.as_mut(),
             head_commit_id,
         )
@@ -587,11 +588,11 @@ mod tests {
 
     async fn scan_rows_at_commit(
         tracked_state: &TrackedStateContext,
-        backend: Arc<UnitTestBackend>,
+        storage: StorageContext,
         commit_id: &str,
     ) -> Vec<TrackedStateRow> {
         tracked_state
-            .reader(backend)
+            .reader(storage)
             .scan_rows_at_commit(
                 commit_id,
                 &TrackedStateScanRequest {
@@ -608,10 +609,10 @@ mod tests {
 
     async fn load_root(
         tracked_state: &TrackedStateContext,
-        backend: Arc<UnitTestBackend>,
+        storage: StorageContext,
         commit_id: &str,
     ) -> crate::tracked_state::tree_types::TrackedStateRootId {
-        let mut reader = tracked_state.reader(backend);
+        let mut reader = tracked_state.reader(storage);
         reader
             .load_root_for_test(commit_id)
             .await
@@ -621,11 +622,11 @@ mod tests {
 
     async fn delete_root(
         tracked_state: &TrackedStateContext,
-        backend: Arc<UnitTestBackend>,
+        storage: StorageContext,
         commit_id: &str,
     ) {
-        let mut tx = backend
-            .begin_transaction(TransactionBeginMode::Write)
+        let mut tx = storage
+            .begin_write_transaction()
             .await
             .expect("transaction should open");
         tracked_state

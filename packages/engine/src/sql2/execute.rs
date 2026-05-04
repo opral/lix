@@ -549,7 +549,6 @@ mod tests {
         create_write_logical_plan, execute_logical_plan, execute_sql, SqlExecutionContext,
         SqlWriteExecutionContext,
     };
-    use crate::backend::ReadScope;
     use crate::binary_cas::BlobDataReader;
     use crate::changelog::{CanonicalChange, ChangelogReader, ChangelogScanRequest};
     use crate::commit_graph::{
@@ -565,6 +564,10 @@ mod tests {
         LiveStateContext, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
     use crate::sql2::{ChangelogQuerySource, SqlChangelogQuerySource};
+    use crate::storage::{
+        KvGetRequest, KvGetResult, KvScanRequest, KvScanResult, StorageContext, StorageReadScope,
+        StorageReadTransaction, StorageReader,
+    };
     use crate::tracked_state::TrackedStateContext;
     use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
     use crate::untracked_state::UntrackedStateContext;
@@ -577,10 +580,35 @@ mod tests {
     struct RowsLiveStateReader {
         rows: Vec<LiveStateRow>,
     }
-    struct BackendBlobReader(Arc<dyn crate::Backend + Send + Sync>);
+    struct BackendBlobReader(StorageContext);
     struct DummyChangelogReader;
     struct DummyCommitGraphReader;
     struct DummyVersionRefReader;
+    struct TestReadTransaction(StorageContext);
+
+    fn test_read_scope(
+        storage: StorageContext,
+    ) -> StorageReadScope<Box<dyn StorageReadTransaction + Send + Sync + 'static>> {
+        StorageReadScope::new(Box::new(TestReadTransaction(storage)))
+    }
+
+    #[async_trait]
+    impl StorageReader for TestReadTransaction {
+        async fn get_kv_many(&mut self, request: KvGetRequest) -> Result<KvGetResult, LixError> {
+            self.0.get_kv_many(request).await
+        }
+
+        async fn scan_kv(&mut self, request: KvScanRequest) -> Result<KvScanResult, LixError> {
+            self.0.scan_kv(request).await
+        }
+    }
+
+    #[async_trait]
+    impl StorageReadTransaction for TestReadTransaction {
+        async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+            Ok(())
+        }
+    }
 
     #[allow(dead_code)]
     fn test_functions() -> FunctionProviderHandle {
@@ -692,9 +720,10 @@ mod tests {
         }
 
         fn changelog_query_source(&self) -> SqlChangelogQuerySource {
-            let read_scope =
-                ReadScope::new(Arc::new(crate::backend::testing::UnitTestBackend::new())
-                    as Arc<dyn crate::Backend + Send + Sync>);
+            let base_scope = test_read_scope(StorageContext::new(Arc::new(
+                crate::backend::testing::UnitTestBackend::new(),
+            )));
+            let read_scope = StorageReadScope::new(base_scope.store());
             ChangelogQuerySource {
                 changelog_reader: Arc::new(DummyChangelogReader),
                 json_reader: JsonStoreContext::new().reader(read_scope.store()),
@@ -732,12 +761,15 @@ mod tests {
             test_functions()
         }
 
-        fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
-            Arc::clone(&self.blob_reader)
-        }
-
         fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
             Ok(self.schema_definitions.clone())
+        }
+
+        async fn load_blob_data_by_hash(
+            &mut self,
+            blob_hash: &str,
+        ) -> Result<Option<Vec<u8>>, LixError> {
+            self.blob_reader.load_blob_data_by_hash(blob_hash).await
         }
 
         async fn scan_live_state(
@@ -925,7 +957,7 @@ mod tests {
             blob_hash: &str,
         ) -> Result<Option<Vec<u8>>, LixError> {
             let binary_cas = crate::binary_cas::BinaryCasContext::new();
-            let reader = binary_cas.reader(self.0.as_ref());
+            let reader = binary_cas.reader(self.0.clone());
             reader.load_blob_data_by_hash(blob_hash).await
         }
     }
@@ -1094,9 +1126,13 @@ mod tests {
             vec![vec![Value::Text("lix_state".to_string())]]
         );
 
-        let tables_result = execute_sql(&ctx, "SELECT table_name FROM information_schema.tables", &[])
-            .await
-            .expect("information_schema.tables should list registered tables");
+        let tables_result = execute_sql(
+            &ctx,
+            "SELECT table_name FROM information_schema.tables",
+            &[],
+        )
+        .await
+        .expect("information_schema.tables should list registered tables");
         assert!(tables_result.rows.iter().any(|row| {
             row.iter()
                 .any(|value| matches!(value, Value::Text(value) if value == "lix_state"))
@@ -2380,7 +2416,7 @@ mod tests {
 
     struct BackendSqlExecutionContext<'a> {
         active_version_id: &'a str,
-        backend: Arc<dyn crate::Backend + Send + Sync>,
+        storage: StorageContext,
         blob_reader: Arc<dyn BlobDataReader>,
         live_state: Arc<dyn LiveStateReader>,
         schema_definitions: Vec<JsonValue>,
@@ -2404,7 +2440,8 @@ mod tests {
         }
 
         fn changelog_query_source(&self) -> SqlChangelogQuerySource {
-            let read_scope = ReadScope::new(Arc::clone(&self.backend));
+            let base_scope = test_read_scope(self.storage.clone());
+            let read_scope = StorageReadScope::new(base_scope.store());
             ChangelogQuerySource {
                 changelog_reader: Arc::new(
                     crate::changelog::ChangelogContext::new().reader(read_scope.store()),
@@ -2420,7 +2457,7 @@ mod tests {
         fn version_ref(&self) -> Arc<dyn VersionRefReader> {
             Arc::new(
                 crate::version::VersionContext::new(Arc::new(UntrackedStateContext::new()))
-                    .ref_reader(Arc::clone(&self.backend)),
+                    .ref_reader(self.storage.clone()),
             )
         }
 
@@ -2433,14 +2470,15 @@ mod tests {
     ) -> Result<(crate::backend::testing::UnitTestBackend, JsonValue), crate::LixError> {
         let backend = crate::backend::testing::UnitTestBackend::new();
         let init_receipt = Engine::initialize(Box::new(backend.clone())).await?;
+        let storage = crate::storage::StorageContext::new(std::sync::Arc::new(backend.clone()));
         crate::test_support::seed_version_head(
-            &backend,
+            storage.clone(),
             "version-a",
             &format!("{}-version-a-root", init_receipt.initial_commit_id),
         )
         .await;
         crate::test_support::seed_version_head(
-            &backend,
+            storage,
             "version-b",
             &format!("{}-version-b-root", init_receipt.initial_commit_id),
         )
@@ -2544,15 +2582,14 @@ mod tests {
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
                 let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
+                let storage = StorageContext::new(Arc::clone(&backend_ref));
                 let blob_reader: Arc<dyn BlobDataReader> =
-                    Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
+                    Arc::new(BackendBlobReader(storage.clone()));
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
-                    backend: Arc::clone(&backend_ref),
+                    storage: storage.clone(),
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(
-                        test_live_state_context().reader(Arc::clone(&backend_ref)),
-                    ),
+                    live_state: Arc::new(test_live_state_context().reader(storage.clone())),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2591,15 +2628,14 @@ mod tests {
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
                 let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
+                let storage = StorageContext::new(Arc::clone(&backend_ref));
                 let blob_reader: Arc<dyn BlobDataReader> =
-                    Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
+                    Arc::new(BackendBlobReader(storage.clone()));
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
-                    backend: Arc::clone(&backend_ref),
+                    storage: storage.clone(),
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(
-                        test_live_state_context().reader(Arc::clone(&backend_ref)),
-                    ),
+                    live_state: Arc::new(test_live_state_context().reader(storage.clone())),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2630,15 +2666,14 @@ mod tests {
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
                 let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
+                let storage = StorageContext::new(Arc::clone(&backend_ref));
                 let blob_reader: Arc<dyn BlobDataReader> =
-                    Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
+                    Arc::new(BackendBlobReader(storage.clone()));
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
-                    backend: Arc::clone(&backend_ref),
+                    storage: storage.clone(),
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(
-                        test_live_state_context().reader(Arc::clone(&backend_ref)),
-                    ),
+                    live_state: Arc::new(test_live_state_context().reader(storage.clone())),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2669,15 +2704,14 @@ mod tests {
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
                 let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
+                let storage = StorageContext::new(Arc::clone(&backend_ref));
                 let blob_reader: Arc<dyn BlobDataReader> =
-                    Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
+                    Arc::new(BackendBlobReader(storage.clone()));
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
-                    backend: Arc::clone(&backend_ref),
+                    storage: storage.clone(),
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(
-                        test_live_state_context().reader(Arc::clone(&backend_ref)),
-                    ),
+                    live_state: Arc::new(test_live_state_context().reader(storage.clone())),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2707,15 +2741,14 @@ mod tests {
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
                 let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
+                let storage = StorageContext::new(Arc::clone(&backend_ref));
                 let blob_reader: Arc<dyn BlobDataReader> =
-                    Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
+                    Arc::new(BackendBlobReader(storage.clone()));
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
-                    backend: Arc::clone(&backend_ref),
+                    storage: storage.clone(),
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(
-                        test_live_state_context().reader(Arc::clone(&backend_ref)),
-                    ),
+                    live_state: Arc::new(test_live_state_context().reader(storage.clone())),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2746,15 +2779,14 @@ mod tests {
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
                 let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
+                let storage = StorageContext::new(Arc::clone(&backend_ref));
                 let blob_reader: Arc<dyn BlobDataReader> =
-                    Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
+                    Arc::new(BackendBlobReader(storage.clone()));
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
-                    backend: Arc::clone(&backend_ref),
+                    storage: storage.clone(),
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(
-                        test_live_state_context().reader(Arc::clone(&backend_ref)),
-                    ),
+                    live_state: Arc::new(test_live_state_context().reader(storage.clone())),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2786,15 +2818,14 @@ mod tests {
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
                 let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
+                let storage = StorageContext::new(Arc::clone(&backend_ref));
                 let blob_reader: Arc<dyn BlobDataReader> =
-                    Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
+                    Arc::new(BackendBlobReader(storage.clone()));
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
-                    backend: Arc::clone(&backend_ref),
+                    storage: storage.clone(),
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(
-                        test_live_state_context().reader(Arc::clone(&backend_ref)),
-                    ),
+                    live_state: Arc::new(test_live_state_context().reader(storage.clone())),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2825,15 +2856,14 @@ mod tests {
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
                 let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
+                let storage = StorageContext::new(Arc::clone(&backend_ref));
                 let blob_reader: Arc<dyn BlobDataReader> =
-                    Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
+                    Arc::new(BackendBlobReader(storage.clone()));
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
-                    backend: Arc::clone(&backend_ref),
+                    storage: storage.clone(),
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(
-                        test_live_state_context().reader(Arc::clone(&backend_ref)),
-                    ),
+                    live_state: Arc::new(test_live_state_context().reader(storage.clone())),
                     schema_definitions: vec![schema_definition],
                 };
 
@@ -2873,15 +2903,14 @@ mod tests {
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
                 let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
+                let storage = StorageContext::new(Arc::clone(&backend_ref));
                 let blob_reader: Arc<dyn BlobDataReader> =
-                    Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
+                    Arc::new(BackendBlobReader(storage.clone()));
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
-                    backend: Arc::clone(&backend_ref),
+                    storage: storage.clone(),
                     blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(
-                        test_live_state_context().reader(Arc::clone(&backend_ref)),
-                    ),
+                    live_state: Arc::new(test_live_state_context().reader(storage.clone())),
                     schema_definitions: vec![schema_definition],
                 };
 
