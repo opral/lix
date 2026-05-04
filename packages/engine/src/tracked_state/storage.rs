@@ -1,7 +1,7 @@
 use crate::storage::KvScanRange;
 use crate::storage::{
-    KvGetGroup, KvGetRequest, KvPair, KvPut, KvScanRequest, KvWriteBatch, KvWriteGroup,
-    StorageReader, StorageWriter,
+    KvGetGroup, KvGetProjection, KvGetRequest, KvPut, KvScanProjection, KvScanRequest, KvScanRow,
+    KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
 };
 use crate::tracked_state::codec::PendingChunkWrite;
 use crate::tracked_state::tree_types::{
@@ -34,12 +34,14 @@ async fn get_one(
                 namespace: namespace.to_string(),
                 keys: vec![key],
             }],
+            projection: KvGetProjection::Values,
         })
         .await?
         .groups
         .into_iter()
         .next()
-        .and_then(|mut group| group.values.pop())
+        .map(|mut group| group.pop_value())
+        .transpose()?
         .flatten())
 }
 
@@ -65,16 +67,17 @@ async fn scan_all(
     store: &mut (impl StorageReader + ?Sized),
     namespace: &str,
     range: KvScanRange,
-) -> Result<Vec<KvPair>, LixError> {
+) -> Result<Vec<KvScanRow>, LixError> {
     Ok(store
         .scan_kv(KvScanRequest {
             namespace: namespace.to_string(),
             range,
             after: None,
             limit: usize::MAX,
+            projection: KvScanProjection::KeysAndValues,
         })
         .await?
-        .rows)
+        .into_rows())
 }
 
 pub(crate) async fn load_root(
@@ -758,13 +761,20 @@ pub(crate) async fn scan_roots(
     pairs
         .into_iter()
         .map(|pair| {
-            let commit_id = String::from_utf8(pair.key).map_err(|error| {
+            let KvScanRow { key, value } = pair;
+            let commit_id = String::from_utf8(key).map_err(|error| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!("tracked-state tree root key is invalid UTF-8: {error}"),
                 )
             })?;
-            let root_id = TrackedStateRootId::from_slice(&pair.value)?;
+            let value = value.ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "tracked-state root scan was requested without values",
+                )
+            })?;
+            let root_id = TrackedStateRootId::from_slice(&value)?;
             Ok((commit_id, root_id))
         })
         .collect()

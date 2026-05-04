@@ -22,8 +22,8 @@ pub(crate) fn bench(c: &mut Criterion, runtime: &Runtime, args: Args) {
             create: in_memory_backend,
         },
         BackendProfile {
-            name: "sqlite_memory",
-            create: sqlite_backend,
+            name: "sqlite_tempfile",
+            create: sqlite_tempfile_backend,
         },
         BackendProfile {
             name: "rocksdb_tempdir",
@@ -184,6 +184,28 @@ fn bench_backend(c: &mut Criterion, runtime: &Runtime, args: Args, profile: Back
                                     &fixture, reads,
                                 ))
                                 .expect("storage/api get_kv_many_hit succeeds"),
+                        )
+                    },
+                    BatchSize::LargeInput,
+                )
+            },
+        );
+
+        group.bench_function(
+            format!(
+                "get_kv_many_exists/{reads_label}",
+                reads_label = label(reads)
+            ),
+            |b| {
+                b.iter_batched(
+                    || prepare_read(runtime, args.rows, profile.create),
+                    |fixture| {
+                        black_box(
+                            runtime
+                                .block_on(storage_bench::storage_api_get_kv_many_exists_prepared(
+                                    &fixture, reads,
+                                ))
+                                .expect("storage/api get_kv_many_exists succeeds"),
                         )
                     },
                     BatchSize::LargeInput,
@@ -417,8 +439,8 @@ fn in_memory_backend() -> Arc<dyn Backend + Send + Sync> {
     BenchBackend::new()
 }
 
-fn sqlite_backend() -> Arc<dyn Backend + Send + Sync> {
-    Arc::new(SqliteBenchBackend::new().expect("create sqlite bench backend"))
+fn sqlite_tempfile_backend() -> Arc<dyn Backend + Send + Sync> {
+    Arc::new(SqliteBenchBackend::tempfile().expect("create sqlite tempfile bench backend"))
 }
 
 fn rocksdb_backend() -> Arc<dyn Backend + Send + Sync> {

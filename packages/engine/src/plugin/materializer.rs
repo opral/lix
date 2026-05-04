@@ -204,8 +204,10 @@ mod tests {
         BINARY_CAS_MANIFEST_CHUNK_NAMESPACE, BINARY_CAS_MANIFEST_NAMESPACE,
     };
     use crate::{
-        BackendReadTransaction, BackendWriteTransaction, BackendKvGetRequest, BackendKvGetResult, BackendKvGetResultGroup, BackendKvPair, BackendKvScanRange,
-        BackendKvScanRequest, BackendKvScanResult, BackendKvWriteBatch, BackendKvWriteStats,
+        BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetEntry, BackendKvGetRequest,
+        BackendKvScanBatch, BackendKvScanProjection, BackendKvScanRange, BackendKvScanRequest,
+        BackendKvScanRow, BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction,
+        BackendWriteTransaction,
     };
     use async_trait::async_trait;
     use std::io::{Cursor, Write};
@@ -241,24 +243,38 @@ mod tests {
 
     #[async_trait]
     impl BackendReadTransaction for PluginLookupTransaction {
-        async fn get_kv_many(&mut self, request: BackendKvGetRequest) -> Result<BackendKvGetResult, LixError> {
+        async fn get_kv_many(
+            &mut self,
+            request: BackendKvGetRequest,
+        ) -> Result<BackendKvGetBatch, LixError> {
             let mut groups = Vec::with_capacity(request.groups.len());
             for group in request.groups {
-                let mut values = Vec::with_capacity(group.keys.len());
+                let mut entries = Vec::with_capacity(group.keys.len());
                 for key in group.keys {
-                    values.push(test_kv_get(&self.archive_bytes, &group.namespace, &key)?);
+                    entries.push(BackendKvGetEntry::for_projection(
+                        test_kv_get(&self.archive_bytes, &group.namespace, &key)?,
+                        request.projection,
+                    ));
                 }
-                groups.push(BackendKvGetResultGroup {
+                groups.push(BackendKvGetBatchGroup {
                     namespace: group.namespace,
-                    values,
+                    entries,
                 });
             }
-            Ok(BackendKvGetResult { groups })
+            Ok(BackendKvGetBatch { groups })
         }
 
-        async fn scan_kv(&mut self, request: BackendKvScanRequest) -> Result<BackendKvScanResult, LixError> {
+        async fn scan_kv(
+            &mut self,
+            request: BackendKvScanRequest,
+        ) -> Result<BackendKvScanBatch, LixError> {
+            let projection = request.projection;
             let mut rows = test_kv_scan(&self.archive_bytes, request.namespace, request.range)?
                 .into_iter()
+                .map(|row| match projection {
+                    BackendKvScanProjection::KeysOnly => BackendKvScanRow::key_only(row.key),
+                    BackendKvScanProjection::KeysAndValues => row,
+                })
                 .filter(|row| {
                     request
                         .after
@@ -269,7 +285,7 @@ mod tests {
             let has_more = rows.len() > request.limit;
             rows.truncate(request.limit);
             let resume_after = has_more.then(|| rows.last().map(|row| row.key.clone())).flatten();
-            Ok(BackendKvScanResult { rows, resume_after })
+            Ok(BackendKvScanBatch { rows, resume_after })
         }
 
         async fn rollback(self: Box<Self>) -> Result<(), LixError> {
@@ -330,7 +346,7 @@ mod tests {
         archive_bytes: &[u8],
         namespace: String,
         range: BackendKvScanRange,
-    ) -> Result<Vec<BackendKvPair>, LixError> {
+    ) -> Result<Vec<BackendKvScanRow>, LixError> {
         if namespace != BINARY_CAS_MANIFEST_CHUNK_NAMESPACE {
             return Ok(Vec::new());
         }
@@ -352,7 +368,7 @@ mod tests {
                 format!("test manifest chunk encode failed: {error}"),
             )
         })?;
-        Ok(vec![BackendKvPair::new(key, value)])
+        Ok(vec![BackendKvScanRow::new(key, value)])
     }
 
     fn build_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {

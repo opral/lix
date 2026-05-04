@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lix_engine::{
-    Backend, BackendKvGetRequest, BackendKvGetResult, BackendKvGetResultGroup, BackendKvPair,
-    BackendKvScanRange, BackendKvScanRequest, BackendKvScanResult, BackendKvWriteBatch,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, LixError,
+    Backend, BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetEntry, BackendKvGetProjection,
+    BackendKvGetRequest, BackendKvScanBatch, BackendKvScanRange, BackendKvScanRequest,
+    BackendKvScanRow, BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction,
+    BackendWriteTransaction, LixError,
 };
 use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
 use tempfile::TempDir;
@@ -67,40 +68,49 @@ impl BackendReadTransaction for RocksDbBenchTransaction {
     async fn get_kv_many(
         &mut self,
         request: BackendKvGetRequest,
-    ) -> Result<BackendKvGetResult, LixError> {
+    ) -> Result<BackendKvGetBatch, LixError> {
+        if request.projection == BackendKvGetProjection::Existence {
+            return rocksdb_get_exists_many(&self.inner.db, &self.pending, request);
+        }
+
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
-            let mut values = Vec::with_capacity(group.keys.len());
+            let mut entries = Vec::with_capacity(group.keys.len());
             let mut committed_positions = Vec::new();
             let mut committed_keys = Vec::new();
             for key in group.keys {
                 let encoded_key = encode_key(&group.namespace, &key);
                 match self.pending.get(&encoded_key) {
-                    Some(PendingWrite::Put(value)) => values.push(Some(value.clone())),
-                    Some(PendingWrite::Delete) => values.push(None),
+                    Some(PendingWrite::Put(value)) => entries.push(
+                        BackendKvGetEntry::for_projection(Some(value.clone()), request.projection),
+                    ),
+                    Some(PendingWrite::Delete) => entries.push(BackendKvGetEntry::missing()),
                     None => {
-                        committed_positions.push(values.len());
+                        committed_positions.push(entries.len());
                         committed_keys.push(encoded_key);
-                        values.push(None);
+                        entries.push(BackendKvGetEntry::missing());
                     }
                 }
             }
             let committed_values = self.inner.db.multi_get(committed_keys);
             for (position, value) in committed_positions.into_iter().zip(committed_values) {
-                values[position] = value.map_err(rocksdb_error)?;
+                entries[position] = BackendKvGetEntry::for_projection(
+                    value.map_err(rocksdb_error)?,
+                    request.projection,
+                );
             }
-            groups.push(BackendKvGetResultGroup {
+            groups.push(BackendKvGetBatchGroup {
                 namespace: group.namespace,
-                values,
+                entries,
             });
         }
-        Ok(BackendKvGetResult { groups })
+        Ok(BackendKvGetBatch { groups })
     }
 
     async fn scan_kv(
         &mut self,
         request: BackendKvScanRequest,
-    ) -> Result<BackendKvScanResult, LixError> {
+    ) -> Result<BackendKvScanBatch, LixError> {
         rocksdb_scan(&self.inner.db, &self.pending, request)
     }
 
@@ -156,11 +166,81 @@ fn open_rocksdb(path: &Path) -> Result<DB, LixError> {
     DB::open(&options, path).map_err(rocksdb_error)
 }
 
+fn rocksdb_get_exists_many(
+    db: &DB,
+    pending: &BTreeMap<Vec<u8>, PendingWrite>,
+    request: BackendKvGetRequest,
+) -> Result<BackendKvGetBatch, LixError> {
+    let mut groups = Vec::with_capacity(request.groups.len());
+    for group in request.groups {
+        let mut entries = vec![BackendKvGetEntry::missing(); group.keys.len()];
+        let mut committed = Vec::new();
+
+        for (position, key) in group.keys.into_iter().enumerate() {
+            let encoded_key = encode_key(&group.namespace, &key);
+            match pending.get(&encoded_key) {
+                Some(PendingWrite::Put(_)) => entries[position] = BackendKvGetEntry::exists(),
+                Some(PendingWrite::Delete) => entries[position] = BackendKvGetEntry::missing(),
+                None => committed.push((encoded_key, position)),
+            }
+        }
+
+        fill_committed_exists(db, &mut entries, committed)?;
+        groups.push(BackendKvGetBatchGroup {
+            namespace: group.namespace,
+            entries,
+        });
+    }
+
+    Ok(BackendKvGetBatch { groups })
+}
+
+fn fill_committed_exists(
+    db: &DB,
+    entries: &mut [BackendKvGetEntry],
+    mut committed: Vec<(Vec<u8>, usize)>,
+) -> Result<(), LixError> {
+    if committed.is_empty() {
+        return Ok(());
+    }
+
+    committed.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut iter = db.raw_iterator();
+    iter.seek(&committed[0].0);
+
+    for (target_key, position) in committed {
+        while iter.valid() {
+            let Some(current_key) = iter.key() else {
+                break;
+            };
+            if current_key >= target_key.as_slice() {
+                break;
+            }
+            iter.next();
+        }
+
+        if !iter.valid() {
+            iter.status().map_err(rocksdb_error)?;
+            break;
+        }
+
+        if iter
+            .key()
+            .is_some_and(|current_key| current_key == target_key.as_slice())
+        {
+            entries[position] = BackendKvGetEntry::exists();
+        }
+    }
+
+    iter.status().map_err(rocksdb_error)?;
+    Ok(())
+}
+
 fn rocksdb_scan(
     db: &DB,
     pending: &BTreeMap<Vec<u8>, PendingWrite>,
     request: BackendKvScanRequest,
-) -> Result<BackendKvScanResult, LixError> {
+) -> Result<BackendKvScanBatch, LixError> {
     let start = scan_start_key(&request);
     let start_encoded = encode_key(&request.namespace, &start);
     let end = scan_end_key(&request.range);
@@ -214,14 +294,18 @@ fn rocksdb_scan(
         if rows.len() > request.limit {
             break;
         }
-        rows.push(BackendKvPair::new(key, value));
+        rows.push(BackendKvScanRow::for_projection(
+            key,
+            value,
+            request.projection,
+        ));
     }
     let has_more = rows.len() > request.limit;
     rows.truncate(request.limit);
     let resume_after = has_more
         .then(|| rows.last().map(|row| row.key.clone()))
         .flatten();
-    Ok(BackendKvScanResult { rows, resume_after })
+    Ok(BackendKvScanBatch { rows, resume_after })
 }
 
 fn rocksdb_scan_committed(
@@ -230,7 +314,7 @@ fn rocksdb_scan_committed(
     start_encoded: Vec<u8>,
     end_encoded: Vec<u8>,
     namespace_prefix: Vec<u8>,
-) -> Result<BackendKvScanResult, LixError> {
+) -> Result<BackendKvScanBatch, LixError> {
     let mut rows = Vec::new();
     for item in db.iterator(IteratorMode::From(&start_encoded, Direction::Forward)) {
         let (key, value) = item.map_err(rocksdb_error)?;
@@ -244,7 +328,11 @@ fn rocksdb_scan_committed(
                 continue;
             }
         }
-        rows.push(BackendKvPair::new(logical_key, value.to_vec()));
+        rows.push(BackendKvScanRow::for_projection(
+            logical_key,
+            value.to_vec(),
+            request.projection,
+        ));
         if rows.len() > request.limit {
             break;
         }
@@ -254,7 +342,7 @@ fn rocksdb_scan_committed(
     let resume_after = has_more
         .then(|| rows.last().map(|row| row.key.clone()))
         .flatten();
-    Ok(BackendKvScanResult { rows, resume_after })
+    Ok(BackendKvScanBatch { rows, resume_after })
 }
 
 fn scan_start_key(request: &BackendKvScanRequest) -> Vec<u8> {

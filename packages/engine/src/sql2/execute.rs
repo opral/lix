@@ -550,7 +550,7 @@ mod tests {
     };
     use crate::sql2::{ChangelogQuerySource, SqlChangelogQuerySource};
     use crate::storage::{
-        KvGetRequest, KvGetResult, KvScanRequest, KvScanResult, StorageContext, StorageReadScope,
+        KvGetBatch, KvGetRequest, KvScanBatch, KvScanRequest, StorageContext, StorageReadScope,
         StorageReadTransaction, StorageReader,
     };
     use crate::tracked_state::TrackedStateContext;
@@ -579,11 +579,11 @@ mod tests {
 
     #[async_trait]
     impl StorageReader for TestReadTransaction {
-        async fn get_kv_many(&mut self, request: KvGetRequest) -> Result<KvGetResult, LixError> {
+        async fn get_kv_many(&mut self, request: KvGetRequest) -> Result<KvGetBatch, LixError> {
             self.0.get_kv_many(request).await
         }
 
-        async fn scan_kv(&mut self, request: KvScanRequest) -> Result<KvScanResult, LixError> {
+        async fn scan_kv(&mut self, request: KvScanRequest) -> Result<KvScanBatch, LixError> {
             self.0.scan_kv(request).await
         }
     }

@@ -2,15 +2,18 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lix_engine::{
-    Backend, BackendKvGetRequest, BackendKvGetResult, BackendKvGetResultGroup, BackendKvPair,
-    BackendKvScanRange, BackendKvScanRequest, BackendKvScanResult, BackendKvWriteBatch,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, LixError,
+    Backend, BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetEntry, BackendKvGetProjection,
+    BackendKvGetRequest, BackendKvScanBatch, BackendKvScanProjection, BackendKvScanRange,
+    BackendKvScanRequest, BackendKvScanRow, BackendKvWriteBatch, BackendKvWriteStats,
+    BackendReadTransaction, BackendWriteTransaction, LixError,
 };
 use rusqlite::{params, Connection, OptionalExtension};
+use tempfile::TempDir;
 
 #[derive(Clone)]
 pub(crate) struct SqliteBenchBackend {
     connection: Arc<Mutex<Connection>>,
+    _temp_dir: Option<Arc<TempDir>>,
 }
 
 pub(crate) struct SqliteBenchTransaction {
@@ -19,24 +22,19 @@ pub(crate) struct SqliteBenchTransaction {
 }
 
 impl SqliteBenchBackend {
-    pub(crate) fn new() -> Result<Self, LixError> {
-        let connection = Connection::open_in_memory().map_err(sqlite_error)?;
-        connection
-            .execute_batch(
-                "
-                PRAGMA journal_mode = MEMORY;
-                PRAGMA synchronous = OFF;
-                CREATE TABLE kv (
-                    namespace TEXT NOT NULL,
-                    key BLOB NOT NULL,
-                    value BLOB NOT NULL,
-                    PRIMARY KEY (namespace, key)
-                ) WITHOUT ROWID;
-                ",
+    pub(crate) fn tempfile() -> Result<Self, LixError> {
+        let temp_dir = Arc::new(TempDir::new().map_err(|error| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("sqlite bench tempdir: {error}"),
             )
-            .map_err(sqlite_error)?;
+        })?);
+        let path = temp_dir.path().join("bench.sqlite");
+        let connection = Connection::open(path).map_err(sqlite_error)?;
+        configure_connection(&connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            _temp_dir: Some(temp_dir),
         })
     }
 
@@ -45,6 +43,26 @@ impl SqliteBenchBackend {
             .lock()
             .map_err(|_| LixError::new("LIX_ERROR_UNKNOWN", "sqlite bench connection poisoned"))
     }
+}
+
+fn configure_connection(connection: &Connection) -> Result<(), LixError> {
+    connection
+        .execute_batch(
+            "
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA temp_store = MEMORY;
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE kv (
+                namespace TEXT NOT NULL,
+                key BLOB NOT NULL,
+                value BLOB NOT NULL,
+                PRIMARY KEY (namespace, key)
+            ) WITHOUT ROWID;
+            ",
+        )
+        .map_err(sqlite_error)?;
+    Ok(())
 }
 
 #[async_trait]
@@ -83,35 +101,61 @@ impl BackendReadTransaction for SqliteBenchTransaction {
     async fn get_kv_many(
         &mut self,
         request: BackendKvGetRequest,
-    ) -> Result<BackendKvGetResult, LixError> {
+    ) -> Result<BackendKvGetBatch, LixError> {
         let connection = self.lock_connection()?;
-        let mut statement = connection
-            .prepare_cached("SELECT value FROM kv WHERE namespace = ?1 AND key = ?2")
-            .map_err(sqlite_error)?;
+        let sql = match request.projection {
+            BackendKvGetProjection::Values => {
+                "SELECT value FROM kv WHERE namespace = ?1 AND key = ?2"
+            }
+            BackendKvGetProjection::Existence => {
+                "SELECT 1 FROM kv WHERE namespace = ?1 AND key = ?2"
+            }
+        };
+        let mut statement = connection.prepare_cached(sql).map_err(sqlite_error)?;
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
-            let mut values = Vec::with_capacity(group.keys.len());
+            let mut entries = Vec::with_capacity(group.keys.len());
             for key in group.keys {
-                let value = statement
-                    .query_row(params![group.namespace.as_str(), key.as_slice()], |row| {
-                        row.get::<_, Vec<u8>>(0)
-                    })
-                    .optional()
-                    .map_err(sqlite_error)?;
-                values.push(value);
+                let entry = match request.projection {
+                    BackendKvGetProjection::Values => {
+                        let value = statement
+                            .query_row(params![group.namespace.as_str(), key.as_slice()], |row| {
+                                row.get::<_, Vec<u8>>(0)
+                            })
+                            .optional()
+                            .map_err(sqlite_error)?;
+                        BackendKvGetEntry::for_projection(value, request.projection)
+                    }
+                    BackendKvGetProjection::Existence => {
+                        let exists = statement
+                            .query_row(
+                                params![group.namespace.as_str(), key.as_slice()],
+                                |_| Ok(()),
+                            )
+                            .optional()
+                            .map_err(sqlite_error)?
+                            .is_some();
+                        if exists {
+                            BackendKvGetEntry::exists()
+                        } else {
+                            BackendKvGetEntry::missing()
+                        }
+                    }
+                };
+                entries.push(entry);
             }
-            groups.push(BackendKvGetResultGroup {
+            groups.push(BackendKvGetBatchGroup {
                 namespace: group.namespace,
-                values,
+                entries,
             });
         }
-        Ok(BackendKvGetResult { groups })
+        Ok(BackendKvGetBatch { groups })
     }
 
     async fn scan_kv(
         &mut self,
         request: BackendKvScanRequest,
-    ) -> Result<BackendKvScanResult, LixError> {
+    ) -> Result<BackendKvScanBatch, LixError> {
         let connection = self.lock_connection()?;
         sqlite_scan(&connection, request)
     }
@@ -198,7 +242,7 @@ impl Drop for SqliteBenchTransaction {
 fn sqlite_scan(
     connection: &Connection,
     request: BackendKvScanRequest,
-) -> Result<BackendKvScanResult, LixError> {
+) -> Result<BackendKvScanBatch, LixError> {
     let start = scan_start_key(&request);
     let end = scan_end_key(&request.range);
     let fetch_limit = request.limit.checked_add(1).ok_or_else(|| {
@@ -213,8 +257,19 @@ fn sqlite_scan(
             "storage scan limit does not fit into sqlite i64",
         )
     })?;
-    let mut statement = connection
-        .prepare_cached(
+    let sql = match request.projection {
+        BackendKvScanProjection::KeysOnly => {
+            "
+            SELECT key FROM kv
+            WHERE namespace = ?1
+              AND (?2 IS NULL OR key > ?2)
+              AND key >= ?3
+              AND (?4 IS NULL OR key < ?4)
+            ORDER BY key
+            LIMIT ?5
+            "
+        }
+        BackendKvScanProjection::KeysAndValues => {
             "
             SELECT key, value FROM kv
             WHERE namespace = ?1
@@ -223,9 +278,10 @@ fn sqlite_scan(
               AND (?4 IS NULL OR key < ?4)
             ORDER BY key
             LIMIT ?5
-            ",
-        )
-        .map_err(sqlite_error)?;
+            "
+        }
+    };
+    let mut statement = connection.prepare_cached(sql).map_err(sqlite_error)?;
     let mut rows = statement
         .query_map(
             params![
@@ -236,10 +292,13 @@ fn sqlite_scan(
                 limit,
             ],
             |row| {
-                Ok(BackendKvPair::new(
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                ))
+                let key = row.get::<_, Vec<u8>>(0)?;
+                match request.projection {
+                    BackendKvScanProjection::KeysOnly => Ok(BackendKvScanRow::key_only(key)),
+                    BackendKvScanProjection::KeysAndValues => {
+                        Ok(BackendKvScanRow::new(key, row.get::<_, Vec<u8>>(1)?))
+                    }
+                }
             },
         )
         .map_err(sqlite_error)?
@@ -250,7 +309,7 @@ fn sqlite_scan(
     let resume_after = has_more
         .then(|| rows.last().map(|row| row.key.clone()))
         .flatten();
-    Ok(BackendKvScanResult { rows, resume_after })
+    Ok(BackendKvScanBatch { rows, resume_after })
 }
 
 fn scan_start_key(request: &BackendKvScanRequest) -> Vec<u8> {

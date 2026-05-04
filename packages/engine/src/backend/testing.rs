@@ -4,9 +4,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::backend::{
-    Backend, BackendKvGetRequest, BackendKvGetResult, BackendKvGetResultGroup, BackendKvPair,
-    BackendKvScanRange, BackendKvScanRequest, BackendKvScanResult, BackendKvWriteBatch,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
+    Backend, BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetEntry, BackendKvGetRequest,
+    BackendKvScanBatch, BackendKvScanProjection, BackendKvScanRange, BackendKvScanRequest,
+    BackendKvScanRow, BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction,
+    BackendWriteTransaction,
 };
 use crate::LixError;
 
@@ -68,25 +69,28 @@ impl BackendReadTransaction for UnitTestTransaction {
     async fn get_kv_many(
         &mut self,
         request: BackendKvGetRequest,
-    ) -> Result<BackendKvGetResult, LixError> {
+    ) -> Result<BackendKvGetBatch, LixError> {
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
-            let mut values = Vec::with_capacity(group.keys.len());
+            let mut entries = Vec::with_capacity(group.keys.len());
             for key in group.keys {
-                values.push(self.kv.get(&(group.namespace.clone(), key)).cloned());
+                entries.push(BackendKvGetEntry::for_projection(
+                    self.kv.get(&(group.namespace.clone(), key)).cloned(),
+                    request.projection,
+                ));
             }
-            groups.push(BackendKvGetResultGroup {
+            groups.push(BackendKvGetBatchGroup {
                 namespace: group.namespace,
-                values,
+                entries,
             });
         }
-        Ok(BackendKvGetResult { groups })
+        Ok(BackendKvGetBatch { groups })
     }
 
     async fn scan_kv(
         &mut self,
         request: BackendKvScanRequest,
-    ) -> Result<BackendKvScanResult, LixError> {
+    ) -> Result<BackendKvScanBatch, LixError> {
         Ok(scan_map_request(&self.kv, request))
     }
 
@@ -147,13 +151,16 @@ pub(crate) fn scan_map(
     namespace: &str,
     range: &BackendKvScanRange,
     limit: Option<usize>,
-) -> Vec<BackendKvPair> {
+    projection: BackendKvScanProjection,
+) -> Vec<BackendKvScanRow> {
     let mut pairs = kv
         .iter()
         .filter(|((candidate_namespace, key), _)| {
             candidate_namespace == namespace && key_matches_range(key, range)
         })
-        .map(|((_, key), value)| BackendKvPair::new(key.clone(), value.clone()))
+        .map(|((_, key), value)| {
+            BackendKvScanRow::for_projection(key.clone(), value.clone(), projection)
+        })
         .collect::<Vec<_>>();
     pairs.sort_by(|left, right| left.key.cmp(&right.key));
     if let Some(limit) = limit {
@@ -162,12 +169,18 @@ pub(crate) fn scan_map(
     pairs
 }
 
-fn scan_map_request(kv: &KvMap, request: BackendKvScanRequest) -> BackendKvScanResult {
+fn scan_map_request(kv: &KvMap, request: BackendKvScanRequest) -> BackendKvScanBatch {
     let scan_limit = request
         .limit
         .checked_add(1 + usize::from(request.after.is_some()))
         .unwrap_or(request.limit);
-    let rows = scan_map(kv, &request.namespace, &request.range, Some(scan_limit));
+    let rows = scan_map(
+        kv,
+        &request.namespace,
+        &request.range,
+        Some(scan_limit),
+        request.projection,
+    );
     let mut rows = rows
         .into_iter()
         .filter(|row| {
@@ -182,7 +195,7 @@ fn scan_map_request(kv: &KvMap, request: BackendKvScanRequest) -> BackendKvScanR
     let resume_after = has_more
         .then(|| rows.last().map(|row| row.key.clone()))
         .flatten();
-    BackendKvScanResult { rows, resume_after }
+    BackendKvScanBatch { rows, resume_after }
 }
 
 fn key_matches_range(key: &[u8], range: &BackendKvScanRange) -> bool {
@@ -253,6 +266,7 @@ mod tests {
                     namespace: namespace.to_string(),
                     keys: vec![key.to_vec()],
                 }],
+                projection: crate::backend::BackendKvGetProjection::Values,
             })
             .await
             .expect("get should succeed");
@@ -264,8 +278,8 @@ mod tests {
             .groups
             .into_iter()
             .next()
-            .and_then(|mut group| group.values.pop())
-            .flatten()
+            .and_then(|mut group| group.entries.pop())
+            .and_then(|entry| entry.value)
     }
 
     async fn scan(
@@ -273,7 +287,7 @@ mod tests {
         namespace: &str,
         range: BackendKvScanRange,
         limit: usize,
-    ) -> Vec<BackendKvPair> {
+    ) -> Vec<BackendKvScanRow> {
         let mut transaction = backend
             .begin_read_transaction()
             .await
@@ -284,6 +298,7 @@ mod tests {
                 range,
                 after: None,
                 limit,
+                projection: BackendKvScanProjection::KeysAndValues,
             })
             .await
             .expect("scan should succeed");
@@ -298,7 +313,8 @@ mod tests {
         backend: &UnitTestBackend,
         after: Option<&[u8]>,
         limit: usize,
-    ) -> BackendKvScanResult {
+        projection: BackendKvScanProjection,
+    ) -> BackendKvScanBatch {
         let mut transaction = backend
             .begin_read_transaction()
             .await
@@ -309,6 +325,7 @@ mod tests {
                 range: BackendKvScanRange::prefix(Vec::new()),
                 after: after.map(Vec::from),
                 limit,
+                projection,
             })
             .await
             .expect("scan should succeed");
@@ -404,7 +421,7 @@ mod tests {
         transaction.commit().await.unwrap();
 
         let pairs = scan(&backend, "ns", BackendKvScanRange::prefix(b"a/"), 1).await;
-        assert_eq!(pairs, vec![BackendKvPair::new(b"a/1", b"1")]);
+        assert_eq!(pairs, vec![BackendKvScanRow::new(b"a/1", b"1")]);
     }
 
     #[tokio::test]
@@ -419,18 +436,25 @@ mod tests {
         put(transaction.as_mut(), "ns", b"c", b"3").await;
         transaction.commit().await.unwrap();
 
-        let first_page = scan_request(&backend, None, 2).await;
+        let first_page =
+            scan_request(&backend, None, 2, BackendKvScanProjection::KeysAndValues).await;
         assert_eq!(
             first_page.rows,
             vec![
-                BackendKvPair::new(b"a", b"1"),
-                BackendKvPair::new(b"b", b"2")
+                BackendKvScanRow::new(b"a", b"1"),
+                BackendKvScanRow::new(b"b", b"2")
             ]
         );
         assert_eq!(first_page.resume_after, Some(b"b".to_vec()));
 
-        let second_page = scan_request(&backend, first_page.resume_after.as_deref(), 2).await;
-        assert_eq!(second_page.rows, vec![BackendKvPair::new(b"c", b"3")]);
+        let second_page = scan_request(
+            &backend,
+            first_page.resume_after.as_deref(),
+            2,
+            BackendKvScanProjection::KeysAndValues,
+        )
+        .await;
+        assert_eq!(second_page.rows, vec![BackendKvScanRow::new(b"c", b"3")]);
         assert_eq!(second_page.resume_after, None);
     }
 
@@ -445,15 +469,72 @@ mod tests {
         put(transaction.as_mut(), "ns", b"b", b"2").await;
         transaction.commit().await.unwrap();
 
-        let page = scan_request(&backend, None, 2).await;
+        let page = scan_request(&backend, None, 2, BackendKvScanProjection::KeysAndValues).await;
         assert_eq!(
             page.rows,
             vec![
-                BackendKvPair::new(b"a", b"1"),
-                BackendKvPair::new(b"b", b"2")
+                BackendKvScanRow::new(b"a", b"1"),
+                BackendKvScanRow::new(b"b", b"2")
             ]
         );
         assert_eq!(page.resume_after, None);
+    }
+
+    #[tokio::test]
+    async fn key_only_scan_omits_values() {
+        let backend = UnitTestBackend::new();
+        let mut transaction = backend
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        put(transaction.as_mut(), "ns", b"a", b"1").await;
+        put(transaction.as_mut(), "ns", b"b", b"2").await;
+        transaction.commit().await.unwrap();
+
+        let page = scan_request(&backend, None, 2, BackendKvScanProjection::KeysOnly).await;
+        assert_eq!(
+            page.rows,
+            vec![
+                BackendKvScanRow::key_only(b"a"),
+                BackendKvScanRow::key_only(b"b")
+            ]
+        );
+        assert_eq!(page.resume_after, None);
+    }
+
+    #[tokio::test]
+    async fn existence_get_omits_values() {
+        let backend = UnitTestBackend::new();
+        let mut transaction = backend
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        put(transaction.as_mut(), "ns", b"a", b"1").await;
+        transaction.commit().await.unwrap();
+
+        let mut transaction = backend
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
+        let result = transaction
+            .get_kv_many(BackendKvGetRequest {
+                groups: vec![BackendKvGetGroup {
+                    namespace: "ns".to_string(),
+                    keys: vec![b"a".to_vec(), b"missing".to_vec()],
+                }],
+                projection: crate::backend::BackendKvGetProjection::Existence,
+            })
+            .await
+            .expect("existence get should succeed");
+        transaction
+            .rollback()
+            .await
+            .expect("rollback should succeed");
+
+        assert_eq!(
+            result.groups[0].entries,
+            vec![BackendKvGetEntry::exists(), BackendKvGetEntry::missing()]
+        );
     }
 
     #[tokio::test]
@@ -478,8 +559,8 @@ mod tests {
         assert_eq!(
             pairs,
             vec![
-                BackendKvPair::new(b"a", b"a"),
-                BackendKvPair::new(b"b", b"b")
+                BackendKvScanRow::new(b"a", b"a"),
+                BackendKvScanRow::new(b"b", b"b")
             ]
         );
     }

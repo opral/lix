@@ -2,8 +2,8 @@ use crate::changelog::codec::{decode_change, encode_change};
 use crate::changelog::{CanonicalChange, ChangelogScanRequest};
 use crate::storage::KvScanRange;
 use crate::storage::{
-    KvGetGroup, KvGetRequest, KvPut, KvScanRequest, KvWriteBatch, KvWriteGroup, StorageReader,
-    StorageWriter,
+    KvGetGroup, KvGetProjection, KvGetRequest, KvPut, KvScanProjection, KvScanRequest,
+    KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
 };
 use crate::LixError;
 
@@ -19,12 +19,14 @@ pub(crate) async fn load_change(
                 namespace: CHANGELOG_CHANGE_NAMESPACE.to_string(),
                 keys: vec![encode_change_key(change_id)],
             }],
+            projection: KvGetProjection::Values,
         })
         .await?
         .groups
         .into_iter()
         .next()
-        .and_then(|mut group| group.values.pop())
+        .map(|mut group| group.pop_value())
+        .transpose()?
         .flatten();
     let Some(bytes) = bytes else {
         return Ok(None);
@@ -44,11 +46,12 @@ pub(crate) async fn scan_changes(
             range: KvScanRange::prefix(Vec::new()),
             after: None,
             limit: request.limit.unwrap_or(usize::MAX),
+            projection: KvScanProjection::KeysAndValues,
         })
         .await?
-        .rows
+        .into_rows()
         .into_iter()
-        .map(|pair| decode_change(&pair.value))
+        .map(|pair| decode_change(&pair.into_value()?))
         .collect()
 }
 
