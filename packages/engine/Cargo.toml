@@ -31,6 +31,7 @@ jsonschema = { version = "0.17", default-features = false, features = ["draft202
 globset = "0.4"
 uuid = { version = "1", features = ["v7", "std", "js"] }
 unicode-normalization = "0.1"
+precis-profiles = "0.1.13"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["rt"] }
 blake3 = "1"

@@ -25,7 +25,7 @@ simulation_test!(
             (
                 "file-percent-bidi",
                 "/docs/%E2%80%AEevil.txt",
-                "LIX_ERROR_PATH_INVALID_IRI_CODE_POINT",
+                "LIX_ERROR_PATH_INVALID_SEGMENT_CODE_POINT",
             ),
         ] {
             let error = session
