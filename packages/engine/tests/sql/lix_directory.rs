@@ -5,6 +5,42 @@ use serde_json::json;
 
 use super::assert_rows_eq;
 
+simulation_test!(
+    lix_directory_path_insert_rejects_percent_encoded_forbidden_code_points,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        for (id, path, expected_code) in [
+            (
+                "dir-percent-nul",
+                "/docs/%00evil/",
+                "LIX_ERROR_PATH_NUL_BYTE",
+            ),
+            (
+                "dir-percent-bidi",
+                "/docs/%E2%80%AEevil/",
+                "LIX_ERROR_PATH_INVALID_SEGMENT_CODE_POINT",
+            ),
+        ] {
+            let error = session
+                .execute(
+                    &format!("INSERT INTO lix_directory (id, path) VALUES ('{id}', '{path}')"),
+                    &[],
+                )
+                .await
+                .expect_err("percent-encoded forbidden path code point should be rejected");
+            assert_eq!(error.code, expected_code);
+        }
+    }
+);
+
 simulation_test!(lix_directory_insert_reads_nested_paths, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
@@ -484,7 +520,7 @@ simulation_test!(
             )
             .await
             .expect_err("descriptor name should reject zero-width characters");
-        assert_eq!(zero_width.code, "LIX_ERROR_PATH_INVALID_IRI_CODE_POINT");
+        assert_eq!(zero_width.code, "LIX_ERROR_PATH_INVALID_SEGMENT_CODE_POINT");
     }
 );
 
