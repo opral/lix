@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use crate::backend::{Backend, BackendReadTransaction, BackendWriteTransaction};
 use crate::storage::{
-    KvGetRequest, KvGetResult, KvScanRequest, KvScanResult, KvWriteBatch, KvWriteStats,
+    KvGetBatch, KvGetRequest, KvScanBatch, KvScanRequest, KvWriteBatch, KvWriteStats,
     StorageReadTransaction, StorageReader, StorageWriteTransaction, StorageWriter,
 };
 use crate::LixError;
@@ -45,7 +45,7 @@ impl StorageContext {
 #[cfg(any(test, feature = "storage-benches"))]
 #[async_trait]
 impl StorageReader for StorageContext {
-    async fn get_kv_many(&mut self, request: KvGetRequest) -> Result<KvGetResult, LixError> {
+    async fn get_kv_many(&mut self, request: KvGetRequest) -> Result<KvGetBatch, LixError> {
         let mut transaction = self.begin_read_transaction().await?;
         let result = transaction.get_kv_many(request).await;
         match result {
@@ -60,7 +60,7 @@ impl StorageReader for StorageContext {
         }
     }
 
-    async fn scan_kv(&mut self, request: KvScanRequest) -> Result<KvScanResult, LixError> {
+    async fn scan_kv(&mut self, request: KvScanRequest) -> Result<KvScanBatch, LixError> {
         let mut transaction = self.begin_read_transaction().await?;
         let result = transaction.scan_kv(request).await;
         match result {
@@ -86,14 +86,14 @@ struct StorageContextWriteTransaction {
 
 #[async_trait]
 impl StorageReader for StorageContextReadTransaction {
-    async fn get_kv_many(&mut self, request: KvGetRequest) -> Result<KvGetResult, LixError> {
+    async fn get_kv_many(&mut self, request: KvGetRequest) -> Result<KvGetBatch, LixError> {
         self.transaction
             .get_kv_many(request.into())
             .await
             .map(Into::into)
     }
 
-    async fn scan_kv(&mut self, request: KvScanRequest) -> Result<KvScanResult, LixError> {
+    async fn scan_kv(&mut self, request: KvScanRequest) -> Result<KvScanBatch, LixError> {
         self.transaction
             .scan_kv(request.into())
             .await
@@ -110,14 +110,14 @@ impl StorageReadTransaction for StorageContextReadTransaction {
 
 #[async_trait]
 impl StorageReader for StorageContextWriteTransaction {
-    async fn get_kv_many(&mut self, request: KvGetRequest) -> Result<KvGetResult, LixError> {
+    async fn get_kv_many(&mut self, request: KvGetRequest) -> Result<KvGetBatch, LixError> {
         self.transaction
             .get_kv_many(request.into())
             .await
             .map(Into::into)
     }
 
-    async fn scan_kv(&mut self, request: KvScanRequest) -> Result<KvScanResult, LixError> {
+    async fn scan_kv(&mut self, request: KvScanRequest) -> Result<KvScanBatch, LixError> {
         self.transaction
             .scan_kv(request.into())
             .await
@@ -154,7 +154,10 @@ mod tests {
     use std::sync::Arc;
 
     use crate::backend::testing::UnitTestBackend;
-    use crate::storage::{KvGetGroup, KvPair, KvScanRange, KvWriteBatch};
+    use crate::storage::{
+        KvGetEntry, KvGetGroup, KvGetProjection, KvScanProjection, KvScanRange, KvScanRow,
+        KvWriteBatch,
+    };
 
     use super::*;
 
@@ -184,12 +187,31 @@ mod tests {
                     namespace: "ns".to_string(),
                     keys: vec![b"a".to_vec(), b"b".to_vec()],
                 }],
+                projection: KvGetProjection::Values,
             })
             .await
             .expect("batch reads");
         assert_eq!(
-            result.groups[0].values,
-            vec![Some(b"1".to_vec()), Some(b"2".to_vec())]
+            result.groups[0].entries,
+            vec![
+                KvGetEntry::value(b"1".to_vec()),
+                KvGetEntry::value(b"2".to_vec())
+            ]
+        );
+
+        let exists = tx
+            .get_kv_many(KvGetRequest {
+                groups: vec![KvGetGroup {
+                    namespace: "ns".to_string(),
+                    keys: vec![b"a".to_vec(), b"missing".to_vec()],
+                }],
+                projection: KvGetProjection::Existence,
+            })
+            .await
+            .expect("existence reads");
+        assert_eq!(
+            exists.groups[0].entries,
+            vec![KvGetEntry::exists(), KvGetEntry::missing()]
         );
 
         let result = tx
@@ -198,10 +220,32 @@ mod tests {
                 range: KvScanRange::prefix(Vec::new()),
                 after: Some(b"a".to_vec()),
                 limit: 1,
+                projection: KvScanProjection::KeysAndValues,
             })
             .await
             .expect("scan reads");
-        assert_eq!(result.rows, vec![KvPair::new(b"b".to_vec(), b"2".to_vec())]);
+        assert_eq!(
+            result.rows,
+            vec![KvScanRow::new(b"b".to_vec(), b"2".to_vec())]
+        );
+
+        let key_only = tx
+            .scan_kv(KvScanRequest {
+                namespace: "ns".to_string(),
+                range: KvScanRange::prefix(Vec::new()),
+                after: None,
+                limit: 2,
+                projection: KvScanProjection::KeysOnly,
+            })
+            .await
+            .expect("key-only scan reads");
+        assert_eq!(
+            key_only.rows,
+            vec![
+                KvScanRow::key_only(b"a".to_vec()),
+                KvScanRow::key_only(b"b".to_vec())
+            ]
+        );
         tx.rollback().await.expect("rollback succeeds");
     }
 }

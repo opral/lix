@@ -7,8 +7,10 @@ use crate::entity_identity::EntityIdentity;
 use crate::entity_identity::EntityIdentityPart;
 use crate::json_store::context::JsonStoreContext;
 use crate::json_store::types::{JsonProjectionPath, JsonRef};
-use crate::storage::KvScanRange;
-use crate::storage::{KvGetGroup, KvGetRequest, KvScanRequest, KvWriteBatch, StorageContext};
+use crate::storage::{
+    KvGetGroup, KvGetProjection, KvGetRequest, KvScanRequest, KvWriteBatch, StorageContext,
+};
+use crate::storage::{KvScanProjection, KvScanRange};
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateDiffRequest, TrackedStateFilter, TrackedStateProjection,
     TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
@@ -330,13 +332,45 @@ pub async fn storage_api_get_kv_many_hits_prepared(
                 namespace: STORAGE_API_NAMESPACE.to_string(),
                 keys,
             }],
+            projection: KvGetProjection::Values,
         })
         .await?;
     transaction.rollback().await?;
     let verified_rows = result.groups[0]
-        .values
+        .entries
         .iter()
-        .filter(|value| value.is_some())
+        .filter(|entry| entry.value.is_some())
+        .count();
+    Ok(StorageBenchReport {
+        measured_rows: reads,
+        verified_rows,
+        elapsed: started_at.elapsed(),
+    })
+}
+
+pub async fn storage_api_get_kv_many_exists_prepared(
+    fixture: &StorageApiFixture,
+    reads: usize,
+) -> Result<StorageBenchReport, LixError> {
+    let mut transaction = fixture.storage.begin_read_transaction().await?;
+    let keys = (0..reads)
+        .map(|index| storage_api_key(index % fixture.rows))
+        .collect::<Vec<_>>();
+    let started_at = Instant::now();
+    let result = transaction
+        .get_kv_many(KvGetRequest {
+            groups: vec![KvGetGroup {
+                namespace: STORAGE_API_NAMESPACE.to_string(),
+                keys,
+            }],
+            projection: KvGetProjection::Existence,
+        })
+        .await?;
+    transaction.rollback().await?;
+    let verified_rows = result.groups[0]
+        .entries
+        .iter()
+        .filter(|entry| entry.exists && entry.value.is_none())
         .count();
     Ok(StorageBenchReport {
         measured_rows: reads,
@@ -360,13 +394,14 @@ pub async fn storage_api_get_kv_many_misses_prepared(
                 namespace: STORAGE_API_NAMESPACE.to_string(),
                 keys,
             }],
+            projection: KvGetProjection::Values,
         })
         .await?;
     transaction.rollback().await?;
     let verified_rows = result.groups[0]
-        .values
+        .entries
         .iter()
-        .filter(|value| value.is_none())
+        .filter(|entry| !entry.exists)
         .count();
     Ok(StorageBenchReport {
         measured_rows: reads,
@@ -396,13 +431,14 @@ pub async fn storage_api_get_kv_many_mixed_hit_miss_prepared(
                 namespace: STORAGE_API_NAMESPACE.to_string(),
                 keys,
             }],
+            projection: KvGetProjection::Values,
         })
         .await?;
     transaction.rollback().await?;
     let verified_rows = result.groups[0]
-        .values
+        .entries
         .iter()
-        .filter(|value| value.is_some())
+        .filter(|entry| entry.value.is_some())
         .count();
     Ok(StorageBenchReport {
         measured_rows: reads,
@@ -451,14 +487,15 @@ pub async fn storage_api_get_kv_many_multi_namespace(
                     keys: odd_keys,
                 },
             ],
+            projection: KvGetProjection::Values,
         })
         .await?;
     transaction.rollback().await?;
     let verified_rows = result
         .groups
         .iter()
-        .flat_map(|group| group.values.iter())
-        .filter(|value| value.is_some())
+        .flat_map(|group| group.entries.iter())
+        .filter(|entry| entry.value.is_some())
         .count();
     Ok(StorageBenchReport {
         measured_rows: reads,
@@ -482,13 +519,14 @@ pub async fn storage_api_get_kv_many_duplicate_keys_prepared(
                 namespace: STORAGE_API_NAMESPACE.to_string(),
                 keys,
             }],
+            projection: KvGetProjection::Values,
         })
         .await?;
     transaction.rollback().await?;
     let verified_rows = result.groups[0]
-        .values
+        .entries
         .iter()
-        .filter(|value| value.is_some())
+        .filter(|entry| entry.value.is_some())
         .count();
     Ok(StorageBenchReport {
         measured_rows: reads,
@@ -509,6 +547,7 @@ pub async fn storage_api_scan_kv_prefix_prepared(
             range: KvScanRange::prefix(b"key/".to_vec()),
             after: None,
             limit,
+            projection: KvScanProjection::KeysOnly,
         })
         .await?;
     transaction.rollback().await?;
@@ -534,6 +573,7 @@ pub async fn storage_api_scan_kv_after_pages_prepared(
                 range: KvScanRange::prefix(b"key/".to_vec()),
                 after,
                 limit: page_size,
+                projection: KvScanProjection::KeysOnly,
             })
             .await?;
         if result.rows.is_empty() {
@@ -564,6 +604,7 @@ pub async fn storage_api_scan_kv_empty_range_prepared(
             range: KvScanRange::prefix(b"absent/".to_vec()),
             after: None,
             limit: fixture.rows,
+            projection: KvScanProjection::KeysOnly,
         })
         .await?;
     transaction.rollback().await?;
@@ -607,6 +648,7 @@ pub async fn storage_api_scan_kv_selective_prefix_prepared(
             range: KvScanRange::prefix(b"selective/".to_vec()),
             after: None,
             limit: fixture.rows,
+            projection: KvScanProjection::KeysOnly,
         })
         .await?;
     transaction.rollback().await?;
@@ -2797,7 +2839,6 @@ fn tracked_rows(config: StorageBenchConfig, commit_id: &str) -> Vec<TrackedState
             file_id: Some("bench.json".to_string()),
             snapshot_content: Some(snapshot_content(index, config.state_payload_bytes)),
             metadata: None,
-            origin: None,
             schema_version: "1".to_string(),
             created_at: timestamp(index),
             updated_at: timestamp(index),
@@ -2825,7 +2866,6 @@ fn tracked_rows_file_selective(
             ),
             snapshot_content: Some(snapshot_content(index, config.state_payload_bytes)),
             metadata: None,
-            origin: None,
             schema_version: "1".to_string(),
             created_at: timestamp(index),
             updated_at: timestamp(index),
@@ -2843,7 +2883,6 @@ fn untracked_rows(config: StorageBenchConfig) -> Vec<UntrackedStateRow> {
             file_id: Some("bench.json".to_string()),
             snapshot_content: Some(snapshot_content(index, config.state_payload_bytes)),
             metadata: None,
-            origin: None,
             schema_version: "1".to_string(),
             created_at: timestamp(index),
             updated_at: timestamp(index),

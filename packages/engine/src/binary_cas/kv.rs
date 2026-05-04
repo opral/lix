@@ -6,8 +6,8 @@ use crate::binary_cas::codec::{
 };
 use crate::binary_cas::BinaryBlobWrite;
 use crate::storage::{
-    KvGetGroup, KvGetRequest, KvPair, KvPut, KvScanRange, KvScanRequest, KvWriteBatch,
-    KvWriteGroup, StorageReader, StorageWriter,
+    KvGetGroup, KvGetProjection, KvGetRequest, KvPut, KvScanProjection, KvScanRange, KvScanRequest,
+    KvScanRow, KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
 };
 use crate::LixError;
 
@@ -86,7 +86,7 @@ pub(crate) async fn scan_manifest_chunks(
     )
     .await?
     .into_iter()
-    .map(|pair| decode_json(&pair.value, "binary CAS manifest chunk"))
+    .map(|pair| decode_json(&pair.into_value()?, "binary CAS manifest chunk"))
     .collect()
 }
 
@@ -141,12 +141,14 @@ async fn get_one(
                 namespace: namespace.to_string(),
                 keys: vec![key],
             }],
+            projection: KvGetProjection::Values,
         })
         .await?
         .groups
         .into_iter()
         .next()
-        .and_then(|mut group| group.values.pop())
+        .map(|mut group| group.pop_value())
+        .transpose()?
         .flatten())
 }
 
@@ -154,16 +156,17 @@ async fn scan_all(
     store: &mut impl StorageReader,
     namespace: &str,
     range: KvScanRange,
-) -> Result<Vec<KvPair>, LixError> {
+) -> Result<Vec<KvScanRow>, LixError> {
     Ok(store
         .scan_kv(KvScanRequest {
             namespace: namespace.to_string(),
             range,
             after: None,
             limit: usize::MAX,
+            projection: KvScanProjection::KeysAndValues,
         })
         .await?
-        .rows)
+        .into_rows())
 }
 
 async fn put_one(

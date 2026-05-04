@@ -33,8 +33,9 @@ pub use schema::{
 };
 
 pub use backend::{
-    Backend, BackendKvGetGroup, BackendKvGetRequest, BackendKvGetResult, BackendKvGetResultGroup,
-    BackendKvPair, BackendKvPut, BackendKvScanRange, BackendKvScanRequest, BackendKvScanResult,
+    Backend, BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetEntry, BackendKvGetGroup,
+    BackendKvGetProjection, BackendKvGetRequest, BackendKvPut, BackendKvScanBatch,
+    BackendKvScanProjection, BackendKvScanRange, BackendKvScanRequest, BackendKvScanRow,
     BackendKvWriteBatch, BackendKvWriteGroup, BackendKvWriteStats, BackendReadTransaction,
     BackendWriteTransaction,
 };

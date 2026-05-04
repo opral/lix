@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use crate::backend::{
-    BackendKvGetRequest, BackendKvGetResult, BackendKvScanRequest, BackendKvScanResult,
+    BackendKvGetBatch, BackendKvGetRequest, BackendKvScanBatch, BackendKvScanRequest,
     BackendKvWriteBatch, BackendKvWriteStats,
 };
 use crate::LixError;
@@ -59,12 +59,12 @@ pub trait BackendReadTransaction: Send + Sync {
     async fn get_kv_many(
         &mut self,
         request: BackendKvGetRequest,
-    ) -> Result<BackendKvGetResult, LixError>;
+    ) -> Result<BackendKvGetBatch, LixError>;
 
     async fn scan_kv(
         &mut self,
         request: BackendKvScanRequest,
-    ) -> Result<BackendKvScanResult, LixError>;
+    ) -> Result<BackendKvScanBatch, LixError>;
 
     async fn rollback(self: Box<Self>) -> Result<(), LixError>;
 }

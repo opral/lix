@@ -1,7 +1,7 @@
 use crate::storage::KvScanRange;
 use crate::storage::{
-    KvGetGroup, KvGetRequest, KvPut, KvScanRequest, KvWriteBatch, KvWriteGroup, StorageReader,
-    StorageWriter,
+    KvGetGroup, KvGetProjection, KvGetRequest, KvPut, KvScanProjection, KvScanRequest,
+    KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
 };
 use crate::untracked_state::{
     UntrackedStateIdentity, UntrackedStateRow, UntrackedStateRowRequest, UntrackedStateScanRequest,
@@ -35,12 +35,14 @@ pub(crate) async fn load_row(
                 namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
                 keys: vec![encode_untracked_state_row_key(&identity)],
             }],
+            projection: KvGetProjection::Values,
         })
         .await?
         .groups
         .into_iter()
         .next()
-        .and_then(|mut group| group.values.pop())
+        .map(|mut group| group.pop_value())
+        .transpose()?
         .flatten();
     let Some(bytes) = bytes else {
         return Ok(None);
@@ -82,11 +84,12 @@ async fn scan_all_untracked_rows(
             range: KvScanRange::prefix(Vec::new()),
             after: None,
             limit: usize::MAX,
+            projection: KvScanProjection::KeysAndValues,
         })
         .await?
-        .rows
+        .into_rows()
         .into_iter()
-        .map(|pair| decode_untracked_state_row(&pair.value))
+        .map(|pair| decode_untracked_state_row(&pair.into_value()?))
         .collect()
 }
 

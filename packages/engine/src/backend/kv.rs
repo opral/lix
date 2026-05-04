@@ -1,19 +1,37 @@
-/// One key/value pair returned by a backend KV scan.
+/// One row returned by a backend KV scan.
 ///
 /// Keys and values are byte-oriented on purpose. Higher layers own encoding,
 /// ordering, and schema decisions so storage can move from SQLite to a prolly
 /// tree without changing higher-level callers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendKvPair {
+pub struct BackendKvScanRow {
     pub key: Vec<u8>,
-    pub value: Vec<u8>,
+    pub value: Option<Vec<u8>>,
 }
 
-impl BackendKvPair {
+impl BackendKvScanRow {
     pub fn new(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
         Self {
             key: key.into(),
-            value: value.into(),
+            value: Some(value.into()),
+        }
+    }
+
+    pub fn key_only(key: impl Into<Vec<u8>>) -> Self {
+        Self {
+            key: key.into(),
+            value: None,
+        }
+    }
+
+    pub fn for_projection(
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+        projection: BackendKvScanProjection,
+    ) -> Self {
+        match projection {
+            BackendKvScanProjection::KeysOnly => Self::key_only(key),
+            BackendKvScanProjection::KeysAndValues => Self::new(key, value),
         }
     }
 }
@@ -32,6 +50,7 @@ pub enum BackendKvScanRange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendKvGetRequest {
     pub groups: Vec<BackendKvGetGroup>,
+    pub projection: BackendKvGetProjection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,14 +60,63 @@ pub struct BackendKvGetGroup {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendKvGetResult {
-    pub groups: Vec<BackendKvGetResultGroup>,
+pub struct BackendKvGetBatch {
+    pub groups: Vec<BackendKvGetBatchGroup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendKvGetResultGroup {
+pub struct BackendKvGetBatchGroup {
     pub namespace: String,
-    pub values: Vec<Option<Vec<u8>>>,
+    pub entries: Vec<BackendKvGetEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKvGetProjection {
+    Values,
+    Existence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendKvGetEntry {
+    pub exists: bool,
+    pub value: Option<Vec<u8>>,
+}
+
+impl BackendKvGetEntry {
+    pub fn missing() -> Self {
+        Self {
+            exists: false,
+            value: None,
+        }
+    }
+
+    pub fn value(value: impl Into<Vec<u8>>) -> Self {
+        Self {
+            exists: true,
+            value: Some(value.into()),
+        }
+    }
+
+    pub fn exists() -> Self {
+        Self {
+            exists: true,
+            value: None,
+        }
+    }
+
+    pub fn for_projection(value: Option<Vec<u8>>, projection: BackendKvGetProjection) -> Self {
+        match (value, projection) {
+            (Some(value), BackendKvGetProjection::Values) => Self::value(value),
+            (Some(_), BackendKvGetProjection::Existence) => Self::exists(),
+            (None, _) => Self::missing(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKvScanProjection {
+    KeysOnly,
+    KeysAndValues,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,11 +125,12 @@ pub struct BackendKvScanRequest {
     pub range: BackendKvScanRange,
     pub after: Option<Vec<u8>>,
     pub limit: usize,
+    pub projection: BackendKvScanProjection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendKvScanResult {
-    pub rows: Vec<BackendKvPair>,
+pub struct BackendKvScanBatch {
+    pub rows: Vec<BackendKvScanRow>,
     pub resume_after: Option<Vec<u8>>,
 }
 

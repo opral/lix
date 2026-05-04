@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::storage::{
-    KvGetRequest, KvGetResult, KvScanRequest, KvScanResult, StorageReadTransaction, StorageReader,
+    KvGetBatch, KvGetRequest, KvScanBatch, KvScanRequest, StorageReadTransaction, StorageReader,
 };
 use crate::LixError;
 use tokio::sync::Mutex;
@@ -60,12 +60,12 @@ impl<S> StorageReader for ScopedStorageReader<S>
 where
     S: StorageReader,
 {
-    async fn get_kv_many(&mut self, request: KvGetRequest) -> Result<KvGetResult, LixError> {
+    async fn get_kv_many(&mut self, request: KvGetRequest) -> Result<KvGetBatch, LixError> {
         let mut store = self.store.lock().await;
         store.get_kv_many(request).await
     }
 
-    async fn scan_kv(&mut self, request: KvScanRequest) -> Result<KvScanResult, LixError> {
+    async fn scan_kv(&mut self, request: KvScanRequest) -> Result<KvScanBatch, LixError> {
         let mut store = self.store.lock().await;
         store.scan_kv(request).await
     }
