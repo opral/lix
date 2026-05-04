@@ -25,7 +25,7 @@
     },
     "name": {
       "type": "string",
-      "pattern": "^[^/\\\\]+$"
+      "pattern": "^(?!\\.{1,2}$)[^/\\\\]+$"
     },
     "extension": {
       "type": [
