@@ -824,6 +824,7 @@ mod tests {
             file_id: None,
             snapshot_content: Some(r#"{"id":"entity-1","value":"hello"}"#.to_string()),
             metadata: None,
+            origin: None,
             schema_version: "1".to_string(),
             created_at: None,
             updated_at: None,

@@ -986,6 +986,7 @@ fn entity_update_write_rows_from_batch(
                     "lixcol_metadata",
                     &spec.schema_key,
                 )?,
+                origin: None,
                 schema_version,
                 created_at: None,
                 updated_at: None,
@@ -1209,6 +1210,7 @@ fn entity_lix_state_write_rows_from_batch_with_options(
                 file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
                 snapshot_content: Some(snapshot_content),
                 metadata: optional_metadata_value(batch, row_index, "lixcol_metadata", &spec.schema_key)?,
+                origin: None,
                 schema_version: schema_version,
                 created_at: None,
                 updated_at: None,
@@ -2608,6 +2610,7 @@ mod tests {
                             .to_string()
                     ),
                     metadata: Some(json!({"source": "entity"})),
+                    origin: None,
                     schema_version: "1".to_string(),
                     created_at: None,
                     updated_at: None,

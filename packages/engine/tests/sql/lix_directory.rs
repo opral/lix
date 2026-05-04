@@ -183,6 +183,92 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_directory_insert_duplicate_id_reports_lix_directory,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES ('same-dir', '/a/')",
+                &[],
+            )
+            .await
+            .expect("first directory insert should succeed");
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES ('same-dir', '/b/')",
+                &[],
+            )
+            .await
+            .expect_err("duplicate directory id insert should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert!(
+            error.message.contains("table 'lix_directory'")
+                && error.message.contains("id 'same-dir'")
+                && !error.message.contains("lix_directory_descriptor"),
+            "unexpected error: {error:?}"
+        );
+    }
+);
+
+simulation_test!(
+    lix_directory_by_version_insert_duplicate_id_reports_lix_directory_by_version,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let version_id = sim.main_version_id();
+
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_directory_by_version \
+                     (id, path, lixcol_version_id) \
+                     VALUES ('same-dir', '/a/', '{version_id}')"
+                ),
+                &[],
+            )
+            .await
+            .expect("first by-version directory insert should succeed");
+
+        let error = session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_directory_by_version \
+                     (id, path, lixcol_version_id) \
+                     VALUES ('same-dir', '/b/', '{version_id}')"
+                ),
+                &[],
+            )
+            .await
+            .expect_err("duplicate by-version directory id insert should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert!(
+            error.message.contains("table 'lix_directory_by_version'")
+                && error.message.contains("id 'same-dir'")
+                && !error.message.contains("table 'lix_directory':")
+                && !error.message.contains("lix_directory_descriptor"),
+            "unexpected error: {error:?}"
+        );
+    }
+);
+
+simulation_test!(
     lix_directory_path_insert_rejects_existing_file_entry,
     |sim| async move {
         let engine = sim.boot_engine().await;

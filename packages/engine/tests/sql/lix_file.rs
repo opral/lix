@@ -547,6 +547,164 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_file_insert_duplicate_id_with_data_reports_lix_file,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('same-file', '/a.bin', X'01')",
+                &[],
+            )
+            .await
+            .expect("first file insert should succeed");
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('same-file', '/b.bin', X'02')",
+                &[],
+            )
+            .await
+            .expect_err("duplicate file id insert should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert!(
+            error.message.contains("table 'lix_file'")
+                && error.message.contains("id 'same-file'")
+                && !error.message.contains("lix_binary_blob_ref"),
+            "unexpected error: {error:?}"
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_insert_duplicate_id_without_data_reports_lix_file,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ('same-file', '/a.bin')",
+                &[],
+            )
+            .await
+            .expect("first file insert should succeed");
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ('same-file', '/b.bin')",
+                &[],
+            )
+            .await
+            .expect_err("duplicate file id insert should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert!(
+            error.message.contains("table 'lix_file'")
+                && error.message.contains("id 'same-file'")
+                && !error.message.contains("lix_file_descriptor"),
+            "unexpected error: {error:?}"
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_insert_duplicate_id_in_same_batch_reports_lix_file,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES \
+                 ('same-file', '/a.bin', X'01'), \
+                 ('same-file', '/b.bin', X'02')",
+                &[],
+            )
+            .await
+            .expect_err("same-batch duplicate file id insert should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert!(
+            error.message.contains("table 'lix_file'")
+                && error.message.contains("id 'same-file'")
+                && !error.message.contains("lix_binary_blob_ref"),
+            "unexpected error: {error:?}"
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_by_version_insert_duplicate_id_reports_lix_file_by_version,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let version_id = sim.main_version_id();
+
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file_by_version \
+                     (id, path, data, lixcol_version_id) \
+                     VALUES ('same-file', '/a.bin', X'01', '{version_id}')"
+                ),
+                &[],
+            )
+            .await
+            .expect("first by-version file insert should succeed");
+
+        let error = session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file_by_version \
+                     (id, path, data, lixcol_version_id) \
+                     VALUES ('same-file', '/b.bin', X'02', '{version_id}')"
+                ),
+                &[],
+            )
+            .await
+            .expect_err("duplicate by-version file id insert should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert!(
+            error.message.contains("table 'lix_file_by_version'")
+                && error.message.contains("id 'same-file'")
+                && !error.message.contains("table 'lix_file':")
+                && !error.message.contains("lix_binary_blob_ref"),
+            "unexpected error: {error:?}"
+        );
+    }
+);
+
+simulation_test!(
     lix_file_path_insert_rejects_existing_directory_entry,
     |sim| async move {
         let engine = sim.boot_engine().await;

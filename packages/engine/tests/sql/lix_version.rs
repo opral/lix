@@ -359,6 +359,13 @@ simulation_test!(lix_version_duplicate_insert_rejects, |sim| async move {
         .await
         .expect_err("duplicate version id should be rejected");
     assert_eq!(error.code, LixError::CODE_UNIQUE);
+    assert!(
+        error.message.contains("table 'lix_version'")
+            && error.message.contains("id 'sql-version-duplicate'")
+            && !error.message.contains("lix_version_descriptor")
+            && !error.message.contains("lix_version_ref"),
+        "unexpected error: {error:?}"
+    );
 });
 
 simulation_test!(

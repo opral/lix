@@ -58,7 +58,10 @@ use super::result_metadata::json_field;
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
-use crate::transaction::types::{StageFileData, StageWrite, StageWriteMode};
+use crate::transaction::types::{
+    LogicalPrimaryKey, StageFileData, StageRowOrigin, StageWrite, StageWriteMode,
+    StageWriteOperation,
+};
 
 pub(crate) async fn register_lix_file_providers(
     session: &SessionContext,
@@ -364,6 +367,7 @@ struct LixFileInsertSink {
     write_ctx: SqlWriteContext,
     functions: FunctionProviderHandle,
     version_binding: VersionBinding,
+    surface_name: &'static str,
     include_data_writes: bool,
 }
 
@@ -381,10 +385,12 @@ impl LixFileInsertSink {
         version_binding: VersionBinding,
         include_data_writes: bool,
     ) -> Self {
+        let surface_name = lix_file_surface_name(&version_binding);
         Self {
             write_ctx,
             functions,
             version_binding,
+            surface_name,
             include_data_writes,
         }
     }
@@ -425,6 +431,7 @@ impl InsertSink for LixFileInsertSink {
                 staged.extend(lix_file_insert_stage_from_batch_with_path_resolvers(
                     &batch,
                     self.version_binding.active_version_id(),
+                    self.surface_name,
                     path_resolvers
                         .as_mut()
                         .expect("path resolver should be initialized"),
@@ -436,6 +443,7 @@ impl InsertSink for LixFileInsertSink {
                     lix_file_insert_stage_from_batch_with_id_generator_and_path_resolvers(
                         &batch,
                         self.version_binding.active_version_id(),
+                        self.surface_name,
                         path_resolvers
                             .as_mut()
                             .expect("path resolver should be initialized"),
@@ -467,6 +475,13 @@ impl InsertSink for LixFileInsertSink {
         }
 
         Ok(staged.count)
+    }
+}
+
+fn lix_file_surface_name(version_binding: &VersionBinding) -> &'static str {
+    match version_binding {
+        VersionBinding::Active { .. } => "lix_file",
+        VersionBinding::Explicit => "lix_file_by_version",
     }
 }
 
@@ -1038,12 +1053,13 @@ fn lix_file_insert_stage_from_batch(
     batch: &RecordBatch,
     version_binding: Option<&str>,
 ) -> Result<LixFileStagedBatch> {
-    lix_file_stage_from_batch_with_options(batch, version_binding, true, true, true)
+    lix_file_stage_from_batch_with_options(batch, version_binding, "lix_file", true, true, true)
 }
 
 fn lix_file_insert_stage_from_batch_with_id_generator_and_path_resolvers(
     batch: &RecordBatch,
     version_binding: Option<&str>,
+    surface_name: &str,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
     generate_id: &mut dyn FnMut() -> String,
     include_data_writes: bool,
@@ -1051,6 +1067,7 @@ fn lix_file_insert_stage_from_batch_with_id_generator_and_path_resolvers(
     lix_file_stage_from_batch_with_options_and_path_resolvers(
         batch,
         version_binding,
+        surface_name,
         true,
         true,
         include_data_writes,
@@ -1062,6 +1079,7 @@ fn lix_file_insert_stage_from_batch_with_id_generator_and_path_resolvers(
 fn lix_file_insert_stage_from_batch_with_path_resolvers(
     batch: &RecordBatch,
     version_binding: Option<&str>,
+    surface_name: &str,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
     generate_directory_id: &mut dyn FnMut() -> String,
     include_data_writes: bool,
@@ -1069,6 +1087,7 @@ fn lix_file_insert_stage_from_batch_with_path_resolvers(
     lix_file_stage_from_batch_with_options_and_path_resolvers(
         batch,
         version_binding,
+        surface_name,
         true,
         true,
         include_data_writes,
@@ -1120,7 +1139,7 @@ fn lix_file_existing_update_stage_from_batch(
 
         if include_data_writes {
             let data = update_required_binary_value(batch, assignment_values, row_index, "data")?;
-            stage_lix_file_data_write(&mut staged, id, data, context)?;
+            stage_lix_file_data_write(&mut staged, id, data, context, None)?;
         }
 
         staged.count = staged
@@ -1247,7 +1266,7 @@ fn lix_file_path_update_stage_from_batch(
         staged.extend_filesystem_plan(plan);
 
         if let Some(data) = assigned_data {
-            stage_lix_file_data_write(&mut staged, id, data, context)?;
+            stage_lix_file_data_write(&mut staged, id, data, context, None)?;
         }
     }
 
@@ -1258,6 +1277,7 @@ fn lix_file_path_update_stage_from_batch(
 fn lix_file_stage_from_batch_with_options(
     batch: &RecordBatch,
     version_binding: Option<&str>,
+    surface_name: &str,
     reject_read_only_fields: bool,
     include_descriptor_writes: bool,
     include_data_writes: bool,
@@ -1265,6 +1285,7 @@ fn lix_file_stage_from_batch_with_options(
     lix_file_stage_from_batch_with_options_and_path_resolvers(
         batch,
         version_binding,
+        surface_name,
         reject_read_only_fields,
         include_descriptor_writes,
         include_data_writes,
@@ -1276,6 +1297,7 @@ fn lix_file_stage_from_batch_with_options(
 fn lix_file_stage_from_batch_with_options_and_path_resolvers(
     batch: &RecordBatch,
     version_binding: Option<&str>,
+    surface_name: &str,
     reject_read_only_fields: bool,
     include_descriptor_writes: bool,
     include_data_writes: bool,
@@ -1321,10 +1343,11 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                     "INSERT into lix_file with path requires directory id generator".to_string(),
                 ));
             };
-            let plan = super::filesystem_planner::plan_file_path_write(
+            let file_id = id.unwrap_or_else(|| generate_directory_id());
+            let mut plan = super::filesystem_planner::plan_file_path_write(
                 resolver,
                 FilePathWriteInput {
-                    id,
+                    id: Some(file_id.clone()),
                     path,
                     data,
                     hidden,
@@ -1333,6 +1356,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                 generate_directory_id,
             )
             .map_err(lix_error_to_datafusion_error)?;
+            attach_lix_file_insert_origin(&mut plan.rows, surface_name, &file_id);
             staged.extend_filesystem_plan(plan);
             continue;
         }
@@ -1367,19 +1391,22 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                         .map_err(lix_error_to_datafusion_error)?;
                 }
             }
-            staged
-                .state_rows
-                .push(file_descriptor_write_row(FileDescriptorWriteIntent {
-                    id: id.clone(),
-                    directory_id: directory_id.clone(),
-                    name: name.clone(),
-                    hidden,
-                    context: context.clone(),
-                }));
+            let mut row = file_descriptor_write_row(FileDescriptorWriteIntent {
+                id: id.clone(),
+                directory_id: directory_id.clone(),
+                name: name.clone(),
+                hidden,
+                context: context.clone(),
+            });
+            if let Some(file_id) = id.as_ref() {
+                row.origin = Some(lix_file_insert_origin(surface_name, file_id));
+            }
+            staged.state_rows.push(row);
         }
 
         if let (Some(id), Some(data)) = (id, data) {
-            stage_lix_file_data_write(&mut staged, id, data, context)?;
+            let origin = Some(lix_file_insert_origin(surface_name, &id));
+            stage_lix_file_data_write(&mut staged, id, data, context, origin)?;
         }
         staged.count = staged
             .count
@@ -1395,19 +1422,20 @@ fn stage_lix_file_data_write(
     file_id: String,
     data: Vec<u8>,
     context: FilesystemRowContext,
+    origin: Option<StageRowOrigin>,
 ) -> Result<()> {
-    staged.state_rows.push(
-        blob_ref_row(BlobRefRowInput {
-            file_id: file_id.clone(),
-            data: data.clone(),
-            context: FilesystemRowContext {
-                file_id: None,
-                metadata: None,
-                ..context.clone()
-            },
-        })
-        .map_err(lix_error_to_datafusion_error)?,
-    );
+    let mut row = blob_ref_row(BlobRefRowInput {
+        file_id: file_id.clone(),
+        data: data.clone(),
+        context: FilesystemRowContext {
+            file_id: None,
+            metadata: None,
+            ..context.clone()
+        },
+    })
+    .map_err(lix_error_to_datafusion_error)?;
+    row.origin = origin;
+    staged.state_rows.push(row);
     staged.file_data_writes.push(StageFileData {
         file_id,
         version_id: context.version_id,
@@ -1415,6 +1443,26 @@ fn stage_lix_file_data_write(
         data,
     });
     Ok(())
+}
+
+fn attach_lix_file_insert_origin(rows: &mut [StageRow], surface_name: &str, file_id: &str) {
+    let origin = lix_file_insert_origin(surface_name, file_id);
+    for row in rows {
+        if row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY || row.schema_key == BLOB_REF_SCHEMA_KEY {
+            row.origin = Some(origin.clone());
+        }
+    }
+}
+
+fn lix_file_insert_origin(surface_name: &str, file_id: &str) -> StageRowOrigin {
+    StageRowOrigin {
+        surface: surface_name.to_string(),
+        operation: StageWriteOperation::Insert,
+        primary_key: Some(LogicalPrimaryKey {
+            columns: vec!["id".to_string()],
+            values: vec![file_id.to_string()],
+        }),
+    }
 }
 
 fn file_row_context_from_batch(
@@ -2906,6 +2954,7 @@ mod tests {
         let staged = lix_file_insert_stage_from_batch_with_path_resolvers(
             &path_data_insert_batch(),
             None,
+            "lix_file",
             &mut resolvers,
             &mut test_id_generator(&["should-not-be-used"]),
             true,
@@ -2936,6 +2985,7 @@ mod tests {
         let staged = lix_file_insert_stage_from_batch_with_path_resolvers(
             &path_data_insert_batch(),
             None,
+            "lix_file",
             &mut resolvers,
             &mut test_id_generator(&["dir-generated-docs", "dir-generated-guides"]),
             true,

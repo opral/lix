@@ -28,7 +28,9 @@ use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValu
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
-use crate::transaction::types::{StageRow, StageWrite, StageWriteMode};
+use crate::transaction::types::{
+    LogicalPrimaryKey, StageRow, StageRowOrigin, StageWrite, StageWriteMode, StageWriteOperation,
+};
 use crate::version::{
     version_descriptor_stage_row, version_descriptor_tombstone_row, version_ref_stage_row,
     version_ref_tombstone_row, VersionRefReader,
@@ -261,7 +263,7 @@ impl InsertSink for LixVersionInsertSink {
                     DataFusionError::Execution("INSERT row count overflow".to_string())
                 })?)
                 .ok_or_else(|| DataFusionError::Execution("INSERT row count overflow".into()))?;
-            rows.extend(version_rows.into_iter().flat_map(version_stage_rows));
+            rows.extend(version_rows.into_iter().flat_map(version_insert_stage_rows));
         }
 
         if !rows.is_empty() {
@@ -533,7 +535,7 @@ impl ExecutionPlan for LixVersionUpdateExec {
                 .map_err(|_| DataFusionError::Execution("UPDATE row count overflow".to_string()))?;
             let rows = version_rows
                 .into_iter()
-                .flat_map(version_stage_rows)
+                .flat_map(version_update_stage_rows)
                 .collect::<Vec<_>>();
 
             if !rows.is_empty() {
@@ -901,18 +903,48 @@ fn version_update_rows_from_batch(
         .collect()
 }
 
-fn version_stage_rows(row: VersionRow) -> Vec<StageRow> {
+fn version_stage_rows(row: VersionRow, origin: Option<StageRowOrigin>) -> Vec<StageRow> {
     vec![
-        version_descriptor_stage_row(&row.id, &row.name, row.hidden),
-        version_ref_stage_row(&row.id, &row.commit_id),
+        with_origin(
+            version_descriptor_stage_row(&row.id, &row.name, row.hidden),
+            origin.clone(),
+        ),
+        with_origin(version_ref_stage_row(&row.id, &row.commit_id), origin),
     ]
 }
 
 fn version_tombstone_rows(row: VersionRow) -> Vec<StageRow> {
+    let origin = Some(lix_version_origin(StageWriteOperation::Delete, &row.id));
     vec![
-        version_descriptor_tombstone_row(&row.id),
-        version_ref_tombstone_row(&row.id),
+        with_origin(version_descriptor_tombstone_row(&row.id), origin.clone()),
+        with_origin(version_ref_tombstone_row(&row.id), origin),
     ]
+}
+
+fn version_insert_stage_rows(row: VersionRow) -> Vec<StageRow> {
+    let origin = lix_version_origin(StageWriteOperation::Insert, &row.id);
+    version_stage_rows(row, Some(origin))
+}
+
+fn version_update_stage_rows(row: VersionRow) -> Vec<StageRow> {
+    let origin = lix_version_origin(StageWriteOperation::Update, &row.id);
+    version_stage_rows(row, Some(origin))
+}
+
+fn with_origin(mut row: StageRow, origin: Option<StageRowOrigin>) -> StageRow {
+    row.origin = origin;
+    row
+}
+
+fn lix_version_origin(operation: StageWriteOperation, version_id: &str) -> StageRowOrigin {
+    StageRowOrigin {
+        surface: "lix_version".to_string(),
+        operation,
+        primary_key: Some(LogicalPrimaryKey {
+            columns: vec!["id".to_string()],
+            values: vec![version_id.to_string()],
+        }),
+    }
 }
 
 fn update_string_value(

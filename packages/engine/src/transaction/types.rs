@@ -26,6 +26,7 @@ pub(crate) struct StageRow {
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<RowMetadata>,
+    pub(crate) origin: Option<StageRowOrigin>,
     pub(crate) schema_version: String,
     pub(crate) created_at: Option<String>,
     pub(crate) updated_at: Option<String>,
@@ -34,6 +35,32 @@ pub(crate) struct StageRow {
     pub(crate) commit_id: Option<String>,
     pub(crate) untracked: bool,
     pub(crate) version_id: String,
+}
+
+/// User-facing write operation that produced one physical staged row.
+///
+/// Composite SQL surfaces such as `lix_file` lower one logical row into
+/// multiple state rows. The transaction layer owns final constraint validation,
+/// but error messages should stay in the vocabulary of the logical operation
+/// when the caller did not write the physical state schema directly.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StageRowOrigin {
+    pub(crate) surface: String,
+    pub(crate) operation: StageWriteOperation,
+    pub(crate) primary_key: Option<LogicalPrimaryKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum StageWriteOperation {
+    Insert,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LogicalPrimaryKey {
+    pub(crate) columns: Vec<String>,
+    pub(crate) values: Vec<String>,
 }
 
 /// Incoming file payload paired with staged filesystem rows.
@@ -98,6 +125,7 @@ pub(crate) struct StagedStateRow {
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<RowMetadata>,
+    pub(crate) origin: Option<StageRowOrigin>,
     pub(crate) schema_version: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
@@ -213,6 +241,7 @@ impl From<&StagedAdoptedStateRow> for StagedStateRow {
             file_id: row.file_id.clone(),
             snapshot_content: row.snapshot_content.clone(),
             metadata: row.metadata.clone(),
+            origin: None,
             schema_version: row.schema_version.clone(),
             created_at: row.created_at.clone(),
             updated_at: row.updated_at.clone(),
