@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
@@ -20,8 +20,10 @@ use crate::version::{VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_REF_SCHEMA_KEY};
 use crate::{LixError, NullableKeyFilter};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
+const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const STATE_SURFACE_SCHEMA_KEY: &str = "lix_state";
+const MAX_DIRECTORY_PARENT_DEPTH: usize = 1024;
 
 /// Immutable view of the final transaction write set before persistence.
 ///
@@ -110,7 +112,204 @@ pub(crate) async fn validate_staged_writes(
     validate_version_ref_delete_restrictions(&input, &pending_constraints).await?;
     validate_committed_insert_identities(&input, &pending_constraints).await?;
     validate_committed_unique_constraints(&input, &pending_constraints).await?;
+    validate_directory_descriptor_parent_graph(&input, &staged_rows).await?;
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DirectoryDescriptorScope {
+    version_id: String,
+    schema_version: String,
+    untracked: bool,
+    file_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DirectoryDescriptorSnapshot {
+    id: String,
+    parent_id: Option<String>,
+}
+
+async fn validate_directory_descriptor_parent_graph(
+    input: &TransactionValidationInput<'_>,
+    staged_rows: &[StagedStateRow],
+) -> Result<(), LixError> {
+    let scopes = staged_directory_descriptor_scopes(staged_rows);
+    for scope in scopes {
+        let mut parents = committed_directory_parent_map(input.live_state, &scope).await?;
+        apply_staged_directory_parent_rows(staged_rows, &scope, &mut parents)?;
+        validate_directory_parent_map(&scope, &parents)?;
+    }
+    Ok(())
+}
+
+fn staged_directory_descriptor_scopes(
+    staged_rows: &[StagedStateRow],
+) -> BTreeSet<DirectoryDescriptorScope> {
+    staged_rows
+        .iter()
+        .filter(|row| row.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
+        .map(|row| DirectoryDescriptorScope {
+            version_id: row.version_id.clone(),
+            schema_version: row.schema_version.clone(),
+            untracked: row.untracked,
+            file_id: row.file_id.clone(),
+        })
+        .collect()
+}
+
+async fn committed_directory_parent_map(
+    live_state: &dyn LiveStateReader,
+    scope: &DirectoryDescriptorScope,
+) -> Result<BTreeMap<String, Option<String>>, LixError> {
+    let rows = live_state
+        .scan_rows(&LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
+                version_ids: vec![scope.version_id.clone()],
+                file_ids: vec![nullable_filter_from_option(&scope.file_id)],
+                include_tombstones: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await?;
+    let mut parents = BTreeMap::new();
+    for row in rows {
+        if !committed_directory_row_is_in_scope(&row, scope) {
+            continue;
+        }
+        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+            continue;
+        };
+        let snapshot = parse_directory_descriptor_snapshot(&row.schema_version, snapshot_content)?;
+        parents.insert(snapshot.id, snapshot.parent_id);
+    }
+    Ok(parents)
+}
+
+fn committed_directory_row_is_in_scope(
+    row: &LiveStateRow,
+    scope: &DirectoryDescriptorScope,
+) -> bool {
+    row.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+        && row.schema_version == scope.schema_version
+        && row.untracked == scope.untracked
+        && row.file_id == scope.file_id
+        && committed_row_is_exact_version_scoped(row, &scope.version_id)
+}
+
+fn apply_staged_directory_parent_rows(
+    staged_rows: &[StagedStateRow],
+    scope: &DirectoryDescriptorScope,
+    parents: &mut BTreeMap<String, Option<String>>,
+) -> Result<(), LixError> {
+    for row in staged_rows {
+        if row.schema_key != DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+            || row.version_id != scope.version_id
+            || row.schema_version != scope.schema_version
+            || row.untracked != scope.untracked
+            || row.file_id != scope.file_id
+        {
+            continue;
+        }
+        let id = row.entity_id.as_string()?;
+        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+            parents.remove(&id);
+            continue;
+        };
+        let snapshot = parse_directory_descriptor_snapshot(&row.schema_version, snapshot_content)?;
+        parents.insert(snapshot.id, snapshot.parent_id);
+    }
+    Ok(())
+}
+
+fn parse_directory_descriptor_snapshot(
+    schema_version: &str,
+    snapshot_content: &str,
+) -> Result<DirectoryDescriptorSnapshot, LixError> {
+    serde_json::from_str::<DirectoryDescriptorSnapshot>(snapshot_content).map_err(|error| {
+        LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!(
+                "lix_directory_descriptor version '{schema_version}' snapshot_content is invalid JSON: {error}"
+            ),
+        )
+    })
+}
+
+fn validate_directory_parent_map(
+    scope: &DirectoryDescriptorScope,
+    parents: &BTreeMap<String, Option<String>>,
+) -> Result<(), LixError> {
+    for directory_id in parents.keys() {
+        validate_directory_parent_chain(scope, parents, directory_id)?;
+    }
+    Ok(())
+}
+
+fn validate_directory_parent_chain(
+    scope: &DirectoryDescriptorScope,
+    parents: &BTreeMap<String, Option<String>>,
+    start_id: &str,
+) -> Result<(), LixError> {
+    let mut current_id = start_id;
+    let mut seen = BTreeSet::<String>::new();
+    for depth in 0..=MAX_DIRECTORY_PARENT_DEPTH {
+        if !seen.insert(current_id.to_string()) {
+            return Err(directory_parent_cycle_error(scope, start_id, current_id));
+        }
+        let Some(parent_id) = parents.get(current_id) else {
+            return Err(directory_parent_missing_error(scope, start_id, current_id));
+        };
+        let Some(parent_id) = parent_id.as_deref() else {
+            return Ok(());
+        };
+        current_id = parent_id;
+        if depth == MAX_DIRECTORY_PARENT_DEPTH {
+            return Err(directory_parent_depth_error(scope, start_id));
+        }
+    }
+    Err(directory_parent_depth_error(scope, start_id))
+}
+
+fn directory_parent_cycle_error(
+    scope: &DirectoryDescriptorScope,
+    start_id: &str,
+    repeated_id: &str,
+) -> LixError {
+    LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        format!(
+            "lix_directory_descriptor parent_id cycle in version '{}': directory '{}' reaches ancestor '{}' twice",
+            scope.version_id, start_id, repeated_id
+        ),
+    )
+    .with_hint("Set parent_id to null or to an existing directory outside the directory's descendants.")
+}
+
+fn directory_parent_missing_error(
+    scope: &DirectoryDescriptorScope,
+    start_id: &str,
+    missing_id: &str,
+) -> LixError {
+    LixError::new(
+        LixError::CODE_FOREIGN_KEY,
+        format!(
+            "lix_directory_descriptor parent_id chain in version '{}' for directory '{}' references missing directory '{}'",
+            scope.version_id, start_id, missing_id
+        ),
+    )
+}
+
+fn directory_parent_depth_error(scope: &DirectoryDescriptorScope, start_id: &str) -> LixError {
+    LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        format!(
+            "lix_directory_descriptor parent_id chain in version '{}' for directory '{}' exceeds maximum depth {}",
+            scope.version_id, start_id, MAX_DIRECTORY_PARENT_DEPTH
+        ),
+    )
 }
 
 async fn validate_committed_insert_identities(

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 use serde_json::{json, Map as JsonMap, Value as JsonValue};
@@ -606,7 +606,7 @@ pub(crate) fn directory_path_resolvers_from_state_rows(
     for (version_id, records) in directory_rows {
         let mut paths = BTreeMap::<String, String>::new();
         for directory_id in records.keys() {
-            resolve_directory_seed_path(directory_id, &records, &mut paths);
+            resolve_directory_seed_path(directory_id, &records, &mut paths, &mut BTreeSet::new())?;
         }
         let seeds = paths
             .into_iter()
@@ -628,20 +628,42 @@ fn resolve_directory_seed_path(
     directory_id: &str,
     records: &BTreeMap<String, DirectoryDescriptorSeed>,
     paths: &mut BTreeMap<String, String>,
-) -> Option<String> {
+    visiting: &mut BTreeSet<String>,
+) -> Result<Option<String>, LixError> {
     if let Some(path) = paths.get(directory_id) {
-        return Some(path.clone());
+        return Ok(Some(path.clone()));
     }
-    let row = records.get(directory_id)?;
+    if !visiting.insert(directory_id.to_string()) {
+        return Err(directory_parent_cycle_error(directory_id));
+    }
+    let Some(row) = records.get(directory_id) else {
+        visiting.remove(directory_id);
+        return Ok(None);
+    };
     let path = match row.parent_id.as_deref() {
         Some(parent_id) => {
-            let parent_path = resolve_directory_seed_path(parent_id, records, paths)?;
+            let Some(parent_path) =
+                resolve_directory_seed_path(parent_id, records, paths, visiting)?
+            else {
+                visiting.remove(directory_id);
+                return Ok(None);
+            };
             format!("{parent_path}{}/", row.name)
         }
         None => format!("/{}/", row.name),
     };
+    visiting.remove(directory_id);
     paths.insert(row.id.clone(), path.clone());
-    Some(path)
+    Ok(Some(path))
+}
+
+fn directory_parent_cycle_error(directory_id: &str) -> LixError {
+    LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        format!(
+            "lix_directory_descriptor parent_id cycle detected while resolving directory '{directory_id}'"
+        ),
+    )
 }
 
 fn state_row(
