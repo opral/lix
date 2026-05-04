@@ -13,7 +13,9 @@ pub use lix_engine::{
     BackendKvPair, BackendKvPut, BackendKvScanRange, BackendKvScanRequest, BackendKvScanResult,
     BackendKvWriteBatch, BackendKvWriteGroup, BackendKvWriteStats, BackendReadTransaction,
     BackendWriteTransaction, CreateVersionOptions, CreateVersionReceipt as CreateVersionResult,
-    ExecuteResult, LixError, LixNotice, MergeVersionOptions, MergeVersionOutcome,
-    MergeVersionReceipt as MergeVersionResult, Row, SqlQueryResult, SwitchVersionOptions,
-    SwitchVersionReceipt as SwitchVersionResult, TryFromValue, Value,
+    ExecuteResult, LixError, LixNotice, MergeChangeStats, MergeConflict, MergeConflictChangeKind,
+    MergeConflictKind, MergeConflictSide, MergeVersionOptions, MergeVersionOutcome,
+    MergeVersionPreview, MergeVersionPreviewOptions, MergeVersionReceipt as MergeVersionResult,
+    Row, SqlQueryResult, SwitchVersionOptions, SwitchVersionReceipt as SwitchVersionResult,
+    TryFromValue, Value,
 };

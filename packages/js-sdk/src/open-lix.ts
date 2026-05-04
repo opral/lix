@@ -194,15 +194,52 @@ export type MergeVersionOutcome =
 	| "mergeCommitted";
 
 export type MergeVersionResult = {
+	/**
+	 * How the merge was applied. `fastForward` advances the target ref without
+	 * creating a merge commit, but can still make source changes visible.
+	 */
 	outcome: MergeVersionOutcome;
 	targetVersionId: string;
 	sourceVersionId: string;
-	mergeBaseCommitId: string | null;
+	baseCommitId: string;
 	targetHeadBeforeCommitId: string;
 	sourceHeadBeforeCommitId: string;
 	targetHeadAfterCommitId: string;
 	createdMergeCommitId: string | null;
-	appliedChangeCount: number;
+	changeStats: MergeChangeStats;
+};
+
+export type MergeVersionPreviewResult = {
+	outcome: MergeVersionOutcome;
+	targetVersionId: string;
+	sourceVersionId: string;
+	baseCommitId: string;
+	targetHeadCommitId: string;
+	sourceHeadCommitId: string;
+	changeStats: MergeChangeStats;
+	conflicts: MergeConflict[];
+};
+
+export type MergeChangeStats = {
+	total: number;
+	added: number;
+	modified: number;
+	removed: number;
+};
+
+export type MergeConflict = {
+	kind: "sameEntityChanged";
+	schemaKey: string;
+	entityId: string;
+	fileId: string | null;
+	target: MergeConflictSide;
+	source: MergeConflictSide;
+};
+
+export type MergeConflictSide = {
+	kind: "added" | "modified" | "removed";
+	beforeChangeId: string | null;
+	afterChangeId: string | null;
 };
 
 export type Lix = {
@@ -221,6 +258,9 @@ export type Lix = {
 	activeVersionId(): Promise<string>;
 	createVersion(options: CreateVersionOptions): Promise<CreateVersionResult>;
 	switchVersion(options: SwitchVersionOptions): Promise<SwitchVersionResult>;
+	mergeVersionPreview(
+		options: MergeVersionOptions,
+	): Promise<MergeVersionPreviewResult>;
 	mergeVersion(options: MergeVersionOptions): Promise<MergeVersionResult>;
 	close(): Promise<void>;
 };
@@ -243,6 +283,9 @@ type WasmLix = {
 	activeVersionId(): Promise<string>;
 	createVersion(options: CreateVersionOptions): Promise<CreateVersionResult>;
 	switchVersion(options: SwitchVersionOptions): Promise<SwitchVersionResult>;
+	mergeVersionPreview(
+		options: MergeVersionOptions,
+	): Promise<MergeVersionPreviewResult>;
 	mergeVersion(options: MergeVersionOptions): Promise<MergeVersionResult>;
 	close(): Promise<void>;
 };
@@ -329,6 +372,12 @@ function createLixHandle(wasmLix: WasmLix): Lix {
 			options: SwitchVersionOptions,
 		): Promise<SwitchVersionResult> {
 			return await runQueued(() => wasmLix.switchVersion(options));
+		},
+
+		async mergeVersionPreview(
+			options: MergeVersionOptions,
+		): Promise<MergeVersionPreviewResult> {
+			return await runQueued(() => wasmLix.mergeVersionPreview(options));
 		},
 
 		async mergeVersion(options: MergeVersionOptions): Promise<MergeVersionResult> {
