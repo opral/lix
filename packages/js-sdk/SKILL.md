@@ -46,10 +46,10 @@ const lix = await openLix({
 `better-sqlite3` is an optional peer dependency of `@lix-js/sdk`; install it in any project that imports `@lix-js/sdk/sqlite`:
 
 ```sh
-npm i @lix-js/sdk@0.6.0-preview.0 better-sqlite3
+npm i @lix-js/sdk better-sqlite3
 ```
 
-Use the explicit preview version (`0.6.0-preview.0`) for now; do not rely on `latest` until the stable package is published.
+Use the version of this skill that ships with the installed `@lix-js/sdk` package; do not copy version-specific snippets from older releases.
 
 The default `openLix()` (no `backend`) is in-memory and dies with the process. For anything that needs to persist — demos, scripts, tests, real apps — pass a `better-sqlite3` backend with a real file path. Each successful `execute()` is durable; `lix.close()` releases the backend handle. Reopening with the same path picks up where you left off.
 
@@ -480,4 +480,4 @@ A short list of things that will burn a fresh agent on the first run.
 
 ## Reporting SDK Friction
 
-If you encounter an SDK bug, missing API, confusing error, documentation gap, or large implementation friction while using this skill, pause and ask the user whether they want you to open a GitHub issue via the `gh` CLI installed on their computer. Do not file the issue without confirmation. If they approve, include a minimal reproduction, expected behavior, actual behavior, package version (`@lix-js/sdk@0.6.0-preview.0`), runtime/version details, and any relevant error output.
+If you encounter an SDK bug, missing API, confusing error, documentation gap, or large implementation friction while using this skill, pause and ask the user whether they want you to open a GitHub issue via the `gh` CLI installed on their computer. Do not file the issue without confirmation. If they approve, include a minimal reproduction, expected behavior, actual behavior, the installed `@lix-js/sdk` package version, runtime/version details, and any relevant error output.

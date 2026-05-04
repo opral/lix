@@ -1,11 +1,12 @@
 {
 	"name": "@lix-js/sdk",
 	"type": "module",
-	"version": "0.6.0-preview.0",
+	"version": "0.6.0-preview.1",
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
 	"files": [
-		"dist"
+		"dist",
+		"SKILL.md"
 	],
 	"exports": {
 		".": {
