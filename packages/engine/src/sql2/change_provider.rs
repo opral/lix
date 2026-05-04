@@ -19,6 +19,7 @@ use datafusion::physical_plan::{
 use futures_util::stream;
 
 use crate::changelog::{materialize_change, ChangelogScanRequest, MaterializedCanonicalChange};
+use crate::serialize_row_metadata;
 use crate::LixError;
 
 use super::record_batch::record_batch_with_row_count;
@@ -286,9 +287,12 @@ fn change_record_batch(
                 string_array(changes.iter().map(|row| Some(row.schema_version.as_str())))
             }
             ChangeColumn::FileId => string_array(changes.iter().map(|row| row.file_id.as_deref())),
-            ChangeColumn::Metadata => {
-                string_array(changes.iter().map(|row| row.metadata.as_deref()))
-            }
+            ChangeColumn::Metadata => Arc::new(StringArray::from(
+                changes
+                    .iter()
+                    .map(|row| row.metadata.as_ref().map(serialize_row_metadata))
+                    .collect::<Vec<_>>(),
+            )),
             ChangeColumn::CreatedAt => {
                 string_array(changes.iter().map(|row| Some(row.created_at.as_str())))
             }

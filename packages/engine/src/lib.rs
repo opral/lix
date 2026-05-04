@@ -39,6 +39,9 @@ pub use backend::{
     BackendWriteTransaction,
 };
 pub use common::LixError;
+pub(crate) use common::{
+    parse_row_metadata, serialize_row_metadata, validate_row_metadata, RowMetadata,
+};
 pub use common::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
 };

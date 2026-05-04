@@ -5,7 +5,7 @@ use crate::tracked_state::tree_types::{
     SnapshotCodec, SnapshotRef, StoredSnapshot, TrackedStateKey, TrackedStateValue,
     TRACKED_STATE_HASH_BYTES,
 };
-use crate::LixError;
+use crate::{parse_row_metadata, serialize_row_metadata, LixError};
 
 const NODE_VERSION: u8 = 1;
 const NODE_KIND_LEAF: u8 = 1;
@@ -136,7 +136,8 @@ pub(crate) fn decode_key(bytes: &[u8]) -> Result<TrackedStateKey, LixError> {
 pub(crate) fn encode_value(value: &TrackedStateValue) -> Vec<u8> {
     let mut out = Vec::new();
     push_snapshot(&mut out, &value.snapshot);
-    push_optional_string(&mut out, value.metadata.as_deref());
+    let metadata = value.metadata.as_ref().map(serialize_row_metadata);
+    push_optional_string(&mut out, metadata.as_deref());
     push_sized_bytes(&mut out, value.schema_version.as_bytes());
     push_sized_bytes(&mut out, value.created_at.as_bytes());
     push_sized_bytes(&mut out, value.updated_at.as_bytes());
@@ -148,7 +149,13 @@ pub(crate) fn encode_value(value: &TrackedStateValue) -> Vec<u8> {
 
 pub(crate) fn encoded_value_len(value: &TrackedStateValue) -> usize {
     snapshot_len(&value.snapshot)
-        + optional_string_len(value.metadata.as_deref())
+        + optional_string_len(
+            value
+                .metadata
+                .as_ref()
+                .map(serialize_row_metadata)
+                .as_deref(),
+        )
         + sized_bytes_len(value.schema_version.as_bytes())
         + sized_bytes_len(value.created_at.as_bytes())
         + sized_bytes_len(value.updated_at.as_bytes())
@@ -160,7 +167,9 @@ pub(crate) fn encoded_value_len(value: &TrackedStateValue) -> usize {
 pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateValue, LixError> {
     let mut cursor = 0usize;
     let snapshot = read_snapshot(bytes, &mut cursor)?;
-    let metadata = read_optional_string(bytes, &mut cursor, "metadata")?;
+    let metadata = read_optional_string(bytes, &mut cursor, "metadata")?
+        .map(|value| parse_row_metadata(&value, "tracked-state metadata"))
+        .transpose()?;
     let schema_version = read_sized_string(bytes, &mut cursor, "schema_version")?;
     let created_at = read_sized_string(bytes, &mut cursor, "created_at")?;
     let updated_at = read_sized_string(bytes, &mut cursor, "updated_at")?;
@@ -620,6 +629,7 @@ fn read_u64(bytes: &[u8], cursor: &mut usize, field_name: &str) -> Result<u64, L
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn key_codec_distinguishes_null_and_value_file_id() {
@@ -725,7 +735,7 @@ mod tests {
     fn value_codec_roundtrips_tombstone_value() {
         let value = TrackedStateValue {
             snapshot: StoredSnapshot::Missing,
-            metadata: Some("{}".to_string()),
+            metadata: Some(json!({})),
             schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
@@ -774,7 +784,7 @@ mod tests {
             },
             TrackedStateValue {
                 snapshot: StoredSnapshot::Inline("{\"value\":\"inline\"}".to_string()),
-                metadata: Some("{}".to_string()),
+                metadata: Some(json!({})),
                 schema_version: "1".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-02T00:00:00Z".to_string(),

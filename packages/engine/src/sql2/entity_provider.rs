@@ -41,8 +41,7 @@ use crate::sql2::write_normalization::{
 };
 use crate::transaction::types::StageRow;
 use crate::version::VersionRefReader;
-use crate::LixError;
-use crate::GLOBAL_VERSION_ID;
+use crate::{parse_row_metadata, serialize_row_metadata, LixError, RowMetadata, GLOBAL_VERSION_ID};
 
 use super::entity_history_provider::EntityHistoryProvider;
 use super::history_route::{
@@ -980,11 +979,12 @@ fn entity_update_write_rows_from_batch(
                     &assignment_values,
                     row_index,
                 )?),
-                metadata: entity_update_optional_string_value(
+                metadata: entity_update_optional_metadata_value(
                     batch,
                     &assignment_values,
                     row_index,
                     "lixcol_metadata",
+                    &spec.schema_key,
                 )?,
                 schema_version,
                 created_at: None,
@@ -1048,6 +1048,20 @@ fn entity_update_optional_string_value(
             "UPDATE entity surface expected text-compatible column '{column_name}', got {other:?}"
         ))),
     }
+}
+
+fn entity_update_optional_metadata_value(
+    batch: &RecordBatch,
+    assignment_values: &UpdateAssignmentValues,
+    row_index: usize,
+    column_name: &str,
+    context: &str,
+) -> Result<Option<RowMetadata>> {
+    entity_update_optional_string_value(batch, assignment_values, row_index, column_name)?
+        .map(|value| {
+            parse_row_metadata(&value, context).map_err(super::error::lix_error_to_datafusion_error)
+        })
+        .transpose()
 }
 
 fn entity_update_json_value(
@@ -1194,7 +1208,7 @@ fn entity_lix_state_write_rows_from_batch_with_options(
                 schema_key: spec.schema_key.clone(),
                 file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
                 snapshot_content: Some(snapshot_content),
-                metadata: optional_string_value(batch, row_index, "lixcol_metadata")?,
+                metadata: optional_metadata_value(batch, row_index, "lixcol_metadata", &spec.schema_key)?,
                 schema_version: schema_version,
                 created_at: None,
                 updated_at: None,
@@ -1360,6 +1374,19 @@ fn optional_string_value(
             "INSERT into entity surface expected text-compatible column '{column_name}', got {other:?}"
         ))),
     }
+}
+
+fn optional_metadata_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+    context: &str,
+) -> Result<Option<RowMetadata>> {
+    optional_string_value(batch, row_index, column_name)?
+        .map(|value| {
+            parse_row_metadata(&value, context).map_err(super::error::lix_error_to_datafusion_error)
+        })
+        .transpose()
 }
 
 fn optional_bool_value(
@@ -1627,7 +1654,11 @@ fn entity_system_column_array(column_name: &str, rows: &[LiveStateRow]) -> Resul
         "schema_key" => string_array(rows.iter().map(|row| Some(row.schema_key.as_str()))),
         "file_id" => string_array(rows.iter().map(|row| row.file_id.as_deref())),
         "snapshot_content" => string_array(rows.iter().map(|row| row.snapshot_content.as_deref())),
-        "metadata" => string_array(rows.iter().map(|row| row.metadata.as_deref())),
+        "metadata" => Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.metadata.as_ref().map(serialize_row_metadata))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef,
         "schema_version" => string_array(rows.iter().map(|row| Some(row.schema_version.as_str()))),
         "created_at" => string_array(rows.iter().map(|row| Some(row.created_at.as_str()))),
         "updated_at" => string_array(rows.iter().map(|row| Some(row.updated_at.as_str()))),
@@ -2109,7 +2140,7 @@ mod tests {
                 "{\"body\":\"hello\",\"rating\":4.5,\"count\":7,\"enabled\":true,\"meta\":{\"x\":1}}"
                     .to_string(),
             ),
-            metadata: Some("{\"source\":\"test\"}".to_string()),
+            metadata: Some(json!({"source": "test"})),
             schema_version: "1".to_string(),
             version_id: "version-a".to_string(),
             change_id: Some("change-a".to_string()),
@@ -2429,7 +2460,10 @@ mod tests {
         assert_eq!(rows[0].schema_key, "project_message");
         assert_eq!(rows[0].schema_version.as_str(), "1");
         assert_eq!(rows[0].version_id, "version-a");
-        assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"entity\"}"));
+        assert_eq!(
+            rows[0].metadata.as_ref(),
+            Some(&json!({"source": "entity"}))
+        );
         assert!(!rows[0].global);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(
@@ -2573,7 +2607,7 @@ mod tests {
                         "{\"body\":\"hello\",\"count\":7,\"enabled\":true,\"meta\":{\"x\":1},\"rating\":4.5}"
                             .to_string()
                     ),
-                    metadata: Some("{\"source\":\"entity\"}".to_string()),
+                    metadata: Some(json!({"source": "entity"})),
                     schema_version: "1".to_string(),
                     created_at: None,
                     updated_at: None,

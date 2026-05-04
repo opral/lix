@@ -17,7 +17,7 @@ use crate::schema::{
 use crate::transaction::staging::StagedWriteSet;
 use crate::transaction::types::StagedStateRow;
 use crate::version::{VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_REF_SCHEMA_KEY};
-use crate::{LixError, NullableKeyFilter};
+use crate::{validate_row_metadata, LixError, NullableKeyFilter};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -73,6 +73,7 @@ pub(crate) async fn validate_staged_writes(
     let mut staged_snapshots = Vec::new();
     for row in &staged_rows {
         validate_staged_row_shape(row)?;
+        validate_staged_row_metadata(row)?;
         validate_schema_exists(row, &schema_catalog)?;
         let snapshot = validate_snapshot_content(row, &mut compiled_schemas)?;
         if let Some(snapshot) = snapshot.as_ref() {
@@ -846,6 +847,20 @@ fn validate_staged_row_shape(row: &StagedStateRow) -> Result<(), LixError> {
             "engine2 transaction validation requires non-empty schema_version",
         ));
     }
+    Ok(())
+}
+
+fn validate_staged_row_metadata(row: &StagedStateRow) -> Result<(), LixError> {
+    let Some(metadata) = row.metadata.as_ref() else {
+        return Ok(());
+    };
+    validate_row_metadata(
+        metadata.clone(),
+        format!(
+            "metadata for schema '{}' version '{}'",
+            row.schema_key, row.schema_version
+        ),
+    )?;
     Ok(())
 }
 

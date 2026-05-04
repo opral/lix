@@ -21,7 +21,7 @@ use futures_util::{stream, TryStreamExt};
 use tokio::sync::Mutex;
 
 use crate::commit_graph::CommitGraphReader;
-use crate::LixError;
+use crate::{serialize_row_metadata, LixError, RowMetadata};
 
 use super::history_route::{
     load_history_entries, parse_history_filter, HistoryColumnStyle, HistoryRoute,
@@ -303,7 +303,7 @@ struct StateHistorySqlRow {
     schema_key: String,
     file_id: Option<String>,
     snapshot_content: Option<String>,
-    metadata: Option<String>,
+    metadata: Option<RowMetadata>,
     schema_version: String,
     change_id: String,
     observed_commit_id: String,
@@ -327,7 +327,11 @@ fn state_history_record_batch(
                 "snapshot_content" => {
                     string_array(rows.iter().map(|row| row.snapshot_content.as_deref()))
                 }
-                "metadata" => string_array(rows.iter().map(|row| row.metadata.as_deref())),
+                "metadata" => Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|row| row.metadata.as_ref().map(serialize_row_metadata))
+                        .collect::<Vec<_>>(),
+                )),
                 "schema_version" => {
                     string_array(rows.iter().map(|row| Some(row.schema_version.as_str())))
                 }

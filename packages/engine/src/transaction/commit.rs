@@ -8,8 +8,8 @@ use crate::storage::{StorageReader, StorageWriter};
 use crate::transaction::staging::StagedWriteSet;
 use crate::transaction::types::{StagedAdoptedStateRow, StagedCommitMembers, StagedStateRow};
 use crate::version::{VersionContext, VersionRefReader};
-use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
+use crate::{serialize_row_metadata, LixError, RowMetadata};
 
 /// Commits transaction-staged rows into durable tracked and untracked stores.
 ///
@@ -198,7 +198,7 @@ fn canonical_change_from_staged_row(
         schema_version: row.schema_version.clone(),
         file_id: row.file_id.clone(),
         snapshot_ref: stage_optional_json(json_writer, row.snapshot_content.as_deref())?,
-        metadata_ref: stage_optional_json(json_writer, row.metadata.as_deref())?,
+        metadata_ref: stage_optional_metadata(json_writer, row.metadata.as_ref())?,
         created_at: row.created_at.clone(),
     })
 }
@@ -213,6 +213,17 @@ fn stage_optional_json(
     json_writer.stage_bytes(value.as_bytes()).map(Some)
 }
 
+fn stage_optional_metadata(
+    json_writer: &mut JsonStoreWriter,
+    value: Option<&RowMetadata>,
+) -> Result<Option<JsonRef>, LixError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let serialized = serialize_row_metadata(value);
+    json_writer.stage_bytes(serialized.as_bytes()).map(Some)
+}
+
 fn canonical_change_from_adopted_row(
     json_writer: &mut JsonStoreWriter,
     row: &StagedAdoptedStateRow,
@@ -224,7 +235,7 @@ fn canonical_change_from_adopted_row(
         schema_version: row.schema_version.clone(),
         file_id: row.file_id.clone(),
         snapshot_ref: stage_optional_json(json_writer, row.snapshot_content.as_deref())?,
-        metadata_ref: stage_optional_json(json_writer, row.metadata.as_deref())?,
+        metadata_ref: stage_optional_metadata(json_writer, row.metadata.as_ref())?,
         created_at: row.created_at.clone(),
     })
 }
