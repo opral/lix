@@ -2881,10 +2881,11 @@ fn canonical_changelog_bench_change(change: MaterializedCanonicalChange) -> Cano
         .snapshot_content
         .as_ref()
         .map(|value| JsonRef::from_hash(blake3::hash(value.as_bytes())));
-    let metadata_ref = change
-        .metadata
-        .as_ref()
-        .map(|value| JsonRef::from_hash(blake3::hash(value.as_bytes())));
+    let metadata_ref = change.metadata.as_ref().map(|value| {
+        let bytes =
+            serde_json::to_vec(value).expect("bench metadata should serialize to JSON bytes");
+        JsonRef::from_hash(blake3::hash(&bytes))
+    });
     CanonicalChange {
         id: change.id,
         entity_id: change.entity_id,
@@ -2913,7 +2914,7 @@ fn changelog_metadata_changes(config: StorageBenchConfig) -> Vec<MaterializedCan
         .into_iter()
         .enumerate()
         .map(|(index, mut change)| {
-            change.metadata = Some(snapshot_content(index, config.state_payload_bytes));
+            change.metadata = Some(snapshot_metadata(index, config.state_payload_bytes));
             change
         })
         .collect()
@@ -2935,7 +2936,7 @@ fn changelog_shared_payload_changes(
 fn changelog_shared_metadata_changes(
     config: StorageBenchConfig,
 ) -> Vec<MaterializedCanonicalChange> {
-    let shared_metadata = snapshot_content(0, config.state_payload_bytes);
+    let shared_metadata = snapshot_metadata(0, config.state_payload_bytes);
     changelog_materialized_changes(config)
         .into_iter()
         .map(|mut change| {
@@ -2950,7 +2951,7 @@ fn changelog_shared_payload_and_metadata_changes(
     config: StorageBenchConfig,
 ) -> Vec<MaterializedCanonicalChange> {
     let shared_snapshot_content = snapshot_content(0, config.state_payload_bytes);
-    let shared_metadata = snapshot_content(1, config.state_payload_bytes);
+    let shared_metadata = snapshot_metadata(1, config.state_payload_bytes);
     changelog_materialized_changes(config)
         .into_iter()
         .map(|mut change| {
@@ -3117,6 +3118,11 @@ fn snapshot_content(index: usize, target_bytes: usize) -> String {
     });
     pad_snapshot_content(&mut value, target_bytes);
     value.to_string()
+}
+
+fn snapshot_metadata(index: usize, target_bytes: usize) -> serde_json::Value {
+    serde_json::from_str(&snapshot_content(index, target_bytes))
+        .expect("bench snapshot content should be valid JSON metadata")
 }
 
 fn updated_snapshot_content(index: usize, target_bytes: usize) -> String {
