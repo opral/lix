@@ -97,6 +97,15 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
     }
 
     if looks_like_type_mismatch(&lower) {
+        if lower.contains("encountered non utf-8 data") {
+            return LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                "Lix SQL string functions require valid UTF-8 text; blob data could not be decoded as UTF-8",
+            )
+            .with_hint(
+                "Pass text to string functions. Raw blob parameters stay binary and are not implicitly decoded as UTF-8.",
+            );
+        }
         return LixError::new(LixError::CODE_TYPE_MISMATCH, message)
             .with_hint("Check the SQL function argument types. JSON text can be converted with lix_json(...); JSON fields can be read with lix_json_get(...) or lix_json_get_text(...).");
     }
