@@ -11,6 +11,19 @@
       "/extension"
     ]
   ],
+  "x-lix-foreign-keys": [
+    {
+      "properties": [
+        "/directory_id"
+      ],
+      "references": {
+        "schemaKey": "lix_directory_descriptor",
+        "properties": [
+          "/id"
+        ]
+      }
+    }
+  ],
   "type": "object",
   "properties": {
     "id": {
@@ -25,7 +38,7 @@
     },
     "name": {
       "type": "string",
-      "pattern": "^[^/\\\\]+$"
+      "pattern": "^(?!\\.{1,2}$)[^/\\\\]+$"
     },
     "extension": {
       "type": [

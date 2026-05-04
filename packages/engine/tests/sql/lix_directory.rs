@@ -1,6 +1,7 @@
 use lix_engine::ExecuteResult;
 use lix_engine::LixError;
 use lix_engine::Value;
+use serde_json::json;
 
 use super::assert_rows_eq;
 
@@ -347,6 +348,57 @@ simulation_test!(
             .await
             .expect_err("parenting a directory under its descendant must be rejected");
         assert_eq!(descendant_cycle.code, LixError::CODE_CONSTRAINT_VIOLATION);
+    }
+);
+
+simulation_test!(
+    lix_directory_descriptor_writes_use_canonical_path_segment_validation,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute("INSERT INTO lix_directory (path) VALUES ('/Café/')", &[])
+            .await
+            .expect("canonical directory insert should succeed");
+
+        let nfc_collision = session
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+                 ) VALUES ('dir-cafe-decomposed', 'lix_directory_descriptor', NULL, $1, '1', false, false)",
+                &[Value::Json(json!({
+                    "id": "dir-cafe-decomposed",
+                    "parent_id": null,
+                    "name": "Cafe\u{301}",
+                    "hidden": false,
+                }))],
+            )
+            .await
+            .expect_err("decomposed descriptor name should normalize before uniqueness");
+        assert_eq!(nfc_collision.code, LixError::CODE_UNIQUE);
+
+        let zero_width = session
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+                 ) VALUES ('dir-zero-width', 'lix_directory_descriptor', NULL, $1, '1', false, false)",
+                &[Value::Json(json!({
+                    "id": "dir-zero-width",
+                    "parent_id": null,
+                    "name": "zero\u{200D}width",
+                    "hidden": false,
+                }))],
+            )
+            .await
+            .expect_err("descriptor name should reject zero-width characters");
+        assert_eq!(zero_width.code, "LIX_ERROR_PATH_INVALID_IRI_CODE_POINT");
     }
 );
 
