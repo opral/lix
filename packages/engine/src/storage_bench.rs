@@ -336,11 +336,7 @@ pub async fn storage_api_get_kv_many_hits_prepared(
         })
         .await?;
     transaction.rollback().await?;
-    let verified_rows = result.groups[0]
-        .entries
-        .iter()
-        .filter(|entry| entry.value.is_some())
-        .count();
+    let verified_rows = result.groups[0].rows.value_count();
     Ok(StorageBenchReport {
         measured_rows: reads,
         verified_rows,
@@ -367,11 +363,7 @@ pub async fn storage_api_get_kv_many_exists_prepared(
         })
         .await?;
     transaction.rollback().await?;
-    let verified_rows = result.groups[0]
-        .entries
-        .iter()
-        .filter(|entry| entry.exists && entry.value.is_none())
-        .count();
+    let verified_rows = result.groups[0].rows.existence_count();
     Ok(StorageBenchReport {
         measured_rows: reads,
         verified_rows,
@@ -398,11 +390,7 @@ pub async fn storage_api_get_kv_many_misses_prepared(
         })
         .await?;
     transaction.rollback().await?;
-    let verified_rows = result.groups[0]
-        .entries
-        .iter()
-        .filter(|entry| !entry.exists)
-        .count();
+    let verified_rows = result.groups[0].rows.missing_count();
     Ok(StorageBenchReport {
         measured_rows: reads,
         verified_rows,
@@ -435,11 +423,7 @@ pub async fn storage_api_get_kv_many_mixed_hit_miss_prepared(
         })
         .await?;
     transaction.rollback().await?;
-    let verified_rows = result.groups[0]
-        .entries
-        .iter()
-        .filter(|entry| entry.value.is_some())
-        .count();
+    let verified_rows = result.groups[0].rows.value_count();
     Ok(StorageBenchReport {
         measured_rows: reads,
         verified_rows,
@@ -494,9 +478,8 @@ pub async fn storage_api_get_kv_many_multi_namespace(
     let verified_rows = result
         .groups
         .iter()
-        .flat_map(|group| group.entries.iter())
-        .filter(|entry| entry.value.is_some())
-        .count();
+        .map(|group| group.rows.value_count())
+        .sum();
     Ok(StorageBenchReport {
         measured_rows: reads,
         verified_rows,
@@ -523,11 +506,7 @@ pub async fn storage_api_get_kv_many_duplicate_keys_prepared(
         })
         .await?;
     transaction.rollback().await?;
-    let verified_rows = result.groups[0]
-        .entries
-        .iter()
-        .filter(|entry| entry.value.is_some())
-        .count();
+    let verified_rows = result.groups[0].rows.value_count();
     Ok(StorageBenchReport {
         measured_rows: reads,
         verified_rows,

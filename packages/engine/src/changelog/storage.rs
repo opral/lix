@@ -50,8 +50,9 @@ pub(crate) async fn scan_changes(
         })
         .await?
         .into_rows()
+        .into_values_required()?
         .into_iter()
-        .map(|pair| decode_change(&pair.into_value()?))
+        .map(|value| decode_change(&value))
         .collect()
 }
 

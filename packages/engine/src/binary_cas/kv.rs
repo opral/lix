@@ -7,7 +7,7 @@ use crate::binary_cas::codec::{
 use crate::binary_cas::BinaryBlobWrite;
 use crate::storage::{
     KvGetGroup, KvGetProjection, KvGetRequest, KvPut, KvScanProjection, KvScanRange, KvScanRequest,
-    KvScanRow, KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
+    KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
 };
 use crate::LixError;
 
@@ -52,7 +52,7 @@ pub(crate) async fn load_manifest(
 
 #[cfg(feature = "storage-benches")]
 pub(crate) async fn count_manifests(store: &mut impl StorageReader) -> Result<usize, LixError> {
-    Ok(scan_all(
+    Ok(scan_all_values(
         store,
         BINARY_CAS_MANIFEST_NAMESPACE,
         KvScanRange::Prefix(Vec::new()),
@@ -79,14 +79,14 @@ pub(crate) async fn scan_manifest_chunks(
     store: &mut impl StorageReader,
     blob_hash: &str,
 ) -> Result<Vec<KvBlobManifestChunk>, LixError> {
-    scan_all(
+    scan_all_values(
         store,
         BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
         KvScanRange::Prefix(manifest_chunk_prefix(blob_hash)),
     )
     .await?
     .into_iter()
-    .map(|pair| decode_json(&pair.into_value()?, "binary CAS manifest chunk"))
+    .map(|value| decode_json(&value, "binary CAS manifest chunk"))
     .collect()
 }
 
@@ -152,11 +152,11 @@ async fn get_one(
         .flatten())
 }
 
-async fn scan_all(
+async fn scan_all_values(
     store: &mut impl StorageReader,
     namespace: &str,
     range: KvScanRange,
-) -> Result<Vec<KvScanRow>, LixError> {
+) -> Result<Vec<Vec<u8>>, LixError> {
     Ok(store
         .scan_kv(KvScanRequest {
             namespace: namespace.to_string(),
@@ -166,7 +166,8 @@ async fn scan_all(
             projection: KvScanProjection::KeysAndValues,
         })
         .await?
-        .into_rows())
+        .into_rows()
+        .into_values_required()?)
 }
 
 async fn put_one(

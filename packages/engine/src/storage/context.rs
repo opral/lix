@@ -155,8 +155,7 @@ mod tests {
 
     use crate::backend::testing::UnitTestBackend;
     use crate::storage::{
-        KvGetEntry, KvGetGroup, KvGetProjection, KvScanProjection, KvScanRange, KvScanRow,
-        KvWriteBatch,
+        KvGetGroup, KvGetProjection, KvScanProjection, KvScanRange, KvWriteBatch,
     };
 
     use super::*;
@@ -191,13 +190,10 @@ mod tests {
             })
             .await
             .expect("batch reads");
-        assert_eq!(
-            result.groups[0].entries,
-            vec![
-                KvGetEntry::value(b"1".to_vec()),
-                KvGetEntry::value(b"2".to_vec())
-            ]
-        );
+        assert_eq!(result.groups[0].rows.key(0), Some(&b"a"[..]));
+        assert_eq!(result.groups[0].rows.value(0), Some(&b"1"[..]));
+        assert_eq!(result.groups[0].rows.key(1), Some(&b"b"[..]));
+        assert_eq!(result.groups[0].rows.value(1), Some(&b"2"[..]));
 
         let exists = tx
             .get_kv_many(KvGetRequest {
@@ -209,10 +205,11 @@ mod tests {
             })
             .await
             .expect("existence reads");
-        assert_eq!(
-            exists.groups[0].entries,
-            vec![KvGetEntry::exists(), KvGetEntry::missing()]
-        );
+        assert_eq!(exists.groups[0].rows.key(0), Some(&b"a"[..]));
+        assert!(exists.groups[0].rows.exists(0));
+        assert_eq!(exists.groups[0].rows.value(0), None);
+        assert_eq!(exists.groups[0].rows.key(1), Some(&b"missing"[..]));
+        assert!(!exists.groups[0].rows.exists(1));
 
         let result = tx
             .scan_kv(KvScanRequest {
@@ -224,10 +221,8 @@ mod tests {
             })
             .await
             .expect("scan reads");
-        assert_eq!(
-            result.rows,
-            vec![KvScanRow::new(b"b".to_vec(), b"2".to_vec())]
-        );
+        assert_eq!(result.rows.key(0), Some(&b"b"[..]));
+        assert_eq!(result.rows.value(0), Some(&b"2"[..]));
 
         let key_only = tx
             .scan_kv(KvScanRequest {
@@ -239,13 +234,10 @@ mod tests {
             })
             .await
             .expect("key-only scan reads");
-        assert_eq!(
-            key_only.rows,
-            vec![
-                KvScanRow::key_only(b"a".to_vec()),
-                KvScanRow::key_only(b"b".to_vec())
-            ]
-        );
+        assert_eq!(key_only.rows.key(0), Some(&b"a"[..]));
+        assert_eq!(key_only.rows.value(0), None);
+        assert_eq!(key_only.rows.key(1), Some(&b"b"[..]));
+        assert_eq!(key_only.rows.value(1), None);
         tx.rollback().await.expect("rollback succeeds");
     }
 }
