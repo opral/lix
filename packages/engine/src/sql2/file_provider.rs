@@ -35,7 +35,9 @@ use crate::live_state::{
 use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
 };
-use crate::sql2::write_normalization::UpdateAssignmentValues;
+use crate::sql2::write_normalization::{
+    InsertCell, InsertColumnIntents, SqlCell, UpdateAssignmentValues, UpdateCell,
+};
 use crate::transaction::types::StageRow;
 use crate::version::VersionRefReader;
 use crate::LixError;
@@ -272,12 +274,15 @@ impl TableProvider for LixFileProvider {
         }
 
         let write_ctx = self.write_access.require_write("INSERT into lix_file")?;
+        let insert_column_intents = InsertColumnIntents::from_input(&input);
+        let include_data_writes = insert_column_intents.includes_column("data");
 
         let sink = LixFileInsertSink::new(
             input.schema(),
             write_ctx.clone(),
             self.functions.clone(),
             self.version_binding.clone(),
+            include_data_writes,
         );
         Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
     }
@@ -360,6 +365,7 @@ struct LixFileInsertSink {
     write_ctx: SqlWriteContext,
     functions: FunctionProviderHandle,
     version_binding: VersionBinding,
+    include_data_writes: bool,
 }
 
 impl std::fmt::Debug for LixFileInsertSink {
@@ -374,12 +380,14 @@ impl LixFileInsertSink {
         write_ctx: SqlWriteContext,
         functions: FunctionProviderHandle,
         version_binding: VersionBinding,
+        include_data_writes: bool,
     ) -> Self {
         Self {
             schema,
             write_ctx,
             functions,
             version_binding,
+            include_data_writes,
         }
     }
 }
@@ -431,6 +439,7 @@ impl DataSink for LixFileInsertSink {
                         .as_mut()
                         .expect("path resolver should be initialized"),
                     &mut || self.functions.call_uuid_v7(),
+                    self.include_data_writes,
                 )?);
             } else {
                 staged.extend(
@@ -441,6 +450,7 @@ impl DataSink for LixFileInsertSink {
                             .as_mut()
                             .expect("path resolver should be initialized"),
                         &mut || self.functions.call_uuid_v7(),
+                        self.include_data_writes,
                     )?,
                 );
             }
@@ -1048,13 +1058,14 @@ fn lix_file_insert_stage_from_batch_with_id_generator_and_path_resolvers(
     version_binding: Option<&str>,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
     generate_id: &mut dyn FnMut() -> String,
+    include_data_writes: bool,
 ) -> Result<LixFileStagedBatch> {
     lix_file_stage_from_batch_with_options_and_path_resolvers(
         batch,
         version_binding,
         true,
         true,
-        true,
+        include_data_writes,
         Some(path_resolvers),
         Some(generate_id),
     )
@@ -1065,13 +1076,14 @@ fn lix_file_insert_stage_from_batch_with_path_resolvers(
     version_binding: Option<&str>,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
     generate_directory_id: &mut dyn FnMut() -> String,
+    include_data_writes: bool,
 ) -> Result<LixFileStagedBatch> {
     lix_file_stage_from_batch_with_options_and_path_resolvers(
         batch,
         version_binding,
         true,
         true,
-        true,
+        include_data_writes,
         Some(path_resolvers),
         Some(generate_directory_id),
     )
@@ -1126,11 +1138,8 @@ fn lix_file_existing_update_stage_from_batch(
         }
 
         if include_data_writes {
-            if let Some(data) =
-                update_optional_binary_value(batch, assignment_values, row_index, "data")?
-            {
-                stage_lix_file_data_write(&mut staged, id, data, context)?;
-            }
+            let data = update_required_binary_value(batch, assignment_values, row_index, "data")?;
+            stage_lix_file_data_write(&mut staged, id, data, context)?;
         }
 
         staged.count = staged
@@ -1230,8 +1239,16 @@ fn lix_file_path_update_stage_from_batch(
             .unwrap_or(false);
         let context =
             file_row_context_from_update(batch, assignment_values, row_index, version_binding)?;
-        let existing_data =
-            update_optional_binary_value(batch, assignment_values, row_index, "data")?;
+        let assigned_data = if update_columns.data {
+            Some(update_required_binary_value(
+                batch,
+                assignment_values,
+                row_index,
+                "data",
+            )?)
+        } else {
+            None
+        };
 
         let resolver = path_resolvers
             .entry(file_path_resolver_key(&context))
@@ -1241,17 +1258,15 @@ fn lix_file_path_update_stage_from_batch(
             id.clone(),
             path,
             hidden,
-            existing_data.clone(),
+            None,
             context.clone(),
             generate_directory_id,
         )
         .map_err(lix_error_to_datafusion_error)?;
         staged.extend_filesystem_plan(plan);
 
-        if update_columns.data {
-            if let Some(data) = existing_data {
-                stage_lix_file_data_write(&mut staged, id, data, context)?;
-            }
+        if let Some(data) = assigned_data {
+            stage_lix_file_data_write(&mut staged, id, data, context)?;
         }
     }
 
@@ -1303,7 +1318,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
         let hidden = optional_bool_value(batch, row_index, "hidden")?;
         let context = file_row_context_from_batch(batch, row_index, version_binding)?;
         let data = if include_data_writes {
-            optional_binary_value(batch, row_index, "data")?
+            insert_optional_binary_value(batch, row_index, "data")?
         } else {
             None
         };
@@ -1967,16 +1982,14 @@ fn update_optional_string_value(
     row_index: usize,
     column_name: &str,
 ) -> Result<Option<String>> {
-    match assignment_values.scalar_value(batch, row_index, column_name)? {
-        None
-        | Some(ScalarValue::Null)
-        | Some(ScalarValue::Utf8(None))
-        | Some(ScalarValue::Utf8View(None))
-        | Some(ScalarValue::LargeUtf8(None)) => Ok(None),
-        Some(ScalarValue::Utf8(Some(value)))
-        | Some(ScalarValue::Utf8View(Some(value)))
-        | Some(ScalarValue::LargeUtf8(Some(value))) => Ok(Some(value)),
-        Some(other) => Err(DataFusionError::Execution(format!(
+    match assignment_values.effective_cell(batch, row_index, column_name)? {
+        InsertCell::Omitted | InsertCell::Provided(SqlCell::Null) => Ok(None),
+        InsertCell::Provided(SqlCell::Value(
+            ScalarValue::Utf8(Some(value))
+            | ScalarValue::Utf8View(Some(value))
+            | ScalarValue::LargeUtf8(Some(value)),
+        )) => Ok(Some(value)),
+        InsertCell::Provided(SqlCell::Value(other)) => Err(DataFusionError::Execution(format!(
             "UPDATE lix_file expected text-compatible column '{column_name}', got {other:?}"
         ))),
     }
@@ -1988,32 +2001,31 @@ fn update_optional_bool_value(
     row_index: usize,
     column_name: &str,
 ) -> Result<Option<bool>> {
-    match assignment_values.scalar_value(batch, row_index, column_name)? {
-        None | Some(ScalarValue::Null) | Some(ScalarValue::Boolean(None)) => Ok(None),
-        Some(ScalarValue::Boolean(Some(value))) => Ok(Some(value)),
-        Some(other) => Err(DataFusionError::Execution(format!(
+    match assignment_values.effective_cell(batch, row_index, column_name)? {
+        InsertCell::Omitted | InsertCell::Provided(SqlCell::Null) => Ok(None),
+        InsertCell::Provided(SqlCell::Value(ScalarValue::Boolean(Some(value)))) => Ok(Some(value)),
+        InsertCell::Provided(SqlCell::Value(other)) => Err(DataFusionError::Execution(format!(
             "UPDATE lix_file expected boolean column '{column_name}', got {other:?}"
         ))),
     }
 }
 
-fn update_optional_binary_value(
-    batch: &RecordBatch,
+fn update_required_binary_value(
+    _batch: &RecordBatch,
     assignment_values: &UpdateAssignmentValues,
     row_index: usize,
     column_name: &str,
-) -> Result<Option<Vec<u8>>> {
-    match assignment_values.scalar_value(batch, row_index, column_name)? {
-        None
-        | Some(ScalarValue::Null)
-        | Some(ScalarValue::Binary(None))
-        | Some(ScalarValue::LargeBinary(None))
-        | Some(ScalarValue::FixedSizeBinary(_, None)) => Ok(None),
-        Some(ScalarValue::Binary(Some(value))) | Some(ScalarValue::LargeBinary(Some(value))) => {
-            Ok(Some(value))
+) -> Result<Vec<u8>> {
+    match assignment_values.assigned_cell(row_index, column_name)? {
+        UpdateCell::Unassigned | UpdateCell::Assigned(SqlCell::Null) => Err(DataFusionError::Execution(format!(
+            "UPDATE lix_file requires binary data for column '{column_name}'; use X'' for an empty file or omit data to leave contents unchanged"
+        ))),
+        UpdateCell::Assigned(SqlCell::Value(ScalarValue::Binary(Some(value))))
+        | UpdateCell::Assigned(SqlCell::Value(ScalarValue::LargeBinary(Some(value)))) => {
+            Ok(value)
         }
-        Some(ScalarValue::FixedSizeBinary(_, Some(value))) => Ok(Some(value)),
-        Some(other) => Err(DataFusionError::Execution(format!(
+        UpdateCell::Assigned(SqlCell::Value(ScalarValue::FixedSizeBinary(_, Some(value)))) => Ok(value),
+        UpdateCell::Assigned(SqlCell::Value(other)) => Err(DataFusionError::Execution(format!(
             "UPDATE lix_file expected binary column '{column_name}', got {other:?}"
         ))),
     }
@@ -2053,17 +2065,19 @@ fn optional_bool_value(
     }
 }
 
-fn optional_binary_value(
+fn insert_optional_binary_value(
     batch: &RecordBatch,
     row_index: usize,
     column_name: &str,
 ) -> Result<Option<Vec<u8>>> {
     match optional_scalar_value(batch, row_index, column_name)? {
-        None
-        | Some(ScalarValue::Null)
+        None => Ok(None),
+        Some(ScalarValue::Null)
         | Some(ScalarValue::Binary(None))
         | Some(ScalarValue::LargeBinary(None))
-        | Some(ScalarValue::FixedSizeBinary(_, None)) => Ok(None),
+        | Some(ScalarValue::FixedSizeBinary(_, None)) => Err(DataFusionError::Execution(format!(
+            "INSERT into lix_file requires binary data for column '{column_name}'; use X'' for an empty file or omit data to create a descriptor without contents"
+        ))),
         Some(ScalarValue::Binary(Some(value))) | Some(ScalarValue::LargeBinary(Some(value))) => {
             Ok(Some(value))
         }
@@ -2192,7 +2206,17 @@ mod tests {
         path_resolvers: Option<&mut BTreeMap<String, super::DirectoryPathResolver>>,
         generate_directory_id: &mut dyn FnMut() -> String,
     ) -> datafusion::common::Result<super::LixFileStagedBatch> {
-        let assignment_values = super::UpdateAssignmentValues::evaluate(batch, &[])?;
+        let mut columns = Vec::new();
+        if update_columns.path {
+            columns.extend(["path", "hidden"]);
+        }
+        if update_columns.data {
+            columns.push("data");
+        }
+        if update_columns.descriptor {
+            columns.extend(["directory_id", "name", "extension", "hidden"]);
+        }
+        let assignment_values = super::UpdateAssignmentValues::from_batch_columns(batch, &columns);
         super::lix_file_update_stage_from_batch(
             batch,
             &assignment_values,
@@ -2860,6 +2884,7 @@ mod tests {
             None,
             &mut resolvers,
             &mut test_id_generator(&["should-not-be-used"]),
+            true,
         )
         .expect("decode file path data");
 
@@ -2890,6 +2915,7 @@ mod tests {
             None,
             &mut resolvers,
             &mut test_id_generator(&["dir-generated-docs", "dir-generated-guides"]),
+            true,
         )
         .expect("decode file path data");
 
@@ -2923,6 +2949,7 @@ mod tests {
             write_ctx,
             test_functions(),
             VersionBinding::explicit(),
+            false,
         );
 
         let count = sink
@@ -2959,6 +2986,7 @@ mod tests {
             write_ctx,
             test_functions(),
             VersionBinding::explicit(),
+            true,
         );
 
         let count = sink
@@ -3018,6 +3046,7 @@ mod tests {
             write_ctx,
             test_functions(),
             VersionBinding::explicit(),
+            true,
         );
 
         let count = sink
