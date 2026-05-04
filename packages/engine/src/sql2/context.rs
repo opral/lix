@@ -63,8 +63,10 @@ pub(crate) trait SqlWriteExecutionContext {
     fn functions(&self) -> FunctionProviderHandle;
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
 
-    async fn load_blob_data_by_hash(&mut self, blob_hash: &str)
-        -> Result<Option<Vec<u8>>, LixError>;
+    async fn load_blob_data_by_hash(
+        &mut self,
+        blob_hash: &str,
+    ) -> Result<Option<Vec<u8>>, LixError>;
 
     async fn scan_live_state(
         &mut self,
