@@ -1,9 +1,8 @@
 use async_trait::async_trait;
 use lix_engine::{
-    Backend, BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetEntry, BackendKvGetRequest,
-    BackendKvScanBatch, BackendKvScanRange, BackendKvScanRequest, BackendKvScanRow,
-    BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
-    LixError,
+    Backend, BackendKvGetBatch, BackendKvGetBatchGroup, BackendKvGetRequest, BackendKvRowBatch,
+    BackendKvScanBatch, BackendKvScanRange, BackendKvScanRequest, BackendKvWriteBatch,
+    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, LixError,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -56,16 +55,17 @@ impl BackendReadTransaction for BenchTransaction {
         let store = self.lock_store()?;
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
-            let mut entries = Vec::with_capacity(group.keys.len());
+            let mut rows = BackendKvRowBatch::with_capacity(group.keys.len());
             for key in group.keys {
-                entries.push(BackendKvGetEntry::for_projection(
+                rows.push_get_projection(
+                    key.clone(),
                     store.get(&(group.namespace.clone(), key)).cloned(),
                     request.projection,
-                ));
+                );
             }
             groups.push(BackendKvGetBatchGroup {
                 namespace: group.namespace,
-                entries,
+                rows,
             });
         }
         Ok(BackendKvGetBatch { groups })
@@ -125,7 +125,7 @@ impl BenchTransaction {
 fn scan_store_request(store: &Store, request: BackendKvScanRequest) -> BackendKvScanBatch {
     let start_key = scan_start_key(&request);
     let lower_bound = (request.namespace.clone(), start_key);
-    let mut rows = Vec::new();
+    let mut rows = BackendKvRowBatch::new();
     for ((row_namespace, key), value) in store.range(lower_bound..) {
         if row_namespace != &request.namespace {
             break;
@@ -144,20 +144,14 @@ fn scan_store_request(store: &Store, request: BackendKvScanRequest) -> BackendKv
         if !matches {
             break;
         }
-        rows.push(BackendKvScanRow::for_projection(
-            key.clone(),
-            value.clone(),
-            request.projection,
-        ));
+        rows.push_scan_projection(key.clone(), value.clone(), request.projection);
         if rows.len() > request.limit {
             break;
         }
     }
     let has_more = rows.len() > request.limit;
     rows.truncate(request.limit);
-    let resume_after = has_more
-        .then(|| rows.last().map(|row| row.key.clone()))
-        .flatten();
+    let resume_after = has_more.then(|| rows.last_key_cloned()).flatten();
     BackendKvScanBatch { rows, resume_after }
 }
 

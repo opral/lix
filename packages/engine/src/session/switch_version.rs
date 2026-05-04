@@ -58,7 +58,8 @@ impl SessionContext {
                         }),
                         SessionMode::Workspace => {
                             transaction
-                                .stage_rows(vec![workspace_version_stage_row(&version_id)?])?;
+                                .stage_rows(vec![workspace_version_stage_row(&version_id)?])
+                                .await?;
                             Ok(SessionMode::Workspace)
                         }
                     }

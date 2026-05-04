@@ -34,14 +34,15 @@ use crate::live_state::{
 use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::version_scope::{
-    explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
+    explicit_version_ids_from_dml_filters, resolve_provider_version_ids,
+    resolve_write_version_scope, VersionBinding,
 };
 use crate::sql2::write_normalization::{
     InsertCell, InsertColumnIntents, SqlCell, UpdateAssignmentValues,
 };
 use crate::transaction::types::StageRow;
 use crate::version::VersionRefReader;
-use crate::{parse_row_metadata, serialize_row_metadata, LixError, RowMetadata, GLOBAL_VERSION_ID};
+use crate::{parse_row_metadata, serialize_row_metadata, LixError, RowMetadata};
 
 use super::entity_history_provider::EntityHistoryProvider;
 use super::history_route::{
@@ -936,20 +937,13 @@ fn entity_update_write_rows_from_batch(
     let assignment_values = UpdateAssignmentValues::evaluate(batch, assignments)?;
     (0..batch.num_rows())
         .map(|row_index| {
-            let explicit_global = optional_bool_value(batch, row_index, "lixcol_global")?;
-            let version_id = if explicit_global == Some(true) {
-                GLOBAL_VERSION_ID.to_string()
-            } else {
-                optional_string_value(batch, row_index, "lixcol_version_id")?
-                    .or_else(|| version_binding.map(ToOwned::to_owned))
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(format!(
-                            "UPDATE into {}_by_version requires lixcol_version_id",
-                            spec.schema_key
-                        ))
-                    })?
-            };
-            let global = explicit_global.unwrap_or(version_id == GLOBAL_VERSION_ID);
+            let scope = resolve_write_version_scope(
+                optional_bool_value(batch, row_index, "lixcol_global")?,
+                optional_string_value(batch, row_index, "lixcol_version_id")?,
+                version_binding,
+                &format!("UPDATE into {}_by_version", spec.schema_key),
+                &spec.schema_key,
+            )?;
 
             let schema_version = optional_string_value(batch, row_index, "lixcol_schema_version")?
                 .or_else(|| spec.schema_version.clone())
@@ -990,12 +984,12 @@ fn entity_update_write_rows_from_batch(
                 schema_version,
                 created_at: None,
                 updated_at: None,
-                global,
+                global: scope.global,
                 change_id: None,
                 commit_id: None,
                 untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?
                     .unwrap_or(false),
-                version_id,
+                version_id: scope.version_id,
             })
         })
         .collect()
@@ -1134,20 +1128,16 @@ fn entity_lix_state_write_rows_from_batch_with_options(
 ) -> Result<Vec<StageRow>> {
     (0..batch.num_rows())
         .map(|row_index| {
-            let explicit_global = optional_bool_value(batch, row_index, "lixcol_global")?;
-            let version_id = if explicit_global == Some(true) {
-                GLOBAL_VERSION_ID.to_string()
-            } else {
-                optional_string_value(batch, row_index, "lixcol_version_id")?
-                    .or_else(|| version_binding.map(ToOwned::to_owned))
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(format!(
-                            "INSERT into {}_by_version requires lixcol_version_id",
-                            spec.schema_key
-                        ))
-                    })?
-            };
-            let global = explicit_global.unwrap_or(version_id == GLOBAL_VERSION_ID);
+            let scope = resolve_write_version_scope(
+                optional_bool_value(batch, row_index, "lixcol_global")?,
+                optional_string_value(batch, row_index, "lixcol_version_id")?,
+                version_binding,
+                &format!(
+                    "INSERT into {}_by_version",
+                    spec.schema_key
+                ),
+                &spec.schema_key,
+            )?;
 
             if let Some(schema_key) = optional_string_value(batch, row_index, "lixcol_schema_key")?
             {
@@ -1214,12 +1204,12 @@ fn entity_lix_state_write_rows_from_batch_with_options(
                 schema_version: schema_version,
                 created_at: None,
                 updated_at: None,
-                global,
+                global: scope.global,
                 change_id: None,
                 commit_id: None,
                 untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?
                     .unwrap_or(false),
-                version_id,
+                version_id: scope.version_id,
             })
         })
         .collect()
@@ -2122,9 +2112,12 @@ mod tests {
 
         async fn load_version_head(
             &mut self,
-            _version_id: &str,
+            version_id: &str,
         ) -> Result<Option<String>, LixError> {
-            Ok(None)
+            if version_id == "ghost-version" {
+                return Ok(None);
+            }
+            Ok(Some(format!("commit-{version_id}")))
         }
 
         async fn stage_write(&mut self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
@@ -2578,6 +2571,25 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].global);
         assert_eq!(rows[0].version_id, crate::GLOBAL_VERSION_ID);
+    }
+
+    #[test]
+    fn entity_insert_rejects_global_with_non_global_version_id() {
+        let spec = entity_insert_spec();
+        let error = entity_lix_state_write_rows_from_batch(
+            &spec,
+            &entity_insert_batch(true, true),
+            &InsertColumnIntents::all_explicit(),
+            None,
+        )
+        .expect_err("global entity write should reject conflicting version id");
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot set lixcol_global=true with non-global lixcol_version_id"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

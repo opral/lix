@@ -1,6 +1,6 @@
 use crate::storage::KvScanRange;
 use crate::storage::{
-    KvGetGroup, KvGetProjection, KvGetRequest, KvPut, KvScanProjection, KvScanRequest, KvScanRow,
+    KvGetGroup, KvGetProjection, KvGetRequest, KvPut, KvRowBatch, KvScanProjection, KvScanRequest,
     KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
 };
 use crate::tracked_state::codec::PendingChunkWrite;
@@ -67,7 +67,7 @@ async fn scan_all(
     store: &mut (impl StorageReader + ?Sized),
     namespace: &str,
     range: KvScanRange,
-) -> Result<Vec<KvScanRow>, LixError> {
+) -> Result<KvRowBatch, LixError> {
     Ok(store
         .scan_kv(KvScanRequest {
             namespace: namespace.to_string(),
@@ -758,22 +758,16 @@ pub(crate) async fn scan_roots(
         KvScanRange::prefix(Vec::new()),
     )
     .await?;
-    pairs
-        .into_iter()
-        .map(|pair| {
-            let KvScanRow { key, value } = pair;
+    (0..pairs.len())
+        .map(|index| {
+            let key = pairs.key(index).expect("scan row key exists").to_vec();
             let commit_id = String::from_utf8(key).map_err(|error| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!("tracked-state tree root key is invalid UTF-8: {error}"),
                 )
             })?;
-            let value = value.ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "tracked-state root scan was requested without values",
-                )
-            })?;
+            let value = pairs.value_required(index)?;
             let root_id = TrackedStateRootId::from_slice(&value)?;
             Ok((commit_id, root_id))
         })

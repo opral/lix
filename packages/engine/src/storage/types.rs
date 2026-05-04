@@ -3,43 +3,143 @@ use async_trait::async_trait;
 use crate::backend;
 use crate::LixError;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct KvScanRow {
-    pub(crate) key: Vec<u8>,
-    pub(crate) value: Option<Vec<u8>>,
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct KvRowBatch {
+    rows: Vec<KvRow>,
 }
 
-impl KvScanRow {
-    pub(crate) fn new(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KvRow {
+    key: Vec<u8>,
+    exists: bool,
+    value: Option<Vec<u8>>,
+}
+
+impl KvRowBatch {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
-            key: key.into(),
-            value: Some(value.into()),
+            rows: Vec::with_capacity(capacity),
         }
     }
 
-    pub(crate) fn key_only(key: impl Into<Vec<u8>>) -> Self {
-        Self {
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub(crate) fn key(&self, index: usize) -> Option<&[u8]> {
+        self.rows.get(index).map(|row| row.key.as_slice())
+    }
+
+    pub(crate) fn exists(&self, index: usize) -> bool {
+        self.rows.get(index).is_some_and(|row| row.exists)
+    }
+
+    pub(crate) fn value(&self, index: usize) -> Option<&[u8]> {
+        self.rows.get(index).and_then(|row| row.value.as_deref())
+    }
+
+    pub(crate) fn value_count(&self) -> usize {
+        self.rows.iter().filter(|row| row.value.is_some()).count()
+    }
+
+    pub(crate) fn existence_count(&self) -> usize {
+        self.rows.iter().filter(|row| row.exists).count()
+    }
+
+    pub(crate) fn missing_count(&self) -> usize {
+        self.rows.iter().filter(|row| !row.exists).count()
+    }
+
+    pub(crate) fn push_missing(&mut self, key: impl Into<Vec<u8>>) {
+        self.rows.push(KvRow {
             key: key.into(),
+            exists: false,
             value: None,
+        });
+    }
+
+    pub(crate) fn push_exists(&mut self, key: impl Into<Vec<u8>>) {
+        self.rows.push(KvRow {
+            key: key.into(),
+            exists: true,
+            value: None,
+        });
+    }
+
+    pub(crate) fn push_value(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
+        self.rows.push(KvRow {
+            key: key.into(),
+            exists: true,
+            value: Some(value.into()),
+        });
+    }
+
+    pub(crate) fn push_key_only(&mut self, key: impl Into<Vec<u8>>) {
+        self.rows.push(KvRow {
+            key: key.into(),
+            exists: true,
+            value: None,
+        });
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.rows.truncate(len);
+    }
+
+    pub(crate) fn pop_value(&mut self) -> Result<Option<Vec<u8>>, LixError> {
+        let Some(row) = self.rows.pop() else {
+            return Ok(None);
+        };
+        if row.exists && row.value.is_none() {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "storage get row was requested without values",
+            ));
         }
+        Ok(row.value)
     }
 
-    pub(crate) fn value(&self) -> Result<&[u8], LixError> {
-        self.value.as_deref().ok_or_else(|| {
+    pub(crate) fn value_required(&self, index: usize) -> Result<&[u8], LixError> {
+        self.value(index).ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "storage scan row was requested without values",
+                "storage row was requested without values",
             )
         })
     }
 
-    pub(crate) fn into_value(self) -> Result<Vec<u8>, LixError> {
-        self.value.ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "storage scan row was requested without values",
-            )
-        })
+    pub(crate) fn into_values_required(self) -> Result<Vec<Vec<u8>>, LixError> {
+        self.rows
+            .into_iter()
+            .map(|row| {
+                row.value.ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "storage row was requested without values",
+                    )
+                })
+            })
+            .collect()
+    }
+}
+
+impl From<backend::BackendKvRowBatch> for KvRowBatch {
+    fn from(batch: backend::BackendKvRowBatch) -> Self {
+        Self {
+            rows: batch
+                .into_parts()
+                .into_iter()
+                .map(|(key, exists, value)| KvRow { key, exists, value })
+                .collect(),
+        }
     }
 }
 
@@ -180,25 +280,21 @@ impl From<backend::BackendKvGetBatch> for KvGetBatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KvGetBatchGroup {
     pub(crate) namespace: String,
-    pub(crate) entries: Vec<KvGetEntry>,
+    pub(crate) rows: KvRowBatch,
 }
 
 impl From<backend::BackendKvGetBatchGroup> for KvGetBatchGroup {
     fn from(group: backend::BackendKvGetBatchGroup) -> Self {
         Self {
             namespace: group.namespace,
-            entries: group.entries.into_iter().map(Into::into).collect(),
+            rows: group.rows.into(),
         }
     }
 }
 
 impl KvGetBatchGroup {
     pub(crate) fn pop_value(&mut self) -> Result<Option<Vec<u8>>, LixError> {
-        self.entries
-            .pop()
-            .map(KvGetEntry::into_value)
-            .transpose()
-            .map(Option::flatten)
+        self.rows.pop_value()
     }
 }
 
@@ -213,54 +309,6 @@ impl From<KvGetProjection> for backend::BackendKvGetProjection {
         match projection {
             KvGetProjection::Values => Self::Values,
             KvGetProjection::Existence => Self::Existence,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct KvGetEntry {
-    pub(crate) exists: bool,
-    pub(crate) value: Option<Vec<u8>>,
-}
-
-impl KvGetEntry {
-    pub(crate) fn missing() -> Self {
-        Self {
-            exists: false,
-            value: None,
-        }
-    }
-
-    pub(crate) fn value(value: impl Into<Vec<u8>>) -> Self {
-        Self {
-            exists: true,
-            value: Some(value.into()),
-        }
-    }
-
-    pub(crate) fn exists() -> Self {
-        Self {
-            exists: true,
-            value: None,
-        }
-    }
-
-    pub(crate) fn into_value(self) -> Result<Option<Vec<u8>>, LixError> {
-        if self.exists && self.value.is_none() {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "storage get entry was requested without values",
-            ));
-        }
-        Ok(self.value)
-    }
-}
-
-impl From<backend::BackendKvGetEntry> for KvGetEntry {
-    fn from(entry: backend::BackendKvGetEntry) -> Self {
-        Self {
-            exists: entry.exists,
-            value: entry.value,
         }
     }
 }
@@ -312,7 +360,7 @@ impl From<KvScanRange> for backend::BackendKvScanRange {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KvScanBatch {
-    pub(crate) rows: Vec<KvScanRow>,
+    pub(crate) rows: KvRowBatch,
     pub(crate) resume_after: Option<Vec<u8>>,
 }
 
@@ -326,18 +374,26 @@ impl KvScanBatch {
     }
 
     pub(crate) fn key(&self, index: usize) -> Option<&[u8]> {
-        self.rows.get(index).map(|row| row.key.as_slice())
+        self.rows.key(index)
     }
 
-    pub(crate) fn value(&self, index: usize) -> Result<Option<&[u8]>, LixError> {
-        self.rows.get(index).map(|row| row.value()).transpose()
+    pub(crate) fn exists(&self, index: usize) -> bool {
+        self.rows.exists(index)
+    }
+
+    pub(crate) fn value(&self, index: usize) -> Option<&[u8]> {
+        self.rows.value(index)
+    }
+
+    pub(crate) fn value_required(&self, index: usize) -> Result<&[u8], LixError> {
+        self.rows.value_required(index)
     }
 
     pub(crate) fn resume_after(&self) -> Option<&[u8]> {
         self.resume_after.as_deref()
     }
 
-    pub(crate) fn into_rows(self) -> Vec<KvScanRow> {
+    pub(crate) fn into_rows(self) -> KvRowBatch {
         self.rows
     }
 }
@@ -345,17 +401,8 @@ impl KvScanBatch {
 impl From<backend::BackendKvScanBatch> for KvScanBatch {
     fn from(result: backend::BackendKvScanBatch) -> Self {
         Self {
-            rows: result.rows.into_iter().map(Into::into).collect(),
+            rows: result.rows.into(),
             resume_after: result.resume_after,
-        }
-    }
-}
-
-impl From<backend::BackendKvScanRow> for KvScanRow {
-    fn from(pair: backend::BackendKvScanRow) -> Self {
-        Self {
-            key: pair.key,
-            value: pair.value,
         }
     }
 }
