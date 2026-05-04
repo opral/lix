@@ -11,7 +11,6 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{not_impl_err, DFSchema, DataFusionError, Result, ScalarValue};
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::dml::InsertOp;
@@ -23,7 +22,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
 };
 use datafusion::prelude::SessionContext;
-use futures_util::{stream, StreamExt, TryStreamExt};
+use futures_util::{stream, TryStreamExt};
 use serde_json::Value as JsonValue;
 
 use crate::commit_graph::CommitGraphReader;
@@ -32,6 +31,7 @@ use crate::live_state::LiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
+use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
@@ -360,7 +360,7 @@ impl TableProvider for EntityProvider {
             write_ctx.clone(),
             insert_version_binding,
         );
-        Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
+        Ok(Arc::new(InsertExec::new(input, Arc::new(sink))))
     }
 
     async fn delete_from(
@@ -469,7 +469,6 @@ impl TableProvider for EntityProvider {
 
 struct EntityInsertSink {
     spec: Arc<EntitySurfaceSpec>,
-    schema: SchemaRef,
     insert_column_intents: InsertColumnIntents,
     write_ctx: SqlWriteContext,
     version_binding: VersionBinding,
@@ -486,14 +485,13 @@ impl std::fmt::Debug for EntityInsertSink {
 impl EntityInsertSink {
     fn new(
         spec: Arc<EntitySurfaceSpec>,
-        schema: SchemaRef,
+        _schema: SchemaRef,
         insert_column_intents: InsertColumnIntents,
         write_ctx: SqlWriteContext,
         version_binding: VersionBinding,
     ) -> Self {
         Self {
             spec,
-            schema,
             insert_column_intents,
             write_ctx,
             version_binding,
@@ -513,22 +511,14 @@ impl DisplayAs for EntityInsertSink {
 }
 
 #[async_trait]
-impl DataSink for EntityInsertSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> &SchemaRef {
-        &self.schema
-    }
-
-    async fn write_all(
+impl InsertSink for EntityInsertSink {
+    async fn write_batches(
         &self,
-        mut data: SendableRecordBatchStream,
+        batches: Vec<RecordBatch>,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
         let mut rows = Vec::new();
-        while let Some(batch) = data.next().await.transpose()? {
+        for batch in batches {
             rows.extend(entity_lix_state_write_rows_from_batch(
                 &self.spec,
                 &batch,
@@ -1991,11 +1981,7 @@ mod tests {
     use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::datasource::sink::DataSink;
     use datafusion::execution::TaskContext;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use datafusion::physical_plan::SendableRecordBatchStream;
-    use futures_util::stream;
     use serde_json::json;
 
     use super::{
@@ -2010,6 +1996,7 @@ mod tests {
     use crate::live_state::{
         LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
     };
+    use crate::sql2::dml::InsertSink;
     use crate::sql2::write_normalization::InsertColumnIntents;
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
     use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWriteOutcome};
@@ -2570,12 +2557,8 @@ mod tests {
             write_ctx,
             super::VersionBinding::explicit(),
         );
-        let stream = stream::iter(vec![Ok(batch)]);
-        let stream: SendableRecordBatchStream =
-            Box::pin(RecordBatchStreamAdapter::new(sink.schema().clone(), stream));
-
         let count = sink
-            .write_all(stream, &Arc::new(TaskContext::default()))
+            .write_batches(vec![batch], &Arc::new(TaskContext::default()))
             .await
             .expect("entity sink should stage write");
 

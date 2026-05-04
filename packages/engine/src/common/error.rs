@@ -77,6 +77,10 @@ impl LixError {
     /// SQL surface.
     pub const CODE_UNSUPPORTED_SQL: &'static str = "LIX_UNSUPPORTED_SQL";
 
+    /// SQL planning succeeded far enough to produce a physical runtime shape
+    /// that the current engine target cannot execute safely.
+    pub const CODE_UNSUPPORTED_SQL_RUNTIME_PLAN: &'static str = "LIX_UNSUPPORTED_SQL_RUNTIME_PLAN";
+
     /// Storage/backend IO failed while executing an operation.
     pub const CODE_STORAGE_ERROR: &'static str = "LIX_STORAGE_ERROR";
 

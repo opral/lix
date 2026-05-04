@@ -9,7 +9,6 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{not_impl_err, DFSchema, DataFusionError, Result, SchemaExt};
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::dml::InsertOp;
@@ -23,13 +22,14 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
-use futures_util::{stream, StreamExt, TryStreamExt};
+use futures_util::{stream, TryStreamExt};
 
 use crate::entity_identity::EntityIdentity;
 use crate::live_state::LiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
+use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::read_only::reject_read_only_stage_rows;
 use crate::sql2::version_scope::{resolve_provider_version_ids, VersionBinding};
 use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValues};
@@ -249,7 +249,7 @@ impl TableProvider for LixStateProvider {
             write_ctx.clone(),
             active_version_id,
         );
-        Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
+        Ok(Arc::new(InsertExec::new(input, Arc::new(sink))))
     }
 
     async fn delete_from(
@@ -329,7 +329,6 @@ impl TableProvider for LixStateProvider {
 }
 
 struct LixStateInsertSink {
-    schema: SchemaRef,
     write_ctx: SqlWriteContext,
     version_binding: String,
 }
@@ -341,9 +340,8 @@ impl std::fmt::Debug for LixStateInsertSink {
 }
 
 impl LixStateInsertSink {
-    fn new(schema: SchemaRef, write_ctx: SqlWriteContext, version_binding: String) -> Self {
+    fn new(_schema: SchemaRef, write_ctx: SqlWriteContext, version_binding: String) -> Self {
         Self {
-            schema,
             write_ctx,
             version_binding,
         }
@@ -362,22 +360,14 @@ impl DisplayAs for LixStateInsertSink {
 }
 
 #[async_trait]
-impl DataSink for LixStateInsertSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> &SchemaRef {
-        &self.schema
-    }
-
-    async fn write_all(
+impl InsertSink for LixStateInsertSink {
+    async fn write_batches(
         &self,
-        mut data: SendableRecordBatchStream,
+        batches: Vec<RecordBatch>,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
         let mut rows = Vec::new();
-        while let Some(batch) = data.next().await.transpose()? {
+        for batch in batches {
             rows.extend(lix_state_write_rows_from_batch(
                 &batch,
                 &self.version_binding,
@@ -1499,6 +1489,7 @@ mod tests {
     use crate::functions::{
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
+    use crate::sql2::dml::{InsertExec, InsertSink};
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
     use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWriteOutcome};
     use crate::version::{VersionHead, VersionRefReader};
@@ -1513,7 +1504,6 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::catalog::TableProvider;
     use datafusion::common::{Column, DataFusionError};
-    use datafusion::datasource::sink::{DataSink, DataSinkExec};
     use datafusion::execution::TaskContext;
     use datafusion::logical_expr::dml::InsertOp;
     use datafusion::logical_expr::expr::InList;
@@ -2143,7 +2133,7 @@ mod tests {
             .await
             .expect("insert should produce a write plan");
 
-        assert!(plan.as_any().is::<DataSinkExec>());
+        assert!(plan.as_any().is::<InsertExec>());
     }
 
     #[test]
@@ -2186,12 +2176,8 @@ mod tests {
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let sink = LixStateInsertSink::new(lix_state_schema(), write_ctx, "version-a".to_string());
         let batch = one_row_lix_state_batch(false);
-        let stream = stream::iter(vec![Ok(batch)]);
-        let stream: SendableRecordBatchStream =
-            Box::pin(RecordBatchStreamAdapter::new(lix_state_schema(), stream));
-
         let count = sink
-            .write_all(stream, &Arc::new(TaskContext::default()))
+            .write_batches(vec![batch], &Arc::new(TaskContext::default()))
             .await
             .expect("sink should stage write");
 

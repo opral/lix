@@ -11,7 +11,6 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{not_impl_err, DFSchema, DataFusionError, Result, ScalarValue};
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::dml::InsertOp;
@@ -23,7 +22,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
 };
 use datafusion::prelude::SessionContext;
-use futures_util::{stream, StreamExt, TryStreamExt};
+use futures_util::{stream, TryStreamExt};
 use serde::Deserialize;
 
 use crate::binary_cas::BlobDataReader;
@@ -32,6 +31,7 @@ use crate::live_state::LiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
+use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
 };
@@ -284,7 +284,7 @@ impl TableProvider for LixFileProvider {
             self.version_binding.clone(),
             include_data_writes,
         );
-        Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
+        Ok(Arc::new(InsertExec::new(input, Arc::new(sink))))
     }
 
     async fn delete_from(
@@ -361,7 +361,6 @@ impl TableProvider for LixFileProvider {
 
 #[allow(dead_code)]
 struct LixFileInsertSink {
-    schema: SchemaRef,
     write_ctx: SqlWriteContext,
     functions: FunctionProviderHandle,
     version_binding: VersionBinding,
@@ -376,14 +375,13 @@ impl std::fmt::Debug for LixFileInsertSink {
 
 impl LixFileInsertSink {
     fn new(
-        schema: SchemaRef,
+        _schema: SchemaRef,
         write_ctx: SqlWriteContext,
         functions: FunctionProviderHandle,
         version_binding: VersionBinding,
         include_data_writes: bool,
     ) -> Self {
         Self {
-            schema,
             write_ctx,
             functions,
             version_binding,
@@ -404,23 +402,15 @@ impl DisplayAs for LixFileInsertSink {
 }
 
 #[async_trait]
-impl DataSink for LixFileInsertSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> &SchemaRef {
-        &self.schema
-    }
-
-    async fn write_all(
+impl InsertSink for LixFileInsertSink {
+    async fn write_batches(
         &self,
-        mut data: SendableRecordBatchStream,
+        batches: Vec<RecordBatch>,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
         let mut staged = LixFileStagedBatch::default();
         let mut path_resolvers = None;
-        while let Some(batch) = data.next().await.transpose()? {
+        for batch in batches {
             if path_resolvers.is_none() {
                 path_resolvers = Some(
                     file_path_resolvers_from_live_state(
@@ -2149,12 +2139,8 @@ mod tests {
     use datafusion::arrow::array::{ArrayRef, BinaryArray, BooleanArray, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
-    use datafusion::datasource::sink::DataSink;
     use datafusion::execution::TaskContext;
     use datafusion::logical_expr::lit;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-    use datafusion::physical_plan::SendableRecordBatchStream;
-    use futures_util::stream;
     use serde_json::Value as JsonValue;
 
     use crate::binary_cas::BlobDataReader;
@@ -2163,6 +2149,7 @@ mod tests {
     };
     use crate::live_state::LiveStateRow;
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
+    use crate::sql2::dml::InsertSink;
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
     use crate::transaction::types::{StageWrite, StageWriteMode, StageWriteOutcome};
     use crate::LixError;
@@ -2436,14 +2423,6 @@ mod tests {
             ],
         )
         .expect("file delete batch")
-    }
-
-    fn batch_stream(batch: RecordBatch) -> SendableRecordBatchStream {
-        let schema = batch.schema();
-        Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream::iter(vec![Ok(batch)]),
-        ))
     }
 
     #[test]
@@ -2969,7 +2948,7 @@ mod tests {
         );
 
         let count = sink
-            .write_all(batch_stream(batch), &Arc::new(TaskContext::default()))
+            .write_batches(vec![batch], &Arc::new(TaskContext::default()))
             .await
             .expect("file insert sink should stage");
 
@@ -3006,7 +2985,7 @@ mod tests {
         );
 
         let count = sink
-            .write_all(batch_stream(batch), &Arc::new(TaskContext::default()))
+            .write_batches(vec![batch], &Arc::new(TaskContext::default()))
             .await
             .expect("file insert sink should stage data");
 
@@ -3066,7 +3045,7 @@ mod tests {
         );
 
         let count = sink
-            .write_all(batch_stream(batch), &Arc::new(TaskContext::default()))
+            .write_batches(vec![batch], &Arc::new(TaskContext::default()))
             .await
             .expect("file insert sink should stage path data");
 

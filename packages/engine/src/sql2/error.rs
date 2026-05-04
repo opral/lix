@@ -42,6 +42,11 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
             .with_hint("Lix SQL uses DataFusion syntax. Use lix_json_get(...) or lix_json_get_text(...) for JSON access, and numbered placeholders like $1, $2, ...");
     }
 
+    if looks_like_unsupported_runtime_plan(&lower) {
+        return LixError::new(LixError::CODE_UNSUPPORTED_SQL_RUNTIME_PLAN, message)
+            .with_hint("This SQL feature currently plans to a physical operator that is not supported by this engine runtime. Rewrite the query to avoid the unsupported operator, or run it on a runtime that supports the full physical plan.");
+    }
+
     if lower.contains("uses variadic path segments") {
         return LixError::new(LixError::CODE_INVALID_JSON_PATH, message)
             .with_hint("Pass path segments as separate arguments, for example lix_json_get_text(document, 'user', 'name'), not '$.user.name' or '/user/name'.");
@@ -170,6 +175,11 @@ fn looks_like_unsupported_dialect(lower: &str) -> bool {
         || lower.contains("unsupported sql type json")
         || lower.contains("sqlite_master")
         || lower.contains("returning")
+}
+
+fn looks_like_unsupported_runtime_plan(lower: &str) -> bool {
+    lower.contains("sql physical operator")
+        && lower.contains("is not supported by the webassembly runtime yet")
 }
 
 fn looks_like_type_mismatch(lower: &str) -> bool {

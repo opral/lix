@@ -1,35 +1,17 @@
 use datafusion::arrow::datatypes::Field;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
-use datafusion::dataframe::DataFrame;
 use datafusion::logical_expr::{Expr, LogicalPlan};
-#[cfg(target_arch = "wasm32")]
-use datafusion::physical_plan::ExecutionPlanProperties;
-use datafusion::prelude::{SessionConfig, SessionContext};
-#[cfg(target_arch = "wasm32")]
-use futures_util::TryStreamExt;
+use datafusion::prelude::SessionContext;
 use serde_json::{json, Value as JsonValue};
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use crate::schema::schema_key_from_definition;
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
-use super::change_provider::register_lix_change_provider;
-use super::commit_derived_provider::register_commit_derived_providers;
-use super::directory_history_provider::register_lix_directory_history_provider;
-use super::directory_provider::{
-    register_lix_directory_providers, register_lix_directory_write_providers,
-};
-use super::entity_provider::{register_entity_providers, register_entity_write_providers};
-use super::file_history_provider::register_lix_file_history_provider;
-use super::file_provider::{register_lix_file_providers, register_lix_file_write_providers};
-use super::history_provider::register_history_providers;
-use super::lix_state_provider::{register_lix_state_providers, register_lix_state_write_providers};
 use super::result_metadata::field_is_json;
-use super::udfs::register_sql2_functions;
-use super::version_provider::{register_lix_version_provider, register_lix_version_write_provider};
-use super::{SqlExecutionContext, SqlStatementKind, SqlWriteContext, SqlWriteExecutionContext};
+use super::session::{build_read_session, build_write_session};
+use super::{SqlExecutionContext, SqlStatementKind, SqlWriteExecutionContext};
 
 #[allow(dead_code)]
 pub(crate) struct SqlLogicalPlan {
@@ -147,33 +129,12 @@ pub(crate) async fn execute_logical_plan(
         .iter()
         .map(|field| field.as_ref().clone())
         .collect::<Vec<_>>();
-    let batches = collect_dataframe(dataframe)
+    let batches = super::runtime::collect_dataframe(dataframe)
         .await
         .map_err(datafusion_error_to_lix_error)?;
     let mut result = query_result_from_batches(&result_fields, &batches)?;
     result.notices = notices;
     Ok(result)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-async fn collect_dataframe(dataframe: DataFrame) -> datafusion::error::Result<Vec<RecordBatch>> {
-    dataframe.collect().await
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn collect_dataframe(dataframe: DataFrame) -> datafusion::error::Result<Vec<RecordBatch>> {
-    let task_ctx = Arc::new(dataframe.task_ctx());
-    let plan = dataframe.create_physical_plan().await?;
-    let partition_count = plan.output_partitioning().partition_count();
-    let mut batches = Vec::new();
-    for partition in 0..partition_count {
-        let partition_batches = plan
-            .execute(partition, Arc::clone(&task_ctx))?
-            .try_collect::<Vec<_>>()
-            .await?;
-        batches.extend(partition_batches);
-    }
-    Ok(batches)
 }
 
 fn validate_parameter_count(plan: &LogicalPlan, param_count: usize) -> Result<(), LixError> {
@@ -279,109 +240,6 @@ fn read_only_history_view_error(view_name: &str) -> LixError {
     .with_hint(
         "History views are query-only; write to the live surface such as lix_state, lix_file, lix_directory, or the typed entity table.",
     )
-}
-
-async fn build_read_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, LixError> {
-    let session = new_lix_session_context();
-    let version_ref = ctx.version_ref();
-    let active_version_commit_id = version_ref
-        .load_head(ctx.active_version_id())
-        .await?
-        .map(|head| head.commit_id);
-    register_sql2_functions(&session, ctx.functions(), active_version_commit_id);
-    register_lix_state_providers(
-        &session,
-        ctx.active_version_id(),
-        ctx.live_state(),
-        Arc::clone(&version_ref),
-    )
-    .await?;
-    register_lix_version_provider(&session, ctx.live_state(), Arc::clone(&version_ref)).await?;
-    let changelog_query_source = ctx.changelog_query_source();
-    register_lix_change_provider(&session, changelog_query_source.clone()).await?;
-    let commit_graph = ctx.commit_graph();
-    register_commit_derived_providers(&session, commit_graph, Arc::clone(&version_ref)).await?;
-    let state_history_commit_graph = ctx.commit_graph();
-    register_history_providers(
-        &session,
-        state_history_commit_graph,
-        changelog_query_source.clone(),
-    )
-    .await?;
-    let file_history_commit_graph = ctx.commit_graph();
-    register_lix_file_history_provider(
-        &session,
-        file_history_commit_graph,
-        changelog_query_source.clone(),
-        ctx.blob_reader(),
-    )
-    .await?;
-    let directory_history_commit_graph = ctx.commit_graph();
-    register_lix_directory_history_provider(
-        &session,
-        directory_history_commit_graph,
-        changelog_query_source.clone(),
-    )
-    .await?;
-    let entity_commit_graph = Arc::new(tokio::sync::Mutex::new(ctx.commit_graph()));
-    register_lix_directory_providers(
-        &session,
-        ctx.active_version_id(),
-        ctx.live_state(),
-        Arc::clone(&version_ref),
-        ctx.functions(),
-    )
-    .await?;
-    register_lix_file_providers(
-        &session,
-        ctx.active_version_id(),
-        ctx.live_state(),
-        Arc::clone(&version_ref),
-        ctx.blob_reader(),
-        ctx.functions(),
-    )
-    .await?;
-    register_entity_providers(
-        &session,
-        ctx.active_version_id(),
-        ctx.live_state(),
-        Arc::clone(&version_ref),
-        entity_commit_graph,
-        changelog_query_source,
-        &ctx.list_visible_schemas()?,
-    )
-    .await?;
-
-    Ok(session)
-}
-
-async fn build_write_session(
-    ctx: &mut dyn SqlWriteExecutionContext,
-) -> Result<SessionContext, LixError> {
-    let session = new_lix_session_context();
-    let write_ctx = SqlWriteContext::new(ctx);
-    let active_version_commit_id = write_ctx
-        .load_version_head(&write_ctx.active_version_id())
-        .await?;
-    register_sql2_functions(&session, write_ctx.functions(), active_version_commit_id);
-
-    register_lix_state_write_providers(&session, write_ctx.clone()).await?;
-    register_lix_version_write_provider(&session, write_ctx.clone()).await?;
-
-    register_lix_directory_write_providers(&session, write_ctx.clone()).await?;
-    register_lix_file_write_providers(&session, write_ctx.clone()).await?;
-    register_entity_write_providers(
-        &session,
-        write_ctx.clone(),
-        &write_ctx.list_visible_schemas()?,
-    )
-    .await?;
-
-    Ok(session)
-}
-
-fn new_lix_session_context() -> SessionContext {
-    SessionContext::new_with_config(SessionConfig::new().with_information_schema(true))
 }
 
 fn classify_logical_plan(plan: &LogicalPlan) -> SqlStatementKind {
