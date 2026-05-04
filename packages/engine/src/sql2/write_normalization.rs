@@ -2,12 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use datafusion::arrow::array::ArrayRef;
+use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result, ScalarValue};
+use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::expressions::{CastExpr, Literal};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::ExecutionPlan;
+
+use crate::LixError;
 
 #[derive(Debug, Clone)]
 pub(crate) enum SqlCell {
@@ -89,6 +93,141 @@ impl InsertColumnIntents {
             Some(value) => InsertCell::Provided(SqlCell::from_scalar(value)),
         })
     }
+}
+
+pub(crate) fn reject_non_binary_casts_for_insert_column(
+    input: &Arc<dyn ExecutionPlan>,
+    column_name: &str,
+    context: &str,
+) -> Result<()> {
+    reject_non_binary_casts_for_insert_column_in_plan(input.as_ref(), column_name, context)
+}
+
+fn reject_non_binary_casts_for_insert_column_in_plan(
+    input: &dyn ExecutionPlan,
+    column_name: &str,
+    context: &str,
+) -> Result<()> {
+    let Some(projection) = input.as_any().downcast_ref::<ProjectionExec>() else {
+        for child in input.children() {
+            reject_non_binary_casts_for_insert_column_in_plan(
+                child.as_ref(),
+                column_name,
+                context,
+            )?;
+        }
+        return Ok(());
+    };
+
+    let Some(expr) = projection
+        .expr()
+        .iter()
+        .find(|expr| expr.alias == column_name)
+    else {
+        return Ok(());
+    };
+
+    if contains_non_binary_cast_to_binary(expr.expr.as_ref()) {
+        return Err(super::error::lix_error_to_datafusion_error(
+            LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                format!("{context} expected binary column '{column_name}'"),
+            )
+            .with_hint("Use X'...' or a binary parameter for file contents."),
+        ));
+    }
+
+    Ok(())
+}
+
+fn contains_non_binary_cast_to_binary(expr: &dyn PhysicalExpr) -> bool {
+    let Some(cast) = expr.as_any().downcast_ref::<CastExpr>() else {
+        return false;
+    };
+
+    if is_binary_type(cast.cast_type()) && !physical_expr_is_binary_or_null(cast.expr().as_ref()) {
+        return true;
+    }
+
+    contains_non_binary_cast_to_binary(cast.expr().as_ref())
+}
+
+fn physical_expr_is_binary_or_null(expr: &dyn PhysicalExpr) -> bool {
+    if let Some(literal) = expr.as_any().downcast_ref::<Literal>() {
+        return scalar_is_binary_or_null(literal.value());
+    }
+
+    if let Some(cast) = expr.as_any().downcast_ref::<CastExpr>() {
+        return is_binary_type(cast.cast_type())
+            && physical_expr_is_binary_or_null(cast.expr().as_ref());
+    }
+
+    false
+}
+
+pub(crate) fn scalar_is_binary_or_null(value: &ScalarValue) -> bool {
+    value.is_null()
+        || matches!(
+            value,
+            ScalarValue::Binary(_)
+                | ScalarValue::LargeBinary(_)
+                | ScalarValue::FixedSizeBinary(_, _)
+        )
+}
+
+pub(crate) fn logical_expr_is_binary_or_null(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(value, _) => scalar_is_binary_or_null(value),
+        Expr::Cast(cast) => {
+            is_binary_type(&cast.data_type) && logical_expr_is_binary_or_null(&cast.expr)
+        }
+        Expr::Alias(alias) => logical_expr_is_binary_or_null(&alias.expr),
+        _ => false,
+    }
+}
+
+pub(crate) fn is_binary_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
+    )
+}
+
+pub(crate) fn lix_file_data_type_lix_error() -> LixError {
+    LixError::new(
+        LixError::CODE_TYPE_MISMATCH,
+        "lix_file.data expects binary data",
+    )
+    .with_hint("Use X'...' or a binary parameter for file contents.")
+}
+
+pub(crate) fn lix_file_data_type_error(
+    context: &str,
+    column_name: &str,
+    instruction: &str,
+) -> DataFusionError {
+    super::error::lix_error_to_datafusion_error(
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!("{context} expected binary column '{column_name}'"),
+        )
+        .with_hint(instruction),
+    )
+}
+
+pub(crate) fn lix_file_data_type_error_with_value(
+    context: &str,
+    column_name: &str,
+    value: &ScalarValue,
+    instruction: &str,
+) -> DataFusionError {
+    super::error::lix_error_to_datafusion_error(
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!("{context} expected binary column '{column_name}', got {value:?}"),
+        )
+        .with_hint(instruction),
+    )
 }
 
 pub(crate) struct UpdateAssignmentValues {

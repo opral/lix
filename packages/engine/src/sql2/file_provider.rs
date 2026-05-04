@@ -36,7 +36,10 @@ use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
 };
 use crate::sql2::write_normalization::{
-    InsertCell, InsertColumnIntents, SqlCell, UpdateAssignmentValues, UpdateCell,
+    is_binary_type, lix_file_data_type_error, lix_file_data_type_error_with_value,
+    logical_expr_is_binary_or_null, reject_non_binary_casts_for_insert_column,
+    scalar_is_binary_or_null, InsertCell, InsertColumnIntents, SqlCell, UpdateAssignmentValues,
+    UpdateCell,
 };
 use crate::transaction::types::StageRow;
 use crate::version::VersionRefReader;
@@ -279,6 +282,9 @@ impl TableProvider for LixFileProvider {
         let write_ctx = self.write_access.require_write("INSERT into lix_file")?;
         let insert_column_intents = InsertColumnIntents::from_input(&input);
         let include_data_writes = insert_column_intents.includes_column("data");
+        if include_data_writes {
+            reject_non_binary_casts_for_insert_column(&input, "data", "INSERT into lix_file")?;
+        }
 
         let sink = LixFileInsertSink::new(
             input.schema(),
@@ -1877,7 +1883,7 @@ fn validate_lix_file_update_assignments(
     schema: &SchemaRef,
     assignments: &[(String, Expr)],
 ) -> Result<()> {
-    for (column_name, _) in assignments {
+    for (column_name, expr) in assignments {
         schema.field_with_name(column_name).map_err(|_| {
             DataFusionError::Plan(format!(
                 "UPDATE lix_file failed: column '{column_name}' does not exist"
@@ -1891,8 +1897,37 @@ fn validate_lix_file_update_assignments(
                 "UPDATE lix_file cannot stage read-only column '{column_name}'"
             )));
         }
+        if column_name == "data" {
+            reject_non_binary_lix_file_data_assignment(expr)?;
+        }
     }
     Ok(())
+}
+
+fn reject_non_binary_lix_file_data_assignment(expr: &Expr) -> Result<()> {
+    match expr {
+        Expr::Literal(value, _) => {
+            if !scalar_is_binary_or_null(value) {
+                return Err(non_binary_lix_file_data_assignment_error());
+            }
+        }
+        Expr::Cast(cast) if is_binary_type(&cast.data_type) => {
+            if !logical_expr_is_binary_or_null(&cast.expr) {
+                return Err(non_binary_lix_file_data_assignment_error());
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn non_binary_lix_file_data_assignment_error() -> DataFusionError {
+    lix_file_data_type_error(
+        "UPDATE lix_file",
+        "data",
+        "use X'...' or a binary parameter for file contents",
+    )
 }
 
 fn filter_lix_file_batch(
@@ -2057,17 +2092,24 @@ fn update_required_binary_value(
     column_name: &str,
 ) -> Result<Vec<u8>> {
     match assignment_values.assigned_cell(row_index, column_name)? {
-        UpdateCell::Unassigned | UpdateCell::Assigned(SqlCell::Null) => Err(DataFusionError::Execution(format!(
-            "UPDATE lix_file requires binary data for column '{column_name}'; use X'' for an empty file or omit data to leave contents unchanged"
-        ))),
+        UpdateCell::Unassigned | UpdateCell::Assigned(SqlCell::Null) => {
+            Err(lix_file_data_type_error(
+                "UPDATE lix_file",
+                column_name,
+                "use X'' for an empty file or omit data to leave contents unchanged",
+            ))
+        }
         UpdateCell::Assigned(SqlCell::Value(ScalarValue::Binary(Some(value))))
-        | UpdateCell::Assigned(SqlCell::Value(ScalarValue::LargeBinary(Some(value)))) => {
+        | UpdateCell::Assigned(SqlCell::Value(ScalarValue::LargeBinary(Some(value)))) => Ok(value),
+        UpdateCell::Assigned(SqlCell::Value(ScalarValue::FixedSizeBinary(_, Some(value)))) => {
             Ok(value)
         }
-        UpdateCell::Assigned(SqlCell::Value(ScalarValue::FixedSizeBinary(_, Some(value)))) => Ok(value),
-        UpdateCell::Assigned(SqlCell::Value(other)) => Err(DataFusionError::Execution(format!(
-            "UPDATE lix_file expected binary column '{column_name}', got {other:?}"
-        ))),
+        UpdateCell::Assigned(SqlCell::Value(other)) => Err(lix_file_data_type_error_with_value(
+            "UPDATE lix_file",
+            column_name,
+            &other,
+            "use X'...' or a binary parameter for file contents",
+        )),
     }
 }
 
@@ -2128,16 +2170,21 @@ fn insert_optional_binary_value(
         Some(ScalarValue::Null)
         | Some(ScalarValue::Binary(None))
         | Some(ScalarValue::LargeBinary(None))
-        | Some(ScalarValue::FixedSizeBinary(_, None)) => Err(DataFusionError::Execution(format!(
-            "INSERT into lix_file requires binary data for column '{column_name}'; use X'' for an empty file or omit data to create a descriptor without contents"
-        ))),
+        | Some(ScalarValue::FixedSizeBinary(_, None)) => Err(lix_file_data_type_error(
+            "INSERT into lix_file",
+            column_name,
+            "use X'' for an empty file or omit data to create a descriptor without contents",
+        )),
         Some(ScalarValue::Binary(Some(value))) | Some(ScalarValue::LargeBinary(Some(value))) => {
             Ok(Some(value))
         }
         Some(ScalarValue::FixedSizeBinary(_, Some(value))) => Ok(Some(value)),
-        Some(other) => Err(DataFusionError::Execution(format!(
-            "INSERT into lix_file expected binary column '{column_name}', got {other:?}"
-        ))),
+        Some(other) => Err(lix_file_data_type_error_with_value(
+            "INSERT into lix_file",
+            column_name,
+            &other,
+            "use X'...' or a binary parameter for file contents",
+        )),
     }
 }
 
