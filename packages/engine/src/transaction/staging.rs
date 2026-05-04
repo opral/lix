@@ -7,7 +7,8 @@ use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{LiveStateRow, LiveStateRowIdentity, LiveStateScanRequest};
 use crate::transaction::normalization::{normalize_stage_row, TransactionSchemaCatalog};
 use crate::transaction::types::{
-    StageAdoptedChange, StageFileData, StageRow, StageWrite, StageWriteMode, StageWriteOutcome,
+    LogicalPrimaryKey, StageAdoptedChange, StageFileData, StageRow, StageRowOrigin, StageWrite,
+    StageWriteMode, StageWriteOperation, StageWriteOutcome,
 };
 use crate::transaction::types::{StagedAdoptedStateRow, StagedCommitMembers, StagedStateRow};
 use crate::GLOBAL_VERSION_ID;
@@ -24,7 +25,7 @@ pub(crate) struct TransactionStagedWrites {
     schema_catalog: Mutex<TransactionSchemaCatalog>,
     rows: Mutex<BTreeMap<StagedStateRowIdentity, StagedStateRow>>,
     adopted_rows: Mutex<BTreeMap<StagedStateRowIdentity, StagedAdoptedStateRow>>,
-    insert_identities: Mutex<BTreeSet<LiveStateRowIdentity>>,
+    insert_identities: Mutex<BTreeMap<LiveStateRowIdentity, Option<StageRowOrigin>>>,
     commit_members_by_version: Mutex<BTreeMap<String, StagedCommitMembers>>,
     extra_commit_parents_by_version: Mutex<BTreeMap<String, Vec<String>>>,
     file_data_writes: Mutex<Vec<StageFileData>>,
@@ -34,7 +35,7 @@ pub(crate) struct TransactionStagedWrites {
 pub(crate) struct StagedWriteSet {
     pub(crate) state_rows: Vec<StagedStateRow>,
     pub(crate) adopted_rows: Vec<StagedAdoptedStateRow>,
-    pub(crate) insert_identities: BTreeSet<LiveStateRowIdentity>,
+    pub(crate) insert_identities: BTreeMap<LiveStateRowIdentity, Option<StageRowOrigin>>,
     pub(crate) commit_members_by_version: BTreeMap<String, StagedCommitMembers>,
     pub(crate) extra_commit_parents_by_version: BTreeMap<String, Vec<String>>,
     pub(crate) file_data_writes: Vec<StageFileData>,
@@ -60,7 +61,7 @@ impl TransactionStagedWrites {
             schema_catalog: Mutex::new(schema_catalog),
             rows: Mutex::new(BTreeMap::new()),
             adopted_rows: Mutex::new(BTreeMap::new()),
-            insert_identities: Mutex::new(BTreeSet::new()),
+            insert_identities: Mutex::new(BTreeMap::new()),
             commit_members_by_version: Mutex::new(BTreeMap::new()),
             extra_commit_parents_by_version: Mutex::new(BTreeMap::new()),
             file_data_writes: Mutex::new(Vec::new()),
@@ -266,7 +267,10 @@ impl TransactionStagedWrites {
             add_row_to_commit_members(&mut commit_members_guard, &mut row, &mut functions);
             let identity = StagedStateRowIdentity::from(&row);
             if mode == Some(StageWriteMode::Insert) {
-                insert_identities_guard.insert(live_state_identity_from_staged_row(&row));
+                insert_identities_guard.insert(
+                    live_state_identity_from_staged_row(&row),
+                    row.origin.clone(),
+                );
             }
             guard.insert(identity, row);
         }
@@ -538,6 +542,7 @@ fn hydrate_state_write_row(
         file_id: row.file_id,
         snapshot_content: row.snapshot_content,
         metadata: row.metadata,
+        origin: row.origin,
         schema_version: row.schema_version,
         created_at: row.created_at.unwrap_or_else(|| updated_at.clone()),
         updated_at,
@@ -611,34 +616,91 @@ fn reject_duplicate_present_rows_in_batch(rows: &[StagedStateRow]) -> Result<(),
             continue;
         }
         if let Some(previous) = pending_present_rows.insert(identity, row) {
-            return Err(LixError::new(
-                LixError::CODE_UNIQUE,
-                format!(
-                    "primary-key constraint violation on schema '{}' version '{}': duplicate staged rows for entity_id '{}' in version '{}'",
-                    row.schema_key,
-                    row.schema_version,
-                    previous.entity_id.as_string()?,
-                    row.version_id
-                ),
-            ));
+            return Err(duplicate_staged_present_row_error(row, previous));
         }
     }
     Ok(())
 }
 
-fn duplicate_insert_identity_error(row: &StagedStateRow) -> LixError {
-    LixError::new(
-        LixError::CODE_UNIQUE,
-        format!(
-            "primary-key constraint violation on schema '{}' version '{}': INSERT would duplicate entity_id '{}' in version '{}'",
-            row.schema_key,
-            row.schema_version,
-            row.entity_id
-                .as_string()
-                .unwrap_or_else(|_| "<invalid entity_id>".to_string()),
-            row.version_id
+fn duplicate_staged_present_row_error(row: &StagedStateRow, previous: &StagedStateRow) -> LixError {
+    let message = logical_primary_key_violation_message(row.origin.as_ref())
+        .unwrap_or_else(|| {
+            format!(
+                "primary-key constraint violation on schema '{}' version '{}': duplicate staged rows for entity_id '{}' in version '{}'",
+                row.schema_key,
+                row.schema_version,
+                previous
+                    .entity_id
+                    .as_string()
+                    .unwrap_or_else(|_| "<invalid entity_id>".to_string()),
+                row.version_id
+            )
+        });
+    LixError::new(LixError::CODE_UNIQUE, message)
+}
+
+pub(crate) fn duplicate_insert_identity_message(
+    schema_key: &str,
+    schema_version: &str,
+    entity_id: &crate::entity_identity::EntityIdentity,
+    version_id: Option<&str>,
+    origin: Option<&StageRowOrigin>,
+) -> String {
+    if let Some(message) = logical_primary_key_violation_message(origin) {
+        return message;
+    }
+    let entity_id = entity_id
+        .as_string()
+        .unwrap_or_else(|_| "<invalid entity_id>".to_string());
+    match version_id {
+        Some(version_id) => format!(
+            "primary-key constraint violation on schema '{schema_key}' version '{schema_version}': INSERT would duplicate entity_id '{entity_id}' in version '{version_id}'"
         ),
-    )
+        None => format!(
+            "primary-key constraint violation on schema '{schema_key}' version '{schema_version}': INSERT would duplicate entity_id '{entity_id}'"
+        ),
+    }
+}
+
+fn duplicate_insert_identity_error(row: &StagedStateRow) -> LixError {
+    let message = duplicate_insert_identity_message(
+        &row.schema_key,
+        &row.schema_version,
+        &row.entity_id,
+        Some(&row.version_id),
+        row.origin.as_ref(),
+    );
+    LixError::new(LixError::CODE_UNIQUE, message)
+}
+
+fn logical_primary_key_violation_message(origin: Option<&StageRowOrigin>) -> Option<String> {
+    let origin = origin?;
+    if origin.operation != StageWriteOperation::Insert {
+        return None;
+    }
+    let primary_key = origin.primary_key.as_ref()?;
+    Some(format!(
+        "primary-key constraint violation on table '{}': INSERT would duplicate {}",
+        origin.surface,
+        format_logical_primary_key(primary_key)
+    ))
+}
+
+fn format_logical_primary_key(primary_key: &LogicalPrimaryKey) -> String {
+    primary_key
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let value = primary_key
+                .values
+                .get(index)
+                .map(String::as_str)
+                .unwrap_or("<missing>");
+            format!("{column} '{value}'")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn conflicting_adopted_identity_error(row: &StagedStateRow) -> LixError {
@@ -1313,6 +1375,7 @@ mod tests {
             file_id: None,
             snapshot_content: Some(format!("{{\"key\":\"{key}\",\"value\":\"{value}\"}}")),
             metadata: None,
+            origin: None,
             schema_version: "1".to_string(),
             created_at: None,
             updated_at: None,

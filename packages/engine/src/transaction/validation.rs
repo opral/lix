@@ -14,6 +14,7 @@ use crate::schema::{
     schema_from_registered_snapshot, schema_key_from_definition, validate_lix_schema,
     validate_lix_schema_definition, SchemaKey,
 };
+use crate::transaction::staging::duplicate_insert_identity_message;
 use crate::transaction::staging::StagedWriteSet;
 use crate::transaction::types::StagedStateRow;
 use crate::version::{VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_REF_SCHEMA_KEY};
@@ -614,7 +615,7 @@ async fn validate_committed_insert_identities(
     input: &TransactionValidationInput<'_>,
     pending_constraints: &PendingConstraintIndexes,
 ) -> Result<(), LixError> {
-    for identity in &input.staged_writes.insert_identities {
+    for (identity, origin) in &input.staged_writes.insert_identities {
         let Some(committed_row) = input
             .live_state
             .load_row(&LiveStateRowRequest {
@@ -635,11 +636,12 @@ async fn validate_committed_insert_identities(
         }
         return Err(LixError::new(
             LixError::CODE_UNIQUE,
-            format!(
-                "primary-key constraint violation on schema '{}' version '{}': INSERT would duplicate entity_id '{}'",
-                identity.schema_key,
-                committed_row.schema_version,
-                identity.entity_id.as_string()?
+            duplicate_insert_identity_message(
+                &identity.schema_key,
+                &committed_row.schema_version,
+                &identity.entity_id,
+                None,
+                origin.as_ref(),
             ),
         ));
     }
@@ -2621,8 +2623,6 @@ fn validate_pending_registered_schema(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use async_trait::async_trait;
     use serde_json::json;
 
@@ -4346,7 +4346,7 @@ mod tests {
         StagedWriteSet {
             state_rows: Vec::new(),
             adopted_rows: Vec::new(),
-            insert_identities: BTreeSet::new(),
+            insert_identities: BTreeMap::new(),
             commit_members_by_version: BTreeMap::new(),
             extra_commit_parents_by_version: BTreeMap::new(),
             file_data_writes: Vec::new(),
@@ -4403,6 +4403,7 @@ mod tests {
             file_id: None,
             snapshot_content: Some(json!({ "value": schema }).to_string()),
             metadata: None,
+            origin: None,
             schema_version: "1".to_string(),
             created_at: "2026-04-29T00:00:00.000Z".to_string(),
             updated_at: "2026-04-29T00:00:00.000Z".to_string(),
@@ -4706,6 +4707,7 @@ mod tests {
             file_id: None,
             snapshot_content,
             metadata: None,
+            origin: None,
             schema_version: schema_version.to_string(),
             created_at: "2026-04-29T00:00:00.000Z".to_string(),
             updated_at: "2026-04-29T00:00:00.000Z".to_string(),

@@ -843,6 +843,7 @@ fn partial_state_row(
         file_id: context.file_id,
         snapshot_content,
         metadata: context.metadata,
+        origin: None,
         schema_version,
         created_at: None,
         updated_at: None,

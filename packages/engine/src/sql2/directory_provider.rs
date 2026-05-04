@@ -35,7 +35,7 @@ use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids, VersionBinding,
 };
 use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValues};
-use crate::transaction::types::StageRow;
+use crate::transaction::types::{LogicalPrimaryKey, StageRow, StageRowOrigin, StageWriteOperation};
 use crate::version::VersionRefReader;
 use crate::GLOBAL_VERSION_ID;
 use crate::{parse_row_metadata, serialize_row_metadata, LixError, RowMetadata};
@@ -347,6 +347,7 @@ struct LixDirectoryInsertSink {
     write_ctx: SqlWriteContext,
     functions: FunctionProviderHandle,
     version_binding: VersionBinding,
+    surface_name: &'static str,
 }
 
 impl std::fmt::Debug for LixDirectoryInsertSink {
@@ -362,10 +363,12 @@ impl LixDirectoryInsertSink {
         functions: FunctionProviderHandle,
         version_binding: VersionBinding,
     ) -> Self {
+        let surface_name = lix_directory_surface_name(&version_binding);
         Self {
             write_ctx,
             functions,
             version_binding,
+            surface_name,
         }
     }
 }
@@ -413,6 +416,7 @@ impl InsertSink for LixDirectoryInsertSink {
                 rows.extend(lix_directory_write_rows_from_batch_with_path_resolvers(
                     &batch,
                     self.version_binding.active_version_id(),
+                    self.surface_name,
                     path_resolvers
                         .as_mut()
                         .expect("path resolver should be initialized"),
@@ -423,6 +427,7 @@ impl InsertSink for LixDirectoryInsertSink {
                     lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
                         &batch,
                         self.version_binding.active_version_id(),
+                        self.surface_name,
                         true,
                         path_resolvers.as_mut(),
                         None,
@@ -440,6 +445,13 @@ impl InsertSink for LixDirectoryInsertSink {
             .map_err(lix_error_to_datafusion_error)?;
 
         Ok(count)
+    }
+}
+
+fn lix_directory_surface_name(version_binding: &VersionBinding) -> &'static str {
+    match version_binding {
+        VersionBinding::Active { .. } => "lix_directory",
+        VersionBinding::Explicit => "lix_directory_by_version",
     }
 }
 
@@ -886,18 +898,20 @@ fn lix_directory_write_rows_from_batch(
     batch: &RecordBatch,
     version_binding: Option<&str>,
 ) -> Result<Vec<StageRow>> {
-    lix_directory_write_rows_from_batch_with_options(batch, version_binding, true)
+    lix_directory_write_rows_from_batch_with_options(batch, version_binding, "lix_directory", true)
 }
 
 fn lix_directory_write_rows_from_batch_with_path_resolvers(
     batch: &RecordBatch,
     version_binding: Option<&str>,
+    surface_name: &str,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<Vec<StageRow>> {
     lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         batch,
         version_binding,
+        surface_name,
         true,
         Some(path_resolvers),
         Some(generate_directory_id),
@@ -1041,11 +1055,13 @@ impl From<&StageRow> for StateRowDedupeKey {
 fn lix_directory_write_rows_from_batch_with_options(
     batch: &RecordBatch,
     version_binding: Option<&str>,
+    surface_name: &str,
     reject_read_only_fields: bool,
 ) -> Result<Vec<StageRow>> {
     lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         batch,
         version_binding,
+        surface_name,
         reject_read_only_fields,
         None,
         None,
@@ -1055,6 +1071,7 @@ fn lix_directory_write_rows_from_batch_with_options(
 fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
     batch: &RecordBatch,
     version_binding: Option<&str>,
+    surface_name: &str,
     reject_read_only_fields: bool,
     mut path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
     mut generate_directory_id: Option<&mut dyn FnMut() -> String>,
@@ -1094,15 +1111,17 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
                         .to_string(),
                 ));
             };
-            let planned_rows = resolver
+            let directory_id = id.unwrap_or_else(|| generate_directory_id());
+            let mut planned_rows = resolver
                 .create_directory_path_with_leaf_id(
                     &path,
-                    id,
+                    Some(directory_id.clone()),
                     context,
                     hidden.unwrap_or(false),
                     generate_directory_id,
                 )
                 .map_err(lix_error_to_datafusion_error)?;
+            attach_lix_directory_insert_origin(&mut planned_rows, surface_name, &directory_id);
             rows.extend(planned_rows);
             continue;
         }
@@ -1119,17 +1138,53 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
                     .map_err(lix_error_to_datafusion_error)?;
             }
         }
-        rows.push(directory_descriptor_write_row(
-            DirectoryDescriptorWriteIntent {
-                id,
-                parent_id,
-                name,
-                hidden,
-                context,
-            },
-        ));
+        let mut row = directory_descriptor_write_row(DirectoryDescriptorWriteIntent {
+            id: id.clone(),
+            parent_id,
+            name,
+            hidden,
+            context,
+        });
+        if let Some(directory_id) = id.as_ref() {
+            row.origin = Some(lix_directory_insert_origin(surface_name, directory_id));
+        }
+        rows.push(row);
     }
     Ok(rows)
+}
+
+fn attach_lix_directory_insert_origin(
+    rows: &mut [StageRow],
+    surface_name: &str,
+    directory_id: &str,
+) {
+    let origin = lix_directory_insert_origin(surface_name, directory_id);
+    for row in rows {
+        if row.schema_key != DIRECTORY_SCHEMA_KEY {
+            continue;
+        }
+        let Some(entity_id) = row
+            .entity_id
+            .as_ref()
+            .and_then(|entity_id| entity_id.as_string().ok())
+        else {
+            continue;
+        };
+        if entity_id == directory_id {
+            row.origin = Some(origin.clone());
+        }
+    }
+}
+
+fn lix_directory_insert_origin(surface_name: &str, directory_id: &str) -> StageRowOrigin {
+    StageRowOrigin {
+        surface: surface_name.to_string(),
+        operation: StageWriteOperation::Insert,
+        primary_key: Some(LogicalPrimaryKey {
+            columns: vec!["id".to_string()],
+            values: vec![directory_id.to_string()],
+        }),
+    }
 }
 
 fn directory_row_context_from_batch(
@@ -1762,7 +1817,7 @@ mod tests {
 
     use super::{
         derive_directory_path_for, directory_path_resolvers_from_state_rows,
-        lix_directory_by_version_schema, lix_directory_record_batch,
+        lix_directory_by_version_schema, lix_directory_insert_origin, lix_directory_record_batch,
         lix_directory_recursive_delete_rows_from_batch, lix_directory_write_rows_from_batch,
         lix_directory_write_rows_from_batch_with_path_resolvers, DirectoryDescriptorRecord,
         LixDirectoryInsertSink, VersionBinding,
@@ -2095,6 +2150,7 @@ mod tests {
                         .to_string()
                 ),
                 metadata: Some(json!({"source": "directory"})),
+                origin: Some(lix_directory_insert_origin("lix_directory", "dir-docs")),
                 schema_version: "1".to_string(),
                 created_at: None,
                 updated_at: None,
@@ -2143,6 +2199,7 @@ mod tests {
         let rows = lix_directory_write_rows_from_batch_with_path_resolvers(
             &directory_path_insert_batch("/docs/nested/"),
             None,
+            "lix_directory",
             &mut resolvers,
             &mut test_id_generator(&["should-not-be-used"]),
         )
@@ -2253,6 +2310,10 @@ mod tests {
                             .to_string()
                     ),
                     metadata: Some(json!({"source": "directory"})),
+                    origin: Some(lix_directory_insert_origin(
+                        "lix_directory_by_version",
+                        "dir-docs"
+                    )),
                     schema_version: "1".to_string(),
                     created_at: None,
                     updated_at: None,
