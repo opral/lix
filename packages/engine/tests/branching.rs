@@ -1510,7 +1510,7 @@ fn assert_version_pair_delete_restricted(error: &lix_engine::LixError) {
 fn assert_merge_conflict_error(error: &lix_engine::LixError) {
     assert_eq!(error.code, "LIX_MERGE_CONFLICT");
     assert!(
-        error.description.contains("tracked-state conflict"),
+        error.message.contains("tracked-state conflict"),
         "unexpected merge error: {error:?}"
     );
     let details = error

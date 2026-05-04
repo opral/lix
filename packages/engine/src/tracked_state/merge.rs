@@ -373,7 +373,7 @@ mod tests {
         )
         .expect_err("merge should reject impossible source removal");
 
-        assert!(error.description.contains("without a tombstone row"));
+        assert!(error.message.contains("without a tombstone row"));
     }
 
     #[test]

@@ -3,11 +3,12 @@ mod wasm {
     use async_trait::async_trait;
     use js_sys::{Array, Object, Reflect};
     use lix_rs_sdk::{
-        open_lix as open_lix_rs, CreateVersionOptions, ExecuteResult, KvPair, KvScanRange,
-        Lix as RsLix, Backend, BackendTransaction, LixError, MergeVersionOptions,
-        OpenLixOptions, SwitchVersionOptions, TransactionBeginMode, Value,
+        open_lix as open_lix_rs, Backend, BackendTransaction, CreateVersionOptions, ExecuteResult,
+        KvPair, KvScanRange, Lix as RsLix, LixError, MergeVersionOptions, OpenLixOptions,
+        SwitchVersionOptions, TransactionBeginMode, Value,
     };
     use serde::Serialize;
+    use serde_json::json;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen::JsCast;
 
@@ -132,7 +133,16 @@ export type MergeVersionResult = {
         /// and `COMMIT` are not part of this contract; use
         /// `information_schema` for catalog inspection.
         #[wasm_bindgen(js_name = execute)]
-        pub async fn execute(&self, sql: String, params: JsValue) -> Result<JsValue, JsValue> {
+        pub async fn execute(&self, sql: JsValue, params: JsValue) -> Result<JsValue, JsValue> {
+            let sql = sql
+                .as_string()
+                .ok_or_else(|| invalid_argument_error("execute", "sql", "string", &sql))
+                .map_err(js_error)?;
+            if !Array::is_array(&params) {
+                return Err(js_error(invalid_argument_error(
+                    "execute", "params", "array", &params,
+                )));
+            }
             let params = Array::from(&params);
             let values = params
                 .iter()
@@ -696,6 +706,56 @@ export type MergeVersionResult = {
         Ok(Object::from(value))
     }
 
+    fn invalid_argument_error(
+        operation: &str,
+        argument: &str,
+        expected: &str,
+        actual_value: &JsValue,
+    ) -> LixError {
+        LixError::new(
+            "LIX_INVALID_ARGUMENT",
+            format!(
+                "lix.{operation}() expected {argument} to be {} {expected}",
+                expected_article(expected)
+            ),
+        )
+        .with_details(json!({
+            "operation": operation,
+            "argument": argument,
+            "expected": expected,
+            "actual": js_type_name(actual_value),
+        }))
+    }
+
+    fn expected_article(expected: &str) -> &'static str {
+        match expected.chars().next().map(|c| c.to_ascii_lowercase()) {
+            Some('a' | 'e' | 'i' | 'o' | 'u') => "an",
+            _ => "a",
+        }
+    }
+
+    fn js_type_name(value: &JsValue) -> &'static str {
+        if value.is_null() {
+            "null"
+        } else if Array::is_array(value) {
+            "array"
+        } else if value.is_undefined() {
+            "undefined"
+        } else if value.is_string() {
+            "string"
+        } else if value.as_bool().is_some() {
+            "boolean"
+        } else if value.as_f64().is_some() {
+            "number"
+        } else if value.is_function() {
+            "function"
+        } else if value.is_object() {
+            "object"
+        } else {
+            "unknown"
+        }
+    }
+
     fn required_string(object: &Object, key: &str, method: &str) -> Result<String, LixError> {
         let value = Reflect::get(object, &JsValue::from_str(key)).map_err(|_| {
             LixError::new(
@@ -740,20 +800,11 @@ export type MergeVersionResult = {
     }
 
     fn value_from_js(value: JsValue) -> Result<Value, LixError> {
-        if value.is_null() || value.is_undefined() {
-            return Ok(Value::Null);
-        }
-        if let Some(value) = value.as_bool() {
-            return Ok(Value::Boolean(value));
-        }
-        if let Some(value) = value.as_f64() {
-            if value.fract() == 0.0 && value >= i64::MIN as f64 && value <= i64::MAX as f64 {
-                return Ok(Value::Integer(value as i64));
-            }
-            return Ok(Value::Real(value));
-        }
-        if let Some(value) = value.as_string() {
-            return Ok(Value::Text(value));
+        if value.is_null() || value.is_undefined() || !value.is_object() {
+            return Err(invalid_param(
+                "parameter must be an explicit Lix value object",
+                &value,
+            ));
         }
 
         let object = Object::from(value.clone());
@@ -766,34 +817,42 @@ export type MergeVersionResult = {
                 Reflect::get(&object, &JsValue::from_str("value"))
                     .ok()
                     .and_then(|value| value.as_bool())
-                    .ok_or_else(|| invalid_value("boolean value must be boolean"))?,
+                    .ok_or_else(|| invalid_param("boolean value must be boolean", &value))?,
             )),
             Some("integer") => {
                 let value = Reflect::get(&object, &JsValue::from_str("value"))
                     .ok()
                     .and_then(|value| value.as_f64())
-                    .ok_or_else(|| invalid_value("integer value must be number"))?;
+                    .ok_or_else(|| invalid_param("integer value must be number", &value))?;
+                if !value.is_finite() || value.fract() != 0.0 {
+                    return Err(invalid_param_message(
+                        "integer value must be a finite integer",
+                    ));
+                }
                 Ok(Value::Integer(value as i64))
             }
             Some("real") => {
                 let value = Reflect::get(&object, &JsValue::from_str("value"))
                     .ok()
                     .and_then(|value| value.as_f64())
-                    .ok_or_else(|| invalid_value("real value must be number"))?;
+                    .ok_or_else(|| invalid_param("real value must be number", &value))?;
+                if !value.is_finite() {
+                    return Err(invalid_param_message("real value must be a finite number"));
+                }
                 Ok(Value::Real(value))
             }
             Some("text") => Ok(Value::Text(
                 Reflect::get(&object, &JsValue::from_str("value"))
                     .ok()
                     .and_then(|value| value.as_string())
-                    .ok_or_else(|| invalid_value("text value must be string"))?,
+                    .ok_or_else(|| invalid_param("text value must be string", &value))?,
             )),
             Some("json") => {
                 let value = Reflect::get(&object, &JsValue::from_str("value"))
-                    .map_err(|_| invalid_value("json value is missing"))?;
+                    .map_err(|_| invalid_param("json value is missing", &value))?;
                 let json = serde_wasm_bindgen::from_value(value).map_err(|error| {
                     LixError::new(
-                        "LIX_ERROR_JS_SDK",
+                        LixError::CODE_INVALID_PARAM,
                         format!("json value must be JSON-serializable: {error}"),
                     )
                 })?;
@@ -803,26 +862,21 @@ export type MergeVersionResult = {
                 let base64 = Reflect::get(&object, &JsValue::from_str("base64"))
                     .ok()
                     .and_then(|value| value.as_string())
-                    .ok_or_else(|| invalid_value("blob base64 must be string"))?;
+                    .ok_or_else(|| invalid_param("blob base64 must be string", &value))?;
                 let bytes =
                     base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64)
                         .map_err(|error| {
                             LixError::new(
-                                "LIX_ERROR_JS_SDK",
+                                LixError::CODE_INVALID_PARAM,
                                 format!("blob base64 must be valid base64: {error}"),
                             )
                         })?;
                 Ok(Value::Blob(bytes))
             }
-            _ => {
-                let json = serde_wasm_bindgen::from_value(value).map_err(|error| {
-                    LixError::new(
-                        "LIX_ERROR_JS_SDK",
-                        format!("parameter must be a Lix value or JSON scalar: {error}"),
-                    )
-                })?;
-                Ok(Value::Json(json))
-            }
+            _ => Err(invalid_param(
+                "parameter must be an explicit Lix value object",
+                &value,
+            )),
         }
     }
 
@@ -936,8 +990,17 @@ export type MergeVersionResult = {
             .map_err(|_| js_sdk_error(format!("could not set {key}")))
     }
 
-    fn invalid_value(message: impl Into<String>) -> LixError {
-        LixError::new("LIX_ERROR_JS_SDK", message.into())
+    fn invalid_param(message: impl Into<String>, value: &JsValue) -> LixError {
+        LixError::new(LixError::CODE_INVALID_PARAM, message.into()).with_details(json!({
+            "operation": "execute",
+            "actual": js_type_name(value),
+        }))
+    }
+
+    fn invalid_param_message(message: impl Into<String>) -> LixError {
+        LixError::new(LixError::CODE_INVALID_PARAM, message.into()).with_details(json!({
+            "operation": "execute",
+        }))
     }
 
     fn js_sdk_error(message: impl Into<String>) -> LixError {
@@ -945,7 +1008,7 @@ export type MergeVersionResult = {
     }
 
     fn js_error(error: LixError) -> JsValue {
-        let js_error = js_sys::Error::new(&error.description);
+        let js_error = js_sys::Error::new(&error.message);
         let object: &Object = js_error.as_ref();
         let _ = Reflect::set(
             object,

@@ -462,7 +462,7 @@ fn assert_single_json(result: ExecuteResult, expected: &str) {
 
 fn assert_closed(error: lix_engine::LixError) {
     assert_eq!(error.code, lix_engine::LixError::CODE_CLOSED);
-    assert_eq!(error.description, "Lix handle is closed");
+    assert_eq!(error.message, "Lix handle is closed");
     assert_eq!(
         error.hint.as_deref(),
         Some("Open a new Lix handle before calling this method.")

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lix_engine::{
-    KvPair, KvScanRange, Backend, BackendTransaction, LixError, TransactionBeginMode,
+    Backend, BackendTransaction, KvPair, KvScanRange, LixError, TransactionBeginMode,
 };
 
 type KvMap = BTreeMap<(String, Vec<u8>), Vec<u8>>;

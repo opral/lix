@@ -99,7 +99,7 @@ impl TableProvider for LixFileHistoryProvider {
     }
 
     fn table_type(&self) -> TableType {
-        TableType::Base
+        TableType::View
     }
 
     fn supports_filters_pushdown(
@@ -714,6 +714,7 @@ fn resolve_file_history_path(
         target_depth,
         directories,
         &mut BTreeMap::new(),
+        &mut BTreeSet::new(),
     )?;
     Some(format!("{directory_path}{filename}"))
 }
@@ -724,9 +725,14 @@ fn resolve_directory_history_path(
     target_depth: u32,
     directories: &[FileHistoryDirectoryRecord],
     cache: &mut BTreeMap<String, Option<String>>,
+    visiting: &mut BTreeSet<String>,
 ) -> Option<String> {
     if let Some(path) = cache.get(directory_id) {
         return path.clone();
+    }
+    if !visiting.insert(directory_id.to_string()) {
+        cache.insert(directory_id.to_string(), None);
+        return None;
     }
     let directory = directories
         .iter()
@@ -749,11 +755,13 @@ fn resolve_directory_history_path(
                 target_depth,
                 directories,
                 cache,
+                visiting,
             )?;
             format!("{parent_path}{}/", directory.name)
         }
         None => format!("/{}/", directory.name),
     };
+    visiting.remove(directory_id);
     cache.insert(directory_id.to_string(), Some(path.clone()));
     Some(path)
 }

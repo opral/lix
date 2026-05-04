@@ -1,4 +1,6 @@
-use datafusion::sql::sqlparser::ast::{Query, SetExpr, Statement};
+use datafusion::sql::sqlparser::ast::{
+    FromTable, ObjectName, Query, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
+};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 
@@ -29,6 +31,16 @@ pub(crate) fn validate_supported_statement_ast(sql: &str) -> Result<(), LixError
     validate_supported_ast_statement(statement)
 }
 
+pub(crate) fn dml_target_table_names(sql: &str) -> Result<Vec<String>, LixError> {
+    let statements = parse_sql_statements(sql)?;
+    let [statement] = statements.as_slice() else {
+        return Ok(Vec::new());
+    };
+    let mut targets = Vec::new();
+    collect_dml_target_table_names(statement, &mut targets);
+    Ok(targets)
+}
+
 fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
     Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| {
         LixError::new(
@@ -36,6 +48,48 @@ fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError> {
             format!("sql2 SQL parse error: {error}"),
         )
     })
+}
+
+fn collect_dml_target_table_names(statement: &Statement, targets: &mut Vec<String>) {
+    match statement {
+        Statement::Insert(insert) => {
+            if let TableObject::TableName(name) = &insert.table {
+                if let Some(table_name) = object_name_table_part(name) {
+                    targets.push(table_name);
+                }
+            }
+        }
+        Statement::Update(update) => {
+            collect_table_with_joins_target(&update.table, targets);
+        }
+        Statement::Delete(delete) => {
+            let tables = match &delete.from {
+                FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+            };
+            for table in tables {
+                collect_table_with_joins_target(table, targets);
+            }
+        }
+        Statement::Explain { statement, .. } => {
+            collect_dml_target_table_names(statement.as_ref(), targets);
+        }
+        _ => {}
+    }
+}
+
+fn collect_table_with_joins_target(table: &TableWithJoins, targets: &mut Vec<String>) {
+    if let TableFactor::Table { name, .. } = &table.relation {
+        if let Some(table_name) = object_name_table_part(name) {
+            targets.push(table_name);
+        }
+    }
+}
+
+fn object_name_table_part(name: &ObjectName) -> Option<String> {
+    name.0
+        .last()
+        .and_then(|part| part.as_ident())
+        .map(|ident| ident.value.clone())
 }
 
 fn classify_ast_statement(statement: &Statement) -> SqlStatementKind {
@@ -88,6 +142,6 @@ fn validate_supported_set_expr(expr: &SetExpr) -> Result<(), LixError> {
     }
 }
 
-fn unsupported_sql_error(description: impl Into<String>) -> LixError {
-    LixError::new(LixError::CODE_UNSUPPORTED_SQL, description)
+fn unsupported_sql_error(message: impl Into<String>) -> LixError {
+    LixError::new(LixError::CODE_UNSUPPORTED_SQL, message)
 }

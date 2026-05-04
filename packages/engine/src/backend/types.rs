@@ -47,7 +47,7 @@ pub trait Backend: Send + Sync {
     async fn destroy(&self) -> Result<(), LixError> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "destroy is not supported by this backend".to_string(),
+            message: "destroy is not supported by this backend".to_string(),
             hint: None,
             details: None,
         })

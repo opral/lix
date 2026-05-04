@@ -77,9 +77,9 @@ where
                 .evaluate_with_functions(expression, context, functions.clone())
                 .map_err(|err| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!(
+                    message: format!(
                         "failed to evaluate x-lix-default for '{}.{}' ({}): {}",
-                        schema_key, field_name, schema_version, err.description
+                        schema_key, field_name, schema_version, err.message
                     ),
                     hint: None,
                     details: None,

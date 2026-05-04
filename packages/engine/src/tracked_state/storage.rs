@@ -688,7 +688,7 @@ fn append_json_chunk(out: &mut String, chunk: &str, first: bool) -> Result<char,
 fn compress_snapshot_payload(snapshot_data: &[u8]) -> Result<Vec<u8>, LixError> {
     zstd::bulk::compress(snapshot_data, 1).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("tracked-state snapshot compression failed: {error}"),
+        message: format!("tracked-state snapshot compression failed: {error}"),
         hint: None,
         details: None,
     })
@@ -710,7 +710,7 @@ fn decode_snapshot_zstd_payload(
     zstd::bulk::decompress(compressed_payload, snapshot_ref.uncompressed_len as usize).map_err(
         |error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
+            message: format!(
                 "tracked-state snapshot decompression failed for ref '{}': {error}",
                 snapshot_ref.hash_hex
             ),
@@ -730,7 +730,7 @@ fn decode_snapshot_zstd_payload(
     let mut decoder =
         ruzstd::decoding::StreamingDecoder::new(compressed_payload).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("tracked-state snapshot decompression failed: {error}"),
+            message: format!("tracked-state snapshot decompression failed: {error}"),
             hint: None,
             details: None,
         })?;
@@ -738,7 +738,7 @@ fn decode_snapshot_zstd_payload(
     let mut output = Vec::new();
     decoder.read_to_end(&mut output).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("tracked-state snapshot decompression failed: {error}"),
+        message: format!("tracked-state snapshot decompression failed: {error}"),
         hint: None,
         details: None,
     })?;

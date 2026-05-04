@@ -28,7 +28,9 @@ pub(crate) fn expanded_version_ids(version_ids: &[String]) -> Vec<String> {
 /// Global rows are projected into each requested version scope, but keep
 /// `global = true`. Version-scoped rows win over projected global rows for the
 /// same identity. Tombstones participate in winning and are filtered only after
-/// visibility is resolved.
+/// visibility is resolved. This projection is a read concern; constraint
+/// validation remains exact storage-scope local unless a validator explicitly
+/// opts into overlay semantics.
 pub(crate) fn resolve_scan_rows(
     rows: Vec<LiveStateRow>,
     requested_version_ids: &[String],
