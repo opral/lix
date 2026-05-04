@@ -1,14 +1,14 @@
 use crate::changelog::{CanonicalChange, MaterializedCanonicalChange};
 use crate::json_store::{JsonRef, JsonStoreReader, JsonStoreWriter};
 use crate::storage::StorageReader;
-use crate::LixError;
+use crate::{serialize_row_metadata, validate_row_metadata, LixError, RowMetadata};
 
 pub(crate) fn canonicalize_materialized_change(
     json_writer: &mut JsonStoreWriter,
     change: &MaterializedCanonicalChange,
 ) -> Result<CanonicalChange, LixError> {
     let snapshot_ref = stage_optional_json(json_writer, change.snapshot_content.as_deref())?;
-    let metadata_ref = stage_optional_json(json_writer, change.metadata.as_deref())?;
+    let metadata_ref = stage_optional_metadata(json_writer, change.metadata.as_ref())?;
     Ok(CanonicalChange {
         id: change.id.clone(),
         entity_id: change.entity_id.clone(),
@@ -30,8 +30,7 @@ where
 {
     let snapshot_content =
         load_optional_json(json_reader, change.snapshot_ref.as_ref(), "snapshot_ref").await?;
-    let metadata =
-        load_optional_json(json_reader, change.metadata_ref.as_ref(), "metadata_ref").await?;
+    let metadata = load_optional_metadata(json_reader, change.metadata_ref.as_ref()).await?;
     Ok(MaterializedCanonicalChange {
         id: change.id,
         entity_id: change.entity_id,
@@ -52,6 +51,36 @@ fn stage_optional_json(
         return Ok(None);
     };
     json_writer.stage_bytes(value.as_bytes()).map(Some)
+}
+
+fn stage_optional_metadata(
+    json_writer: &mut JsonStoreWriter,
+    value: Option<&RowMetadata>,
+) -> Result<Option<JsonRef>, LixError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let serialized = serialize_row_metadata(value);
+    json_writer.stage_bytes(serialized.as_bytes()).map(Some)
+}
+
+async fn load_optional_metadata<S>(
+    json_reader: &mut JsonStoreReader<S>,
+    json_ref: Option<&JsonRef>,
+) -> Result<Option<RowMetadata>, LixError>
+where
+    S: StorageReader,
+{
+    let Some(json) = load_optional_json(json_reader, json_ref, "metadata_ref").await? else {
+        return Ok(None);
+    };
+    let metadata = serde_json::from_str::<RowMetadata>(&json).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_INVALID_JSON",
+            format!("metadata_ref is invalid JSON: {error}"),
+        )
+    })?;
+    validate_row_metadata(metadata, "metadata_ref").map(Some)
 }
 
 async fn load_optional_json<S>(

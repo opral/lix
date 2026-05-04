@@ -795,7 +795,7 @@ mod tests {
         version_id: String,
         file_id: Option<String>,
         snapshot_content: Option<String>,
-        metadata: Option<String>,
+        metadata: Option<JsonValue>,
         global: bool,
         untracked: bool,
         tombstone: bool,
@@ -1096,7 +1096,9 @@ mod tests {
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
-            metadata: metadata.map(ToOwned::to_owned),
+            metadata: metadata.map(|value| {
+                serde_json::from_str(value).expect("test metadata should be valid JSON")
+            }),
             schema_version: "1".to_string(),
             version_id: "version-a".to_string(),
             change_id: Some(format!("change-{entity_id}")),
@@ -1115,7 +1117,7 @@ mod tests {
             schema_key: "test_state_schema".to_string(),
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
-            metadata: Some(format!("{{\"source\":\"{entity_id}\"}}")),
+            metadata: Some(json!({ "source": entity_id })),
             schema_version: "1".to_string(),
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
@@ -1148,7 +1150,7 @@ mod tests {
                 })
                 .to_string(),
             ),
-            metadata: Some(format!("{{\"source\":\"{entity_id}\"}}")),
+            metadata: Some(json!({ "source": entity_id })),
             schema_version: "1".to_string(),
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
@@ -1181,7 +1183,7 @@ mod tests {
                 })
                 .to_string(),
             ),
-            metadata: Some(format!("{{\"source\":\"{entity_id}\"}}")),
+            metadata: Some(json!({ "source": entity_id })),
             schema_version: "1".to_string(),
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
@@ -1628,7 +1630,7 @@ mod tests {
             rows[0].snapshot_content.as_deref(),
             Some("{\"key\":\"hello\",\"value\":\"world\"}")
         );
-        assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"sql\"}"));
+        assert_eq!(rows[0].metadata.as_ref(), Some(&json!({"source": "sql"})));
     }
 
     #[tokio::test]
@@ -1721,7 +1723,10 @@ mod tests {
             rows[0].snapshot_content.as_deref(),
             Some("{\"key\":\"hello\",\"value\":\"from-select\"}")
         );
-        assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"select\"}"));
+        assert_eq!(
+            rows[0].metadata.as_ref(),
+            Some(&json!({"source": "select"}))
+        );
     }
 
     #[tokio::test]
@@ -1951,8 +1956,8 @@ mod tests {
             Some("{\"hidden\":true,\"id\":\"dir-docs\",\"name\":\"docs\",\"parent_id\":null}")
         );
         assert_eq!(
-            rows[0].metadata.as_deref(),
-            Some("{\"source\":\"directory-update\"}")
+            rows[0].metadata.as_ref(),
+            Some(&json!({"source": "directory-update"}))
         );
     }
 
@@ -2234,8 +2239,8 @@ mod tests {
         assert_eq!(snapshot["name"], "readme-updated.txt");
         assert_eq!(snapshot["hidden"], true);
         assert_eq!(
-            rows[0].metadata.as_deref(),
-            Some("{\"source\":\"file-update\"}")
+            rows[0].metadata.as_ref(),
+            Some(&json!({"source": "file-update"}))
         );
     }
 
@@ -2450,8 +2455,8 @@ mod tests {
             Some("{\"value\":\"updated\"}")
         );
         assert_eq!(
-            rows[0].metadata.as_deref(),
-            Some("{\"source\":\"entity-update\"}")
+            rows[0].metadata.as_ref(),
+            Some(&json!({"source": "entity-update"}))
         );
     }
 
@@ -2527,7 +2532,7 @@ mod tests {
             &mut ctx,
             "UPDATE lix_state \
              SET snapshot_content = '{\"key\":\"hello\",\"value\":\"updated\"}', \
-                 metadata = schema_key \
+                 metadata = '{\"schema_key\":\"lix_key_value\"}' \
              WHERE metadata = '{\"source\":\"match\"}'",
             &[],
         )
@@ -2550,7 +2555,10 @@ mod tests {
             rows[0].snapshot_content.as_deref(),
             Some("{\"key\":\"hello\",\"value\":\"updated\"}")
         );
-        assert_eq!(rows[0].metadata.as_deref(), Some("lix_key_value"));
+        assert_eq!(
+            rows[0].metadata.as_ref(),
+            Some(&json!({"schema_key": "lix_key_value"}))
+        );
     }
 
     #[tokio::test]

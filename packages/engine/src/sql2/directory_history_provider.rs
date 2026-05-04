@@ -23,6 +23,7 @@ use tokio::sync::Mutex;
 
 use crate::changelog::MaterializedCanonicalChange;
 use crate::commit_graph::CommitGraphReader;
+use crate::serialize_row_metadata;
 use crate::LixError;
 
 use super::history_projection::{tombstone_identity_column_value, HistoryIdentityProjection};
@@ -543,10 +544,16 @@ fn directory_history_column_array(
             rows.iter()
                 .map(|row| row.descriptor_change.snapshot_content.as_deref()),
         ),
-        HISTORY_COL_METADATA => string_array(
+        HISTORY_COL_METADATA => Arc::new(StringArray::from(
             rows.iter()
-                .map(|row| row.descriptor_change.metadata.as_deref()),
-        ),
+                .map(|row| {
+                    row.descriptor_change
+                        .metadata
+                        .as_ref()
+                        .map(serialize_row_metadata)
+                })
+                .collect::<Vec<_>>(),
+        )),
         HISTORY_COL_OBSERVED_COMMIT_ID => string_array(
             rows.iter()
                 .map(|row| Some(row.event.observed_commit_id.as_str())),

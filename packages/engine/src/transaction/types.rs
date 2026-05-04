@@ -4,6 +4,7 @@ use crate::entity_identity::EntityIdentity;
 use crate::live_state::LiveStateRow;
 use crate::tracked_state::TrackedStateRow;
 use crate::untracked_state::UntrackedStateRow;
+use crate::RowMetadata;
 
 /// Incoming state row before transaction hydration.
 ///
@@ -24,7 +25,7 @@ pub(crate) struct StageRow {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<String>,
-    pub(crate) metadata: Option<String>,
+    pub(crate) metadata: Option<RowMetadata>,
     pub(crate) schema_version: String,
     pub(crate) created_at: Option<String>,
     pub(crate) updated_at: Option<String>,
@@ -96,7 +97,7 @@ pub(crate) struct StagedStateRow {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<String>,
-    pub(crate) metadata: Option<String>,
+    pub(crate) metadata: Option<RowMetadata>,
     pub(crate) schema_version: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
@@ -114,7 +115,7 @@ pub(crate) struct StagedAdoptedStateRow {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<String>,
-    pub(crate) metadata: Option<String>,
+    pub(crate) metadata: Option<RowMetadata>,
     pub(crate) schema_version: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,

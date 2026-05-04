@@ -1,5 +1,6 @@
 use crate::entity_identity::EntityIdentity;
 use crate::tracked_state::TrackedStateRow;
+use crate::RowMetadata;
 use crate::{LixError, NullableKeyFilter};
 
 pub(crate) const TRACKED_STATE_HASH_BYTES: usize = 32;
@@ -63,7 +64,7 @@ impl TrackedStateKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateValue {
     pub(crate) snapshot: StoredSnapshot,
-    pub(crate) metadata: Option<String>,
+    pub(crate) metadata: Option<RowMetadata>,
     pub(crate) schema_version: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
