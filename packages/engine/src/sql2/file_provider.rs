@@ -1646,11 +1646,22 @@ async fn lix_file_record_batch(
     let mut version_ids = Vec::new();
 
     for ((version_id, _), file) in file_rows {
-        let directory_path = file.directory_id.as_ref().and_then(|directory_id| {
-            directory_paths
-                .get(&(version_id.clone(), directory_id.clone()))
-                .cloned()
-        });
+        let directory_path = match file.directory_id.as_ref() {
+            Some(directory_id) => {
+                let key = (version_id.clone(), directory_id.clone());
+                let Some(path) = directory_paths.get(&key).cloned() else {
+                    return Err(LixError::new(
+                        LixError::CODE_FOREIGN_KEY,
+                        format!(
+                            "lix_file_descriptor '{}' references missing directory_id '{}' in version '{}'",
+                            file.id, directory_id, version_id
+                        ),
+                    ));
+                };
+                Some(path)
+            }
+            None => None,
+        };
         let filename = match file.extension.as_deref() {
             Some(extension) if !extension.is_empty() => format!("{}.{}", file.name, extension),
             _ => file.name.clone(),
@@ -2329,6 +2340,25 @@ mod tests {
         }
     }
 
+    fn live_file_row(entity_id: &str, version_id: &str, snapshot_content: &str) -> LiveStateRow {
+        LiveStateRow {
+            entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
+                .expect("entity id should decode"),
+            schema_key: super::FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+            file_id: None,
+            snapshot_content: Some(snapshot_content.to_string()),
+            metadata: None,
+            schema_version: "1".to_string(),
+            version_id: version_id.to_string(),
+            change_id: Some(format!("change-{entity_id}")),
+            commit_id: Some(format!("commit-{entity_id}")),
+            global: false,
+            untracked: false,
+            created_at: "2026-04-23T00:00:00Z".to_string(),
+            updated_at: "2026-04-23T01:00:00Z".to_string(),
+        }
+    }
+
     fn string_column(values: Vec<Option<&str>>) -> ArrayRef {
         Arc::new(StringArray::from(values)) as ArrayRef
     }
@@ -2475,6 +2505,25 @@ mod tests {
             .expect("path derivation should succeed"),
             Some("/docs/guides/".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn file_projection_rejects_unresolved_non_root_directory_id() {
+        let blob_reader = Arc::new(CapturingWriteContext::default()) as Arc<dyn BlobDataReader>;
+        let error = super::lix_file_record_batch(
+            &super::lix_file_schema(),
+            &blob_reader,
+            vec![live_file_row(
+                "file-readme",
+                "version-b",
+                "{\"id\":\"file-readme\",\"directory_id\":\"missing-dir\",\"name\":\"readme\",\"extension\":\"md\",\"hidden\":false}",
+            )],
+        )
+        .await
+        .expect_err("unresolved non-root directory_id should not project as root path");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+        assert!(error.message.contains("missing-dir"));
     }
 
     #[test]

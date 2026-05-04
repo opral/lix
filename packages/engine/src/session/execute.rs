@@ -315,19 +315,18 @@ impl SessionContext {
                 .await;
         }
 
-        let read_transaction = self.storage.begin_read_transaction().await?;
-        let read_scope = StorageReadScope::new(read_transaction);
-        let mut read_store = read_scope.store();
-        let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-            Arc::new(self.live_state.reader(read_store.clone()));
-        let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
-        let functions = runtime_functions.provider();
-        let active_version_id = self.active_version_id_from_reader(&mut read_store).await?;
-        let visible_schemas = self
-            .schema_registry
-            .visible_schemas(live_state.as_ref(), &active_version_id)
-            .await?;
-        let result = {
+        let read_scope = StorageReadScope::new(self.storage.begin_read_transaction().await?);
+        let read_result = async {
+            let mut read_store = read_scope.store();
+            let live_state: Arc<dyn crate::live_state::LiveStateReader> =
+                Arc::new(self.live_state.reader(read_store.clone()));
+            let runtime_functions = FunctionContext::prepare(live_state.as_ref()).await?;
+            let functions = runtime_functions.provider();
+            let active_version_id = self.active_version_id_from_reader(&mut read_store).await?;
+            let visible_schemas = self
+                .schema_registry
+                .visible_schemas(live_state.as_ref(), &active_version_id)
+                .await?;
             let ctx = SessionSqlExecutionContext {
                 active_version_id: &active_version_id,
                 read_store,
@@ -339,13 +338,13 @@ impl SessionContext {
                 functions: functions.clone(),
             };
 
-            match sql2::create_logical_plan(&ctx, sql).await {
-                Ok(plan) => sql2::execute_logical_plan(plan, params).await,
-                Err(error) => Err(error),
-            }
+            let plan = sql2::create_logical_plan(&ctx, sql).await?;
+            let result = sql2::execute_logical_plan(plan, params).await?;
+            drop(ctx);
+            drop(live_state);
+            Ok::<_, LixError>((runtime_functions, result))
         };
-        drop(live_state);
-        let result = match result {
+        let (runtime_functions, result) = match read_result.await {
             Ok(result) => {
                 read_scope.rollback().await?;
                 result

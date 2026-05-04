@@ -9,7 +9,7 @@ pub use error::LixError;
 pub(crate) use fingerprint::stable_content_fingerprint_hex;
 pub(crate) use fs_path::{
     directory_ancestor_paths, directory_name_from_path, normalize_directory_path,
-    parent_directory_path, ParsedFilePath,
+    normalize_path_segment, parent_directory_path, ParsedFilePath,
 };
 pub(crate) use identity::json_pointer_get;
 pub use identity::{

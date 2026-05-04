@@ -27,9 +27,6 @@ pub(crate) mod untracked_state;
 pub(crate) mod version;
 pub mod wasm;
 
-#[cfg(test)]
-mod tests;
-
 pub use schema::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,
     validate_lix_schema_definition,

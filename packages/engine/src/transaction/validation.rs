@@ -3168,7 +3168,11 @@ mod tests {
 
     #[tokio::test]
     async fn validation_allows_pending_file_owner_reference() {
-        let visible_schemas = vec![unique_schema(), file_descriptor_schema()];
+        let visible_schemas = vec![
+            unique_schema(),
+            file_descriptor_schema(),
+            directory_descriptor_schema(),
+        ];
         let staged_writes = StagedWriteSet {
             state_rows: vec![
                 staged_file_descriptor_row("file-a", "version-a"),
@@ -4437,6 +4441,12 @@ mod tests {
     fn file_descriptor_schema() -> JsonValue {
         builtin_schema_definition(FILE_DESCRIPTOR_SCHEMA_KEY)
             .expect("lix_file_descriptor builtin schema should exist")
+            .clone()
+    }
+
+    fn directory_descriptor_schema() -> JsonValue {
+        builtin_schema_definition(DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
+            .expect("lix_directory_descriptor builtin schema should exist")
             .clone()
     }
 

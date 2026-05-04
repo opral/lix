@@ -503,6 +503,86 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_file_insert_rejects_missing_directory_id,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_file (directory_id, name, extension) \
+                 VALUES ('missing-dir', 'readme', 'md')",
+                &[],
+            )
+            .await
+            .expect_err("file insert should reject missing directory_id");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+    }
+);
+
+simulation_test!(
+    lix_file_update_rejects_missing_directory_id_and_preserves_path,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES ('dir-docs', '/docs/')",
+                &[],
+            )
+            .await
+            .expect("directory insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, directory_id, name, extension) \
+                 VALUES ('file-readme', 'dir-docs', 'readme', 'md')",
+                &[],
+            )
+            .await
+            .expect("file insert should succeed");
+
+        let error = session
+            .execute(
+                "UPDATE lix_file SET directory_id = 'missing-dir' WHERE id = 'file-readme'",
+                &[],
+            )
+            .await
+            .expect_err("file update should reject missing directory_id");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+
+        let result = session
+            .execute(
+                "SELECT path, directory_id FROM lix_file WHERE id = 'file-readme'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Text("/docs/readme.md".to_string()),
+                Value::Text("dir-docs".to_string())
+            ]
+        );
+    }
+);
+
+simulation_test!(
     lix_file_path_insert_rejects_dot_segments,
     |sim| async move {
         let engine = sim.boot_engine().await;
