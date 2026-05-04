@@ -199,9 +199,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binary_cas::codec::{
+        binary_blob_hash_bytes, encode_binary_cas_chunk, encode_binary_cas_manifest,
+        encode_binary_cas_manifest_chunk, BinaryCasManifest, BinaryChunkCodec,
+    };
     use crate::binary_cas::kv::{
-        KvBlobManifest, KvBlobManifestChunk, KvChunk, BINARY_CAS_CHUNK_NAMESPACE,
-        BINARY_CAS_MANIFEST_CHUNK_NAMESPACE, BINARY_CAS_MANIFEST_NAMESPACE,
+        BINARY_CAS_CHUNK_NAMESPACE, BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
+        BINARY_CAS_MANIFEST_NAMESPACE,
     };
     use crate::{
         BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup,
@@ -338,31 +342,25 @@ mod tests {
         key: &[u8],
     ) -> Result<Option<Vec<u8>>, LixError> {
         match (namespace, key) {
-            (BINARY_CAS_MANIFEST_NAMESPACE, b"blob-plugin-json") => serde_json::to_vec(
-                &KvBlobManifest {
-                    size_bytes: archive_bytes.len() as u64,
-                    chunk_count: 1,
-                },
-            )
-            .map(Some)
-            .map_err(|error| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("test manifest encode failed: {error}"),
-                )
-            }),
-            (BINARY_CAS_CHUNK_NAMESPACE, b"chunk-plugin-json") => serde_json::to_vec(&KvChunk {
-                codec: "raw".to_string(),
-                codec_dict_id: None,
-                data: archive_bytes.to_vec(),
-            })
-            .map(Some)
-            .map_err(|error| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("test chunk encode failed: {error}"),
-                )
-            }),
+            (BINARY_CAS_MANIFEST_NAMESPACE, key)
+                if key == binary_blob_hash_bytes(archive_bytes).as_slice() =>
+            {
+                Ok(Some(encode_binary_cas_manifest(
+                    &BinaryCasManifest::Chunked {
+                        size_bytes: archive_bytes.len() as u64,
+                        chunk_count: 1,
+                    },
+                )))
+            }
+            (BINARY_CAS_CHUNK_NAMESPACE, key)
+                if key == binary_blob_hash_bytes(archive_bytes).as_slice() =>
+            {
+                Ok(Some(encode_binary_cas_chunk(
+                    BinaryChunkCodec::Raw,
+                    archive_bytes.len() as u64,
+                    archive_bytes,
+                )))
+            }
             _ => Ok(None),
         }
     }
@@ -378,7 +376,10 @@ mod tests {
                 resume_after: None,
             });
         }
-        let key = b"blob-plugin-json/00000000000000000000".to_vec();
+        let blob_hash = binary_blob_hash_bytes(archive_bytes);
+        let chunk_hash = binary_blob_hash_bytes(archive_bytes);
+        let mut key = blob_hash.to_vec();
+        key.extend_from_slice(&0u64.to_be_bytes());
         let include = match request.range {
             BackendKvScanRange::Prefix(prefix) => key.starts_with(&prefix),
             BackendKvScanRange::Range { start, end } => key >= start && key < end,
@@ -390,16 +391,7 @@ mod tests {
                 resume_after: None,
             });
         }
-        let value = serde_json::to_vec(&KvBlobManifestChunk {
-            chunk_hash: "chunk-plugin-json".to_string(),
-            chunk_size: archive_bytes.len() as u64,
-        })
-        .map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("test manifest chunk encode failed: {error}"),
-            )
-        })?;
+        let value = encode_binary_cas_manifest_chunk(&chunk_hash, archive_bytes.len() as u64);
         let mut keys = BytePageBuilder::with_capacity(1, key.len());
         let mut values = BytePageBuilder::with_capacity(1, value.len());
         let mut resume_after = None;
