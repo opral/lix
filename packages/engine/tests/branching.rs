@@ -3,8 +3,8 @@
 mod support;
 use lix_engine::Value;
 use lix_engine::{
-    CreateVersionOptions, Engine, LixError, MergeVersionOptions, MergeVersionOutcome,
-    SwitchVersionOptions,
+    CreateVersionOptions, Engine, LixError, MergeChangeStats, MergeVersionOptions,
+    MergeVersionOutcome, MergeVersionPreviewOptions, SwitchVersionOptions,
 };
 use serde_json::Value as JsonValue;
 
@@ -611,7 +611,7 @@ simulation_test!(
             .expect("merge head resolution should succeed");
 
         assert_eq!(receipt.outcome, MergeVersionOutcome::AlreadyUpToDate);
-        assert_eq!(receipt.applied_change_count, 0);
+        assert_eq!(receipt.change_stats, MergeChangeStats::default());
         assert_eq!(receipt.created_merge_commit_id, None);
         assert_eq!(receipt.target_version_id, sim.main_version_id());
         assert_eq!(receipt.source_version_id, "draft-version");
@@ -656,6 +656,35 @@ simulation_test!(
             .expect("draft head should load")
             .expect("draft head should exist");
 
+        let preview = main
+            .merge_version_preview(MergeVersionPreviewOptions {
+                source_version_id: "draft-version".to_string(),
+            })
+            .await
+            .expect("merge preview should analyze fast-forward");
+        assert_eq!(preview.outcome, MergeVersionOutcome::FastForward);
+        assert_eq!(preview.target_head_commit_id, target_head_before);
+        assert_eq!(preview.source_head_commit_id, source_head);
+        assert_eq!(
+            preview.change_stats,
+            MergeChangeStats {
+                total: 1,
+                added: 1,
+                modified: 0,
+                removed: 0,
+            }
+        );
+        assert_eq!(preview.conflicts.len(), 0);
+        assert_eq!(
+            engine
+                .load_version_head_commit_id(sim.main_version_id())
+                .await
+                .expect("main head should load")
+                .as_deref(),
+            Some(target_head_before.as_str()),
+            "preview should not advance the target ref"
+        );
+
         let receipt = main
             .merge_version(MergeVersionOptions {
                 source_version_id: "draft-version".to_string(),
@@ -663,12 +692,17 @@ simulation_test!(
             .await
             .expect("merge should fast-forward target");
         assert_eq!(receipt.outcome, MergeVersionOutcome::FastForward);
-        assert_eq!(receipt.applied_change_count, 0);
-        assert_eq!(receipt.created_merge_commit_id, None);
         assert_eq!(
-            receipt.merge_base_commit_id.as_deref(),
-            Some(target_head_before.as_str())
+            receipt.change_stats,
+            MergeChangeStats {
+                total: 1,
+                added: 1,
+                modified: 0,
+                removed: 0,
+            }
         );
+        assert_eq!(receipt.created_merge_commit_id, None);
+        assert_eq!(receipt.base_commit_id, target_head_before);
         assert_eq!(receipt.target_head_before_commit_id, target_head_before);
         assert_eq!(receipt.source_head_before_commit_id, source_head);
         assert_eq!(receipt.target_head_after_commit_id, source_head);
@@ -734,7 +768,15 @@ simulation_test!(
             .await
             .expect("merge should apply source change");
         assert_eq!(receipt.outcome, MergeVersionOutcome::MergeCommitted);
-        assert_eq!(receipt.applied_change_count, 1);
+        assert_eq!(
+            receipt.change_stats,
+            MergeChangeStats {
+                total: 1,
+                added: 1,
+                modified: 0,
+                removed: 0,
+            }
+        );
         assert_eq!(receipt.target_head_before_commit_id, target_head_before);
         assert_eq!(receipt.source_head_before_commit_id, source_head);
 
@@ -952,7 +994,7 @@ simulation_test!(
             .expect("merge should apply source delete");
 
         assert_eq!(receipt.outcome, MergeVersionOutcome::FastForward);
-        assert_eq!(receipt.applied_change_count, 0);
+        assert_eq!(receipt.change_stats, MergeChangeStats::default());
         assert_eq!(receipt.created_merge_commit_id, None);
         assert_eq!(receipt.target_head_after_commit_id, source_head);
         assert_key_value(&main, "shared-before-branch", None).await;
@@ -985,7 +1027,7 @@ simulation_test!(
             .expect("convergent delete merge should succeed");
 
         assert_eq!(receipt.outcome, MergeVersionOutcome::MergeCommitted);
-        assert_eq!(receipt.applied_change_count, 0);
+        assert_eq!(receipt.change_stats, MergeChangeStats::default());
         let merge_commit_id = receipt
             .created_merge_commit_id
             .clone()
@@ -1117,7 +1159,7 @@ simulation_test!(
             .expect("convergent update merge should succeed");
 
         assert_eq!(receipt.outcome, MergeVersionOutcome::MergeCommitted);
-        assert_eq!(receipt.applied_change_count, 0);
+        assert_eq!(receipt.change_stats, MergeChangeStats::default());
         let merge_commit_id = receipt
             .created_merge_commit_id
             .clone()
@@ -1217,7 +1259,7 @@ simulation_test!(
             .expect("convergent independent add merge should succeed");
 
         assert_eq!(receipt.outcome, MergeVersionOutcome::MergeCommitted);
-        assert_eq!(receipt.applied_change_count, 0);
+        assert_eq!(receipt.change_stats, MergeChangeStats::default());
         let merge_commit_id = receipt
             .created_merge_commit_id
             .clone()
@@ -1524,15 +1566,19 @@ fn assert_merge_conflict_error(error: &lix_engine::LixError) {
     assert_eq!(conflicts.len(), 1);
     let conflict = &conflicts[0];
     assert_eq!(
-        conflict.get("schema_key").and_then(JsonValue::as_str),
+        conflict.get("kind").and_then(JsonValue::as_str),
+        Some("sameEntityChanged")
+    );
+    assert_eq!(
+        conflict.get("schemaKey").and_then(JsonValue::as_str),
         Some("lix_key_value")
     );
     assert!(
         conflict
-            .get("entity_id")
+            .get("entityId")
             .and_then(JsonValue::as_str)
             .is_some(),
-        "conflict should include entity_id: {conflict:?}"
+        "conflict should include entityId: {conflict:?}"
     );
     assert!(
         conflict.get("target").is_some(),
