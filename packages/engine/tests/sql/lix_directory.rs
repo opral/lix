@@ -26,7 +26,7 @@ simulation_test!(
             (
                 "dir-percent-bidi",
                 "/docs/%E2%80%AEevil/",
-                "LIX_ERROR_PATH_INVALID_IRI_CODE_POINT",
+                "LIX_ERROR_PATH_INVALID_SEGMENT_CODE_POINT",
             ),
         ] {
             let error = session
@@ -434,7 +434,7 @@ simulation_test!(
             )
             .await
             .expect_err("descriptor name should reject zero-width characters");
-        assert_eq!(zero_width.code, "LIX_ERROR_PATH_INVALID_IRI_CODE_POINT");
+        assert_eq!(zero_width.code, "LIX_ERROR_PATH_INVALID_SEGMENT_CODE_POINT");
     }
 );
 
