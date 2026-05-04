@@ -994,7 +994,15 @@ simulation_test!(
             .expect("merge should apply source delete");
 
         assert_eq!(receipt.outcome, MergeVersionOutcome::FastForward);
-        assert_eq!(receipt.change_stats, MergeChangeStats::default());
+        assert_eq!(
+            receipt.change_stats,
+            MergeChangeStats {
+                total: 1,
+                added: 0,
+                modified: 0,
+                removed: 1,
+            }
+        );
         assert_eq!(receipt.created_merge_commit_id, None);
         assert_eq!(receipt.target_head_after_commit_id, source_head);
         assert_key_value(&main, "shared-before-branch", None).await;
