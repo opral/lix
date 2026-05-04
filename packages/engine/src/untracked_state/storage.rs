@@ -83,18 +83,15 @@ pub(crate) async fn delete_rows(
 async fn scan_all_untracked_rows(
     store: &mut impl StorageReader,
 ) -> Result<Vec<UntrackedStateRow>, LixError> {
-    store
+    let page = store
         .scan_values(KvScanRequest {
             namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
             range: KvScanRange::prefix(Vec::new()),
             after: None,
             limit: usize::MAX,
         })
-        .await?
-        .values
-        .into_iter()
-        .map(|value| decode_untracked_state_row(&value))
-        .collect()
+        .await?;
+    page.values.iter().map(decode_untracked_state_row).collect()
 }
 
 fn row_matches_scan(row: &UntrackedStateRow, request: &UntrackedStateScanRequest) -> bool {

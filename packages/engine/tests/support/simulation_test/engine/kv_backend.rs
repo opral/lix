@@ -3,11 +3,11 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lix_engine::{
-    Backend, BackendKvEntry, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup,
-    BackendKvGetGroup, BackendKvGetRequest, BackendKvKeyPage, BackendKvPut, BackendKvScanRange,
-    BackendKvScanRequest, BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage,
-    BackendKvWriteBatch, BackendKvWriteGroup, BackendKvWriteStats, BackendReadTransaction,
-    BackendWriteTransaction, LixError,
+    Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetGroup,
+    BackendKvGetRequest, BackendKvKeyPage, BackendKvPut, BackendKvScanRange, BackendKvScanRequest,
+    BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
+    BackendKvWriteGroup, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
+    BytePageBuilder, LixError,
 };
 
 pub(crate) type KvKey = (String, Vec<u8>);
@@ -125,7 +125,7 @@ impl BackendReadTransaction for InMemoryKvTransaction {
     ) -> Result<BackendKvKeyPage, LixError> {
         let entries = self.scan_visible_entries(request)?;
         Ok(BackendKvKeyPage {
-            keys: entries.entries.into_iter().map(|entry| entry.key).collect(),
+            keys: entries.keys,
             resume_after: entries.resume_after,
         })
     }
@@ -136,11 +136,7 @@ impl BackendReadTransaction for InMemoryKvTransaction {
     ) -> Result<BackendKvValuePage, LixError> {
         let entries = self.scan_visible_entries(request)?;
         Ok(BackendKvValuePage {
-            values: entries
-                .entries
-                .into_iter()
-                .map(|entry| entry.value)
-                .collect(),
+            values: entries.values,
             resume_after: entries.resume_after,
         })
     }
@@ -249,12 +245,15 @@ fn scan_map(map: &KvMap, request: &BackendKvScanRequest) -> BackendKvEntryPage {
     let resume_after = has_more
         .then(|| pairs.last().map(|(key, _)| key.clone()))
         .flatten();
-    let entries = pairs
-        .into_iter()
-        .map(|(key, value)| BackendKvEntry { key, value })
-        .collect();
+    let mut keys = BytePageBuilder::with_capacity(pairs.len(), 0);
+    let mut values = BytePageBuilder::with_capacity(pairs.len(), 0);
+    for (key, value) in pairs {
+        keys.push(key);
+        values.push(value);
+    }
     BackendKvEntryPage {
-        entries,
+        keys: keys.finish(),
+        values: values.finish(),
         resume_after,
     }
 }
@@ -412,9 +411,9 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(rows.entries[0].key, b"a".to_vec());
-        assert_eq!(rows.entries[0].value, b"new".to_vec());
-        assert_eq!(rows.entries[1].key, b"c".to_vec());
-        assert_eq!(rows.entries[1].value, b"three".to_vec());
+        assert_eq!(rows.key(0).expect("key exists"), b"a");
+        assert_eq!(rows.value(0).expect("value exists"), b"new");
+        assert_eq!(rows.key(1).expect("key exists"), b"c");
+        assert_eq!(rows.value(1).expect("value exists"), b"three");
     }
 }

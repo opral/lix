@@ -1,3 +1,92 @@
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BytePage {
+    bytes: Vec<u8>,
+    offsets: Vec<u32>,
+}
+
+impl BytePage {
+    pub fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            offsets: vec![0],
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, index: usize) -> Option<&[u8]> {
+        let start = usize::try_from(*self.offsets.get(index)?).ok()?;
+        let end = usize::try_from(*self.offsets.get(index + 1)?).ok()?;
+        self.bytes.get(start..end)
+    }
+
+    pub fn iter(&self) -> BytePageIter<'_> {
+        BytePageIter {
+            page: self,
+            index: 0,
+        }
+    }
+}
+
+pub struct BytePageIter<'a> {
+    page: &'a BytePage,
+    index: usize,
+}
+
+impl<'a> Iterator for BytePageIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let value = self.page.get(self.index)?;
+        self.index += 1;
+        Some(value)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BytePageBuilder {
+    bytes: Vec<u8>,
+    offsets: Vec<u32>,
+}
+
+impl BytePageBuilder {
+    pub fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            offsets: vec![0],
+        }
+    }
+
+    pub fn with_capacity(items: usize, bytes: usize) -> Self {
+        let mut offsets = Vec::with_capacity(items.saturating_add(1));
+        offsets.push(0);
+        Self {
+            bytes: Vec::with_capacity(bytes),
+            offsets,
+        }
+    }
+
+    pub fn push(&mut self, value: impl AsRef<[u8]>) {
+        let value = value.as_ref();
+        self.bytes.extend_from_slice(value);
+        let end = u32::try_from(self.bytes.len()).expect("byte page exceeds u32 offset capacity");
+        self.offsets.push(end);
+    }
+
+    pub fn finish(self) -> BytePage {
+        BytePage {
+            bytes: self.bytes,
+            offsets: self.offsets,
+        }
+    }
+}
+
 /// Ordered byte range for backend KV scans.
 ///
 /// Ranges are half-open: `start <= key < end`. `Prefix` is explicit because it
@@ -71,26 +160,39 @@ pub struct BackendKvScanRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendKvKeyPage {
-    pub keys: Vec<Vec<u8>>,
+    pub keys: BytePage,
     pub resume_after: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendKvValuePage {
-    pub values: Vec<Vec<u8>>,
+    pub values: BytePage,
     pub resume_after: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendKvEntryPage {
-    pub entries: Vec<BackendKvEntry>,
+    pub keys: BytePage,
+    pub values: BytePage,
     pub resume_after: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendKvEntry {
-    pub key: Vec<u8>,
-    pub value: Vec<u8>,
+impl BackendKvEntryPage {
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    pub fn key(&self, index: usize) -> Option<&[u8]> {
+        self.keys.get(index)
+    }
+
+    pub fn value(&self, index: usize) -> Option<&[u8]> {
+        self.values.get(index)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 use lix_engine::{
-    Backend, BackendKvEntry, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup,
-    BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest,
-    BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, LixError,
+    Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetRequest,
+    BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch,
+    BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteStats,
+    BackendReadTransaction, BackendWriteTransaction, BytePageBuilder, LixError,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -159,7 +159,9 @@ impl BenchTransaction {
 fn scan_store_keys(store: &Store, request: BackendKvScanRequest) -> BackendKvKeyPage {
     let start_key = scan_start_key(&request);
     let lower_bound = (request.namespace.clone(), start_key);
-    let mut keys = Vec::new();
+    let mut keys = BytePageBuilder::new();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
     for ((row_namespace, key), _value) in store.range(lower_bound..) {
         if row_namespace != &request.namespace {
             break;
@@ -172,21 +174,29 @@ fn scan_store_keys(store: &Store, request: BackendKvScanRequest) -> BackendKvKey
         if !key_matches_range(key, &request.range) {
             break;
         }
-        keys.push(key.clone());
-        if keys.len() > request.limit {
+        if count < request.limit {
+            resume_after_candidate = Some(key.clone());
+            keys.push(key);
+        }
+        count += 1;
+        if count > request.limit {
             break;
         }
     }
-    let has_more = keys.len() > request.limit;
-    keys.truncate(request.limit);
-    let resume_after = has_more.then(|| keys.last().cloned()).flatten();
-    BackendKvKeyPage { keys, resume_after }
+    let resume_after = (count > request.limit)
+        .then_some(resume_after_candidate)
+        .flatten();
+    BackendKvKeyPage {
+        keys: keys.finish(),
+        resume_after,
+    }
 }
 
 fn scan_store_values(store: &Store, request: BackendKvScanRequest) -> BackendKvValuePage {
     let start_key = scan_start_key(&request);
     let lower_bound = (request.namespace.clone(), start_key);
-    let mut values = Vec::new();
+    let mut values = BytePageBuilder::new();
+    let mut count = 0;
     let mut resume_after_candidate = None;
     for ((row_namespace, key), value) in store.range(lower_bound..) {
         if row_namespace != &request.namespace {
@@ -200,19 +210,20 @@ fn scan_store_values(store: &Store, request: BackendKvScanRequest) -> BackendKvV
         if !key_matches_range(key, &request.range) {
             break;
         }
-        if values.len() < request.limit {
+        if count < request.limit {
             resume_after_candidate = Some(key.clone());
+            values.push(value);
         }
-        values.push(value.clone());
-        if values.len() > request.limit {
+        count += 1;
+        if count > request.limit {
             break;
         }
     }
-    let has_more = values.len() > request.limit;
-    values.truncate(request.limit);
-    let resume_after = has_more.then_some(resume_after_candidate).flatten();
+    let resume_after = (count > request.limit)
+        .then_some(resume_after_candidate)
+        .flatten();
     BackendKvValuePage {
-        values,
+        values: values.finish(),
         resume_after,
     }
 }
@@ -220,7 +231,10 @@ fn scan_store_values(store: &Store, request: BackendKvScanRequest) -> BackendKvV
 fn scan_store_entries(store: &Store, request: BackendKvScanRequest) -> BackendKvEntryPage {
     let start_key = scan_start_key(&request);
     let lower_bound = (request.namespace.clone(), start_key);
-    let mut entries = Vec::new();
+    let mut keys = BytePageBuilder::new();
+    let mut values = BytePageBuilder::new();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
     for ((row_namespace, key), value) in store.range(lower_bound..) {
         if row_namespace != &request.namespace {
             break;
@@ -233,21 +247,22 @@ fn scan_store_entries(store: &Store, request: BackendKvScanRequest) -> BackendKv
         if !key_matches_range(key, &request.range) {
             break;
         }
-        entries.push(BackendKvEntry {
-            key: key.clone(),
-            value: value.clone(),
-        });
-        if entries.len() > request.limit {
+        if count < request.limit {
+            resume_after_candidate = Some(key.clone());
+            keys.push(key);
+            values.push(value);
+        }
+        count += 1;
+        if count > request.limit {
             break;
         }
     }
-    let has_more = entries.len() > request.limit;
-    entries.truncate(request.limit);
-    let resume_after = has_more
-        .then(|| entries.last().map(|entry| entry.key.clone()))
+    let resume_after = (count > request.limit)
+        .then_some(resume_after_candidate)
         .flatten();
     BackendKvEntryPage {
-        entries,
+        keys: keys.finish(),
+        values: values.finish(),
         resume_after,
     }
 }
