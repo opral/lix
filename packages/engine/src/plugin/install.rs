@@ -216,7 +216,6 @@ fn prepare_plugin_archive_write_statement(
     let descriptor = PlannedFilesystemDescriptor {
         directory_id: plugin_directory_id.to_string(),
         name: parsed_path.name.clone(),
-        extension: parsed_path.extension.clone(),
         metadata: None,
         hidden: false,
     };
@@ -310,7 +309,6 @@ fn plugin_archive_file_descriptor_row(
         "id": archive_id,
         "directory_id": descriptor.directory_id,
         "name": descriptor.name,
-        "extension": descriptor.extension,
         "hidden": descriptor.hidden,
     })
     .to_string();

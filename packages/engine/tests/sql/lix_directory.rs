@@ -222,8 +222,8 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, directory_id, name, extension) \
-                 VALUES ('file-foo', NULL, 'foo', NULL)",
+                "INSERT INTO lix_file (id, directory_id, name) \
+                 VALUES ('file-foo', NULL, 'foo')",
                 &[],
             )
             .await

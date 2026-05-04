@@ -49,7 +49,7 @@ const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
 use super::filesystem_planner::{
     blob_ref_row, directory_path_resolvers_from_state_rows, file_descriptor_row,
-    file_descriptor_write_row, file_entry_name, filesystem_storage_scope_key, plan_file_delete,
+    file_descriptor_write_row, filesystem_storage_scope_key, plan_file_delete,
     plan_file_path_update, BlobRefRowInput, DirectoryPathResolver, FileDeleteInput,
     FileDescriptorRowInput, FileDescriptorWriteIntent, FilePathWriteInput, FilesystemDeletePlan,
     FilesystemRowContext,
@@ -930,7 +930,6 @@ struct FileDescriptorRecord {
     id: String,
     directory_id: Option<String>,
     name: String,
-    extension: Option<String>,
     hidden: bool,
     live: LiveStateRow,
 }
@@ -953,7 +952,6 @@ struct FileDescriptorSnapshot {
     id: String,
     directory_id: Option<String>,
     name: String,
-    extension: Option<String>,
     hidden: bool,
 }
 
@@ -1111,18 +1109,12 @@ fn lix_file_existing_update_stage_from_batch(
             let directory_id =
                 update_optional_string_value(batch, assignment_values, row_index, "directory_id")?;
             let name = update_required_string_value(batch, assignment_values, row_index, "name")?;
-            let extension =
-                update_optional_string_value(batch, assignment_values, row_index, "extension")?;
             if let Some(path_resolvers) = path_resolvers.as_deref_mut() {
                 let resolver = path_resolvers
                     .entry(file_path_resolver_key(&context))
                     .or_insert_with(DirectoryPathResolver::default);
                 resolver
-                    .reserve_file(
-                        directory_id.clone(),
-                        file_entry_name(&name, extension.as_deref()),
-                        id.clone(),
-                    )
+                    .reserve_file(directory_id.clone(), name.clone(), id.clone())
                     .map_err(lix_error_to_datafusion_error)?;
             }
             staged
@@ -1131,7 +1123,6 @@ fn lix_file_existing_update_stage_from_batch(
                     id: id.clone(),
                     directory_id,
                     name,
-                    extension,
                     hidden,
                     context: context.clone(),
                 }));
@@ -1326,7 +1317,6 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
         if let Some(path) = path {
             reject_read_only_lix_file_insert_field(batch, row_index, "directory_id")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "name")?;
-            reject_read_only_lix_file_insert_field(batch, row_index, "extension")?;
 
             let Some(path_resolvers) = path_resolvers.as_deref_mut() else {
                 return Err(DataFusionError::Execution(
@@ -1359,7 +1349,6 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 
         let directory_id = optional_string_value(batch, row_index, "directory_id")?;
         let name = required_string_value(batch, row_index, "name")?;
-        let extension = optional_string_value(batch, row_index, "extension")?;
 
         let id = if data.is_some() {
             match id {
@@ -1384,11 +1373,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                         .entry(file_path_resolver_key(&context))
                         .or_insert_with(DirectoryPathResolver::default);
                     resolver
-                        .reserve_file(
-                            directory_id.clone(),
-                            file_entry_name(&name, extension.as_deref()),
-                            file_id.clone(),
-                        )
+                        .reserve_file(directory_id.clone(), name.clone(), file_id.clone())
                         .map_err(lix_error_to_datafusion_error)?;
                 }
             }
@@ -1398,7 +1383,6 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                     id: id.clone(),
                     directory_id: directory_id.clone(),
                     name: name.clone(),
-                    extension: extension.clone(),
                     hidden,
                     context: context.clone(),
                 }));
@@ -1578,7 +1562,6 @@ async fn lix_file_record_batch(
                         id: snapshot.id,
                         directory_id: snapshot.directory_id,
                         name: snapshot.name,
-                        extension: snapshot.extension,
                         hidden: snapshot.hidden,
                         live: row,
                     },
@@ -1629,7 +1612,6 @@ async fn lix_file_record_batch(
     let mut paths = Vec::new();
     let mut directory_ids = Vec::new();
     let mut names = Vec::new();
-    let mut extensions = Vec::new();
     let mut hiddens = Vec::new();
     let mut data_values = Vec::new();
     let mut entity_ids = Vec::new();
@@ -1662,13 +1644,9 @@ async fn lix_file_record_batch(
             }
             None => None,
         };
-        let filename = match file.extension.as_deref() {
-            Some(extension) if !extension.is_empty() => format!("{}.{}", file.name, extension),
-            _ => file.name.clone(),
-        };
         let path = match directory_path {
-            Some(directory_path) => format!("{directory_path}{filename}"),
-            None => format!("/{filename}"),
+            Some(directory_path) => format!("{directory_path}{}", file.name),
+            None => format!("/{}", file.name),
         };
         let data = if needs_data {
             match blob_rows.get(&(version_id.clone(), file.id.clone())) {
@@ -1687,7 +1665,6 @@ async fn lix_file_record_batch(
         paths.push(Some(path));
         directory_ids.push(file.directory_id);
         names.push(Some(file.name));
-        extensions.push(file.extension);
         hiddens.push(Some(file.hidden));
         data_values.push(data);
         entity_ids.push(Some(file.live.entity_id.as_string()?));
@@ -1711,7 +1688,6 @@ async fn lix_file_record_batch(
             "path" => Arc::new(StringArray::from(paths.clone())),
             "directory_id" => Arc::new(StringArray::from(directory_ids.clone())),
             "name" => Arc::new(StringArray::from(names.clone())),
-            "extension" => Arc::new(StringArray::from(extensions.clone())),
             "hidden" => Arc::new(BooleanArray::from(hiddens.clone())),
             "data" => Arc::new(BinaryArray::from(
                 data_values
@@ -1870,7 +1846,7 @@ fn validate_lix_file_update_assignments(
         })?;
         if !matches!(
             column_name.as_str(),
-            "path" | "directory_id" | "name" | "extension" | "hidden" | "data" | "lixcol_metadata"
+            "path" | "directory_id" | "name" | "hidden" | "data" | "lixcol_metadata"
         ) {
             return Err(DataFusionError::Execution(format!(
                 "UPDATE lix_file cannot stage read-only column '{column_name}'"
@@ -2130,7 +2106,6 @@ fn lix_file_schema() -> SchemaRef {
         Field::new("path", DataType::Utf8, false),
         Field::new("directory_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
-        Field::new("extension", DataType::Utf8, true),
         Field::new("hidden", DataType::Boolean, true),
         Field::new("data", DataType::Binary, true),
         Field::new("lixcol_entity_id", DataType::Utf8, false),
@@ -2225,7 +2200,7 @@ mod tests {
             columns.push("data");
         }
         if update_columns.descriptor {
-            columns.extend(["directory_id", "name", "extension", "hidden"]);
+            columns.extend(["directory_id", "name", "hidden"]);
         }
         let assignment_values = super::UpdateAssignmentValues::from_batch_columns(batch, &columns);
         super::lix_file_update_stage_from_batch(
@@ -2368,7 +2343,6 @@ mod tests {
             Field::new("id", DataType::Utf8, false),
             Field::new("directory_id", DataType::Utf8, true),
             Field::new("name", DataType::Utf8, false),
-            Field::new("extension", DataType::Utf8, true),
             Field::new("hidden", DataType::Boolean, false),
             Field::new("lixcol_global", DataType::Boolean, false),
             Field::new("lixcol_metadata", DataType::Utf8, true),
@@ -2376,8 +2350,7 @@ mod tests {
         let mut columns = vec![
             string_column(vec![Some("file-readme")]),
             string_column(vec![Some("dir-docs")]),
-            string_column(vec![Some("readme")]),
-            string_column(vec![Some("md")]),
+            string_column(vec![Some("readme.md")]),
             Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
             Arc::new(BooleanArray::from(vec![global])) as ArrayRef,
             string_column(vec![Some("{\"source\":\"file\"}")]),
@@ -2395,7 +2368,6 @@ mod tests {
                 Field::new("id", DataType::Utf8, false),
                 Field::new("directory_id", DataType::Utf8, true),
                 Field::new("name", DataType::Utf8, false),
-                Field::new("extension", DataType::Utf8, true),
                 Field::new("hidden", DataType::Boolean, false),
                 Field::new("data", DataType::Binary, true),
                 Field::new("lixcol_version_id", DataType::Utf8, false),
@@ -2403,8 +2375,7 @@ mod tests {
             vec![
                 string_column(vec![Some("file-readme")]),
                 string_column(vec![Some("dir-docs")]),
-                string_column(vec![Some("readme")]),
-                string_column(vec![Some("md")]),
+                string_column(vec![Some("readme.md")]),
                 Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
                 Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
                 string_column(vec![Some("version-b")]),
@@ -2516,7 +2487,7 @@ mod tests {
             vec![live_file_row(
                 "file-readme",
                 "version-b",
-                "{\"id\":\"file-readme\",\"directory_id\":\"missing-dir\",\"name\":\"readme\",\"extension\":\"md\",\"hidden\":false}",
+                "{\"id\":\"file-readme\",\"directory_id\":\"missing-dir\",\"name\":\"readme.md\",\"hidden\":false}",
             )],
         )
         .await
@@ -2548,8 +2519,7 @@ mod tests {
                 .expect("descriptor snapshot JSON");
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-docs");
-        assert_eq!(snapshot["name"], "readme");
-        assert_eq!(snapshot["extension"], "md");
+        assert_eq!(snapshot["name"], "readme.md");
         assert_eq!(snapshot["hidden"], false);
     }
 
@@ -2624,8 +2594,7 @@ mod tests {
                 .expect("descriptor snapshot JSON");
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-docs");
-        assert_eq!(snapshot["name"], "renamed");
-        assert_eq!(snapshot["extension"], "md");
+        assert_eq!(snapshot["name"], "renamed.md");
         assert_eq!(snapshot["hidden"], false);
     }
 
@@ -2706,8 +2675,7 @@ mod tests {
             serde_json::from_str(staged.state_rows[0].snapshot_content.as_deref().unwrap())
                 .expect("descriptor snapshot JSON");
         assert_eq!(snapshot["directory_id"], "dir-docs");
-        assert_eq!(snapshot["name"], "renamed");
-        assert_eq!(snapshot["extension"], "md");
+        assert_eq!(snapshot["name"], "renamed.md");
     }
 
     #[tokio::test]
@@ -2951,8 +2919,7 @@ mod tests {
                 .expect("descriptor snapshot JSON");
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-guides");
-        assert_eq!(snapshot["name"], "readme");
-        assert_eq!(snapshot["extension"], "md");
+        assert_eq!(snapshot["name"], "readme.md");
     }
 
     #[test]

@@ -80,7 +80,6 @@ pub(crate) struct FileDescriptorRowInput {
     pub(crate) id: String,
     pub(crate) directory_id: Option<String>,
     pub(crate) name: String,
-    pub(crate) extension: Option<String>,
     pub(crate) hidden: bool,
     pub(crate) context: FilesystemRowContext,
 }
@@ -99,7 +98,6 @@ pub(crate) struct FileDescriptorWriteIntent {
     pub(crate) id: Option<String>,
     pub(crate) directory_id: Option<String>,
     pub(crate) name: String,
-    pub(crate) extension: Option<String>,
     pub(crate) hidden: Option<bool>,
     pub(crate) context: FilesystemRowContext,
 }
@@ -145,7 +143,6 @@ struct FileDescriptorSnapshot {
     id: String,
     directory_id: Option<String>,
     name: String,
-    extension: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -405,13 +402,6 @@ fn filesystem_namespace_conflict_error(
     )
 }
 
-pub(crate) fn file_entry_name(name: &str, extension: Option<&str>) -> String {
-    match extension {
-        Some(extension) => format!("{name}.{extension}"),
-        None => name.to_string(),
-    }
-}
-
 pub(crate) fn directory_descriptor_row(input: DirectoryDescriptorRowInput) -> StageRow {
     directory_descriptor_write_row(DirectoryDescriptorWriteIntent {
         id: Some(input.id),
@@ -427,7 +417,6 @@ pub(crate) fn file_descriptor_row(input: FileDescriptorRowInput) -> StageRow {
         id: Some(input.id),
         directory_id: input.directory_id,
         name: input.name,
-        extension: input.extension,
         hidden: Some(input.hidden),
         context: input.context,
     })
@@ -474,14 +463,6 @@ pub(crate) fn file_descriptor_write_row(input: FileDescriptorWriteIntent) -> Sta
             .unwrap_or(JsonValue::Null),
     );
     snapshot.insert("name".to_string(), JsonValue::String(input.name));
-    snapshot.insert(
-        "extension".to_string(),
-        input
-            .extension
-            .clone()
-            .map(JsonValue::String)
-            .unwrap_or(JsonValue::Null),
-    );
     if let Some(hidden) = input.hidden {
         snapshot.insert("hidden".to_string(), JsonValue::Bool(hidden));
     }
@@ -548,13 +529,11 @@ pub(crate) fn plan_file_path_write(
         None => None,
     };
 
-    let entry_name = file_entry_name(&parsed.name, parsed.extension.as_deref());
-    resolver.reserve_file(directory_id.clone(), entry_name, file_id.clone())?;
+    resolver.reserve_file(directory_id.clone(), parsed.name.clone(), file_id.clone())?;
     rows.push(file_descriptor_row(FileDescriptorRowInput {
         id: file_id.clone(),
         directory_id,
         name: parsed.name.clone(),
-        extension: parsed.extension.clone(),
         hidden: input.hidden.unwrap_or(false),
         context: input.context.clone(),
     }));
@@ -612,13 +591,15 @@ pub(crate) fn plan_file_path_update(
         None => None,
     };
 
-    let entry_name = file_entry_name(&parsed.name, parsed.extension.as_deref());
-    resolver.reserve_file(directory_id.clone(), entry_name, existing_file_id.clone())?;
+    resolver.reserve_file(
+        directory_id.clone(),
+        parsed.name.clone(),
+        existing_file_id.clone(),
+    )?;
     rows.push(file_descriptor_row(FileDescriptorRowInput {
         id: existing_file_id,
         directory_id,
         name: parsed.name.clone(),
-        extension: parsed.extension.clone(),
         hidden: existing_hidden,
         context,
     }));
@@ -734,10 +715,9 @@ pub(crate) fn directory_path_resolvers_from_state_rows(
                             format!("invalid lix_file_descriptor snapshot JSON: {error}"),
                         )
                     })?;
-                let entry_name = file_entry_name(&snapshot.name, snapshot.extension.as_deref());
                 file_rows.entry(resolver_key).or_default().push((
                     snapshot.directory_id,
-                    entry_name,
+                    snapshot.name,
                     snapshot.id,
                 ));
             }
@@ -976,8 +956,7 @@ mod tests {
         let row = file_descriptor_row(FileDescriptorRowInput {
             id: "file-readme".to_string(),
             directory_id: Some("dir-docs".to_string()),
-            name: "readme".to_string(),
-            extension: Some("md".to_string()),
+            name: "readme.md".to_string(),
             hidden: false,
             context: FilesystemRowContext::active_version("version-a"),
         });
@@ -993,8 +972,7 @@ mod tests {
         let snapshot: JsonValue =
             serde_json::from_str(row.snapshot_content.as_deref().unwrap()).unwrap();
         assert_eq!(snapshot["directory_id"], "dir-docs");
-        assert_eq!(snapshot["name"], "readme");
-        assert_eq!(snapshot["extension"], "md");
+        assert_eq!(snapshot["name"], "readme.md");
     }
 
     #[test]
@@ -1188,8 +1166,7 @@ mod tests {
             serde_json::from_str(file_row.snapshot_content.as_deref().unwrap()).unwrap();
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-generated-guides");
-        assert_eq!(snapshot["name"], "readme");
-        assert_eq!(snapshot["extension"], "md");
+        assert_eq!(snapshot["name"], "readme.md");
     }
 
     #[test]
@@ -1260,8 +1237,7 @@ mod tests {
             serde_json::from_str(plan.rows[0].snapshot_content.as_deref().unwrap()).unwrap();
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-docs");
-        assert_eq!(snapshot["name"], "renamed");
-        assert_eq!(snapshot["extension"], "md");
+        assert_eq!(snapshot["name"], "renamed.md");
         assert_eq!(snapshot["hidden"], false);
     }
 
@@ -1304,8 +1280,7 @@ mod tests {
         let snapshot: JsonValue =
             serde_json::from_str(file_row.snapshot_content.as_deref().unwrap()).unwrap();
         assert_eq!(snapshot["directory_id"], "dir-generated-guides");
-        assert_eq!(snapshot["name"], "readme");
-        assert_eq!(snapshot["extension"], "md");
+        assert_eq!(snapshot["name"], "readme.md");
         assert_eq!(snapshot["hidden"], true);
     }
 
@@ -1512,7 +1487,6 @@ mod tests {
             id: id.to_string(),
             directory_id: directory_id.map(ToOwned::to_owned),
             name: name.to_string(),
-            extension: None,
             hidden: false,
             context,
         }

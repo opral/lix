@@ -5,6 +5,212 @@ use lix_engine::Value;
 use super::assert_rows_eq;
 
 simulation_test!(
+    lix_file_path_insert_preserves_opaque_file_name_segments,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        for (id, path) in [
+            ("file-foo-dot", "/foo."),
+            ("file-foo-dot-dot", "/foo.."),
+            ("file-foo-dot-dot-dot", "/foo..."),
+            ("file-archive", "/archive.tar.gz"),
+            ("file-dotenv", "/.env"),
+            ("file-percent-dot", "/docs/%2Ehidden"),
+        ] {
+            session
+                .execute(
+                    &format!("INSERT INTO lix_file (id, path) VALUES ('{id}', '{path}')"),
+                    &[],
+                )
+                .await
+                .expect("opaque file name insert should succeed");
+        }
+
+        let result = session
+            .execute(
+                "SELECT id, path, name \
+                 FROM lix_file \
+                 WHERE id IN (\
+                   'file-foo-dot',\
+                   'file-foo-dot-dot',\
+                   'file-foo-dot-dot-dot',\
+                   'file-archive',\
+                   'file-dotenv',\
+                   'file-percent-dot'\
+                 ) \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+
+        assert_rows_eq(
+            result,
+            vec![
+                vec![
+                    Value::Text("file-archive".to_string()),
+                    Value::Text("/archive.tar.gz".to_string()),
+                    Value::Text("archive.tar.gz".to_string()),
+                ],
+                vec![
+                    Value::Text("file-dotenv".to_string()),
+                    Value::Text("/.env".to_string()),
+                    Value::Text(".env".to_string()),
+                ],
+                vec![
+                    Value::Text("file-foo-dot".to_string()),
+                    Value::Text("/foo.".to_string()),
+                    Value::Text("foo.".to_string()),
+                ],
+                vec![
+                    Value::Text("file-foo-dot-dot".to_string()),
+                    Value::Text("/foo..".to_string()),
+                    Value::Text("foo..".to_string()),
+                ],
+                vec![
+                    Value::Text("file-foo-dot-dot-dot".to_string()),
+                    Value::Text("/foo...".to_string()),
+                    Value::Text("foo...".to_string()),
+                ],
+                vec![
+                    Value::Text("file-percent-dot".to_string()),
+                    Value::Text("/docs/.hidden".to_string()),
+                    Value::Text(".hidden".to_string()),
+                ],
+            ],
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_descriptor_shape_insert_uses_name_as_full_basename,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, directory_id, name) \
+                 VALUES ('file-descriptor-dot', NULL, 'foo.')",
+                &[],
+            )
+            .await
+            .expect("descriptor-shaped insert should accept full opaque basename");
+
+        let result = session
+            .execute(
+                "SELECT id, path, name \
+                 FROM lix_file \
+                 WHERE id = 'file-descriptor-dot'",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+
+        assert_rows_eq(
+            result,
+            vec![vec![
+                Value::Text("file-descriptor-dot".to_string()),
+                Value::Text("/foo.".to_string()),
+                Value::Text("foo.".to_string()),
+            ]],
+        );
+    }
+);
+
+simulation_test!(
+    lix_file_extension_column_is_not_writable_identity,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, directory_id, name, extension) \
+                 VALUES ('file-extension-write', NULL, 'readme', 'md')",
+                &[],
+            )
+            .await
+            .expect_err("extension should not be accepted as writable file identity");
+    }
+);
+
+simulation_test!(
+    lix_file_namespace_treats_trailing_dot_names_as_distinct,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ('file-foo', '/foo')",
+                &[],
+            )
+            .await
+            .expect("plain file insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES ('file-foo-dot', '/foo.')",
+                &[],
+            )
+            .await
+            .expect("trailing-dot file insert should be distinct from plain name");
+
+        let result = session
+            .execute(
+                "SELECT id, path, name \
+                 FROM lix_file \
+                 WHERE id IN ('file-foo', 'file-foo-dot') \
+                 ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("file read should succeed");
+
+        assert_rows_eq(
+            result,
+            vec![
+                vec![
+                    Value::Text("file-foo".to_string()),
+                    Value::Text("/foo".to_string()),
+                    Value::Text("foo".to_string()),
+                ],
+                vec![
+                    Value::Text("file-foo-dot".to_string()),
+                    Value::Text("/foo.".to_string()),
+                    Value::Text("foo.".to_string()),
+                ],
+            ],
+        );
+    }
+);
+
+simulation_test!(
     lix_file_insert_reads_path_data_and_parent_dirs,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -105,8 +311,8 @@ simulation_test!(lix_file_insert_applies_defaulted_id, |sim| async move {
 
     let insert_result = session
         .execute(
-            "INSERT INTO lix_file (directory_id, name, extension) \
-             VALUES ('dir-docs', 'readme', 'md')",
+            "INSERT INTO lix_file (directory_id, name) \
+             VALUES ('dir-docs', 'readme.md')",
             &[],
         )
         .await
@@ -115,7 +321,7 @@ simulation_test!(lix_file_insert_applies_defaulted_id, |sim| async move {
 
     let result = session
         .execute(
-            "SELECT id, path, directory_id, name, extension, hidden \
+            "SELECT id, path, directory_id, name, hidden \
              FROM lix_file \
              WHERE path = '/docs/readme.md'",
             &[],
@@ -125,7 +331,7 @@ simulation_test!(lix_file_insert_applies_defaulted_id, |sim| async move {
     let row_set = result;
     assert_eq!(row_set.len(), 1);
     let values = row_set.rows()[0].values();
-    let [Value::Text(id), Value::Text(path), Value::Text(directory_id), Value::Text(name), Value::Text(extension), Value::Boolean(hidden)] =
+    let [Value::Text(id), Value::Text(path), Value::Text(directory_id), Value::Text(name), Value::Boolean(hidden)] =
         values
     else {
         panic!("expected generated file row, got {values:?}");
@@ -133,8 +339,7 @@ simulation_test!(lix_file_insert_applies_defaulted_id, |sim| async move {
     assert!(!id.is_empty(), "defaulted file id should be non-empty");
     assert_eq!(path, "/docs/readme.md");
     assert_eq!(directory_id, "dir-docs");
-    assert_eq!(name, "readme");
-    assert_eq!(extension, "md");
+    assert_eq!(name, "readme.md");
     assert!(!hidden);
 });
 
@@ -161,7 +366,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, path, name, extension, hidden \
+                "SELECT id, path, name, hidden \
              FROM lix_file \
              WHERE path = '/docs/readme.md'",
                 &[],
@@ -171,15 +376,14 @@ simulation_test!(
         let row_set = result;
         assert_eq!(row_set.len(), 1);
         let values = row_set.rows()[0].values();
-        let [Value::Text(id), Value::Text(path), Value::Text(name), Value::Text(extension), Value::Boolean(hidden)] =
+        let [Value::Text(id), Value::Text(path), Value::Text(name), Value::Boolean(hidden)] =
             values
         else {
             panic!("expected generated file path row, got {values:?}");
         };
         assert!(!id.is_empty(), "defaulted file id should be non-empty");
         assert_eq!(path, "/docs/readme.md");
-        assert_eq!(name, "readme");
-        assert_eq!(extension, "md");
+        assert_eq!(name, "readme.md");
         assert!(!hidden);
     }
 );
@@ -455,8 +659,8 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_file (id, directory_id, name, extension) \
-                 VALUES ('file-foo', NULL, 'foo', NULL)",
+                "INSERT INTO lix_file (id, directory_id, name) \
+                 VALUES ('file-foo', NULL, 'foo')",
                 &[],
             )
             .await
@@ -516,8 +720,8 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_file (directory_id, name, extension) \
-                 VALUES ('missing-dir', 'readme', 'md')",
+                "INSERT INTO lix_file (directory_id, name) \
+                 VALUES ('missing-dir', 'readme.md')",
                 &[],
             )
             .await
@@ -548,8 +752,8 @@ simulation_test!(
             .expect("directory insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_file (id, directory_id, name, extension) \
-                 VALUES ('file-readme', 'dir-docs', 'readme', 'md')",
+                "INSERT INTO lix_file (id, directory_id, name) \
+                 VALUES ('file-readme', 'dir-docs', 'readme.md')",
                 &[],
             )
             .await
@@ -637,8 +841,8 @@ simulation_test!(
 
         let insert_result = session
             .execute(
-                "INSERT INTO lix_file (directory_id, name, extension, data) \
-             VALUES ('dir-docs', 'readme', 'md', X'68656C6C6F')",
+                "INSERT INTO lix_file (directory_id, name, data) \
+             VALUES ('dir-docs', 'readme.md', X'68656C6C6F')",
                 &[],
             )
             .await

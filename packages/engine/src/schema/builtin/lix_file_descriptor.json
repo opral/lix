@@ -7,8 +7,7 @@
   "x-lix-unique": [
     [
       "/directory_id",
-      "/name",
-      "/extension"
+      "/name"
     ]
   ],
   "x-lix-foreign-keys": [
@@ -40,13 +39,6 @@
       "type": "string",
       "pattern": "^(?!\\.{1,2}$)[^/\\\\]+$"
     },
-    "extension": {
-      "type": [
-        "string",
-        "null"
-      ],
-      "pattern": "^[^./\\\\]+$"
-    },
     "hidden": {
       "type": "boolean",
       "x-lix-default": "false"
@@ -55,8 +47,7 @@
   "required": [
     "id",
     "directory_id",
-    "name",
-    "extension"
+    "name"
   ],
   "additionalProperties": false
 }

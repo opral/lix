@@ -126,7 +126,6 @@ pub(crate) struct ParsedFilePath {
     pub(crate) normalized_path: NormalizedFilePath,
     pub(crate) directory_path: Option<NormalizedDirectoryPath>,
     pub(crate) name: String,
-    pub(crate) extension: Option<String>,
 }
 
 impl ParsedFilePath {
@@ -495,7 +494,10 @@ fn parse_file_path_impl(path: &str) -> PathResult<ParsedFilePath> {
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
-    let file_name = segments.last().ok_or(PathError::InvalidRootUsage)?;
+    let file_name = segments
+        .last()
+        .ok_or(PathError::InvalidRootUsage)?
+        .to_string();
     let directory_path = if segments.len() > 1 {
         Some(NormalizedDirectoryPath::from_normalized(format!(
             "/{}/",
@@ -505,26 +507,10 @@ fn parse_file_path_impl(path: &str) -> PathResult<ParsedFilePath> {
         None
     };
 
-    let last_dot = file_name.rfind('.');
-    let (name, extension) = match last_dot {
-        Some(index) if index > 0 => {
-            let name = file_name[..index].to_string();
-            let extension = file_name[index + 1..].to_string();
-            let extension = if extension.is_empty() {
-                None
-            } else {
-                Some(extension)
-            };
-            (name, extension)
-        }
-        _ => (file_name.to_string(), None),
-    };
-
     Ok(ParsedFilePath {
         normalized_path: NormalizedFilePath::from_normalized(normalized_path),
         directory_path,
-        name,
-        extension,
+        name: file_name,
     })
 }
 
