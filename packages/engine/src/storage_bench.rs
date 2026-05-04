@@ -1767,19 +1767,6 @@ pub async fn prepare_changelog_read_entity_history(
     })
 }
 
-pub async fn prepare_changelog_read_commit_facts(
-    backend: &Arc<dyn Backend + Send + Sync>,
-    config: StorageBenchConfig,
-) -> Result<ChangelogReadFixture, LixError> {
-    let context = ChangelogContext::new();
-    let changes = changelog_commit_fact_changes(config);
-    append_changelog_changes(backend, &context, &changes).await?;
-    Ok(ChangelogReadFixture {
-        context,
-        rows: config.rows,
-    })
-}
-
 pub async fn changelog_encode_only_prepared(
     fixture: &ChangelogCodecFixture,
 ) -> Result<StorageBenchReport, LixError> {
@@ -1867,20 +1854,6 @@ pub async fn changelog_scan_all_prepared(
     Ok(report(fixture.rows, verified_rows, Duration::ZERO))
 }
 
-pub async fn changelog_scan_change_ids_only_prepared(
-    backend: &Arc<dyn Backend + Send + Sync>,
-    fixture: &ChangelogReadFixture,
-) -> Result<StorageBenchReport, LixError> {
-    let reader = fixture
-        .context
-        .reader(StorageContext::new(Arc::clone(backend)));
-    let changes = reader
-        .scan_changes(&ChangelogScanRequest::default())
-        .await?;
-    let verified_rows = changes.iter().filter(|change| !change.id.is_empty()).count();
-    Ok(report(fixture.rows, verified_rows, Duration::ZERO))
-}
-
 pub async fn changelog_scan_full_changes_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &ChangelogReadFixture,
@@ -1941,27 +1914,6 @@ pub async fn changelog_scan_entity_history_prepared(
     let verified_rows = changes
         .iter()
         .filter(|change| change.entity_id == target)
-        .count();
-    Ok(report(
-        fixture.rows.div_ceil(10),
-        verified_rows,
-        Duration::ZERO,
-    ))
-}
-
-pub async fn changelog_scan_commit_facts_prepared(
-    backend: &Arc<dyn Backend + Send + Sync>,
-    fixture: &ChangelogReadFixture,
-) -> Result<StorageBenchReport, LixError> {
-    let reader = fixture
-        .context
-        .reader(StorageContext::new(Arc::clone(backend)));
-    let changes = reader
-        .scan_changes(&ChangelogScanRequest::default())
-        .await?;
-    let verified_rows = changes
-        .iter()
-        .filter(|change| change.schema_key == "lix_commit")
         .count();
     Ok(report(
         fixture.rows.div_ceil(10),
@@ -3133,23 +3085,6 @@ fn changelog_entity_history_changes(
         .map(|(index, mut change)| {
             if index % 10 == 0 {
                 change.entity_id = EntityIdentity::single(CHANGELOG_HISTORY_ENTITY_ID);
-            }
-            change
-        })
-        .collect()
-}
-
-fn changelog_commit_fact_changes(config: StorageBenchConfig) -> Vec<MaterializedCanonicalChange> {
-    changelog_materialized_changes(config)
-        .into_iter()
-        .enumerate()
-        .map(|(index, mut change)| {
-            if index % 10 == 0 {
-                change.schema_key = "lix_commit".to_string();
-                change.entity_id = EntityIdentity::single(format!("bench-commit-{index}"));
-                change.snapshot_content = Some(format!(
-                    "{{\"id\":\"bench-commit-{index}\",\"parent_ids\":[]}}"
-                ));
             }
             change
         })
