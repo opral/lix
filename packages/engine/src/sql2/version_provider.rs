@@ -8,7 +8,6 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{not_impl_err, DFSchema, DataFusionError, Result, ScalarValue};
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::dml::InsertOp;
@@ -19,10 +18,11 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
 };
-use futures_util::{stream, StreamExt, TryStreamExt};
+use futures_util::{stream, TryStreamExt};
 use serde_json::Value as JsonValue;
 
 use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateScanRequest};
+use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::record_batch::record_batch_with_row_count;
 use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValues};
 use crate::sql2::{
@@ -149,7 +149,7 @@ impl TableProvider for LixVersionProvider {
 
         let write_ctx = self.write_access.require_write("INSERT into lix_version")?;
         let sink = LixVersionInsertSink::new(input.schema(), write_ctx);
-        Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
+        Ok(Arc::new(InsertExec::new(input, Arc::new(sink))))
     }
 
     async fn delete_from(
@@ -209,7 +209,6 @@ impl TableProvider for LixVersionProvider {
 }
 
 struct LixVersionInsertSink {
-    schema: SchemaRef,
     write_ctx: SqlWriteContext,
 }
 
@@ -220,8 +219,8 @@ impl std::fmt::Debug for LixVersionInsertSink {
 }
 
 impl LixVersionInsertSink {
-    fn new(schema: SchemaRef, write_ctx: SqlWriteContext) -> Self {
-        Self { schema, write_ctx }
+    fn new(_schema: SchemaRef, write_ctx: SqlWriteContext) -> Self {
+        Self { write_ctx }
     }
 }
 
@@ -237,18 +236,10 @@ impl DisplayAs for LixVersionInsertSink {
 }
 
 #[async_trait]
-impl DataSink for LixVersionInsertSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> &SchemaRef {
-        &self.schema
-    }
-
-    async fn write_all(
+impl InsertSink for LixVersionInsertSink {
+    async fn write_batches(
         &self,
-        mut data: SendableRecordBatchStream,
+        batches: Vec<RecordBatch>,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
         let default_commit_id = self
@@ -263,7 +254,7 @@ impl DataSink for LixVersionInsertSink {
             })?;
         let mut rows = Vec::new();
         let mut count = 0u64;
-        while let Some(batch) = data.next().await.transpose()? {
+        for batch in batches {
             let version_rows = version_insert_rows_from_batch(&batch, &default_commit_id)?;
             count = count
                 .checked_add(u64::try_from(version_rows.len()).map_err(|_| {

@@ -1,3 +1,6 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
 import {
 	openLix,
@@ -12,6 +15,9 @@ import {
 	type TransactionBeginMode,
 	isLixError,
 } from "./index.js";
+
+const execFileAsync = promisify(execFile);
+const jsSdkRoot = fileURLToPath(new URL("..", import.meta.url));
 
 test("openLix exposes the rs-sdk e2e flow", async () => {
 	const lix = await openLix();
@@ -132,6 +138,55 @@ test("execute supports UNION ALL without trapping wasm", async () => {
 
 	expect(result.rows.map((row) => row.get("Int64(1)"))).toEqual([1, 2]);
 	await lix.close();
+});
+
+test("unsupported UNION DISTINCT returns a JS error without trapping wasm", async () => {
+	const { stdout } = await execFileAsync(
+		process.execPath,
+		[
+			"--input-type=module",
+			"-e",
+			`
+				import { openLix } from './dist/index.js';
+				const lix = await openLix();
+				try {
+					await lix.execute('SELECT 1 UNION SELECT 1');
+					console.log('unexpected-success');
+				} catch (error) {
+					console.log(error.code, error.message);
+				} finally {
+					await lix.close().catch(() => {});
+				}
+			`,
+		],
+		{ cwd: jsSdkRoot },
+	);
+
+	expect(stdout).toContain("LIX_UNSUPPORTED_SQL_RUNTIME_PLAN");
+	expect(stdout).toContain("CoalescePartitionsExec");
+});
+
+test("INSERT SELECT UNION ALL executes without trapping wasm", async () => {
+	const { stdout } = await execFileAsync(
+		process.execPath,
+		[
+			"--input-type=module",
+			"-e",
+			`
+				import { openLix } from './dist/index.js';
+				const lix = await openLix();
+				try {
+					const result = await lix.execute("INSERT INTO lix_directory (path) SELECT '/u1/' UNION ALL SELECT '/u2/'");
+					console.log(result.rowsAffected);
+				} finally {
+					await lix.close().catch(() => {});
+				}
+			`,
+		],
+		{ cwd: jsSdkRoot },
+	);
+
+	expect(stdout.trim()).toBe("2");
 });
 
 test("createVersion can start from an explicit commit id", async () => {

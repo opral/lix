@@ -131,6 +131,12 @@ struct TransactionLifecycleViolation {
     pattern: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SqlRuntimeOwnershipViolation {
+    file: String,
+    pattern: &'static str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum UseToken {
     DblColon,
@@ -160,6 +166,24 @@ fn read_engine_source(relative: &str) -> String {
     fs::read_to_string(src_root().join(relative)).expect("engine source file should be readable")
 }
 
+fn source_between<'a>(
+    relative: &str,
+    source: &'a str,
+    start_needle: &str,
+    end_needle: &str,
+) -> &'a str {
+    let start = source
+        .find(start_needle)
+        .unwrap_or_else(|| panic!("{relative} should contain `{start_needle}`"));
+    let end = source[start..]
+        .find(end_needle)
+        .map(|end| start + end)
+        .unwrap_or_else(|| {
+            panic!("{relative} should contain `{end_needle}` after `{start_needle}`")
+        });
+    &source[start..end]
+}
+
 fn assert_source_contains_in_order(relative: &str, source: &str, needles: &[&str]) {
     let mut previous: Option<(&str, usize)> = None;
     for needle in needles {
@@ -173,6 +197,24 @@ fn assert_source_contains_in_order(relative: &str, source: &str, needles: &[&str
             );
         }
         previous = Some((needle, index));
+    }
+}
+
+fn assert_source_contains_all(relative: &str, source: &str, needles: &[&str]) {
+    for needle in needles {
+        assert!(
+            source.contains(needle),
+            "{relative} should contain `{needle}`",
+        );
+    }
+}
+
+fn assert_source_contains_none(relative: &str, source: &str, needles: &[&str]) {
+    for needle in needles {
+        assert!(
+            !source.contains(needle),
+            "{relative} should not contain `{needle}`",
+        );
     }
 }
 
@@ -1844,6 +1886,29 @@ fn render_grouped_transaction_lifecycle_violations(
     rendered
 }
 
+fn render_grouped_sql_runtime_ownership_violations(
+    violations: &[SqlRuntimeOwnershipViolation],
+) -> String {
+    let mut grouped: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+
+    for violation in violations {
+        grouped
+            .entry(violation.file.as_str())
+            .or_default()
+            .push(violation.pattern);
+    }
+
+    let mut rendered = String::new();
+    for (file, patterns) in grouped {
+        let _ = writeln!(&mut rendered, "{file}:");
+        for pattern in patterns {
+            let _ = writeln!(&mut rendered, "  - {pattern}");
+        }
+    }
+
+    rendered
+}
+
 fn top_level_module_set() -> HashSet<String> {
     let lib_source = fs::read_to_string(lib_path()).expect("src/lib.rs should be readable");
     parse_top_level_modules(&lib_source).into_iter().collect()
@@ -2324,6 +2389,62 @@ fn current_shared_persistence_root_files() -> Vec<String> {
         .collect()
 }
 
+fn is_sql2_runtime_owner_path(relative_path: &str) -> bool {
+    relative_path == "sql2/runtime.rs"
+}
+
+fn current_sql2_datafusion_physical_execution_owner_violations() -> Vec<SqlRuntimeOwnershipViolation>
+{
+    let mut violations = BTreeSet::new();
+
+    for (relative_path, source) in production_source_files() {
+        if !relative_path.starts_with("sql2/") || is_sql2_runtime_owner_path(&relative_path) {
+            continue;
+        }
+
+        let stripped = strip_test_code(&source);
+        let masked_source = mask_rust_source(&stripped);
+        for pattern in [
+            ".collect().await",
+            ".create_physical_plan().await",
+            ".execute(partition,",
+            "execute_input_stream(",
+        ] {
+            if masked_source.contains(pattern) {
+                violations.insert(SqlRuntimeOwnershipViolation {
+                    file: relative_path.clone(),
+                    pattern,
+                });
+            }
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
+fn current_sql2_data_sink_exec_violations() -> Vec<SqlRuntimeOwnershipViolation> {
+    let mut violations = BTreeSet::new();
+
+    for (relative_path, source) in production_source_files() {
+        if !relative_path.starts_with("sql2/") {
+            continue;
+        }
+
+        let stripped = strip_test_code(&source);
+        let masked_source = mask_rust_source(&stripped);
+        for pattern in ["DataSinkExec", "DataSinkExec::new("] {
+            if masked_source.contains(pattern) {
+                violations.insert(SqlRuntimeOwnershipViolation {
+                    file: relative_path.clone(),
+                    pattern,
+                });
+            }
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
 #[test]
 fn sealed_owner_violations_are_empty() {
     let violations = current_sealed_owner_violations();
@@ -2529,6 +2650,135 @@ fn owner_storage_modules_do_not_expose_public_sql_shaped_helpers() {
         violations.is_empty(),
         "owner-local `storage.rs` seams should expose operation-shaped APIs rather than public SQL-shaped helpers.\n\nCurrent violations:\n{}",
         render_grouped_raw_sql_execution_violations(&violations),
+    );
+}
+
+#[test]
+fn sql2_physical_execution_is_owned_by_runtime_module() {
+    let violations = current_sql2_datafusion_physical_execution_owner_violations();
+
+    assert!(
+        violations.is_empty(),
+        "DataFusion physical execution must be centralized in `sql2/runtime.rs`; read/write SQL paths should not collect DataFrames or execute physical plans through side doors.\n\nCurrent violations:\n{}",
+        render_grouped_sql_runtime_ownership_violations(&violations),
+    );
+}
+
+#[test]
+fn sql2_write_providers_do_not_delegate_dml_execution_to_datafusion_sinks() {
+    let violations = current_sql2_data_sink_exec_violations();
+
+    assert!(
+        violations.is_empty(),
+        "SQL2 write providers must not use DataFusion `DataSinkExec`; DML source batches should be collected through the SQL runtime and staged by transaction-owned write code.\n\nCurrent violations:\n{}",
+        render_grouped_sql_runtime_ownership_violations(&violations),
+    );
+}
+
+#[test]
+fn sql2_read_session_does_not_register_write_surfaces() {
+    let relative = "sql2/session.rs";
+    let source = read_engine_source(relative);
+    let read_session = source_between(
+        relative,
+        &source,
+        "pub(crate) async fn build_read_session",
+        "pub(crate) async fn build_write_session",
+    );
+
+    assert_source_contains_all(
+        relative,
+        read_session,
+        &[
+            "register_lix_state_providers",
+            "register_lix_version_provider",
+            "register_lix_change_provider",
+            "register_commit_derived_providers",
+            "register_history_providers",
+            "register_lix_file_history_provider",
+            "register_lix_directory_history_provider",
+            "register_lix_directory_providers",
+            "register_lix_file_providers",
+            "register_entity_providers",
+        ],
+    );
+    assert_source_contains_none(
+        relative,
+        read_session,
+        &[
+            "SqlWriteContext::new",
+            "register_lix_state_write_providers",
+            "register_lix_version_write_provider",
+            "register_lix_directory_write_providers",
+            "register_lix_file_write_providers",
+            "register_entity_write_providers",
+        ],
+    );
+}
+
+#[test]
+fn sql2_write_session_does_not_register_history_or_committed_read_surfaces() {
+    let relative = "sql2/session.rs";
+    let source = read_engine_source(relative);
+    let write_session = source_between(
+        relative,
+        &source,
+        "pub(crate) async fn build_write_session",
+        "fn new_sql_session_context",
+    );
+
+    assert_source_contains_all(
+        relative,
+        write_session,
+        &[
+            "SqlWriteContext::new",
+            "register_lix_state_write_providers",
+            "register_lix_version_write_provider",
+            "register_lix_directory_write_providers",
+            "register_lix_file_write_providers",
+            "register_entity_write_providers",
+        ],
+    );
+    assert_source_contains_none(
+        relative,
+        write_session,
+        &[
+            "ctx.changelog_query_source",
+            "ctx.commit_graph",
+            "ctx.live_state()",
+            "ctx.version_ref()",
+            "register_lix_state_providers",
+            "register_lix_version_provider",
+            "register_lix_change_provider",
+            "register_commit_derived_providers",
+            "register_history_providers",
+            "register_lix_file_history_provider",
+            "register_lix_directory_history_provider",
+            "register_lix_directory_providers",
+            "register_lix_file_providers",
+            "register_entity_providers",
+        ],
+    );
+}
+
+#[test]
+fn sql2_session_context_keeps_wasm_safe_physical_plan_defaults() {
+    let relative = "sql2/session.rs";
+    let source = read_engine_source(relative);
+    let session_context = source_between(relative, &source, "fn new_sql_session_context", "\n}");
+
+    assert_source_contains_all(
+        relative,
+        session_context,
+        &[
+            ".with_target_partitions(1)",
+            "\"datafusion.optimizer.repartition_aggregations\", false",
+            "\"datafusion.optimizer.repartition_joins\", false",
+            "\"datafusion.optimizer.repartition_sorts\", false",
+            "\"datafusion.optimizer.repartition_windows\", false",
+            "\"datafusion.optimizer.repartition_file_scans\", false",
+            "\"datafusion.optimizer.enable_round_robin_repartition\", false",
+        ],
     );
 }
 
