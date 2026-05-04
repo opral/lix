@@ -312,12 +312,15 @@ fn entity_history_column_array(
         return entity_history_system_column_array(system_column, rows);
     }
 
-    let column_type = spec.column_types.get(column_name).ok_or_else(|| {
-        DataFusionError::Execution(format!(
-            "sql2 entity history provider '{}' does not expose column '{}'",
-            spec.schema_key, column_name
-        ))
-    })?;
+    let column_type = spec
+        .visible_column(column_name)
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "sql2 entity history provider '{}' does not expose column '{}'",
+                spec.schema_key, column_name
+            ))
+        })?
+        .column_type;
     let projected_values = rows
         .iter()
         .map(|row| entity_history_column_value(row, spec, column_name))
@@ -327,7 +330,7 @@ fn entity_history_column_array(
         EntityColumnType::String | EntityColumnType::Json => Arc::new(StringArray::from(
             projected_values
                 .iter()
-                .map(|snapshot| entity_json_text_value(snapshot.as_ref(), *column_type))
+                .map(|snapshot| entity_json_text_value(snapshot.as_ref(), column_type))
                 .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
         EntityColumnType::Integer => Arc::new(Int64Array::from(
