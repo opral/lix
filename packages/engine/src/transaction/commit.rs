@@ -322,6 +322,7 @@ async fn finalize_commit_rows(
             file_id: None,
             snapshot_content: Some(snapshot_content),
             metadata: None,
+            origin: None,
             schema_version: "1".to_string(),
             created_at: timestamp.clone(),
             updated_at: timestamp.clone(),
@@ -355,7 +356,7 @@ fn merge_parent_commit_ids(mut base: Vec<String>, extra: Vec<String>) -> Vec<Str
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use serde_json::Value as JsonValue;
@@ -399,7 +400,7 @@ mod tests {
             &version_ctx,
             transaction.as_mut(),
             StagedWriteSet {
-                insert_identities: BTreeSet::new(),
+                insert_identities: BTreeMap::new(),
                 state_rows: vec![tracked_global_row("change-1")],
                 adopted_rows: Vec::new(),
                 commit_members_by_version: BTreeMap::from([(
@@ -465,7 +466,7 @@ mod tests {
             &version_ctx,
             transaction.as_mut(),
             StagedWriteSet {
-                insert_identities: BTreeSet::new(),
+                insert_identities: BTreeMap::new(),
                 state_rows: vec![untracked_global_row("change-untracked")],
                 adopted_rows: Vec::new(),
                 commit_members_by_version: BTreeMap::new(),
@@ -545,7 +546,7 @@ mod tests {
             &version_ctx,
             transaction.as_mut(),
             StagedWriteSet {
-                insert_identities: BTreeSet::new(),
+                insert_identities: BTreeMap::new(),
                 state_rows: vec![tracked_global_row("change-tracked")],
                 adopted_rows: Vec::new(),
                 commit_members_by_version: BTreeMap::from([(
@@ -605,7 +606,7 @@ mod tests {
             &version_ctx,
             transaction.as_mut(),
             StagedWriteSet {
-                insert_identities: BTreeSet::new(),
+                insert_identities: BTreeMap::new(),
                 state_rows: vec![tracked_version_row("version-a", "change-version-a")],
                 adopted_rows: Vec::new(),
                 commit_members_by_version: BTreeMap::from([(
@@ -872,6 +873,7 @@ mod tests {
             file_id: None,
             snapshot_content: Some("{\"value\":1}".to_string()),
             metadata: None,
+            origin: None,
             schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),

@@ -754,7 +754,7 @@ mod tests {
             functions(),
         )
         .expect_err("file descriptor name should reject bidi formatting characters");
-        assert_eq!(bidi.code, "LIX_ERROR_PATH_INVALID_IRI_CODE_POINT");
+        assert_eq!(bidi.code, "LIX_ERROR_PATH_INVALID_SEGMENT_CODE_POINT");
 
         let zero_width = normalize_stage_row(
             StageRow {
@@ -775,7 +775,7 @@ mod tests {
             functions(),
         )
         .expect_err("directory descriptor name should reject zero-width characters");
-        assert_eq!(zero_width.code, "LIX_ERROR_PATH_INVALID_IRI_CODE_POINT");
+        assert_eq!(zero_width.code, "LIX_ERROR_PATH_INVALID_SEGMENT_CODE_POINT");
     }
 
     #[test]
@@ -824,6 +824,7 @@ mod tests {
             file_id: None,
             snapshot_content: Some(r#"{"id":"entity-1","value":"hello"}"#.to_string()),
             metadata: None,
+            origin: None,
             schema_version: "1".to_string(),
             created_at: None,
             updated_at: None,

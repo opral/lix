@@ -919,6 +919,7 @@ mod tests {
                 .to_string(),
             ),
             metadata: None,
+            origin: None,
             schema_version: "1".to_string(),
             created_at: None,
             updated_at: None,
