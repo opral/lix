@@ -10,6 +10,19 @@
       "/name"
     ]
   ],
+  "x-lix-foreign-keys": [
+    {
+      "properties": [
+        "/parent_id"
+      ],
+      "references": {
+        "schemaKey": "lix_directory_descriptor",
+        "properties": [
+          "/id"
+        ]
+      }
+    }
+  ],
   "type": "object",
   "properties": {
     "id": {

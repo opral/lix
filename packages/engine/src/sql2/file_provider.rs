@@ -1565,7 +1565,7 @@ async fn lix_file_record_batch(
         }
     }
 
-    let directory_paths = derive_directory_paths(&directory_rows);
+    let directory_paths = derive_directory_paths(&directory_rows)?;
     let mut ids = Vec::new();
     let mut paths = Vec::new();
     let mut directory_ids = Vec::new();
@@ -1682,7 +1682,7 @@ async fn lix_file_record_batch(
 
 fn derive_directory_paths(
     rows: &[DirectoryDescriptorRecord],
-) -> BTreeMap<(String, String), String> {
+) -> Result<BTreeMap<(String, String), String>, LixError> {
     let mut by_version = BTreeMap::<String, BTreeMap<String, &DirectoryDescriptorRecord>>::new();
     for row in rows {
         by_version
@@ -1694,10 +1694,16 @@ fn derive_directory_paths(
     let mut paths = BTreeMap::<(String, String), String>::new();
     for (version_id, records) in by_version {
         for directory_id in records.keys() {
-            derive_directory_path_for(&version_id, directory_id, &records, &mut paths);
+            derive_directory_path_for(
+                &version_id,
+                directory_id,
+                &records,
+                &mut paths,
+                &mut BTreeSet::new(),
+            )?;
         }
     }
-    paths
+    Ok(paths)
 }
 
 fn derive_directory_path_for(
@@ -1705,23 +1711,45 @@ fn derive_directory_path_for(
     directory_id: &str,
     records: &BTreeMap<String, &DirectoryDescriptorRecord>,
     paths: &mut BTreeMap<(String, String), String>,
-) -> Option<String> {
+    visiting: &mut BTreeSet<String>,
+) -> Result<Option<String>, LixError> {
     if let Some(path) = paths.get(&(version_id.to_string(), directory_id.to_string())) {
-        return Some(path.clone());
+        return Ok(Some(path.clone()));
     }
-    let row = records.get(directory_id)?;
+    if !visiting.insert(directory_id.to_string()) {
+        return Err(directory_parent_cycle_error(version_id, directory_id));
+    }
+    let Some(row) = records.get(directory_id) else {
+        visiting.remove(directory_id);
+        return Ok(None);
+    };
     let path = match row.parent_id.as_deref() {
         Some(parent_id) => {
-            let parent_path = derive_directory_path_for(version_id, parent_id, records, paths)?;
+            let Some(parent_path) =
+                derive_directory_path_for(version_id, parent_id, records, paths, visiting)?
+            else {
+                visiting.remove(directory_id);
+                return Ok(None);
+            };
             format!("{parent_path}{}/", row.name)
         }
         None => format!("/{}/", row.name),
     };
+    visiting.remove(directory_id);
     paths.insert(
         (version_id.to_string(), directory_id.to_string()),
         path.clone(),
     );
-    Some(path)
+    Ok(Some(path))
+}
+
+fn directory_parent_cycle_error(version_id: &str, directory_id: &str) -> LixError {
+    LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        format!(
+            "lix_directory_descriptor parent_id cycle in version '{version_id}' while resolving directory '{directory_id}'"
+        ),
+    )
 }
 
 fn projected_schema(base_schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Result<SchemaRef> {
@@ -2366,7 +2394,14 @@ mod tests {
         let mut paths = BTreeMap::new();
 
         assert_eq!(
-            derive_directory_path_for("version-a", "dir-guides", &records, &mut paths),
+            derive_directory_path_for(
+                "version-a",
+                "dir-guides",
+                &records,
+                &mut paths,
+                &mut BTreeSet::new()
+            )
+            .expect("path derivation should succeed"),
             Some("/docs/guides/".to_string())
         );
     }

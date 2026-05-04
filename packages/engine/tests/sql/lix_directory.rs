@@ -214,6 +214,76 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_directory_update_rejects_parent_cycle,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, parent_id, name) VALUES \
+                 ('dir-parent', NULL, 'parent'), \
+                 ('dir-child', 'dir-parent', 'child')",
+                &[],
+            )
+            .await
+            .expect("directory tree insert should succeed");
+
+        let self_cycle = session
+            .execute(
+                "UPDATE lix_directory SET parent_id = id WHERE id = 'dir-parent'",
+                &[],
+            )
+            .await
+            .expect_err("self parent must be rejected");
+        assert_eq!(self_cycle.code, LixError::CODE_CONSTRAINT_VIOLATION);
+
+        let descendant_cycle = session
+            .execute(
+                "UPDATE lix_directory SET parent_id = 'dir-child' WHERE id = 'dir-parent'",
+                &[],
+            )
+            .await
+            .expect_err("parenting a directory under its descendant must be rejected");
+        assert_eq!(descendant_cycle.code, LixError::CODE_CONSTRAINT_VIOLATION);
+    }
+);
+
+simulation_test!(
+    lix_state_insert_rejects_directory_parent_cycle,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+                 ) VALUES \
+                 ('dir-a', 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-a\",\"parent_id\":\"dir-b\",\"name\":\"a\",\"hidden\":false}'), '1', false, false), \
+                 ('dir-b', 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-b\",\"parent_id\":\"dir-a\",\"name\":\"b\",\"hidden\":false}'), '1', false, false)",
+                &[],
+            )
+            .await
+            .expect_err("descriptor cycles staged through lix_state must be rejected");
+
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+    }
+);
+
+simulation_test!(
     lix_directory_delete_recursively_deletes_tree,
     |sim| async move {
         let engine = sim.boot_engine().await;
