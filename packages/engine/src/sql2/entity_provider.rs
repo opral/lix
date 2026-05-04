@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -169,12 +169,34 @@ pub(super) enum EntityColumnType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct EntitySurfaceColumn {
+    pub(super) name: String,
+    pub(super) column_type: EntityColumnType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct EntitySurfaceSpec {
     pub(super) schema_key: String,
     schema_version: Option<String>,
     pub(super) primary_key_paths: Vec<Vec<String>>,
-    pub(super) visible_columns: Vec<String>,
-    pub(super) column_types: BTreeMap<String, EntityColumnType>,
+    pub(super) columns: Vec<EntitySurfaceColumn>,
+}
+
+impl EntitySurfaceSpec {
+    #[cfg(test)]
+    fn visible_column_names(&self) -> impl Iterator<Item = &str> {
+        self.columns.iter().map(|column| column.name.as_str())
+    }
+
+    pub(super) fn visible_column(&self, column_name: &str) -> Option<&EntitySurfaceColumn> {
+        self.columns
+            .iter()
+            .find(|column| column.name == column_name)
+    }
+
+    fn is_visible_column(&self, column_name: &str) -> bool {
+        self.visible_column(column_name).is_some()
+    }
 }
 
 pub(crate) struct EntityProvider {
@@ -876,9 +898,7 @@ fn validate_entity_update_assignments(
                 spec.schema_key
             ))
         })?;
-        if !spec.visible_columns.iter().any(|name| name == column_name)
-            && column_name != "lixcol_metadata"
-        {
+        if !spec.is_visible_column(column_name) && column_name != "lixcol_metadata" {
             return Err(DataFusionError::Execution(format!(
                 "UPDATE entity surface '{}' cannot stage read-only column '{column_name}'",
                 spec.schema_key
@@ -1023,23 +1043,17 @@ fn entity_update_snapshot_content_from_batch(
         }
     };
 
-    for column_name in &spec.visible_columns {
-        let column_type = spec.column_types.get(column_name).ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "entity surface '{}' is missing type metadata for '{}'",
-                spec.schema_key, column_name
-            ))
-        })?;
+    for column in &spec.columns {
         let value = match entity_update_json_value(
             assignment_values,
             row_index,
-            column_name,
-            *column_type,
+            &column.name,
+            column.column_type,
         )? {
             Some(value) => value,
             None => continue,
         };
-        object.insert(column_name.clone(), value);
+        object.insert(column.name.clone(), value);
     }
     serde_json::to_string(&JsonValue::Object(object)).map_err(|error| {
         DataFusionError::Execution(format!(
@@ -1245,23 +1259,17 @@ fn entity_snapshot_content_from_batch(
     row_index: usize,
 ) -> Result<String> {
     let mut object = serde_json::Map::new();
-    for column_name in &spec.visible_columns {
-        let column_type = spec.column_types.get(column_name).ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "entity surface '{}' is missing type metadata for '{}'",
-                spec.schema_key, column_name
-            ))
-        })?;
-        let value = match insert_column_intents.cell(batch, row_index, column_name)? {
+    for column in &spec.columns {
+        let value = match insert_column_intents.cell(batch, row_index, &column.name)? {
             InsertCell::Omitted => {
                 continue;
             }
             InsertCell::Provided(SqlCell::Null) => JsonValue::Null,
             InsertCell::Provided(SqlCell::Value(value)) => {
-                entity_json_value_from_scalar(Some(value), *column_type)?
+                entity_json_value_from_scalar(Some(value), column.column_type)?
             }
         };
-        object.insert(column_name.clone(), value);
+        object.insert(column.name.clone(), value);
     }
     serde_json::to_string(&JsonValue::Object(object)).map_err(|error| {
         DataFusionError::Execution(format!(
@@ -1615,12 +1623,15 @@ fn entity_column_array(
         return entity_system_column_array(property_name, rows);
     }
 
-    let column_type = spec.column_types.get(column_name).ok_or_else(|| {
-        DataFusionError::Execution(format!(
-            "sql2 entity provider '{}' does not expose column '{}'",
-            spec.schema_key, column_name
-        ))
-    })?;
+    let column_type = spec
+        .visible_column(column_name)
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "sql2 entity provider '{}' does not expose column '{}'",
+                spec.schema_key, column_name
+            ))
+        })?
+        .column_type;
 
     let values = snapshots
         .iter()
@@ -1630,7 +1641,7 @@ fn entity_column_array(
         EntityColumnType::String | EntityColumnType::Json => Arc::new(StringArray::from(
             values
                 .iter()
-                .map(|value| entity_json_text_value(*value, *column_type))
+                .map(|value| entity_json_text_value(*value, column_type))
                 .collect::<Result<Vec<_>>>()?,
         )) as ArrayRef,
         EntityColumnType::Integer => Arc::new(Int64Array::from(
@@ -1758,20 +1769,19 @@ pub(super) fn entity_surface_schema(
     variant: EntityProviderVariant,
 ) -> SchemaRef {
     let mut fields = spec
-        .visible_columns
+        .columns
         .iter()
-        .filter_map(|column_name| {
-            let column_type = spec.column_types.get(column_name)?;
+        .map(|column| {
             let field = Field::new(
-                column_name,
-                arrow_data_type_for_entity_column_type(*column_type),
+                &column.name,
+                arrow_data_type_for_entity_column_type(column.column_type),
                 true,
             );
-            Some(if *column_type == EntityColumnType::Json {
+            if column.column_type == EntityColumnType::Json {
                 mark_json_field(field)
             } else {
                 field
-            })
+            }
         })
         .collect::<Vec<_>>();
 
@@ -1850,42 +1860,44 @@ fn derive_entity_surface_spec_from_schema(
         .and_then(JsonValue::as_str)
         .map(ToOwned::to_owned);
 
-    let mut visible_columns = schema
+    let properties = schema
         .get("properties")
         .and_then(JsonValue::as_object)
-        .map(|properties| {
-            let mut columns = properties
-                .keys()
-                .filter(|key| !key.starts_with("lixcol_"))
-                .cloned()
-                .collect::<Vec<_>>();
-            columns.sort();
-            columns
-        })
-        .unwrap_or_default();
-    visible_columns.dedup();
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                format!("schema '{schema_key}' must define object properties"),
+            )
+        })?;
 
-    let column_types = schema
-        .get("properties")
-        .and_then(JsonValue::as_object)
-        .map(|properties| {
-            properties
-                .iter()
-                .filter(|(key, _)| !key.starts_with("lixcol_"))
-                .filter_map(|(key, property_schema)| {
-                    entity_column_type_from_schema(property_schema).map(|kind| (key.clone(), kind))
-                })
-                .collect::<BTreeMap<_, _>>()
+    let mut columns = properties
+        .iter()
+        .filter(|(key, _)| !key.starts_with("lixcol_"))
+        .map(|(key, property_schema)| {
+            let column_type = entity_column_type_from_schema(property_schema).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    format!(
+                        "schema '{schema_key}' property '/{key}' must declare a SQL-projectable JSON Schema type"
+                    ),
+                )
+                .with_hint("Use an explicit type such as string, number, integer, boolean, object, array, or a supported union of those types.")
+            })?;
+            Ok(EntitySurfaceColumn {
+                name: key.clone(),
+                column_type,
+            })
         })
-        .unwrap_or_default();
+        .collect::<std::result::Result<Vec<_>, LixError>>()?;
+    columns.sort_by(|left, right| left.name.cmp(&right.name));
+
     let primary_key_paths = parse_primary_key_paths(schema)?;
 
     Ok(EntitySurfaceSpec {
         schema_key: schema_key.to_string(),
         schema_version,
         primary_key_paths,
-        visible_columns,
-        column_types,
+        columns,
     })
 }
 
@@ -2285,19 +2297,46 @@ mod tests {
         assert_eq!(spec.schema_key, "project_message");
         assert_eq!(spec.schema_version.as_deref(), Some("1"));
         assert_eq!(
-            spec.visible_columns,
-            vec!["body".to_string(), "meta".to_string(), "rating".to_string()]
+            spec.visible_column_names().collect::<Vec<_>>(),
+            vec!["body", "meta", "rating"]
         );
         assert_eq!(
-            spec.column_types.get("body"),
-            Some(&EntityColumnType::String)
+            spec.visible_column("body").map(|column| column.column_type),
+            Some(EntityColumnType::String)
         );
         assert_eq!(
-            spec.column_types.get("rating"),
-            Some(&EntityColumnType::Number)
+            spec.visible_column("rating")
+                .map(|column| column.column_type),
+            Some(EntityColumnType::Number)
         );
-        assert_eq!(spec.column_types.get("meta"), Some(&EntityColumnType::Json));
-        assert!(!spec.column_types.contains_key("lixcol_entity_id"));
+        assert_eq!(
+            spec.visible_column("meta").map(|column| column.column_type),
+            Some(EntityColumnType::Json)
+        );
+        assert!(!spec.is_visible_column("lixcol_entity_id"));
+    }
+
+    #[test]
+    fn entity_surface_spec_rejects_properties_without_projection_type() {
+        let error = derive_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "project_message",
+            "x-lix-version": "1",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "kind": {}
+            },
+            "required": ["id", "kind"],
+            "additionalProperties": false
+        }))
+        .expect_err("unprojectable property should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            error.message.contains("property '/kind'"),
+            "error should identify the property: {error:?}"
+        );
     }
 
     #[test]
