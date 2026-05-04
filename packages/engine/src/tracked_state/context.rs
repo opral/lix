@@ -302,6 +302,7 @@ where
     /// `target_commit_id` is the destination root that should keep its own
     /// changes. `source_commit_id` is the incoming root whose non-conflicting
     /// changes should be applied.
+    #[allow(dead_code)]
     pub(crate) async fn plan_merge(
         &mut self,
         base_commit_id: &str,

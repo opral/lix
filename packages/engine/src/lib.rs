@@ -50,8 +50,10 @@ pub use common::{WireQueryResult, WireValue};
 pub use engine::Engine;
 pub use init::InitReceipt;
 pub use session::{
-    CreateVersionOptions, CreateVersionReceipt, MergeVersionOptions, MergeVersionOutcome,
-    MergeVersionReceipt, SessionContext, SwitchVersionOptions, SwitchVersionReceipt,
+    CreateVersionOptions, CreateVersionReceipt, MergeChangeStats, MergeConflict,
+    MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, MergeVersionOptions,
+    MergeVersionOutcome, MergeVersionPreview, MergeVersionPreviewOptions, MergeVersionReceipt,
+    SessionContext, SwitchVersionOptions, SwitchVersionReceipt,
 };
 pub use session::{ExecuteResult, Row, RowRef, TryFromValue};
 

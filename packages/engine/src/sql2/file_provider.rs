@@ -2069,7 +2069,7 @@ fn update_optional_string_value(
     row_index: usize,
     column_name: &str,
 ) -> Result<Option<String>> {
-    match assignment_values.effective_cell(batch, row_index, column_name)? {
+    match assignment_values.assigned_or_existing_cell(batch, row_index, column_name)? {
         InsertCell::Omitted | InsertCell::Provided(SqlCell::Null) => Ok(None),
         InsertCell::Provided(SqlCell::Value(
             ScalarValue::Utf8(Some(value))
@@ -2102,7 +2102,7 @@ fn update_optional_bool_value(
     row_index: usize,
     column_name: &str,
 ) -> Result<Option<bool>> {
-    match assignment_values.effective_cell(batch, row_index, column_name)? {
+    match assignment_values.assigned_or_existing_cell(batch, row_index, column_name)? {
         InsertCell::Omitted | InsertCell::Provided(SqlCell::Null) => Ok(None),
         InsertCell::Provided(SqlCell::Value(ScalarValue::Boolean(Some(value)))) => Ok(Some(value)),
         InsertCell::Provided(SqlCell::Value(other)) => Err(DataFusionError::Execution(format!(
