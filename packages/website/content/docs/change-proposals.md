@@ -1,3 +1,7 @@
+---
+description: Build review workflows on top of Lix change proposals so users and agents can submit, approve, reject, and merge isolated work.
+---
+
 # Change Proposals
 
 Change proposals enable review and approval workflows in your application. Users and AI agents can propose changes in isolated versions that are reviewed before merging into the main version.

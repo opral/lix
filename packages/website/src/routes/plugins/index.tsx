@@ -34,10 +34,11 @@ export const Route = createFileRoute("/plugins/")({
       | undefined;
     const rawMarkdown = loaderData?.markdown ?? "";
     const title =
-      getMarkdownTitle({ rawMarkdown, frontmatter }) ?? "Lix Plugins";
+      getMarkdownTitle({ rawMarkdown, frontmatter }) ??
+      "Lix Plugins | JSON, CSV, Markdown, and ProseMirror change tracking";
     const description =
       getMarkdownDescription({ rawMarkdown, frontmatter }) ??
-      "Discover Lix plugins and integrations.";
+      "Discover Lix plugins and integrations for tracking semantic changes across JSON, CSV, Markdown, ProseMirror, and more.";
     const canonicalUrl = buildCanonicalUrl("/plugins");
     const ogImage = resolveOgImage(frontmatter);
     const ogMeta = extractOgMeta(frontmatter);

@@ -1,3 +1,7 @@
+---
+description: Validation rules let Lix catch bad changes automatically so agents and humans can fix issues before review or release.
+---
+
 # Validation Rules
 
 > [!NOTE]

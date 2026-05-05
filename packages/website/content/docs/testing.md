@@ -1,3 +1,7 @@
+---
+description: Test Lix code with real in-memory instances, no mocks, and the same SQL-driven behavior your app uses in production.
+---
+
 # Testing
 
 Testing code that uses Lix is straightforward because you can run a real, in-memory Lix instance in your test environment. This approach avoids mocks and ensures your tests exercise the same code paths that run in production, giving you high confidence in your application's behavior.
