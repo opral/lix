@@ -2,18 +2,20 @@
 
 use crate::binary_cas::chunking::fastcdc_chunk_ranges;
 use crate::binary_cas::codec::{
-    binary_blob_hash_bytes, decode_binary_cas_chunk, decode_binary_cas_manifest,
-    decode_binary_cas_manifest_chunk, encode_binary_cas_chunk, encode_binary_cas_manifest,
-    encode_binary_cas_manifest_chunk, encode_binary_chunk_payload, hash_bytes_to_hex,
-    hash_hex_to_bytes, BinaryCasManifest, BinaryChunkCodec,
+    decode_binary_cas_chunk, decode_binary_cas_manifest, decode_binary_cas_manifest_chunk,
+    encode_binary_cas_chunk, encode_binary_cas_manifest, encode_binary_cas_manifest_chunk,
+    encode_binary_chunk_payload, BinaryCasManifest, BinaryChunkCodec,
 };
-use crate::binary_cas::BinaryBlobWrite;
+use crate::binary_cas::{
+    BlobBytesBatch, BlobExistsBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch,
+    BlobWrite, BlobWriteReceipt,
+};
 use crate::storage::{
     KvGetGroup, KvGetRequest, KvPut, KvScanRange, KvScanRequest, KvWriteBatch, KvWriteGroup,
     StorageReader, StorageWriter,
 };
 use crate::LixError;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub(crate) const BINARY_CAS_MANIFEST_NAMESPACE: &str = "binary_cas.manifest";
 pub(crate) const BINARY_CAS_MANIFEST_CHUNK_NAMESPACE: &str = "binary_cas.manifest_chunk";
@@ -34,12 +36,12 @@ pub(crate) struct KvChunk {
 
 pub(crate) async fn load_manifest(
     store: &mut impl StorageReader,
-    blob_hash: &str,
+    blob_hash: BlobHash,
 ) -> Result<Option<BinaryCasManifest>, LixError> {
     let Some(bytes) = get_one(
         store,
         BINARY_CAS_MANIFEST_NAMESPACE,
-        manifest_key(blob_hash)?,
+        manifest_key(blob_hash),
     )
     .await?
     else {
@@ -61,13 +63,13 @@ pub(crate) async fn count_manifests(store: &mut impl StorageReader) -> Result<us
 
 pub(crate) async fn put_manifest(
     writer: &mut impl StorageWriter,
-    blob_hash: &str,
+    blob_hash: BlobHash,
     manifest: &BinaryCasManifest,
 ) -> Result<(), LixError> {
     put_one(
         writer,
         BINARY_CAS_MANIFEST_NAMESPACE,
-        manifest_key(blob_hash)?,
+        manifest_key(blob_hash),
         encode_binary_cas_manifest(manifest),
     )
     .await
@@ -75,12 +77,12 @@ pub(crate) async fn put_manifest(
 
 pub(crate) async fn scan_manifest_chunks(
     store: &mut impl StorageReader,
-    blob_hash: &str,
+    blob_hash: BlobHash,
 ) -> Result<Vec<KvBlobManifestChunk>, LixError> {
     scan_all_values(
         store,
         BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
-        KvScanRange::Prefix(manifest_chunk_prefix(blob_hash)?),
+        KvScanRange::Prefix(manifest_chunk_prefix(blob_hash)),
     )
     .await?
     .into_iter()
@@ -96,14 +98,14 @@ pub(crate) async fn scan_manifest_chunks(
 
 pub(crate) async fn put_manifest_chunk(
     writer: &mut impl StorageWriter,
-    blob_hash: &str,
+    blob_hash: BlobHash,
     chunk_index: u64,
     chunk: &KvBlobManifestChunk,
 ) -> Result<(), LixError> {
     put_one(
         writer,
         BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
-        manifest_chunk_key(blob_hash, chunk_index)?,
+        manifest_chunk_key(blob_hash, chunk_index),
         encode_binary_cas_manifest_chunk(&chunk.chunk_hash, chunk.chunk_size),
     )
     .await
@@ -111,9 +113,9 @@ pub(crate) async fn put_manifest_chunk(
 
 pub(crate) async fn load_chunk(
     store: &mut impl StorageReader,
-    chunk_hash: &str,
+    chunk_hash: BlobHash,
 ) -> Result<Option<KvChunk>, LixError> {
-    let Some(bytes) = get_one(store, BINARY_CAS_CHUNK_NAMESPACE, chunk_key(chunk_hash)?).await?
+    let Some(bytes) = get_one(store, BINARY_CAS_CHUNK_NAMESPACE, chunk_key(chunk_hash)).await?
     else {
         return Ok(None);
     };
@@ -127,13 +129,13 @@ pub(crate) async fn load_chunk(
 
 pub(crate) async fn put_chunk(
     writer: &mut impl StorageWriter,
-    chunk_hash: &str,
+    chunk_hash: BlobHash,
     chunk: &KvChunk,
 ) -> Result<(), LixError> {
     put_one(
         writer,
         BINARY_CAS_CHUNK_NAMESPACE,
-        chunk_key(chunk_hash)?,
+        chunk_key(chunk_hash),
         encode_binary_cas_chunk(chunk.codec, chunk.uncompressed_len, &chunk.data),
     )
     .await
@@ -193,134 +195,18 @@ async fn put_one(
     Ok(())
 }
 
-pub(crate) async fn load_blob_data_by_hash(
+pub(crate) async fn load_metadata_many(
     store: &mut impl StorageReader,
-    blob_hash: &str,
-) -> Result<Option<Vec<u8>>, LixError> {
-    let requested_blob_hash = hash_hex_to_bytes(blob_hash, "binary CAS blob")?;
-    let Some(manifest) = load_manifest(store, blob_hash).await? else {
-        return Ok(None);
-    };
-    let expected_blob_size = persisted_size_to_usize(manifest.size_bytes(), "binary CAS blob")?;
-    match manifest {
-        BinaryCasManifest::Empty { size_bytes } => {
-            if size_bytes != 0 {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("binary CAS empty blob '{blob_hash}' has nonzero size {size_bytes}"),
-                ));
-            }
-            if requested_blob_hash != binary_blob_hash_bytes(&[]) {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("binary CAS blob '{blob_hash}' failed content-address verification"),
-                ));
-            }
-            return Ok(Some(Vec::new()));
-        }
-        BinaryCasManifest::SingleChunk {
-            size_bytes,
-            chunk_hash,
-        } => {
-            return load_single_chunk_blob(
-                store,
-                blob_hash,
-                requested_blob_hash,
-                chunk_hash,
-                size_bytes,
-            )
-            .await
-            .map(Some);
-        }
-        BinaryCasManifest::Chunked { chunk_count, .. } => {
-            return load_chunked_blob(
-                store,
-                blob_hash,
-                requested_blob_hash,
-                expected_blob_size,
-                chunk_count,
-            )
-            .await
-            .map(Some);
-        }
+    hashes: &[BlobHash],
+) -> Result<BlobMetadataBatch, LixError> {
+    if hashes.is_empty() {
+        return Ok(BlobMetadataBatch::new(Vec::new()));
     }
-}
-
-async fn load_single_chunk_blob(
-    store: &mut impl StorageReader,
-    blob_hash: &str,
-    requested_blob_hash: [u8; 32],
-    chunk_hash: [u8; 32],
-    size_bytes: u64,
-) -> Result<Vec<u8>, LixError> {
-    let expected_chunk_size = persisted_size_to_usize(size_bytes, "binary CAS chunk")?;
-    let chunk_row = store
+    let rows = store
         .get_values(KvGetRequest {
             groups: vec![KvGetGroup {
-                namespace: BINARY_CAS_CHUNK_NAMESPACE.to_string(),
-                keys: vec![chunk_hash.to_vec()],
-            }],
-        })
-        .await?
-        .groups
-        .into_iter()
-        .next()
-        .and_then(|mut group| group.pop_value())
-        .ok_or_else(|| {
-            let chunk_hash = hash_bytes_to_hex(&chunk_hash);
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("binary CAS chunk '{chunk_hash}' is missing for blob '{blob_hash}'"),
-            )
-        })?;
-    let chunk_hash_hex = hash_bytes_to_hex(&chunk_hash);
-    let payload = decode_and_verify_chunk(
-        &chunk_row,
-        expected_chunk_size,
-        blob_hash,
-        &chunk_hash_hex,
-        chunk_hash,
-    )?;
-    if chunk_hash != requested_blob_hash && binary_blob_hash_bytes(&payload) != requested_blob_hash
-    {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("binary CAS blob '{blob_hash}' failed content-address verification"),
-        ));
-    }
-    Ok(payload)
-}
-
-async fn load_chunked_blob(
-    store: &mut impl StorageReader,
-    blob_hash: &str,
-    requested_blob_hash: [u8; 32],
-    expected_blob_size: usize,
-    chunk_count: u32,
-) -> Result<Vec<u8>, LixError> {
-    let manifest_chunks = scan_manifest_chunks(store, blob_hash).await?;
-    if manifest_chunks.len() != chunk_count as usize {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "binary CAS blob '{}' expected {} chunks, found {}",
-                blob_hash,
-                chunk_count,
-                manifest_chunks.len()
-            ),
-        ));
-    }
-
-    let mut out = Vec::with_capacity(expected_blob_size);
-    let chunk_keys = manifest_chunks
-        .iter()
-        .map(|manifest_chunk| manifest_chunk.chunk_hash.to_vec())
-        .collect::<Vec<_>>();
-    let chunk_rows = store
-        .get_values(KvGetRequest {
-            groups: vec![KvGetGroup {
-                namespace: BINARY_CAS_CHUNK_NAMESPACE.to_string(),
-                keys: chunk_keys,
+                namespace: BINARY_CAS_MANIFEST_NAMESPACE.to_string(),
+                keys: hashes.iter().map(|hash| manifest_key(*hash)).collect(),
             }],
         })
         .await?
@@ -329,68 +215,258 @@ async fn load_chunked_blob(
         .next()
         .map(|group| group.values)
         .unwrap_or_default();
-    if chunk_rows.len() != manifest_chunks.len() {
+    if rows.len() != hashes.len() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
-                "binary CAS blob '{}' expected {} chunk rows, got {}",
-                blob_hash,
-                manifest_chunks.len(),
-                chunk_rows.len()
+                "binary CAS metadata read expected {} rows, got {}",
+                hashes.len(),
+                rows.len()
             ),
         ));
     }
+    let entries = rows
+        .into_iter()
+        .zip(hashes.iter().copied())
+        .map(|(row, hash)| {
+            row.map(|bytes| {
+                let manifest = decode_binary_cas_manifest(&bytes)?;
+                metadata_from_manifest(hash, manifest)
+            })
+            .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(BlobMetadataBatch::new(entries))
+}
 
-    for (index, manifest_chunk) in manifest_chunks.iter().enumerate() {
-        let Some(chunk_bytes) = chunk_rows[index].as_deref() else {
-            let chunk_hash = hash_bytes_to_hex(&manifest_chunk.chunk_hash);
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "binary CAS chunk '{}' is missing for blob '{}'",
-                    chunk_hash, blob_hash
-                ),
-            ));
+pub(crate) async fn exists_many(
+    store: &mut impl StorageReader,
+    hashes: &[BlobHash],
+) -> Result<BlobExistsBatch, LixError> {
+    Ok(BlobExistsBatch::new(
+        load_metadata_many(store, hashes)
+            .await?
+            .into_vec()
+            .into_iter()
+            .map(|metadata| metadata.is_some())
+            .collect(),
+    ))
+}
+
+pub(crate) async fn load_bytes_many(
+    store: &mut impl StorageReader,
+    hashes: &[BlobHash],
+) -> Result<BlobBytesBatch, LixError> {
+    let metadata = load_metadata_many(store, hashes).await?.into_vec();
+    let mut chunked_manifests = Vec::new();
+    let mut requested_chunks = Vec::new();
+    let mut seen_chunks = HashSet::new();
+
+    for (index, metadata) in metadata.iter().enumerate() {
+        let Some(metadata) = metadata else {
+            continue;
         };
-        let expected_chunk_size =
-            persisted_size_to_usize(manifest_chunk.chunk_size, "binary CAS chunk")?;
-        let chunk_hash = hash_bytes_to_hex(&manifest_chunk.chunk_hash);
-        let payload = decode_and_verify_chunk(
-            chunk_bytes,
-            expected_chunk_size,
-            blob_hash,
-            &chunk_hash,
-            manifest_chunk.chunk_hash,
-        )?;
-        out.extend_from_slice(&payload);
+        match &metadata.layout {
+            BlobLayout::Empty => {}
+            BlobLayout::SingleChunk { chunk_hash } => {
+                if seen_chunks.insert(*chunk_hash) {
+                    requested_chunks.push(*chunk_hash);
+                }
+            }
+            BlobLayout::Chunked { chunk_count } => {
+                let manifest_chunks = scan_manifest_chunks(store, metadata.hash).await?;
+                if manifest_chunks.len() != *chunk_count as usize {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "binary CAS blob '{}' expected {} chunks, found {}",
+                            metadata.hash.to_hex(),
+                            chunk_count,
+                            manifest_chunks.len()
+                        ),
+                    ));
+                }
+                for manifest_chunk in &manifest_chunks {
+                    let chunk_hash = BlobHash::from_bytes(manifest_chunk.chunk_hash);
+                    if seen_chunks.insert(chunk_hash) {
+                        requested_chunks.push(chunk_hash);
+                    }
+                }
+                chunked_manifests.push((index, manifest_chunks));
+            }
+        }
     }
 
-    if out.len() != expected_blob_size {
+    let chunk_rows = load_chunk_rows(store, &requested_chunks).await?;
+    let chunk_rows_by_hash = requested_chunks
+        .into_iter()
+        .zip(chunk_rows.into_iter())
+        .collect::<HashMap<_, _>>();
+    let chunked_manifests_by_index = chunked_manifests
+        .into_iter()
+        .collect::<HashMap<usize, Vec<KvBlobManifestChunk>>>();
+
+    let entries = metadata
+        .into_iter()
+        .enumerate()
+        .map(|(index, metadata)| {
+            metadata
+                .map(|metadata| {
+                    assemble_blob_bytes(
+                        &metadata,
+                        &chunk_rows_by_hash,
+                        chunked_manifests_by_index.get(&index),
+                    )
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(BlobBytesBatch::new(entries))
+}
+
+async fn load_chunk_rows(
+    store: &mut impl StorageReader,
+    hashes: &[BlobHash],
+) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(store
+        .get_values(KvGetRequest {
+            groups: vec![KvGetGroup {
+                namespace: BINARY_CAS_CHUNK_NAMESPACE.to_string(),
+                keys: hashes.iter().map(|hash| chunk_key(*hash)).collect(),
+            }],
+        })
+        .await?
+        .groups
+        .into_iter()
+        .next()
+        .map(|group| group.values)
+        .unwrap_or_default())
+}
+
+fn assemble_blob_bytes(
+    metadata: &BlobMetadata,
+    chunk_rows_by_hash: &HashMap<BlobHash, Option<Vec<u8>>>,
+    chunked_manifest: Option<&Vec<KvBlobManifestChunk>>,
+) -> Result<Vec<u8>, LixError> {
+    let expected_blob_size = persisted_size_to_usize(metadata.size_bytes, "binary CAS blob")?;
+    let bytes = match &metadata.layout {
+        BlobLayout::Empty => {
+            if metadata.hash != BlobHash::from_content(&[]) {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "binary CAS blob '{}' failed content-address verification",
+                        metadata.hash.to_hex()
+                    ),
+                ));
+            }
+            Vec::new()
+        }
+        BlobLayout::SingleChunk { chunk_hash } => {
+            let chunk = decode_chunk_from_map(
+                chunk_rows_by_hash,
+                metadata.hash,
+                *chunk_hash,
+                expected_blob_size,
+            )?;
+            if *chunk_hash != metadata.hash && BlobHash::from_content(&chunk) != metadata.hash {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "binary CAS blob '{}' failed content-address verification",
+                        metadata.hash.to_hex()
+                    ),
+                ));
+            }
+            chunk
+        }
+        BlobLayout::Chunked { chunk_count } => {
+            let Some(manifest_chunks) = chunked_manifest else {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "binary CAS blob '{}' missing chunk manifest",
+                        metadata.hash.to_hex()
+                    ),
+                ));
+            };
+            if manifest_chunks.len() != *chunk_count as usize {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "binary CAS blob '{}' expected {} chunks, found {}",
+                        metadata.hash.to_hex(),
+                        chunk_count,
+                        manifest_chunks.len()
+                    ),
+                ));
+            }
+            let mut out = Vec::with_capacity(expected_blob_size);
+            for manifest_chunk in manifest_chunks {
+                let chunk_hash = BlobHash::from_bytes(manifest_chunk.chunk_hash);
+                let expected_chunk_size =
+                    persisted_size_to_usize(manifest_chunk.chunk_size, "binary CAS chunk")?;
+                let chunk = decode_chunk_from_map(
+                    chunk_rows_by_hash,
+                    metadata.hash,
+                    chunk_hash,
+                    expected_chunk_size,
+                )?;
+                out.extend_from_slice(&chunk);
+            }
+            if out.len() != expected_blob_size {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "binary CAS blob '{}' expected {} bytes, decoded {} bytes",
+                        metadata.hash.to_hex(),
+                        expected_blob_size,
+                        out.len()
+                    ),
+                ));
+            }
+            if BlobHash::from_content(&out) != metadata.hash {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "binary CAS blob '{}' failed content-address verification",
+                        metadata.hash.to_hex()
+                    ),
+                ));
+            }
+            out
+        }
+    };
+    Ok(bytes)
+}
+
+fn decode_chunk_from_map(
+    chunk_rows_by_hash: &HashMap<BlobHash, Option<Vec<u8>>>,
+    blob_hash: BlobHash,
+    chunk_hash: BlobHash,
+    expected_chunk_size: usize,
+) -> Result<Vec<u8>, LixError> {
+    let Some(Some(chunk_bytes)) = chunk_rows_by_hash.get(&chunk_hash) else {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
-                "binary CAS blob '{}' expected {} bytes, decoded {} bytes",
-                blob_hash,
-                expected_blob_size,
-                out.len()
+                "binary CAS chunk '{}' is missing for blob '{}'",
+                chunk_hash.to_hex(),
+                blob_hash.to_hex()
             ),
         ));
-    }
-    if binary_blob_hash_bytes(&out) != requested_blob_hash {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("binary CAS blob '{blob_hash}' failed content-address verification"),
-        ));
-    }
-    Ok(out)
+    };
+    decode_and_verify_chunk(chunk_bytes, expected_chunk_size, blob_hash, chunk_hash)
 }
 
 fn decode_and_verify_chunk(
     chunk_bytes: &[u8],
     expected_chunk_size: usize,
-    blob_hash: &str,
-    chunk_hash_hex: &str,
-    chunk_hash: [u8; 32],
+    blob_hash: BlobHash,
+    chunk_hash: BlobHash,
 ) -> Result<Vec<u8>, LixError> {
     let (codec, uncompressed_len, chunk_payload) = decode_binary_cas_chunk(chunk_bytes)?;
     if uncompressed_len != expected_chunk_size as u64 {
@@ -398,7 +474,10 @@ fn decode_and_verify_chunk(
             "LIX_ERROR_UNKNOWN",
             format!(
                 "binary CAS chunk '{}' for blob '{}' expected {} uncompressed bytes, row says {}",
-                chunk_hash_hex, blob_hash, expected_chunk_size, uncompressed_len
+                chunk_hash.to_hex(),
+                blob_hash.to_hex(),
+                expected_chunk_size,
+                uncompressed_len
             ),
         ));
     }
@@ -408,115 +487,103 @@ fn decode_and_verify_chunk(
             "LIX_ERROR_UNKNOWN",
             format!(
                 "binary CAS chunk '{}' for blob '{}' expected {} decoded bytes, got {}",
-                chunk_hash_hex,
-                blob_hash,
+                chunk_hash.to_hex(),
+                blob_hash.to_hex(),
                 expected_chunk_size,
                 chunk_payload.len()
             ),
         ));
     }
-    if binary_blob_hash_bytes(chunk_payload) != chunk_hash {
+    if BlobHash::from_content(chunk_payload) != chunk_hash {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
                 "binary CAS chunk '{}' for blob '{}' failed content-address verification",
-                chunk_hash_hex, blob_hash
+                chunk_hash.to_hex(),
+                blob_hash.to_hex()
             ),
         ));
     }
     Ok(chunk_payload.to_vec())
 }
 
-pub(crate) async fn blob_exists(
-    store: &mut impl StorageReader,
-    blob_hash: &str,
-) -> Result<bool, LixError> {
-    Ok(load_manifest(store, blob_hash).await?.is_some())
-}
-
-pub(crate) async fn persist_blob_writes_in_transaction(
-    writer: &mut impl StorageWriter,
-    writes: &[BinaryBlobWrite<'_>],
-) -> Result<(), LixError> {
-    let mut batch = KvWriteBatch::new();
-    let mut blob_hashes = HashSet::new();
-    let mut chunk_keys = HashSet::new();
-
-    for write in writes {
-        stage_blob_write(&mut batch, &mut blob_hashes, &mut chunk_keys, write)?;
-    }
-    if !batch.is_empty() {
-        writer.write_kv_batch(batch).await?;
-    }
-    Ok(())
-}
-
-fn stage_blob_write(
+pub(crate) fn stage_blob_write(
     batch: &mut KvWriteBatch,
     blob_hashes: &mut HashSet<[u8; 32]>,
     chunk_keys: &mut HashSet<Vec<u8>>,
-    write: &BinaryBlobWrite<'_>,
-) -> Result<(), LixError> {
-    let blob_hash = binary_blob_hash_bytes(write.data);
-    if !blob_hashes.insert(blob_hash) {
-        return Ok(());
+    write: &BlobWrite<'_>,
+) -> Result<BlobWriteReceipt, LixError> {
+    let blob_hash = BlobHash::from_content(write.bytes);
+    let chunk_ranges = fastcdc_chunk_ranges(write.bytes);
+    let layout = match chunk_ranges.as_slice() {
+        [] => BlobLayout::Empty,
+        [(start, end)] => BlobLayout::SingleChunk {
+            chunk_hash: BlobHash::from_content(&write.bytes[*start..*end]),
+        },
+        _ => BlobLayout::Chunked {
+            chunk_count: u32::try_from(chunk_ranges.len()).map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "binary CAS blob has too many chunks for manifest".to_string(),
+                )
+            })?,
+        },
+    };
+    let receipt = BlobWriteReceipt {
+        hash: blob_hash,
+        size_bytes: write.bytes.len() as u64,
+        layout: layout.clone(),
+    };
+    if !blob_hashes.insert(blob_hash.into_bytes()) {
+        return Ok(receipt);
     }
 
-    let chunk_ranges = fastcdc_chunk_ranges(write.data);
-    let manifest_key = blob_hash.to_vec();
-    match chunk_ranges.as_slice() {
-        [] => {
+    let manifest_key = manifest_key(blob_hash);
+    match &layout {
+        BlobLayout::Empty => {
             batch.put(
                 BINARY_CAS_MANIFEST_NAMESPACE,
                 manifest_key,
                 encode_binary_cas_manifest(&BinaryCasManifest::Empty { size_bytes: 0 }),
             );
         }
-        [(start, end)] => {
-            let chunk_data = &write.data[*start..*end];
-            let chunk_hash = binary_blob_hash_bytes(chunk_data);
-            let chunk_key = chunk_hash.to_vec();
+        BlobLayout::SingleChunk { chunk_hash } => {
+            let chunk_hash = *chunk_hash;
             batch.put(
                 BINARY_CAS_MANIFEST_NAMESPACE,
                 manifest_key,
                 encode_binary_cas_manifest(&BinaryCasManifest::SingleChunk {
-                    size_bytes: write.data.len() as u64,
-                    chunk_hash,
+                    size_bytes: write.bytes.len() as u64,
+                    chunk_hash: chunk_hash.into_bytes(),
                 }),
             );
-            if chunk_keys.insert(chunk_key.clone()) {
-                let encoded_chunk = encode_binary_chunk_payload(chunk_data);
+            if chunk_keys.insert(chunk_key(chunk_hash)) {
+                let encoded_chunk = encode_binary_chunk_payload(write.bytes);
                 batch.put(
                     BINARY_CAS_CHUNK_NAMESPACE,
-                    chunk_key,
+                    chunk_key(chunk_hash),
                     encode_binary_cas_chunk(
                         encoded_chunk.codec,
-                        chunk_data.len() as u64,
+                        write.bytes.len() as u64,
                         &encoded_chunk.data,
                     ),
                 );
             }
         }
-        _ => {
-            let manifest = BinaryCasManifest::Chunked {
-                size_bytes: write.data.len() as u64,
-                chunk_count: u32::try_from(chunk_ranges.len()).map_err(|_| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        "binary CAS blob has too many chunks for manifest".to_string(),
-                    )
-                })?,
-            };
+        BlobLayout::Chunked { chunk_count } => {
             batch.put(
                 BINARY_CAS_MANIFEST_NAMESPACE,
                 manifest_key,
-                encode_binary_cas_manifest(&manifest),
+                encode_binary_cas_manifest(&BinaryCasManifest::Chunked {
+                    size_bytes: write.bytes.len() as u64,
+                    chunk_count: *chunk_count,
+                }),
             );
 
             for (chunk_index, (start, end)) in chunk_ranges.into_iter().enumerate() {
-                let chunk_data = &write.data[start..end];
-                let chunk_hash = binary_blob_hash_bytes(chunk_data);
-                let chunk_key = chunk_hash.to_vec();
+                let chunk_data = &write.bytes[start..end];
+                let chunk_hash = BlobHash::from_content(chunk_data);
+                let chunk_key = chunk_key(chunk_hash);
                 if chunk_keys.insert(chunk_key.clone()) {
                     let encoded_chunk = encode_binary_chunk_payload(chunk_data);
                     batch.put(
@@ -532,39 +599,65 @@ fn stage_blob_write(
 
                 batch.put(
                     BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
-                    manifest_chunk_key_bytes(&blob_hash, chunk_index as u64),
-                    encode_binary_cas_manifest_chunk(&chunk_hash, chunk_data.len() as u64),
+                    manifest_chunk_key(blob_hash, chunk_index as u64),
+                    encode_binary_cas_manifest_chunk(
+                        chunk_hash.as_bytes(),
+                        chunk_data.len() as u64,
+                    ),
                 );
             }
         }
     }
-    Ok(())
+    Ok(receipt)
 }
 
-fn manifest_key(blob_hash: &str) -> Result<Vec<u8>, LixError> {
-    Ok(hash_hex_to_bytes(blob_hash, "binary CAS blob")?.to_vec())
+fn metadata_from_manifest(
+    hash: BlobHash,
+    manifest: BinaryCasManifest,
+) -> Result<BlobMetadata, LixError> {
+    let size_bytes = manifest.size_bytes();
+    let layout = match manifest {
+        BinaryCasManifest::Empty { size_bytes } => {
+            if size_bytes != 0 {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "binary CAS empty blob '{}' has nonzero size {size_bytes}",
+                        hash.to_hex()
+                    ),
+                ));
+            }
+            BlobLayout::Empty
+        }
+        BinaryCasManifest::SingleChunk { chunk_hash, .. } => BlobLayout::SingleChunk {
+            chunk_hash: BlobHash::from_bytes(chunk_hash),
+        },
+        BinaryCasManifest::Chunked { chunk_count, .. } => BlobLayout::Chunked { chunk_count },
+    };
+    Ok(BlobMetadata {
+        hash,
+        size_bytes,
+        layout,
+    })
 }
 
-fn manifest_chunk_prefix(blob_hash: &str) -> Result<Vec<u8>, LixError> {
-    Ok(hash_hex_to_bytes(blob_hash, "binary CAS blob")?.to_vec())
+fn manifest_key(blob_hash: BlobHash) -> Vec<u8> {
+    blob_hash.as_bytes().to_vec()
 }
 
-fn manifest_chunk_key(blob_hash: &str, chunk_index: u64) -> Result<Vec<u8>, LixError> {
-    Ok(manifest_chunk_key_bytes(
-        &hash_hex_to_bytes(blob_hash, "binary CAS blob")?,
-        chunk_index,
-    ))
+fn manifest_chunk_prefix(blob_hash: BlobHash) -> Vec<u8> {
+    blob_hash.as_bytes().to_vec()
 }
 
-fn manifest_chunk_key_bytes(blob_hash: &[u8; 32], chunk_index: u64) -> Vec<u8> {
+fn manifest_chunk_key(blob_hash: BlobHash, chunk_index: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(40);
-    out.extend_from_slice(blob_hash);
+    out.extend_from_slice(blob_hash.as_bytes());
     out.extend_from_slice(&chunk_index.to_be_bytes());
     out
 }
 
-fn chunk_key(chunk_hash: &str) -> Result<Vec<u8>, LixError> {
-    Ok(hash_hex_to_bytes(chunk_hash, "binary CAS chunk")?.to_vec())
+fn chunk_key(chunk_hash: BlobHash) -> Vec<u8> {
+    chunk_hash.as_bytes().to_vec()
 }
 
 fn persisted_size_to_usize(size: u64, label: &str) -> Result<usize, LixError> {
@@ -580,7 +673,7 @@ fn persisted_size_to_usize(size: u64, label: &str) -> Result<usize, LixError> {
 mod tests {
     use super::*;
     use crate::backend::testing::UnitTestBackend;
-    use crate::binary_cas::codec::binary_blob_hash_hex;
+    use crate::binary_cas::BinaryCasContext;
     use crate::storage::StorageContext;
 
     #[tokio::test]
@@ -590,15 +683,15 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        let blob_hash = binary_blob_hash_hex(b"blob-a");
-        let chunk_a_hash = binary_blob_hash_bytes(b"chunk-a");
-        let chunk_b_hash = binary_blob_hash_bytes(b"chunk-b");
+        let blob_hash = BlobHash::from_content(b"blob-a");
+        let chunk_a_hash = BlobHash::from_content(b"chunk-a").into_bytes();
+        let chunk_b_hash = BlobHash::from_content(b"chunk-b").into_bytes();
 
         {
             let mut writer = transaction.as_mut();
             put_manifest(
                 &mut writer,
-                &blob_hash,
+                blob_hash,
                 &BinaryCasManifest::Chunked {
                     size_bytes: 12,
                     chunk_count: 2,
@@ -608,7 +701,7 @@ mod tests {
             .expect("manifest should persist");
             put_manifest_chunk(
                 &mut writer,
-                &blob_hash,
+                blob_hash,
                 1,
                 &KvBlobManifestChunk {
                     chunk_hash: chunk_b_hash,
@@ -619,7 +712,7 @@ mod tests {
             .expect("chunk ref should persist");
             put_manifest_chunk(
                 &mut writer,
-                &blob_hash,
+                blob_hash,
                 0,
                 &KvBlobManifestChunk {
                     chunk_hash: chunk_a_hash,
@@ -631,9 +724,12 @@ mod tests {
         }
         transaction.commit().await.expect("commit should succeed");
 
-        let mut store = storage.clone();
+        let mut store = storage
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
         assert_eq!(
-            load_manifest(&mut store, &blob_hash)
+            load_manifest(&mut store, blob_hash)
                 .await
                 .expect("manifest should load"),
             Some(BinaryCasManifest::Chunked {
@@ -641,9 +737,12 @@ mod tests {
                 chunk_count: 2,
             })
         );
-        let mut store = storage.clone();
+        let mut store = storage
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
         assert_eq!(
-            scan_manifest_chunks(&mut store, &blob_hash)
+            scan_manifest_chunks(&mut store, blob_hash)
                 .await
                 .expect("manifest chunks should scan"),
             vec![
@@ -671,19 +770,22 @@ mod tests {
             uncompressed_len: 5,
             data: b"hello".to_vec(),
         };
-        let chunk_hash = binary_blob_hash_hex(b"chunk-a");
+        let chunk_hash = BlobHash::from_content(b"chunk-a");
 
         {
             let mut writer = transaction.as_mut();
-            put_chunk(&mut writer, &chunk_hash, &chunk)
+            put_chunk(&mut writer, chunk_hash, &chunk)
                 .await
                 .expect("chunk should persist");
         }
         transaction.commit().await.expect("commit should succeed");
 
-        let mut store = storage.clone();
+        let mut store = storage
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
         assert_eq!(
-            load_chunk(&mut store, &chunk_hash)
+            load_chunk(&mut store, chunk_hash)
                 .await
                 .expect("chunk should load"),
             Some(chunk)
@@ -692,13 +794,12 @@ mod tests {
 
     #[test]
     fn binary_hash_keys_are_compact_and_manifest_chunks_sort_by_index() {
-        let blob_hash = binary_blob_hash_hex(b"blob");
-        let manifest_key = manifest_key(&blob_hash).expect("manifest key should encode");
-        let chunk_key =
-            chunk_key(&binary_blob_hash_hex(b"chunk")).expect("chunk key should encode");
-        let first = manifest_chunk_key(&blob_hash, 1).expect("first key should encode");
-        let second = manifest_chunk_key(&blob_hash, 2).expect("second key should encode");
-        let later = manifest_chunk_key(&blob_hash, 10).expect("later key should encode");
+        let blob_hash = BlobHash::from_content(b"blob");
+        let manifest_key = manifest_key(blob_hash);
+        let chunk_key = chunk_key(BlobHash::from_content(b"chunk"));
+        let first = manifest_chunk_key(blob_hash, 1);
+        let second = manifest_chunk_key(blob_hash, 2);
+        let later = manifest_chunk_key(blob_hash, 10);
 
         assert_eq!(manifest_key.len(), 32);
         assert_eq!(chunk_key.len(), 32);
@@ -711,55 +812,67 @@ mod tests {
     async fn public_kv_api_roundtrips_blob_bytes() {
         let storage = StorageContext::new(std::sync::Arc::new(UnitTestBackend::new()));
         let data = b"hello chunked kv cas";
-        let blob_hash = binary_blob_hash_hex(data);
+        let blob_hash = BlobHash::from_content(data);
         let mut transaction = storage
             .begin_write_transaction()
             .await
             .expect("transaction should open");
 
         {
-            let mut writer = transaction.as_mut();
-            persist_blob_writes_in_transaction(
-                &mut writer,
-                &[BinaryBlobWrite {
-                    file_id: "file-a",
-                    version_id: "global",
-                    data,
-                }],
-            )
-            .await
-            .expect("blob write should persist");
+            let mut writer = BinaryCasContext::new().writer();
+            writer.stage_bytes(data).expect("blob write should persist");
+            writer
+                .flush(&mut transaction.as_mut())
+                .await
+                .expect("blob write should flush");
         }
         transaction.commit().await.expect("commit should succeed");
 
-        let mut store = storage.clone();
+        let mut store = storage
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
         assert_eq!(
-            load_blob_data_by_hash(&mut store, &blob_hash)
+            load_bytes_many(&mut store, &[blob_hash])
                 .await
-                .expect("blob should load"),
-            Some(data.to_vec())
+                .expect("blob should load")
+                .into_vec(),
+            vec![Some(data.to_vec())]
         );
-        let mut store = storage.clone();
+        let mut store = storage
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
         assert_eq!(
-            load_manifest(&mut store, &blob_hash)
+            load_manifest(&mut store, blob_hash)
                 .await
                 .expect("manifest should load"),
             Some(BinaryCasManifest::SingleChunk {
                 size_bytes: data.len() as u64,
-                chunk_hash: binary_blob_hash_bytes(data),
+                chunk_hash: BlobHash::from_content(data).into_bytes(),
             })
         );
-        let mut store = storage.clone();
+        let mut store = storage
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
         assert_eq!(
-            scan_manifest_chunks(&mut store, &blob_hash)
+            scan_manifest_chunks(&mut store, blob_hash)
                 .await
                 .expect("single-chunk blob should not spill manifest chunks"),
             Vec::<KvBlobManifestChunk>::new()
         );
-        let mut store = storage.clone();
-        assert!(blob_exists(&mut store, &blob_hash)
+        let mut store = storage
+            .begin_read_transaction()
             .await
-            .expect("blob exists should succeed"));
+            .expect("read transaction should open");
+        assert_eq!(
+            exists_many(&mut store, &[blob_hash])
+                .await
+                .expect("blob exists should succeed")
+                .into_vec(),
+            vec![true]
+        );
     }
 
     #[tokio::test]
@@ -767,24 +880,19 @@ mod tests {
         let storage = StorageContext::new(std::sync::Arc::new(UnitTestBackend::new()));
         let data = b"same length";
         let corrupted = b"SAME length";
-        let blob_hash = binary_blob_hash_hex(data);
+        let blob_hash = BlobHash::from_content(data);
 
         let mut transaction = storage
             .begin_write_transaction()
             .await
             .expect("transaction should open");
         {
-            let mut writer = transaction.as_mut();
-            persist_blob_writes_in_transaction(
-                &mut writer,
-                &[BinaryBlobWrite {
-                    file_id: "file-corrupt-chunk",
-                    version_id: "global",
-                    data,
-                }],
-            )
-            .await
-            .expect("blob write should persist");
+            let mut writer = BinaryCasContext::new().writer();
+            writer.stage_bytes(data).expect("blob write should persist");
+            writer
+                .flush(&mut transaction.as_mut())
+                .await
+                .expect("blob write should flush");
         }
         transaction.commit().await.expect("commit should succeed");
 
@@ -797,7 +905,7 @@ mod tests {
             put_one(
                 &mut writer,
                 BINARY_CAS_CHUNK_NAMESPACE,
-                chunk_key(&blob_hash).expect("chunk key should encode"),
+                chunk_key(blob_hash),
                 encode_binary_cas_chunk(BinaryChunkCodec::Raw, corrupted.len() as u64, corrupted),
             )
             .await
@@ -805,8 +913,11 @@ mod tests {
         }
         transaction.commit().await.expect("commit should succeed");
 
-        let mut store = storage.clone();
-        let error = load_blob_data_by_hash(&mut store, &blob_hash)
+        let mut store = storage
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
+        let error = load_bytes_many(&mut store, &[blob_hash])
             .await
             .expect_err("corrupt chunk should be rejected");
         assert!(error
@@ -820,8 +931,8 @@ mod tests {
         let expected = b"expected bytes";
         let substituted = b"different byte";
         assert_eq!(expected.len(), substituted.len());
-        let expected_blob_hash = binary_blob_hash_hex(expected);
-        let substituted_chunk_hash = binary_blob_hash_hex(substituted);
+        let expected_blob_hash = BlobHash::from_content(expected);
+        let substituted_chunk_hash = BlobHash::from_content(substituted);
 
         let mut transaction = storage
             .begin_write_transaction()
@@ -831,7 +942,7 @@ mod tests {
             let mut writer = transaction.as_mut();
             put_manifest(
                 &mut writer,
-                &expected_blob_hash,
+                expected_blob_hash,
                 &BinaryCasManifest::Chunked {
                     size_bytes: expected.len() as u64,
                     chunk_count: 1,
@@ -841,10 +952,10 @@ mod tests {
             .expect("manifest should persist");
             put_manifest_chunk(
                 &mut writer,
-                &expected_blob_hash,
+                expected_blob_hash,
                 0,
                 &KvBlobManifestChunk {
-                    chunk_hash: binary_blob_hash_bytes(substituted),
+                    chunk_hash: BlobHash::from_content(substituted).into_bytes(),
                     chunk_size: substituted.len() as u64,
                 },
             )
@@ -852,7 +963,7 @@ mod tests {
             .expect("manifest chunk should persist");
             put_chunk(
                 &mut writer,
-                &substituted_chunk_hash,
+                substituted_chunk_hash,
                 &KvChunk {
                     codec: BinaryChunkCodec::Raw,
                     uncompressed_len: substituted.len() as u64,
@@ -864,8 +975,11 @@ mod tests {
         }
         transaction.commit().await.expect("commit should succeed");
 
-        let mut store = storage.clone();
-        let error = load_blob_data_by_hash(&mut store, &expected_blob_hash)
+        let mut store = storage
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
+        let error = load_bytes_many(&mut store, &[expected_blob_hash])
             .await
             .expect_err("wrong assembled blob should be rejected");
         assert!(error
@@ -877,37 +991,41 @@ mod tests {
     async fn public_kv_api_roundtrips_empty_blob() {
         let storage = StorageContext::new(std::sync::Arc::new(UnitTestBackend::new()));
         let data = b"";
-        let blob_hash = binary_blob_hash_hex(data);
+        let blob_hash = BlobHash::from_content(data);
         let mut transaction = storage
             .begin_write_transaction()
             .await
             .expect("transaction should open");
 
         {
-            let mut writer = transaction.as_mut();
-            persist_blob_writes_in_transaction(
-                &mut writer,
-                &[BinaryBlobWrite {
-                    file_id: "file-empty",
-                    version_id: "global",
-                    data,
-                }],
-            )
-            .await
-            .expect("empty blob write should persist");
+            let mut writer = BinaryCasContext::new().writer();
+            writer
+                .stage_bytes(data)
+                .expect("empty blob write should persist");
+            writer
+                .flush(&mut transaction.as_mut())
+                .await
+                .expect("empty blob write should flush");
         }
         transaction.commit().await.expect("commit should succeed");
 
-        let mut store = storage.clone();
+        let mut store = storage
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
         assert_eq!(
-            load_blob_data_by_hash(&mut store, &blob_hash)
+            load_bytes_many(&mut store, &[blob_hash])
                 .await
-                .expect("empty blob should load"),
-            Some(Vec::new())
+                .expect("empty blob should load")
+                .into_vec(),
+            vec![Some(Vec::new())]
         );
-        let mut store = storage.clone();
+        let mut store = storage
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
         assert_eq!(
-            scan_manifest_chunks(&mut store, &blob_hash)
+            scan_manifest_chunks(&mut store, blob_hash)
                 .await
                 .expect("empty blob chunks should scan"),
             Vec::<KvBlobManifestChunk>::new()
@@ -920,37 +1038,41 @@ mod tests {
         let data = (0..600_000)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
-        let blob_hash = binary_blob_hash_hex(&data);
+        let blob_hash = BlobHash::from_content(&data);
         let mut transaction = storage
             .begin_write_transaction()
             .await
             .expect("transaction should open");
 
         {
-            let mut writer = transaction.as_mut();
-            persist_blob_writes_in_transaction(
-                &mut writer,
-                &[BinaryBlobWrite {
-                    file_id: "file-large",
-                    version_id: "global",
-                    data: &data,
-                }],
-            )
-            .await
-            .expect("large blob write should persist");
+            let mut writer = BinaryCasContext::new().writer();
+            writer
+                .stage_bytes(&data)
+                .expect("large blob write should persist");
+            writer
+                .flush(&mut transaction.as_mut())
+                .await
+                .expect("large blob write should flush");
         }
         transaction.commit().await.expect("commit should succeed");
 
-        let mut store = storage.clone();
+        let mut store = storage
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
         assert_eq!(
-            load_blob_data_by_hash(&mut store, &blob_hash)
+            load_bytes_many(&mut store, &[blob_hash])
                 .await
-                .expect("large blob should load"),
-            Some(data)
+                .expect("large blob should load")
+                .into_vec(),
+            vec![Some(data.clone())]
         );
-        let mut store = storage.clone();
+        let mut store = storage
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
         assert!(
-            scan_manifest_chunks(&mut store, &blob_hash)
+            scan_manifest_chunks(&mut store, blob_hash)
                 .await
                 .expect("large blob chunks should scan")
                 .len()

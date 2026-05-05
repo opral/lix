@@ -1,12 +1,15 @@
 use async_trait::async_trait;
 
-use crate::binary_cas::BinaryBlobWrite;
-use crate::storage::{StorageReader, StorageWriter};
+use crate::binary_cas::{
+    BlobBytesBatch, BlobExistsBatch, BlobHash, BlobMetadataBatch, BlobWrite, BlobWriteReceipt,
+};
+use crate::storage::{KvWriteBatch, StorageReader, StorageWriter};
 use crate::LixError;
+use std::collections::HashSet;
 
 #[async_trait]
 pub(crate) trait BlobDataReader: Send + Sync {
-    async fn load_blob_data_by_hash(&self, blob_hash: &str) -> Result<Option<Vec<u8>>, LixError>;
+    async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError>;
 }
 
 /// Long-lived Binary CAS context factory.
@@ -32,11 +35,8 @@ impl BinaryCasContext {
         BinaryCasStoreReader { store }
     }
 
-    pub(crate) fn writer<S>(&self, store: S) -> BinaryCasWriter<S>
-    where
-        S: StorageWriter,
-    {
-        BinaryCasWriter { store }
+    pub(crate) fn writer(&self) -> BinaryCasWriter {
+        BinaryCasWriter::new()
     }
 }
 
@@ -45,22 +45,12 @@ impl<S> BlobDataReader for BinaryCasStoreReader<S>
 where
     S: StorageReader + Clone + Send + Sync,
 {
-    async fn load_blob_data_by_hash(&self, blob_hash: &str) -> Result<Option<Vec<u8>>, LixError> {
+    async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
         let mut reader = BinaryCasStoreReader {
             store: self.store.clone(),
         };
-        let reader: &mut dyn BinaryCasReader = &mut reader;
-        reader.load_blob_data_by_hash(blob_hash).await
+        BinaryCasStoreReader::load_bytes_many(&mut reader, hashes).await
     }
-}
-
-/// Read side for Binary CAS blobs.
-#[async_trait]
-pub(crate) trait BinaryCasReader {
-    async fn load_blob_data_by_hash(
-        &mut self,
-        blob_hash: &str,
-    ) -> Result<Option<Vec<u8>>, LixError>;
 }
 
 /// Binary CAS reader over a caller-supplied KV store.
@@ -72,11 +62,27 @@ impl<S> BinaryCasStoreReader<S>
 where
     S: StorageReader,
 {
-    pub(crate) async fn load_blob_data_by_hash(
+    #[allow(dead_code)]
+    pub(crate) async fn exists_many(
         &mut self,
-        blob_hash: &str,
-    ) -> Result<Option<Vec<u8>>, LixError> {
-        crate::binary_cas::kv::load_blob_data_by_hash(&mut self.store, blob_hash).await
+        hashes: &[BlobHash],
+    ) -> Result<BlobExistsBatch, LixError> {
+        crate::binary_cas::kv::exists_many(&mut self.store, hashes).await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn load_metadata_many(
+        &mut self,
+        hashes: &[BlobHash],
+    ) -> Result<BlobMetadataBatch, LixError> {
+        crate::binary_cas::kv::load_metadata_many(&mut self.store, hashes).await
+    }
+
+    pub(crate) async fn load_bytes_many(
+        &mut self,
+        hashes: &[BlobHash],
+    ) -> Result<BlobBytesBatch, LixError> {
+        crate::binary_cas::kv::load_bytes_many(&mut self.store, hashes).await
     }
 
     #[cfg(feature = "storage-benches")]
@@ -85,35 +91,59 @@ where
     }
 }
 
-#[async_trait]
-impl<S> BinaryCasReader for BinaryCasStoreReader<S>
-where
-    S: StorageReader + Send,
-{
-    async fn load_blob_data_by_hash(
-        &mut self,
-        blob_hash: &str,
-    ) -> Result<Option<Vec<u8>>, LixError> {
-        BinaryCasStoreReader::load_blob_data_by_hash(self, blob_hash).await
-    }
-}
-
 /// Transaction-scoped Binary CAS writer.
 ///
 /// This type does not begin, commit, or roll back transactions. It only writes
 /// CAS data into the transaction supplied by the caller.
-pub(crate) struct BinaryCasWriter<S> {
-    store: S,
+pub(crate) struct BinaryCasWriter {
+    batch: KvWriteBatch,
+    blob_hashes: HashSet<[u8; 32]>,
+    chunk_keys: HashSet<Vec<u8>>,
 }
 
-impl<S> BinaryCasWriter<S>
-where
-    S: StorageWriter,
-{
-    pub(crate) async fn put_blob_writes(
+impl BinaryCasWriter {
+    fn new() -> Self {
+        Self {
+            batch: KvWriteBatch::new(),
+            blob_hashes: HashSet::new(),
+            chunk_keys: HashSet::new(),
+        }
+    }
+
+    pub(crate) fn stage_bytes(&mut self, bytes: &[u8]) -> Result<BlobWriteReceipt, LixError> {
+        crate::binary_cas::kv::stage_blob_write(
+            &mut self.batch,
+            &mut self.blob_hashes,
+            &mut self.chunk_keys,
+            &BlobWrite { bytes },
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn stage_many(
         &mut self,
-        writes: &[BinaryBlobWrite<'_>],
+        writes: &[BlobWrite<'_>],
+    ) -> Result<Vec<BlobWriteReceipt>, LixError> {
+        writes
+            .iter()
+            .map(|write| {
+                crate::binary_cas::kv::stage_blob_write(
+                    &mut self.batch,
+                    &mut self.blob_hashes,
+                    &mut self.chunk_keys,
+                    write,
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) async fn flush(
+        self,
+        store: &mut (impl StorageWriter + ?Sized),
     ) -> Result<(), LixError> {
-        crate::binary_cas::kv::persist_blob_writes_in_transaction(&mut self.store, writes).await
+        if !self.batch.is_empty() {
+            store.write_kv_batch(self.batch).await?;
+        }
+        Ok(())
     }
 }

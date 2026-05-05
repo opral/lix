@@ -75,6 +75,7 @@ impl BinaryCasManifest {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn binary_blob_hash_hex(data: &[u8]) -> String {
     crate::common::stable_content_fingerprint_hex(data)
 }

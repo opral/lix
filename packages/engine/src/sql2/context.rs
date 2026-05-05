@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
-use crate::binary_cas::BlobDataReader;
+use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
 use crate::changelog::ChangelogReader;
 use crate::commit_graph::CommitGraphReader;
 use crate::functions::FunctionProviderHandle;
@@ -63,10 +63,7 @@ pub(crate) trait SqlWriteExecutionContext {
     fn functions(&self) -> FunctionProviderHandle;
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
 
-    async fn load_blob_data_by_hash(
-        &mut self,
-        blob_hash: &str,
-    ) -> Result<Option<Vec<u8>>, LixError>;
+    async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError>;
 
     async fn scan_live_state(
         &mut self,
@@ -139,10 +136,10 @@ impl SqlWriteContext {
         }
     }
 
-    pub(crate) async fn load_blob_data_by_hash(
+    pub(crate) async fn load_bytes_many(
         &self,
-        blob_hash: &str,
-    ) -> Result<Option<Vec<u8>>, LixError> {
+        hashes: &[BlobHash],
+    ) -> Result<BlobBytesBatch, LixError> {
         let _guard = self.gate.lock().await;
         unsafe {
             self.ptr
@@ -150,7 +147,7 @@ impl SqlWriteContext {
                 .as_ptr()
                 .as_mut()
                 .unwrap()
-                .load_blob_data_by_hash(blob_hash)
+                .load_bytes_many(hashes)
                 .await
         }
     }
@@ -200,8 +197,8 @@ impl WriteContextBlobDataReader {
 
 #[async_trait]
 impl BlobDataReader for WriteContextBlobDataReader {
-    async fn load_blob_data_by_hash(&self, blob_hash: &str) -> Result<Option<Vec<u8>>, LixError> {
-        self.ctx.load_blob_data_by_hash(blob_hash).await
+    async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
+        self.ctx.load_bytes_many(hashes).await
     }
 }
 

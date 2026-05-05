@@ -21,7 +21,7 @@ use futures_util::stream;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use crate::binary_cas::BlobDataReader;
+use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::changelog::MaterializedCanonicalChange;
 use crate::commit_graph::CommitGraphReader;
 use crate::serialize_row_metadata;
@@ -412,7 +412,7 @@ async fn load_file_history_rows(
         let blob = nearest_blob_ref(&blobs, &event);
         let data = if needs_data {
             match blob.and_then(|blob| blob.blob_hash.as_deref()) {
-                Some(blob_hash) => blob_reader.load_blob_data_by_hash(blob_hash).await?,
+                Some(blob_hash) => load_single_blob_bytes(blob_reader, blob_hash).await?,
                 None => None,
             }
         } else {
@@ -461,6 +461,20 @@ async fn load_file_history_rows(
             .then(left.event.change.id.cmp(&right.event.change.id))
     });
     Ok(output)
+}
+
+async fn load_single_blob_bytes(
+    blob_reader: &Arc<dyn BlobDataReader>,
+    blob_hash: &str,
+) -> Result<Option<Vec<u8>>, LixError> {
+    let hash = BlobHash::from_hex(blob_hash)?;
+    Ok(blob_reader
+        .load_bytes_many(&[hash])
+        .await?
+        .into_vec()
+        .into_iter()
+        .next()
+        .flatten())
 }
 
 fn file_history_events(
