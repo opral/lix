@@ -108,21 +108,29 @@ impl BackendReadTransaction for SqliteBenchTransaction {
             .map_err(sqlite_error)?;
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
-            let mut values = Vec::with_capacity(group.keys.len());
+            let namespace = group.namespace.clone();
+            let mut values = BytePageBuilder::with_capacity(group.keys.len(), 0);
+            let mut present = Vec::with_capacity(group.keys.len());
             for key in group.keys {
-                values.push(
-                    statement
-                        .query_row(params![group.namespace.as_str(), key.as_slice()], |row| {
-                            row.get::<_, Vec<u8>>(0)
-                        })
-                        .optional()
-                        .map_err(sqlite_error)?,
-                );
+                let value = statement
+                    .query_row(params![namespace.as_str(), key.as_slice()], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })
+                    .optional()
+                    .map_err(sqlite_error)?;
+                if let Some(value) = value {
+                    values.push(value);
+                    present.push(true);
+                } else {
+                    values.push([]);
+                    present.push(false);
+                }
             }
-            groups.push(BackendKvValueGroup {
-                namespace: group.namespace,
-                values,
-            });
+            groups.push(BackendKvValueGroup::new(
+                namespace,
+                values.finish(),
+                present,
+            ));
         }
         Ok(BackendKvValueBatch { groups })
     }
@@ -137,23 +145,18 @@ impl BackendReadTransaction for SqliteBenchTransaction {
             .map_err(sqlite_error)?;
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
+            let namespace = group.namespace.clone();
             let mut exists = Vec::with_capacity(group.keys.len());
             for key in group.keys {
                 exists.push(
                     statement
-                        .query_row(
-                            params![group.namespace.as_str(), key.as_slice()],
-                            |_| Ok(()),
-                        )
+                        .query_row(params![namespace.as_str(), key.as_slice()], |_| Ok(()))
                         .optional()
                         .map_err(sqlite_error)?
                         .is_some(),
                 );
             }
-            groups.push(BackendKvExistsGroup {
-                namespace: group.namespace,
-                exists,
-            });
+            groups.push(BackendKvExistsGroup { namespace, exists });
         }
         Ok(BackendKvExistsBatch { groups })
     }
@@ -212,20 +215,29 @@ impl BackendWriteTransaction for SqliteBenchTransaction {
             .map_err(sqlite_error)?;
         let mut stats = BackendKvWriteStats::default();
         for group in batch.groups {
-            for put in group.puts {
+            let namespace = group.namespace().to_string();
+            for index in 0..group.put_count() {
+                let key = group.put_key(index).ok_or_else(|| {
+                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put key")
+                })?;
+                let value = group.put_value(index).ok_or_else(|| {
+                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put value")
+                })?;
                 put_statement
-                    .execute(params![
-                        group.namespace.as_str(),
-                        put.key.as_slice(),
-                        put.value.as_slice()
-                    ])
+                    .execute(params![namespace.as_str(), key, value])
                     .map_err(sqlite_error)?;
                 stats.puts += 1;
-                stats.bytes_written += put.key.len() + put.value.len();
+                stats.bytes_written += key.len() + value.len();
             }
-            for key in group.deletes {
+            for index in 0..group.delete_count() {
+                let key = group.delete_key(index).ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "backend write batch missing delete key",
+                    )
+                })?;
                 delete_statement
-                    .execute(params![group.namespace.as_str(), key.as_slice()])
+                    .execute(params![namespace.as_str(), key])
                     .map_err(sqlite_error)?;
                 stats.deletes += 1;
                 stats.bytes_written += key.len();

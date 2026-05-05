@@ -5,7 +5,7 @@ mod types;
 
 pub use kv::{
     BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetGroup,
-    BackendKvGetRequest, BackendKvKeyPage, BackendKvPut, BackendKvScanRange, BackendKvScanRequest,
+    BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest,
     BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
     BackendKvWriteGroup, BackendKvWriteStats, BytePage, BytePageBuilder,
 };

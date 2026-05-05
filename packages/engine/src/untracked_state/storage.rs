@@ -1,7 +1,7 @@
 use crate::json_store::JsonStoreContext;
 use crate::storage::KvScanRange;
 use crate::storage::{
-    KvGetGroup, KvGetRequest, KvPut, KvScanRequest, KvWriteBatch, KvWriteGroup, StorageReader,
+    KvGetGroup, KvGetRequest, KvScanRequest, KvWriteBatch, KvWriteGroup, StorageReader,
     StorageWriter,
 };
 use crate::untracked_state::{
@@ -50,7 +50,7 @@ pub(crate) async fn load_row(
         .groups
         .into_iter()
         .next()
-        .and_then(|mut group| group.pop_value());
+        .and_then(|group| group.single_value_owned());
     let Some(bytes) = bytes else {
         return Ok(None);
     };
@@ -69,24 +69,23 @@ pub(crate) async fn write_rows(
     writer: &mut impl StorageWriter,
     rows: &[MaterializedUntrackedStateRow],
 ) -> Result<(), LixError> {
-    let mut puts = Vec::with_capacity(rows.len());
-    let mut deletes = Vec::new();
+    let mut group = KvWriteGroup::new(UNTRACKED_STATE_ROW_NAMESPACE);
     let mut json_writer = JsonStoreContext::new().writer();
     for row in rows {
         let identity = UntrackedStateIdentity::from_materialized_row(row);
         if row.snapshot_content.is_none() {
-            deletes.push(encode_untracked_state_row_key(&identity));
+            group.delete(encode_untracked_state_row_key(&identity));
         } else {
             let canonical =
                 crate::untracked_state::canonicalize_materialized_row(&mut json_writer, row)?;
-            puts.push(KvPut {
-                key: encode_untracked_state_row_key(&identity),
-                value: crate::untracked_state::codec::encode_row(&canonical)?,
-            });
+            group.put(
+                encode_untracked_state_row_key(&identity),
+                crate::untracked_state::codec::encode_row(&canonical)?,
+            );
         }
     }
     json_writer.flush(&mut *writer).await?;
-    write_untracked_batch(writer, puts, deletes).await?;
+    write_untracked_batch(writer, group).await?;
     Ok(())
 }
 
@@ -94,11 +93,11 @@ pub(crate) async fn delete_rows(
     writer: &mut impl StorageWriter,
     identities: &[UntrackedStateIdentity],
 ) -> Result<(), LixError> {
-    let deletes = identities
-        .iter()
-        .map(encode_untracked_state_row_key)
-        .collect();
-    write_untracked_batch(writer, Vec::new(), deletes).await?;
+    let mut group = KvWriteGroup::new(UNTRACKED_STATE_ROW_NAMESPACE);
+    for identity in identities {
+        group.delete(encode_untracked_state_row_key(identity));
+    }
+    write_untracked_batch(writer, group).await?;
     Ok(())
 }
 
@@ -153,19 +152,14 @@ fn identity_from_request(request: &UntrackedStateRowRequest) -> Option<Untracked
 
 async fn write_untracked_batch(
     writer: &mut impl StorageWriter,
-    puts: Vec<KvPut>,
-    deletes: Vec<Vec<u8>>,
+    group: KvWriteGroup,
 ) -> Result<(), LixError> {
-    if puts.is_empty() && deletes.is_empty() {
+    if group.put_count() == 0 && group.delete_count() == 0 {
         return Ok(());
     }
     writer
         .write_kv_batch(KvWriteBatch {
-            groups: vec![KvWriteGroup {
-                namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
-                puts,
-                deletes,
-            }],
+            groups: vec![group],
         })
         .await?;
     Ok(())

@@ -209,20 +209,29 @@ impl BackendReadTransaction for RecordingTransaction {
         let data = self.data.lock().expect("recording backend lock poisoned");
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
-            let mut values = Vec::with_capacity(group.keys.len());
+            let namespace = group.namespace.clone();
+            let mut values = BytePageBuilder::with_capacity(group.keys.len(), 0);
+            let mut present = Vec::with_capacity(group.keys.len());
             for key in group.keys {
-                let identity = (group.namespace.clone(), key.clone());
-                values.push(
-                    self.pending
-                        .get(&identity)
-                        .cloned()
-                        .unwrap_or_else(|| data.get(&identity).cloned()),
-                );
+                let identity = (namespace.clone(), key.clone());
+                let value = self
+                    .pending
+                    .get(&identity)
+                    .cloned()
+                    .unwrap_or_else(|| data.get(&identity).cloned());
+                if let Some(value) = value {
+                    values.push(value);
+                    present.push(true);
+                } else {
+                    values.push([]);
+                    present.push(false);
+                }
             }
-            groups.push(BackendKvValueGroup {
-                namespace: group.namespace,
-                values,
-            });
+            groups.push(BackendKvValueGroup::new(
+                namespace,
+                values.finish(),
+                present,
+            ));
         }
         Ok(BackendKvValueBatch { groups })
     }
@@ -234,9 +243,10 @@ impl BackendReadTransaction for RecordingTransaction {
         let data = self.data.lock().expect("recording backend lock poisoned");
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
+            let namespace = group.namespace.clone();
             let mut exists = Vec::with_capacity(group.keys.len());
             for key in group.keys {
-                let identity = (group.namespace.clone(), key.clone());
+                let identity = (namespace.clone(), key.clone());
                 exists.push(
                     self.pending
                         .get(&identity)
@@ -244,10 +254,7 @@ impl BackendReadTransaction for RecordingTransaction {
                         .unwrap_or_else(|| data.contains_key(&identity)),
                 );
             }
-            groups.push(BackendKvExistsGroup {
-                namespace: group.namespace,
-                exists,
-            });
+            groups.push(BackendKvExistsGroup { namespace, exists });
         }
         Ok(BackendKvExistsBatch { groups })
     }
@@ -304,16 +311,29 @@ impl BackendWriteTransaction for RecordingTransaction {
     ) -> Result<BackendKvWriteStats, LixError> {
         let mut stats = BackendKvWriteStats::default();
         for group in batch.groups {
-            for put in group.puts {
+            let namespace = group.namespace().to_string();
+            for index in 0..group.put_count() {
+                let key = group.put_key(index).ok_or_else(|| {
+                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put key")
+                })?;
+                let value = group.put_value(index).ok_or_else(|| {
+                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put value")
+                })?;
                 stats.puts += 1;
-                stats.bytes_written += put.key.len() + put.value.len();
+                stats.bytes_written += key.len() + value.len();
                 self.pending
-                    .insert((group.namespace.clone(), put.key), Some(put.value));
+                    .insert((namespace.clone(), key.to_vec()), Some(value.to_vec()));
             }
-            for key in group.deletes {
+            for index in 0..group.delete_count() {
+                let key = group.delete_key(index).ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "backend write batch missing delete key",
+                    )
+                })?;
                 stats.deletes += 1;
                 stats.bytes_written += key.len();
-                self.pending.insert((group.namespace.clone(), key), None);
+                self.pending.insert((namespace.clone(), key.to_vec()), None);
             }
         }
         Ok(stats)

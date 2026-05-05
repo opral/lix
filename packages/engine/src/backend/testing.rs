@@ -72,15 +72,23 @@ impl BackendReadTransaction for UnitTestTransaction {
     ) -> Result<BackendKvValueBatch, LixError> {
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
-            let values = group
-                .keys
-                .into_iter()
-                .map(|key| self.kv.get(&(group.namespace.clone(), key)).cloned())
-                .collect();
-            groups.push(BackendKvValueGroup {
-                namespace: group.namespace,
-                values,
-            });
+            let namespace = group.namespace.clone();
+            let mut values = BytePageBuilder::with_capacity(group.keys.len(), 0);
+            let mut present = Vec::with_capacity(group.keys.len());
+            for key in group.keys {
+                if let Some(value) = self.kv.get(&(namespace.clone(), key)) {
+                    values.push(value);
+                    present.push(true);
+                } else {
+                    values.push([]);
+                    present.push(false);
+                }
+            }
+            groups.push(BackendKvValueGroup::new(
+                namespace,
+                values.finish(),
+                present,
+            ));
         }
         Ok(BackendKvValueBatch { groups })
     }
@@ -91,15 +99,13 @@ impl BackendReadTransaction for UnitTestTransaction {
     ) -> Result<BackendKvExistsBatch, LixError> {
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
+            let namespace = group.namespace.clone();
             let exists = group
                 .keys
                 .into_iter()
-                .map(|key| self.kv.contains_key(&(group.namespace.clone(), key)))
+                .map(|key| self.kv.contains_key(&(namespace.clone(), key)))
                 .collect();
-            groups.push(BackendKvExistsGroup {
-                namespace: group.namespace,
-                exists,
-            });
+            groups.push(BackendKvExistsGroup { namespace, exists });
         }
         Ok(BackendKvExistsBatch { groups })
     }
@@ -138,16 +144,29 @@ impl BackendWriteTransaction for UnitTestTransaction {
     ) -> Result<BackendKvWriteStats, LixError> {
         let mut stats = BackendKvWriteStats::default();
         for group in batch.groups {
-            for put in group.puts {
+            let namespace = group.namespace().to_string();
+            for index in 0..group.put_count() {
+                let key = group.put_key(index).ok_or_else(|| {
+                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put key")
+                })?;
+                let value = group.put_value(index).ok_or_else(|| {
+                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put value")
+                })?;
                 stats.puts += 1;
-                stats.bytes_written += put.key.len() + put.value.len();
+                stats.bytes_written += key.len() + value.len();
                 self.kv
-                    .insert((group.namespace.clone(), put.key), put.value);
+                    .insert((namespace.clone(), key.to_vec()), value.to_vec());
             }
-            for key in group.deletes {
+            for index in 0..group.delete_count() {
+                let key = group.delete_key(index).ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "backend write batch missing delete key",
+                    )
+                })?;
                 stats.deletes += 1;
                 stats.bytes_written += key.len();
-                self.kv.remove(&(group.namespace.clone(), key));
+                self.kv.remove(&(namespace.clone(), key.to_vec()));
             }
         }
         Ok(stats)
@@ -294,8 +313,8 @@ fn lock_error(name: &str) -> LixError {
 mod tests {
     use super::*;
     use crate::backend::{
-        BackendKvGetGroup, BackendKvGetRequest, BackendKvPut, BackendKvScanRequest,
-        BackendKvWriteBatch, BackendKvWriteGroup,
+        BackendKvGetGroup, BackendKvGetRequest, BackendKvScanRequest, BackendKvWriteBatch,
+        BackendKvWriteGroup,
     };
 
     async fn put(
@@ -306,14 +325,11 @@ mod tests {
     ) {
         transaction
             .write_kv_batch(BackendKvWriteBatch {
-                groups: vec![BackendKvWriteGroup {
-                    namespace: namespace.to_string(),
-                    puts: vec![BackendKvPut {
-                        key: key.to_vec(),
-                        value: value.to_vec(),
-                    }],
-                    deletes: Vec::new(),
-                }],
+                groups: {
+                    let mut group = BackendKvWriteGroup::new(namespace);
+                    group.put(key, value);
+                    vec![group]
+                },
             })
             .await
             .expect("put should succeed");
@@ -326,11 +342,11 @@ mod tests {
     ) {
         transaction
             .write_kv_batch(BackendKvWriteBatch {
-                groups: vec![BackendKvWriteGroup {
-                    namespace: namespace.to_string(),
-                    puts: Vec::new(),
-                    deletes: vec![key.to_vec()],
-                }],
+                groups: {
+                    let mut group = BackendKvWriteGroup::new(namespace);
+                    group.delete(key);
+                    vec![group]
+                },
             })
             .await
             .expect("delete should succeed");
@@ -358,7 +374,7 @@ mod tests {
             .groups
             .into_iter()
             .next()
-            .and_then(|mut group| group.pop_value())
+            .and_then(|group| group.value(0).flatten().map(<[u8]>::to_vec))
     }
 
     async fn scan(
