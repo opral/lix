@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
-use crate::binary_cas::BinaryCasContext;
+use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobHash};
 use crate::changelog::ChangelogContext;
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
 use crate::entity_identity::EntityIdentity;
@@ -418,13 +418,10 @@ impl SqlWriteExecutionContext for Transaction {
         Ok(self.visible_schemas.clone())
     }
 
-    async fn load_blob_data_by_hash(
-        &mut self,
-        blob_hash: &str,
-    ) -> Result<Option<Vec<u8>>, LixError> {
+    async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
         self.binary_cas
             .reader(self.storage_transaction.as_mut())
-            .load_blob_data_by_hash(blob_hash)
+            .load_bytes_many(hashes)
             .await
     }
 

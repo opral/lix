@@ -1,4 +1,4 @@
-use crate::binary_cas::{BinaryBlobWrite, BinaryCasContext};
+use crate::binary_cas::{BinaryCasContext, BlobHash, BlobWrite};
 use crate::changelog::{
     canonicalize_materialized_change, CanonicalChange, ChangelogContext, ChangelogScanRequest,
     MaterializedCanonicalChange,
@@ -752,7 +752,7 @@ pub struct BinaryCasWriteFixture {
 pub struct BinaryCasReadFixture {
     context: BinaryCasContext,
     rows: usize,
-    hashes: Vec<String>,
+    hashes: Vec<BlobHash>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1983,7 +1983,7 @@ pub async fn prepare_binary_cas_read(
     write_binary_blob_writes(backend, &context, &writes).await?;
     let hashes = payloads
         .iter()
-        .map(|payload| crate::binary_cas::binary_blob_hash_hex(payload))
+        .map(|payload| BlobHash::from_content(payload))
         .collect::<Vec<_>>();
     Ok(BinaryCasReadFixture {
         context,
@@ -1996,15 +1996,16 @@ pub async fn binary_cas_read_blob_hit_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &BinaryCasReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let mut verified_rows = 0;
     let mut reader = fixture
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
-    for hash in &fixture.hashes {
-        if reader.load_blob_data_by_hash(hash).await?.is_some() {
-            verified_rows += 1;
-        }
-    }
+    let verified_rows = reader
+        .load_bytes_many(&fixture.hashes)
+        .await?
+        .into_vec()
+        .into_iter()
+        .filter(|row| row.is_some())
+        .count();
     Ok(report(fixture.hashes.len(), verified_rows, Duration::ZERO))
 }
 
@@ -2017,10 +2018,11 @@ pub async fn binary_cas_read_blob_miss_prepared(
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
     for index in 0..fixture.rows {
-        let missing_hash = format!("{index:064x}");
+        let missing_hash = BlobHash::from_hex(&format!("{index:064x}"))?;
         if reader
-            .load_blob_data_by_hash(&missing_hash)
+            .load_bytes_many(&[missing_hash])
             .await?
+            .get(0)
             .is_none()
         {
             misses += 1;
@@ -2711,17 +2713,18 @@ pub async fn binary_cas_read_blob_hit(
     write_binary_blob_writes(backend, &context, &writes).await?;
     let hashes = payloads
         .iter()
-        .map(|payload| crate::binary_cas::binary_blob_hash_hex(payload))
+        .map(|payload| BlobHash::from_content(payload))
         .collect::<Vec<_>>();
 
     let started = Instant::now();
-    let mut verified_rows = 0;
     let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
-    for hash in &hashes {
-        if reader.load_blob_data_by_hash(hash).await?.is_some() {
-            verified_rows += 1;
-        }
-    }
+    let verified_rows = reader
+        .load_bytes_many(&hashes)
+        .await?
+        .into_vec()
+        .into_iter()
+        .filter(|row| row.is_some())
+        .count();
     Ok(report(hashes.len(), verified_rows, started.elapsed()))
 }
 
@@ -2739,10 +2742,11 @@ pub async fn binary_cas_read_blob_miss(
     let mut misses = 0;
     let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
     for index in 0..config.rows {
-        let missing_hash = format!("{index:064x}");
+        let missing_hash = BlobHash::from_hex(&format!("{index:064x}"))?;
         if reader
-            .load_blob_data_by_hash(&missing_hash)
+            .load_bytes_many(&[missing_hash])
             .await?
+            .get(0)
             .is_none()
         {
             misses += 1;
@@ -2843,13 +2847,14 @@ async fn append_changelog_changes(
 async fn write_binary_blob_writes(
     backend: &Arc<dyn Backend + Send + Sync>,
     context: &BinaryCasContext,
-    writes: &[BinaryBlobWrite<'_>],
+    writes: &[BlobWrite<'_>],
 ) -> Result<(), LixError> {
     let storage = StorageContext::new(Arc::clone(backend));
     let mut transaction = storage.begin_write_transaction().await?;
     {
-        let mut writer = context.writer(transaction.as_mut());
-        writer.put_blob_writes(writes).await?;
+        let mut writer = context.writer();
+        writer.stage_many(writes)?;
+        writer.flush(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await
 }
@@ -3167,17 +3172,11 @@ fn binary_half_duplicate_payloads(rows: usize, blob_bytes: usize) -> Vec<Vec<u8>
         .collect()
 }
 
-fn binary_blob_writes<'a>(
-    file_ids: &'a [String],
-    payloads: &'a [Vec<u8>],
-) -> Vec<BinaryBlobWrite<'a>> {
+fn binary_blob_writes<'a>(_file_ids: &'a [String], payloads: &'a [Vec<u8>]) -> Vec<BlobWrite<'a>> {
     payloads
         .iter()
-        .enumerate()
-        .map(|(index, payload)| BinaryBlobWrite {
-            file_id: file_ids[index].as_str(),
-            version_id: "bench-version",
-            data: payload.as_slice(),
+        .map(|payload| BlobWrite {
+            bytes: payload.as_slice(),
         })
         .collect()
 }

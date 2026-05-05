@@ -1715,11 +1715,11 @@ mod tests {
 
     #[async_trait]
     impl BlobDataReader for DummyBlobReader {
-        async fn load_blob_data_by_hash(
+        async fn load_bytes_many(
             &self,
-            _blob_hash: &str,
-        ) -> Result<Option<Vec<u8>>, LixError> {
-            Ok(None)
+            hashes: &[crate::binary_cas::BlobHash],
+        ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
+            Ok(crate::binary_cas::BlobBytesBatch::missing(hashes.len()))
         }
     }
 
@@ -1737,11 +1737,11 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn load_blob_data_by_hash(
+        async fn load_bytes_many(
             &mut self,
-            blob_hash: &str,
-        ) -> Result<Option<Vec<u8>>, LixError> {
-            DummyBlobReader.load_blob_data_by_hash(blob_hash).await
+            hashes: &[crate::binary_cas::BlobHash],
+        ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
+            DummyBlobReader.load_bytes_many(hashes).await
         }
 
         async fn scan_live_state(
@@ -1780,11 +1780,11 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn load_blob_data_by_hash(
+        async fn load_bytes_many(
             &mut self,
-            blob_hash: &str,
-        ) -> Result<Option<Vec<u8>>, LixError> {
-            DummyBlobReader.load_blob_data_by_hash(blob_hash).await
+            hashes: &[crate::binary_cas::BlobHash],
+        ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
+            DummyBlobReader.load_bytes_many(hashes).await
         }
 
         async fn scan_live_state(

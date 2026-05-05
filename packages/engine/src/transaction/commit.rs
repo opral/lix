@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::binary_cas::{BinaryBlobWrite, BinaryCasContext};
+use crate::binary_cas::BinaryCasContext;
 use crate::changelog::{CanonicalChange, ChangelogContext};
 use crate::json_store::{JsonRef, JsonStoreContext, JsonStoreWriter};
 use crate::live_state::{LiveStateContext, LiveStateRow};
@@ -27,19 +27,11 @@ pub(crate) async fn commit_staged_writes(
     staged_writes: StagedWriteSet,
 ) -> Result<(), LixError> {
     if !staged_writes.file_data_writes.is_empty() {
-        let blob_writes = staged_writes
-            .file_data_writes
-            .iter()
-            .map(|write| BinaryBlobWrite {
-                file_id: &write.file_id,
-                version_id: &write.version_id,
-                data: &write.data,
-            })
-            .collect::<Vec<_>>();
-        binary_cas
-            .writer(&mut *transaction)
-            .put_blob_writes(&blob_writes)
-            .await?;
+        let mut blob_writer = binary_cas.writer();
+        for write in &staged_writes.file_data_writes {
+            blob_writer.stage_bytes(&write.data)?;
+        }
+        blob_writer.flush(transaction).await?;
     }
 
     let (mut changelog_rows, untracked_rows): (Vec<_>, Vec<_>) = staged_writes

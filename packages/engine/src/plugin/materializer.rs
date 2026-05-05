@@ -109,9 +109,14 @@ pub(crate) async fn load_installed_plugin_from_archive_ref_with_backend(
     };
     let binary_cas = crate::binary_cas::BinaryCasContext::new();
     let mut reader = binary_cas.reader(backend);
+    let archive_hash = crate::binary_cas::BlobHash::from_hex(&archive_ref.blob_hash)?;
     let archive_bytes = reader
-        .load_blob_data_by_hash(&archive_ref.blob_hash)
+        .load_bytes_many(&[archive_hash])
         .await?
+        .into_vec()
+        .into_iter()
+        .next()
+        .flatten()
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             message: format!(
