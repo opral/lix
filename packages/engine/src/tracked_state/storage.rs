@@ -1,5 +1,5 @@
 use crate::storage::{
-    KvGetGroup, KvGetRequest, KvPut, KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
+    KvGetGroup, KvGetRequest, KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
 };
 use crate::tracked_state::codec::PendingChunkWrite;
 use crate::tracked_state::tree_types::{TrackedStateRootId, TRACKED_STATE_HASH_BYTES};
@@ -25,7 +25,7 @@ async fn get_one(
         .groups
         .into_iter()
         .next()
-        .and_then(|mut group| group.pop_value()))
+        .and_then(|group| group.single_value_owned()))
 }
 
 async fn put_one(
@@ -36,11 +36,11 @@ async fn put_one(
 ) -> Result<(), LixError> {
     writer
         .write_kv_batch(KvWriteBatch {
-            groups: vec![KvWriteGroup {
-                namespace: namespace.to_string(),
-                puts: vec![KvPut { key, value }],
-                deletes: Vec::new(),
-            }],
+            groups: {
+                let mut group = KvWriteGroup::new(namespace);
+                group.put(key, value);
+                vec![group]
+            },
         })
         .await?;
     Ok(())
@@ -113,18 +113,13 @@ pub(crate) async fn delete_root(
 ) -> Result<(), LixError> {
     writer
         .write_kv_batch(KvWriteBatch {
-            groups: vec![
-                KvWriteGroup {
-                    namespace: TRACKED_STATE_ROOT_NAMESPACE.to_string(),
-                    puts: Vec::new(),
-                    deletes: vec![commit_id.as_bytes().to_vec()],
-                },
-                KvWriteGroup {
-                    namespace: TRACKED_STATE_BY_FILE_ROOT_NAMESPACE.to_string(),
-                    puts: Vec::new(),
-                    deletes: vec![commit_id.as_bytes().to_vec()],
-                },
-            ],
+            groups: {
+                let mut root = KvWriteGroup::new(TRACKED_STATE_ROOT_NAMESPACE);
+                root.delete(commit_id.as_bytes());
+                let mut by_file = KvWriteGroup::new(TRACKED_STATE_BY_FILE_ROOT_NAMESPACE);
+                by_file.delete(commit_id.as_bytes());
+                vec![root, by_file]
+            },
         })
         .await?;
     Ok(())

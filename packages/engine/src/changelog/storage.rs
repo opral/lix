@@ -2,7 +2,7 @@ use crate::changelog::codec::{decode_change, encode_change};
 use crate::changelog::{CanonicalChange, ChangelogScanRequest};
 use crate::storage::KvScanRange;
 use crate::storage::{
-    KvGetGroup, KvGetRequest, KvPut, KvScanRequest, KvWriteBatch, KvWriteGroup, StorageReader,
+    KvGetGroup, KvGetRequest, KvScanRequest, KvWriteBatch, KvWriteGroup, StorageReader,
     StorageWriter,
 };
 use crate::LixError;
@@ -24,7 +24,7 @@ pub(crate) async fn load_change(
         .groups
         .into_iter()
         .next()
-        .and_then(|mut group| group.pop_value());
+        .and_then(|group| group.single_value_owned());
     let Some(bytes) = bytes else {
         return Ok(None);
     };
@@ -52,22 +52,13 @@ pub(crate) async fn append_changes(
     writer: &mut (impl StorageWriter + ?Sized),
     changes: &[CanonicalChange],
 ) -> Result<(), LixError> {
-    let puts = changes
-        .iter()
-        .map(|change| {
-            Ok(KvPut {
-                key: encode_change_key(&change.id),
-                value: encode_change(change)?,
-            })
-        })
-        .collect::<Result<Vec<_>, LixError>>()?;
+    let mut group = KvWriteGroup::new(CHANGELOG_CHANGE_NAMESPACE);
+    for change in changes {
+        group.put(encode_change_key(&change.id), encode_change(change)?);
+    }
     writer
         .write_kv_batch(KvWriteBatch {
-            groups: vec![KvWriteGroup {
-                namespace: CHANGELOG_CHANGE_NAMESPACE.to_string(),
-                puts,
-                deletes: Vec::new(),
-            }],
+            groups: vec![group],
         })
         .await?;
     Ok(())

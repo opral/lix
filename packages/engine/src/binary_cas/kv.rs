@@ -11,7 +11,7 @@ use crate::binary_cas::{
     BlobWrite, BlobWriteReceipt,
 };
 use crate::storage::{
-    KvGetGroup, KvGetRequest, KvPut, KvScanRange, KvScanRequest, KvWriteBatch, KvWriteGroup,
+    KvGetGroup, KvGetRequest, KvScanRange, KvScanRequest, KvWriteBatch, KvWriteGroup,
     StorageReader, StorageWriter,
 };
 use crate::LixError;
@@ -157,7 +157,7 @@ async fn get_one(
         .groups
         .into_iter()
         .next()
-        .and_then(|mut group| group.pop_value()))
+        .and_then(|group| group.single_value_owned()))
 }
 
 async fn scan_all_values(
@@ -185,11 +185,11 @@ async fn put_one(
 ) -> Result<(), LixError> {
     writer
         .write_kv_batch(KvWriteBatch {
-            groups: vec![KvWriteGroup {
-                namespace: namespace.to_string(),
-                puts: vec![KvPut { key, value }],
-                deletes: Vec::new(),
-            }],
+            groups: {
+                let mut group = KvWriteGroup::new(namespace);
+                group.put(key, value);
+                vec![group]
+            },
         })
         .await?;
     Ok(())
@@ -213,7 +213,12 @@ pub(crate) async fn load_metadata_many(
         .groups
         .into_iter()
         .next()
-        .map(|group| group.values)
+        .map(|group| {
+            group
+                .values_iter()
+                .map(|value| value.map(<[u8]>::to_vec))
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     if rows.len() != hashes.len() {
         return Err(LixError::new(
@@ -342,7 +347,12 @@ async fn load_chunk_rows(
         .groups
         .into_iter()
         .next()
-        .map(|group| group.values)
+        .map(|group| {
+            group
+                .values_iter()
+                .map(|value| value.map(<[u8]>::to_vec))
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default())
 }
 

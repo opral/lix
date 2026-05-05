@@ -258,15 +258,19 @@ mod tests {
         ) -> Result<BackendKvValueBatch, LixError> {
             let mut groups = Vec::with_capacity(request.groups.len());
             for group in request.groups {
-                let values = group
-                    .keys
-                    .into_iter()
-                    .map(|key| test_kv_get(&self.archive_bytes, &group.namespace, &key))
-                    .collect::<Result<Vec<_>, LixError>>()?;
-                groups.push(BackendKvValueGroup {
-                    namespace: group.namespace,
-                    values,
-                });
+            let namespace = group.namespace.clone();
+            let mut values = BytePageBuilder::with_capacity(group.keys.len(), 0);
+                let mut present = Vec::with_capacity(group.keys.len());
+                for key in group.keys {
+                    if let Some(value) = test_kv_get(&self.archive_bytes, &group.namespace, &key)? {
+                        values.push(value);
+                        present.push(true);
+                    } else {
+                        values.push([]);
+                        present.push(false);
+                    }
+                }
+                groups.push(BackendKvValueGroup::new(namespace, values.finish(), present));
             }
             Ok(BackendKvValueBatch { groups })
         }
@@ -277,7 +281,8 @@ mod tests {
         ) -> Result<BackendKvExistsBatch, LixError> {
             let mut groups = Vec::with_capacity(request.groups.len());
             for group in request.groups {
-                let exists = group
+            let namespace = group.namespace.clone();
+            let exists = group
                     .keys
                     .iter()
                     .map(|key| test_kv_get(&self.archive_bytes, &group.namespace, key))
@@ -286,7 +291,7 @@ mod tests {
                     .map(|value| value.is_some())
                     .collect();
                 groups.push(BackendKvExistsGroup {
-                    namespace: group.namespace,
+                    namespace,
                     exists,
                 });
             }
