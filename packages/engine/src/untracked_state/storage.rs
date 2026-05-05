@@ -179,7 +179,7 @@ mod tests {
     use super::*;
     use crate::backend::testing::UnitTestBackend;
     use crate::storage::{StorageContext, StorageWriteTransaction};
-    use crate::untracked_state::{canonicalize_materialized_row, UntrackedStateContext};
+    use crate::untracked_state::UntrackedStateContext;
 
     async fn write_materialized_rows_to_store(
         context: &UntrackedStateContext,
@@ -190,7 +190,13 @@ mod tests {
         let canonical_rows = {
             let mut json_writer = JsonStoreContext::new().writer();
             rows.iter()
-                .map(|row| canonicalize_materialized_row(&mut writes, &mut json_writer, row))
+                .map(|row| {
+                    crate::test_support::untracked_state_row_from_materialized(
+                        &mut writes,
+                        &mut json_writer,
+                        row,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .expect("rows should canonicalize")
         };
@@ -298,8 +304,12 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         let canonical_row = {
             let mut json_writer = JsonStoreContext::new().writer();
-            canonicalize_materialized_row(&mut writes, &mut json_writer, &row)
-                .expect("row should canonicalize")
+            crate::test_support::untracked_state_row_from_materialized(
+                &mut writes,
+                &mut json_writer,
+                &row,
+            )
+            .expect("row should canonicalize")
         };
         let mut writer = context.writer(&mut writes);
         writer

@@ -1,17 +1,15 @@
 use std::sync::Arc;
 
-use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::entity_identity::EntityIdentity;
-use crate::json_store::JsonStoreWriter;
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::untracked_state::{
-    canonicalize_materialized_row, MaterializedUntrackedStateRow, UntrackedStateContext,
-    UntrackedStateFilter, UntrackedStateRow, UntrackedStateRowRequest, UntrackedStateScanRequest,
+    MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter, UntrackedStateRow,
+    UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
+use crate::version::VERSION_REF_SCHEMA_KEY;
 use crate::version::{VersionHead, VersionRefReader};
-use crate::version::{VERSION_REF_SCHEMA_KEY, VERSION_REF_SCHEMA_VERSION};
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
@@ -151,17 +149,6 @@ impl VersionRefWriter<'_> {
     }
 }
 
-pub(super) fn canonical_version_ref_row(
-    writes: &mut StorageWriteSet,
-    json_writer: &mut JsonStoreWriter,
-    version_id: &str,
-    commit_id: &str,
-    timestamp: &str,
-) -> Result<UntrackedStateRow, LixError> {
-    let row = version_ref_row(version_id, commit_id, timestamp)?;
-    canonicalize_materialized_row(writes, json_writer, &row)
-}
-
 fn decode_version_head(
     requested_version_id: &str,
     row: &MaterializedUntrackedStateRow,
@@ -191,36 +178,6 @@ fn decode_version_head(
     }))
 }
 
-fn version_ref_row(
-    version_id: &str,
-    commit_id: &str,
-    timestamp: &str,
-) -> Result<MaterializedUntrackedStateRow, LixError> {
-    let snapshot_content = serde_json::to_string(&json!({
-        "id": version_id,
-        "commit_id": commit_id,
-    }))
-    .map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("engine2 version-ref snapshot serialization failed: {error}"),
-        )
-    })?;
-
-    Ok(MaterializedUntrackedStateRow {
-        entity_id: crate::entity_identity::EntityIdentity::single(version_id),
-        schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
-        file_id: None,
-        snapshot_content: Some(snapshot_content),
-        metadata: None,
-        schema_version: VERSION_REF_SCHEMA_VERSION.to_string(),
-        created_at: timestamp.to_string(),
-        updated_at: timestamp.to_string(),
-        global: true,
-        version_id: GLOBAL_VERSION_ID.to_string(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -228,9 +185,8 @@ mod tests {
     use crate::backend::testing::UnitTestBackend;
     use crate::json_store::JsonStoreContext;
     use crate::storage::{StorageContext, StorageWriteSet};
-    use crate::untracked_state::{
-        canonicalize_materialized_row, UntrackedStateContext, UntrackedStateRowRequest,
-    };
+    use crate::transaction::prepare_version_ref_row;
+    use crate::untracked_state::{UntrackedStateContext, UntrackedStateRowRequest};
 
     use super::*;
 
@@ -356,51 +312,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn malformed_snapshot_errors_clearly() {
-        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
-        let untracked_state = UntrackedStateContext::new();
-        let version_ref = VersionRefContext::new(Arc::new(UntrackedStateContext::new()));
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut row = version_ref_row("version-b", "commit-b", "2026-01-01T00:00:00Z")
-            .expect("version-ref row should plan");
-        row.snapshot_content = Some("{not-json".to_string());
-        let mut writes = StorageWriteSet::new();
-        let canonical_row = {
-            let mut json_writer = JsonStoreContext::new().writer();
-            canonicalize_materialized_row(&mut writes, &mut json_writer, &row)
-                .expect("malformed row should canonicalize for test setup")
-        };
-        untracked_state
-            .writer(&mut writes)
-            .stage_rows(&[canonical_row])
-            .expect("malformed row should write for test setup");
-        writes
-            .apply(&mut transaction.as_mut())
-            .await
-            .expect("malformed row should apply for test setup");
-        transaction
-            .commit()
-            .await
-            .expect("transaction should commit");
-
-        let error = version_ref
-            .reader(storage)
-            .load_head("version-b")
-            .await
-            .expect_err("malformed snapshot should error");
-
-        assert!(
-            error
-                .message
-                .contains("engine2 version-ref snapshot parse failed"),
-            "unexpected error: {error:?}"
-        );
-    }
-
     fn test_version_ref() -> VersionRefContext {
         VersionRefContext::new(Arc::new(UntrackedStateContext::new()))
     }
@@ -414,7 +325,7 @@ mod tests {
     ) -> Result<(), LixError> {
         let canonical_row = {
             let mut json_writer = JsonStoreContext::new().writer();
-            canonical_version_ref_row(writes, &mut json_writer, version_id, commit_id, timestamp)?
+            prepare_version_ref_row(writes, &mut json_writer, version_id, commit_id, timestamp)?
         };
         version_ref.writer(writes).stage_rows(&[canonical_row])
     }

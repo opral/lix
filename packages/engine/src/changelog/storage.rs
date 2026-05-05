@@ -69,8 +69,7 @@ mod tests {
 
     use crate::backend::testing::UnitTestBackend;
     use crate::changelog::{
-        canonicalize_materialized_change, materialize_change, ChangelogContext,
-        ChangelogScanRequest, MaterializedCanonicalChange,
+        materialize_change, ChangelogContext, ChangelogScanRequest, MaterializedCanonicalChange,
     };
     use crate::json_store::JsonStoreContext;
     use crate::storage::{StorageContext, StorageWriteSet, StorageWriteTransaction};
@@ -186,7 +185,13 @@ mod tests {
         let mut json_writer = JsonStoreContext::new().writer();
         let canonical_changes = changes
             .iter()
-            .map(|change| canonicalize_materialized_change(&mut writes, &mut json_writer, change))
+            .map(|change| {
+                crate::test_support::canonical_change_from_materialized(
+                    &mut writes,
+                    &mut json_writer,
+                    change,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()
             .expect("changes should canonicalize");
         let mut writer = changelog.writer(&mut writes);

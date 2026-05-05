@@ -1,27 +1,7 @@
 use crate::changelog::{CanonicalChange, MaterializedCanonicalChange};
-use crate::json_store::{JsonRef, JsonStoreReader, JsonStoreWriter};
-use crate::storage::{StorageReader, StorageWriteSet};
-use crate::{serialize_row_metadata, validate_row_metadata, LixError, RowMetadata};
-
-pub(crate) fn canonicalize_materialized_change(
-    writes: &mut StorageWriteSet,
-    json_writer: &mut JsonStoreWriter,
-    change: &MaterializedCanonicalChange,
-) -> Result<CanonicalChange, LixError> {
-    let snapshot_ref =
-        stage_optional_json(writes, json_writer, change.snapshot_content.as_deref())?;
-    let metadata_ref = stage_optional_metadata(writes, json_writer, change.metadata.as_ref())?;
-    Ok(CanonicalChange {
-        id: change.id.clone(),
-        entity_id: change.entity_id.clone(),
-        schema_key: change.schema_key.clone(),
-        schema_version: change.schema_version.clone(),
-        file_id: change.file_id.clone(),
-        snapshot_ref,
-        metadata_ref,
-        created_at: change.created_at.clone(),
-    })
-}
+use crate::json_store::{JsonRef, JsonStoreReader};
+use crate::storage::StorageReader;
+use crate::{validate_row_metadata, LixError, RowMetadata};
 
 pub(crate) async fn materialize_change<S>(
     json_reader: &mut JsonStoreReader<S>,
@@ -43,31 +23,6 @@ where
         metadata,
         created_at: change.created_at,
     })
-}
-
-fn stage_optional_json(
-    writes: &mut StorageWriteSet,
-    json_writer: &mut JsonStoreWriter,
-    value: Option<&str>,
-) -> Result<Option<JsonRef>, LixError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    json_writer.stage_bytes(writes, value.as_bytes()).map(Some)
-}
-
-fn stage_optional_metadata(
-    writes: &mut StorageWriteSet,
-    json_writer: &mut JsonStoreWriter,
-    value: Option<&RowMetadata>,
-) -> Result<Option<JsonRef>, LixError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let serialized = serialize_row_metadata(value);
-    json_writer
-        .stage_bytes(writes, serialized.as_bytes())
-        .map(Some)
 }
 
 async fn load_optional_metadata<S>(

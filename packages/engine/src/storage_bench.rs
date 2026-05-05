@@ -1,13 +1,12 @@
 use crate::binary_cas::{BinaryCasContext, BlobHash, BlobWrite};
 use crate::changelog::{
-    canonicalize_materialized_change, CanonicalChange, ChangelogContext, ChangelogScanRequest,
-    MaterializedCanonicalChange,
+    CanonicalChange, ChangelogContext, ChangelogScanRequest, MaterializedCanonicalChange,
 };
 use crate::entity_identity::EntityIdentity;
 use crate::entity_identity::EntityIdentityPart;
 use crate::json_store::context::JsonStoreContext;
 use crate::json_store::types::{JsonProjectionPath, JsonRef};
-use crate::live_state::{LiveStateContext, LiveStateRow};
+use crate::live_state::{LiveStateContext, LiveStateRow, LiveStateWriteBatch};
 use crate::schema_registry::SchemaRegistry;
 use crate::session::SessionMode;
 use crate::storage::{
@@ -15,15 +14,14 @@ use crate::storage::{
     StorageWriteSet,
 };
 use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDiffRequest, TrackedStateFilter, TrackedStateProjection,
-    TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
+    MaterializedTrackedStateRow, TrackedStateContext, TrackedStateDiffRequest, TrackedStateFilter,
+    TrackedStateProjection, TrackedStateRowRequest, TrackedStateScanRequest,
 };
 use crate::transaction::open_transaction;
 use crate::transaction::types::{StageRow, StageWrite, StageWriteMode};
 use crate::untracked_state::{
-    canonicalize_materialized_row, MaterializedUntrackedStateRow, UntrackedStateContext,
-    UntrackedStateFilter, UntrackedStateProjection, UntrackedStateRowRequest,
-    UntrackedStateScanRequest,
+    MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter,
+    UntrackedStateProjection, UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
 use crate::version::VersionContext;
 use crate::{Backend, LixError, NullableKeyFilter, RowMetadata};
@@ -581,6 +579,8 @@ async fn seed_transaction_visible_schema_rows(
     storage: StorageContext,
     live_state: &LiveStateContext,
 ) -> Result<(), LixError> {
+    let mut writes = StorageWriteSet::new();
+    let mut json_writer = JsonStoreContext::new().writer();
     let rows = crate::schema::seed_schema_definitions()
         .into_iter()
         .cloned()
@@ -588,7 +588,8 @@ async fn seed_transaction_visible_schema_rows(
         .map(|schema| {
             let key = crate::schema::schema_key_from_definition(&schema)
                 .expect("seed schema key should derive");
-            LiveStateRow {
+            let snapshot_content = serde_json::json!({ "value": schema }).to_string();
+            Ok(LiveStateRow {
                 entity_id: crate::schema::registered_schema_entity_id(
                     &key.schema_key,
                     &key.schema_version,
@@ -598,24 +599,30 @@ async fn seed_transaction_visible_schema_rows(
                 file_id: None,
                 version_id: crate::GLOBAL_VERSION_ID.to_string(),
                 schema_version: "1".to_string(),
-                snapshot_content: Some(serde_json::json!({ "value": schema }).to_string()),
-                metadata: None,
+                snapshot_ref: Some(
+                    json_writer.stage_bytes(&mut writes, snapshot_content.as_bytes())?,
+                ),
+                metadata_ref: None,
                 created_at: "1970-01-01T00:00:00.000Z".to_string(),
                 updated_at: "1970-01-01T00:00:00.000Z".to_string(),
                 change_id: None,
                 commit_id: None,
                 untracked: true,
                 global: true,
-            }
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, LixError>>()?;
     let mut transaction = storage.begin_write_transaction().await?;
-    let mut writes = StorageWriteSet::new();
-    let mut json_writer = JsonStoreContext::new().writer();
     {
         let mut writer = live_state.writer(transaction.as_mut());
         writer
-            .stage_rows(&mut writes, &mut json_writer, &rows)
+            .stage_rows(
+                &mut writes,
+                LiveStateWriteBatch {
+                    untracked_rows: rows,
+                    tracked_roots: Vec::new(),
+                },
+            )
             .await?;
     }
     writes.apply(&mut transaction.as_mut()).await?;
@@ -1344,7 +1351,7 @@ fn storage_api_updated_value(index: usize) -> Vec<u8> {
 
 pub struct TrackedStateWriteRootFixture {
     context: TrackedStateContext,
-    rows: Vec<TrackedStateRow>,
+    rows: Vec<MaterializedTrackedStateRow>,
 }
 
 pub struct TrackedStateReadFixture {
@@ -1357,7 +1364,7 @@ pub struct TrackedStateReadFixture {
 
 pub struct TrackedStateUpdateFixture {
     context: TrackedStateContext,
-    rows: Vec<TrackedStateRow>,
+    rows: Vec<MaterializedTrackedStateRow>,
 }
 
 pub struct TrackedStateDiffFixture {
@@ -3402,7 +3409,7 @@ async fn write_tracked_root(
     context: &TrackedStateContext,
     commit_id: &str,
     parent_commit_id: Option<&str>,
-    rows: &[TrackedStateRow],
+    rows: &[MaterializedTrackedStateRow],
 ) -> Result<(), LixError> {
     let storage = StorageContext::new(Arc::clone(backend));
     let mut transaction = storage.begin_write_transaction().await?;
@@ -3410,15 +3417,24 @@ async fn write_tracked_root(
         let mut writes = StorageWriteSet::new();
         {
             let mut json_writer = JsonStoreContext::new().writer();
+            let canonical_rows = rows
+                .iter()
+                .map(|row| {
+                    crate::test_support::tracked_state_row_from_materialized(
+                        &mut writes,
+                        &mut json_writer,
+                        row,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             context
                 .writer()
                 .stage_root(
                     &mut transaction.as_mut(),
                     &mut writes,
-                    &mut json_writer,
                     commit_id,
                     parent_commit_id,
-                    rows,
+                    &canonical_rows,
                 )
                 .await?;
         }
@@ -3431,7 +3447,7 @@ async fn scan_tracked(
     backend: &Arc<dyn Backend + Send + Sync>,
     context: &TrackedStateContext,
     commit_id: &str,
-) -> Result<Vec<TrackedStateRow>, LixError> {
+) -> Result<Vec<MaterializedTrackedStateRow>, LixError> {
     let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
     reader
         .scan_rows_at_commit(commit_id, &TrackedStateScanRequest::default())
@@ -3450,7 +3466,13 @@ async fn write_untracked_rows(
         let canonical_rows = {
             let mut json_writer = JsonStoreContext::new().writer();
             rows.iter()
-                .map(|row| canonicalize_materialized_row(&mut writes, &mut json_writer, row))
+                .map(|row| {
+                    crate::test_support::untracked_state_row_from_materialized(
+                        &mut writes,
+                        &mut json_writer,
+                        row,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut writer = context.writer(&mut writes);
@@ -3483,7 +3505,11 @@ async fn append_changelog_changes(
             changes
                 .iter()
                 .map(|change| {
-                    canonicalize_materialized_change(&mut writes, &mut json_writer, change)
+                    crate::test_support::canonical_change_from_materialized(
+                        &mut writes,
+                        &mut json_writer,
+                        change,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
@@ -3534,9 +3560,9 @@ const CHANGELOG_MATCH_SCHEMA_KEY: &str = "bench_changelog_entity";
 const CHANGELOG_OTHER_SCHEMA_KEY: &str = "bench_changelog_other_entity";
 const CHANGELOG_HISTORY_ENTITY_ID: &str = "change-entity-history-target";
 
-fn tracked_rows(config: StorageBenchConfig, commit_id: &str) -> Vec<TrackedStateRow> {
+fn tracked_rows(config: StorageBenchConfig, commit_id: &str) -> Vec<MaterializedTrackedStateRow> {
     (0..config.rows)
-        .map(|index| TrackedStateRow {
+        .map(|index| MaterializedTrackedStateRow {
             entity_id: EntityIdentity::single(entity_id("tracked", index, config.key_pattern)),
             schema_key: tracked_schema_key(index, config.selectivity),
             file_id: Some("bench.json".to_string()),
@@ -3554,9 +3580,9 @@ fn tracked_rows(config: StorageBenchConfig, commit_id: &str) -> Vec<TrackedState
 fn tracked_rows_file_selective(
     config: StorageBenchConfig,
     commit_id: &str,
-) -> Vec<TrackedStateRow> {
+) -> Vec<MaterializedTrackedStateRow> {
     (0..config.rows)
-        .map(|index| TrackedStateRow {
+        .map(|index| MaterializedTrackedStateRow {
             entity_id: EntityIdentity::single(entity_id("tracked", index, config.key_pattern)),
             schema_key: TRACKED_MATCH_SCHEMA_KEY.to_string(),
             file_id: Some(

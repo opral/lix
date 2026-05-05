@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::live_state::LiveStateRow;
+use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{LiveStateReader, LiveStateScanRequest};
 use crate::transaction::staging::{StagedStateRowIdentity, StagedStateRowOverlay};
 use crate::LixError;
@@ -9,7 +9,7 @@ pub(crate) async fn overlay_scan_rows(
     base: &dyn LiveStateReader,
     staged: &StagedStateRowOverlay,
     request: &LiveStateScanRequest,
-) -> Result<Vec<LiveStateRow>, LixError> {
+) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
     let mut rows = staged.scan(request);
     let hidden_identities = staged.identities_matching_scan(request);
     let mut visible_identities = rows

@@ -1,5 +1,5 @@
 use crate::commit_graph::CommitGraphContext;
-use crate::json_store::{JsonStoreContext, JsonStoreWriter};
+use crate::json_store::JsonStoreContext;
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::tracked_state::by_file_index::ByFileIndex;
 use crate::tracked_state::diff::{diff_commits, TrackedStateDiff, TrackedStateDiffRequest};
@@ -11,7 +11,9 @@ use crate::tracked_state::tree::TrackedStateTree;
 use crate::tracked_state::tree_types::{
     TrackedStateKey, TrackedStateMutation, TrackedStateTreeScanRequest, TrackedStateValue,
 };
-use crate::tracked_state::{TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest};
+use crate::tracked_state::{
+    MaterializedTrackedStateRow, TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
+};
 use crate::LixError;
 
 /// Factory for rebuildable tracked-state readers and writers.
@@ -55,7 +57,6 @@ impl TrackedStateContext {
         read_store: R,
         tracked_store: &mut S,
         writes: &mut StorageWriteSet,
-        json_writer: &mut JsonStoreWriter,
         head_commit_id: &str,
     ) -> Result<TrackedStateRebuildReport, LixError>
     where
@@ -68,7 +69,6 @@ impl TrackedStateContext {
             read_store,
             tracked_store,
             writes,
-            json_writer,
             head_commit_id,
         )
         .await
@@ -89,7 +89,7 @@ where
         &mut self,
         commit_id: &str,
         request: &TrackedStateScanRequest,
-    ) -> Result<Vec<TrackedStateRow>, LixError> {
+    ) -> Result<Vec<MaterializedTrackedStateRow>, LixError> {
         let Some(root_id) = self.tree.load_root(&mut self.store, commit_id).await? else {
             return Ok(Vec::new());
         };
@@ -127,7 +127,7 @@ where
         &mut self,
         commit_id: &str,
         request: &TrackedStateRowRequest,
-    ) -> Result<Option<TrackedStateRow>, LixError> {
+    ) -> Result<Option<MaterializedTrackedStateRow>, LixError> {
         let key = tracked_key_from_request(request)?;
         let Some(root_id) = self.tree.load_root(&mut self.store, commit_id).await? else {
             return Ok(None);
@@ -188,7 +188,7 @@ where
         &mut self,
         key: TrackedStateKey,
         value: TrackedStateValue,
-    ) -> Result<TrackedStateRow, LixError> {
+    ) -> Result<MaterializedTrackedStateRow, LixError> {
         let mut json_reader = JsonStoreContext::new().reader(&mut self.store);
         materialize_value(
             &mut json_reader,
@@ -319,7 +319,6 @@ impl TrackedStateWriter {
         &mut self,
         store: &mut (impl StorageReader + ?Sized),
         writes: &mut StorageWriteSet,
-        json_writer: &mut JsonStoreWriter,
         commit_id: &str,
         parent_commit_id: Option<&str>,
         rows: &[TrackedStateRow],
@@ -341,8 +340,7 @@ impl TrackedStateWriter {
         let mut stored_rows = Vec::with_capacity(rows.len());
         let mut mutations = Vec::with_capacity(rows.len());
         for row in rows {
-            let stored_value =
-                crate::tracked_state::canonicalize_materialized_row(writes, json_writer, row)?;
+            let stored_value = TrackedStateValue::from_row(row);
             mutations.push(TrackedStateMutation::put(
                 TrackedStateKey::from_row(row),
                 stored_value.clone(),
@@ -866,9 +864,9 @@ mod tests {
     }
 
     async fn seed_merge_roots(
-        base_rows: &[TrackedStateRow],
-        target_rows: &[TrackedStateRow],
-        source_rows: &[TrackedStateRow],
+        base_rows: &[MaterializedTrackedStateRow],
+        target_rows: &[MaterializedTrackedStateRow],
+        source_rows: &[MaterializedTrackedStateRow],
     ) -> (StorageContext, TrackedStateContext) {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
@@ -930,20 +928,24 @@ mod tests {
         tracked_state: &TrackedStateContext,
         commit_id: &str,
         parent_commit_id: Option<&str>,
-        rows: &[TrackedStateRow],
+        rows: &[MaterializedTrackedStateRow],
     ) -> Result<TrackedStateWriteReceipt, LixError> {
         let mut writes = StorageWriteSet::new();
         let receipt = {
             let mut json_writer = JsonStoreContext::new().writer();
+            let canonical_rows = crate::test_support::tracked_state_rows_from_materialized(
+                &mut writes,
+                &mut json_writer,
+                rows,
+            )?;
             tracked_state
                 .writer()
                 .stage_root(
                     transaction,
                     &mut writes,
-                    &mut json_writer,
                     commit_id,
                     parent_commit_id,
-                    rows,
+                    &canonical_rows,
                 )
                 .await?
         };
@@ -951,13 +953,13 @@ mod tests {
         Ok(receipt)
     }
 
-    fn tombstone(entity_id: &str, change_id: &str, commit_id: &str) -> TrackedStateRow {
+    fn tombstone(entity_id: &str, change_id: &str, commit_id: &str) -> MaterializedTrackedStateRow {
         let mut row = row(entity_id, change_id, commit_id);
         row.snapshot_content = None;
         row
     }
 
-    fn row(entity_id: &str, change_id: &str, commit_id: &str) -> TrackedStateRow {
+    fn row(entity_id: &str, change_id: &str, commit_id: &str) -> MaterializedTrackedStateRow {
         row_with_value(entity_id, change_id, commit_id, "value")
     }
 
@@ -966,8 +968,8 @@ mod tests {
         change_id: &str,
         commit_id: &str,
         value: &str,
-    ) -> TrackedStateRow {
-        TrackedStateRow {
+    ) -> MaterializedTrackedStateRow {
+        MaterializedTrackedStateRow {
             entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
             schema_key: "test_schema".to_string(),
             file_id: None,

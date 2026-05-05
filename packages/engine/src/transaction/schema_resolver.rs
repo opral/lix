@@ -4,7 +4,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
-use crate::live_state::{LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest};
+use crate::live_state::{
+    LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+};
 use crate::schema_registry::SchemaRegistry;
 use crate::transaction::live_state_overlay::overlay_scan_rows;
 use crate::transaction::normalization::{
@@ -118,14 +120,14 @@ impl LiveStateReader for TransactionSchemaLiveStateReader<'_> {
     async fn scan_rows(
         &self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<LiveStateRow>, LixError> {
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         overlay_scan_rows(self.base, &self.staged, request).await
     }
 
     async fn load_row(
         &self,
         request: &LiveStateRowRequest,
-    ) -> Result<Option<LiveStateRow>, LixError> {
+    ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         self.base.load_row(request).await
     }
 }

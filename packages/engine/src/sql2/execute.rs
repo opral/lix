@@ -671,7 +671,8 @@ mod tests {
     };
     use crate::json_store::JsonStoreContext;
     use crate::live_state::{
-        LiveStateContext, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+        LiveStateContext, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
+        MaterializedLiveStateRow,
     };
     use crate::sql2::{ChangelogQuerySource, SqlChangelogQuerySource};
     use crate::storage::{
@@ -680,6 +681,7 @@ mod tests {
         StorageWriteSet,
     };
     use crate::tracked_state::TrackedStateContext;
+    use crate::transaction::prepare_version_ref_row;
     use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
     use crate::untracked_state::UntrackedStateContext;
     use crate::version::VersionRefReader;
@@ -689,7 +691,7 @@ mod tests {
     struct DummyBlobReader;
     struct DummyLiveStateReader;
     struct RowsLiveStateReader {
-        rows: Vec<LiveStateRow>,
+        rows: Vec<MaterializedLiveStateRow>,
     }
     struct BackendBlobReader(StorageContext);
     struct DummyChangelogReader;
@@ -898,7 +900,7 @@ mod tests {
         async fn scan_live_state(
             &mut self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             self.live_state.scan_rows(request).await
         }
 
@@ -1034,14 +1036,14 @@ mod tests {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(vec![])
         }
 
         async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<LiveStateRow>, LixError> {
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
             Ok(None)
         }
     }
@@ -1051,14 +1053,14 @@ mod tests {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
         async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<LiveStateRow>, LixError> {
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
             Ok(None)
         }
     }
@@ -1069,7 +1071,10 @@ mod tests {
             &self,
             hashes: &[crate::binary_cas::BlobHash],
         ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
-            Ok(crate::binary_cas::BlobBytesBatch::missing(hashes.len()))
+            Ok(crate::binary_cas::BlobBytesBatch::new(vec![
+                None;
+                hashes.len()
+            ]))
         }
     }
 
@@ -1085,8 +1090,8 @@ mod tests {
         }
     }
 
-    fn live_lix_state_row(entity_id: &str, metadata: Option<&str>) -> LiveStateRow {
-        LiveStateRow {
+    fn live_lix_state_row(entity_id: &str, metadata: Option<&str>) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: "lix_key_value".to_string(),
@@ -1106,8 +1111,8 @@ mod tests {
         }
     }
 
-    fn live_entity_row(entity_id: &str, version_id: &str, value: &str) -> LiveStateRow {
-        LiveStateRow {
+    fn live_entity_row(entity_id: &str, version_id: &str, value: &str) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: "test_state_schema".to_string(),
@@ -1131,8 +1136,8 @@ mod tests {
         parent_id: Option<&str>,
         name: &str,
         hidden: bool,
-    ) -> LiveStateRow {
-        LiveStateRow {
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: "lix_directory_descriptor".to_string(),
@@ -1164,8 +1169,8 @@ mod tests {
         directory_id: Option<&str>,
         name: &str,
         hidden: bool,
-    ) -> LiveStateRow {
-        LiveStateRow {
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: "lix_file_descriptor".to_string(),
@@ -2894,14 +2899,14 @@ mod tests {
             let canonical_rows = {
                 let mut json_writer = JsonStoreContext::new().writer();
                 vec![
-                    version_ctx.canonical_ref_row(
+                    prepare_version_ref_row(
                         &mut writes,
                         &mut json_writer,
                         "version-a",
                         &init_receipt.initial_commit_id,
                         "1970-01-01T00:00:00.000Z",
                     )?,
-                    version_ctx.canonical_ref_row(
+                    prepare_version_ref_row(
                         &mut writes,
                         &mut json_writer,
                         "version-b",

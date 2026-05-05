@@ -95,12 +95,6 @@ impl BlobBytesBatch {
         Self { entries }
     }
 
-    pub(crate) fn missing(count: usize) -> Self {
-        Self {
-            entries: vec![None; count],
-        }
-    }
-
     #[allow(dead_code)]
     pub(crate) fn get(&self, index: usize) -> Option<&[u8]> {
         self.entries

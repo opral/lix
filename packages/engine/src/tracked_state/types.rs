@@ -1,14 +1,30 @@
 use crate::entity_identity::EntityIdentity;
+use crate::json_store::JsonRef;
 use crate::{NullableKeyFilter, RowMetadata};
 
-/// Rebuildable tracked state row.
+/// Ref-backed tracked state row used at write/storage boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrackedStateRow {
+    pub(crate) entity_id: EntityIdentity,
+    pub(crate) schema_key: String,
+    pub(crate) file_id: Option<String>,
+    pub(crate) snapshot_ref: Option<JsonRef>,
+    pub(crate) metadata_ref: Option<JsonRef>,
+    pub(crate) schema_version: String,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) change_id: String,
+    pub(crate) commit_id: String,
+}
+
+/// Materialized rebuildable tracked state row.
 ///
 /// Tracked rows are the projection that can be rebuilt from changelog facts.
 /// They intentionally do not carry an `untracked` flag: untracked local overlay
 /// data belongs to `untracked_state`, and the serving `live_state` facade is
 /// responsible for combining both sources.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct TrackedStateRow {
+pub(crate) struct MaterializedTrackedStateRow {
     pub(crate) entity_id: EntityIdentity,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,

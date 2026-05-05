@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value as JsonValue;
 
-use crate::live_state::LiveStateRow;
+use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
 use crate::schema::schema_key_from_definition;
 use crate::{LixError, NullableKeyFilter, GLOBAL_VERSION_ID};
@@ -55,7 +55,10 @@ impl SchemaRegistry {
     }
 }
 
-fn version_scoped_schema_row_is_visible(row: &LiveStateRow, requested_version_id: &str) -> bool {
+fn version_scoped_schema_row_is_visible(
+    row: &MaterializedLiveStateRow,
+    requested_version_id: &str,
+) -> bool {
     requested_version_id == GLOBAL_VERSION_ID || !row.global
 }
 
@@ -83,7 +86,7 @@ fn schema_key_is_older(
 }
 
 fn decode_registered_schema_row(
-    row: &LiveStateRow,
+    row: &MaterializedLiveStateRow,
 ) -> Result<Option<(crate::schema::SchemaKey, JsonValue)>, LixError> {
     if row.schema_key != REGISTERED_SCHEMA_KEY {
         return Err(LixError::new(
@@ -195,11 +198,11 @@ mod tests {
     }
 
     struct RowsLiveStateReader {
-        rows: Vec<LiveStateRow>,
+        rows: Vec<MaterializedLiveStateRow>,
     }
 
     impl RowsLiveStateReader {
-        fn new(rows: Vec<LiveStateRow>) -> Self {
+        fn new(rows: Vec<MaterializedLiveStateRow>) -> Self {
             Self { rows }
         }
     }
@@ -209,7 +212,7 @@ mod tests {
         async fn scan_rows(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self
                 .rows
                 .iter()
@@ -228,7 +231,7 @@ mod tests {
         async fn load_row(
             &self,
             request: &LiveStateRowRequest,
-        ) -> Result<Option<LiveStateRow>, LixError> {
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
             Ok(self
                 .rows
                 .iter()
@@ -241,8 +244,8 @@ mod tests {
         }
     }
 
-    fn registered_schema_row(schema_key: &str, schema_version: &str) -> LiveStateRow {
-        LiveStateRow {
+    fn registered_schema_row(schema_key: &str, schema_version: &str) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: registered_schema_entity_id(schema_key, schema_version),
             file_id: None,
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),

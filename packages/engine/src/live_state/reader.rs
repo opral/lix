@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::live_state::LiveStateRow;
+use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{LiveStateRowRequest, LiveStateScanRequest};
 use crate::LixError;
 
@@ -14,10 +14,10 @@ pub(crate) trait LiveStateReader: Send + Sync {
     async fn scan_rows(
         &self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<LiveStateRow>, LixError>;
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError>;
 
     async fn load_row(
         &self,
         request: &LiveStateRowRequest,
-    ) -> Result<Option<LiveStateRow>, LixError>;
+    ) -> Result<Option<MaterializedLiveStateRow>, LixError>;
 }

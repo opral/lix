@@ -1,6 +1,6 @@
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
-use crate::tracked_state::TrackedStateRow;
+use crate::tracked_state::{MaterializedTrackedStateRow, TrackedStateRow};
 use crate::{LixError, NullableKeyFilter};
 
 pub(crate) const TRACKED_STATE_HASH_BYTES: usize = 32;
@@ -59,7 +59,7 @@ impl TrackedStateKey {
 /// Tracked entity payload stored at a commit root.
 ///
 /// This is deliberately the version-independent part of `TrackedStateRow`.
-/// Callers project it back to `TrackedStateRow` by supplying the version id
+/// Callers project it back to `MaterializedTrackedStateRow` by supplying the version id
 /// selected by the version ref.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateValue {
@@ -74,20 +74,16 @@ pub(crate) struct TrackedStateValue {
 }
 
 impl TrackedStateValue {
-    pub(crate) fn from_row_refs(
-        row: &TrackedStateRow,
-        snapshot_ref: Option<JsonRef>,
-        metadata_ref: Option<JsonRef>,
-    ) -> Self {
+    pub(crate) fn from_row(row: &TrackedStateRow) -> Self {
         Self {
-            snapshot_ref,
-            metadata_ref,
+            snapshot_ref: row.snapshot_ref.clone(),
+            metadata_ref: row.metadata_ref.clone(),
             schema_version: row.schema_version.clone(),
             created_at: row.created_at.clone(),
             updated_at: row.updated_at.clone(),
             change_id: row.change_id.clone(),
             commit_id: row.commit_id.clone(),
-            deleted: row.snapshot_content.is_none(),
+            deleted: row.snapshot_ref.is_none(),
         }
     }
 
@@ -96,8 +92,8 @@ impl TrackedStateValue {
         key: TrackedStateKey,
         snapshot_content: Option<String>,
         metadata: Option<crate::RowMetadata>,
-    ) -> TrackedStateRow {
-        TrackedStateRow {
+    ) -> MaterializedTrackedStateRow {
+        MaterializedTrackedStateRow {
             entity_id: key.entity_id,
             schema_key: key.schema_key,
             file_id: key.file_id,

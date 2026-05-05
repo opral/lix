@@ -10,7 +10,7 @@ use crate::common::{
     parent_directory_path, stable_content_fingerprint_hex, ParsedFilePath,
 };
 use crate::entity_identity::EntityIdentity;
-use crate::live_state::LiveStateRow;
+use crate::live_state::MaterializedLiveStateRow;
 use crate::{LixError, RowMetadata};
 
 use super::filesystem_visibility::VisibleFilesystem;
@@ -675,7 +675,7 @@ pub(crate) fn plan_recursive_directory_delete(
 }
 
 pub(crate) fn directory_path_resolvers_from_state_rows(
-    rows: Vec<LiveStateRow>,
+    rows: Vec<MaterializedLiveStateRow>,
 ) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
     let mut directory_rows = BTreeMap::<String, BTreeMap<String, DirectoryDescriptorSeed>>::new();
     let mut file_rows = BTreeMap::<String, Vec<(Option<String>, String, String)>>::new();
@@ -920,7 +920,7 @@ mod tests {
     use crate::sql2::filesystem_visibility::{
         VisibleBlobRef, VisibleDirectory, VisibleFile, VisibleFilesystem,
     };
-    use crate::{entity_identity::EntityIdentity, live_state::LiveStateRow};
+    use crate::{entity_identity::EntityIdentity, live_state::MaterializedLiveStateRow};
 
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
         let mut ids = ids.iter();
@@ -1506,8 +1506,8 @@ mod tests {
         entity_id: &str,
         version_id: &str,
         snapshot_content: &str,
-    ) -> LiveStateRow {
-        LiveStateRow {
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: EntityIdentity::from_string(entity_id).expect("entity id should decode"),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id: None,

@@ -17,15 +17,13 @@ pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
     TrackedStateDiffRequest,
 };
-pub(crate) use materialization::{
-    canonicalize_materialized_row, materialize_value, TrackedMaterializationProjection,
-};
+pub(crate) use materialization::{materialize_value, TrackedMaterializationProjection};
 #[allow(unused_imports)]
 pub(crate) use merge::{
     plan_merge, TrackedStateMergeConflict, TrackedStateMergePatch, TrackedStateMergePlan,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{
-    TrackedStateFilter, TrackedStateProjection, TrackedStateRow, TrackedStateRowRequest,
-    TrackedStateScanRequest,
+    MaterializedTrackedStateRow, TrackedStateFilter, TrackedStateProjection, TrackedStateRow,
+    TrackedStateRowRequest, TrackedStateScanRequest,
 };

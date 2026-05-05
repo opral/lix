@@ -11,7 +11,7 @@ use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::json_store::JsonStoreContext;
 use crate::live_state::{
-    LiveStateContext, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+    LiveStateContext, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
 };
 use crate::schema_registry::SchemaRegistry;
 use crate::session::{SessionMode, WORKSPACE_VERSION_KEY};
@@ -21,6 +21,7 @@ use crate::tracked_state::{TrackedStateContext, TrackedStateStoreReader};
 use crate::transaction::commit;
 use crate::transaction::live_state_overlay::overlay_scan_rows;
 use crate::transaction::normalization::normalize_stage_row;
+use crate::transaction::prepare_version_ref_row;
 use crate::transaction::schema_resolver::TransactionSchemaResolver;
 use crate::transaction::staging::{StagedWriteSet, TransactionStagedWrites};
 use crate::transaction::types::{
@@ -340,7 +341,7 @@ impl Transaction {
         let mut writes = StorageWriteSet::new();
         let canonical_row = {
             let mut json_writer = JsonStoreContext::new().writer();
-            self.version_ctx.canonical_ref_row(
+            prepare_version_ref_row(
                 &mut writes,
                 &mut json_writer,
                 version_id,
@@ -441,7 +442,7 @@ impl SqlWriteExecutionContext for Transaction {
     async fn scan_live_state(
         &mut self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<LiveStateRow>, LixError> {
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let staged = self.staged_writes.staging_overlay()?;
         let base = self.live_state.reader(self.storage_transaction.as_mut());
         overlay_scan_rows(&base, &staged, request).await
@@ -692,6 +693,7 @@ mod tests {
     use super::*;
     use crate::backend::testing::UnitTestBackend;
     use crate::changelog::ChangelogScanRequest;
+    use crate::live_state::{LiveStateRow, LiveStateWriteBatch};
     use crate::tracked_state::{TrackedStateRowRequest, TrackedStateScanRequest};
     use crate::untracked_state::{UntrackedStateContext, UntrackedStateRowRequest};
     use crate::version::VersionContext;
@@ -1220,11 +1222,14 @@ mod tests {
     }
 
     async fn seed_visible_schema_rows(storage: StorageContext, live_state: &LiveStateContext) {
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer();
         let rows = crate::schema::seed_schema_definitions()
             .into_iter()
             .map(|schema| {
                 let key = crate::schema::schema_key_from_definition(schema)
                     .expect("seed schema key should derive");
+                let snapshot_content = json!({ "value": schema }).to_string();
                 LiveStateRow {
                     entity_id: crate::schema::registered_schema_entity_id(
                         &key.schema_key,
@@ -1235,8 +1240,12 @@ mod tests {
                     file_id: None,
                     version_id: GLOBAL_VERSION_ID.to_string(),
                     schema_version: "1".to_string(),
-                    snapshot_content: Some(json!({ "value": schema }).to_string()),
-                    metadata: None,
+                    snapshot_ref: Some(
+                        json_writer
+                            .stage_bytes(&mut writes, snapshot_content.as_bytes())
+                            .expect("schema snapshot should stage"),
+                    ),
+                    metadata_ref: None,
                     created_at: "1970-01-01T00:00:00.000Z".to_string(),
                     updated_at: "1970-01-01T00:00:00.000Z".to_string(),
                     change_id: None,
@@ -1250,12 +1259,16 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("schema fixture transaction should open");
-        let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer();
         {
             let mut writer = live_state.writer(storage_transaction.as_mut());
             writer
-                .stage_rows(&mut writes, &mut json_writer, &rows)
+                .stage_rows(
+                    &mut writes,
+                    LiveStateWriteBatch {
+                        untracked_rows: rows,
+                        tracked_roots: Vec::new(),
+                    },
+                )
                 .await
                 .expect("schema fixture rows should stage");
         }

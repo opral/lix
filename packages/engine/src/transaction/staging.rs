@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use crate::functions::{FunctionProvider, FunctionProviderHandle};
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
-use crate::live_state::{LiveStateRow, LiveStateRowIdentity, LiveStateScanRequest};
+use crate::live_state::{LiveStateRowIdentity, LiveStateScanRequest, MaterializedLiveStateRow};
 use crate::transaction::types::{
     LogicalPrimaryKey, StageAdoptedChange, StageFileData, StageRow, StageRowOrigin, StageWrite,
     StageWriteMode, StageWriteOperation, StageWriteOutcome,
@@ -364,16 +364,16 @@ impl StagedStateRowOverlay {
     }
 
     /// Returns staged rows visible for a scan request.
-    pub(crate) fn scan(&self, request: &LiveStateScanRequest) -> Vec<LiveStateRow> {
+    pub(crate) fn scan(&self, request: &LiveStateScanRequest) -> Vec<MaterializedLiveStateRow> {
         self.rows
             .values()
             .filter(|row| staged_row_matches_scan(row, request))
-            .map(LiveStateRow::from)
+            .map(MaterializedLiveStateRow::from)
             .chain(
                 self.adopted_rows
                     .values()
                     .filter(|row| adopted_row_matches_scan(row, request))
-                    .map(LiveStateRow::from),
+                    .map(MaterializedLiveStateRow::from),
             )
             .collect()
     }
@@ -407,7 +407,7 @@ impl StagedStateRowOverlay {
             return Some(if row.snapshot_content.is_none() {
                 StagedExactRow::Tombstone
             } else {
-                StagedExactRow::Row(LiveStateRow::from(row))
+                StagedExactRow::Row(MaterializedLiveStateRow::from(row))
             });
         }
 
@@ -416,14 +416,14 @@ impl StagedStateRowOverlay {
             return Some(if row.snapshot_content.is_none() {
                 StagedExactRow::Tombstone
             } else {
-                StagedExactRow::Row(LiveStateRow::from(row))
+                StagedExactRow::Row(MaterializedLiveStateRow::from(row))
             });
         }
         self.adopted_rows.get(&identity).map(|row| {
             if row.snapshot_content.is_none() {
                 StagedExactRow::Tombstone
             } else {
-                StagedExactRow::Row(LiveStateRow::from(row))
+                StagedExactRow::Row(MaterializedLiveStateRow::from(row))
             }
         })
     }
@@ -431,7 +431,7 @@ impl StagedStateRowOverlay {
 
 #[cfg(test)]
 pub(crate) enum StagedExactRow {
-    Row(LiveStateRow),
+    Row(MaterializedLiveStateRow),
     Tombstone,
 }
 
@@ -501,8 +501,8 @@ impl From<&StagedAdoptedStateRow> for StagedStateRowIdentity {
     }
 }
 
-impl From<&LiveStateRow> for StagedStateRowIdentity {
-    fn from(row: &LiveStateRow) -> Self {
+impl From<&MaterializedLiveStateRow> for StagedStateRowIdentity {
+    fn from(row: &MaterializedLiveStateRow) -> Self {
         Self {
             untracked: row.untracked,
             schema_key: row.schema_key.clone(),

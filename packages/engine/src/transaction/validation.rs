@@ -6,8 +6,8 @@ use serde_json::Value as JsonValue;
 use crate::common::json_pointer_get;
 use crate::entity_identity::{EntityIdentity, EntityIdentityError, EntityIdentityPart};
 use crate::live_state::{
-    LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateRowIdentity, LiveStateRowRequest,
-    LiveStateScanRequest,
+    LiveStateFilter, LiveStateReader, LiveStateRowIdentity, LiveStateRowRequest,
+    LiveStateScanRequest, MaterializedLiveStateRow,
 };
 use crate::schema::{
     compile_lix_schema, format_lix_schema_validation_errors, schema_from_registered_snapshot,
@@ -289,7 +289,7 @@ async fn committed_directory_parent_map(
 }
 
 fn committed_directory_row_is_in_scope(
-    row: &LiveStateRow,
+    row: &MaterializedLiveStateRow,
     scope: &DirectoryDescriptorScope,
 ) -> bool {
     row.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
@@ -460,7 +460,7 @@ async fn committed_filesystem_namespace_occupants(
 }
 
 fn committed_filesystem_row_is_in_scope(
-    row: &LiveStateRow,
+    row: &MaterializedLiveStateRow,
     scope: &FilesystemStorageScope,
 ) -> bool {
     (row.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
@@ -501,7 +501,7 @@ fn apply_staged_filesystem_namespace_rows(
 }
 
 fn filesystem_namespace_occupant_from_live_row(
-    row: &LiveStateRow,
+    row: &MaterializedLiveStateRow,
 ) -> Result<Option<(FilesystemNamespaceIdentity, FilesystemNamespaceOccupant)>, LixError> {
     let Some(snapshot_content) = row.snapshot_content.as_deref() else {
         return Ok(None);
@@ -1201,7 +1201,7 @@ impl PendingConstraintIndexes {
         Ok(())
     }
 
-    fn tombstones_identity(&self, row: &LiveStateRow) -> bool {
+    fn tombstones_identity(&self, row: &MaterializedLiveStateRow) -> bool {
         let identity = LiveStateRowIdentity::from_row(row);
         self.tombstones
             .iter()
@@ -1570,7 +1570,7 @@ async fn committed_deleted_row_value(
 
 fn committed_delete_restriction_error(
     deleted_identity: &LiveStateRowIdentity,
-    referencing_row: &LiveStateRow,
+    referencing_row: &MaterializedLiveStateRow,
     local_properties: &[Vec<String>],
 ) -> Result<LixError, LixError> {
     Ok(LixError::new(
@@ -1587,7 +1587,7 @@ fn committed_delete_restriction_error(
 }
 
 fn parse_committed_snapshot(
-    row: &LiveStateRow,
+    row: &MaterializedLiveStateRow,
     snapshot_content: &str,
 ) -> Result<JsonValue, LixError> {
     serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
@@ -2027,7 +2027,10 @@ fn nullable_filter_from_option(value: &Option<String>) -> NullableKeyFilter<Stri
     }
 }
 
-fn committed_row_is_in_exact_validation_scope(row: &LiveStateRow, key: &PendingUniqueKey) -> bool {
+fn committed_row_is_in_exact_validation_scope(
+    row: &MaterializedLiveStateRow,
+    key: &PendingUniqueKey,
+) -> bool {
     // LiveStateReader may return serving projections such as global rows
     // projected into a requested version. Constraint validation is root-local:
     // only rows authored in the exact version participate.
@@ -2039,7 +2042,7 @@ fn committed_row_is_in_exact_validation_scope(row: &LiveStateRow, key: &PendingU
         && committed_row_is_exact_version_scoped(row, &key.version_id)
 }
 
-fn committed_row_is_exact_version_scoped(row: &LiveStateRow, version_id: &str) -> bool {
+fn committed_row_is_exact_version_scoped(row: &MaterializedLiveStateRow, version_id: &str) -> bool {
     row.version_id == version_id && row.global == (row.version_id == crate::GLOBAL_VERSION_ID)
 }
 
@@ -2610,7 +2613,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::live_state::{LiveStateRow, LiveStateRowRequest, LiveStateScanRequest};
+    use crate::live_state::{LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow};
     use crate::schema::{schema_key_from_definition, seed_schema_definition};
 
     struct EmptyLiveStateReader;
@@ -2620,7 +2623,7 @@ mod tests {
         async fn scan_rows(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(test_file_descriptor_rows()
                 .into_iter()
                 .filter(|row| live_state_row_matches_scan(row, request))
@@ -2630,7 +2633,7 @@ mod tests {
         async fn load_row(
             &self,
             request: &LiveStateRowRequest,
-        ) -> Result<Option<LiveStateRow>, LixError> {
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
             Ok(test_file_descriptor_rows()
                 .into_iter()
                 .find(|row| live_state_row_matches_load(row, request)))
@@ -2731,7 +2734,7 @@ mod tests {
     }
 
     struct StaticLiveStateReader {
-        rows: Vec<LiveStateRow>,
+        rows: Vec<MaterializedLiveStateRow>,
     }
 
     #[async_trait]
@@ -2739,7 +2742,7 @@ mod tests {
         async fn scan_rows(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self
                 .rows
                 .iter()
@@ -2767,7 +2770,7 @@ mod tests {
         async fn load_row(
             &self,
             request: &LiveStateRowRequest,
-        ) -> Result<Option<LiveStateRow>, LixError> {
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
             Ok(self
                 .rows
                 .iter()
@@ -2789,20 +2792,20 @@ mod tests {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(Vec::new())
         }
 
         async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<LiveStateRow>, LixError> {
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
             Ok(None)
         }
     }
 
     struct StrictStaticLiveStateReader {
-        rows: Vec<LiveStateRow>,
+        rows: Vec<MaterializedLiveStateRow>,
     }
 
     #[async_trait]
@@ -2810,7 +2813,7 @@ mod tests {
         async fn scan_rows(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self
                 .rows
                 .iter()
@@ -2822,7 +2825,7 @@ mod tests {
         async fn load_row(
             &self,
             request: &LiveStateRowRequest,
-        ) -> Result<Option<LiveStateRow>, LixError> {
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
             Ok(self
                 .rows
                 .iter()
@@ -3714,7 +3717,10 @@ mod tests {
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
-            rows: vec![LiveStateRow::from(fk_parent_row("parent-1", "version-a"))],
+            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+                "parent-1",
+                "version-a",
+            ))],
         };
 
         validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
@@ -3735,7 +3741,10 @@ mod tests {
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
-            rows: vec![LiveStateRow::from(fk_parent_row("parent-1", "version-b"))],
+            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+                "parent-1",
+                "version-b",
+            ))],
         };
 
         let error =
@@ -3765,7 +3774,10 @@ mod tests {
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
-            rows: vec![LiveStateRow::from(fk_parent_row("parent-1", "version-a"))],
+            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+                "parent-1",
+                "version-a",
+            ))],
         };
 
         let error =
@@ -3793,7 +3805,10 @@ mod tests {
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
-            rows: vec![LiveStateRow::from(fk_parent_row("parent-1", "version-a"))],
+            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+                "parent-1",
+                "version-a",
+            ))],
         };
 
         let error =
@@ -3840,7 +3855,10 @@ mod tests {
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
-            rows: vec![LiveStateRow::from(fk_parent_row("target-1", "version-a"))],
+            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+                "target-1",
+                "version-a",
+            ))],
         };
 
         validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
@@ -3859,8 +3877,8 @@ mod tests {
         parent_delete.snapshot_content = None;
         let live_state = StaticLiveStateReader {
             rows: vec![
-                LiveStateRow::from(fk_parent_row("parent-1", "version-a")),
-                LiveStateRow::from(fk_child_row("child-1", "parent-1", "version-a")),
+                MaterializedLiveStateRow::from(fk_parent_row("parent-1", "version-a")),
+                MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "version-a")),
             ],
         };
         let staged_writes = StagedWriteSet {
@@ -3888,8 +3906,8 @@ mod tests {
         parent_delete.snapshot_content = None;
         let live_state = StaticLiveStateReader {
             rows: vec![
-                LiveStateRow::from(fk_parent_row("parent-1", "version-a")),
-                LiveStateRow::from(fk_child_row("child-1", "parent-1", "version-b")),
+                MaterializedLiveStateRow::from(fk_parent_row("parent-1", "version-a")),
+                MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "version-b")),
             ],
         };
         let staged_writes = StagedWriteSet {
@@ -3916,8 +3934,8 @@ mod tests {
         child_delete.snapshot_content = None;
         let live_state = StaticLiveStateReader {
             rows: vec![
-                LiveStateRow::from(fk_parent_row("parent-1", "version-a")),
-                LiveStateRow::from(fk_child_row("child-1", "parent-1", "version-a")),
+                MaterializedLiveStateRow::from(fk_parent_row("parent-1", "version-a")),
+                MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "version-a")),
             ],
         };
         let staged_writes = StagedWriteSet {
@@ -4325,7 +4343,10 @@ mod tests {
         )
         .expect("pending FK validation should collect unresolved check");
         let live_state = StaticLiveStateReader {
-            rows: vec![LiveStateRow::from(fk_parent_row("parent-1", "version-a"))],
+            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+                "parent-1",
+                "version-a",
+            ))],
         };
 
         let still_unresolved = validate_committed_foreign_keys(
@@ -4368,7 +4389,10 @@ mod tests {
         )
         .expect("pending FK validation should collect unresolved check");
         let live_state = StaticLiveStateReader {
-            rows: vec![LiveStateRow::from(fk_parent_row("parent-1", "version-b"))],
+            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+                "parent-1",
+                "version-b",
+            ))],
         };
 
         let still_unresolved = validate_committed_foreign_keys(
@@ -4411,7 +4435,10 @@ mod tests {
         )
         .expect("pending FK validation should collect unresolved check");
         let live_state = StaticLiveStateReader {
-            rows: vec![LiveStateRow::from(fk_parent_row("target-1", "version-a"))],
+            rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
+                "target-1",
+                "version-a",
+            ))],
         };
 
         let still_unresolved = validate_committed_foreign_keys(
@@ -4443,7 +4470,10 @@ mod tests {
         }
     }
 
-    fn live_state_row_matches_scan(row: &LiveStateRow, request: &LiveStateScanRequest) -> bool {
+    fn live_state_row_matches_scan(
+        row: &MaterializedLiveStateRow,
+        request: &LiveStateScanRequest,
+    ) -> bool {
         (request.filter.schema_keys.is_empty()
             || request.filter.schema_keys.contains(&row.schema_key))
             && (request.filter.version_ids.is_empty()
@@ -4456,14 +4486,17 @@ mod tests {
                     .any(|filter| filter.matches(row.file_id.as_ref())))
     }
 
-    fn live_state_row_matches_load(row: &LiveStateRow, request: &LiveStateRowRequest) -> bool {
+    fn live_state_row_matches_load(
+        row: &MaterializedLiveStateRow,
+        request: &LiveStateRowRequest,
+    ) -> bool {
         row.schema_key == request.schema_key
             && row.version_id == request.version_id
             && row.entity_id == request.entity_id
             && request.file_id.matches(row.file_id.as_ref())
     }
 
-    fn test_file_descriptor_rows() -> Vec<LiveStateRow> {
+    fn test_file_descriptor_rows() -> Vec<MaterializedLiveStateRow> {
         vec![
             committed_file_descriptor_row("file-a", "version-a"),
             committed_file_descriptor_row("file-a", "version-b"),
@@ -4755,13 +4788,13 @@ mod tests {
         row
     }
 
-    fn committed_file_descriptor_row(file_id: &str, version_id: &str) -> LiveStateRow {
-        LiveStateRow::from(staged_file_descriptor_row(file_id, version_id))
+    fn committed_file_descriptor_row(file_id: &str, version_id: &str) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow::from(staged_file_descriptor_row(file_id, version_id))
     }
 
-    fn committed_unique_row(entity_id: &str, slug: &str, title: &str) -> LiveStateRow {
+    fn committed_unique_row(entity_id: &str, slug: &str, title: &str) -> MaterializedLiveStateRow {
         let row = unique_row(entity_id, slug, title);
-        LiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: row.entity_id,
             schema_key: row.schema_key,
             file_id: row.file_id,
@@ -4782,8 +4815,8 @@ mod tests {
         entity_id: &str,
         scope: Option<&str>,
         name: &str,
-    ) -> LiveStateRow {
-        LiveStateRow::from(nullable_unique_row(entity_id, scope, name))
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow::from(nullable_unique_row(entity_id, scope, name))
     }
 
     fn staged_row(
