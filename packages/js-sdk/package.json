@@ -1,11 +1,12 @@
 {
 	"name": "@lix-js/sdk",
 	"type": "module",
-	"version": "0.6.0-preview.1",
+	"version": "0.6.0-preview.2",
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
 	"files": [
 		"dist",
+		"dist-engine-src",
 		"SKILL.md"
 	],
 	"exports": {
@@ -22,6 +23,8 @@
 	"scripts": {
 		"build": "node ./scripts/build.js",
 		"sync:builtin-schemas": "node ./scripts/sync-builtin-schemas.js",
+		"sync:engine-src": "node ./scripts/sync-engine-src.js",
+		"prepack": "node ./scripts/sync-engine-src.js",
 		"typecheck": "pnpm run sync:builtin-schemas && tsc -p tsconfig.json --noEmit",
 		"test": "node ./scripts/build.js && vitest run",
 		"test:watch": "node ./scripts/build.js && vitest"
@@ -57,6 +60,7 @@
 				],
 				"outputs": [
 					"{projectRoot}/dist",
+					"{projectRoot}/dist-engine-src",
 					"{projectRoot}/src/engine-wasm/wasm"
 				]
 			}

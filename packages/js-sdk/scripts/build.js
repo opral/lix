@@ -100,6 +100,10 @@ async function syncBuiltinSchemas() {
 	await run("node", ["./scripts/sync-builtin-schemas.js"], { cwd: jsSdkDir });
 }
 
+async function syncEngineSource() {
+	await run("node", ["./scripts/sync-engine-src.js"], { cwd: jsSdkDir });
+}
+
 async function buildTypescriptDist() {
 	await run("tsc", ["-p", "tsconfig.json"], { cwd: jsSdkDir });
 }
@@ -107,6 +111,7 @@ async function buildTypescriptDist() {
 async function main() {
 	await rm(distDir, { recursive: true, force: true });
 	await syncBuiltinSchemas();
+	await syncEngineSource();
 	await buildEngineWasm();
 	await buildTypescriptDist();
 }

@@ -124,38 +124,98 @@ function valueToNative(value: Value): LixNativeValue {
 	}
 }
 
-export type TransactionBeginMode = "read" | "write" | "deferred";
-
-export type KvScanRange =
+export type BackendKvScanRange =
 	| { kind: "prefix"; prefix: Uint8Array }
 	| { kind: "range"; start: Uint8Array; end: Uint8Array };
 
-export type KvPair = {
+export type BackendKvGetRequest = {
+	groups: BackendKvGetGroup[];
+};
+
+export type BackendKvGetGroup = {
+	namespace: string;
+	keys: Uint8Array[];
+};
+
+export type BackendKvValueBatch = {
+	groups: BackendKvValueGroup[];
+};
+
+export type BackendKvValueGroup = {
+	namespace: string;
+	values: Array<Uint8Array | null>;
+};
+
+export type BackendKvExistsBatch = {
+	groups: BackendKvExistsGroup[];
+};
+
+export type BackendKvExistsGroup = {
+	namespace: string;
+	exists: boolean[];
+};
+
+export type BackendKvScanRequest = {
+	namespace: string;
+	range: BackendKvScanRange;
+	after?: Uint8Array | null;
+	limit: number;
+};
+
+export type BackendKvKeyPage = {
+	keys: Uint8Array[];
+	resumeAfter?: Uint8Array | null;
+};
+
+export type BackendKvValuePage = {
+	values: Uint8Array[];
+	resumeAfter?: Uint8Array | null;
+};
+
+export type BackendKvEntryPage = {
+	keys: Uint8Array[];
+	values: Uint8Array[];
+	resumeAfter?: Uint8Array | null;
+};
+
+export type BackendKvPut = {
 	key: Uint8Array;
 	value: Uint8Array;
 };
 
-export type LixBackendTransaction = {
-	kvGet(namespace: string, key: Uint8Array): Uint8Array | null | undefined;
-	kvScan(
-		namespace: string,
-		range: KvScanRange,
-		limit?: number | null,
-	): KvPair[];
-	kvPut(namespace: string, key: Uint8Array, value: Uint8Array): void;
-	kvDelete(namespace: string, key: Uint8Array): void;
-	commit(): void;
+export type BackendKvWriteBatch = {
+	groups: BackendKvWriteGroup[];
+};
+
+export type BackendKvWriteGroup = {
+	namespace: string;
+	puts: BackendKvPut[];
+	deletes: Uint8Array[];
+};
+
+export type BackendKvWriteStats = {
+	puts: number;
+	deletes: number;
+	bytesWritten: number;
+};
+
+export type LixBackendReadTransaction = {
+	getValues(request: BackendKvGetRequest): BackendKvValueBatch;
+	existsMany(request: BackendKvGetRequest): BackendKvExistsBatch;
+	scanKeys(request: BackendKvScanRequest): BackendKvKeyPage;
+	scanValues(request: BackendKvScanRequest): BackendKvValuePage;
+	scanEntries(request: BackendKvScanRequest): BackendKvEntryPage;
 	rollback(): void;
 };
 
+export type LixBackendWriteTransaction = LixBackendReadTransaction & {
+	writeKvBatch(batch: BackendKvWriteBatch): BackendKvWriteStats;
+	commit(): void;
+};
+
 export type LixBackend = {
-	beginTransaction(mode: TransactionBeginMode): LixBackendTransaction;
-	kvGet?(namespace: string, key: Uint8Array): Uint8Array | null | undefined;
-	kvScan?(
-		namespace: string,
-		range: KvScanRange,
-		limit?: number | null,
-	): KvPair[];
+	beginReadTransaction(): LixBackendReadTransaction;
+	beginWriteTransaction(): LixBackendWriteTransaction;
 	close?(): void;
 };
 

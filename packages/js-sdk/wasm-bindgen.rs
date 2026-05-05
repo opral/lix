@@ -3,12 +3,13 @@ mod wasm {
     use async_trait::async_trait;
     use js_sys::{Array, Object, Reflect};
     use lix_rs_sdk::{
-        open_lix as open_lix_rs, Backend, BackendKvGetBatch, BackendKvGetBatchGroup,
-        BackendKvGetRequest, BackendKvRowBatch, BackendKvScanBatch, BackendKvScanProjection,
-        BackendKvScanRange, BackendKvScanRequest, BackendKvWriteBatch, BackendKvWriteStats,
-        BackendReadTransaction, BackendWriteTransaction, CreateVersionOptions, ExecuteResult,
-        Lix as RsLix, LixError, MergeVersionOptions, MergeVersionPreviewOptions, OpenLixOptions,
-        SwitchVersionOptions, Value,
+        open_lix as open_lix_rs, Backend, BackendKvEntryPage, BackendKvExistsBatch,
+        BackendKvExistsGroup, BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange,
+        BackendKvScanRequest, BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage,
+        BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
+        BytePageBuilder, CreateVersionOptions, ExecuteResult, Lix as RsLix, LixError,
+        MergeVersionOptions, MergeVersionPreviewOptions, OpenLixOptions, SwitchVersionOptions,
+        Value,
     };
     use serde::Serialize;
     use serde_json::json;
@@ -47,30 +48,98 @@ export type LixNotice = {
   hint?: string;
 };
 
-export type TransactionBeginMode = "read" | "write" | "deferred";
-
-export type KvScanRange =
+export type BackendKvScanRange =
   | { kind: "prefix"; prefix: Uint8Array }
   | { kind: "range"; start: Uint8Array; end: Uint8Array };
 
-export type KvPair = {
+export type BackendKvGetRequest = {
+  groups: BackendKvGetGroup[];
+};
+
+export type BackendKvGetGroup = {
+  namespace: string;
+  keys: Uint8Array[];
+};
+
+export type BackendKvValueBatch = {
+  groups: BackendKvValueGroup[];
+};
+
+export type BackendKvValueGroup = {
+  namespace: string;
+  values: Array<Uint8Array | null>;
+};
+
+export type BackendKvExistsBatch = {
+  groups: BackendKvExistsGroup[];
+};
+
+export type BackendKvExistsGroup = {
+  namespace: string;
+  exists: boolean[];
+};
+
+export type BackendKvScanRequest = {
+  namespace: string;
+  range: BackendKvScanRange;
+  after?: Uint8Array | null;
+  limit: number;
+};
+
+export type BackendKvKeyPage = {
+  keys: Uint8Array[];
+  resumeAfter?: Uint8Array | null;
+};
+
+export type BackendKvValuePage = {
+  values: Uint8Array[];
+  resumeAfter?: Uint8Array | null;
+};
+
+export type BackendKvEntryPage = {
+  keys: Uint8Array[];
+  values: Uint8Array[];
+  resumeAfter?: Uint8Array | null;
+};
+
+export type BackendKvPut = {
   key: Uint8Array;
   value: Uint8Array;
 };
 
-export type BackendTransaction = {
-  kvGet(namespace: string, key: Uint8Array): Uint8Array | null | undefined;
-  kvScan(namespace: string, range: KvScanRange, limit?: number | null): KvPair[];
-  kvPut(namespace: string, key: Uint8Array, value: Uint8Array): void;
-  kvDelete(namespace: string, key: Uint8Array): void;
-  commit(): void;
+export type BackendKvWriteBatch = {
+  groups: BackendKvWriteGroup[];
+};
+
+export type BackendKvWriteGroup = {
+  namespace: string;
+  puts: BackendKvPut[];
+  deletes: Uint8Array[];
+};
+
+export type BackendKvWriteStats = {
+  puts: number;
+  deletes: number;
+  bytesWritten: number;
+};
+
+export type BackendReadTransaction = {
+  getValues(request: BackendKvGetRequest): BackendKvValueBatch;
+  existsMany(request: BackendKvGetRequest): BackendKvExistsBatch;
+  scanKeys(request: BackendKvScanRequest): BackendKvKeyPage;
+  scanValues(request: BackendKvScanRequest): BackendKvValuePage;
+  scanEntries(request: BackendKvScanRequest): BackendKvEntryPage;
   rollback(): void;
 };
 
+export type BackendWriteTransaction = BackendReadTransaction & {
+  writeKvBatch(batch: BackendKvWriteBatch): BackendKvWriteStats;
+  commit(): void;
+};
+
 export type Backend = {
-  beginTransaction(mode: TransactionBeginMode): BackendTransaction;
-  kvGet?(namespace: string, key: Uint8Array): Uint8Array | null | undefined;
-  kvScan?(namespace: string, range: KvScanRange, limit?: number | null): KvPair[];
+  beginReadTransaction(): BackendReadTransaction;
+  beginWriteTransaction(): BackendWriteTransaction;
   close?(): void;
 };
 
@@ -338,11 +407,10 @@ export type MergeConflictSide = {
         async fn begin_read_transaction(
             &self,
         ) -> Result<Box<dyn BackendReadTransaction + Send + Sync + 'static>, LixError> {
-            let transaction =
-                call_method1(&self.inner, "beginTransaction", &JsValue::from_str("read"))?;
+            let transaction = call_method0(&self.inner, "beginReadTransaction")?;
             if transaction.is_null() || transaction.is_undefined() || !transaction.is_object() {
                 return Err(js_sdk_error(
-                    "backend.beginTransaction() must return a transaction object",
+                    "backend.beginReadTransaction() must return a transaction object",
                 ));
             }
             Ok(Box::new(JsBackendTransaction { inner: transaction }))
@@ -351,11 +419,10 @@ export type MergeConflictSide = {
         async fn begin_write_transaction(
             &self,
         ) -> Result<Box<dyn BackendWriteTransaction + Send + Sync + 'static>, LixError> {
-            let transaction =
-                call_method1(&self.inner, "beginTransaction", &JsValue::from_str("write"))?;
+            let transaction = call_method0(&self.inner, "beginWriteTransaction")?;
             if transaction.is_null() || transaction.is_undefined() || !transaction.is_object() {
                 return Err(js_sdk_error(
-                    "backend.beginTransaction() must return a transaction object",
+                    "backend.beginWriteTransaction() must return a transaction object",
                 ));
             }
             Ok(Box::new(JsBackendTransaction { inner: transaction }))
@@ -381,74 +448,58 @@ export type MergeConflictSide = {
 
     #[async_trait]
     impl BackendReadTransaction for JsBackendTransaction {
-        async fn get_kv_many(
+        async fn get_values(
             &mut self,
             request: BackendKvGetRequest,
-        ) -> Result<BackendKvGetBatch, LixError> {
-            let mut groups = Vec::with_capacity(request.groups.len());
-            for group in request.groups {
-                let mut rows = BackendKvRowBatch::with_capacity(group.keys.len());
-                for key in group.keys {
-                    rows.push_get_projection(
-                        key.clone(),
-                        js_value_to_optional_bytes(
-                            call_method2(
-                                &self.inner,
-                                "kvGet",
-                                &JsValue::from_str(&group.namespace),
-                                &bytes_to_js(&key),
-                            )?,
-                            "transaction.kvGet",
-                        )?,
-                        request.projection,
-                    );
-                }
-                groups.push(BackendKvGetBatchGroup {
-                    namespace: group.namespace,
-                    rows,
-                });
-            }
-            Ok(BackendKvGetBatch { groups })
+        ) -> Result<BackendKvValueBatch, LixError> {
+            js_value_to_value_batch(
+                call_method1(&self.inner, "getValues", &kv_get_request_to_js(&request)?)?,
+                "transaction.getValues",
+            )
         }
 
-        async fn scan_kv(
+        async fn exists_many(
+            &mut self,
+            request: BackendKvGetRequest,
+        ) -> Result<BackendKvExistsBatch, LixError> {
+            js_value_to_exists_batch(
+                call_method1(&self.inner, "existsMany", &kv_get_request_to_js(&request)?)?,
+                "transaction.existsMany",
+            )
+        }
+
+        async fn scan_keys(
             &mut self,
             request: BackendKvScanRequest,
-        ) -> Result<BackendKvScanBatch, LixError> {
-            let scan_limit = request
-                .limit
-                .checked_add(1 + usize::from(request.after.is_some()))
-                .unwrap_or(request.limit);
-            let mut pairs = js_value_to_kv_pairs(
-                call_method3(
-                    &self.inner,
-                    "kvScan",
-                    &JsValue::from_str(&request.namespace),
-                    &kv_scan_range_to_js(&request.range)?,
-                    &usize_to_js(scan_limit),
-                )?,
-                "transaction.kvScan",
-            )?
-            .into_iter()
-            .filter(|(key, _)| {
-                request
-                    .after
-                    .as_deref()
-                    .is_none_or(|after| key.as_slice() > after)
-            })
-            .collect::<Vec<_>>();
-            let has_more = pairs.len() > request.limit;
-            pairs.truncate(request.limit);
+        ) -> Result<BackendKvKeyPage, LixError> {
+            js_value_to_key_page(
+                call_method1(&self.inner, "scanKeys", &kv_scan_request_to_js(&request)?)?,
+                "transaction.scanKeys",
+            )
+        }
 
-            let mut rows = BackendKvRowBatch::with_capacity(pairs.len());
-            for (key, value) in pairs {
-                match request.projection {
-                    BackendKvScanProjection::KeysOnly => rows.push_key_only(key),
-                    BackendKvScanProjection::KeysAndValues => rows.push_value(key, value),
-                }
-            }
-            let resume_after = has_more.then(|| rows.last_key_cloned()).flatten();
-            Ok(BackendKvScanBatch { rows, resume_after })
+        async fn scan_values(
+            &mut self,
+            request: BackendKvScanRequest,
+        ) -> Result<BackendKvValuePage, LixError> {
+            js_value_to_value_page(
+                call_method1(&self.inner, "scanValues", &kv_scan_request_to_js(&request)?)?,
+                "transaction.scanValues",
+            )
+        }
+
+        async fn scan_entries(
+            &mut self,
+            request: BackendKvScanRequest,
+        ) -> Result<BackendKvEntryPage, LixError> {
+            js_value_to_entry_page(
+                call_method1(
+                    &self.inner,
+                    "scanEntries",
+                    &kv_scan_request_to_js(&request)?,
+                )?,
+                "transaction.scanEntries",
+            )
         }
 
         async fn rollback(self: Box<Self>) -> Result<(), LixError> {
@@ -463,31 +514,10 @@ export type MergeConflictSide = {
             &mut self,
             batch: BackendKvWriteBatch,
         ) -> Result<BackendKvWriteStats, LixError> {
-            let mut stats = BackendKvWriteStats::default();
-            for group in batch.groups {
-                for put in group.puts {
-                    stats.puts += 1;
-                    stats.bytes_written += put.key.len() + put.value.len();
-                    call_method3(
-                        &self.inner,
-                        "kvPut",
-                        &JsValue::from_str(&group.namespace),
-                        &bytes_to_js(&put.key),
-                        &bytes_to_js(&put.value),
-                    )?;
-                }
-                for key in group.deletes {
-                    stats.deletes += 1;
-                    stats.bytes_written += key.len();
-                    call_method2(
-                        &self.inner,
-                        "kvDelete",
-                        &JsValue::from_str(&group.namespace),
-                        &bytes_to_js(&key),
-                    )?;
-                }
-            }
-            Ok(stats)
+            js_value_to_write_stats(
+                call_method1(&self.inner, "writeKvBatch", &kv_write_batch_to_js(&batch)?)?,
+                "transaction.writeKvBatch",
+            )
         }
 
         async fn commit(self: Box<Self>) -> Result<(), LixError> {
@@ -512,29 +542,6 @@ export type MergeConflictSide = {
         call_function1(&method, receiver, arg1)
     }
 
-    fn call_method2(
-        receiver: &JsValue,
-        method_name: &str,
-        arg1: &JsValue,
-        arg2: &JsValue,
-    ) -> Result<JsValue, LixError> {
-        let method = Reflect::get(receiver, &JsValue::from_str(method_name))
-            .map_err(|_| js_sdk_error(format!("{method_name} could not be read")))?;
-        call_function2(&method, receiver, arg1, arg2)
-    }
-
-    fn call_method3(
-        receiver: &JsValue,
-        method_name: &str,
-        arg1: &JsValue,
-        arg2: &JsValue,
-        arg3: &JsValue,
-    ) -> Result<JsValue, LixError> {
-        let method = Reflect::get(receiver, &JsValue::from_str(method_name))
-            .map_err(|_| js_sdk_error(format!("{method_name} could not be read")))?;
-        call_function3(&method, receiver, arg1, arg2, arg3)
-    }
-
     fn call_function0(function: &JsValue, receiver: &JsValue) -> Result<JsValue, LixError> {
         let function = function
             .dyn_ref::<js_sys::Function>()
@@ -553,39 +560,6 @@ export type MergeConflictSide = {
         reject_promise(function.call1(receiver, arg1).map_err(js_to_lix_error)?)
     }
 
-    fn call_function2(
-        function: &JsValue,
-        receiver: &JsValue,
-        arg1: &JsValue,
-        arg2: &JsValue,
-    ) -> Result<JsValue, LixError> {
-        let function = function
-            .dyn_ref::<js_sys::Function>()
-            .ok_or_else(|| js_sdk_error("backend method must be a function"))?;
-        reject_promise(
-            function
-                .call2(receiver, arg1, arg2)
-                .map_err(js_to_lix_error)?,
-        )
-    }
-
-    fn call_function3(
-        function: &JsValue,
-        receiver: &JsValue,
-        arg1: &JsValue,
-        arg2: &JsValue,
-        arg3: &JsValue,
-    ) -> Result<JsValue, LixError> {
-        let function = function
-            .dyn_ref::<js_sys::Function>()
-            .ok_or_else(|| js_sdk_error("backend method must be a function"))?;
-        reject_promise(
-            function
-                .call3(receiver, arg1, arg2, arg3)
-                .map_err(js_to_lix_error)?,
-        )
-    }
-
     fn reject_promise(value: JsValue) -> Result<JsValue, LixError> {
         if value.is_instance_of::<js_sys::Promise>() {
             return Err(js_sdk_error(
@@ -599,16 +573,6 @@ export type MergeConflictSide = {
         js_sys::Uint8Array::from(bytes).into()
     }
 
-    fn js_value_to_optional_bytes(
-        value: JsValue,
-        context: &str,
-    ) -> Result<Option<Vec<u8>>, LixError> {
-        if value.is_null() || value.is_undefined() {
-            return Ok(None);
-        }
-        Ok(Some(js_value_to_bytes(value, context)?))
-    }
-
     fn js_value_to_bytes(value: JsValue, context: &str) -> Result<Vec<u8>, LixError> {
         if !value.is_instance_of::<js_sys::Uint8Array>() {
             return Err(js_sdk_error(format!("{context} must return Uint8Array")));
@@ -618,6 +582,25 @@ export type MergeConflictSide = {
 
     fn usize_to_js(value: usize) -> JsValue {
         JsValue::from_f64(value as f64)
+    }
+
+    fn kv_get_request_to_js(request: &BackendKvGetRequest) -> Result<JsValue, LixError> {
+        let object = Object::new();
+        let groups = Array::new();
+        for group in &request.groups {
+            let group_object = Object::new();
+            set_string(&group_object, "namespace", &group.namespace)?;
+            let keys = Array::new();
+            for key in &group.keys {
+                keys.push(&bytes_to_js(key));
+            }
+            Reflect::set(&group_object, &JsValue::from_str("keys"), &keys)
+                .map_err(|_| js_sdk_error("could not set get request keys"))?;
+            groups.push(&group_object);
+        }
+        Reflect::set(&object, &JsValue::from_str("groups"), &groups)
+            .map_err(|_| js_sdk_error("could not set get request groups"))?;
+        Ok(object.into())
     }
 
     fn kv_scan_range_to_js(range: &BackendKvScanRange) -> Result<JsValue, LixError> {
@@ -639,29 +622,233 @@ export type MergeConflictSide = {
         Ok(object.into())
     }
 
-    fn js_value_to_kv_pairs(
+    fn kv_scan_request_to_js(request: &BackendKvScanRequest) -> Result<JsValue, LixError> {
+        let object = Object::new();
+        set_string(&object, "namespace", &request.namespace)?;
+        Reflect::set(
+            &object,
+            &JsValue::from_str("range"),
+            &kv_scan_range_to_js(&request.range)?,
+        )
+        .map_err(|_| js_sdk_error("could not set scan request range"))?;
+        let after = request
+            .after
+            .as_deref()
+            .map(bytes_to_js)
+            .unwrap_or(JsValue::NULL);
+        Reflect::set(&object, &JsValue::from_str("after"), &after)
+            .map_err(|_| js_sdk_error("could not set scan request after"))?;
+        Reflect::set(
+            &object,
+            &JsValue::from_str("limit"),
+            &usize_to_js(request.limit),
+        )
+        .map_err(|_| js_sdk_error("could not set scan request limit"))?;
+        Ok(object.into())
+    }
+
+    fn kv_write_batch_to_js(batch: &BackendKvWriteBatch) -> Result<JsValue, LixError> {
+        let object = Object::new();
+        let groups = Array::new();
+        for group in &batch.groups {
+            let group_object = Object::new();
+            set_string(&group_object, "namespace", group.namespace())?;
+
+            let puts = Array::new();
+            for index in 0..group.put_count() {
+                let key = group.put_key(index).ok_or_else(|| {
+                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put key")
+                })?;
+                let value = group.put_value(index).ok_or_else(|| {
+                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put value")
+                })?;
+                let put = Object::new();
+                Reflect::set(&put, &JsValue::from_str("key"), &bytes_to_js(key))
+                    .map_err(|_| js_sdk_error("could not set write put key"))?;
+                Reflect::set(&put, &JsValue::from_str("value"), &bytes_to_js(value))
+                    .map_err(|_| js_sdk_error("could not set write put value"))?;
+                puts.push(&put);
+            }
+            Reflect::set(&group_object, &JsValue::from_str("puts"), &puts)
+                .map_err(|_| js_sdk_error("could not set write puts"))?;
+
+            let deletes = Array::new();
+            for index in 0..group.delete_count() {
+                let key = group.delete_key(index).ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "backend write batch missing delete key",
+                    )
+                })?;
+                deletes.push(&bytes_to_js(key));
+            }
+            Reflect::set(&group_object, &JsValue::from_str("deletes"), &deletes)
+                .map_err(|_| js_sdk_error("could not set write deletes"))?;
+            groups.push(&group_object);
+        }
+        Reflect::set(&object, &JsValue::from_str("groups"), &groups)
+            .map_err(|_| js_sdk_error("could not set write groups"))?;
+        Ok(object.into())
+    }
+
+    fn js_value_to_value_batch(
         value: JsValue,
         context: &str,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, LixError> {
-        if !Array::is_array(&value) {
-            return Err(js_sdk_error(format!("{context} must return an array")));
-        }
-        Array::from(&value)
+    ) -> Result<BackendKvValueBatch, LixError> {
+        let object = expect_backend_object(value, context)?;
+        let groups = required_array(&object, "groups", context)?;
+        let groups = groups
             .iter()
-            .map(|row| {
-                if row.is_null() || row.is_undefined() || !row.is_object() {
-                    return Err(js_sdk_error(format!("{context} rows must be objects")));
+            .enumerate()
+            .map(|(index, group)| {
+                let group_context = format!("{context}.groups[{index}]");
+                let group = expect_backend_object(group, &group_context)?;
+                let namespace = required_string(&group, "namespace", &group_context)?;
+                let values = required_array(&group, "values", &group_context)?;
+                let mut bytes = BytePageBuilder::with_capacity(values.length() as usize, 0);
+                let mut present = Vec::with_capacity(values.length() as usize);
+                for value in values.iter() {
+                    if value.is_null() || value.is_undefined() {
+                        bytes.push([]);
+                        present.push(false);
+                    } else {
+                        bytes.push(js_value_to_bytes(
+                            value,
+                            &format!("{group_context}.values"),
+                        )?);
+                        present.push(true);
+                    }
                 }
-                let key = Reflect::get(&row, &JsValue::from_str("key"))
-                    .map_err(|_| js_sdk_error(format!("{context} row key could not be read")))?;
-                let value = Reflect::get(&row, &JsValue::from_str("value"))
-                    .map_err(|_| js_sdk_error(format!("{context} row value could not be read")))?;
-                Ok((
-                    js_value_to_bytes(key, "kv pair key")?,
-                    js_value_to_bytes(value, "kv pair value")?,
-                ))
+                Ok(BackendKvValueGroup::new(namespace, bytes.finish(), present))
             })
-            .collect()
+            .collect::<Result<Vec<_>, LixError>>()?;
+        Ok(BackendKvValueBatch { groups })
+    }
+
+    fn js_value_to_exists_batch(
+        value: JsValue,
+        context: &str,
+    ) -> Result<BackendKvExistsBatch, LixError> {
+        let object = expect_backend_object(value, context)?;
+        let groups = required_array(&object, "groups", context)?;
+        let groups = groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| {
+                let group_context = format!("{context}.groups[{index}]");
+                let group = expect_backend_object(group, &group_context)?;
+                let namespace = required_string(&group, "namespace", &group_context)?;
+                let exists = required_array(&group, "exists", &group_context)?
+                    .iter()
+                    .map(|value| {
+                        value.as_bool().ok_or_else(|| {
+                            js_sdk_error(format!("{group_context}.exists must contain booleans"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, LixError>>()?;
+                Ok(BackendKvExistsGroup { namespace, exists })
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        Ok(BackendKvExistsBatch { groups })
+    }
+
+    fn js_value_to_key_page(value: JsValue, context: &str) -> Result<BackendKvKeyPage, LixError> {
+        let object = expect_backend_object(value, context)?;
+        Ok(BackendKvKeyPage {
+            keys: byte_array_property(&object, "keys", context)?.finish(),
+            resume_after: optional_bytes_property(&object, "resumeAfter", context)?,
+        })
+    }
+
+    fn js_value_to_value_page(
+        value: JsValue,
+        context: &str,
+    ) -> Result<BackendKvValuePage, LixError> {
+        let object = expect_backend_object(value, context)?;
+        Ok(BackendKvValuePage {
+            values: byte_array_property(&object, "values", context)?.finish(),
+            resume_after: optional_bytes_property(&object, "resumeAfter", context)?,
+        })
+    }
+
+    fn js_value_to_entry_page(
+        value: JsValue,
+        context: &str,
+    ) -> Result<BackendKvEntryPage, LixError> {
+        let object = expect_backend_object(value, context)?;
+        Ok(BackendKvEntryPage {
+            keys: byte_array_property(&object, "keys", context)?.finish(),
+            values: byte_array_property(&object, "values", context)?.finish(),
+            resume_after: optional_bytes_property(&object, "resumeAfter", context)?,
+        })
+    }
+
+    fn js_value_to_write_stats(
+        value: JsValue,
+        context: &str,
+    ) -> Result<BackendKvWriteStats, LixError> {
+        let object = expect_backend_object(value, context)?;
+        Ok(BackendKvWriteStats {
+            puts: required_usize(&object, "puts", context)?,
+            deletes: required_usize(&object, "deletes", context)?,
+            bytes_written: required_usize(&object, "bytesWritten", context)?,
+        })
+    }
+
+    fn expect_backend_object(value: JsValue, context: &str) -> Result<Object, LixError> {
+        if value.is_null() || value.is_undefined() || !value.is_object() {
+            return Err(js_sdk_error(format!("{context} must return an object")));
+        }
+        Ok(Object::from(value))
+    }
+
+    fn required_array(object: &Object, key: &str, context: &str) -> Result<Array, LixError> {
+        let value = Reflect::get(object, &JsValue::from_str(key))
+            .map_err(|_| js_sdk_error(format!("{context}.{key} could not be read")))?;
+        if !Array::is_array(&value) {
+            return Err(js_sdk_error(format!("{context}.{key} must be an array")));
+        }
+        Ok(Array::from(&value))
+    }
+
+    fn byte_array_property(
+        object: &Object,
+        key: &str,
+        context: &str,
+    ) -> Result<BytePageBuilder, LixError> {
+        let array = required_array(object, key, context)?;
+        let mut page = BytePageBuilder::with_capacity(array.length() as usize, 0);
+        for value in array.iter() {
+            page.push(js_value_to_bytes(value, &format!("{context}.{key}"))?);
+        }
+        Ok(page)
+    }
+
+    fn optional_bytes_property(
+        object: &Object,
+        key: &str,
+        context: &str,
+    ) -> Result<Option<Vec<u8>>, LixError> {
+        let value = Reflect::get(object, &JsValue::from_str(key))
+            .map_err(|_| js_sdk_error(format!("{context}.{key} could not be read")))?;
+        if value.is_undefined() || value.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(js_value_to_bytes(value, &format!("{context}.{key}"))?))
+    }
+
+    fn required_usize(object: &Object, key: &str, context: &str) -> Result<usize, LixError> {
+        let value = Reflect::get(object, &JsValue::from_str(key))
+            .map_err(|_| js_sdk_error(format!("{context}.{key} could not be read")))?;
+        let number = value
+            .as_f64()
+            .ok_or_else(|| js_sdk_error(format!("{context}.{key} must be a number")))?;
+        if !number.is_finite() || number < 0.0 || number.fract() != 0.0 {
+            return Err(js_sdk_error(format!(
+                "{context}.{key} must be a non-negative integer"
+            )));
+        }
+        Ok(number as usize)
     }
 
     fn js_to_lix_error(value: JsValue) -> LixError {
