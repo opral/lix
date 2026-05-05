@@ -190,6 +190,13 @@ impl Transaction {
         write: StageWrite,
     ) -> Result<StageWriteOutcome, LixError> {
         require_valid_stage_write_storage_scopes(&write)?;
+        #[cfg(feature = "storage-benches")]
+        {
+            crate::storage_bench::record_transaction_rows_staged(stage_write_row_count(&write));
+            crate::storage_bench::record_transaction_untracked_rows(
+                stage_write_untracked_row_count(&write),
+            );
+        }
         self.require_existing_stage_write_version_ids(&write)
             .await?;
         let write = self.normalize_stage_write(write).await?;
@@ -241,6 +248,8 @@ impl Transaction {
         staged_writes: &StagedWriteSet,
     ) -> Result<(), LixError> {
         for version_id in staged_write_validation_version_ids(staged_writes) {
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_transaction_validation_version();
             let version_staged_writes =
                 staged_write_set_for_schema_scope(staged_writes, &version_id);
             let live_state = self.live_state.reader(self.storage_transaction.as_mut());
@@ -463,6 +472,26 @@ fn stage_write_version_ids(write: &StageWrite) -> BTreeSet<String> {
             .iter()
             .map(|change| change.version_id.clone())
             .collect(),
+    }
+}
+
+#[cfg(feature = "storage-benches")]
+fn stage_write_row_count(write: &StageWrite) -> usize {
+    match write {
+        StageWrite::Rows { rows, .. } => rows.len(),
+        StageWrite::RowsWithFileData { rows, .. } => rows.len(),
+        StageWrite::AdoptedChanges { changes } => changes.len(),
+    }
+}
+
+#[cfg(feature = "storage-benches")]
+fn stage_write_untracked_row_count(write: &StageWrite) -> usize {
+    match write {
+        StageWrite::Rows { rows, .. } => rows.iter().filter(|row| row.untracked).count(),
+        StageWrite::RowsWithFileData { rows, .. } => {
+            rows.iter().filter(|row| row.untracked).count()
+        }
+        StageWrite::AdoptedChanges { .. } => 0,
     }
 }
 

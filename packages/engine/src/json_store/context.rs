@@ -113,6 +113,8 @@ impl JsonStoreWriter {
         })?;
         let hash = blake3::hash(bytes);
         let hash_bytes = *hash.as_bytes();
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_json_store_stage_bytes(hash_bytes);
         let json_ref = JsonRef::from_hash(hash);
         if !self.seen.insert(hash_bytes) {
             return Ok(json_ref);

@@ -1,0 +1,825 @@
+use async_trait::async_trait;
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use lix_engine::storage_bench::{self, TransactionAccountingReport};
+use lix_engine::{
+    Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvGetRequest, BackendKvKeyPage,
+    BackendKvScanRequest, BackendKvValueBatch, BackendKvValuePage, BackendKvWriteBatch,
+    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, LixError,
+};
+use std::collections::{BTreeMap, HashSet};
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
+use tokio::runtime::Runtime;
+
+#[path = "../storage/backend.rs"]
+mod backend;
+
+use backend::BenchBackend;
+
+const ENTITY_ROWS: usize = 10_000;
+const LARGE_ENTITY_ROWS: usize = 1_000;
+const UPDATE_ROWS_SMALL: usize = 1;
+const UPDATE_ROWS_BATCH: usize = 100;
+
+fn transaction_benches(c: &mut Criterion) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("create tokio runtime for transaction benchmarks");
+    let mut group = c.benchmark_group("transaction");
+
+    group.bench_function("open_empty", |b| {
+        b.iter_batched(
+            || {
+                runtime
+                    .block_on(storage_bench::prepare_transaction_commit_empty(
+                        BenchBackend::new(),
+                    ))
+                    .expect("prepare transaction/open_empty")
+            },
+            |fixture| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::transaction_open_empty_prepared(&fixture))
+                        .unwrap_or_else(|error| panic!("transaction/open_empty succeeds: {error}")),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("stage_only_entities_no_payload/10k", |b| {
+        b.iter_batched(
+            || {
+                runtime
+                    .block_on(
+                        storage_bench::prepare_transaction_commit_entities_no_payload(
+                            BenchBackend::new(),
+                            ENTITY_ROWS,
+                        ),
+                    )
+                    .expect("prepare transaction/stage_only_entities_no_payload")
+            },
+            |fixture| {
+                stage_only(
+                    &runtime,
+                    fixture,
+                    "transaction/stage_only_entities_no_payload",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("stage_only_entities_payload_1k_unique/10k", |b| {
+        b.iter_batched(
+            || {
+                runtime
+                    .block_on(
+                        storage_bench::prepare_transaction_commit_entities_payload_1k_unique(
+                            BenchBackend::new(),
+                            ENTITY_ROWS,
+                        ),
+                    )
+                    .expect("prepare transaction/stage_only_entities_payload_1k_unique")
+            },
+            |fixture| {
+                stage_only(
+                    &runtime,
+                    fixture,
+                    "transaction/stage_only_entities_payload_1k_unique",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("commit_only_entities_no_payload/10k", |b| {
+        b.iter_batched(
+            || {
+                let fixture = runtime
+                    .block_on(
+                        storage_bench::prepare_transaction_commit_entities_no_payload(
+                            BenchBackend::new(),
+                            ENTITY_ROWS,
+                        ),
+                    )
+                    .expect("prepare transaction/commit_only_entities_no_payload fixture");
+                runtime
+                    .block_on(storage_bench::prepare_transaction_commit_only(fixture))
+                    .expect("prepare transaction/commit_only_entities_no_payload")
+            },
+            |fixture| {
+                commit_only(
+                    &runtime,
+                    fixture,
+                    "transaction/commit_only_entities_no_payload",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("commit_only_entities_payload_1k_same/10k", |b| {
+        b.iter_batched(
+            || {
+                let fixture = runtime
+                    .block_on(
+                        storage_bench::prepare_transaction_commit_entities_payload_1k_same(
+                            BenchBackend::new(),
+                            ENTITY_ROWS,
+                        ),
+                    )
+                    .expect("prepare transaction/commit_only_entities_payload_1k_same fixture");
+                runtime
+                    .block_on(storage_bench::prepare_transaction_commit_only(fixture))
+                    .expect("prepare transaction/commit_only_entities_payload_1k_same")
+            },
+            |fixture| {
+                commit_only(
+                    &runtime,
+                    fixture,
+                    "transaction/commit_only_entities_payload_1k_same",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("commit_only_entities_payload_1k_unique/10k", |b| {
+        b.iter_batched(
+            || {
+                let fixture = runtime
+                    .block_on(
+                        storage_bench::prepare_transaction_commit_entities_payload_1k_unique(
+                            BenchBackend::new(),
+                            ENTITY_ROWS,
+                        ),
+                    )
+                    .expect("prepare transaction/commit_only_entities_payload_1k_unique fixture");
+                runtime
+                    .block_on(storage_bench::prepare_transaction_commit_only(fixture))
+                    .expect("prepare transaction/commit_only_entities_payload_1k_unique")
+            },
+            |fixture| {
+                commit_only(
+                    &runtime,
+                    fixture,
+                    "transaction/commit_only_entities_payload_1k_unique",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("accounting_entities_no_payload/10k", |b| {
+        b.iter_batched(
+            || {
+                prepare_accounting(&runtime, |backend| {
+                    storage_bench::prepare_transaction_commit_entities_no_payload(
+                        backend,
+                        ENTITY_ROWS,
+                    )
+                })
+            },
+            |fixture| {
+                accounting(
+                    &runtime,
+                    fixture,
+                    "transaction/accounting_entities_no_payload",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("accounting_entities_payload_1k_unique/10k", |b| {
+        b.iter_batched(
+            || {
+                prepare_accounting(&runtime, |backend| {
+                    storage_bench::prepare_transaction_commit_entities_payload_1k_unique(
+                        backend,
+                        ENTITY_ROWS,
+                    )
+                })
+            },
+            |fixture| {
+                accounting(
+                    &runtime,
+                    fixture,
+                    "transaction/accounting_entities_payload_1k_unique",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("accounting_entities_payload_1k_same/10k", |b| {
+        b.iter_batched(
+            || {
+                prepare_accounting(&runtime, |backend| {
+                    storage_bench::prepare_transaction_commit_entities_payload_1k_same(
+                        backend,
+                        ENTITY_ROWS,
+                    )
+                })
+            },
+            |fixture| {
+                accounting(
+                    &runtime,
+                    fixture,
+                    "transaction/accounting_entities_payload_1k_same",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("accounting_untracked_payload_1k_same/10k", |b| {
+        b.iter_batched(
+            || {
+                prepare_accounting(&runtime, |backend| {
+                    storage_bench::prepare_transaction_commit_untracked_payload_1k_same(
+                        backend,
+                        ENTITY_ROWS,
+                    )
+                })
+            },
+            |fixture| {
+                accounting(
+                    &runtime,
+                    fixture,
+                    "transaction/accounting_untracked_payload_1k_same",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("stage_plus_commit_empty", |b| {
+        b.iter_batched(
+            || {
+                runtime
+                    .block_on(storage_bench::prepare_transaction_commit_empty(
+                        BenchBackend::new(),
+                    ))
+                    .expect("prepare transaction/stage_plus_commit_empty")
+            },
+            |fixture| commit(&runtime, fixture, "transaction/stage_plus_commit_empty"),
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("stage_plus_commit_schema_only/1", |b| {
+        b.iter_batched(
+            || {
+                runtime
+                    .block_on(storage_bench::prepare_transaction_commit_schema_only(
+                        BenchBackend::new(),
+                    ))
+                    .expect("prepare transaction/stage_plus_commit_schema_only")
+            },
+            |fixture| {
+                commit(
+                    &runtime,
+                    fixture,
+                    "transaction/stage_plus_commit_schema_only",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("stage_plus_commit_entities_no_payload/10k", |b| {
+        b.iter_batched(
+            || {
+                runtime
+                    .block_on(
+                        storage_bench::prepare_transaction_commit_entities_no_payload(
+                            BenchBackend::new(),
+                            ENTITY_ROWS,
+                        ),
+                    )
+                    .expect("prepare transaction/stage_plus_commit_entities_no_payload")
+            },
+            |fixture| {
+                commit(
+                    &runtime,
+                    fixture,
+                    "transaction/stage_plus_commit_entities_no_payload",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("stage_plus_commit_entities_payload_1k_unique/10k", |b| {
+        b.iter_batched(
+            || {
+                runtime
+                    .block_on(
+                        storage_bench::prepare_transaction_commit_entities_payload_1k_unique(
+                            BenchBackend::new(),
+                            ENTITY_ROWS,
+                        ),
+                    )
+                    .expect("prepare transaction/stage_plus_commit_entities_payload_1k_unique")
+            },
+            |fixture| {
+                commit(
+                    &runtime,
+                    fixture,
+                    "transaction/stage_plus_commit_entities_payload_1k_unique",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("stage_plus_commit_entities_payload_1k_same/10k", |b| {
+        b.iter_batched(
+            || {
+                runtime
+                    .block_on(
+                        storage_bench::prepare_transaction_commit_entities_payload_1k_same(
+                            BenchBackend::new(),
+                            ENTITY_ROWS,
+                        ),
+                    )
+                    .expect("prepare transaction/stage_plus_commit_entities_payload_1k_same")
+            },
+            |fixture| {
+                commit(
+                    &runtime,
+                    fixture,
+                    "transaction/stage_plus_commit_entities_payload_1k_same",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("stage_plus_commit_entities_payload_1k_half_duplicate/10k", |b| {
+        b.iter_batched(
+            || {
+                runtime
+                    .block_on(
+                        storage_bench::prepare_transaction_commit_entities_payload_1k_half_duplicate(
+                            BenchBackend::new(),
+                            ENTITY_ROWS,
+                        ),
+                    )
+                    .expect(
+                        "prepare transaction/stage_plus_commit_entities_payload_1k_half_duplicate",
+                    )
+            },
+            |fixture| {
+                commit(
+                    &runtime,
+                    fixture,
+                    "transaction/stage_plus_commit_entities_payload_1k_half_duplicate",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("stage_plus_commit_entities_metadata_1k_same/10k", |b| {
+        b.iter_batched(
+            || {
+                runtime
+                    .block_on(
+                        storage_bench::prepare_transaction_commit_entities_metadata_1k_same(
+                            BenchBackend::new(),
+                            ENTITY_ROWS,
+                        ),
+                    )
+                    .expect("prepare transaction/stage_plus_commit_entities_metadata_1k_same")
+            },
+            |fixture| {
+                commit(
+                    &runtime,
+                    fixture,
+                    "transaction/stage_plus_commit_entities_metadata_1k_same",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("stage_plus_commit_entities_payload_16k_unique/1k", |b| {
+        b.iter_batched(
+            || {
+                runtime
+                    .block_on(
+                        storage_bench::prepare_transaction_commit_entities_payload_16k_unique(
+                            BenchBackend::new(),
+                            LARGE_ENTITY_ROWS,
+                        ),
+                    )
+                    .expect("prepare transaction/stage_plus_commit_entities_payload_16k_unique")
+            },
+            |fixture| {
+                commit(
+                    &runtime,
+                    fixture,
+                    "transaction/stage_plus_commit_entities_payload_16k_unique",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("stage_plus_commit_untracked_payload_1k_same/10k", |b| {
+        b.iter_batched(
+            || {
+                runtime
+                    .block_on(
+                        storage_bench::prepare_transaction_commit_untracked_payload_1k_same(
+                            BenchBackend::new(),
+                            ENTITY_ROWS,
+                        ),
+                    )
+                    .expect("prepare transaction/stage_plus_commit_untracked_payload_1k_same")
+            },
+            |fixture| {
+                commit(
+                    &runtime,
+                    fixture,
+                    "transaction/stage_plus_commit_untracked_payload_1k_same",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function(
+        "stage_plus_commit_update_1_existing_payload_1k/root_10k",
+        |b| {
+            b.iter_batched(
+                || {
+                    runtime
+                        .block_on(
+                            storage_bench::prepare_transaction_update_existing_payload_1k(
+                                BenchBackend::new(),
+                                ENTITY_ROWS,
+                                UPDATE_ROWS_SMALL,
+                            ),
+                        )
+                        .expect(
+                            "prepare transaction/stage_plus_commit_update_1_existing_payload_1k",
+                        )
+                },
+                |fixture| {
+                    commit(
+                        &runtime,
+                        fixture,
+                        "transaction/stage_plus_commit_update_1_existing_payload_1k",
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        },
+    );
+
+    group.bench_function(
+        "stage_plus_commit_update_100_existing_payload_1k/root_10k",
+        |b| {
+            b.iter_batched(
+                || {
+                    runtime
+                        .block_on(
+                            storage_bench::prepare_transaction_update_existing_payload_1k(
+                                BenchBackend::new(),
+                                ENTITY_ROWS,
+                                UPDATE_ROWS_BATCH,
+                            ),
+                        )
+                        .expect(
+                            "prepare transaction/stage_plus_commit_update_100_existing_payload_1k",
+                        )
+                },
+                |fixture| {
+                    commit(
+                        &runtime,
+                        fixture,
+                        "transaction/stage_plus_commit_update_100_existing_payload_1k",
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        },
+    );
+
+    group.finish();
+}
+
+fn commit(
+    runtime: &Runtime,
+    fixture: storage_bench::TransactionBenchFixture,
+    label: &str,
+) -> storage_bench::StorageBenchReport {
+    black_box(
+        runtime
+            .block_on(storage_bench::transaction_commit_prepared(&fixture))
+            .unwrap_or_else(|error| panic!("{label} succeeds: {error}")),
+    )
+}
+
+fn stage_only(
+    runtime: &Runtime,
+    fixture: storage_bench::TransactionBenchFixture,
+    label: &str,
+) -> storage_bench::StorageBenchReport {
+    black_box(
+        runtime
+            .block_on(storage_bench::transaction_stage_only_prepared(&fixture))
+            .unwrap_or_else(|error| panic!("{label} succeeds: {error}")),
+    )
+}
+
+fn commit_only(
+    runtime: &Runtime,
+    fixture: storage_bench::TransactionCommitOnlyFixture,
+    label: &str,
+) -> storage_bench::StorageBenchReport {
+    black_box(
+        runtime
+            .block_on(storage_bench::transaction_commit_only_prepared(fixture))
+            .unwrap_or_else(|error| panic!("{label} succeeds: {error}")),
+    )
+}
+
+struct AccountingFixture {
+    fixture: storage_bench::TransactionBenchFixture,
+    storage: Arc<StorageAccounting>,
+}
+
+fn prepare_accounting<F, Fut>(runtime: &Runtime, prepare: F) -> AccountingFixture
+where
+    F: FnOnce(Arc<dyn Backend + Send + Sync>) -> Fut,
+    Fut: std::future::Future<Output = Result<storage_bench::TransactionBenchFixture, LixError>>,
+{
+    let (backend, storage) = CountingBackend::new(BenchBackend::new());
+    let fixture = runtime
+        .block_on(prepare(backend))
+        .expect("prepare transaction accounting fixture");
+    storage.reset();
+    storage_bench::reset_transaction_bench_counters();
+    AccountingFixture { fixture, storage }
+}
+
+fn accounting(
+    runtime: &Runtime,
+    fixture: AccountingFixture,
+    label: &str,
+) -> TransactionAccountingReport {
+    runtime
+        .block_on(storage_bench::transaction_commit_prepared(&fixture.fixture))
+        .unwrap_or_else(|error| panic!("{label} succeeds: {error}"));
+    let storage = fixture.storage.snapshot();
+    let report = TransactionAccountingReport {
+        counters: storage_bench::transaction_bench_counters(),
+        storage_write_batches: storage.write_batches,
+        kv_puts_by_namespace: storage.kv_puts_by_namespace,
+        bytes_by_namespace: storage.bytes_by_namespace,
+    };
+    print_accounting_once(label, &report);
+    black_box(report)
+}
+
+static PRINTED_ACCOUNTING_LABELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn print_accounting_once(label: &str, report: &TransactionAccountingReport) {
+    if std::env::var("LIX_BENCH_PRINT_ACCOUNTING").ok().as_deref() != Some("1") {
+        return;
+    }
+    let labels = PRINTED_ACCOUNTING_LABELS.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut labels = labels
+        .lock()
+        .expect("printed accounting label mutex should lock");
+    if !labels.insert(label.to_string()) {
+        return;
+    }
+    eprintln!("{label}: {report:#?}");
+}
+
+#[derive(Default)]
+struct StorageAccounting {
+    inner: Mutex<StorageAccountingSnapshot>,
+}
+
+#[derive(Default)]
+struct StorageAccountingSnapshot {
+    write_batches: usize,
+    kv_puts_by_namespace: BTreeMap<String, usize>,
+    bytes_by_namespace: BTreeMap<String, usize>,
+}
+
+impl StorageAccounting {
+    fn reset(&self) {
+        *self
+            .inner
+            .lock()
+            .expect("storage accounting mutex should lock") = StorageAccountingSnapshot::default();
+    }
+
+    fn record_write_batch(&self, batch: &BackendKvWriteBatch) {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("storage accounting mutex should lock");
+        inner.write_batches += 1;
+        for group in &batch.groups {
+            let namespace = group.namespace().to_string();
+            for index in 0..group.put_count() {
+                let Some(key) = group.put_key(index) else {
+                    continue;
+                };
+                let Some(value) = group.put_value(index) else {
+                    continue;
+                };
+                *inner
+                    .kv_puts_by_namespace
+                    .entry(namespace.clone())
+                    .or_default() += 1;
+                *inner
+                    .bytes_by_namespace
+                    .entry(namespace.clone())
+                    .or_default() += key.len() + value.len();
+            }
+            for index in 0..group.delete_count() {
+                let Some(key) = group.delete_key(index) else {
+                    continue;
+                };
+                *inner
+                    .bytes_by_namespace
+                    .entry(namespace.clone())
+                    .or_default() += key.len();
+            }
+        }
+    }
+
+    fn snapshot(&self) -> StorageAccountingSnapshot {
+        let inner = self
+            .inner
+            .lock()
+            .expect("storage accounting mutex should lock");
+        StorageAccountingSnapshot {
+            write_batches: inner.write_batches,
+            kv_puts_by_namespace: inner.kv_puts_by_namespace.clone(),
+            bytes_by_namespace: inner.bytes_by_namespace.clone(),
+        }
+    }
+}
+
+struct CountingBackend {
+    inner: Arc<dyn Backend + Send + Sync>,
+    accounting: Arc<StorageAccounting>,
+}
+
+impl CountingBackend {
+    fn new(
+        inner: Arc<dyn Backend + Send + Sync>,
+    ) -> (Arc<dyn Backend + Send + Sync>, Arc<StorageAccounting>) {
+        let accounting = Arc::new(StorageAccounting::default());
+        (
+            Arc::new(Self {
+                inner,
+                accounting: Arc::clone(&accounting),
+            }),
+            accounting,
+        )
+    }
+}
+
+#[async_trait]
+impl Backend for CountingBackend {
+    async fn begin_read_transaction(
+        &self,
+    ) -> Result<Box<dyn BackendReadTransaction + Send + Sync + 'static>, LixError> {
+        let transaction = self.inner.begin_read_transaction().await?;
+        Ok(Box::new(CountingReadTransaction { transaction }))
+    }
+
+    async fn begin_write_transaction(
+        &self,
+    ) -> Result<Box<dyn BackendWriteTransaction + Send + Sync + 'static>, LixError> {
+        let transaction = self.inner.begin_write_transaction().await?;
+        Ok(Box::new(CountingWriteTransaction {
+            transaction,
+            accounting: Arc::clone(&self.accounting),
+        }))
+    }
+}
+
+struct CountingReadTransaction {
+    transaction: Box<dyn BackendReadTransaction + Send + Sync + 'static>,
+}
+
+#[async_trait]
+impl BackendReadTransaction for CountingReadTransaction {
+    async fn get_values(
+        &mut self,
+        request: BackendKvGetRequest,
+    ) -> Result<BackendKvValueBatch, LixError> {
+        self.transaction.get_values(request).await
+    }
+
+    async fn exists_many(
+        &mut self,
+        request: BackendKvGetRequest,
+    ) -> Result<lix_engine::BackendKvExistsBatch, LixError> {
+        self.transaction.exists_many(request).await
+    }
+
+    async fn scan_keys(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvKeyPage, LixError> {
+        self.transaction.scan_keys(request).await
+    }
+
+    async fn scan_values(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvValuePage, LixError> {
+        self.transaction.scan_values(request).await
+    }
+
+    async fn scan_entries(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvEntryPage, LixError> {
+        self.transaction.scan_entries(request).await
+    }
+
+    async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+        self.transaction.rollback().await
+    }
+}
+
+struct CountingWriteTransaction {
+    transaction: Box<dyn BackendWriteTransaction + Send + Sync + 'static>,
+    accounting: Arc<StorageAccounting>,
+}
+
+#[async_trait]
+impl BackendReadTransaction for CountingWriteTransaction {
+    async fn get_values(
+        &mut self,
+        request: BackendKvGetRequest,
+    ) -> Result<BackendKvValueBatch, LixError> {
+        self.transaction.get_values(request).await
+    }
+
+    async fn exists_many(
+        &mut self,
+        request: BackendKvGetRequest,
+    ) -> Result<BackendKvExistsBatch, LixError> {
+        self.transaction.exists_many(request).await
+    }
+
+    async fn scan_keys(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvKeyPage, LixError> {
+        self.transaction.scan_keys(request).await
+    }
+
+    async fn scan_values(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvValuePage, LixError> {
+        self.transaction.scan_values(request).await
+    }
+
+    async fn scan_entries(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvEntryPage, LixError> {
+        self.transaction.scan_entries(request).await
+    }
+
+    async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+        self.transaction.rollback().await
+    }
+}
+
+#[async_trait]
+impl BackendWriteTransaction for CountingWriteTransaction {
+    async fn write_kv_batch(
+        &mut self,
+        batch: BackendKvWriteBatch,
+    ) -> Result<BackendKvWriteStats, LixError> {
+        self.accounting.record_write_batch(&batch);
+        self.transaction.write_kv_batch(batch).await
+    }
+
+    async fn commit(self: Box<Self>) -> Result<(), LixError> {
+        self.transaction.commit().await
+    }
+}
+
+criterion_group!(benches, transaction_benches);
+criterion_main!(benches);
