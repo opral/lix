@@ -1,10 +1,11 @@
 use crate::commit_graph::CommitGraphContext;
+use crate::json_store::JsonStoreContext;
 use crate::storage::{StorageReader, StorageWriter};
 use crate::tracked_state::by_file_index::ByFileIndex;
 use crate::tracked_state::diff::{diff_commits, TrackedStateDiff, TrackedStateDiffRequest};
+use crate::tracked_state::materialize_value;
 use crate::tracked_state::merge::{self, TrackedStateMergePlan};
 use crate::tracked_state::rebuild::TrackedStateRebuildReport;
-use crate::tracked_state::snapshot_store::SnapshotStore;
 use crate::tracked_state::storage;
 use crate::tracked_state::tree::TrackedStateTree;
 use crate::tracked_state::tree_types::{
@@ -20,26 +21,12 @@ use crate::LixError;
 #[derive(Clone)]
 pub(crate) struct TrackedStateContext {
     tree: TrackedStateTree,
-    snapshot_store: SnapshotStore,
 }
 
 impl TrackedStateContext {
     pub(crate) fn new() -> Self {
         Self {
             tree: TrackedStateTree::new(),
-            snapshot_store: SnapshotStore::new(),
-        }
-    }
-
-    #[cfg(feature = "storage-benches")]
-    pub(crate) fn with_max_inline_encoded_value_bytes_for_bench(
-        max_inline_encoded_value_bytes: usize,
-    ) -> Self {
-        Self {
-            tree: TrackedStateTree::new(),
-            snapshot_store: SnapshotStore::with_max_inline_encoded_value_bytes(
-                max_inline_encoded_value_bytes,
-            ),
         }
     }
 
@@ -62,7 +49,6 @@ impl TrackedStateContext {
         TrackedStateWriter {
             store,
             tree: self.tree.clone(),
-            snapshot_store: self.snapshot_store,
         }
     }
 
@@ -124,19 +110,17 @@ where
                     &tree_scan_request_from_tracked(request),
                 )
                 .await?;
-            SnapshotStore::resolve_rows(&mut self.store, rows, scan_needs_snapshot_content(request))
-                .await?
+            rows
         };
-        let needs_snapshot_content = scan_needs_snapshot_content(request);
-        Ok(rows
-            .into_iter()
-            .map(|(key, mut value)| {
-                if !needs_snapshot_content {
-                    value = value.without_snapshot_content();
-                }
-                value.into_row(key)
-            })
-            .collect())
+        let projection = crate::tracked_state::TrackedMaterializationProjection::from_columns(
+            &request.projection.columns,
+        );
+        let mut json_reader = JsonStoreContext::new().reader(&mut self.store);
+        let mut materialized = Vec::with_capacity(rows.len());
+        for (key, value) in rows {
+            materialized.push(materialize_value(&mut json_reader, key, value, &projection).await?);
+        }
+        Ok(materialized)
     }
 
     pub(crate) async fn load_row_at_commit(
@@ -153,8 +137,14 @@ where
             .get(&mut self.store, &root_id, &key)
             .await?
             .map(|value| async {
-                let value = SnapshotStore::resolve_value(&mut self.store, value).await?;
-                Ok::<_, LixError>(value.into_row(key))
+                let mut json_reader = JsonStoreContext::new().reader(&mut self.store);
+                materialize_value(
+                    &mut json_reader,
+                    key,
+                    value,
+                    &crate::tracked_state::TrackedMaterializationProjection::full(),
+                )
+                .await
             });
         match row {
             Some(row) => row.await.map(Some),
@@ -191,28 +181,22 @@ where
                 request,
             )
             .await?;
-        let mut resolved = Vec::with_capacity(entries.len());
-        for entry in entries {
-            resolved.push(
-                crate::tracked_state::tree_types::TrackedStateTreeDiffEntry {
-                    before: match entry.before {
-                        Some((key, value)) => Some((
-                            key,
-                            SnapshotStore::resolve_value(&mut self.store, value).await?,
-                        )),
-                        None => None,
-                    },
-                    after: match entry.after {
-                        Some((key, value)) => Some((
-                            key,
-                            SnapshotStore::resolve_value(&mut self.store, value).await?,
-                        )),
-                        None => None,
-                    },
-                },
-            );
-        }
-        Ok(resolved)
+        Ok(entries)
+    }
+
+    pub(crate) async fn materialize_tree_value(
+        &mut self,
+        key: TrackedStateKey,
+        value: TrackedStateValue,
+    ) -> Result<TrackedStateRow, LixError> {
+        let mut json_reader = JsonStoreContext::new().reader(&mut self.store);
+        materialize_value(
+            &mut json_reader,
+            key,
+            value,
+            &crate::tracked_state::TrackedMaterializationProjection::full(),
+        )
+        .await
     }
 
     async fn scan_rows_at_commit_by_file_index(
@@ -239,12 +223,7 @@ where
                     &tree_scan_request_from_tracked(request),
                 )
                 .await?;
-            return SnapshotStore::resolve_rows(
-                &mut self.store,
-                rows,
-                scan_needs_snapshot_content(request),
-            )
-            .await;
+            return Ok(rows);
         }
         let index_rows = self
             .tree
@@ -252,8 +231,8 @@ where
             .await?;
         let mut rows = Vec::new();
         let tree_request = tree_scan_request_from_tracked(request);
-        let needs_snapshot_content = scan_needs_snapshot_content(request);
-        if needs_snapshot_content {
+        let needs_payloads = scan_needs_json_payloads(request);
+        if needs_payloads {
             let mut primary_keys = Vec::with_capacity(index_rows.len());
             for (index_key, _) in index_rows {
                 if let Some(primary_key) = ByFileIndex::primary_key_from_index_key(index_key) {
@@ -274,10 +253,7 @@ where
                 if !tree_request.matches(&primary_key, &value) {
                     continue;
                 }
-                rows.push((
-                    primary_key,
-                    SnapshotStore::resolve_value(&mut self.store, value).await?,
-                ));
+                rows.push((primary_key, value));
             }
             return Ok(rows);
         }
@@ -332,7 +308,6 @@ where
 pub(crate) struct TrackedStateWriter<S> {
     store: S,
     tree: TrackedStateTree,
-    snapshot_store: SnapshotStore,
 }
 
 impl<S> TrackedStateWriter<S>
@@ -370,17 +345,17 @@ where
         };
         let mut stored_rows = Vec::with_capacity(rows.len());
         let mut mutations = Vec::with_capacity(rows.len());
+        let mut json_writer = JsonStoreContext::new().writer();
         for row in rows {
-            let stored_value = self
-                .snapshot_store
-                .store_value(&mut self.store, TrackedStateValue::from_row(row))
-                .await?;
+            let stored_value =
+                crate::tracked_state::canonicalize_materialized_row(&mut json_writer, row)?;
             mutations.push(TrackedStateMutation::put(
                 TrackedStateKey::from_row(row),
                 stored_value.clone(),
             ));
             stored_rows.push((row, stored_value));
         }
+        json_writer.flush(&mut self.store).await?;
         let result = self
             .tree
             .apply_mutations(
@@ -460,13 +435,15 @@ fn tree_scan_request_from_tracked(
     }
 }
 
-fn scan_needs_snapshot_content(request: &TrackedStateScanRequest) -> bool {
-    request.projection.columns.is_empty()
-        || request
-            .projection
-            .columns
-            .iter()
-            .any(|column| column == "snapshot_content")
+fn scan_needs_json_payloads(request: &TrackedStateScanRequest) -> bool {
+    if request.projection.columns.is_empty() {
+        return true;
+    }
+    request
+        .projection
+        .columns
+        .iter()
+        .any(|column| column == "snapshot_content" || column == "metadata")
 }
 
 fn tracked_key_from_request(request: &TrackedStateRowRequest) -> Result<TrackedStateKey, LixError> {
@@ -494,7 +471,6 @@ mod tests {
     use super::*;
     use crate::backend::{testing::UnitTestBackend, Backend};
     use crate::storage::StorageContext;
-    use crate::tracked_state::snapshot_store::DEFAULT_MAX_INLINE_ENCODED_VALUE_BYTES;
     use crate::NullableKeyFilter;
 
     #[tokio::test]
@@ -790,11 +766,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_resolve_large_snapshot_refs() {
+    async fn reads_resolve_json_snapshot_refs() {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
-        let large_value = "x".repeat(DEFAULT_MAX_INLINE_ENCODED_VALUE_BYTES + 512);
+        let large_value = "x".repeat(1536);
         let row = row_with_value("entity-a", "change-a", "commit-1", &large_value);
 
         let mut transaction = storage
@@ -834,11 +810,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projected_scans_do_not_return_snapshot_refs_when_snapshot_content_is_omitted() {
+    async fn projected_scans_do_not_materialize_snapshot_when_snapshot_content_is_omitted() {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
-        let large_value = "x".repeat(DEFAULT_MAX_INLINE_ENCODED_VALUE_BYTES + 512);
+        let large_value = "x".repeat(1536);
         let row = row_with_value("entity-a", "change-a", "commit-1", &large_value);
 
         let mut transaction = storage

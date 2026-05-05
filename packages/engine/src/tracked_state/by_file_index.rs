@@ -1,5 +1,5 @@
 use crate::tracked_state::tree_types::{
-    StoredSnapshot, TrackedStateKey, TrackedStateTreeScanRequest, TrackedStateValue,
+    TrackedStateKey, TrackedStateTreeScanRequest, TrackedStateValue,
 };
 use crate::tracked_state::{TrackedStateRow, TrackedStateScanRequest};
 use crate::NullableKeyFilter;
@@ -69,8 +69,8 @@ impl ByFileIndex {
 
     pub(crate) fn header_value_from_primary(value: &TrackedStateValue) -> TrackedStateValue {
         TrackedStateValue {
-            snapshot: StoredSnapshot::Missing,
-            metadata: value.metadata.clone(),
+            snapshot_ref: None,
+            metadata_ref: None,
             schema_version: value.schema_version.clone(),
             created_at: value.created_at.clone(),
             updated_at: value.updated_at.clone(),

@@ -2,9 +2,9 @@ mod by_file_index;
 mod codec;
 mod context;
 mod diff;
+mod materialization;
 mod merge;
 pub(crate) mod rebuild;
-mod snapshot_store;
 mod storage;
 mod tree;
 mod tree_types;
@@ -16,6 +16,9 @@ pub(crate) use context::{TrackedStateContext, TrackedStateStoreReader, TrackedSt
 pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
     TrackedStateDiffRequest,
+};
+pub(crate) use materialization::{
+    canonicalize_materialized_row, materialize_value, TrackedMaterializationProjection,
 };
 #[allow(unused_imports)]
 pub(crate) use merge::{

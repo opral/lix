@@ -1,13 +1,14 @@
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::entity_identity::{EntityIdentity, EntityIdentityPart};
+use crate::json_store::JsonRef;
 use crate::tracked_state::tree_types::{
-    SnapshotCodec, SnapshotRef, StoredSnapshot, TrackedStateKey, TrackedStateValue,
-    TRACKED_STATE_HASH_BYTES,
+    TrackedStateKey, TrackedStateValue, TRACKED_STATE_HASH_BYTES,
 };
-use crate::{parse_row_metadata, serialize_row_metadata, LixError};
+use crate::LixError;
 
 const NODE_VERSION: u8 = 1;
+const VALUE_VERSION: u8 = 2;
 const NODE_KIND_LEAF: u8 = 1;
 const NODE_KIND_INTERNAL: u8 = 2;
 const WEIBULL_K: i32 = 4;
@@ -15,12 +16,6 @@ const ENTITY_IDENTITY_END: u8 = 0;
 const ENTITY_IDENTITY_STRING: u8 = 1;
 const ENTITY_IDENTITY_BOOL: u8 = 2;
 const ENTITY_IDENTITY_NUMBER: u8 = 3;
-const SNAPSHOT_MISSING: u8 = 0;
-const SNAPSHOT_INLINE: u8 = 1;
-const SNAPSHOT_REF: u8 = 2;
-const SNAPSHOT_CODEC_RAW: u8 = 0;
-const SNAPSHOT_CODEC_ZSTD: u8 = 1;
-const SNAPSHOT_CODEC_JSON_CHUNKS: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EncodedLeafEntry {
@@ -135,9 +130,9 @@ pub(crate) fn decode_key(bytes: &[u8]) -> Result<TrackedStateKey, LixError> {
 
 pub(crate) fn encode_value(value: &TrackedStateValue) -> Vec<u8> {
     let mut out = Vec::new();
-    push_snapshot(&mut out, &value.snapshot);
-    let metadata = value.metadata.as_ref().map(serialize_row_metadata);
-    push_optional_string(&mut out, metadata.as_deref());
+    out.push(VALUE_VERSION);
+    push_optional_json_ref(&mut out, value.snapshot_ref.as_ref());
+    push_optional_json_ref(&mut out, value.metadata_ref.as_ref());
     push_sized_bytes(&mut out, value.schema_version.as_bytes());
     push_sized_bytes(&mut out, value.created_at.as_bytes());
     push_sized_bytes(&mut out, value.updated_at.as_bytes());
@@ -147,15 +142,10 @@ pub(crate) fn encode_value(value: &TrackedStateValue) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 pub(crate) fn encoded_value_len(value: &TrackedStateValue) -> usize {
-    snapshot_len(&value.snapshot)
-        + optional_string_len(
-            value
-                .metadata
-                .as_ref()
-                .map(serialize_row_metadata)
-                .as_deref(),
-        )
+    1 + optional_json_ref_len(value.snapshot_ref.as_ref())
+        + optional_json_ref_len(value.metadata_ref.as_ref())
         + sized_bytes_len(value.schema_version.as_bytes())
         + sized_bytes_len(value.created_at.as_bytes())
         + sized_bytes_len(value.updated_at.as_bytes())
@@ -166,10 +156,15 @@ pub(crate) fn encoded_value_len(value: &TrackedStateValue) -> usize {
 
 pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateValue, LixError> {
     let mut cursor = 0usize;
-    let snapshot = read_snapshot(bytes, &mut cursor)?;
-    let metadata = read_optional_string(bytes, &mut cursor, "metadata")?
-        .map(|value| parse_row_metadata(&value, "tracked-state metadata"))
-        .transpose()?;
+    let version = read_u8(bytes, &mut cursor, "value version")?;
+    if version != VALUE_VERSION {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("unsupported tracked-state tree value version {version}"),
+        ));
+    }
+    let snapshot_ref = read_optional_json_ref(bytes, &mut cursor, "snapshot_ref")?;
+    let metadata_ref = read_optional_json_ref(bytes, &mut cursor, "metadata_ref")?;
     let schema_version = read_sized_string(bytes, &mut cursor, "schema_version")?;
     let created_at = read_sized_string(bytes, &mut cursor, "created_at")?;
     let updated_at = read_sized_string(bytes, &mut cursor, "updated_at")?;
@@ -192,8 +187,8 @@ pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateValue, LixError> 
         ));
     }
     Ok(TrackedStateValue {
-        snapshot,
-        metadata,
+        snapshot_ref,
+        metadata_ref,
         schema_version,
         created_at,
         updated_at,
@@ -203,84 +198,43 @@ pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateValue, LixError> 
     })
 }
 
-fn push_snapshot(out: &mut Vec<u8>, snapshot: &StoredSnapshot) {
-    match snapshot {
-        StoredSnapshot::Missing => out.push(SNAPSHOT_MISSING),
-        StoredSnapshot::Inline(snapshot_content) => {
-            out.push(SNAPSHOT_INLINE);
-            push_sized_bytes(out, snapshot_content.as_bytes());
-        }
-        StoredSnapshot::Ref(snapshot_ref) => {
-            out.push(SNAPSHOT_REF);
-            out.push(snapshot_codec_byte(snapshot_ref.codec));
-            out.extend_from_slice(&snapshot_ref.uncompressed_len.to_be_bytes());
-            push_sized_bytes(out, snapshot_ref.hash_hex.as_bytes());
-        }
-    }
-}
-
-fn snapshot_len(snapshot: &StoredSnapshot) -> usize {
-    match snapshot {
-        StoredSnapshot::Missing => 1,
-        StoredSnapshot::Inline(snapshot_content) => {
-            1 + sized_bytes_len(snapshot_content.as_bytes())
-        }
-        StoredSnapshot::Ref(snapshot_ref) => {
-            1 + 1 + 8 + sized_bytes_len(snapshot_ref.hash_hex.as_bytes())
-        }
-    }
-}
-
-fn optional_string_len(value: Option<&str>) -> usize {
-    match value {
-        Some(value) => 1 + sized_bytes_len(value.as_bytes()),
-        None => 1,
-    }
-}
-
+#[cfg(test)]
 fn sized_bytes_len(bytes: &[u8]) -> usize {
     4 + bytes.len()
 }
 
-fn read_snapshot(bytes: &[u8], cursor: &mut usize) -> Result<StoredSnapshot, LixError> {
-    match read_u8(bytes, cursor, "snapshot kind")? {
-        SNAPSHOT_MISSING => Ok(StoredSnapshot::Missing),
-        SNAPSHOT_INLINE => {
-            read_sized_string(bytes, cursor, "snapshot_content").map(StoredSnapshot::Inline)
+fn push_optional_json_ref(out: &mut Vec<u8>, value: Option<&JsonRef>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            out.extend_from_slice(value.as_hash_bytes());
         }
-        SNAPSHOT_REF => {
-            let codec = read_snapshot_codec(bytes, cursor)?;
-            let uncompressed_len = read_u64(bytes, cursor, "snapshot_ref uncompressed_len")?;
-            let hash_hex = read_sized_string(bytes, cursor, "snapshot_ref hash")?;
-            Ok(StoredSnapshot::Ref(SnapshotRef {
-                codec,
-                hash_hex,
-                uncompressed_len,
-            }))
-        }
-        other => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state tree value has invalid snapshot kind byte {other}"),
-        )),
+        None => out.push(0),
     }
 }
 
-fn snapshot_codec_byte(codec: SnapshotCodec) -> u8 {
-    match codec {
-        SnapshotCodec::Raw => SNAPSHOT_CODEC_RAW,
-        SnapshotCodec::Zstd => SNAPSHOT_CODEC_ZSTD,
-        SnapshotCodec::JsonChunks => SNAPSHOT_CODEC_JSON_CHUNKS,
+#[cfg(test)]
+fn optional_json_ref_len(value: Option<&JsonRef>) -> usize {
+    match value {
+        Some(_) => 1 + TRACKED_STATE_HASH_BYTES,
+        None => 1,
     }
 }
 
-fn read_snapshot_codec(bytes: &[u8], cursor: &mut usize) -> Result<SnapshotCodec, LixError> {
-    match read_u8(bytes, cursor, "snapshot_ref codec")? {
-        SNAPSHOT_CODEC_RAW => Ok(SnapshotCodec::Raw),
-        SNAPSHOT_CODEC_ZSTD => Ok(SnapshotCodec::Zstd),
-        SNAPSHOT_CODEC_JSON_CHUNKS => Ok(SnapshotCodec::JsonChunks),
+fn read_optional_json_ref(
+    bytes: &[u8],
+    cursor: &mut usize,
+    field: &str,
+) -> Result<Option<JsonRef>, LixError> {
+    match read_u8(bytes, cursor, field)? {
+        0 => Ok(None),
+        1 => {
+            let hash = read_fixed_hash(bytes, cursor, field)?;
+            Ok(Some(JsonRef::from_hash_bytes(hash)))
+        }
         other => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("tracked-state tree value has invalid snapshot codec byte {other}"),
+            format!("tracked-state tree value has invalid {field} presence byte {other}"),
         )),
     }
 }
@@ -424,16 +378,6 @@ fn level_salt(level: usize) -> u64 {
     value ^ (value >> 31)
 }
 
-fn push_optional_string(out: &mut Vec<u8>, value: Option<&str>) {
-    match value {
-        Some(value) => {
-            out.push(1);
-            push_sized_bytes(out, value.as_bytes());
-        }
-        None => out.push(0),
-    }
-}
-
 fn push_entity_identity(out: &mut Vec<u8>, identity: &EntityIdentity) {
     assert!(
         !identity.parts.is_empty(),
@@ -508,21 +452,6 @@ fn read_entity_identity(bytes: &[u8], cursor: &mut usize) -> Result<EntityIdenti
         ));
     }
     Ok(EntityIdentity { parts })
-}
-
-fn read_optional_string(
-    bytes: &[u8],
-    cursor: &mut usize,
-    field_name: &str,
-) -> Result<Option<String>, LixError> {
-    match read_u8(bytes, cursor, field_name)? {
-        0 => Ok(None),
-        1 => read_sized_string(bytes, cursor, field_name).map(Some),
-        other => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state tree optional field '{field_name}' has invalid tag {other}"),
-        )),
-    }
 }
 
 fn push_sized_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -629,7 +558,6 @@ fn read_u64(bytes: &[u8], cursor: &mut usize, field_name: &str) -> Result<u64, L
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn key_codec_distinguishes_null_and_value_file_id() {
@@ -734,8 +662,8 @@ mod tests {
     #[test]
     fn value_codec_roundtrips_tombstone_value() {
         let value = TrackedStateValue {
-            snapshot: StoredSnapshot::Missing,
-            metadata: Some(json!({})),
+            snapshot_ref: None,
+            metadata_ref: Some(JsonRef::from_hash_bytes([1; 32])),
             schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
@@ -751,12 +679,8 @@ mod tests {
     #[test]
     fn value_codec_roundtrips_snapshot_ref() {
         let value = TrackedStateValue {
-            snapshot: StoredSnapshot::Ref(SnapshotRef {
-                codec: SnapshotCodec::Zstd,
-                hash_hex: "abc123".to_string(),
-                uncompressed_len: 2048,
-            }),
-            metadata: None,
+            snapshot_ref: Some(JsonRef::from_hash_bytes([2; 32])),
+            metadata_ref: None,
             schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
@@ -773,8 +697,8 @@ mod tests {
     fn encoded_value_len_matches_encoded_value_bytes() {
         let values = [
             TrackedStateValue {
-                snapshot: StoredSnapshot::Missing,
-                metadata: None,
+                snapshot_ref: None,
+                metadata_ref: None,
                 schema_version: "1".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
@@ -783,8 +707,8 @@ mod tests {
                 deleted: true,
             },
             TrackedStateValue {
-                snapshot: StoredSnapshot::Inline("{\"value\":\"inline\"}".to_string()),
-                metadata: Some(json!({})),
+                snapshot_ref: Some(JsonRef::from_hash_bytes([3; 32])),
+                metadata_ref: Some(JsonRef::from_hash_bytes([4; 32])),
                 schema_version: "1".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
@@ -793,12 +717,8 @@ mod tests {
                 deleted: false,
             },
             TrackedStateValue {
-                snapshot: StoredSnapshot::Ref(SnapshotRef {
-                    codec: SnapshotCodec::Raw,
-                    hash_hex: "abc123".to_string(),
-                    uncompressed_len: 12,
-                }),
-                metadata: None,
+                snapshot_ref: Some(JsonRef::from_hash_bytes([5; 32])),
+                metadata_ref: None,
                 schema_version: "1".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-02T00:00:00Z".to_string(),

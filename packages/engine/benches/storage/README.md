@@ -39,12 +39,6 @@ Storage accounting report:
 cargo test -p lix_engine --features storage-benches storage_accounting -- --ignored --nocapture
 ```
 
-Max inline encoded value accounting:
-
-```bash
-cargo test -p lix_engine --features storage-benches max_inline_encoded_value_accounting -- --ignored --nocapture
-```
-
 ## Benchmarks
 
 The checked-in baseline size is stable: `10k` logical rows or blobs, with
@@ -128,8 +122,6 @@ Additional high-signal variants are registered for:
 - scan selectivity: `1pct`, `10pct`, `100pct`
 - projection-aware scans: file-selective header scans that omit
   `snapshot_content`, including `1KiB` out-of-line snapshot variants
-- max inline encoded value variants for `1KiB` payload write and file-scan
-  workloads
 - point-read scaling: `100` point reads over `1k`, `10k`, and `100k` rows
 - update shape: update/overwrite `10pct`, update/overwrite all, append or insert new keys
 - prolly-style tracked-state cases: single-row update in `10k`/`100k` roots,

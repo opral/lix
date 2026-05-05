@@ -2105,7 +2105,10 @@ mod tests {
             .expect("row should load")
             .expect("row should exist");
         assert_eq!(loaded.change_id, "change-new");
-        assert_eq!(loaded.inline_snapshot_content(), Some("{\"v\":2}"));
+        assert_eq!(
+            loaded.snapshot_ref,
+            Some(crate::json_store::JsonRef::from_hash_bytes([2; 32]))
+        );
     }
 
     #[tokio::test]
@@ -2633,15 +2636,15 @@ mod tests {
     }
 
     fn value(change_id: &str, snapshot_content: Option<&str>) -> TrackedStateValue {
+        let snapshot_ref = match snapshot_content {
+            Some("{\"v\":1}") => Some(crate::json_store::JsonRef::from_hash_bytes([1; 32])),
+            Some("{\"v\":2}") => Some(crate::json_store::JsonRef::from_hash_bytes([2; 32])),
+            Some(_) => Some(crate::json_store::JsonRef::from_hash_bytes([3; 32])),
+            None => None,
+        };
         TrackedStateValue {
-            snapshot: snapshot_content
-                .map(|snapshot_content| {
-                    crate::tracked_state::tree_types::StoredSnapshot::Inline(
-                        snapshot_content.to_string(),
-                    )
-                })
-                .unwrap_or(crate::tracked_state::tree_types::StoredSnapshot::Missing),
-            metadata: None,
+            snapshot_ref,
+            metadata_ref: None,
             schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),

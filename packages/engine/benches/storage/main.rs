@@ -60,6 +60,7 @@ fn storage_benches(c: &mut Criterion) {
 
     storage_api::bench(c, &runtime, args);
     tracked_state::bench(c, &runtime, args);
+    tracked_state::bench_fast(c, &runtime, args);
     untracked_state::bench(c, &runtime, args);
     changelog::bench(c, &runtime, args);
     binary_cas::bench(c, &runtime, args);
