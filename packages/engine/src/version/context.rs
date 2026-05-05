@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use crate::storage::{StorageReader, StorageWriter};
-use crate::untracked_state::UntrackedStateContext;
+use crate::json_store::JsonStoreWriter;
+use crate::storage::{StorageReader, StorageWriteSet};
+use crate::untracked_state::{UntrackedStateContext, UntrackedStateRow};
 
-use super::refs::VersionRefContext;
+use super::refs::{canonical_version_ref_row, VersionRefContext};
 use super::VersionRefReader;
 
 /// Aggregate entrypoint for version-domain services.
@@ -30,20 +31,21 @@ impl VersionContext {
         self.refs.reader(store)
     }
 
-    /// Advances a version ref in a caller-provided KV writer.
-    pub(crate) async fn advance_ref<S>(
+    pub(crate) fn canonical_ref_row(
         &self,
-        store: S,
+        json_writer: &mut JsonStoreWriter<'_>,
         version_id: &str,
         commit_id: &str,
         timestamp: &str,
-    ) -> Result<(), crate::LixError>
-    where
-        S: StorageWriter,
-    {
-        self.refs
-            .writer(store)
-            .advance_head(version_id, commit_id, timestamp)
-            .await
+    ) -> Result<UntrackedStateRow, crate::LixError> {
+        canonical_version_ref_row(json_writer, version_id, commit_id, timestamp)
+    }
+
+    pub(crate) fn stage_canonical_ref_rows(
+        &self,
+        writes: &mut StorageWriteSet,
+        rows: &[UntrackedStateRow],
+    ) -> Result<(), crate::LixError> {
+        self.refs.writer(writes).write_rows(rows)
     }
 }

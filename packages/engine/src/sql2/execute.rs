@@ -677,6 +677,7 @@ mod tests {
     use crate::storage::{
         KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch,
         KvValuePage, StorageContext, StorageReadScope, StorageReadTransaction, StorageReader,
+        StorageWriteSet,
     };
     use crate::tracked_state::TrackedStateContext;
     use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
@@ -2889,22 +2890,26 @@ mod tests {
             let version_ctx = crate::version::VersionContext::new(Arc::new(
                 crate::untracked_state::UntrackedStateContext::new(),
             ));
-            version_ctx
-                .advance_ref(
-                    transaction.as_mut(),
-                    "version-a",
-                    &init_receipt.initial_commit_id,
-                    "1970-01-01T00:00:00.000Z",
-                )
-                .await?;
-            version_ctx
-                .advance_ref(
-                    transaction.as_mut(),
-                    "version-b",
-                    &init_receipt.initial_commit_id,
-                    "1970-01-01T00:00:00.000Z",
-                )
-                .await?;
+            let mut writes = StorageWriteSet::new();
+            let canonical_rows = {
+                let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+                vec![
+                    version_ctx.canonical_ref_row(
+                        &mut json_writer,
+                        "version-a",
+                        &init_receipt.initial_commit_id,
+                        "1970-01-01T00:00:00.000Z",
+                    )?,
+                    version_ctx.canonical_ref_row(
+                        &mut json_writer,
+                        "version-b",
+                        &init_receipt.initial_commit_id,
+                        "1970-01-01T00:00:00.000Z",
+                    )?,
+                ]
+            };
+            version_ctx.stage_canonical_ref_rows(&mut writes, &canonical_rows)?;
+            writes.apply(&mut transaction.as_mut()).await?;
             transaction.commit().await?;
         }
         let engine = Engine::new(Box::new(backend.clone())).await?;

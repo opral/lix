@@ -1,7 +1,7 @@
-use crate::storage::{StorageReader, StorageWriter};
+use crate::storage::{StorageReader, StorageWriteSet};
 use crate::untracked_state::{
-    MaterializedUntrackedStateRow, UntrackedStateIdentity, UntrackedStateRowRequest,
-    UntrackedStateScanRequest,
+    MaterializedUntrackedStateRow, UntrackedStateIdentity, UntrackedStateRow,
+    UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
 use crate::LixError;
 
@@ -28,15 +28,12 @@ impl UntrackedStateContext {
         UntrackedStateStoreReader { store }
     }
 
-    /// Creates a writer over a caller-provided KV writer.
+    /// Creates a writer over a transaction-local storage write set.
     ///
-    /// The context never opens its own transaction; caller-provided writer
-    /// ownership controls commit or rollback behavior.
-    pub(crate) fn writer<S>(&self, store: S) -> UntrackedStateWriter<S>
-    where
-        S: StorageWriter,
-    {
-        UntrackedStateWriter { store }
+    /// The context never opens its own transaction; the caller applies the
+    /// write set to choose the durable commit or rollback boundary.
+    pub(crate) fn writer<'a>(&self, writes: &'a mut StorageWriteSet) -> UntrackedStateWriter<'a> {
+        UntrackedStateWriter { writes }
     }
 }
 
@@ -64,31 +61,22 @@ where
     }
 }
 
-/// Untracked-state writer over a caller-provided KV writer.
-pub(crate) struct UntrackedStateWriter<S> {
-    store: S,
+/// Untracked-state writer over a transaction-local storage write set.
+pub(crate) struct UntrackedStateWriter<'a> {
+    writes: &'a mut StorageWriteSet,
 }
 
-impl<S> UntrackedStateWriter<S>
-where
-    S: StorageWriter,
-{
+impl UntrackedStateWriter<'_> {
     /// Writes the latest untracked rows for their identities.
     ///
-    /// A row with `snapshot_content = None` is treated as removal because
+    /// A row with `snapshot_ref = None` is treated as removal because
     /// untracked state keeps only the current local value, not tombstones.
-    pub(crate) async fn write_rows(
-        &mut self,
-        rows: &[MaterializedUntrackedStateRow],
-    ) -> Result<(), LixError> {
-        crate::untracked_state::storage::write_rows(&mut self.store, rows).await
+    pub(crate) fn write_rows(&mut self, rows: &[UntrackedStateRow]) -> Result<(), LixError> {
+        crate::untracked_state::storage::write_rows(self.writes, rows)
     }
 
     /// Removes untracked rows by exact identity.
-    pub(crate) async fn delete_rows(
-        &mut self,
-        identities: &[UntrackedStateIdentity],
-    ) -> Result<(), LixError> {
-        crate::untracked_state::storage::delete_rows(&mut self.store, identities).await
+    pub(crate) fn delete_rows(&mut self, identities: &[UntrackedStateIdentity]) {
+        crate::untracked_state::storage::delete_rows(self.writes, identities)
     }
 }

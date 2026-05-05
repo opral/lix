@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
+use crate::json_store::JsonStoreContext;
 use crate::storage::StorageContext;
+use crate::storage::StorageWriteSet;
 use crate::tracked_state::{TrackedStateContext, TrackedStateRow};
 use crate::untracked_state::UntrackedStateContext;
 use crate::version::VersionContext;
@@ -34,8 +36,19 @@ pub(crate) async fn seed_version_head_with_rows(
         .begin_write_transaction()
         .await
         .expect("seed transaction should open");
-    VersionContext::new(Arc::new(UntrackedStateContext::new()))
-        .advance_ref(transaction.as_mut(), version_id, commit_id, TEST_TIMESTAMP)
+    let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
+    let mut writes = StorageWriteSet::new();
+    let canonical_row = {
+        let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+        version_ctx
+            .canonical_ref_row(&mut json_writer, version_id, commit_id, TEST_TIMESTAMP)
+            .expect("version ref should canonicalize")
+    };
+    version_ctx
+        .stage_canonical_ref_rows(&mut writes, &[canonical_row])
+        .expect("version ref should stage");
+    writes
+        .apply(&mut transaction.as_mut())
         .await
         .expect("version ref should write");
     TrackedStateContext::new()

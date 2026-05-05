@@ -4,10 +4,11 @@ use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::entity_identity::EntityIdentity;
-use crate::storage::{StorageReader, StorageWriter};
+use crate::json_store::JsonStoreWriter;
+use crate::storage::{StorageReader, StorageWriteSet};
 use crate::untracked_state::{
-    MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter,
-    UntrackedStateRowRequest, UntrackedStateScanRequest, UntrackedStateWriter,
+    canonicalize_materialized_row, MaterializedUntrackedStateRow, UntrackedStateContext,
+    UntrackedStateFilter, UntrackedStateRow, UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
 use crate::version::{VersionHead, VersionRefReader};
 use crate::version::{VERSION_REF_SCHEMA_KEY, VERSION_REF_SCHEMA_VERSION};
@@ -40,13 +41,11 @@ impl VersionRefContext {
         }
     }
 
-    /// Creates a version-ref writer over a caller-provided KV writer.
-    pub(super) fn writer<S>(&self, store: S) -> VersionRefWriter<S>
-    where
-        S: StorageWriter,
-    {
+    /// Creates a version-ref writer over a transaction-local storage write set.
+    pub(super) fn writer<'a>(&self, writes: &'a mut StorageWriteSet) -> VersionRefWriter<'a> {
         VersionRefWriter {
-            untracked_state_writer: self.untracked_state.writer(store),
+            untracked_state: Arc::clone(&self.untracked_state),
+            writes,
         }
     }
 }
@@ -141,30 +140,25 @@ where
 }
 
 /// Write side for moving version heads.
-pub(super) struct VersionRefWriter<S>
-where
-    S: StorageWriter,
-{
-    untracked_state_writer: UntrackedStateWriter<S>,
+pub(super) struct VersionRefWriter<'a> {
+    untracked_state: Arc<UntrackedStateContext>,
+    writes: &'a mut StorageWriteSet,
 }
 
-impl<S> VersionRefWriter<S>
-where
-    S: StorageWriter,
-{
-    /// Advances a version ref to `commit_id`.
-    ///
-    /// The row is untracked by design: refs are mutable local pointers over the
-    /// changelog, not changelog facts themselves.
-    pub(crate) async fn advance_head(
-        &mut self,
-        version_id: &str,
-        commit_id: &str,
-        timestamp: &str,
-    ) -> Result<(), LixError> {
-        let row = version_ref_row(version_id, commit_id, timestamp)?;
-        self.untracked_state_writer.write_rows(&[row]).await
+impl VersionRefWriter<'_> {
+    pub(crate) fn write_rows(&mut self, rows: &[UntrackedStateRow]) -> Result<(), LixError> {
+        self.untracked_state.writer(self.writes).write_rows(rows)
     }
+}
+
+pub(super) fn canonical_version_ref_row(
+    json_writer: &mut JsonStoreWriter<'_>,
+    version_id: &str,
+    commit_id: &str,
+    timestamp: &str,
+) -> Result<UntrackedStateRow, LixError> {
+    let row = version_ref_row(version_id, commit_id, timestamp)?;
+    canonicalize_materialized_row(json_writer, &row)
 }
 
 fn decode_version_head(
@@ -231,8 +225,11 @@ mod tests {
     use std::sync::Arc;
 
     use crate::backend::testing::UnitTestBackend;
-    use crate::storage::StorageContext;
-    use crate::untracked_state::{UntrackedStateContext, UntrackedStateRowRequest};
+    use crate::json_store::JsonStoreContext;
+    use crate::storage::{StorageContext, StorageWriteSet};
+    use crate::untracked_state::{
+        canonicalize_materialized_row, UntrackedStateContext, UntrackedStateRowRequest,
+    };
 
     use super::*;
 
@@ -259,11 +256,19 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        version_ref
-            .writer(transaction.as_mut())
-            .advance_head("version-a", "commit-a", "2026-01-01T00:00:00Z")
+        let mut writes = StorageWriteSet::new();
+        stage_version_head(
+            &version_ref,
+            &mut writes,
+            "version-a",
+            "commit-a",
+            "2026-01-01T00:00:00Z",
+        )
+        .expect("version head should advance");
+        writes
+            .apply(&mut transaction.as_mut())
             .await
-            .expect("version head should advance");
+            .expect("version head should apply");
         transaction
             .commit()
             .await
@@ -303,16 +308,27 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        version_ref
-            .writer(transaction.as_mut())
-            .advance_head("version-b", "commit-b", "2026-01-01T00:00:00Z")
+        let mut writes = StorageWriteSet::new();
+        stage_version_head(
+            &version_ref,
+            &mut writes,
+            "version-b",
+            "commit-b",
+            "2026-01-01T00:00:00Z",
+        )
+        .expect("version-b should advance");
+        stage_version_head(
+            &version_ref,
+            &mut writes,
+            "version-a",
+            "commit-a",
+            "2026-01-01T00:00:00Z",
+        )
+        .expect("version-a should advance");
+        writes
+            .apply(&mut transaction.as_mut())
             .await
-            .expect("version-b should advance");
-        version_ref
-            .writer(transaction.as_mut())
-            .advance_head("version-a", "commit-a", "2026-01-01T00:00:00Z")
-            .await
-            .expect("version-a should advance");
+            .expect("version heads should apply");
         transaction
             .commit()
             .await
@@ -351,11 +367,20 @@ mod tests {
         let mut row = version_ref_row("version-b", "commit-b", "2026-01-01T00:00:00Z")
             .expect("version-ref row should plan");
         row.snapshot_content = Some("{not-json".to_string());
+        let mut writes = StorageWriteSet::new();
+        let canonical_row = {
+            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            canonicalize_materialized_row(&mut json_writer, &row)
+                .expect("malformed row should canonicalize for test setup")
+        };
         untracked_state
-            .writer(transaction.as_mut())
-            .write_rows(&[row])
-            .await
+            .writer(&mut writes)
+            .write_rows(&[canonical_row])
             .expect("malformed row should write for test setup");
+        writes
+            .apply(&mut transaction.as_mut())
+            .await
+            .expect("malformed row should apply for test setup");
         transaction
             .commit()
             .await
@@ -377,5 +402,19 @@ mod tests {
 
     fn test_version_ref() -> VersionRefContext {
         VersionRefContext::new(Arc::new(UntrackedStateContext::new()))
+    }
+
+    fn stage_version_head(
+        version_ref: &VersionRefContext,
+        writes: &mut StorageWriteSet,
+        version_id: &str,
+        commit_id: &str,
+        timestamp: &str,
+    ) -> Result<(), LixError> {
+        let canonical_row = {
+            let mut json_writer = JsonStoreContext::new().writer(writes);
+            canonical_version_ref_row(&mut json_writer, version_id, commit_id, timestamp)?
+        };
+        version_ref.writer(writes).write_rows(&[canonical_row])
     }
 }

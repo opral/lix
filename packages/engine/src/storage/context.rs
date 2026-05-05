@@ -242,7 +242,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::backend::testing::UnitTestBackend;
-    use crate::storage::{KvGetGroup, KvScanRange, KvWriteBatch};
+    use crate::storage::{KvGetGroup, KvScanRange, KvWriteBatch, StorageWriteSet};
 
     use super::*;
 
@@ -311,6 +311,45 @@ mod tests {
             .await
             .expect("key-only scan reads");
         assert_eq!(key_only.keys.iter().collect::<Vec<_>>(), vec![b"a", b"b"]);
+        tx.rollback().await.expect("rollback succeeds");
+    }
+
+    #[tokio::test]
+    async fn storage_write_set_applies_as_one_batch() {
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend);
+        let mut tx = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction opens");
+
+        let mut writes = StorageWriteSet::new();
+        assert!(writes.is_empty());
+        writes.put("ns", b"a".to_vec(), b"1".to_vec());
+        writes.put("ns", b"b".to_vec(), b"2".to_vec());
+        writes.delete("ns", b"missing".to_vec());
+        assert!(!writes.is_empty());
+
+        let stats = writes.apply(tx.as_mut()).await.expect("write set applies");
+        assert_eq!(stats.puts, 2);
+        assert_eq!(stats.deletes, 1);
+        tx.commit().await.expect("commit succeeds");
+
+        let mut tx = storage
+            .begin_read_transaction()
+            .await
+            .expect("read transaction opens");
+        let result = tx
+            .get_values(KvGetRequest {
+                groups: vec![KvGetGroup {
+                    namespace: "ns".to_string(),
+                    keys: vec![b"a".to_vec(), b"b".to_vec()],
+                }],
+            })
+            .await
+            .expect("batch reads");
+        assert_eq!(result.groups[0].value(0), Some(Some(&b"1"[..])));
+        assert_eq!(result.groups[0].value(1), Some(Some(&b"2"[..])));
         tx.rollback().await.expect("rollback succeeds");
     }
 }

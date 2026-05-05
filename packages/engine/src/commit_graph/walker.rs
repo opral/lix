@@ -228,7 +228,7 @@ mod tests {
     };
     use crate::commit_graph::CommitGraphContext;
     use crate::json_store::JsonStoreContext;
-    use crate::storage::StorageContext;
+    use crate::storage::{StorageContext, StorageWriteSet};
     use crate::LixError;
 
     #[tokio::test]
@@ -730,21 +730,23 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        let mut json_writer = JsonStoreContext::new().writer();
-        let canonical_changes = changes
-            .iter()
-            .map(|change| canonicalize_materialized_change(&mut json_writer, change))
-            .collect::<Result<Vec<_>, _>>()
-            .expect("changes should canonicalize");
-        json_writer
-            .flush(&mut tx.as_mut())
-            .await
-            .expect("json should flush");
+        let mut writes = StorageWriteSet::new();
+        let canonical_changes = {
+            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            changes
+                .iter()
+                .map(|change| canonicalize_materialized_change(&mut json_writer, change))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("changes should canonicalize")
+        };
         changelog
-            .writer(tx.as_mut())
+            .writer(&mut writes)
             .append_changes(&canonical_changes)
-            .await
             .expect("append should succeed");
+        writes
+            .apply(&mut tx.as_mut())
+            .await
+            .expect("writes should apply");
         tx.commit().await.expect("commit should succeed");
     }
 

@@ -4,7 +4,7 @@ use crate::binary_cas::BinaryCasContext;
 use crate::changelog::{CanonicalChange, ChangelogContext};
 use crate::json_store::{JsonRef, JsonStoreContext, JsonStoreWriter};
 use crate::live_state::{LiveStateContext, LiveStateRow};
-use crate::storage::{StorageReader, StorageWriter};
+use crate::storage::{StorageReader, StorageWriteSet, StorageWriter};
 use crate::transaction::staging::StagedWriteSet;
 use crate::transaction::types::{StagedAdoptedStateRow, StagedCommitMembers, StagedStateRow};
 use crate::version::{VersionContext, VersionRefReader};
@@ -27,11 +27,12 @@ pub(crate) async fn commit_staged_writes(
     staged_writes: StagedWriteSet,
 ) -> Result<(), LixError> {
     if !staged_writes.file_data_writes.is_empty() {
-        let mut blob_writer = binary_cas.writer();
+        let mut writes = StorageWriteSet::new();
+        let mut blob_writer = binary_cas.writer(&mut writes);
         for write in &staged_writes.file_data_writes {
             blob_writer.stage_bytes(&write.data)?;
         }
-        blob_writer.flush(transaction).await?;
+        writes.apply(transaction).await?;
     }
 
     let (mut changelog_rows, untracked_rows): (Vec<_>, Vec<_>) = staged_writes
@@ -58,17 +59,16 @@ pub(crate) async fn commit_staged_writes(
     }
 
     if !changelog_rows.is_empty() {
-        let mut json_writer = JsonStoreContext::new().writer();
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer(&mut writes);
         let canonical_changes =
             new_canonical_changes(changelog, transaction, &mut json_writer, &changelog_rows)
                 .await?;
         {
-            json_writer.flush(transaction).await?;
+            let mut writer = changelog.writer(&mut writes);
+            writer.append_changes(&canonical_changes)?;
         }
-        {
-            let mut writer = changelog.writer(&mut *transaction);
-            writer.append_changes(&canonical_changes).await?;
-        }
+        writes.apply(transaction).await?;
     }
     if !adopted_rows.is_empty() {
         validate_adopted_canonical_changes(changelog, transaction, &adopted_rows).await?;
@@ -90,14 +90,18 @@ pub(crate) async fn commit_staged_writes(
     }
 
     for version_head in version_heads {
-        version_ctx
-            .advance_ref(
-                &mut *transaction,
+        let mut writes = StorageWriteSet::new();
+        let canonical_row = {
+            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            version_ctx.canonical_ref_row(
+                &mut json_writer,
                 &version_head.version_id,
                 &version_head.commit_id,
                 &version_head.timestamp,
-            )
-            .await?;
+            )?
+        };
+        version_ctx.stage_canonical_ref_rows(&mut writes, &[canonical_row])?;
+        writes.apply(transaction).await?;
     }
     Ok(())
 }
@@ -105,7 +109,7 @@ pub(crate) async fn commit_staged_writes(
 async fn new_canonical_changes(
     changelog: &ChangelogContext,
     transaction: &mut (impl StorageReader + StorageWriter + ?Sized),
-    json_writer: &mut JsonStoreWriter,
+    json_writer: &mut JsonStoreWriter<'_>,
     rows: &[StagedStateRow],
 ) -> Result<Vec<CanonicalChange>, LixError> {
     let reader = changelog.reader(&mut *transaction);
@@ -139,7 +143,8 @@ async fn validate_adopted_canonical_changes(
     transaction: &mut (impl StorageReader + StorageWriter + ?Sized),
     rows: &[StagedAdoptedStateRow],
 ) -> Result<(), LixError> {
-    let mut json_writer = JsonStoreContext::new().writer();
+    let mut writes = StorageWriteSet::new();
+    let mut json_writer = JsonStoreContext::new().writer(&mut writes);
     let reader = changelog.reader(&mut *transaction);
     for row in rows {
         let expected = canonical_change_from_adopted_row(&mut json_writer, row)?;
@@ -173,7 +178,7 @@ async fn validate_adopted_canonical_changes(
 }
 
 fn canonical_change_from_staged_row(
-    json_writer: &mut JsonStoreWriter,
+    json_writer: &mut JsonStoreWriter<'_>,
     row: &StagedStateRow,
 ) -> Result<CanonicalChange, LixError> {
     let Some(change_id) = row.change_id.as_ref() else {
@@ -196,7 +201,7 @@ fn canonical_change_from_staged_row(
 }
 
 fn stage_optional_json(
-    json_writer: &mut JsonStoreWriter,
+    json_writer: &mut JsonStoreWriter<'_>,
     value: Option<&str>,
 ) -> Result<Option<JsonRef>, LixError> {
     let Some(value) = value else {
@@ -206,7 +211,7 @@ fn stage_optional_json(
 }
 
 fn stage_optional_metadata(
-    json_writer: &mut JsonStoreWriter,
+    json_writer: &mut JsonStoreWriter<'_>,
     value: Option<&RowMetadata>,
 ) -> Result<Option<JsonRef>, LixError> {
     let Some(value) = value else {
@@ -217,7 +222,7 @@ fn stage_optional_metadata(
 }
 
 fn canonical_change_from_adopted_row(
-    json_writer: &mut JsonStoreWriter,
+    json_writer: &mut JsonStoreWriter<'_>,
     row: &StagedAdoptedStateRow,
 ) -> Result<CanonicalChange, LixError> {
     Ok(CanonicalChange {
@@ -359,7 +364,8 @@ mod tests {
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
     use crate::storage::StorageContext;
     use crate::untracked_state::{
-        MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateRowRequest,
+        canonicalize_materialized_row, MaterializedUntrackedStateRow, UntrackedStateContext,
+        UntrackedStateRowRequest,
     };
     use crate::version::VersionContext;
     use crate::NullableKeyFilter;
@@ -515,13 +521,23 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("seed transaction should open");
+        let mut writes = StorageWriteSet::new();
+        let canonical_row = {
+            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            canonicalize_materialized_row(
+                &mut json_writer,
+                &MaterializedUntrackedStateRow::from(untracked_global_row("change-untracked")),
+            )
+            .expect("untracked seed should canonicalize")
+        };
         untracked_state
-            .writer(seed_transaction.as_mut())
-            .write_rows(&[MaterializedUntrackedStateRow::from(untracked_global_row(
-                "change-untracked",
-            ))])
-            .await
+            .writer(&mut writes)
+            .write_rows(&[canonical_row])
             .expect("untracked seed should write");
+        writes
+            .apply(&mut seed_transaction.as_mut())
+            .await
+            .expect("untracked seed should apply");
         seed_transaction
             .commit()
             .await

@@ -1,9 +1,7 @@
 use crate::json_store::compression::{compress_json_payload, decode_json_zstd_payload};
 use crate::json_store::encoded::{EncodedJson, JsonCodec};
 use crate::json_store::types::JsonRef;
-use crate::storage::{
-    KvGetGroup, KvGetRequest, KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
-};
+use crate::storage::{KvGetGroup, KvGetRequest, StorageReader};
 use crate::LixError;
 use std::borrow::Cow;
 
@@ -59,15 +57,6 @@ fn encode_json_for_storage_with_ref(
     })
 }
 
-pub(crate) async fn persist_json_bytes(
-    writer: &mut (impl StorageWriter + ?Sized),
-    bytes: &[u8],
-) -> Result<JsonRef, LixError> {
-    let (json_ref, stored_payload) = encode_json_bytes_for_storage(bytes)?;
-    persist_stored_json_payload(writer, &json_ref, &stored_payload).await?;
-    Ok(json_ref)
-}
-
 pub(crate) fn encode_json_bytes_for_storage(bytes: &[u8]) -> Result<(JsonRef, Vec<u8>), LixError> {
     let json = std::str::from_utf8(bytes).map_err(|error| {
         LixError::new(
@@ -86,31 +75,6 @@ pub(crate) fn encode_json_str_for_storage_with_ref(
     let encoded_json = encode_json_for_storage_with_ref(json, json_ref)?;
     let json_ref = encoded_json.json_ref.clone();
     Ok((json_ref, encode_stored_json_payload(&encoded_json)))
-}
-
-async fn persist_encoded_json(
-    writer: &mut (impl StorageWriter + ?Sized),
-    encoded_json: &EncodedJson<'_>,
-) -> Result<(), LixError> {
-    let stored_payload = encode_stored_json_payload(encoded_json);
-    persist_stored_json_payload(writer, &encoded_json.json_ref, &stored_payload).await
-}
-
-pub(crate) async fn persist_stored_json_payload(
-    writer: &mut (impl StorageWriter + ?Sized),
-    json_ref: &JsonRef,
-    stored_payload: &[u8],
-) -> Result<(), LixError> {
-    writer
-        .write_kv_batch(KvWriteBatch {
-            groups: {
-                let mut group = KvWriteGroup::new(JSON_NAMESPACE);
-                group.put(json_ref.as_hash_bytes(), stored_payload);
-                vec![group]
-            },
-        })
-        .await?;
-    Ok(())
 }
 
 pub(crate) async fn load_json_bytes(
@@ -233,7 +197,7 @@ mod tests {
 
     use super::*;
     use crate::backend::testing::UnitTestBackend;
-    use crate::storage::StorageContext;
+    use crate::storage::{StorageContext, StorageWriteSet};
 
     #[tokio::test]
     async fn json_roundtrips_raw_payload() {
@@ -246,7 +210,14 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        persist_encoded_json(&mut transaction.as_mut(), &encoded)
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            JSON_NAMESPACE,
+            encoded.json_ref.as_hash_bytes().to_vec(),
+            encode_stored_json_payload(&encoded),
+        );
+        writes
+            .apply(&mut transaction.as_mut())
             .await
             .expect("json should store");
         transaction

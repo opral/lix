@@ -5,7 +5,7 @@ use crate::tracked_state::TrackedStateRow;
 use crate::{serialize_row_metadata, validate_row_metadata, LixError, RowMetadata};
 
 pub(crate) fn canonicalize_materialized_row(
-    json_writer: &mut JsonStoreWriter,
+    json_writer: &mut JsonStoreWriter<'_>,
     row: &TrackedStateRow,
 ) -> Result<TrackedStateValue, LixError> {
     let snapshot_ref = stage_optional_json(json_writer, row.snapshot_content.as_deref())?;
@@ -65,7 +65,7 @@ impl TrackedMaterializationProjection {
 }
 
 fn stage_optional_json(
-    json_writer: &mut JsonStoreWriter,
+    json_writer: &mut JsonStoreWriter<'_>,
     value: Option<&str>,
 ) -> Result<Option<JsonRef>, LixError> {
     let Some(value) = value else {
@@ -75,7 +75,7 @@ fn stage_optional_json(
 }
 
 fn stage_optional_metadata(
-    json_writer: &mut JsonStoreWriter,
+    json_writer: &mut JsonStoreWriter<'_>,
     value: Option<&RowMetadata>,
 ) -> Result<Option<JsonRef>, LixError> {
     let Some(value) = value else {

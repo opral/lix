@@ -7,5 +7,6 @@ pub(crate) use read_scope::{ScopedStorageReader, StorageReadScope};
 pub(crate) use types::{
     KvEntryPage, KvExistsBatch, KvExistsGroup, KvGetGroup, KvGetRequest, KvKeyPage, KvScanRange,
     KvScanRequest, KvValueBatch, KvValueGroup, KvValuePage, KvWriteBatch, KvWriteGroup,
-    KvWriteStats, StorageReadTransaction, StorageReader, StorageWriteTransaction, StorageWriter,
+    KvWriteStats, StorageReadTransaction, StorageReader, StorageWriteSet, StorageWriteTransaction,
+    StorageWriter,
 };

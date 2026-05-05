@@ -1,6 +1,6 @@
 use crate::commit_graph::CommitGraphContext;
 use crate::json_store::JsonStoreContext;
-use crate::storage::{StorageReader, StorageWriter};
+use crate::storage::{StorageReader, StorageWriteSet, StorageWriter};
 use crate::tracked_state::by_file_index::ByFileIndex;
 use crate::tracked_state::diff::{diff_commits, TrackedStateDiff, TrackedStateDiffRequest};
 use crate::tracked_state::materialize_value;
@@ -345,7 +345,8 @@ where
         };
         let mut stored_rows = Vec::with_capacity(rows.len());
         let mut mutations = Vec::with_capacity(rows.len());
-        let mut json_writer = JsonStoreContext::new().writer();
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer(&mut writes);
         for row in rows {
             let stored_value =
                 crate::tracked_state::canonicalize_materialized_row(&mut json_writer, row)?;
@@ -355,7 +356,7 @@ where
             ));
             stored_rows.push((row, stored_value));
         }
-        json_writer.flush(&mut self.store).await?;
+        writes.apply(&mut self.store).await?;
         let result = self
             .tree
             .apply_mutations(

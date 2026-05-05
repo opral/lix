@@ -10,7 +10,7 @@ use crate::live_state::{LiveStateContext, LiveStateRow};
 use crate::schema::{
     registered_schema_entity_id, schema_key_from_definition, seed_schema_definitions,
 };
-use crate::storage::StorageContext;
+use crate::storage::{StorageContext, StorageWriteSet};
 use crate::untracked_state::MaterializedUntrackedStateRow;
 use crate::version::{
     VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_DESCRIPTOR_SCHEMA_VERSION, VERSION_REF_SCHEMA_KEY,
@@ -186,15 +186,16 @@ pub(crate) async fn initialize(
     let mut transaction = storage.begin_write_transaction().await?;
 
     {
-        let mut json_writer = JsonStoreContext::new().writer();
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer(&mut writes);
         let canonical_changes = plan
             .changes
             .iter()
             .map(|change| canonicalize_materialized_change(&mut json_writer, change))
             .collect::<Result<Vec<_>, _>>()?;
-        json_writer.flush(&mut transaction.as_mut()).await?;
-        let mut writer = changelog.writer(transaction.as_mut());
-        writer.append_changes(&canonical_changes).await?;
+        let mut writer = changelog.writer(&mut writes);
+        writer.append_changes(&canonical_changes)?;
+        writes.apply(&mut transaction.as_mut()).await?;
     }
 
     let mut live_rows = plan
