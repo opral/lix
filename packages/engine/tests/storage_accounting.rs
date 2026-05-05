@@ -48,6 +48,8 @@ struct AccountingSnapshot {
     json_chunk_value_bytes: usize,
     changelog_entries: usize,
     changelog_value_bytes: usize,
+    untracked_entries: usize,
+    untracked_value_bytes: usize,
 }
 
 impl AccountingSnapshot {
@@ -102,6 +104,12 @@ impl AccountingSnapshot {
             changelog_value_bytes: self
                 .changelog_value_bytes
                 .saturating_sub(before.changelog_value_bytes),
+            untracked_entries: self
+                .untracked_entries
+                .saturating_sub(before.untracked_entries),
+            untracked_value_bytes: self
+                .untracked_value_bytes
+                .saturating_sub(before.untracked_value_bytes),
         }
     }
 }
@@ -143,6 +151,15 @@ enum ChangelogAccountingWorkload {
     Tombstones { rows: usize },
     Metadata1k { rows: usize },
     CompositeEntityIds { rows: usize },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UntrackedAccountingWorkload {
+    WriteRows {
+        label: &'static str,
+        rows: usize,
+        payload_bytes: usize,
+    },
 }
 
 #[tokio::test]
@@ -353,6 +370,62 @@ async fn changelog_accounting() {
     }
 }
 
+#[tokio::test]
+#[ignore = "prints deterministic untracked_state storage accounting table"]
+async fn untracked_state_accounting() {
+    let workloads = [
+        UntrackedAccountingWorkload::WriteRows {
+            label: "write_rows_payload_small",
+            rows: 10_000,
+            payload_bytes: 0,
+        },
+        UntrackedAccountingWorkload::WriteRows {
+            label: "write_rows_payload_1k",
+            rows: 10_000,
+            payload_bytes: 1024,
+        },
+        UntrackedAccountingWorkload::WriteRows {
+            label: "write_rows_payload_16k",
+            rows: 1_000,
+            payload_bytes: 16 * 1024,
+        },
+        UntrackedAccountingWorkload::WriteRows {
+            label: "write_rows_payload_128k",
+            rows: 100,
+            payload_bytes: 128 * 1024,
+        },
+    ];
+
+    println!(
+        "{:<31} {:>7} {:>8} {:>12} {:>12} {:>10} {:>11} {:>13}",
+        "workload",
+        "rows",
+        "entries",
+        "value_bytes",
+        "total_bytes",
+        "bytes/row",
+        "rows_ns",
+        "row_bytes"
+    );
+
+    for workload in workloads {
+        let row = run_untracked_workload(workload)
+            .await
+            .expect("untracked_state accounting workload should run");
+        println!(
+            "{:<31} {:>7} {:>8} {:>12} {:>12} {:>10} {:>11} {:>13}",
+            untracked_workload_label(workload),
+            row.rows,
+            row.snapshot.entries,
+            row.snapshot.value_bytes,
+            row.snapshot.total_bytes(),
+            row.snapshot.bytes_per_row(row.rows),
+            row.snapshot.untracked_entries,
+            row.snapshot.untracked_value_bytes,
+        );
+    }
+}
+
 struct AccountingRow {
     rows: usize,
     snapshot: AccountingSnapshot,
@@ -516,6 +589,21 @@ async fn run_changelog_workload(
     })
 }
 
+async fn run_untracked_workload(
+    workload: UntrackedAccountingWorkload,
+) -> Result<AccountingRow, LixError> {
+    let accounting_backend = AccountingBackend::default();
+    let backend: Arc<dyn Backend + Send + Sync> = Arc::new(accounting_backend.clone());
+    let rows = untracked_workload_rows(workload);
+    let fixture =
+        storage_bench::prepare_untracked_state_write_rows(untracked_config_for(workload)).await?;
+    storage_bench::untracked_state_write_rows_prepared(&backend, &fixture).await?;
+    Ok(AccountingRow {
+        rows,
+        snapshot: accounting_backend.accounting()?,
+    })
+}
+
 fn config_for(workload: AccountingWorkload) -> StorageBenchConfig {
     StorageBenchConfig {
         rows: workload_rows(workload),
@@ -618,6 +706,33 @@ fn changelog_workload_label(workload: ChangelogAccountingWorkload) -> String {
     }
 }
 
+fn untracked_config_for(workload: UntrackedAccountingWorkload) -> StorageBenchConfig {
+    StorageBenchConfig {
+        rows: untracked_workload_rows(workload),
+        blob_bytes: 1024,
+        state_payload_bytes: match workload {
+            UntrackedAccountingWorkload::WriteRows { payload_bytes, .. } => payload_bytes,
+        },
+        key_pattern: StorageBenchKeyPattern::Sequential,
+        selectivity: StorageBenchSelectivity::Percent100,
+        update_fraction: StorageBenchUpdateFraction::Percent100,
+    }
+}
+
+fn untracked_workload_rows(workload: UntrackedAccountingWorkload) -> usize {
+    match workload {
+        UntrackedAccountingWorkload::WriteRows { rows, .. } => rows,
+    }
+}
+
+fn untracked_workload_label(workload: UntrackedAccountingWorkload) -> String {
+    match workload {
+        UntrackedAccountingWorkload::WriteRows { label, rows, .. } => {
+            format!("{label}/{}", row_label(rows))
+        }
+    }
+}
+
 fn json_workload_label(workload: JsonAccountingWorkload) -> String {
     match workload {
         JsonAccountingWorkload::Raw1k { rows } => {
@@ -693,6 +808,10 @@ impl AccountingBackend {
                 "changelog.change" => {
                     snapshot.changelog_entries += 1;
                     snapshot.changelog_value_bytes += value.len();
+                }
+                "untracked_state.row" => {
+                    snapshot.untracked_entries += 1;
+                    snapshot.untracked_value_bytes += value.len();
                 }
                 _ => {}
             }

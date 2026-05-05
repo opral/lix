@@ -1,7 +1,9 @@
 use crate::changelog::MaterializedCanonicalChange;
 use crate::entity_identity::EntityIdentity;
 use crate::tracked_state::TrackedStateRow;
-use crate::untracked_state::{UntrackedStateFilter, UntrackedStateRow, UntrackedStateRowRequest};
+use crate::untracked_state::{
+    MaterializedUntrackedStateRow, UntrackedStateFilter, UntrackedStateRowRequest,
+};
 use crate::{NullableKeyFilter, RowMetadata, Value};
 
 /// Durable row visible through live_state reads.
@@ -42,8 +44,8 @@ impl From<LiveStateRow> for MaterializedCanonicalChange {
     }
 }
 
-impl From<UntrackedStateRow> for LiveStateRow {
-    fn from(row: UntrackedStateRow) -> Self {
+impl From<MaterializedUntrackedStateRow> for LiveStateRow {
+    fn from(row: MaterializedUntrackedStateRow) -> Self {
         LiveStateRow {
             entity_id: row.entity_id,
             schema_key: row.schema_key,
@@ -100,9 +102,9 @@ impl TryFrom<&LiveStateRow> for TrackedStateRow {
     }
 }
 
-impl From<&LiveStateRow> for UntrackedStateRow {
+impl From<&LiveStateRow> for MaterializedUntrackedStateRow {
     fn from(row: &LiveStateRow) -> Self {
-        UntrackedStateRow {
+        MaterializedUntrackedStateRow {
             entity_id: row.entity_id.clone(),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
