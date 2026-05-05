@@ -9,13 +9,14 @@ use crate::changelog::ChangelogContext;
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
+use crate::json_store::JsonStoreContext;
 use crate::live_state::{
     LiveStateContext, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
 };
 use crate::schema_registry::SchemaRegistry;
 use crate::session::{SessionMode, WORKSPACE_VERSION_KEY};
 use crate::sql2::SqlWriteExecutionContext;
-use crate::storage::{StorageContext, StorageWriteTransaction};
+use crate::storage::{StorageContext, StorageWriteSet, StorageWriteTransaction};
 use crate::tracked_state::{TrackedStateContext, TrackedStateStoreReader};
 use crate::transaction::commit;
 use crate::transaction::live_state_overlay::overlay_scan_rows;
@@ -333,14 +334,22 @@ impl Transaction {
         commit_id: &str,
     ) -> Result<(), LixError> {
         let timestamp = self.functions.call_timestamp();
-        self.version_ctx
-            .advance_ref(
-                self.storage_transaction.as_mut(),
+        let mut writes = StorageWriteSet::new();
+        let canonical_row = {
+            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            self.version_ctx.canonical_ref_row(
+                &mut json_writer,
                 version_id,
                 commit_id,
                 &timestamp,
-            )
+            )?
+        };
+        self.version_ctx
+            .stage_canonical_ref_rows(&mut writes, &[canonical_row])?;
+        writes
+            .apply(&mut self.storage_transaction.as_mut())
             .await
+            .map(|_| ())
     }
 
     /// Returns the commit id currently staged for `version_id`, if tracked rows

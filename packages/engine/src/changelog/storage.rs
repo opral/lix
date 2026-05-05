@@ -1,10 +1,7 @@
 use crate::changelog::codec::{decode_change, encode_change};
 use crate::changelog::{CanonicalChange, ChangelogScanRequest};
 use crate::storage::KvScanRange;
-use crate::storage::{
-    KvGetGroup, KvGetRequest, KvScanRequest, KvWriteBatch, KvWriteGroup, StorageReader,
-    StorageWriter,
-};
+use crate::storage::{KvGetGroup, KvGetRequest, KvScanRequest, StorageReader, StorageWriteSet};
 use crate::LixError;
 
 const CHANGELOG_CHANGE_NAMESPACE: &str = "changelog.change";
@@ -48,19 +45,17 @@ pub(crate) async fn scan_changes(
     page.values.iter().map(decode_change).collect()
 }
 
-pub(crate) async fn append_changes(
-    writer: &mut (impl StorageWriter + ?Sized),
+pub(crate) fn append_changes(
+    writes: &mut StorageWriteSet,
     changes: &[CanonicalChange],
 ) -> Result<(), LixError> {
-    let mut group = KvWriteGroup::new(CHANGELOG_CHANGE_NAMESPACE);
     for change in changes {
-        group.put(encode_change_key(&change.id), encode_change(change)?);
+        writes.put(
+            CHANGELOG_CHANGE_NAMESPACE,
+            encode_change_key(&change.id),
+            encode_change(change)?,
+        );
     }
-    writer
-        .write_kv_batch(KvWriteBatch {
-            groups: vec![group],
-        })
-        .await?;
     Ok(())
 }
 
@@ -78,7 +73,7 @@ mod tests {
         ChangelogScanRequest, MaterializedCanonicalChange,
     };
     use crate::json_store::JsonStoreContext;
-    use crate::storage::{StorageContext, StorageWriteTransaction};
+    use crate::storage::{StorageContext, StorageWriteSet, StorageWriteTransaction};
 
     use super::*;
 
@@ -187,24 +182,21 @@ mod tests {
         tx: &mut Box<dyn StorageWriteTransaction + Send + Sync + 'static>,
         changes: &[MaterializedCanonicalChange],
     ) {
-        let mut json_writer = JsonStoreContext::new().writer();
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer(&mut writes);
         let canonical_changes = changes
             .iter()
             .map(|change| canonicalize_materialized_change(&mut json_writer, change))
             .collect::<Result<Vec<_>, _>>()
             .expect("changes should canonicalize");
-        {
-            let mut writer_store = tx.as_mut();
-            json_writer
-                .flush(&mut writer_store)
-                .await
-                .expect("json should flush");
-        }
-        let mut writer = changelog.writer(tx.as_mut());
+        let mut writer = changelog.writer(&mut writes);
         writer
             .append_changes(&canonical_changes)
-            .await
             .expect("append should succeed");
+        writes
+            .apply(&mut tx.as_mut())
+            .await
+            .expect("writes should apply");
     }
 
     async fn load_test_change(

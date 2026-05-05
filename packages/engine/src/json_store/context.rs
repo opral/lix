@@ -1,6 +1,6 @@
 use crate::json_store::store;
 use crate::json_store::types::{JsonProjection, JsonProjectionPath, JsonRef};
-use crate::storage::{StorageReader, StorageWriter};
+use crate::storage::{StorageReader, StorageWriteSet};
 use crate::LixError;
 use std::collections::HashSet;
 
@@ -19,8 +19,8 @@ impl JsonStoreContext {
         JsonStoreReader { store }
     }
 
-    pub(crate) fn writer(&self) -> JsonStoreWriter {
-        JsonStoreWriter::new()
+    pub(crate) fn writer<'a>(&self, writes: &'a mut StorageWriteSet) -> JsonStoreWriter<'a> {
+        JsonStoreWriter::new(writes)
     }
 
     pub(crate) async fn load_bytes(
@@ -89,20 +89,15 @@ where
     }
 }
 
-pub(crate) struct JsonStoreWriter {
-    staged: Vec<StagedJson>,
+pub(crate) struct JsonStoreWriter<'a> {
+    writes: &'a mut StorageWriteSet,
     seen: HashSet<[u8; 32]>,
 }
 
-struct StagedJson {
-    json_ref: JsonRef,
-    stored_payload: Vec<u8>,
-}
-
-impl JsonStoreWriter {
-    fn new() -> Self {
+impl<'a> JsonStoreWriter<'a> {
+    fn new(writes: &'a mut StorageWriteSet) -> Self {
         Self {
-            staged: Vec::new(),
+            writes,
             seen: HashSet::new(),
         }
     }
@@ -122,21 +117,11 @@ impl JsonStoreWriter {
         }
         let (json_ref, stored_payload) =
             store::encode_json_str_for_storage_with_ref(json, json_ref)?;
-        self.staged.push(StagedJson {
-            json_ref: json_ref.clone(),
+        self.writes.put(
+            store::JSON_NAMESPACE,
+            json_ref.as_hash_bytes().to_vec(),
             stored_payload,
-        });
+        );
         Ok(json_ref)
-    }
-
-    pub(crate) async fn flush(
-        self,
-        store: &mut (impl StorageWriter + ?Sized),
-    ) -> Result<(), LixError> {
-        for staged in self.staged {
-            store::persist_stored_json_payload(store, &staged.json_ref, &staged.stored_payload)
-                .await?;
-        }
-        Ok(())
     }
 }

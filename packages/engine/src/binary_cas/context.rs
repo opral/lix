@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use crate::binary_cas::{
     BlobBytesBatch, BlobExistsBatch, BlobHash, BlobMetadataBatch, BlobWrite, BlobWriteReceipt,
 };
-use crate::storage::{KvWriteBatch, StorageReader, StorageWriter};
+use crate::storage::{StorageReader, StorageWriteSet};
 use crate::LixError;
 use std::collections::HashSet;
 
@@ -35,8 +35,8 @@ impl BinaryCasContext {
         BinaryCasStoreReader { store }
     }
 
-    pub(crate) fn writer(&self) -> BinaryCasWriter {
-        BinaryCasWriter::new()
+    pub(crate) fn writer<'a>(&self, writes: &'a mut StorageWriteSet) -> BinaryCasWriter<'a> {
+        BinaryCasWriter::new(writes)
     }
 }
 
@@ -95,16 +95,16 @@ where
 ///
 /// This type does not begin, commit, or roll back transactions. It only writes
 /// CAS data into the transaction supplied by the caller.
-pub(crate) struct BinaryCasWriter {
-    batch: KvWriteBatch,
+pub(crate) struct BinaryCasWriter<'a> {
+    writes: &'a mut StorageWriteSet,
     blob_hashes: HashSet<[u8; 32]>,
     chunk_keys: HashSet<Vec<u8>>,
 }
 
-impl BinaryCasWriter {
-    fn new() -> Self {
+impl<'a> BinaryCasWriter<'a> {
+    fn new(writes: &'a mut StorageWriteSet) -> Self {
         Self {
-            batch: KvWriteBatch::new(),
+            writes,
             blob_hashes: HashSet::new(),
             chunk_keys: HashSet::new(),
         }
@@ -112,7 +112,7 @@ impl BinaryCasWriter {
 
     pub(crate) fn stage_bytes(&mut self, bytes: &[u8]) -> Result<BlobWriteReceipt, LixError> {
         crate::binary_cas::kv::stage_blob_write(
-            &mut self.batch,
+            self.writes,
             &mut self.blob_hashes,
             &mut self.chunk_keys,
             &BlobWrite { bytes },
@@ -128,22 +128,12 @@ impl BinaryCasWriter {
             .iter()
             .map(|write| {
                 crate::binary_cas::kv::stage_blob_write(
-                    &mut self.batch,
+                    self.writes,
                     &mut self.blob_hashes,
                     &mut self.chunk_keys,
                     write,
                 )
             })
             .collect()
-    }
-
-    pub(crate) async fn flush(
-        self,
-        store: &mut (impl StorageWriter + ?Sized),
-    ) -> Result<(), LixError> {
-        if !self.batch.is_empty() {
-            store.write_kv_batch(self.batch).await?;
-        }
-        Ok(())
     }
 }

@@ -1,5 +1,5 @@
 use crate::changelog::{CanonicalChange, ChangelogReader, ChangelogScanRequest};
-use crate::storage::{StorageReader, StorageWriter};
+use crate::storage::{StorageReader, StorageWriteSet};
 use crate::LixError;
 use tokio::sync::Mutex;
 
@@ -28,12 +28,9 @@ impl ChangelogContext {
         }
     }
 
-    /// Creates a changelog writer over a caller-provided KV writer.
-    pub(crate) fn writer<S>(&self, store: S) -> ChangelogWriter<S>
-    where
-        S: StorageWriter,
-    {
-        ChangelogWriter { store }
+    /// Creates a changelog writer over a transaction-local storage write set.
+    pub(crate) fn writer<'a>(&self, writes: &'a mut StorageWriteSet) -> ChangelogWriter<'a> {
+        ChangelogWriter { writes }
     }
 }
 
@@ -82,20 +79,14 @@ where
     }
 }
 
-/// Changelog writer over a caller-provided KV writer.
-pub(crate) struct ChangelogWriter<S> {
-    store: S,
+/// Changelog writer over a transaction-local storage write set.
+pub(crate) struct ChangelogWriter<'a> {
+    writes: &'a mut StorageWriteSet,
 }
 
-impl<S> ChangelogWriter<S>
-where
-    S: StorageWriter,
-{
+impl ChangelogWriter<'_> {
     #[allow(dead_code)]
-    pub(crate) async fn append_changes(
-        &mut self,
-        changes: &[CanonicalChange],
-    ) -> Result<(), LixError> {
-        crate::changelog::storage::append_changes(&mut self.store, changes).await
+    pub(crate) fn append_changes(&mut self, changes: &[CanonicalChange]) -> Result<(), LixError> {
+        crate::changelog::storage::append_changes(self.writes, changes)
     }
 }

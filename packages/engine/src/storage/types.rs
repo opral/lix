@@ -335,6 +335,36 @@ impl KvEntryPage {
     }
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct StorageWriteSet {
+    batch: KvWriteBatch,
+}
+
+impl StorageWriteSet {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn put(&mut self, namespace: &'static str, key: Vec<u8>, value: Vec<u8>) {
+        self.batch.put(namespace, key, value);
+    }
+
+    pub(crate) fn delete(&mut self, namespace: &'static str, key: Vec<u8>) {
+        self.batch.delete(namespace, key);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.batch.is_empty()
+    }
+
+    pub(crate) async fn apply(
+        self,
+        writer: &mut (impl StorageWriter + ?Sized),
+    ) -> Result<KvWriteStats, LixError> {
+        writer.write_kv_batch(self.batch).await
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct KvWriteBatch {
     pub(crate) groups: Vec<KvWriteGroup>,

@@ -45,7 +45,7 @@ pub(crate) struct UntrackedStateIdentity {
 }
 
 impl UntrackedStateIdentity {
-    pub(crate) fn from_materialized_row(row: &MaterializedUntrackedStateRow) -> Self {
+    pub(crate) fn from_row(row: &UntrackedStateRow) -> Self {
         Self {
             version_id: row.version_id.clone(),
             schema_key: row.schema_key.clone(),

@@ -9,14 +9,16 @@ use crate::json_store::context::JsonStoreContext;
 use crate::json_store::types::{JsonProjectionPath, JsonRef};
 use crate::storage::{
     KvGetGroup, KvGetRequest, KvScanRange, KvScanRequest, KvWriteBatch, StorageContext,
+    StorageWriteSet,
 };
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateDiffRequest, TrackedStateFilter, TrackedStateProjection,
     TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
 };
 use crate::untracked_state::{
-    MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter,
-    UntrackedStateProjection, UntrackedStateRowRequest, UntrackedStateScanRequest,
+    canonicalize_materialized_row, MaterializedUntrackedStateRow, UntrackedStateContext,
+    UntrackedStateFilter, UntrackedStateProjection, UntrackedStateRowRequest,
+    UntrackedStateScanRequest,
 };
 use crate::{Backend, LixError, NullableKeyFilter};
 use std::sync::Arc;
@@ -2025,12 +2027,12 @@ pub async fn json_store_write_prepared(
     let storage = StorageContext::new(Arc::clone(backend));
     let mut transaction = storage.begin_write_transaction().await?;
     {
-        let mut writer = fixture.context.writer();
+        let mut writes = StorageWriteSet::new();
+        let mut writer = fixture.context.writer(&mut writes);
         for document in &fixture.documents {
             writer.stage_bytes(document)?;
         }
-        let mut store = transaction.as_mut();
-        writer.flush(&mut store).await?;
+        writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await?;
     Ok(report(
@@ -2066,12 +2068,12 @@ pub async fn prepare_json_store_projection_read(
     let storage = StorageContext::new(Arc::clone(backend));
     let mut transaction = storage.begin_write_transaction().await?;
     {
-        let mut writer = context.writer();
+        let mut writes = StorageWriteSet::new();
+        let mut writer = context.writer(&mut writes);
         for document in documents {
             refs.push(writer.stage_bytes(&document)?);
         }
-        let mut store = transaction.as_mut();
-        writer.flush(&mut store).await?;
+        writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await?;
     Ok(JsonStoreReadFixture {
@@ -2158,12 +2160,12 @@ async fn prepare_json_store_base_update(
     let storage = StorageContext::new(Arc::clone(backend));
     let mut transaction = storage.begin_write_transaction().await?;
     {
-        let mut writer = context.writer();
+        let mut writes = StorageWriteSet::new();
+        let mut writer = context.writer(&mut writes);
         for document in documents {
             refs.push(writer.stage_bytes(&document)?);
         }
-        let mut store = transaction.as_mut();
-        writer.flush(&mut store).await?;
+        writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await?;
     Ok(JsonStoreReadFixture {
@@ -2201,13 +2203,13 @@ async fn json_store_write_against_base_prepared(
     let storage = StorageContext::new(Arc::clone(backend));
     let mut transaction = storage.begin_write_transaction().await?;
     {
-        let mut writer = fixture.context.writer();
+        let mut writes = StorageWriteSet::new();
+        let mut writer = fixture.context.writer(&mut writes);
         for (index, _json_ref) in fixture.refs.iter().enumerate() {
             let updated = updated_json_document(shape, index);
             writer.stage_bytes(&updated)?;
         }
-        let mut store = transaction.as_mut();
-        writer.flush(&mut store).await?;
+        writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await?;
     Ok(report(
@@ -2775,8 +2777,16 @@ async fn write_untracked_rows(
     let storage = StorageContext::new(Arc::clone(backend));
     let mut transaction = storage.begin_write_transaction().await?;
     {
-        let mut writer = context.writer(transaction.as_mut());
-        writer.write_rows(rows).await?;
+        let mut writes = StorageWriteSet::new();
+        let canonical_rows = {
+            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            rows.iter()
+                .map(|row| canonicalize_materialized_row(&mut json_writer, row))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut writer = context.writer(&mut writes);
+        writer.write_rows(&canonical_rows)?;
+        writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await
 }
@@ -2798,14 +2808,17 @@ async fn append_changelog_changes(
     let storage = StorageContext::new(Arc::clone(backend));
     let mut transaction = storage.begin_write_transaction().await?;
     {
-        let mut json_writer = JsonStoreContext::new().writer();
-        let canonical_changes = changes
-            .iter()
-            .map(|change| canonicalize_materialized_change(&mut json_writer, change))
-            .collect::<Result<Vec<_>, _>>()?;
-        json_writer.flush(&mut transaction.as_mut()).await?;
-        let mut writer = context.writer(transaction.as_mut());
-        writer.append_changes(&canonical_changes).await?;
+        let mut writes = StorageWriteSet::new();
+        let canonical_changes = {
+            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            changes
+                .iter()
+                .map(|change| canonicalize_materialized_change(&mut json_writer, change))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut writer = context.writer(&mut writes);
+        writer.append_changes(&canonical_changes)?;
+        writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await
 }
@@ -2818,9 +2831,10 @@ async fn write_binary_blob_writes(
     let storage = StorageContext::new(Arc::clone(backend));
     let mut transaction = storage.begin_write_transaction().await?;
     {
-        let mut writer = context.writer();
+        let mut writeset = StorageWriteSet::new();
+        let mut writer = context.writer(&mut writeset);
         writer.stage_many(writes)?;
-        writer.flush(&mut transaction.as_mut()).await?;
+        writeset.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await
 }

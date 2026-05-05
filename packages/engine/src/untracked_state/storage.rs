@@ -1,9 +1,6 @@
 use crate::json_store::JsonStoreContext;
 use crate::storage::KvScanRange;
-use crate::storage::{
-    KvGetGroup, KvGetRequest, KvScanRequest, KvWriteBatch, KvWriteGroup, StorageReader,
-    StorageWriter,
-};
+use crate::storage::{KvGetGroup, KvGetRequest, KvScanRequest, StorageReader, StorageWriteSet};
 use crate::untracked_state::{
     MaterializedUntrackedStateRow, UntrackedMaterializationProjection, UntrackedStateIdentity,
     UntrackedStateRow, UntrackedStateRowRequest, UntrackedStateScanRequest,
@@ -65,40 +62,35 @@ pub(crate) async fn load_row(
     .map(Some)
 }
 
-pub(crate) async fn write_rows(
-    writer: &mut impl StorageWriter,
-    rows: &[MaterializedUntrackedStateRow],
+pub(crate) fn write_rows(
+    writes: &mut StorageWriteSet,
+    rows: &[UntrackedStateRow],
 ) -> Result<(), LixError> {
-    let mut group = KvWriteGroup::new(UNTRACKED_STATE_ROW_NAMESPACE);
-    let mut json_writer = JsonStoreContext::new().writer();
     for row in rows {
-        let identity = UntrackedStateIdentity::from_materialized_row(row);
-        if row.snapshot_content.is_none() {
-            group.delete(encode_untracked_state_row_key(&identity));
-        } else {
-            let canonical =
-                crate::untracked_state::canonicalize_materialized_row(&mut json_writer, row)?;
-            group.put(
+        let identity = UntrackedStateIdentity::from_row(row);
+        if row.snapshot_ref.is_none() {
+            writes.delete(
+                UNTRACKED_STATE_ROW_NAMESPACE,
                 encode_untracked_state_row_key(&identity),
-                crate::untracked_state::codec::encode_row(&canonical)?,
+            );
+        } else {
+            writes.put(
+                UNTRACKED_STATE_ROW_NAMESPACE,
+                encode_untracked_state_row_key(&identity),
+                crate::untracked_state::codec::encode_row(row)?,
             );
         }
     }
-    json_writer.flush(&mut *writer).await?;
-    write_untracked_batch(writer, group).await?;
     Ok(())
 }
 
-pub(crate) async fn delete_rows(
-    writer: &mut impl StorageWriter,
-    identities: &[UntrackedStateIdentity],
-) -> Result<(), LixError> {
-    let mut group = KvWriteGroup::new(UNTRACKED_STATE_ROW_NAMESPACE);
+pub(crate) fn delete_rows(writes: &mut StorageWriteSet, identities: &[UntrackedStateIdentity]) {
     for identity in identities {
-        group.delete(encode_untracked_state_row_key(identity));
+        writes.delete(
+            UNTRACKED_STATE_ROW_NAMESPACE,
+            encode_untracked_state_row_key(identity),
+        );
     }
-    write_untracked_batch(writer, group).await?;
-    Ok(())
 }
 
 async fn scan_all_canonical_rows(
@@ -150,21 +142,6 @@ fn identity_from_request(request: &UntrackedStateRowRequest) -> Option<Untracked
     })
 }
 
-async fn write_untracked_batch(
-    writer: &mut impl StorageWriter,
-    group: KvWriteGroup,
-) -> Result<(), LixError> {
-    if group.put_count() == 0 && group.delete_count() == 0 {
-        return Ok(());
-    }
-    writer
-        .write_kv_batch(KvWriteBatch {
-            groups: vec![group],
-        })
-        .await?;
-    Ok(())
-}
-
 fn encode_untracked_state_row_key(identity: &UntrackedStateIdentity) -> Vec<u8> {
     let mut out = Vec::new();
     push_component(&mut out, &identity.version_id);
@@ -198,8 +175,28 @@ mod tests {
 
     use super::*;
     use crate::backend::testing::UnitTestBackend;
-    use crate::storage::StorageContext;
-    use crate::untracked_state::UntrackedStateContext;
+    use crate::storage::{StorageContext, StorageWriter};
+    use crate::untracked_state::{canonicalize_materialized_row, UntrackedStateContext};
+
+    async fn write_materialized_rows_to_store(
+        context: &UntrackedStateContext,
+        store: &mut (impl StorageWriter + ?Sized),
+        rows: &[MaterializedUntrackedStateRow],
+    ) {
+        let mut writes = StorageWriteSet::new();
+        let canonical_rows = {
+            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            rows.iter()
+                .map(|row| canonicalize_materialized_row(&mut json_writer, row))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("rows should canonicalize")
+        };
+        context
+            .writer(&mut writes)
+            .write_rows(&canonical_rows)
+            .expect("rows should write");
+        writes.apply(store).await.expect("rows should apply");
+    }
 
     #[tokio::test]
     async fn write_and_load_roundtrips() {
@@ -212,11 +209,12 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        context
-            .writer(transaction.as_mut())
-            .write_rows(std::slice::from_ref(&row))
-            .await
-            .expect("write should succeed");
+        write_materialized_rows_to_store(
+            &context,
+            transaction.as_mut(),
+            std::slice::from_ref(&row),
+        )
+        .await;
         transaction.commit().await.expect("commit should succeed");
 
         let loaded = {
@@ -243,15 +241,16 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        context
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        write_materialized_rows_to_store(
+            &context,
+            transaction.as_mut(),
+            &[
                 untracked_row("global", "lix_key_value", "global-ui"),
                 untracked_row("version-a", "lix_key_value", "version-ui"),
                 untracked_row("version-a", "other_schema", "other"),
-            ])
-            .await
-            .expect("writes should succeed");
+            ],
+        )
+        .await;
         transaction.commit().await.expect("commit should succeed");
 
         let rows = {
@@ -282,21 +281,31 @@ mod tests {
         let storage = StorageContext::new(backend.clone());
         let context = UntrackedStateContext::new();
         let row = untracked_row("global", "lix_key_value", "ui-tab");
-        let identity = UntrackedStateIdentity::from_materialized_row(&row);
+        let identity = UntrackedStateIdentity {
+            version_id: row.version_id.clone(),
+            schema_key: row.schema_key.clone(),
+            entity_id: row.entity_id.clone(),
+            file_id: row.file_id.clone(),
+        };
 
         let mut transaction = storage
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        let mut writer = context.writer(transaction.as_mut());
+        let mut writes = StorageWriteSet::new();
+        let canonical_row = {
+            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            canonicalize_materialized_row(&mut json_writer, &row).expect("row should canonicalize")
+        };
+        let mut writer = context.writer(&mut writes);
         writer
-            .write_rows(std::slice::from_ref(&row))
-            .await
+            .write_rows(&[canonical_row])
             .expect("write should succeed");
-        writer
-            .delete_rows(&[identity])
+        writer.delete_rows(&[identity]);
+        writes
+            .apply(&mut transaction.as_mut())
             .await
-            .expect("delete should succeed");
+            .expect("writes should apply");
         transaction.commit().await.expect("commit should succeed");
 
         let loaded = {

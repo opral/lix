@@ -2,18 +2,19 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::commit_graph::{CommitGraphCommit, CommitGraphContext};
+use crate::json_store::JsonStoreContext;
 use crate::live_state::visibility;
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
 };
-use crate::storage::{StorageReader, StorageWriter};
+use crate::storage::{StorageReader, StorageWriteSet, StorageWriter};
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateFilter, TrackedStateProjection, TrackedStateRow,
     TrackedStateRowRequest, TrackedStateScanRequest,
 };
 use crate::untracked_state::{
-    MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateIdentity,
-    UntrackedStateRowRequest, UntrackedStateScanRequest,
+    canonicalize_materialized_row, MaterializedUntrackedStateRow, UntrackedStateContext,
+    UntrackedStateIdentity, UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
 use crate::version::VERSION_REF_SCHEMA_KEY;
 use crate::LixError;
@@ -279,11 +280,18 @@ where
                 .into_iter()
                 .map(MaterializedUntrackedStateRow::from)
                 .collect::<Vec<_>>();
-            let store: &mut dyn StorageWriter = &mut self.store;
+            let mut writes = StorageWriteSet::new();
+            let canonical_rows = {
+                let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+                untracked_rows
+                    .iter()
+                    .map(|row| canonicalize_materialized_row(&mut json_writer, row))
+                    .collect::<Result<Vec<_>, _>>()?
+            };
             self.untracked_state
-                .writer(store)
-                .write_rows(&untracked_rows)
-                .await?;
+                .writer(&mut writes)
+                .write_rows(&canonical_rows)?;
+            writes.apply(&mut self.store).await?;
         }
 
         if tracked_rows.is_empty() {
@@ -302,11 +310,11 @@ where
             })
             .collect::<Result<Vec<_>, LixError>>()?;
         {
-            let store: &mut dyn StorageWriter = &mut self.store;
+            let mut writes = StorageWriteSet::new();
             self.untracked_state
-                .writer(store)
-                .delete_rows(&identities)
-                .await?;
+                .writer(&mut writes)
+                .delete_rows(&identities);
+            writes.apply(&mut self.store).await?;
         }
 
         for (commit_id, rows) in grouped_live_rows_by_commit(&tracked_rows)? {
@@ -749,7 +757,7 @@ mod tests {
     use crate::entity_identity::EntityIdentity;
     use crate::json_store::JsonStoreContext;
     use crate::live_state::LiveStateFilter;
-    use crate::storage::StorageContext;
+    use crate::storage::{StorageContext, StorageWriter};
     use crate::tracked_state::TrackedStateScanRequest;
     use crate::untracked_state::{MaterializedUntrackedStateRow, UntrackedStateContext};
     use crate::NullableKeyFilter;
@@ -763,12 +771,33 @@ mod tests {
         )
     }
 
+    async fn write_untracked_rows_to_store(
+        store: &mut (impl StorageWriter + ?Sized),
+        rows: &[MaterializedUntrackedStateRow],
+    ) {
+        let mut writes = StorageWriteSet::new();
+        let canonical_rows = {
+            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            rows.iter()
+                .map(|row| canonicalize_materialized_row(&mut json_writer, row))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("untracked rows should canonicalize")
+        };
+        UntrackedStateContext::new()
+            .writer(&mut writes)
+            .write_rows(&canonical_rows)
+            .expect("untracked rows should write");
+        writes
+            .apply(store)
+            .await
+            .expect("untracked rows should apply");
+    }
+
     #[tokio::test]
     async fn live_state_overlays_untracked_rows() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
-        let untracked_state = UntrackedStateContext::new();
 
         let mut transaction = storage
             .begin_write_transaction()
@@ -783,14 +812,14 @@ mod tests {
             )])
             .await
             .expect("tracked row should write");
-        untracked_state
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        write_untracked_rows_to_store(
+            transaction.as_mut(),
+            &[
                 version_ref_row("global", "commit-tracked"),
                 untracked_row("untracked-value"),
-            ])
-            .await
-            .expect("untracked row should write");
+            ],
+        )
+        .await;
         transaction.commit().await.expect("commit should persist");
 
         let rows = scan_selected_tab_at(&live_state, storage.clone(), "global", false)
@@ -841,11 +870,11 @@ mod tests {
             )])
             .await
             .expect("tracked row should write");
-        UntrackedStateContext::new()
-            .writer(transaction.as_mut())
-            .write_rows(&[version_ref_row("global", "commit-tracked")])
-            .await
-            .expect("version ref should write");
+        write_untracked_rows_to_store(
+            transaction.as_mut(),
+            &[version_ref_row("global", "commit-tracked")],
+        )
+        .await;
         transaction.commit().await.expect("commit should persist");
 
         let loaded = load_selected_tab(&live_state, storage.clone())
@@ -865,7 +894,6 @@ mod tests {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
-        let untracked_state = UntrackedStateContext::new();
 
         let mut transaction = storage
             .begin_write_transaction()
@@ -880,23 +908,29 @@ mod tests {
             )])
             .await
             .expect("tracked row should write");
-        let mut untracked_writer = untracked_state.writer(transaction.as_mut());
-        untracked_writer
-            .write_rows(&[
+        write_untracked_rows_to_store(
+            transaction.as_mut(),
+            &[
                 version_ref_row("global", "commit-tracked"),
                 untracked_row("untracked-value"),
-            ])
-            .await
-            .expect("untracked row should write");
-        untracked_writer
-            .delete_rows(&[crate::untracked_state::UntrackedStateIdentity {
-                version_id: "global".to_string(),
-                schema_key: "lix_key_value".to_string(),
-                entity_id: EntityIdentity::single("selected-tab"),
-                file_id: None,
-            }])
-            .await
-            .expect("untracked row should delete");
+            ],
+        )
+        .await;
+        {
+            let mut writes = StorageWriteSet::new();
+            UntrackedStateContext::new()
+                .writer(&mut writes)
+                .delete_rows(&[crate::untracked_state::UntrackedStateIdentity {
+                    version_id: "global".to_string(),
+                    schema_key: "lix_key_value".to_string(),
+                    entity_id: EntityIdentity::single("selected-tab"),
+                    file_id: None,
+                }]);
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("untracked row should delete");
+        }
         transaction.commit().await.expect("commit should persist");
 
         let loaded = load_selected_tab(&live_state, storage.clone())
@@ -930,14 +964,14 @@ mod tests {
             )])
             .await
             .expect("tracked row should write");
-        UntrackedStateContext::new()
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        write_untracked_rows_to_store(
+            transaction.as_mut(),
+            &[
                 version_ref_row("global", "commit-global"),
                 version_ref_row("version-a", "commit-version-a"),
-            ])
-            .await
-            .expect("version refs should write");
+            ],
+        )
+        .await;
         transaction.commit().await.expect("commit should persist");
 
         let loaded = load_selected_tab_at(&live_state, storage.clone(), "version-a")
@@ -978,14 +1012,14 @@ mod tests {
             )])
             .await
             .expect("global tracked row should write");
-        UntrackedStateContext::new()
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        write_untracked_rows_to_store(
+            transaction.as_mut(),
+            &[
                 version_ref_row("global", "commit-global"),
                 version_ref_row("main", "commit-main"),
-            ])
-            .await
-            .expect("global version ref should write");
+            ],
+        )
+        .await;
         transaction.commit().await.expect("commit should persist");
 
         let loaded = load_selected_tab_at(&live_state, storage.clone(), "main")
@@ -1031,14 +1065,14 @@ mod tests {
             ])
             .await
             .expect("tracked rows should write");
-        UntrackedStateContext::new()
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        write_untracked_rows_to_store(
+            transaction.as_mut(),
+            &[
                 version_ref_row("global", "commit-global"),
                 version_ref_row("version-a", "commit-version"),
-            ])
-            .await
-            .expect("version refs should write");
+            ],
+        )
+        .await;
         transaction.commit().await.expect("commit should persist");
 
         let loaded = load_selected_tab_at(&live_state, storage.clone(), "version-a")
@@ -1077,14 +1111,14 @@ mod tests {
             ])
             .await
             .expect("tracked rows should write");
-        UntrackedStateContext::new()
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        write_untracked_rows_to_store(
+            transaction.as_mut(),
+            &[
                 version_ref_row("global", "commit-global"),
                 version_ref_row("main", "commit-main"),
-            ])
-            .await
-            .expect("version refs should write");
+            ],
+        )
+        .await;
         transaction.commit().await.expect("commit should persist");
 
         let loaded = load_selected_tab_at(&live_state, storage.clone(), "main")
@@ -1105,7 +1139,6 @@ mod tests {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(Arc::clone(&backend));
         let live_state = live_state_context();
-        let untracked_state = UntrackedStateContext::new();
 
         let mut transaction = storage
             .begin_write_transaction()
@@ -1124,16 +1157,16 @@ mod tests {
             ])
             .await
             .expect("tracked rows should write");
-        untracked_state
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        write_untracked_rows_to_store(
+            transaction.as_mut(),
+            &[
                 version_ref_row("global", "commit-global"),
                 version_ref_row("version-a", "commit-version"),
                 untracked_row_at("global", "global-untracked"),
                 untracked_row_at("version-a", "version-untracked"),
-            ])
-            .await
-            .expect("untracked rows should write");
+            ],
+        )
+        .await;
         transaction.commit().await.expect("commit should persist");
 
         let loaded = load_selected_tab_at(&live_state, storage.clone(), "version-a")
@@ -1172,14 +1205,14 @@ mod tests {
             ])
             .await
             .expect("rows should write");
-        UntrackedStateContext::new()
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        write_untracked_rows_to_store(
+            transaction.as_mut(),
+            &[
                 version_ref_row("global", "commit-global"),
                 version_ref_row("version-a", "commit-version"),
-            ])
-            .await
-            .expect("version refs should write");
+            ],
+        )
+        .await;
         transaction.commit().await.expect("commit should persist");
 
         let rows = scan_selected_tab_at(&live_state, storage.clone(), "version-a", false)
@@ -1213,14 +1246,14 @@ mod tests {
             )])
             .await
             .expect("rows should write");
-        UntrackedStateContext::new()
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        write_untracked_rows_to_store(
+            transaction.as_mut(),
+            &[
                 version_ref_row("global", "commit-global"),
                 version_ref_row("version-a", "commit-version-a"),
-            ])
-            .await
-            .expect("version refs should write");
+            ],
+        )
+        .await;
         transaction.commit().await.expect("commit should persist");
 
         let rows = scan_selected_tab_at(&live_state, storage.clone(), "version-a", false)
@@ -1255,11 +1288,11 @@ mod tests {
             )])
             .await
             .expect("tracked row should write");
-        UntrackedStateContext::new()
-            .writer(transaction.as_mut())
-            .write_rows(&[version_ref_row("global", "commit-global")])
-            .await
-            .expect("global version ref should write");
+        write_untracked_rows_to_store(
+            transaction.as_mut(),
+            &[version_ref_row("global", "commit-global")],
+        )
+        .await;
         transaction.commit().await.expect("commit should persist");
 
         let rows = scan_selected_tab_at(&live_state, storage.clone(), "missing-version", false)
@@ -1295,14 +1328,14 @@ mod tests {
             ])
             .await
             .expect("rows should write");
-        UntrackedStateContext::new()
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        write_untracked_rows_to_store(
+            transaction.as_mut(),
+            &[
                 version_ref_row("global", "commit-global"),
                 version_ref_row("version-a", "commit-version"),
-            ])
-            .await
-            .expect("version refs should write");
+            ],
+        )
+        .await;
         transaction.commit().await.expect("commit should persist");
 
         let hidden = scan_selected_tab_at(&live_state, storage.clone(), "version-a", false)
@@ -1340,14 +1373,14 @@ mod tests {
             ])
             .await
             .expect("tracked rows should write");
-        UntrackedStateContext::new()
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        write_untracked_rows_to_store(
+            transaction.as_mut(),
+            &[
                 version_ref_row("global", "commit-global"),
                 version_ref_row("main", "commit-main"),
-            ])
-            .await
-            .expect("version refs should write");
+            ],
+        )
+        .await;
         transaction.commit().await.expect("commit should persist");
 
         let hidden = scan_selected_tab_at(&live_state, storage.clone(), "main", false)
@@ -1529,11 +1562,11 @@ mod tests {
             ])
             .await
             .expect("commit facts are changelog projections, not root-local rows");
-        UntrackedStateContext::new()
-            .writer(transaction.as_mut())
-            .write_rows(&[version_ref_row("version-a", "commit-version")])
-            .await
-            .expect("version ref should write");
+        write_untracked_rows_to_store(
+            transaction.as_mut(),
+            &[version_ref_row("version-a", "commit-version")],
+        )
+        .await;
         transaction.commit().await.expect("commit should persist");
 
         let loaded = load_selected_tab_at(&live_state, storage.clone(), "version-a")
@@ -1873,11 +1906,22 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("version-ref transaction should open");
+        let mut writes = StorageWriteSet::new();
+        let canonical_refs = {
+            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            refs.iter()
+                .map(|row| canonicalize_materialized_row(&mut json_writer, row))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("version refs should canonicalize")
+        };
         UntrackedStateContext::new()
-            .writer(transaction.as_mut())
-            .write_rows(refs)
-            .await
+            .writer(&mut writes)
+            .write_rows(&canonical_refs)
             .expect("version refs should write");
+        writes
+            .apply(&mut transaction.as_mut())
+            .await
+            .expect("version refs should apply");
         transaction
             .commit()
             .await
@@ -1950,18 +1994,20 @@ mod tests {
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
         };
-        let mut json_writer = JsonStoreContext::new().writer();
-        let canonical_change = canonicalize_materialized_change(&mut json_writer, &change)
-            .expect("commit change should canonicalize");
-        json_writer
-            .flush(&mut transaction.as_mut())
-            .await
-            .expect("commit json should flush");
+        let mut writes = StorageWriteSet::new();
+        let canonical_change = {
+            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            canonicalize_materialized_change(&mut json_writer, &change)
+                .expect("commit change should canonicalize")
+        };
         changelog
-            .writer(transaction.as_mut())
+            .writer(&mut writes)
             .append_changes(&[canonical_change])
-            .await
             .expect("commit change should append");
+        writes
+            .apply(&mut transaction.as_mut())
+            .await
+            .expect("commit change should apply");
         transaction
             .commit()
             .await
