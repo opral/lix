@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 
 use crate::binary_cas::BinaryCasContext;
 use crate::changelog::{CanonicalChange, ChangelogContext};
+use crate::functions::FunctionContext;
 use crate::json_store::{JsonRef, JsonStoreContext, JsonStoreWriter};
 use crate::live_state::{LiveStateContext, LiveStateRow};
-use crate::storage::{StorageReader, StorageWriteSet, StorageWriter};
+use crate::storage::{StorageReader, StorageWriteSet, StorageWriteTransaction};
 use crate::transaction::staging::StagedWriteSet;
 use crate::transaction::types::{StagedAdoptedStateRow, StagedCommitMembers, StagedStateRow};
 use crate::version::{VersionContext, VersionRefReader};
@@ -23,16 +24,18 @@ pub(crate) async fn commit_staged_writes(
     changelog: &ChangelogContext,
     live_state: &LiveStateContext,
     version_ctx: &VersionContext,
-    transaction: &mut (impl StorageReader + StorageWriter + ?Sized),
+    runtime_functions: Option<&FunctionContext>,
+    transaction: &mut (impl StorageWriteTransaction + ?Sized),
     staged_writes: StagedWriteSet,
 ) -> Result<(), LixError> {
+    let mut writes = StorageWriteSet::new();
+    let mut json_writer = JsonStoreContext::new().writer();
+
     if !staged_writes.file_data_writes.is_empty() {
-        let mut writes = StorageWriteSet::new();
         let mut blob_writer = binary_cas.writer(&mut writes);
         for write in &staged_writes.file_data_writes {
             blob_writer.stage_bytes(&write.data)?;
         }
-        writes.apply(transaction).await?;
     }
 
     let (mut changelog_rows, untracked_rows): (Vec<_>, Vec<_>) = staged_writes
@@ -50,25 +53,35 @@ pub(crate) async fn commit_staged_writes(
     changelog_rows.extend(finalized.commit_rows);
     let version_heads = finalized.version_heads;
 
+    if let Some(runtime_functions) = runtime_functions {
+        let mut writer = live_state.writer(&mut *transaction);
+        runtime_functions
+            .stage_persist_if_needed(&mut writer, &mut writes, &mut json_writer)
+            .await?;
+    }
+
     if changelog_rows.is_empty()
         && adopted_rows.is_empty()
         && untracked_rows.is_empty()
         && version_heads.is_empty()
+        && writes.is_empty()
     {
         return Ok(());
     }
 
     if !changelog_rows.is_empty() {
-        let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer(&mut writes);
-        let canonical_changes =
-            new_canonical_changes(changelog, transaction, &mut json_writer, &changelog_rows)
-                .await?;
+        let canonical_changes = new_canonical_changes(
+            changelog,
+            transaction,
+            &mut writes,
+            &mut json_writer,
+            &changelog_rows,
+        )
+        .await?;
         {
             let mut writer = changelog.writer(&mut writes);
-            writer.append_changes(&canonical_changes)?;
+            writer.stage_changes(&canonical_changes)?;
         }
-        writes.apply(transaction).await?;
     }
     if !adopted_rows.is_empty() {
         validate_adopted_canonical_changes(changelog, transaction, &adopted_rows).await?;
@@ -86,36 +99,37 @@ pub(crate) async fn commit_staged_writes(
 
     {
         let mut writer = live_state.writer(&mut *transaction);
-        writer.write_rows(&live_state_rows).await?;
+        writer
+            .stage_rows(&mut writes, &mut json_writer, &live_state_rows)
+            .await?;
     }
 
     for version_head in version_heads {
-        let mut writes = StorageWriteSet::new();
-        let canonical_row = {
-            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
-            version_ctx.canonical_ref_row(
-                &mut json_writer,
-                &version_head.version_id,
-                &version_head.commit_id,
-                &version_head.timestamp,
-            )?
-        };
+        let canonical_row = version_ctx.canonical_ref_row(
+            &mut writes,
+            &mut json_writer,
+            &version_head.version_id,
+            &version_head.commit_id,
+            &version_head.timestamp,
+        )?;
         version_ctx.stage_canonical_ref_rows(&mut writes, &[canonical_row])?;
-        writes.apply(transaction).await?;
     }
+
+    writes.apply(transaction).await?;
     Ok(())
 }
 
 async fn new_canonical_changes(
     changelog: &ChangelogContext,
-    transaction: &mut (impl StorageReader + StorageWriter + ?Sized),
-    json_writer: &mut JsonStoreWriter<'_>,
+    transaction: &mut (impl StorageReader + ?Sized),
+    writes: &mut StorageWriteSet,
+    json_writer: &mut JsonStoreWriter,
     rows: &[StagedStateRow],
 ) -> Result<Vec<CanonicalChange>, LixError> {
     let reader = changelog.reader(&mut *transaction);
     let mut changes = Vec::new();
     for row in rows {
-        let change = canonical_change_from_staged_row(json_writer, row)?;
+        let change = canonical_change_from_staged_row(writes, json_writer, row)?;
         match reader.load_change(&change.id).await? {
             Some(existing) => {
                 let entity_id = existing
@@ -140,14 +154,14 @@ async fn new_canonical_changes(
 
 async fn validate_adopted_canonical_changes(
     changelog: &ChangelogContext,
-    transaction: &mut (impl StorageReader + StorageWriter + ?Sized),
+    transaction: &mut (impl StorageReader + ?Sized),
     rows: &[StagedAdoptedStateRow],
 ) -> Result<(), LixError> {
     let mut writes = StorageWriteSet::new();
-    let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+    let mut json_writer = JsonStoreContext::new().writer();
     let reader = changelog.reader(&mut *transaction);
     for row in rows {
-        let expected = canonical_change_from_adopted_row(&mut json_writer, row)?;
+        let expected = canonical_change_from_adopted_row(&mut writes, &mut json_writer, row)?;
         match reader.load_change(&expected.id).await? {
             Some(existing) if existing == expected => {}
             Some(existing) => {
@@ -178,7 +192,8 @@ async fn validate_adopted_canonical_changes(
 }
 
 fn canonical_change_from_staged_row(
-    json_writer: &mut JsonStoreWriter<'_>,
+    writes: &mut StorageWriteSet,
+    json_writer: &mut JsonStoreWriter,
     row: &StagedStateRow,
 ) -> Result<CanonicalChange, LixError> {
     let Some(change_id) = row.change_id.as_ref() else {
@@ -194,35 +209,40 @@ fn canonical_change_from_staged_row(
         schema_key: row.schema_key.clone(),
         schema_version: row.schema_version.clone(),
         file_id: row.file_id.clone(),
-        snapshot_ref: stage_optional_json(json_writer, row.snapshot_content.as_deref())?,
-        metadata_ref: stage_optional_metadata(json_writer, row.metadata.as_ref())?,
+        snapshot_ref: stage_optional_json(writes, json_writer, row.snapshot_content.as_deref())?,
+        metadata_ref: stage_optional_metadata(writes, json_writer, row.metadata.as_ref())?,
         created_at: row.created_at.clone(),
     })
 }
 
 fn stage_optional_json(
-    json_writer: &mut JsonStoreWriter<'_>,
+    writes: &mut StorageWriteSet,
+    json_writer: &mut JsonStoreWriter,
     value: Option<&str>,
 ) -> Result<Option<JsonRef>, LixError> {
     let Some(value) = value else {
         return Ok(None);
     };
-    json_writer.stage_bytes(value.as_bytes()).map(Some)
+    json_writer.stage_bytes(writes, value.as_bytes()).map(Some)
 }
 
 fn stage_optional_metadata(
-    json_writer: &mut JsonStoreWriter<'_>,
+    writes: &mut StorageWriteSet,
+    json_writer: &mut JsonStoreWriter,
     value: Option<&RowMetadata>,
 ) -> Result<Option<JsonRef>, LixError> {
     let Some(value) = value else {
         return Ok(None);
     };
     let serialized = serialize_row_metadata(value);
-    json_writer.stage_bytes(serialized.as_bytes()).map(Some)
+    json_writer
+        .stage_bytes(writes, serialized.as_bytes())
+        .map(Some)
 }
 
 fn canonical_change_from_adopted_row(
-    json_writer: &mut JsonStoreWriter<'_>,
+    writes: &mut StorageWriteSet,
+    json_writer: &mut JsonStoreWriter,
     row: &StagedAdoptedStateRow,
 ) -> Result<CanonicalChange, LixError> {
     Ok(CanonicalChange {
@@ -231,8 +251,8 @@ fn canonical_change_from_adopted_row(
         schema_key: row.schema_key.clone(),
         schema_version: row.schema_version.clone(),
         file_id: row.file_id.clone(),
-        snapshot_ref: stage_optional_json(json_writer, row.snapshot_content.as_deref())?,
-        metadata_ref: stage_optional_metadata(json_writer, row.metadata.as_ref())?,
+        snapshot_ref: stage_optional_json(writes, json_writer, row.snapshot_content.as_deref())?,
+        metadata_ref: stage_optional_metadata(writes, json_writer, row.metadata.as_ref())?,
         created_at: row.created_at.clone(),
     })
 }
@@ -354,12 +374,21 @@ fn merge_parent_commit_ids(mut base: Vec<String>, extra: Vec<String>) -> Vec<Str
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
+    use async_trait::async_trait;
     use serde_json::Value as JsonValue;
 
     use super::*;
-    use crate::backend::{testing::UnitTestBackend, Backend};
+    use crate::backend::{
+        testing::UnitTestBackend, Backend, BackendKvEntryPage, BackendKvExistsBatch,
+        BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRequest, BackendKvValueBatch,
+        BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction,
+        BackendWriteTransaction,
+    };
     use crate::changelog::ChangelogContext;
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
     use crate::storage::StorageContext;
@@ -369,6 +398,9 @@ mod tests {
     };
     use crate::version::VersionContext;
     use crate::NullableKeyFilter;
+
+    const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
+    const DETERMINISTIC_SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
 
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(
@@ -396,6 +428,7 @@ mod tests {
             &changelog,
             live_state.as_ref(),
             &version_ctx,
+            None,
             transaction.as_mut(),
             StagedWriteSet {
                 insert_identities: BTreeMap::new(),
@@ -462,6 +495,7 @@ mod tests {
             &changelog,
             live_state.as_ref(),
             &version_ctx,
+            None,
             transaction.as_mut(),
             StagedWriteSet {
                 insert_identities: BTreeMap::new(),
@@ -523,8 +557,9 @@ mod tests {
             .expect("seed transaction should open");
         let mut writes = StorageWriteSet::new();
         let canonical_row = {
-            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            let mut json_writer = JsonStoreContext::new().writer();
             canonicalize_materialized_row(
+                &mut writes,
                 &mut json_writer,
                 &MaterializedUntrackedStateRow::from(untracked_global_row("change-untracked")),
             )
@@ -532,7 +567,7 @@ mod tests {
         };
         untracked_state
             .writer(&mut writes)
-            .write_rows(&[canonical_row])
+            .stage_rows(&[canonical_row])
             .expect("untracked seed should write");
         writes
             .apply(&mut seed_transaction.as_mut())
@@ -552,6 +587,7 @@ mod tests {
             &changelog,
             live_state.as_ref(),
             &version_ctx,
+            None,
             transaction.as_mut(),
             StagedWriteSet {
                 insert_identities: BTreeMap::new(),
@@ -591,6 +627,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commit_staged_writes_applies_cross_subsystem_rows_as_one_backend_batch() {
+        let counting_backend = Arc::new(CountingBackend::new());
+        let write_batches = counting_backend.write_batches();
+        let backend: Arc<dyn Backend + Send + Sync> = counting_backend;
+        let storage = StorageContext::new(backend);
+        let binary_cas = BinaryCasContext::new();
+        let changelog = ChangelogContext::new();
+        let live_state = Arc::new(live_state_context());
+        let untracked_state = UntrackedStateContext::new();
+        let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
+        crate::test_support::seed_global_version_head(storage.clone()).await;
+        {
+            let mut seed_transaction = storage
+                .begin_write_transaction()
+                .await
+                .expect("seed transaction should open");
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            let mode_snapshot = serde_json::to_string(&serde_json::json!({
+                "key": DETERMINISTIC_MODE_KEY,
+                "value": { "enabled": true },
+            }))
+            .expect("mode snapshot should serialize");
+            {
+                let mut writer = live_state.writer(seed_transaction.as_mut());
+                writer
+                    .stage_rows(
+                        &mut writes,
+                        &mut json_writer,
+                        &[LiveStateRow {
+                            entity_id: crate::entity_identity::EntityIdentity::single(
+                                DETERMINISTIC_MODE_KEY,
+                            ),
+                            schema_key: "lix_key_value".to_string(),
+                            file_id: None,
+                            snapshot_content: Some(mode_snapshot),
+                            metadata: None,
+                            schema_version: "1".to_string(),
+                            created_at: "2026-01-01T00:00:00Z".to_string(),
+                            updated_at: "2026-01-01T00:00:00Z".to_string(),
+                            global: true,
+                            change_id: None,
+                            commit_id: None,
+                            untracked: true,
+                            version_id: GLOBAL_VERSION_ID.to_string(),
+                        }],
+                    )
+                    .await
+                    .expect("deterministic mode should stage");
+            }
+            writes
+                .apply(&mut seed_transaction.as_mut())
+                .await
+                .expect("deterministic mode should apply");
+            seed_transaction
+                .commit()
+                .await
+                .expect("seed transaction should persist");
+        }
+        write_batches.store(0, Ordering::SeqCst);
+        let runtime_functions = {
+            let reader = live_state.reader(storage.clone());
+            FunctionContext::prepare(&reader)
+                .await
+                .expect("runtime context should prepare")
+        };
+        runtime_functions.provider().call_uuid_v7();
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+
+        let mut untracked_row = untracked_global_row("change-untracked");
+        untracked_row.entity_id = crate::entity_identity::EntityIdentity::single("entity-2");
+
+        commit_staged_writes(
+            &binary_cas,
+            &changelog,
+            live_state.as_ref(),
+            &version_ctx,
+            Some(&runtime_functions),
+            transaction.as_mut(),
+            StagedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: vec![tracked_global_row("change-tracked"), untracked_row],
+                adopted_rows: Vec::new(),
+                commit_members_by_version: BTreeMap::from([(
+                    GLOBAL_VERSION_ID.to_string(),
+                    members(["change-tracked"]),
+                )]),
+                extra_commit_parents_by_version: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("cross-subsystem commit should stage and apply");
+
+        assert_eq!(
+            write_batches.load(Ordering::SeqCst),
+            1,
+            "tracked, json, untracked, changelog, and version refs must apply as one backend write batch"
+        );
+
+        transaction
+            .commit()
+            .await
+            .expect("commit should persist kv");
+        assert_eq!(write_batches.load(Ordering::SeqCst), 1);
+
+        let changes = changelog
+            .reader(storage.clone())
+            .scan_changes(&crate::changelog::ChangelogScanRequest::default())
+            .await
+            .expect("changelog scan should succeed");
+        assert!(changes.iter().any(|change| change.id == "change-tracked"));
+        assert!(changes
+            .iter()
+            .any(|change| change.schema_key == "lix_commit"));
+
+        let loaded_head = version_ctx
+            .ref_reader(storage.clone())
+            .load_head_commit_id(GLOBAL_VERSION_ID)
+            .await
+            .expect("version ref load should succeed");
+        assert_eq!(loaded_head.as_deref(), Some("test-uuid-1"));
+
+        let untracked = {
+            let mut untracked_reader = untracked_state.reader(storage.clone());
+            untracked_reader
+                .load_row(&UntrackedStateRowRequest {
+                    schema_key: "test_schema".to_string(),
+                    version_id: GLOBAL_VERSION_ID.to_string(),
+                    entity_id: crate::entity_identity::EntityIdentity::single("entity-2"),
+                    file_id: NullableKeyFilter::Null,
+                })
+                .await
+        }
+        .expect("untracked row load should succeed")
+        .expect("untracked row should persist");
+        assert_eq!(
+            untracked.snapshot_content.as_deref(),
+            Some("{\"value\":\"untracked\"}")
+        );
+
+        let sequence_row = live_state
+            .reader(storage.clone())
+            .load_row(&LiveStateRowRequest {
+                schema_key: "lix_key_value".to_string(),
+                version_id: GLOBAL_VERSION_ID.to_string(),
+                entity_id: crate::entity_identity::EntityIdentity::single(
+                    DETERMINISTIC_SEQUENCE_KEY,
+                ),
+                file_id: NullableKeyFilter::Null,
+            })
+            .await
+            .expect("deterministic sequence should load")
+            .expect("deterministic sequence should persist");
+        assert_eq!(
+            sequence_row.snapshot_content.as_deref(),
+            Some("{\"key\":\"lix_deterministic_sequence_number\",\"value\":0}")
+        );
+    }
+
+    #[tokio::test]
     async fn non_global_tracked_write_creates_one_commit_and_advances_only_touched_version() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(Arc::clone(&backend));
@@ -612,6 +812,7 @@ mod tests {
             &changelog,
             live_state.as_ref(),
             &version_ctx,
+            None,
             transaction.as_mut(),
             StagedWriteSet {
                 insert_identities: BTreeMap::new(),
@@ -918,6 +1119,106 @@ mod tests {
             version_id: GLOBAL_VERSION_ID.to_string(),
             entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
             file_id: NullableKeyFilter::Null,
+        }
+    }
+
+    struct CountingBackend {
+        inner: UnitTestBackend,
+        write_batches: Arc<AtomicUsize>,
+    }
+
+    impl CountingBackend {
+        fn new() -> Self {
+            Self {
+                inner: UnitTestBackend::new(),
+                write_batches: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn write_batches(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.write_batches)
+        }
+    }
+
+    #[async_trait]
+    impl Backend for CountingBackend {
+        async fn begin_read_transaction(
+            &self,
+        ) -> Result<Box<dyn BackendReadTransaction + Send + Sync + 'static>, LixError> {
+            self.inner.begin_read_transaction().await
+        }
+
+        async fn begin_write_transaction(
+            &self,
+        ) -> Result<Box<dyn BackendWriteTransaction + Send + Sync + 'static>, LixError> {
+            Ok(Box::new(CountingWriteTransaction {
+                inner: self.inner.begin_write_transaction().await?,
+                write_batches: Arc::clone(&self.write_batches),
+            }))
+        }
+    }
+
+    struct CountingWriteTransaction {
+        inner: Box<dyn BackendWriteTransaction + Send + Sync + 'static>,
+        write_batches: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl BackendReadTransaction for CountingWriteTransaction {
+        async fn get_values(
+            &mut self,
+            request: BackendKvGetRequest,
+        ) -> Result<BackendKvValueBatch, LixError> {
+            self.inner.get_values(request).await
+        }
+
+        async fn exists_many(
+            &mut self,
+            request: BackendKvGetRequest,
+        ) -> Result<BackendKvExistsBatch, LixError> {
+            self.inner.exists_many(request).await
+        }
+
+        async fn scan_keys(
+            &mut self,
+            request: BackendKvScanRequest,
+        ) -> Result<BackendKvKeyPage, LixError> {
+            self.inner.scan_keys(request).await
+        }
+
+        async fn scan_values(
+            &mut self,
+            request: BackendKvScanRequest,
+        ) -> Result<BackendKvValuePage, LixError> {
+            self.inner.scan_values(request).await
+        }
+
+        async fn scan_entries(
+            &mut self,
+            request: BackendKvScanRequest,
+        ) -> Result<BackendKvEntryPage, LixError> {
+            self.inner.scan_entries(request).await
+        }
+
+        async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+            let Self { inner, .. } = *self;
+            inner.rollback().await
+        }
+    }
+
+    #[async_trait]
+    impl BackendWriteTransaction for CountingWriteTransaction {
+        async fn write_kv_batch(
+            &mut self,
+            batch: BackendKvWriteBatch,
+        ) -> Result<BackendKvWriteStats, LixError> {
+            self.write_batches.fetch_add(1, Ordering::SeqCst);
+            self.inner.write_kv_batch(batch).await
+        }
+
+        async fn commit(self: Box<Self>) -> Result<(), LixError> {
+            let Self { inner, .. } = *self;
+            inner.commit().await
         }
     }
 }

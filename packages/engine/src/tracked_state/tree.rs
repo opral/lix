@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, future::Future, ops::Range, pin::Pin};
 
-use crate::storage::{StorageReader, StorageWriter};
+use crate::storage::{StorageReader, StorageWriteSet};
 use crate::tracked_state::codec::{
     boundary_trigger, child_summary_from_node, decode_key, decode_node, decode_value,
     encode_internal_node, encode_key, encode_leaf_node, encode_schema_file_prefix,
@@ -212,22 +212,38 @@ impl TrackedStateTree {
 
     pub(crate) async fn apply_mutations(
         &self,
-        writer: &mut impl StorageWriter,
+        store: &mut (impl StorageReader + ?Sized),
+        writes: &mut StorageWriteSet,
         base_root: Option<&TrackedStateRootId>,
         mutations: Vec<TrackedStateMutation>,
         commit_id: Option<&str>,
     ) -> Result<TrackedStateApplyResult, LixError> {
+        let mut overlay = storage::TrackedStateChunkOverlay::new();
         if let Some(root_id) = base_root {
             if mutations.len() == 1 {
                 if let Some(result) = self
-                    .apply_single_mutation(writer, root_id, &mutations[0], commit_id)
+                    .apply_single_mutation(
+                        store,
+                        writes,
+                        &mut overlay,
+                        root_id,
+                        &mutations[0],
+                        commit_id,
+                    )
                     .await?
                 {
                     return Ok(result);
                 }
             } else if mutations.len() > 1 {
                 if let Some(result) = self
-                    .apply_sorted_mutations_chunker(writer, root_id, &mutations, commit_id)
+                    .apply_sorted_mutations_chunker(
+                        store,
+                        writes,
+                        &mut overlay,
+                        root_id,
+                        &mutations,
+                        commit_id,
+                    )
                     .await?
                 {
                     return Ok(result);
@@ -237,7 +253,7 @@ impl TrackedStateTree {
 
         let mut entries = match base_root {
             Some(root_id) => self
-                .collect_leaf_entries(writer, root_id)
+                .collect_leaf_entries(store, root_id)
                 .await?
                 .into_iter()
                 .map(|entry| (entry.key, entry.value))
@@ -261,9 +277,9 @@ impl TrackedStateTree {
                 .map(|(key, value)| EncodedLeafEntry { key, value })
                 .collect(),
         )?;
-        storage::write_chunks(writer, &built.chunks).await?;
+        overlay.stage_chunks(writes, &built.chunks);
         let persisted_root = if let Some(commit_id) = commit_id {
-            storage::store_root(writer, commit_id, &built.root_id).await?;
+            storage::stage_root(writes, commit_id, &built.root_id);
             true
         } else {
             false
@@ -281,7 +297,9 @@ impl TrackedStateTree {
 
     async fn apply_single_mutation(
         &self,
-        writer: &mut impl StorageWriter,
+        store: &mut (impl StorageReader + ?Sized),
+        writes: &mut StorageWriteSet,
+        overlay: &mut storage::TrackedStateChunkOverlay,
         root_id: &TrackedStateRootId,
         mutation: &TrackedStateMutation,
         commit_id: Option<&str>,
@@ -292,7 +310,9 @@ impl TrackedStateTree {
 
         if let Some(result) = self
             .apply_single_mutation_from_seek_path(
-                writer,
+                store,
+                writes,
+                overlay,
                 root_id,
                 &encoded_key,
                 &encoded_value,
@@ -303,7 +323,9 @@ impl TrackedStateTree {
             return Ok(result);
         }
 
-        let levels = self.collect_summary_levels(writer, root_id).await?;
+        let levels = self
+            .collect_summary_levels_with_overlay(store, overlay, root_id)
+            .await?;
         let Some(leaves) = levels.first() else {
             return Ok(None);
         };
@@ -316,7 +338,7 @@ impl TrackedStateTree {
         };
 
         let mut entries = self
-            .load_leaf_entries(writer, &target_leaf.child_hash)
+            .load_leaf_entries_with_overlay(store, overlay, &target_leaf.child_hash)
             .await?;
         match entries.binary_search_by(|entry| entry.key.as_slice().cmp(&encoded_key)) {
             Ok(index) => {
@@ -370,8 +392,12 @@ impl TrackedStateTree {
             }
 
             suffix_entries.extend(
-                self.load_leaf_entries(writer, &leaves[next_leaf_index].child_hash)
-                    .await?,
+                self.load_leaf_entries_with_overlay(
+                    store,
+                    overlay,
+                    &leaves[next_leaf_index].child_hash,
+                )
+                .await?,
             );
             next_leaf_index += 1;
         }
@@ -384,9 +410,9 @@ impl TrackedStateTree {
             chunks,
             &encoded_key,
         )?;
-        storage::write_chunks(writer, &built.chunks).await?;
+        overlay.stage_chunks(writes, &built.chunks);
         let persisted_root = if let Some(commit_id) = commit_id {
-            storage::store_root(writer, commit_id, &built.root_id).await?;
+            storage::stage_root(writes, commit_id, &built.root_id);
             true
         } else {
             false
@@ -622,7 +648,9 @@ impl TrackedStateTree {
 
     async fn apply_sorted_mutations_chunker(
         &self,
-        writer: &mut impl StorageWriter,
+        store: &mut (impl StorageReader + ?Sized),
+        writes: &mut StorageWriteSet,
+        overlay: &mut storage::TrackedStateChunkOverlay,
         root_id: &TrackedStateRootId,
         mutations: &[TrackedStateMutation],
         commit_id: Option<&str>,
@@ -638,7 +666,9 @@ impl TrackedStateTree {
 
         let mutations = mutation_map.into_iter().collect::<Vec<_>>();
 
-        let levels = self.collect_summary_levels(writer, root_id).await?;
+        let levels = self
+            .collect_summary_levels_with_overlay(store, overlay, root_id)
+            .await?;
         let Some(leaves) = levels.first() else {
             return Ok(None);
         };
@@ -676,7 +706,10 @@ impl TrackedStateTree {
             loop {
                 if leaf_index < leaves.len() {
                     let leaf = &leaves[leaf_index];
-                    for entry in self.load_leaf_entries(writer, &leaf.child_hash).await? {
+                    for entry in self
+                        .load_leaf_entries_with_overlay(store, overlay, &leaf.child_hash)
+                        .await?
+                    {
                         window_entries.insert(entry.key, entry.value);
                     }
 
@@ -758,12 +791,15 @@ impl TrackedStateTree {
         }
 
         let built = self.build_tree_from_leaf_summaries(output_leaves, chunks)?;
-        self.persist_built_tree(writer, built, commit_id).await
+        self.persist_built_tree(writes, overlay, built, commit_id)
+            .await
     }
 
     async fn apply_single_mutation_from_seek_path(
         &self,
-        writer: &mut impl StorageWriter,
+        store: &mut (impl StorageReader + ?Sized),
+        writes: &mut StorageWriteSet,
+        overlay: &mut storage::TrackedStateChunkOverlay,
         root_id: &TrackedStateRootId,
         encoded_key: &[u8],
         encoded_value: &[u8],
@@ -772,7 +808,10 @@ impl TrackedStateTree {
         let mut current = *root_id.as_bytes();
         let mut path = Vec::new();
         let mut entries = loop {
-            match self.load_node(writer, &current).await? {
+            match self
+                .load_node_with_overlay(store, overlay, &current)
+                .await?
+            {
                 DecodedNode::Leaf(leaf) => break leaf.entries().to_vec(),
                 DecodedNode::Internal(internal) => {
                     let children = internal.children().to_vec();
@@ -818,7 +857,7 @@ impl TrackedStateTree {
         let Some(leaf_parent) = path.pop() else {
             let built = self.build_tree_from_entries(entries)?;
             return self
-                .persist_built_tree(writer, built, commit_id)
+                .persist_built_tree(writes, overlay, built, commit_id)
                 .await
                 .map(Some);
         };
@@ -859,8 +898,12 @@ impl TrackedStateTree {
             }
 
             leaf_entries.extend(
-                self.load_leaf_entries(writer, &leaf_parent.children[next_leaf_index].child_hash)
-                    .await?,
+                self.load_leaf_entries_with_overlay(
+                    store,
+                    overlay,
+                    &leaf_parent.children[next_leaf_index].child_hash,
+                )
+                .await?,
             );
             next_leaf_index += 1;
         }
@@ -899,7 +942,7 @@ impl TrackedStateTree {
                     chunk_bytes,
                 };
                 return self
-                    .persist_built_tree(writer, built, commit_id)
+                    .persist_built_tree(writes, overlay, built, commit_id)
                     .await
                     .map(Some);
             };
@@ -912,13 +955,14 @@ impl TrackedStateTree {
 
     async fn persist_built_tree(
         &self,
-        writer: &mut impl StorageWriter,
+        writes: &mut StorageWriteSet,
+        overlay: &mut storage::TrackedStateChunkOverlay,
         built: BuiltTree,
         commit_id: Option<&str>,
     ) -> Result<Option<TrackedStateApplyResult>, LixError> {
-        storage::write_chunks(writer, &built.chunks).await?;
+        overlay.stage_chunks(writes, &built.chunks);
         let persisted_root = if let Some(commit_id) = commit_id {
-            storage::store_root(writer, commit_id, &built.root_id).await?;
+            storage::stage_root(writes, commit_id, &built.root_id);
             true
         } else {
             false
@@ -1192,7 +1236,7 @@ impl TrackedStateTree {
 
     async fn collect_leaf_entries(
         &self,
-        store: &mut impl StorageReader,
+        store: &mut (impl StorageReader + ?Sized),
         root_id: &TrackedStateRootId,
     ) -> Result<Vec<EncodedLeafEntry>, LixError> {
         let mut out = Vec::new();
@@ -1387,28 +1431,35 @@ impl TrackedStateTree {
         Ok(entries)
     }
 
-    async fn collect_summary_levels(
+    async fn collect_summary_levels_with_overlay(
         &self,
-        store: &mut impl StorageReader,
+        store: &mut (impl StorageReader + ?Sized),
+        overlay: &storage::TrackedStateChunkOverlay,
         root_id: &TrackedStateRootId,
     ) -> Result<Vec<Vec<ChildSummary>>, LixError> {
         let mut levels = Vec::new();
-        self.collect_summary_levels_for_node(store, *root_id.as_bytes(), &mut levels)
-            .await?;
+        self.collect_summary_levels_for_node_with_overlay(
+            store,
+            overlay,
+            *root_id.as_bytes(),
+            &mut levels,
+        )
+        .await?;
         Ok(levels)
     }
 
-    fn collect_summary_levels_for_node<'a, S>(
+    fn collect_summary_levels_for_node_with_overlay<'a, S>(
         &'a self,
         store: &'a mut S,
+        overlay: &'a storage::TrackedStateChunkOverlay,
         hash: [u8; TRACKED_STATE_HASH_BYTES],
         levels: &'a mut Vec<Vec<ChildSummary>>,
     ) -> Pin<Box<dyn Future<Output = Result<(ChildSummary, usize), LixError>> + 'a>>
     where
-        S: StorageReader + 'a,
+        S: StorageReader + ?Sized + 'a,
     {
         Box::pin(async move {
-            match self.load_node(store, &hash).await? {
+            match self.load_node_with_overlay(store, overlay, &hash).await? {
                 DecodedNode::Leaf(leaf) => {
                     let summary = leaf_summary(hash, leaf.entries());
                     push_level_summary(levels, 0, summary.clone());
@@ -1417,7 +1468,10 @@ impl TrackedStateTree {
                 DecodedNode::Internal(internal) => {
                     let children = internal.children().to_vec();
                     let child_height = match children.first() {
-                        Some(child) => match self.load_node(store, &child.child_hash).await? {
+                        Some(child) => match self
+                            .load_node_with_overlay(store, overlay, &child.child_hash)
+                            .await?
+                        {
                             DecodedNode::Leaf(_) => {
                                 if levels.is_empty() {
                                     levels.push(Vec::new());
@@ -1429,8 +1483,9 @@ impl TrackedStateTree {
                                 let mut child_height = None;
                                 for child in &children {
                                     let (_, height) = self
-                                        .collect_summary_levels_for_node(
+                                        .collect_summary_levels_for_node_with_overlay(
                                             store,
+                                            overlay,
                                             child.child_hash,
                                             levels,
                                         )
@@ -1453,7 +1508,7 @@ impl TrackedStateTree {
 
     async fn load_leaf_entries(
         &self,
-        store: &mut impl StorageReader,
+        store: &mut (impl StorageReader + ?Sized),
         hash: &[u8; TRACKED_STATE_HASH_BYTES],
     ) -> Result<Vec<EncodedLeafEntry>, LixError> {
         match self.load_node(store, hash).await? {
@@ -1465,12 +1520,40 @@ impl TrackedStateTree {
         }
     }
 
+    async fn load_leaf_entries_with_overlay(
+        &self,
+        store: &mut (impl StorageReader + ?Sized),
+        overlay: &storage::TrackedStateChunkOverlay,
+        hash: &[u8; TRACKED_STATE_HASH_BYTES],
+    ) -> Result<Vec<EncodedLeafEntry>, LixError> {
+        match self.load_node_with_overlay(store, overlay, hash).await? {
+            DecodedNode::Leaf(leaf) => Ok(leaf.entries().to_vec()),
+            DecodedNode::Internal(_) => Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state expected leaf chunk but found internal node",
+            )),
+        }
+    }
+
     async fn load_node(
         &self,
-        store: &mut impl StorageReader,
+        store: &mut (impl StorageReader + ?Sized),
         hash: &[u8; TRACKED_STATE_HASH_BYTES],
     ) -> Result<DecodedNode, LixError> {
         let bytes = storage::read_chunk(store, hash).await?.ok_or_else(|| {
+            LixError::new("LIX_ERROR_UNKNOWN", "tracked-state tree chunk is missing")
+        })?;
+        storage::verify_chunk_hash(hash, &bytes)?;
+        decode_node(&bytes)
+    }
+
+    async fn load_node_with_overlay(
+        &self,
+        store: &mut (impl StorageReader + ?Sized),
+        overlay: &storage::TrackedStateChunkOverlay,
+        hash: &[u8; TRACKED_STATE_HASH_BYTES],
+    ) -> Result<DecodedNode, LixError> {
+        let bytes = overlay.read_chunk(store, hash).await?.ok_or_else(|| {
             LixError::new("LIX_ERROR_UNKNOWN", "tracked-state tree chunk is missing")
         })?;
         storage::verify_chunk_hash(hash, &bytes)?;
@@ -2029,7 +2112,7 @@ mod tests {
     use super::*;
     use crate::backend::testing::UnitTestBackend;
     use crate::entity_identity::EntityIdentity;
-    use crate::storage::StorageContext;
+    use crate::storage::{StorageContext, StorageWriteTransaction};
 
     #[tokio::test]
     async fn exact_read_roundtrips_from_stored_root() {
@@ -2042,15 +2125,15 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        let result = tree
-            .apply_mutations(
-                &mut transaction.as_mut(),
-                None,
-                vec![TrackedStateMutation::put(key.clone(), value.clone())],
-                Some("commit-1"),
-            )
-            .await
-            .expect("mutations should apply");
+        let result = apply_mutations_for_test(
+            &tree,
+            transaction.as_mut(),
+            None,
+            vec![TrackedStateMutation::put(key.clone(), value.clone())],
+            Some("commit-1"),
+        )
+        .await
+        .expect("mutations should apply");
         transaction
             .commit()
             .await
@@ -2081,18 +2164,18 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        let result = tree
-            .apply_mutations(
-                &mut transaction.as_mut(),
-                None,
-                vec![
-                    TrackedStateMutation::put(key.clone(), value("change-old", Some("{\"v\":1}"))),
-                    TrackedStateMutation::put(key.clone(), value("change-new", Some("{\"v\":2}"))),
-                ],
-                None,
-            )
-            .await
-            .expect("mutations should apply");
+        let result = apply_mutations_for_test(
+            &tree,
+            transaction.as_mut(),
+            None,
+            vec![
+                TrackedStateMutation::put(key.clone(), value("change-old", Some("{\"v\":1}"))),
+                TrackedStateMutation::put(key.clone(), value("change-new", Some("{\"v\":2}"))),
+            ],
+            None,
+        )
+        .await
+        .expect("mutations should apply");
         transaction
             .commit()
             .await
@@ -2120,25 +2203,22 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        let result = tree
-            .apply_mutations(
-                &mut transaction.as_mut(),
-                None,
-                vec![
-                    TrackedStateMutation::put(
-                        key("schema-a", None, "visible"),
-                        value("c1", Some("{}")),
-                    ),
-                    TrackedStateMutation::put(key("schema-a", None, "deleted"), value("c2", None)),
-                    TrackedStateMutation::put(
-                        key("schema-b", None, "other"),
-                        value("c3", Some("{}")),
-                    ),
-                ],
-                None,
-            )
-            .await
-            .expect("mutations should apply");
+        let result = apply_mutations_for_test(
+            &tree,
+            transaction.as_mut(),
+            None,
+            vec![
+                TrackedStateMutation::put(
+                    key("schema-a", None, "visible"),
+                    value("c1", Some("{}")),
+                ),
+                TrackedStateMutation::put(key("schema-a", None, "deleted"), value("c2", None)),
+                TrackedStateMutation::put(key("schema-b", None, "other"), value("c3", Some("{}"))),
+            ],
+            None,
+        )
+        .await
+        .expect("mutations should apply");
         transaction
             .commit()
             .await
@@ -2172,32 +2252,32 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        let result = tree
-            .apply_mutations(
-                &mut transaction.as_mut(),
-                None,
-                vec![
-                    TrackedStateMutation::put(
-                        key("schema-a", Some("file-a"), "entity-a"),
-                        value("c1", Some("{}")),
-                    ),
-                    TrackedStateMutation::put(
-                        key("schema-a", Some("file-b"), "entity-a"),
-                        value("c2", Some("{}")),
-                    ),
-                    TrackedStateMutation::put(
-                        key("schema-a", Some("file-a"), "entity-b"),
-                        value("c3", Some("{}")),
-                    ),
-                    TrackedStateMutation::put(
-                        key("schema-b", Some("file-a"), "entity-a"),
-                        value("c4", Some("{}")),
-                    ),
-                ],
-                None,
-            )
-            .await
-            .expect("mutations should apply");
+        let result = apply_mutations_for_test(
+            &tree,
+            transaction.as_mut(),
+            None,
+            vec![
+                TrackedStateMutation::put(
+                    key("schema-a", Some("file-a"), "entity-a"),
+                    value("c1", Some("{}")),
+                ),
+                TrackedStateMutation::put(
+                    key("schema-a", Some("file-b"), "entity-a"),
+                    value("c2", Some("{}")),
+                ),
+                TrackedStateMutation::put(
+                    key("schema-a", Some("file-a"), "entity-b"),
+                    value("c3", Some("{}")),
+                ),
+                TrackedStateMutation::put(
+                    key("schema-b", Some("file-a"), "entity-a"),
+                    value("c4", Some("{}")),
+                ),
+            ],
+            None,
+        )
+        .await
+        .expect("mutations should apply");
         transaction
             .commit()
             .await
@@ -2238,33 +2318,30 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        let base = tree
-            .apply_mutations(
-                &mut transaction.as_mut(),
-                None,
-                vec![
-                    TrackedStateMutation::put(unchanged_key.clone(), value("c1", Some("{}"))),
-                    TrackedStateMutation::put(
-                        changed_key.clone(),
-                        value("c2", Some("{\"old\":true}")),
-                    ),
-                ],
-                None,
-            )
-            .await
-            .expect("base should build");
-        let next = tree
-            .apply_mutations(
-                &mut transaction.as_mut(),
-                Some(&base.root_id),
-                vec![TrackedStateMutation::put(
-                    changed_key.clone(),
-                    value("c3", Some("{\"new\":true}")),
-                )],
-                None,
-            )
-            .await
-            .expect("next should build");
+        let base = apply_mutations_for_test(
+            &tree,
+            transaction.as_mut(),
+            None,
+            vec![
+                TrackedStateMutation::put(unchanged_key.clone(), value("c1", Some("{}"))),
+                TrackedStateMutation::put(changed_key.clone(), value("c2", Some("{\"old\":true}"))),
+            ],
+            None,
+        )
+        .await
+        .expect("base should build");
+        let next = apply_mutations_for_test(
+            &tree,
+            transaction.as_mut(),
+            Some(&base.root_id),
+            vec![TrackedStateMutation::put(
+                changed_key.clone(),
+                value("c3", Some("{\"new\":true}")),
+            )],
+            None,
+        )
+        .await
+        .expect("next should build");
         transaction
             .commit()
             .await
@@ -2301,42 +2378,42 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        let base = tree
-            .apply_mutations(
-                &mut transaction.as_mut(),
-                None,
-                vec![TrackedStateMutation::put(
-                    shared_key.clone(),
-                    value("shared-change", Some("{\"shared\":true}")),
-                )],
-                Some("commit-base"),
-            )
-            .await
-            .expect("base root should build");
-        let branch_a = tree
-            .apply_mutations(
-                &mut transaction.as_mut(),
-                Some(&base.root_id),
-                vec![TrackedStateMutation::put(
-                    branch_a_key.clone(),
-                    value("branch-a-change", Some("{\"branch\":\"a\"}")),
-                )],
-                Some("commit-a"),
-            )
-            .await
-            .expect("branch a root should build");
-        let branch_b = tree
-            .apply_mutations(
-                &mut transaction.as_mut(),
-                Some(&base.root_id),
-                vec![TrackedStateMutation::put(
-                    branch_b_key.clone(),
-                    value("branch-b-change", Some("{\"branch\":\"b\"}")),
-                )],
-                Some("commit-b"),
-            )
-            .await
-            .expect("branch b root should build");
+        let base = apply_mutations_for_test(
+            &tree,
+            transaction.as_mut(),
+            None,
+            vec![TrackedStateMutation::put(
+                shared_key.clone(),
+                value("shared-change", Some("{\"shared\":true}")),
+            )],
+            Some("commit-base"),
+        )
+        .await
+        .expect("base root should build");
+        let branch_a = apply_mutations_for_test(
+            &tree,
+            transaction.as_mut(),
+            Some(&base.root_id),
+            vec![TrackedStateMutation::put(
+                branch_a_key.clone(),
+                value("branch-a-change", Some("{\"branch\":\"a\"}")),
+            )],
+            Some("commit-a"),
+        )
+        .await
+        .expect("branch a root should build");
+        let branch_b = apply_mutations_for_test(
+            &tree,
+            transaction.as_mut(),
+            Some(&base.root_id),
+            vec![TrackedStateMutation::put(
+                branch_b_key.clone(),
+                value("branch-b-change", Some("{\"branch\":\"b\"}")),
+            )],
+            Some("commit-b"),
+        )
+        .await
+        .expect("branch b root should build");
         transaction
             .commit()
             .await
@@ -2391,22 +2468,21 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        let base = tree
-            .apply_mutations(&mut transaction.as_mut(), None, rows, None)
+        let base = apply_mutations_for_test(&tree, transaction.as_mut(), None, rows, None)
             .await
             .expect("base should build");
-        let fast = tree
-            .apply_mutations(
-                &mut transaction.as_mut(),
-                Some(&base.root_id),
-                vec![TrackedStateMutation::put(
-                    changed_key.clone(),
-                    changed_value.clone(),
-                )],
-                None,
-            )
-            .await
-            .expect("fast path should apply");
+        let fast = apply_mutations_for_test(
+            &tree,
+            transaction.as_mut(),
+            Some(&base.root_id),
+            vec![TrackedStateMutation::put(
+                changed_key.clone(),
+                changed_value.clone(),
+            )],
+            None,
+        )
+        .await
+        .expect("fast path should apply");
         let mut canonical_entries = tree
             .collect_leaf_entries(&mut transaction.as_mut(), &base.root_id)
             .await
@@ -2450,22 +2526,21 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        let base = tree
-            .apply_mutations(&mut transaction.as_mut(), None, rows, None)
+        let base = apply_mutations_for_test(&tree, transaction.as_mut(), None, rows, None)
             .await
             .expect("base should build");
-        let fast = tree
-            .apply_mutations(
-                &mut transaction.as_mut(),
-                Some(&base.root_id),
-                vec![TrackedStateMutation::put(
-                    inserted_key.clone(),
-                    inserted_value.clone(),
-                )],
-                None,
-            )
-            .await
-            .expect("fast path should apply");
+        let fast = apply_mutations_for_test(
+            &tree,
+            transaction.as_mut(),
+            Some(&base.root_id),
+            vec![TrackedStateMutation::put(
+                inserted_key.clone(),
+                inserted_value.clone(),
+            )],
+            None,
+        )
+        .await
+        .expect("fast path should apply");
         let mut canonical_entries = tree
             .collect_leaf_entries(&mut transaction.as_mut(), &base.root_id)
             .await
@@ -2521,19 +2596,18 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        let base = tree
-            .apply_mutations(&mut transaction.as_mut(), None, rows, None)
+        let base = apply_mutations_for_test(&tree, transaction.as_mut(), None, rows, None)
             .await
             .expect("base should build");
-        let fast = tree
-            .apply_mutations(
-                &mut transaction.as_mut(),
-                Some(&base.root_id),
-                updates.clone(),
-                None,
-            )
-            .await
-            .expect("batch path should apply");
+        let fast = apply_mutations_for_test(
+            &tree,
+            transaction.as_mut(),
+            Some(&base.root_id),
+            updates.clone(),
+            None,
+        )
+        .await
+        .expect("batch path should apply");
         let mut canonical_entries = tree
             .collect_leaf_entries(&mut transaction.as_mut(), &base.root_id)
             .await
@@ -2588,19 +2662,18 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        let base = tree
-            .apply_mutations(&mut transaction.as_mut(), None, rows, None)
+        let base = apply_mutations_for_test(&tree, transaction.as_mut(), None, rows, None)
             .await
             .expect("base should build");
-        let fast = tree
-            .apply_mutations(
-                &mut transaction.as_mut(),
-                Some(&base.root_id),
-                inserts.clone(),
-                None,
-            )
-            .await
-            .expect("batch path should apply");
+        let fast = apply_mutations_for_test(
+            &tree,
+            transaction.as_mut(),
+            Some(&base.root_id),
+            inserts.clone(),
+            None,
+        )
+        .await
+        .expect("batch path should apply");
         let mut canonical_entries = tree
             .collect_leaf_entries(&mut transaction.as_mut(), &base.root_id)
             .await
@@ -2625,6 +2698,21 @@ mod tests {
             .expect("canonical root should build");
 
         assert_eq!(fast.root_id, canonical.root_id);
+    }
+
+    async fn apply_mutations_for_test(
+        tree: &TrackedStateTree,
+        transaction: &mut dyn StorageWriteTransaction,
+        base_root: Option<&TrackedStateRootId>,
+        mutations: Vec<TrackedStateMutation>,
+        commit_id: Option<&str>,
+    ) -> Result<TrackedStateApplyResult, LixError> {
+        let mut writes = StorageWriteSet::new();
+        let result = tree
+            .apply_mutations(transaction, &mut writes, base_root, mutations, commit_id)
+            .await?;
+        writes.apply(transaction).await?;
+        Ok(result)
     }
 
     fn key(schema_key: &str, file_id: Option<&str>, entity_id: &str) -> TrackedStateKey {

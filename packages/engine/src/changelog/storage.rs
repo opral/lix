@@ -45,7 +45,7 @@ pub(crate) async fn scan_changes(
     page.values.iter().map(decode_change).collect()
 }
 
-pub(crate) fn append_changes(
+pub(crate) fn stage_changes(
     writes: &mut StorageWriteSet,
     changes: &[CanonicalChange],
 ) -> Result<(), LixError> {
@@ -183,15 +183,15 @@ mod tests {
         changes: &[MaterializedCanonicalChange],
     ) {
         let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+        let mut json_writer = JsonStoreContext::new().writer();
         let canonical_changes = changes
             .iter()
-            .map(|change| canonicalize_materialized_change(&mut json_writer, change))
+            .map(|change| canonicalize_materialized_change(&mut writes, &mut json_writer, change))
             .collect::<Result<Vec<_>, _>>()
             .expect("changes should canonicalize");
         let mut writer = changelog.writer(&mut writes);
         writer
-            .append_changes(&canonical_changes)
+            .stage_changes(&canonical_changes)
             .expect("append should succeed");
         writes
             .apply(&mut tx.as_mut())

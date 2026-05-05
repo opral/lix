@@ -39,9 +39,15 @@ pub(crate) async fn seed_version_head_with_rows(
     let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
     let mut writes = StorageWriteSet::new();
     let canonical_row = {
-        let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+        let mut json_writer = JsonStoreContext::new().writer();
         version_ctx
-            .canonical_ref_row(&mut json_writer, version_id, commit_id, TEST_TIMESTAMP)
+            .canonical_ref_row(
+                &mut writes,
+                &mut json_writer,
+                version_id,
+                commit_id,
+                TEST_TIMESTAMP,
+            )
             .expect("version ref should canonicalize")
     };
     version_ctx
@@ -51,9 +57,24 @@ pub(crate) async fn seed_version_head_with_rows(
         .apply(&mut transaction.as_mut())
         .await
         .expect("version ref should write");
-    TrackedStateContext::new()
-        .writer(transaction.as_mut())
-        .write_root(commit_id, None, rows)
+    let mut writes = StorageWriteSet::new();
+    {
+        let mut json_writer = JsonStoreContext::new().writer();
+        TrackedStateContext::new()
+            .writer()
+            .stage_root(
+                &mut transaction.as_mut(),
+                &mut writes,
+                &mut json_writer,
+                commit_id,
+                None,
+                rows,
+            )
+            .await
+            .expect("tracked root should write");
+    }
+    writes
+        .apply(&mut transaction.as_mut())
         .await
         .expect("tracked root should write");
     transaction.commit().await.expect("seed should commit");

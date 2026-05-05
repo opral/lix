@@ -1,14 +1,15 @@
 use crate::json_store::{JsonRef, JsonStoreReader, JsonStoreWriter};
-use crate::storage::StorageReader;
+use crate::storage::{StorageReader, StorageWriteSet};
 use crate::untracked_state::{MaterializedUntrackedStateRow, UntrackedStateRow};
 use crate::{serialize_row_metadata, validate_row_metadata, LixError, RowMetadata};
 
 pub(crate) fn canonicalize_materialized_row(
-    json_writer: &mut JsonStoreWriter<'_>,
+    writes: &mut StorageWriteSet,
+    json_writer: &mut JsonStoreWriter,
     row: &MaterializedUntrackedStateRow,
 ) -> Result<UntrackedStateRow, LixError> {
-    let snapshot_ref = stage_optional_json(json_writer, row.snapshot_content.as_deref())?;
-    let metadata_ref = stage_optional_metadata(json_writer, row.metadata.as_ref())?;
+    let snapshot_ref = stage_optional_json(writes, json_writer, row.snapshot_content.as_deref())?;
+    let metadata_ref = stage_optional_metadata(writes, json_writer, row.metadata.as_ref())?;
     Ok(UntrackedStateRow {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
@@ -81,24 +82,28 @@ impl UntrackedMaterializationProjection {
 }
 
 fn stage_optional_json(
-    json_writer: &mut JsonStoreWriter<'_>,
+    writes: &mut StorageWriteSet,
+    json_writer: &mut JsonStoreWriter,
     value: Option<&str>,
 ) -> Result<Option<JsonRef>, LixError> {
     let Some(value) = value else {
         return Ok(None);
     };
-    json_writer.stage_bytes(value.as_bytes()).map(Some)
+    json_writer.stage_bytes(writes, value.as_bytes()).map(Some)
 }
 
 fn stage_optional_metadata(
-    json_writer: &mut JsonStoreWriter<'_>,
+    writes: &mut StorageWriteSet,
+    json_writer: &mut JsonStoreWriter,
     value: Option<&RowMetadata>,
 ) -> Result<Option<JsonRef>, LixError> {
     let Some(value) = value else {
         return Ok(None);
     };
     let serialized = serialize_row_metadata(value);
-    json_writer.stage_bytes(serialized.as_bytes()).map(Some)
+    json_writer
+        .stage_bytes(writes, serialized.as_bytes())
+        .map(Some)
 }
 
 async fn load_optional_metadata<S>(

@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use crate::functions::FunctionContext;
+use crate::json_store::JsonStoreContext;
 use crate::sql2;
-use crate::storage::StorageReadScope;
+use crate::storage::{StorageReadScope, StorageWriteSet};
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
 use super::context::{SessionContext, SessionSqlExecutionContext};
@@ -370,9 +371,18 @@ impl SessionContext {
         runtime_functions: &FunctionContext,
     ) -> Result<(), LixError> {
         let mut transaction = self.storage.begin_write_transaction().await?;
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer();
         runtime_functions
-            .persist_if_needed(&mut self.live_state.writer(transaction.as_mut()))
+            .stage_persist_if_needed(
+                &mut self.live_state.writer(transaction.as_mut()),
+                &mut writes,
+                &mut json_writer,
+            )
             .await?;
+        if !writes.is_empty() {
+            writes.apply(&mut transaction.as_mut()).await?;
+        }
         transaction.commit().await
     }
 }

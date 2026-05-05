@@ -1,6 +1,6 @@
 use crate::commit_graph::CommitGraphContext;
-use crate::json_store::JsonStoreContext;
-use crate::storage::{StorageReader, StorageWriteSet, StorageWriter};
+use crate::json_store::{JsonStoreContext, JsonStoreWriter};
+use crate::storage::{StorageReader, StorageWriteSet};
 use crate::tracked_state::by_file_index::ByFileIndex;
 use crate::tracked_state::diff::{diff_commits, TrackedStateDiff, TrackedStateDiffRequest};
 use crate::tracked_state::materialize_value;
@@ -41,34 +41,34 @@ impl TrackedStateContext {
         }
     }
 
-    /// Creates a tracked-state writer over a caller-provided KV writer.
-    pub(crate) fn writer<S>(&self, store: S) -> TrackedStateWriter<S>
-    where
-        S: StorageWriter,
-    {
+    /// Creates a tracked-state writer that stages into a caller-owned write set.
+    pub(crate) fn writer(&self) -> TrackedStateWriter {
         TrackedStateWriter {
-            store,
             tree: self.tree.clone(),
         }
     }
 
     /// Rebuilds tracked state at one commit from commit-graph entities.
-    pub(crate) async fn rebuild_state_at_commit<R, W>(
+    pub(crate) async fn rebuild_state_at_commit<R, S>(
         &self,
         commit_graph: &CommitGraphContext,
         read_store: R,
-        write_store: W,
+        tracked_store: &mut S,
+        writes: &mut StorageWriteSet,
+        json_writer: &mut JsonStoreWriter,
         head_commit_id: &str,
     ) -> Result<TrackedStateRebuildReport, LixError>
     where
         R: StorageReader,
-        W: StorageWriter,
+        S: StorageReader + ?Sized,
     {
         crate::tracked_state::rebuild::rebuild_state_at_commit(
             self,
             commit_graph,
             read_store,
-            write_store,
+            tracked_store,
+            writes,
+            json_writer,
             head_commit_id,
         )
         .await
@@ -305,33 +305,28 @@ where
 }
 
 /// Writer for rebuildable tracked-state roots.
-pub(crate) struct TrackedStateWriter<S> {
-    store: S,
+pub(crate) struct TrackedStateWriter {
     tree: TrackedStateTree,
 }
 
-impl<S> TrackedStateWriter<S>
-where
-    S: StorageWriter,
-{
-    /// Writes one root for `commit_id` from the provided row set.
+impl TrackedStateWriter {
+    /// Stages one root for `commit_id` from the provided row set.
     ///
     /// `parent_commit_id` is the tracked-state root to layer mutations on top
     /// of. Rebuild passes `None` because it has already materialized the full
     /// entity set for the requested head.
-    pub(crate) async fn write_root(
+    pub(crate) async fn stage_root(
         &mut self,
+        store: &mut (impl StorageReader + ?Sized),
+        writes: &mut StorageWriteSet,
+        json_writer: &mut JsonStoreWriter,
         commit_id: &str,
         parent_commit_id: Option<&str>,
         rows: &[TrackedStateRow],
     ) -> Result<TrackedStateWriteReceipt, LixError> {
         let base_root = match parent_commit_id {
             Some(parent_commit_id) => {
-                let Some(root) = self
-                    .tree
-                    .load_root(&mut self.store, parent_commit_id)
-                    .await?
-                else {
+                let Some(root) = self.tree.load_root(store, parent_commit_id).await? else {
                     return Err(LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!(
@@ -345,22 +340,20 @@ where
         };
         let mut stored_rows = Vec::with_capacity(rows.len());
         let mut mutations = Vec::with_capacity(rows.len());
-        let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer(&mut writes);
         for row in rows {
             let stored_value =
-                crate::tracked_state::canonicalize_materialized_row(&mut json_writer, row)?;
+                crate::tracked_state::canonicalize_materialized_row(writes, json_writer, row)?;
             mutations.push(TrackedStateMutation::put(
                 TrackedStateKey::from_row(row),
                 stored_value.clone(),
             ));
             stored_rows.push((row, stored_value));
         }
-        writes.apply(&mut self.store).await?;
         let result = self
             .tree
             .apply_mutations(
-                &mut self.store,
+                store,
+                writes,
                 base_root.as_ref(),
                 mutations,
                 Some(commit_id),
@@ -368,7 +361,7 @@ where
             .await?;
 
         let by_file_base_root = match parent_commit_id {
-            Some(parent_commit_id) => storage::load_by_file_root(&mut self.store, parent_commit_id)
+            Some(parent_commit_id) => storage::load_by_file_root(store, parent_commit_id)
                 .await?
                 .ok_or_else(|| {
                     LixError::new(
@@ -391,13 +384,14 @@ where
         let by_file_result = self
             .tree
             .apply_mutations(
-                &mut self.store,
+                store,
+                writes,
                 by_file_base_root.as_ref(),
                 by_file_mutations,
                 None,
             )
             .await?;
-        storage::store_by_file_root(&mut self.store, commit_id, &by_file_result.root_id).await?;
+        storage::stage_by_file_root(writes, commit_id, &by_file_result.root_id);
         Ok(TrackedStateWriteReceipt {
             commit_id: commit_id.to_string(),
             row_count: result.row_count,
@@ -410,11 +404,12 @@ where
     /// rebuild/corruption tests where the changelog remains authoritative and
     /// the tracked-state projection must be recreated from the commit id.
     #[cfg(test)]
-    pub(crate) async fn delete_root_for_rebuild(
+    pub(crate) fn stage_delete_root_for_rebuild(
         &mut self,
+        writes: &mut StorageWriteSet,
         commit_id: &str,
-    ) -> Result<(), LixError> {
-        storage::delete_root(&mut self.store, commit_id).await
+    ) {
+        storage::stage_delete_root(writes, commit_id)
     }
 }
 
@@ -471,7 +466,7 @@ mod tests {
 
     use super::*;
     use crate::backend::{testing::UnitTestBackend, Backend};
-    use crate::storage::StorageContext;
+    use crate::storage::{StorageContext, StorageWriteSet, StorageWriteTransaction};
     use crate::NullableKeyFilter;
 
     #[tokio::test]
@@ -484,15 +479,15 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        let error = tracked_state
-            .writer(transaction.as_mut())
-            .write_root(
-                "commit-child",
-                Some("missing-parent"),
-                &[row("entity-child", "change-child", "commit-child")],
-            )
-            .await
-            .expect_err("parent root must exist when parent_commit_id is provided");
+        let error = write_root_for_test(
+            transaction.as_mut(),
+            &tracked_state,
+            "commit-child",
+            Some("missing-parent"),
+            &[row("entity-child", "change-child", "commit-child")],
+        )
+        .await
+        .expect_err("parent root must exist when parent_commit_id is provided");
 
         assert!(
             error.message.contains("parent root") && error.message.contains("missing-parent"),
@@ -626,11 +621,15 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        tracked_state
-            .writer(transaction.as_mut())
-            .write_root("commit-1", None, &[file_a, file_b])
-            .await
-            .expect("root should write");
+        write_root_for_test(
+            transaction.as_mut(),
+            &tracked_state,
+            "commit-1",
+            None,
+            &[file_a, file_b],
+        )
+        .await
+        .expect("root should write");
         transaction
             .commit()
             .await
@@ -672,11 +671,15 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        tracked_state
-            .writer(transaction.as_mut())
-            .write_root("commit-1", None, std::slice::from_ref(&row))
-            .await
-            .expect("root should write");
+        write_root_for_test(
+            transaction.as_mut(),
+            &tracked_state,
+            "commit-1",
+            None,
+            std::slice::from_ref(&row),
+        )
+        .await
+        .expect("root should write");
         transaction
             .commit()
             .await
@@ -731,11 +734,15 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        tracked_state
-            .writer(transaction.as_mut())
-            .write_root("commit-1", None, &[live, deleted])
-            .await
-            .expect("root should write");
+        write_root_for_test(
+            transaction.as_mut(),
+            &tracked_state,
+            "commit-1",
+            None,
+            &[live, deleted],
+        )
+        .await
+        .expect("root should write");
         transaction
             .commit()
             .await
@@ -778,11 +785,15 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        tracked_state
-            .writer(transaction.as_mut())
-            .write_root("commit-1", None, std::slice::from_ref(&row))
-            .await
-            .expect("root should write");
+        write_root_for_test(
+            transaction.as_mut(),
+            &tracked_state,
+            "commit-1",
+            None,
+            std::slice::from_ref(&row),
+        )
+        .await
+        .expect("root should write");
         transaction
             .commit()
             .await
@@ -822,11 +833,15 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        tracked_state
-            .writer(transaction.as_mut())
-            .write_root("commit-1", None, std::slice::from_ref(&row))
-            .await
-            .expect("root should write");
+        write_root_for_test(
+            transaction.as_mut(),
+            &tracked_state,
+            "commit-1",
+            None,
+            std::slice::from_ref(&row),
+        )
+        .await
+        .expect("root should write");
         transaction
             .commit()
             .await
@@ -862,21 +877,33 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        tracked_state
-            .writer(transaction.as_mut())
-            .write_root("base", None, base_rows)
-            .await
-            .expect("base root should write");
-        tracked_state
-            .writer(transaction.as_mut())
-            .write_root("target", None, target_rows)
-            .await
-            .expect("target root should write");
-        tracked_state
-            .writer(transaction.as_mut())
-            .write_root("source", None, source_rows)
-            .await
-            .expect("source root should write");
+        write_root_for_test(
+            transaction.as_mut(),
+            &tracked_state,
+            "base",
+            None,
+            base_rows,
+        )
+        .await
+        .expect("base root should write");
+        write_root_for_test(
+            transaction.as_mut(),
+            &tracked_state,
+            "target",
+            None,
+            target_rows,
+        )
+        .await
+        .expect("target root should write");
+        write_root_for_test(
+            transaction.as_mut(),
+            &tracked_state,
+            "source",
+            None,
+            source_rows,
+        )
+        .await
+        .expect("source root should write");
         transaction
             .commit()
             .await
@@ -896,6 +923,32 @@ mod tests {
             .iter()
             .map(|entry| entry.identity.entity_id.as_string().expect("identity"))
             .collect()
+    }
+
+    async fn write_root_for_test(
+        transaction: &mut dyn StorageWriteTransaction,
+        tracked_state: &TrackedStateContext,
+        commit_id: &str,
+        parent_commit_id: Option<&str>,
+        rows: &[TrackedStateRow],
+    ) -> Result<TrackedStateWriteReceipt, LixError> {
+        let mut writes = StorageWriteSet::new();
+        let receipt = {
+            let mut json_writer = JsonStoreContext::new().writer();
+            tracked_state
+                .writer()
+                .stage_root(
+                    transaction,
+                    &mut writes,
+                    &mut json_writer,
+                    commit_id,
+                    parent_commit_id,
+                    rows,
+                )
+                .await?
+        };
+        writes.apply(transaction).await?;
+        Ok(receipt)
     }
 
     fn tombstone(entity_id: &str, change_id: &str, commit_id: &str) -> TrackedStateRow {

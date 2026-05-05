@@ -146,19 +146,20 @@ pub(super) struct VersionRefWriter<'a> {
 }
 
 impl VersionRefWriter<'_> {
-    pub(crate) fn write_rows(&mut self, rows: &[UntrackedStateRow]) -> Result<(), LixError> {
-        self.untracked_state.writer(self.writes).write_rows(rows)
+    pub(crate) fn stage_rows(&mut self, rows: &[UntrackedStateRow]) -> Result<(), LixError> {
+        self.untracked_state.writer(self.writes).stage_rows(rows)
     }
 }
 
 pub(super) fn canonical_version_ref_row(
-    json_writer: &mut JsonStoreWriter<'_>,
+    writes: &mut StorageWriteSet,
+    json_writer: &mut JsonStoreWriter,
     version_id: &str,
     commit_id: &str,
     timestamp: &str,
 ) -> Result<UntrackedStateRow, LixError> {
     let row = version_ref_row(version_id, commit_id, timestamp)?;
-    canonicalize_materialized_row(json_writer, &row)
+    canonicalize_materialized_row(writes, json_writer, &row)
 }
 
 fn decode_version_head(
@@ -369,13 +370,13 @@ mod tests {
         row.snapshot_content = Some("{not-json".to_string());
         let mut writes = StorageWriteSet::new();
         let canonical_row = {
-            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
-            canonicalize_materialized_row(&mut json_writer, &row)
+            let mut json_writer = JsonStoreContext::new().writer();
+            canonicalize_materialized_row(&mut writes, &mut json_writer, &row)
                 .expect("malformed row should canonicalize for test setup")
         };
         untracked_state
             .writer(&mut writes)
-            .write_rows(&[canonical_row])
+            .stage_rows(&[canonical_row])
             .expect("malformed row should write for test setup");
         writes
             .apply(&mut transaction.as_mut())
@@ -412,9 +413,9 @@ mod tests {
         timestamp: &str,
     ) -> Result<(), LixError> {
         let canonical_row = {
-            let mut json_writer = JsonStoreContext::new().writer(writes);
-            canonical_version_ref_row(&mut json_writer, version_id, commit_id, timestamp)?
+            let mut json_writer = JsonStoreContext::new().writer();
+            canonical_version_ref_row(writes, &mut json_writer, version_id, commit_id, timestamp)?
         };
-        version_ref.writer(writes).write_rows(&[canonical_row])
+        version_ref.writer(writes).stage_rows(&[canonical_row])
     }
 }

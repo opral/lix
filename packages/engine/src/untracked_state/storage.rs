@@ -62,7 +62,7 @@ pub(crate) async fn load_row(
     .map(Some)
 }
 
-pub(crate) fn write_rows(
+pub(crate) fn stage_rows(
     writes: &mut StorageWriteSet,
     rows: &[UntrackedStateRow],
 ) -> Result<(), LixError> {
@@ -84,7 +84,10 @@ pub(crate) fn write_rows(
     Ok(())
 }
 
-pub(crate) fn delete_rows(writes: &mut StorageWriteSet, identities: &[UntrackedStateIdentity]) {
+pub(crate) fn stage_delete_rows(
+    writes: &mut StorageWriteSet,
+    identities: &[UntrackedStateIdentity],
+) {
     for identity in identities {
         writes.delete(
             UNTRACKED_STATE_ROW_NAMESPACE,
@@ -175,25 +178,25 @@ mod tests {
 
     use super::*;
     use crate::backend::testing::UnitTestBackend;
-    use crate::storage::{StorageContext, StorageWriter};
+    use crate::storage::{StorageContext, StorageWriteTransaction};
     use crate::untracked_state::{canonicalize_materialized_row, UntrackedStateContext};
 
     async fn write_materialized_rows_to_store(
         context: &UntrackedStateContext,
-        store: &mut (impl StorageWriter + ?Sized),
+        store: &mut (impl StorageWriteTransaction + ?Sized),
         rows: &[MaterializedUntrackedStateRow],
     ) {
         let mut writes = StorageWriteSet::new();
         let canonical_rows = {
-            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            let mut json_writer = JsonStoreContext::new().writer();
             rows.iter()
-                .map(|row| canonicalize_materialized_row(&mut json_writer, row))
+                .map(|row| canonicalize_materialized_row(&mut writes, &mut json_writer, row))
                 .collect::<Result<Vec<_>, _>>()
                 .expect("rows should canonicalize")
         };
         context
             .writer(&mut writes)
-            .write_rows(&canonical_rows)
+            .stage_rows(&canonical_rows)
             .expect("rows should write");
         writes.apply(store).await.expect("rows should apply");
     }
@@ -294,14 +297,15 @@ mod tests {
             .expect("transaction should open");
         let mut writes = StorageWriteSet::new();
         let canonical_row = {
-            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
-            canonicalize_materialized_row(&mut json_writer, &row).expect("row should canonicalize")
+            let mut json_writer = JsonStoreContext::new().writer();
+            canonicalize_materialized_row(&mut writes, &mut json_writer, &row)
+                .expect("row should canonicalize")
         };
         let mut writer = context.writer(&mut writes);
         writer
-            .write_rows(&[canonical_row])
+            .stage_rows(&[canonical_row])
             .expect("write should succeed");
-        writer.delete_rows(&[identity]);
+        writer.stage_delete_rows(&[identity]);
         writes
             .apply(&mut transaction.as_mut())
             .await

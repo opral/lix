@@ -1,15 +1,16 @@
 use crate::json_store::{JsonRef, JsonStoreReader, JsonStoreWriter};
-use crate::storage::StorageReader;
+use crate::storage::{StorageReader, StorageWriteSet};
 use crate::tracked_state::tree_types::{TrackedStateKey, TrackedStateValue};
 use crate::tracked_state::TrackedStateRow;
 use crate::{serialize_row_metadata, validate_row_metadata, LixError, RowMetadata};
 
 pub(crate) fn canonicalize_materialized_row(
-    json_writer: &mut JsonStoreWriter<'_>,
+    writes: &mut StorageWriteSet,
+    json_writer: &mut JsonStoreWriter,
     row: &TrackedStateRow,
 ) -> Result<TrackedStateValue, LixError> {
-    let snapshot_ref = stage_optional_json(json_writer, row.snapshot_content.as_deref())?;
-    let metadata_ref = stage_optional_metadata(json_writer, row.metadata.as_ref())?;
+    let snapshot_ref = stage_optional_json(writes, json_writer, row.snapshot_content.as_deref())?;
+    let metadata_ref = stage_optional_metadata(writes, json_writer, row.metadata.as_ref())?;
     Ok(TrackedStateValue::from_row_refs(
         row,
         snapshot_ref,
@@ -65,24 +66,28 @@ impl TrackedMaterializationProjection {
 }
 
 fn stage_optional_json(
-    json_writer: &mut JsonStoreWriter<'_>,
+    writes: &mut StorageWriteSet,
+    json_writer: &mut JsonStoreWriter,
     value: Option<&str>,
 ) -> Result<Option<JsonRef>, LixError> {
     let Some(value) = value else {
         return Ok(None);
     };
-    json_writer.stage_bytes(value.as_bytes()).map(Some)
+    json_writer.stage_bytes(writes, value.as_bytes()).map(Some)
 }
 
 fn stage_optional_metadata(
-    json_writer: &mut JsonStoreWriter<'_>,
+    writes: &mut StorageWriteSet,
+    json_writer: &mut JsonStoreWriter,
     value: Option<&RowMetadata>,
 ) -> Result<Option<JsonRef>, LixError> {
     let Some(value) = value else {
         return Ok(None);
     };
     let serialized = serialize_row_metadata(value);
-    json_writer.stage_bytes(serialized.as_bytes()).map(Some)
+    json_writer
+        .stage_bytes(writes, serialized.as_bytes())
+        .map(Some)
 }
 
 async fn load_optional_metadata<S>(

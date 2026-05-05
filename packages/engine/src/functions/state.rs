@@ -2,8 +2,9 @@ use serde_json::Value as JsonValue;
 
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{DeterministicMode, DeterministicSequence};
+use crate::json_store::JsonStoreWriter;
 use crate::live_state::{LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateWriter};
-use crate::storage::StorageWriter;
+use crate::storage::{StorageReader, StorageWriteSet};
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
@@ -45,13 +46,15 @@ pub(crate) async fn load_sequence(
 ///
 /// The row is untracked global `lix_key_value` state: it is durable local
 /// runtime state, not a changelog fact.
-pub(crate) async fn write_sequence<S>(
+pub(crate) async fn stage_sequence<S>(
     writer: &mut LiveStateWriter<S>,
+    writes: &mut StorageWriteSet,
+    json_writer: &mut JsonStoreWriter,
     sequence: DeterministicSequence,
     timestamp: &str,
 ) -> Result<(), LixError>
 where
-    S: StorageWriter,
+    S: StorageReader,
 {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "key": DETERMINISTIC_SEQUENCE_KEY,
@@ -68,7 +71,7 @@ where
         snapshot_content,
         timestamp.to_string(),
     );
-    writer.write_rows(&[row]).await
+    writer.stage_rows(writes, json_writer, &[row]).await
 }
 
 async fn load_key_value_row(
@@ -278,15 +281,25 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        let mut writer = live_state.writer(tx.as_mut());
 
-        write_sequence(
-            &mut writer,
-            DeterministicSequence { highest_seen: 7 },
-            "1970-01-01T00:00:00.000Z",
-        )
-        .await
-        .expect("sequence should persist");
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
+        {
+            let mut writer = live_state.writer(tx.as_mut());
+            stage_sequence(
+                &mut writer,
+                &mut writes,
+                &mut json_writer,
+                DeterministicSequence { highest_seen: 7 },
+                "1970-01-01T00:00:00.000Z",
+            )
+            .await
+            .expect("sequence should stage");
+        }
+        writes
+            .apply(&mut tx.as_mut())
+            .await
+            .expect("sequence should apply");
         tx.commit().await.expect("transaction should commit");
 
         let reader = live_state.reader(storage.clone());
@@ -332,11 +345,19 @@ mod tests {
             snapshot_content,
             "1970-01-01T00:00:00.000Z".to_string(),
         );
-        live_state
-            .writer(tx.as_mut())
-            .write_rows(&[row])
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
+        {
+            let mut writer = live_state.writer(tx.as_mut());
+            writer
+                .stage_rows(&mut writes, &mut json_writer, &[row])
+                .await
+                .expect("test key-value should stage");
+        }
+        writes
+            .apply(&mut tx.as_mut())
             .await
-            .expect("test key-value should write");
+            .expect("test key-value should apply");
         tx.commit().await.expect("transaction should commit");
     }
 }

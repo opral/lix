@@ -33,12 +33,13 @@ impl VersionContext {
 
     pub(crate) fn canonical_ref_row(
         &self,
-        json_writer: &mut JsonStoreWriter<'_>,
+        writes: &mut StorageWriteSet,
+        json_writer: &mut JsonStoreWriter,
         version_id: &str,
         commit_id: &str,
         timestamp: &str,
     ) -> Result<UntrackedStateRow, crate::LixError> {
-        canonical_version_ref_row(json_writer, version_id, commit_id, timestamp)
+        canonical_version_ref_row(writes, json_writer, version_id, commit_id, timestamp)
     }
 
     pub(crate) fn stage_canonical_ref_rows(
@@ -46,6 +47,6 @@ impl VersionContext {
         writes: &mut StorageWriteSet,
         rows: &[UntrackedStateRow],
     ) -> Result<(), crate::LixError> {
-        self.refs.writer(writes).write_rows(rows)
+        self.refs.writer(writes).stage_rows(rows)
     }
 }

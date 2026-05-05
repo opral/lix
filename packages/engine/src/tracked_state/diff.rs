@@ -180,7 +180,8 @@ mod tests {
 
     use super::*;
     use crate::backend::testing::UnitTestBackend;
-    use crate::storage::StorageContext;
+    use crate::json_store::JsonStoreContext;
+    use crate::storage::{StorageContext, StorageWriteSet, StorageWriteTransaction};
     use crate::tracked_state::TrackedStateContext;
     use crate::NullableKeyFilter;
 
@@ -394,18 +395,40 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        tracked_state
-            .writer(tx.as_mut())
-            .write_root("left", None, left_rows)
+        write_root_for_test(tx.as_mut(), &tracked_state, "left", None, left_rows)
             .await
             .expect("left root should write");
-        tracked_state
-            .writer(tx.as_mut())
-            .write_root("right", None, right_rows)
+        write_root_for_test(tx.as_mut(), &tracked_state, "right", None, right_rows)
             .await
             .expect("right root should write");
         tx.commit().await.expect("transaction should commit");
         (storage, tracked_state)
+    }
+
+    async fn write_root_for_test(
+        tx: &mut dyn StorageWriteTransaction,
+        tracked_state: &TrackedStateContext,
+        commit_id: &str,
+        parent_commit_id: Option<&str>,
+        rows: &[TrackedStateRow],
+    ) -> Result<(), LixError> {
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut json_writer = JsonStoreContext::new().writer();
+            tracked_state
+                .writer()
+                .stage_root(
+                    tx,
+                    &mut writes,
+                    &mut json_writer,
+                    commit_id,
+                    parent_commit_id,
+                    rows,
+                )
+                .await?;
+        }
+        writes.apply(tx).await?;
+        Ok(())
     }
 
     fn kinds(diff: &TrackedStateDiff) -> Vec<(String, TrackedStateDiffKind)> {

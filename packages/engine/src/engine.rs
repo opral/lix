@@ -5,11 +5,12 @@ use crate::changelog::ChangelogContext;
 use crate::commit_graph::CommitGraphContext;
 use crate::entity_identity::EntityIdentity;
 use crate::init::InitReceipt;
+use crate::json_store::JsonStoreContext;
 use crate::live_state::LiveStateContext;
 use crate::live_state::LiveStateRowRequest;
 use crate::schema_registry::SchemaRegistry;
 use crate::session::SessionContext;
-use crate::storage::StorageContext;
+use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::TrackedStateContext;
 use crate::untracked_state::UntrackedStateContext;
 use crate::version::{VersionContext, VersionRefReader};
@@ -172,12 +173,16 @@ impl Engine {
         let storage = self.storage();
         let mut read_transaction = storage.begin_read_transaction().await?;
         let mut transaction = storage.begin_write_transaction().await?;
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer();
         let rebuild_result = self
             .tracked_state
             .rebuild_state_at_commit(
                 &commit_graph,
                 read_transaction.as_mut(),
                 transaction.as_mut(),
+                &mut writes,
+                &mut json_writer,
                 &head_commit_id,
             )
             .await;
@@ -187,6 +192,10 @@ impl Engine {
             return Err(error);
         }
         if let Err(error) = read_transaction.rollback().await {
+            let _ = transaction.rollback().await;
+            return Err(error);
+        }
+        if let Err(error) = writes.apply(&mut transaction.as_mut()).await {
             let _ = transaction.rollback().await;
             return Err(error);
         }

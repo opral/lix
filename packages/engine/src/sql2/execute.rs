@@ -2892,15 +2892,17 @@ mod tests {
             ));
             let mut writes = StorageWriteSet::new();
             let canonical_rows = {
-                let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+                let mut json_writer = JsonStoreContext::new().writer();
                 vec![
                     version_ctx.canonical_ref_row(
+                        &mut writes,
                         &mut json_writer,
                         "version-a",
                         &init_receipt.initial_commit_id,
                         "1970-01-01T00:00:00.000Z",
                     )?,
                     version_ctx.canonical_ref_row(
+                        &mut writes,
                         &mut json_writer,
                         "version-b",
                         &init_receipt.initial_commit_id,
