@@ -33,6 +33,8 @@ impl TransactionSchemaResolver {
         version_id: &str,
     ) -> Result<(), LixError> {
         if !self.catalogs_by_version.contains_key(version_id) {
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_transaction_schema_catalog_load();
             let reader = TransactionSchemaLiveStateReader {
                 base: live_state,
                 staged,
@@ -65,6 +67,8 @@ impl TransactionSchemaResolver {
         staged_writes: &StagedWriteSet,
         version_id: &str,
     ) -> Result<TransactionSchemaCatalog, LixError> {
+        #[cfg(feature = "storage-benches")]
+        crate::storage_bench::record_transaction_schema_catalog_load();
         let schemas = self
             .registry
             .visible_schemas(live_state, version_id)
