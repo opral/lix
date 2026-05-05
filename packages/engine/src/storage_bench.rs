@@ -2439,43 +2439,41 @@ pub async fn changelog_decode_only_prepared(
     ))
 }
 
-pub async fn changelog_load_change_hit_prepared(
+pub async fn changelog_load_changes_hit_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &ChangelogReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let reader = fixture
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
-    let mut verified_rows = 0;
-    for index in 0..fixture.rows {
-        if reader
-            .load_change(&format!("bench-change-{index}"))
-            .await?
-            .is_some()
-        {
-            verified_rows += 1;
-        }
-    }
+    let change_ids = (0..fixture.rows)
+        .map(|index| format!("bench-change-{index}"))
+        .collect::<Vec<_>>();
+    let verified_rows = reader
+        .load_changes(&change_ids)
+        .await?
+        .into_iter()
+        .filter(Option::is_some)
+        .count();
     Ok(report(fixture.rows, verified_rows, Duration::ZERO))
 }
 
-pub async fn changelog_load_change_miss_prepared(
+pub async fn changelog_load_changes_miss_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &ChangelogReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let reader = fixture
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
-    let mut misses = 0;
-    for index in 0..fixture.rows {
-        if reader
-            .load_change(&format!("missing-change-{index}"))
-            .await?
-            .is_none()
-        {
-            misses += 1;
-        }
-    }
+    let change_ids = (0..fixture.rows)
+        .map(|index| format!("missing-change-{index}"))
+        .collect::<Vec<_>>();
+    let misses = reader
+        .load_changes(&change_ids)
+        .await?
+        .into_iter()
+        .filter(Option::is_none)
+        .count();
     Ok(report(fixture.rows, misses, Duration::ZERO))
 }
 
@@ -3233,7 +3231,7 @@ pub async fn changelog_append_changes(
     Ok(report(changes.len(), verified_rows, elapsed))
 }
 
-pub async fn changelog_load_change_hit(
+pub async fn changelog_load_changes_hit(
     backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
@@ -3243,20 +3241,19 @@ pub async fn changelog_load_change_hit(
     let reader = context.reader(StorageContext::new(Arc::clone(backend)));
 
     let started = Instant::now();
-    let mut verified_rows = 0;
-    for index in 0..config.rows {
-        if reader
-            .load_change(&format!("bench-change-{index}"))
-            .await?
-            .is_some()
-        {
-            verified_rows += 1;
-        }
-    }
+    let change_ids = (0..config.rows)
+        .map(|index| format!("bench-change-{index}"))
+        .collect::<Vec<_>>();
+    let verified_rows = reader
+        .load_changes(&change_ids)
+        .await?
+        .into_iter()
+        .filter(Option::is_some)
+        .count();
     Ok(report(config.rows, verified_rows, started.elapsed()))
 }
 
-pub async fn changelog_load_change_miss(
+pub async fn changelog_load_changes_miss(
     backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
@@ -3266,16 +3263,15 @@ pub async fn changelog_load_change_miss(
     let reader = context.reader(StorageContext::new(Arc::clone(backend)));
 
     let started = Instant::now();
-    let mut misses = 0;
-    for index in 0..config.rows {
-        if reader
-            .load_change(&format!("missing-change-{index}"))
-            .await?
-            .is_none()
-        {
-            misses += 1;
-        }
-    }
+    let change_ids = (0..config.rows)
+        .map(|index| format!("missing-change-{index}"))
+        .collect::<Vec<_>>();
+    let misses = reader
+        .load_changes(&change_ids)
+        .await?
+        .into_iter()
+        .filter(Option::is_none)
+        .count();
     Ok(report(config.rows, misses, started.elapsed()))
 }
 

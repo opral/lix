@@ -942,8 +942,11 @@ mod tests {
 
     #[async_trait]
     impl ChangelogReader for DummyChangelogReader {
-        async fn load_change(&self, _change_id: &str) -> Result<Option<CanonicalChange>, LixError> {
-            Ok(None)
+        async fn load_changes(
+            &self,
+            change_ids: &[String],
+        ) -> Result<Vec<Option<CanonicalChange>>, LixError> {
+            Ok(vec![None; change_ids.len()])
         }
 
         async fn scan_changes(

@@ -9,6 +9,7 @@ use lix_engine::{
 use std::collections::{BTreeMap, HashSet};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::runtime::Runtime;
 
 #[path = "../storage/backend.rs"]
@@ -512,6 +513,136 @@ fn transaction_benches(c: &mut Criterion) {
     );
 
     group.finish();
+
+    let mut io_group = c.benchmark_group("transaction_io_100us");
+
+    io_group.bench_function("stage_plus_commit_entities_no_payload/10k", |b| {
+        b.iter_batched(
+            || {
+                runtime
+                    .block_on(
+                        storage_bench::prepare_transaction_commit_entities_no_payload(
+                            latency_backend(),
+                            ENTITY_ROWS,
+                        ),
+                    )
+                    .expect("prepare transaction_io_100us/stage_plus_commit_entities_no_payload")
+            },
+            |fixture| {
+                commit(
+                    &runtime,
+                    fixture,
+                    "transaction_io_100us/stage_plus_commit_entities_no_payload",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    io_group.bench_function("stage_plus_commit_entities_payload_1k_same/10k", |b| {
+        b.iter_batched(
+            || {
+                runtime
+                    .block_on(
+                        storage_bench::prepare_transaction_commit_entities_payload_1k_same(
+                            latency_backend(),
+                            ENTITY_ROWS,
+                        ),
+                    )
+                    .expect(
+                        "prepare transaction_io_100us/stage_plus_commit_entities_payload_1k_same",
+                    )
+            },
+            |fixture| {
+                commit(
+                    &runtime,
+                    fixture,
+                    "transaction_io_100us/stage_plus_commit_entities_payload_1k_same",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    io_group.bench_function("stage_plus_commit_entities_payload_1k_unique/10k", |b| {
+        b.iter_batched(
+            || {
+                runtime
+                    .block_on(
+                        storage_bench::prepare_transaction_commit_entities_payload_1k_unique(
+                            latency_backend(),
+                            ENTITY_ROWS,
+                        ),
+                    )
+                    .expect(
+                        "prepare transaction_io_100us/stage_plus_commit_entities_payload_1k_unique",
+                    )
+            },
+            |fixture| {
+                commit(
+                    &runtime,
+                    fixture,
+                    "transaction_io_100us/stage_plus_commit_entities_payload_1k_unique",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    io_group.bench_function("stage_plus_commit_untracked_payload_1k_same/10k", |b| {
+        b.iter_batched(
+            || {
+                runtime
+                    .block_on(
+                        storage_bench::prepare_transaction_commit_untracked_payload_1k_same(
+                            latency_backend(),
+                            ENTITY_ROWS,
+                        ),
+                    )
+                    .expect(
+                        "prepare transaction_io_100us/stage_plus_commit_untracked_payload_1k_same",
+                    )
+            },
+            |fixture| {
+                commit(
+                    &runtime,
+                    fixture,
+                    "transaction_io_100us/stage_plus_commit_untracked_payload_1k_same",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    io_group.bench_function("commit_only_entities_payload_1k_same/10k", |b| {
+        b.iter_batched(
+            || {
+                let fixture = runtime
+                    .block_on(
+                        storage_bench::prepare_transaction_commit_entities_payload_1k_same(
+                            latency_backend(),
+                            ENTITY_ROWS,
+                        ),
+                    )
+                    .expect(
+                        "prepare transaction_io_100us/commit_only_entities_payload_1k_same fixture",
+                    );
+                runtime
+                    .block_on(storage_bench::prepare_transaction_commit_only(fixture))
+                    .expect("prepare transaction_io_100us/commit_only_entities_payload_1k_same")
+            },
+            |fixture| {
+                commit_only(
+                    &runtime,
+                    fixture,
+                    "transaction_io_100us/commit_only_entities_payload_1k_same",
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    io_group.finish();
 }
 
 fn commit(
@@ -548,6 +679,15 @@ fn commit_only(
             .block_on(storage_bench::transaction_commit_only_prepared(fixture))
             .unwrap_or_else(|error| panic!("{label} succeeds: {error}")),
     )
+}
+
+fn latency_backend() -> Arc<dyn Backend + Send + Sync> {
+    Arc::new(LatencyBackend {
+        inner: BenchBackend::new(),
+        read_delay: Duration::from_micros(100),
+        write_delay: Duration::from_micros(250),
+        commit_delay: Duration::from_micros(500),
+    })
 }
 
 struct AccountingFixture {
@@ -690,6 +830,168 @@ impl CountingBackend {
             }),
             accounting,
         )
+    }
+}
+
+struct LatencyBackend {
+    inner: Arc<dyn Backend + Send + Sync>,
+    read_delay: Duration,
+    write_delay: Duration,
+    commit_delay: Duration,
+}
+
+impl LatencyBackend {
+    fn delay(duration: Duration) {
+        if !duration.is_zero() {
+            std::thread::sleep(duration);
+        }
+    }
+}
+
+#[async_trait]
+impl Backend for LatencyBackend {
+    async fn begin_read_transaction(
+        &self,
+    ) -> Result<Box<dyn BackendReadTransaction + Send + Sync + 'static>, LixError> {
+        let transaction = self.inner.begin_read_transaction().await?;
+        Ok(Box::new(LatencyReadTransaction {
+            transaction,
+            read_delay: self.read_delay,
+        }))
+    }
+
+    async fn begin_write_transaction(
+        &self,
+    ) -> Result<Box<dyn BackendWriteTransaction + Send + Sync + 'static>, LixError> {
+        let transaction = self.inner.begin_write_transaction().await?;
+        Ok(Box::new(LatencyWriteTransaction {
+            transaction,
+            read_delay: self.read_delay,
+            write_delay: self.write_delay,
+            commit_delay: self.commit_delay,
+        }))
+    }
+}
+
+struct LatencyReadTransaction {
+    transaction: Box<dyn BackendReadTransaction + Send + Sync + 'static>,
+    read_delay: Duration,
+}
+
+#[async_trait]
+impl BackendReadTransaction for LatencyReadTransaction {
+    async fn get_values(
+        &mut self,
+        request: BackendKvGetRequest,
+    ) -> Result<BackendKvValueBatch, LixError> {
+        LatencyBackend::delay(self.read_delay);
+        self.transaction.get_values(request).await
+    }
+
+    async fn exists_many(
+        &mut self,
+        request: BackendKvGetRequest,
+    ) -> Result<BackendKvExistsBatch, LixError> {
+        LatencyBackend::delay(self.read_delay);
+        self.transaction.exists_many(request).await
+    }
+
+    async fn scan_keys(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvKeyPage, LixError> {
+        LatencyBackend::delay(self.read_delay);
+        self.transaction.scan_keys(request).await
+    }
+
+    async fn scan_values(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvValuePage, LixError> {
+        LatencyBackend::delay(self.read_delay);
+        self.transaction.scan_values(request).await
+    }
+
+    async fn scan_entries(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvEntryPage, LixError> {
+        LatencyBackend::delay(self.read_delay);
+        self.transaction.scan_entries(request).await
+    }
+
+    async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+        self.transaction.rollback().await
+    }
+}
+
+struct LatencyWriteTransaction {
+    transaction: Box<dyn BackendWriteTransaction + Send + Sync + 'static>,
+    read_delay: Duration,
+    write_delay: Duration,
+    commit_delay: Duration,
+}
+
+#[async_trait]
+impl BackendReadTransaction for LatencyWriteTransaction {
+    async fn get_values(
+        &mut self,
+        request: BackendKvGetRequest,
+    ) -> Result<BackendKvValueBatch, LixError> {
+        LatencyBackend::delay(self.read_delay);
+        self.transaction.get_values(request).await
+    }
+
+    async fn exists_many(
+        &mut self,
+        request: BackendKvGetRequest,
+    ) -> Result<BackendKvExistsBatch, LixError> {
+        LatencyBackend::delay(self.read_delay);
+        self.transaction.exists_many(request).await
+    }
+
+    async fn scan_keys(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvKeyPage, LixError> {
+        LatencyBackend::delay(self.read_delay);
+        self.transaction.scan_keys(request).await
+    }
+
+    async fn scan_values(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvValuePage, LixError> {
+        LatencyBackend::delay(self.read_delay);
+        self.transaction.scan_values(request).await
+    }
+
+    async fn scan_entries(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvEntryPage, LixError> {
+        LatencyBackend::delay(self.read_delay);
+        self.transaction.scan_entries(request).await
+    }
+
+    async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+        self.transaction.rollback().await
+    }
+}
+
+#[async_trait]
+impl BackendWriteTransaction for LatencyWriteTransaction {
+    async fn write_kv_batch(
+        &mut self,
+        batch: BackendKvWriteBatch,
+    ) -> Result<BackendKvWriteStats, LixError> {
+        LatencyBackend::delay(self.write_delay);
+        self.transaction.write_kv_batch(batch).await
+    }
+
+    async fn commit(self: Box<Self>) -> Result<(), LixError> {
+        LatencyBackend::delay(self.commit_delay);
+        self.transaction.commit().await
     }
 }
 

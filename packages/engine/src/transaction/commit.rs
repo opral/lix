@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::binary_cas::BinaryCasContext;
 use crate::changelog::{CanonicalChange, ChangelogContext};
@@ -138,27 +138,39 @@ async fn new_canonical_changes(
     rows: &[StagedStateRow],
 ) -> Result<Vec<CanonicalChange>, LixError> {
     let reader = changelog.reader(&mut *transaction);
-    let mut changes = Vec::new();
+    let mut changes = Vec::with_capacity(rows.len());
+    let mut change_ids = Vec::with_capacity(rows.len());
+    let mut seen_change_ids = BTreeSet::new();
     for row in rows {
         let change = canonical_change_from_staged_row(writes, json_writer, row)?;
-        match reader.load_change(&change.id).await? {
-            Some(existing) => {
-                let entity_id = existing
-                    .entity_id
-                    .as_string()
-                    .unwrap_or_else(|_| "<invalid entity_id>".to_string());
-                return Err(LixError::new(
-                    LixError::CODE_UNIQUE,
-                    format!(
-                        "canonical change id '{}' already exists with different content for schema '{}' entity '{}'",
-                        change.id,
-                        existing.schema_key,
-                        entity_id
-                    ),
-                ));
-            }
-            None => changes.push(change),
+        if !seen_change_ids.insert(change.id.clone()) {
+            return Err(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!(
+                    "canonical change id '{}' appears more than once in the same transaction",
+                    change.id
+                ),
+            ));
         }
+        change_ids.push(change.id.clone());
+        changes.push(change);
+    }
+    let existing_changes = reader.load_changes(&change_ids).await?;
+    for (change, existing) in changes.iter().zip(existing_changes) {
+        let Some(existing) = existing else {
+            continue;
+        };
+        let entity_id = existing
+            .entity_id
+            .as_string()
+            .unwrap_or_else(|_| "<invalid entity_id>".to_string());
+        return Err(LixError::new(
+            LixError::CODE_UNIQUE,
+            format!(
+                "canonical change id '{}' already exists with different content for schema '{}' entity '{}'",
+                change.id, existing.schema_key, entity_id
+            ),
+        ));
     }
     Ok(changes)
 }
@@ -170,12 +182,29 @@ async fn validate_adopted_canonical_changes(
 ) -> Result<Vec<CanonicalChange>, LixError> {
     let mut writes = StorageWriteSet::new();
     let mut json_writer = JsonStoreContext::new().writer();
-    let reader = changelog.reader(&mut *transaction);
     let mut changes = Vec::with_capacity(rows.len());
+    let mut change_ids = Vec::with_capacity(rows.len());
+    let mut seen_change_ids = BTreeSet::new();
     for row in rows {
         let expected = canonical_change_from_adopted_row(&mut writes, &mut json_writer, row)?;
-        match reader.load_change(&expected.id).await? {
-            Some(existing) if existing == expected => changes.push(existing),
+        if !seen_change_ids.insert(expected.id.clone()) {
+            return Err(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!(
+                    "adopted canonical change id '{}' appears more than once in the same transaction",
+                    expected.id
+                ),
+            ));
+        }
+        change_ids.push(expected.id.clone());
+        changes.push(expected);
+    }
+    let reader = changelog.reader(&mut *transaction);
+    let existing_changes = reader.load_changes(&change_ids).await?;
+    let mut loaded_changes = Vec::with_capacity(changes.len());
+    for (expected, existing) in changes.into_iter().zip(existing_changes) {
+        match existing {
+            Some(existing) if existing == expected => loaded_changes.push(existing),
             Some(existing) => {
                 let entity_id = existing
                     .entity_id
@@ -200,7 +229,7 @@ async fn validate_adopted_canonical_changes(
             }
         }
     }
-    Ok(changes)
+    Ok(loaded_changes)
 }
 
 fn live_state_batch_from_committed_rows(
