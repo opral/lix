@@ -66,8 +66,14 @@ where
         .diff_tree_entries_at_commits(left_commit_id, right_commit_id, &scan_request)
         .await?
     {
-        let before = tree_entry.before.map(|(key, value)| value.into_row(key));
-        let after = tree_entry.after.map(|(key, value)| value.into_row(key));
+        let before = match tree_entry.before {
+            Some((key, value)) => Some(reader.materialize_tree_value(key, value).await?),
+            None => None,
+        };
+        let after = match tree_entry.after {
+            Some((key, value)) => Some(reader.materialize_tree_value(key, value).await?),
+            None => None,
+        };
         let identity = match before.as_ref().or(after.as_ref()) {
             Some(row) => TrackedStateDiffIdentity::from_row(row)?,
             None => continue,

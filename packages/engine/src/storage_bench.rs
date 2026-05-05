@@ -22,8 +22,6 @@ use crate::{Backend, LixError, NullableKeyFilter};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const DEFAULT_MAX_INLINE_ENCODED_VALUE_BYTES: usize = 1024;
-
 #[derive(Debug, Clone, Copy)]
 pub struct StorageBenchConfig {
     pub rows: usize,
@@ -786,21 +784,8 @@ pub struct JsonStoreReadFixture {
 pub async fn prepare_tracked_state_write_root(
     config: StorageBenchConfig,
 ) -> Result<TrackedStateWriteRootFixture, LixError> {
-    prepare_tracked_state_write_root_with_max_inline_encoded_value_bytes(
-        config,
-        DEFAULT_MAX_INLINE_ENCODED_VALUE_BYTES,
-    )
-    .await
-}
-
-pub async fn prepare_tracked_state_write_root_with_max_inline_encoded_value_bytes(
-    config: StorageBenchConfig,
-    max_inline_encoded_value_bytes: usize,
-) -> Result<TrackedStateWriteRootFixture, LixError> {
     Ok(TrackedStateWriteRootFixture {
-        context: TrackedStateContext::with_max_inline_encoded_value_bytes_for_bench(
-            max_inline_encoded_value_bytes,
-        ),
+        context: TrackedStateContext::new(),
         rows: tracked_rows(config, "bench-tracked-commit"),
     })
 }
@@ -844,22 +829,7 @@ pub async fn prepare_tracked_state_read_file_selective(
     backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<TrackedStateReadFixture, LixError> {
-    prepare_tracked_state_read_file_selective_with_max_inline_encoded_value_bytes(
-        backend,
-        config,
-        DEFAULT_MAX_INLINE_ENCODED_VALUE_BYTES,
-    )
-    .await
-}
-
-pub async fn prepare_tracked_state_read_file_selective_with_max_inline_encoded_value_bytes(
-    backend: &Arc<dyn Backend + Send + Sync>,
-    config: StorageBenchConfig,
-    max_inline_encoded_value_bytes: usize,
-) -> Result<TrackedStateReadFixture, LixError> {
-    let context = TrackedStateContext::with_max_inline_encoded_value_bytes_for_bench(
-        max_inline_encoded_value_bytes,
-    );
+    let context = TrackedStateContext::new();
     let rows = tracked_rows_file_selective(config, "bench-tracked-commit");
     write_tracked_root(backend, &context, "bench-tracked-commit", None, &rows).await?;
     Ok(TrackedStateReadFixture {

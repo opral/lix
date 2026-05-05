@@ -192,7 +192,7 @@ async fn storage_accounting() {
     ];
 
     println!(
-        "{:<31} {:>7} {:>8} {:>12} {:>12} {:>10} {:>11} {:>11} {:>11} {:>11}",
+        "{:<31} {:>7} {:>8} {:>12} {:>12} {:>10} {:>11} {:>11} {:>11} {:>11} {:>9} {:>13}",
         "workload",
         "rows",
         "entries",
@@ -202,7 +202,9 @@ async fn storage_accounting() {
         "chunks",
         "snapshots",
         "roots",
-        "file_roots"
+        "file_roots",
+        "json",
+        "json_bytes"
     );
 
     for workload in workloads {
@@ -210,7 +212,7 @@ async fn storage_accounting() {
             .await
             .expect("storage accounting workload should run");
         println!(
-            "{:<31} {:>7} {:>8} {:>12} {:>12} {:>10} {:>11} {:>11} {:>11} {:>11}",
+            "{:<31} {:>7} {:>8} {:>12} {:>12} {:>10} {:>11} {:>11} {:>11} {:>11} {:>9} {:>13}",
             workload_label(workload),
             row.rows,
             row.snapshot.entries,
@@ -221,67 +223,9 @@ async fn storage_accounting() {
             row.snapshot.tracked_snapshot_entries,
             row.snapshot.tracked_root_entries,
             row.snapshot.tracked_by_file_root_entries,
+            row.snapshot.json_entries,
+            row.snapshot.json_value_bytes,
         );
-    }
-}
-
-#[tokio::test]
-#[ignore = "prints max inline encoded value accounting table"]
-async fn max_inline_encoded_value_accounting() {
-    let workloads = [
-        AccountingWorkload::WriteRoot {
-            label: "write_root_payload_small",
-            rows: 10_000,
-            payload_bytes: 0,
-        },
-        AccountingWorkload::WriteRoot {
-            label: "write_root_payload_1k",
-            rows: 10_000,
-            payload_bytes: 1024,
-        },
-        AccountingWorkload::WriteRoot {
-            label: "write_root_payload_16k",
-            rows: 1_000,
-            payload_bytes: 16 * 1024,
-        },
-        AccountingWorkload::WriteRoot {
-            label: "write_root_payload_128k",
-            rows: 100,
-            payload_bytes: 128 * 1024,
-        },
-    ];
-
-    println!(
-        "{:<10} {:<31} {:>7} {:>8} {:>12} {:>12} {:>10} {:>11} {:>11}",
-        "max_inline",
-        "workload",
-        "rows",
-        "entries",
-        "value_bytes",
-        "total_bytes",
-        "bytes/row",
-        "chunks",
-        "snapshots"
-    );
-
-    for threshold in [512, 1024, 2048, 4096, 8192] {
-        for workload in workloads {
-            let row = run_write_root_workload_with_max_inline_encoded_value(workload, threshold)
-                .await
-                .expect("storage accounting max-inline workload should run");
-            println!(
-                "{:<10} {:<31} {:>7} {:>8} {:>12} {:>12} {:>10} {:>11} {:>11}",
-                threshold,
-                workload_label(workload),
-                row.rows,
-                row.snapshot.entries,
-                row.snapshot.value_bytes,
-                row.snapshot.total_bytes(),
-                row.snapshot.bytes_per_row(row.rows),
-                row.snapshot.tracked_chunk_entries,
-                row.snapshot.tracked_snapshot_entries,
-            );
-        }
     }
 }
 
@@ -469,27 +413,6 @@ async fn run_workload(workload: AccountingWorkload) -> Result<AccountingRow, Lix
         }
     };
     Ok(AccountingRow { rows, snapshot })
-}
-
-async fn run_write_root_workload_with_max_inline_encoded_value(
-    workload: AccountingWorkload,
-    max_inline_encoded_value_bytes: usize,
-) -> Result<AccountingRow, LixError> {
-    let accounting_backend = AccountingBackend::default();
-    let backend: Arc<dyn Backend + Send + Sync> = Arc::new(accounting_backend.clone());
-    let config = config_for(workload);
-    let rows = workload_rows(workload);
-    let fixture =
-        storage_bench::prepare_tracked_state_write_root_with_max_inline_encoded_value_bytes(
-            config,
-            max_inline_encoded_value_bytes,
-        )
-        .await?;
-    storage_bench::tracked_state_write_root_prepared(&backend, &fixture).await?;
-    Ok(AccountingRow {
-        rows,
-        snapshot: accounting_backend.accounting()?,
-    })
 }
 
 async fn run_json_workload(workload: JsonAccountingWorkload) -> Result<AccountingRow, LixError> {
@@ -792,10 +715,6 @@ impl AccountingBackend {
                 }
                 "tracked_state.tree.root.by_file" => {
                     snapshot.tracked_by_file_root_entries += 1;
-                }
-                "tracked_state.snapshot" => {
-                    snapshot.tracked_snapshot_entries += 1;
-                    snapshot.tracked_snapshot_value_bytes += value.len();
                 }
                 "json_store.json" => {
                     snapshot.json_entries += 1;
