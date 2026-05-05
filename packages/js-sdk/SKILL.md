@@ -309,6 +309,8 @@ Include `x-lix-primary-key` so the engine can derive entity identity. Each entry
 
 Without `x-lix-primary-key`, table-style INSERTs fail with `requires lixcol_entity_id because the schema has no x-lix-primary-key`.
 
+Do **not** add generic `created_at` or `updated_at` fields to registered app schemas by default. Lix already records creation/update semantics through `lix_change`, history tables, and `lixcol_*` metadata. Add timestamp fields only when they are domain data (`due_at`, `occurred_at`, `published_at`, `active_from`, etc.), not row lifecycle bookkeeping.
+
 ## Reading Results
 
 `lix.execute()` returns a discriminated `ExecuteResult`:
