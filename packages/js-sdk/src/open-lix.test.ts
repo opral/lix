@@ -5,14 +5,22 @@ import { expect, test } from "vitest";
 import {
 	openLix,
 	Value,
+	type BackendKvEntryPage,
+	type BackendKvExistsBatch,
+	type BackendKvGetRequest,
+	type BackendKvKeyPage,
+	type BackendKvScanRange,
+	type BackendKvScanRequest,
+	type BackendKvValueBatch,
+	type BackendKvValuePage,
+	type BackendKvWriteBatch,
+	type BackendKvWriteStats,
 	type ExecuteResult,
-	type KvPair,
-	type KvScanRange,
 	type LixBackend,
-	type LixBackendTransaction,
+	type LixBackendReadTransaction,
+	type LixBackendWriteTransaction,
 	type LixError,
 	type Lix,
-	type TransactionBeginMode,
 	isLixError,
 } from "./index.js";
 
@@ -574,8 +582,7 @@ type StoredKvPair = {
 function createMemoryBackend(): LixBackend {
 	let rows: StoredKvPair[] = [];
 
-	return {
-		beginTransaction(_mode: TransactionBeginMode): LixBackendTransaction {
+	function createTransaction(): LixBackendWriteTransaction {
 			let transactionRows = rows.map(cloneStoredPair);
 			let closed = false;
 
@@ -586,48 +593,95 @@ function createMemoryBackend(): LixBackend {
 			};
 
 			return {
-				kvGet(namespace, key) {
+				getValues(request): BackendKvValueBatch {
 					ensureOpen();
-					const row = transactionRows.find(
-						(row) =>
-							row.namespace === namespace && compareBytes(row.key, key) === 0,
-					);
-					return row ? new Uint8Array(row.value) : null;
+					return {
+						groups: request.groups.map((group) => ({
+							namespace: group.namespace,
+							values: group.keys.map((key) => {
+								const row = transactionRows.find(
+									(row) =>
+										row.namespace === group.namespace &&
+										compareBytes(row.key, key) === 0,
+								);
+								return row ? new Uint8Array(row.value) : null;
+							}),
+						})),
+					};
 				},
-				kvScan(namespace, range, limit) {
+				existsMany(request): BackendKvExistsBatch {
 					ensureOpen();
-					const matches = transactionRows
-						.filter(
-							(row) =>
-								row.namespace === namespace && keyMatchesRange(row.key, range),
-						)
-						.sort((left, right) => compareBytes(left.key, right.key))
-						.slice(0, limit ?? undefined);
-					return matches.map(
-						(row): KvPair => ({
-							key: new Uint8Array(row.key),
-							value: new Uint8Array(row.value),
-						}),
-					);
+					return {
+						groups: request.groups.map((group) => ({
+							namespace: group.namespace,
+							exists: group.keys.map((key) =>
+								transactionRows.some(
+									(row) =>
+										row.namespace === group.namespace &&
+										compareBytes(row.key, key) === 0,
+								),
+							),
+						})),
+					};
 				},
-				kvPut(namespace, key, value) {
+				scanKeys(request): BackendKvKeyPage {
 					ensureOpen();
-					transactionRows = transactionRows.filter(
-						(row) =>
-							row.namespace !== namespace || compareBytes(row.key, key) !== 0,
-					);
-					transactionRows.push({
-						namespace,
-						key: new Uint8Array(key),
-						value: new Uint8Array(value),
-					});
+					const { pairs, resumeAfter } = scanPage(transactionRows, request);
+					return {
+						keys: pairs.map((row) => new Uint8Array(row.key)),
+						resumeAfter,
+					};
 				},
-				kvDelete(namespace, key) {
+				scanValues(request): BackendKvValuePage {
 					ensureOpen();
-					transactionRows = transactionRows.filter(
-						(row) =>
-							row.namespace !== namespace || compareBytes(row.key, key) !== 0,
-					);
+					const { pairs, resumeAfter } = scanPage(transactionRows, request);
+					return {
+						values: pairs.map((row) => new Uint8Array(row.value)),
+						resumeAfter,
+					};
+				},
+				scanEntries(request): BackendKvEntryPage {
+					ensureOpen();
+					const { pairs, resumeAfter } = scanPage(transactionRows, request);
+					return {
+						keys: pairs.map((row) => new Uint8Array(row.key)),
+						values: pairs.map((row) => new Uint8Array(row.value)),
+						resumeAfter,
+					};
+				},
+				writeKvBatch(batch): BackendKvWriteStats {
+					ensureOpen();
+					const stats: BackendKvWriteStats = {
+						puts: 0,
+						deletes: 0,
+						bytesWritten: 0,
+					};
+					for (const group of batch.groups) {
+						for (const put of group.puts) {
+							stats.puts += 1;
+							stats.bytesWritten += put.key.length + put.value.length;
+							transactionRows = transactionRows.filter(
+								(row) =>
+									row.namespace !== group.namespace ||
+									compareBytes(row.key, put.key) !== 0,
+							);
+							transactionRows.push({
+								namespace: group.namespace,
+								key: new Uint8Array(put.key),
+								value: new Uint8Array(put.value),
+							});
+						}
+						for (const key of group.deletes) {
+							stats.deletes += 1;
+							stats.bytesWritten += key.length;
+							transactionRows = transactionRows.filter(
+								(row) =>
+									row.namespace !== group.namespace ||
+									compareBytes(row.key, key) !== 0,
+							);
+						}
+					}
+					return stats;
 				},
 				commit() {
 					ensureOpen();
@@ -639,6 +693,14 @@ function createMemoryBackend(): LixBackend {
 					closed = true;
 				},
 			};
+	}
+
+	return {
+		beginReadTransaction(): LixBackendReadTransaction {
+			return createTransaction();
+		},
+		beginWriteTransaction(): LixBackendWriteTransaction {
+			return createTransaction();
 		},
 	};
 }
@@ -651,7 +713,27 @@ function cloneStoredPair(row: StoredKvPair): StoredKvPair {
 	};
 }
 
-function keyMatchesRange(key: Uint8Array, range: KvScanRange): boolean {
+function scanPage(
+	rows: StoredKvPair[],
+	request: BackendKvScanRequest,
+): { pairs: StoredKvPair[]; resumeAfter: Uint8Array | null } {
+	const matches = rows
+		.filter(
+			(row) =>
+				row.namespace === request.namespace &&
+				keyMatchesRange(row.key, request.range) &&
+				(!request.after || compareBytes(row.key, request.after) > 0),
+		)
+		.sort((left, right) => compareBytes(left.key, right.key));
+	const hasMore = matches.length > request.limit;
+	const pairs = matches.slice(0, request.limit);
+	return {
+		pairs,
+		resumeAfter: hasMore ? (pairs.at(-1)?.key ?? null) : null,
+	};
+}
+
+function keyMatchesRange(key: Uint8Array, range: BackendKvScanRange): boolean {
 	if (range.kind === "prefix") {
 		if (key.length < range.prefix.length) return false;
 		return range.prefix.every((byte, index) => key[index] === byte);

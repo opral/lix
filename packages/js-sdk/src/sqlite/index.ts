@@ -1,10 +1,18 @@
 import DatabaseConstructor, { type Database } from "better-sqlite3";
 import type {
-	KvPair,
-	KvScanRange,
+	BackendKvEntryPage,
+	BackendKvExistsBatch,
+	BackendKvGetRequest,
+	BackendKvKeyPage,
+	BackendKvScanRange,
+	BackendKvScanRequest,
+	BackendKvValueBatch,
+	BackendKvValuePage,
+	BackendKvWriteBatch,
+	BackendKvWriteStats,
 	LixBackend,
-	LixBackendTransaction,
-	TransactionBeginMode,
+	LixBackendReadTransaction,
+	LixBackendWriteTransaction,
 } from "../open-lix.js";
 
 export type BetterSqlite3BackendOptions = {
@@ -76,27 +84,22 @@ class BetterSqlite3Backend implements LixBackend {
 		this.#registryKey = registryKey;
 	}
 
-	beginTransaction(mode: TransactionBeginMode): LixBackendTransaction {
+	beginReadTransaction(): LixBackendReadTransaction {
 		this.#ensureOpen();
 		if (this.#db.inTransaction) {
 			throw new Error("cannot open nested Lix backend transaction");
 		}
-		this.#db.exec(mode === "write" ? "BEGIN IMMEDIATE" : "BEGIN DEFERRED");
+		this.#db.exec("BEGIN DEFERRED");
 		return new BetterSqlite3Transaction(this.#db);
 	}
 
-	kvGet(namespace: string, key: Uint8Array): Uint8Array | null {
+	beginWriteTransaction(): LixBackendWriteTransaction {
 		this.#ensureOpen();
-		return kvGet(this.#db, namespace, key);
-	}
-
-	kvScan(
-		namespace: string,
-		range: KvScanRange,
-		limit?: number | null,
-	): KvPair[] {
-		this.#ensureOpen();
-		return kvScan(this.#db, namespace, range, limit);
+		if (this.#db.inTransaction) {
+			throw new Error("cannot open nested Lix backend transaction");
+		}
+		this.#db.exec("BEGIN IMMEDIATE");
+		return new BetterSqlite3Transaction(this.#db);
 	}
 
 	close(): void {
@@ -118,7 +121,7 @@ class BetterSqlite3Backend implements LixBackend {
 	}
 }
 
-class BetterSqlite3Transaction implements LixBackendTransaction {
+class BetterSqlite3Transaction implements LixBackendWriteTransaction {
 	readonly #db: Database;
 	#closed = false;
 
@@ -126,36 +129,64 @@ class BetterSqlite3Transaction implements LixBackendTransaction {
 		this.#db = db;
 	}
 
-	kvGet(namespace: string, key: Uint8Array): Uint8Array | null {
+	getValues(request: BackendKvGetRequest): BackendKvValueBatch {
 		this.#ensureOpen();
-		return kvGet(this.#db, namespace, key);
+		return getValues(this.#db, request);
 	}
 
-	kvScan(
-		namespace: string,
-		range: KvScanRange,
-		limit?: number | null,
-	): KvPair[] {
+	existsMany(request: BackendKvGetRequest): BackendKvExistsBatch {
 		this.#ensureOpen();
-		return kvScan(this.#db, namespace, range, limit);
+		return existsMany(this.#db, request);
 	}
 
-	kvPut(namespace: string, key: Uint8Array, value: Uint8Array): void {
+	scanKeys(request: BackendKvScanRequest): BackendKvKeyPage {
 		this.#ensureOpen();
-		this.#db
-			.prepare(
-				`INSERT INTO lix_kv (namespace, key, value)
-				 VALUES (?, ?, ?)
-				 ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value`,
-			)
-			.run(namespace, sqliteBytes(key), sqliteBytes(value));
+		const { pairs, resumeAfter } = scanPage(this.#db, request);
+		return {
+			keys: pairs.map(({ key }) => key),
+			resumeAfter,
+		};
 	}
 
-	kvDelete(namespace: string, key: Uint8Array): void {
+	scanValues(request: BackendKvScanRequest): BackendKvValuePage {
 		this.#ensureOpen();
-		this.#db
-			.prepare("DELETE FROM lix_kv WHERE namespace = ? AND key = ?")
-			.run(namespace, sqliteBytes(key));
+		const { pairs, resumeAfter } = scanPage(this.#db, request);
+		return {
+			values: pairs.map(({ value }) => value),
+			resumeAfter,
+		};
+	}
+
+	scanEntries(request: BackendKvScanRequest): BackendKvEntryPage {
+		this.#ensureOpen();
+		const { pairs, resumeAfter } = scanPage(this.#db, request);
+		return {
+			keys: pairs.map(({ key }) => key),
+			values: pairs.map(({ value }) => value),
+			resumeAfter,
+		};
+	}
+
+	writeKvBatch(batch: BackendKvWriteBatch): BackendKvWriteStats {
+		this.#ensureOpen();
+		const stats: BackendKvWriteStats = {
+			puts: 0,
+			deletes: 0,
+			bytesWritten: 0,
+		};
+		for (const group of batch.groups) {
+			for (const put of group.puts) {
+				stats.puts += 1;
+				stats.bytesWritten += put.key.length + put.value.length;
+				kvPut(this.#db, group.namespace, put.key, put.value);
+			}
+			for (const key of group.deletes) {
+				stats.deletes += 1;
+				stats.bytesWritten += key.length;
+				kvDelete(this.#db, group.namespace, key);
+			}
+		}
+		return stats;
 	}
 
 	commit(): void {
@@ -177,6 +208,60 @@ class BetterSqlite3Transaction implements LixBackendTransaction {
 	}
 }
 
+type KvPair = {
+	key: Uint8Array;
+	value: Uint8Array;
+};
+
+function getValues(
+	db: Database,
+	request: BackendKvGetRequest,
+): BackendKvValueBatch {
+	return {
+		groups: request.groups.map((group) => ({
+			namespace: group.namespace,
+			values: group.keys.map((key) => kvGet(db, group.namespace, key)),
+		})),
+	};
+}
+
+function existsMany(
+	db: Database,
+	request: BackendKvGetRequest,
+): BackendKvExistsBatch {
+	return {
+		groups: request.groups.map((group) => ({
+			namespace: group.namespace,
+			exists: group.keys.map(
+				(key) => kvGet(db, group.namespace, key) !== null,
+			),
+		})),
+	};
+}
+
+function scanPage(
+	db: Database,
+	request: BackendKvScanRequest,
+): { pairs: KvPair[]; resumeAfter: Uint8Array | null } {
+	const scanLimit = request.limit + 1 + (request.after ? 1 : 0);
+	const pairs = kvScan(
+		db,
+		request.namespace,
+		request.range,
+		scanLimit,
+	).filter(
+		(pair) => !request.after || compareBytes(pair.key, request.after) > 0,
+	);
+	const hasMore = pairs.length > request.limit;
+	const pagePairs = pairs.slice(0, request.limit);
+	return {
+		pairs: pagePairs,
+		resumeAfter: hasMore
+			? (pagePairs.at(-1)?.key ?? null)
+			: null,
+	};
+}
+
 function kvGet(
 	db: Database,
 	namespace: string,
@@ -191,10 +276,30 @@ function kvGet(
 	return bytesFromUnknown(row.value, "lix_kv.value");
 }
 
+function kvPut(
+	db: Database,
+	namespace: string,
+	key: Uint8Array,
+	value: Uint8Array,
+): void {
+	db.prepare(
+		`INSERT INTO lix_kv (namespace, key, value)
+		 VALUES (?, ?, ?)
+		 ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value`,
+	).run(namespace, sqliteBytes(key), sqliteBytes(value));
+}
+
+function kvDelete(db: Database, namespace: string, key: Uint8Array): void {
+	db.prepare("DELETE FROM lix_kv WHERE namespace = ? AND key = ?").run(
+		namespace,
+		sqliteBytes(key),
+	);
+}
+
 function kvScan(
 	db: Database,
 	namespace: string,
-	range: KvScanRange,
+	range: BackendKvScanRange,
 	limit?: number | null,
 ): KvPair[] {
 	const { sql, params } = scanQuery(namespace, range, limit);
@@ -211,7 +316,7 @@ function kvScan(
 
 function scanQuery(
 	namespace: string,
-	range: KvScanRange,
+	range: BackendKvScanRange,
 	limit?: number | null,
 ): { sql: string; params: unknown[] } {
 	const params: unknown[] = [namespace];
@@ -238,6 +343,15 @@ function scanQuery(
 		params.push(limit);
 	}
 	return { sql, params };
+}
+
+function compareBytes(left: Uint8Array, right: Uint8Array): number {
+	const length = Math.min(left.length, right.length);
+	for (let index = 0; index < length; index++) {
+		const delta = left[index]! - right[index]!;
+		if (delta !== 0) return delta;
+	}
+	return left.length - right.length;
 }
 
 function prefixUpperBound(prefix: Uint8Array): Uint8Array | null {

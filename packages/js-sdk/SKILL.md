@@ -1,102 +1,89 @@
 ---
 name: lix-js-sdk
-description: Use this skill when building examples, demos, tests, or applications with @lix-js/sdk — opening a Lix, registering schemas, writing entities through generated SQL tables, branching state into named versions, merging, and querying the change history.
+description: Use this skill when building examples, demos, tests, or applications with @lix-js/sdk: opening a Lix, registering schemas, writing entities through generated SQL tables, creating named versions, merging, and querying change history.
 ---
 
 # Lix JS SDK Skill
 
 ## What Is Lix
 
-Lix is an embeddable version control system. The primary use case is **versioning files of any kind** — `.docx`, CAD drawings, PDFs, JSON catalogs, source code — by parsing them into typed entities on write. Once parsed, the file's contents become rows in your schema tables, and Lix versions, branches, and merges those rows. A registered file plugin owns the parse-and-serialize round trip; the engine handles versioning, branching, three-way merge, and an immutable change journal.
+Lix is an embeddable version control system for structured application state. It gives apps named versions, merge, and an immutable SQL-queryable change journal without asking the app to build those systems from scratch.
 
-Apps can also use the entity layer **directly**, without files in the picture. That's the appealing path for app-first products: define a schema, write rows, get versioning for free. Same engine, same primitives.
+Current `@lix-js/sdk` capabilities:
 
-Every row in every registered schema is a tracked entity, every write happens on a named **version** (Lix's word for "branch"), and `mergeVersion` performs a three-way merge over those entities. The whole engine runs in-process, normally against a local SQLite file.
+- Register JSON schemas as tracked entity tables.
+- Read and write entities through generated SQL tables.
+- Create named versions of state and write/read across versions.
+- Merge one version into the active version.
+- Query `lix_change` for history, audit, activity feeds, and undo-style features.
+- Store files as bytes with `lix_file` and version them like other entities.
 
-**Merge granularity is per-entity (per-row), not per-field.** Two versions editing *different rows* (or different entities of the same schema) merge cleanly. Two versions editing the *same row* — even on disjoint fields — surface as a conflict today. Field-level merge is on the roadmap; until it ships, model your data as multiple small entities (sections, blocks, paragraphs, message keys, line items) when you want concurrent reviewers to compose without conflict.
+Product direction:
 
-**Lix targets non-developers as the primary end-user.** That shapes the vocabulary: what Git calls a "branch" is called a **version** in Lix, because "you can have multiple versions of this document" reads naturally to non-devs while "branch" does not. Use "version" — not "branch" — in user-facing copy, demo names, and example values.
+- Lix is designed to version files of any kind by parsing them into typed entities on write.
+- Parser plugins that turn file contents into app entities are not shipped through the JS SDK yet. Do not promise this behavior in demos. Today, `lix_file` versions bytes, while app entities are modeled directly through registered schemas.
 
-**Where Lix sits next to neighbors:** *not Yjs* (Lix is entity-grained, not character-CRDT), *not Git* (typed rows + a queryable change journal, not text diffs), *not plain SQLite* (branches and merges are primitives, not something you build on top).
+Every row in every registered schema is a tracked entity. Merge granularity is currently per-entity, not per-field: two versions editing different rows merge cleanly; two versions editing the same row conflict, even if the fields are disjoint. Model collaborative domains as many small entities, such as sections, blocks, paragraphs, message keys, or line items.
 
-## When To Use Lix
+Use Lix vocabulary in user-facing copy. What Git calls a branch is called a **version** in Lix because that language makes sense to non-developers.
 
-Reach for Lix when an app needs branchable, mergeable, auditable structured state:
+## When To Use This Skill
 
-- **Document / CMS / no-code editors with drafts and review.** A user clicks "Propose changes" → that's `createVersion({ name: "Marketing edit" })`. Reviewers diff via `lix_change`, accept via `mergeVersion`. Like Google Docs "suggesting mode", but durable, branchable, and over typed entities.
-- **AI agent sandboxes.** Spawn an agent on its own version, let it mutate freely, the human reviews the diff and merges or discards. Cheap rollback, no shadow tables.
-- **Real-time and local-first multiplayer.** Lix already journals every change with author, timestamp, and entity identity — that is exactly what a sync protocol needs. Each peer is a version; sync is merge. Conflicts surface as exceptions instead of silent last-writer-wins.
-- **Scenario / what-if branching** in spreadsheets, budgets, OKR planners, pricing tables.
-- **Translation / localization workflows.** Each translator works on a version of the message catalog; merges flow back to main.
-- **Auditable records** (compliance, clinical, legal). `lix_change` is an immutable journal queryable as SQL — replaces a hand-rolled audit log.
+Use this skill when you need to write or debug consumer code using `@lix-js/sdk`:
 
-Anti-fits: high-throughput OLTP (payments, telemetry, ad bidding), pure analytics ingest, and read-only caches. Lix tracks every write — that is dead weight when there is nothing to version.
+- Opening a persistent `.lix` file.
+- Registering schemas.
+- Writing and reading generated SQL entity tables.
+- Reading `execute()` results.
+- Creating, switching, previewing, and merging versions.
+- Querying history through `lix_change`.
+- Building app demos, examples, smoke tests, or product flows around the SDK.
 
-## API Surface
+Do not use this skill for raw SQLite access, private engine/wasm internals, SDK publishing, SDK build pipelines, or unreleased file-parser plugin behavior.
 
-```ts
-import { openLix } from "@lix-js/sdk";
-import { createBetterSqlite3Backend } from "@lix-js/sdk/sqlite";
+## Agent Quick Start
 
-const lix = await openLix({
-  backend: createBetterSqlite3Backend({ path: "/path/to/file.lix" }),
-});
-```
+1. Install `@lix-js/sdk` and `better-sqlite3`.
+2. Open with `createBetterSqlite3Backend({ path })`; do not open `.lix` with raw SQLite.
+3. Register a schema with `x-lix-key`, `x-lix-version`, `x-lix-primary-key`, and `additionalProperties: false`.
+4. Write rows through the generated table named by `x-lix-key`.
+5. Use `<schema>_by_version` plus `lixcol_version_id` for side-by-side version reads/writes.
+6. Query `lix_change` for audit/history instead of hand-rolling audit tables.
+7. Wrap `mergeVersion()` in `try/catch` whenever conflicts are possible.
 
-`better-sqlite3` is an optional peer dependency of `@lix-js/sdk`; install it in any project that imports `@lix-js/sdk/sqlite`:
+## Core Rules
+
+- Use the public `@lix-js/sdk` API only.
+- Use `createBetterSqlite3Backend()` for persistent apps, demos, and tests.
+- Use numbered SQL placeholders: `$1`, `$2`, `$3`; bare `?` is rejected.
+- Use `lix_json($1)` when inserting JSON text into JSON-typed columns.
+- Use stable, namespaced, lowercase schema keys like `acme_section`, not generic names like `task`.
+- Always include `x-lix-primary-key` and `additionalProperties: false` on app schemas.
+- Use version names from the user's vocabulary, such as `"Marketing edit"` or `"Q3 pricing draft"`.
+- Model concurrent-edit domains as collections of small rows because merge is per-row today.
+- Prefer `_by_version` tables for demos, sync, agent inspection, and side-by-side diffs.
+- Close handles in scripts and tests with `await lix.close()`.
+
+## Install And Open
 
 ```sh
 npm i @lix-js/sdk better-sqlite3
 ```
 
-Use the version of this skill that ships with the installed `@lix-js/sdk` package; do not copy version-specific snippets from older releases.
-
-The default `openLix()` (no `backend`) is in-memory and dies with the process. For anything that needs to persist — demos, scripts, tests, real apps — pass a `better-sqlite3` backend with a real file path. Each successful `execute()` is durable; `lix.close()` releases the backend handle. Reopening with the same path picks up where you left off.
-
-For tests and demos, use an isolated temp dir per run:
-
 ```ts
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
+import { openLix } from "@lix-js/sdk";
+import { createBetterSqlite3Backend } from "@lix-js/sdk/sqlite";
 
-const dir = mkdtempSync(path.join(tmpdir(), "lix-"));
 const lix = await openLix({
-  backend: createBetterSqlite3Backend({ path: path.join(dir, "demo.lix") }),
+  backend: createBetterSqlite3Backend({ path: "/path/to/app.lix" }),
 });
 ```
 
-The handle is intentionally small:
+`better-sqlite3` is an optional peer dependency. Install it in projects that import `@lix-js/sdk/sqlite`.
 
-```ts
-type Lix = {
-  execute(sql: string, params?: readonly unknown[]): Promise<ExecuteResult>;
-  activeVersionId(): Promise<string>;
-  createVersion(options: { id?: string; name: string }): Promise<{ versionId: string }>;
-  switchVersion(options: { versionId: string }): Promise<{ versionId: string }>;
-  mergeVersionPreview(options: { sourceVersionId: string }): Promise<MergeVersionPreviewResult>;
-  mergeVersion(options: { sourceVersionId: string }): Promise<MergeVersionResult>;
-  close(): Promise<void>;
-};
-```
+`openLix()` without a backend is in-memory and dies with the process. For anything that should persist, pass a real `.lix` path. Reopening the same path picks up existing state.
 
-Use the public `@lix-js/sdk` API only. Do not import from `engine-wasm`, do not call `initLix` / `createWasmSqliteBackend`, do not open SQLite directly against a `.lix` file.
-
-If behavior is unclear, read source before guessing:
-
-- [packages/js-sdk/src/open-lix.ts](https://github.com/opral/lix/blob/561f92b5bc3fa68e48a863ed3a02129645a57011/packages/js-sdk/src/open-lix.ts) — current JS API.
-- [packages/js-sdk/src/open-lix.test.ts](https://github.com/opral/lix/blob/561f92b5bc3fa68e48a863ed3a02129645a57011/packages/js-sdk/src/open-lix.test.ts) — canonical end-to-end flow.
-- [packages/js-sdk/src/sqlite/index.ts](https://github.com/opral/lix/blob/561f92b5bc3fa68e48a863ed3a02129645a57011/packages/js-sdk/src/sqlite/index.ts) — `better-sqlite3` backend factory.
-- [packages/engine/src/schema/builtin](https://github.com/opral/lix/tree/561f92b5bc3fa68e48a863ed3a02129645a57011/packages/engine/src/schema/builtin) — built-in entity table shapes.
-- [packages/engine/src/sql2/udfs](https://github.com/opral/lix/tree/561f92b5bc3fa68e48a863ed3a02129645a57011/packages/engine/src/sql2/udfs) — registered SQL functions.
-
-## Canonical End-To-End Example
-
-This is the demo to imitate. It shows the four things that make Lix Lix in one script: **isolation** (one SELECT against `<schema>_by_version` returns all versions side by side), **clean parallel merges** (two reviewers editing *different entities* both land on Published), **the audit journal** (`lix_change` is a queryable SQL table), and **conflicts** (two versions edit the *same* entity → `mergeVersion` throws).
-
-The schema models a brochure as a list of **section entities** (headline, body, disclaimer) — not one row with multiple fields. That matches Lix's per-row merge granularity: Marketing edits the headline section, Legal edits the disclaimer section, both merge cleanly because they touched different rows.
-
-Note: every registered schema `X` automatically gets a sibling table `X_by_version` exposing a `lixcol_version_id` column. Use it for cross-version reads and writes — you almost never need `switchVersion` for demos or read paths.
+For tests and demos, use an isolated temp directory per run:
 
 ```ts
 import { mkdtempSync } from "node:fs";
@@ -109,408 +96,373 @@ const dir = mkdtempSync(path.join(tmpdir(), "lix-"));
 const lix = await openLix({
   backend: createBetterSqlite3Backend({ path: path.join(dir, "demo.lix") }),
 });
-const published = await lix.activeVersionId();
+```
 
-// 1. Register a section schema. A brochure is a *collection* of sections.
+Use the version of this skill that ships with the installed `@lix-js/sdk` package. If behavior is unclear, inspect the installed package before guessing. The npm package bundles matching engine source under `node_modules/@lix-js/sdk/dist-engine-src/`.
+
+Useful installed-package references:
+
+- `dist-engine-src/src/sql2/entity_provider.rs` - registered schema SQL surfaces.
+- `dist-engine-src/src/sql2/change_provider.rs` - `lix_change` projection.
+- `dist-engine-src/src/sql2/version_provider.rs` - writable `lix_version` surface.
+- `dist-engine-src/src/transaction/validation.rs` - primary-key, unique, foreign-key, and shape validation.
+- `dist-engine-src/src/schema/definition.json` - Lix schema-definition meta-schema.
+- `dist-engine-src/src/schema/builtin/` - built-in entity table shapes.
+- `dist-engine-src/src/sql2/udfs/` - registered SQL functions.
+
+Do not import from `@lix-js/sdk/engine-wasm`, do not call private wasm helpers, and do not open the `.lix` SQLite file directly.
+
+## Minimal Entity Example
+
+This is the smallest useful consumer pattern: open, register a schema, write a row, read it back, and close.
+
+```ts
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { openLix } from "@lix-js/sdk";
+import { createBetterSqlite3Backend } from "@lix-js/sdk/sqlite";
+
+const dir = mkdtempSync(path.join(tmpdir(), "lix-"));
+const lix = await openLix({
+  backend: createBetterSqlite3Backend({ path: path.join(dir, "demo.lix") }),
+});
+
 await lix.execute(
   "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
-  [JSON.stringify({
-    $schema: "https://json-schema.org/draft/2020-12/schema",
-    "x-lix-key": "acme_section",
-    "x-lix-version": "1",
-    "x-lix-primary-key": ["/id"],
-    type: "object",
-    required: ["id", "brochure_id", "kind", "text"],
-    properties: {
-      id:          { type: "string" },
-      brochure_id: { type: "string" },
-      kind:        { type: "string" }, // "headline" | "body" | "disclaimer"
-      text:        { type: "string" },
-    },
-    additionalProperties: false,
-  })],
-);
-
-// 2. Seed three sections of the live brochure on Published.
-await lix.execute(
-  `INSERT INTO acme_section (id, brochure_id, kind, text) VALUES
-     ($1,$2,$3,$4),($5,$6,$7,$8),($9,$10,$11,$12)`,
   [
-    "s-headline",   "spring-2026", "headline",   "Meet the Acme X1",
-    "s-body",       "spring-2026", "body",       "A fast, friendly bike for everyone.",
-    "s-disclaimer", "spring-2026", "disclaimer", "Specs subject to change.",
+    JSON.stringify({
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      "x-lix-key": "acme_note",
+      "x-lix-version": "1",
+      "x-lix-primary-key": ["/id"],
+      type: "object",
+      required: ["id", "title", "done"],
+      properties: {
+        id: { type: "string" },
+        title: { type: "string" },
+        done: { type: "boolean" },
+      },
+      additionalProperties: false,
+    }),
   ],
 );
 
-// 3. Create all three reviewer versions up front from the same Published base.
-//    (Forking later — after a merge — would change the merge base and hide the conflict.)
-const marketing = await lix.createVersion({ name: "Marketing edit" });
-const legal     = await lix.createVersion({ name: "Legal review" });
-const competing = await lix.createVersion({ name: "Competing headline" });
-
-// Marketing rewrites the headline section.
 await lix.execute(
-  `UPDATE acme_section_by_version
-      SET text = $1
-    WHERE id = $2 AND lixcol_version_id = $3`,
-  ["The Acme X1 — built for your weekend", "s-headline", marketing.versionId],
+  "INSERT INTO acme_note (id, title, done) VALUES ($1, $2, $3)",
+  ["n1", "Draft launch copy", false],
 );
 
-// Legal rewrites the disclaimer section. Different entity → won't conflict with Marketing.
-await lix.execute(
-  `UPDATE acme_section_by_version
-      SET text = $1
-    WHERE id = $2 AND lixcol_version_id = $3`,
-  ["Specifications and pricing subject to change. See acme.com/legal.",
-   "s-disclaimer", legal.versionId],
+const result = await lix.execute(
+  "SELECT title, done FROM acme_note WHERE id = $1",
+  ["n1"],
 );
 
-// Competing rewrites the *same* headline section as Marketing. This will conflict on merge.
-await lix.execute(
-  `UPDATE acme_section_by_version
-      SET text = $1
-    WHERE id = $2 AND lixcol_version_id = $3`,
-  ["Acme X1: now with carbon fork", "s-headline", competing.versionId],
-);
-
-// 4. THE AHA: one SELECT, four versions side by side.
-const sideBySide = await lix.execute(
-  `SELECT v.name, s.kind, s.text
-     FROM acme_section_by_version s
-     JOIN lix_version v ON v.id = s.lixcol_version_id
-    WHERE s.brochure_id = $1
-      AND s.lixcol_version_id IN ($2, $3, $4, $5)
-    ORDER BY v.name, s.kind`,
-  ["spring-2026", published, marketing.versionId, legal.versionId, competing.versionId],
-);
-if (sideBySide.kind === "rows") {
-  console.log("Same brochure, four versions:");
-  let lastVersion = "";
-  for (const row of sideBySide.rows.rows) {
-    const v = row[0].asText()!;
-    if (v !== lastVersion) { console.log(`  [${v}]`); lastVersion = v; }
-    console.log(`    ${row[1].asText()!.padEnd(11)} → ${row[2].asText()}`);
-  }
-}
-
-// 5. Merge Marketing and Legal into Published. Different entities → both succeed.
-const m1 = await lix.mergeVersion({ sourceVersionId: marketing.versionId });
-const m2 = await lix.mergeVersion({ sourceVersionId: legal.versionId });
-console.log(`\nMarketing merge: ${m1.outcome} (+${m1.changeStats.total} changes)`);
-console.log(`Legal merge:     ${m2.outcome} (+${m2.changeStats.total} changes)`);
-
-const finalState = await lix.execute(
-  `SELECT kind, text FROM acme_section
-    WHERE brochure_id = $1 ORDER BY kind`,
-  ["spring-2026"],
-);
-if (finalState.kind === "rows") {
-  console.log("\nPublished, after both merges (Marketing's headline + Legal's disclaimer):");
-  for (const row of finalState.rows.rows) {
-    console.log(`  ${row[0].asText()!.padEnd(11)} → ${row[1].asText()}`);
-  }
-}
-
-// 6. The change journal is just a SQL table. Audit log, blame, undo — all queries.
-//    snapshot_content currently comes back as TEXT (a JSON string), so JSON.parse it.
-const history = await lix.execute(
-  `SELECT created_at, entity_id, snapshot_content
-     FROM lix_change
-    WHERE schema_key = $1
-    ORDER BY created_at`,
-  ["acme_section"],
-);
-if (history.kind === "rows") {
-  console.log(`\nAudit trail (${history.rows.rows.length} entries):`);
-  for (const row of history.rows.rows) {
-    const snap = row[2].asText();
-    const parsed = snap ? JSON.parse(snap) : null;
-    console.log(`  ${row[0].asText()}  ${row[1].asText()}  ${JSON.stringify(parsed)}`);
-  }
-}
-
-// 7. Try to merge Competing — it edited the same s-headline that Marketing already merged.
-//    The engine detects the entity-level conflict and throws.
-try {
-  await lix.mergeVersion({ sourceVersionId: competing.versionId });
-} catch (err) {
-  console.log(`\nConflict surfaced (expected): ${(err as Error).message}`);
-}
+const row = result.rows[0]!;
+console.log(row.value("title").asText(), row.value("done").asBoolean());
 
 await lix.close();
 ```
 
-What gets printed, in order:
+## Reading Results
 
-- One SELECT shows the same brochure across four versions, each section with its own per-version text — versioning lives *in the query layer*.
-- Two `mergeCommitted` outcomes with non-zero `changeStats.total`.
-- A final Published brochure with **Marketing's headline AND Legal's disclaimer** — clean per-row merge.
-- An audit trail straight out of `lix_change`, ordered by `created_at`.
-- A caught conflict from the version that re-edited Marketing's section.
-
-That output is the elevator pitch. Imitate this shape when building demos: model the domain as **collections of small entities** (sections, blocks, paragraphs, message keys, line items) so reviewers naturally edit different rows; create all versions up front from the same base; use `<schema>_by_version` for cross-version reads and writes (you almost never need `switchVersion`); name versions in the user's vocabulary (`"Marketing edit"`, `"Legal review"`, `"Editor's pass"`, `"Q3 pricing draft"` — never `"Draft"` or `"branch-1"`); always include a `SELECT FROM lix_change` to surface the audit trail; and a deliberate `try/catch` conflict path.
-
-## Cross-Version Reads And Writes
-
-Every registered schema `X` gets a sibling table `X_by_version` with a `lixcol_version_id` column. Use it whenever a query needs more than one version, or whenever you want to write to a non-active version without `switchVersion`.
-
-- **Reads** filter by `lixcol_version_id` (or omit the filter to scan all versions, joining on `lix_version` for the version name).
-- **INSERTs** require `lixcol_version_id` — without it the engine errors with `INSERT into <key>_by_version requires lixcol_version_id`.
-- **UPDATEs / DELETEs** must include `lixcol_version_id` in the WHERE clause; DELETEs without it error with `DELETE FROM <key>_by_version requires an explicit lixcol_version_id predicate`.
-- The non-suffixed table (`acme_brochure`) is the **active-version view** — convenient for app code that always operates on the current version, but `_by_version` is the right tool for demos, sync, agent inspection, and side-by-side diffs.
-
-The same pattern applies to built-ins: `lix_change_by_version`, `lix_commit_by_version`, `lix_directory_by_version`, etc.
-
-## Files (`lix_file`)
-
-Files are first-class in Lix — and this is a core USP, not a side feature. The built-in `lix_file` table lets you write any file (text, JSON, markdown, binary) into the lix and get versioning, branching, merging, and history over it for free. Parent directories are created automatically.
+`lix.execute()` returns one shape for every statement:
 
 ```ts
-// Write a file. `data` is a blob (bytes).
-await lix.execute(
-  "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
-  ["file-readme", "/docs/readme.md", new TextEncoder().encode("# Hello\n")],
-);
+type ExecuteResult = {
+  columns: string[];
+  rows: Row[];
+  rowsAffected: number;
+  notices: LixNotice[];
+};
+```
 
-// Read it back.
-const r = await lix.execute(
-  "SELECT path, data FROM lix_file WHERE id = $1",
-  ["file-readme"],
-);
-if (r.kind === "rows") {
-  const [path, data] = r.rows.rows[0]!;
-  console.log(path.asText(), new TextDecoder().decode(data.asBlob()!));
+There is no `result.kind`. `SELECT` fills `columns` and `rows`; `INSERT`, `UPDATE`, and `DELETE` usually return `rows: []` and set `rowsAffected`.
+
+Each row is a `Row` object. Use `row.value("column")` or `row.valueAt(index)` to get a `Value`, then call typed accessors:
+
+```ts
+const r = await lix.execute("SELECT id, title, done FROM acme_note");
+for (const row of r.rows) {
+  const id = row.value("id").asText();
+  const title = row.value("title").asText();
+  const done = row.value("done").asBoolean();
 }
 ```
 
-Columns on `lix_file`:
+| Method        | Returns                   | Use for                                   |
+| ------------- | ------------------------- | ----------------------------------------- |
+| `asText()`    | `string \| undefined`     | strings; note `asText`, not `asString`    |
+| `asBoolean()` | `boolean \| undefined`    | booleans                                  |
+| `asInteger()` | `number \| undefined`     | integer fields                            |
+| `asReal()`    | `number \| undefined`     | decimal/real fields                       |
+| `asJson()`    | `JsonValue \| undefined`  | objects and arrays                        |
+| `asBlob()`    | `Uint8Array \| undefined` | binary data                               |
 
-| Column | Type | What it is |
-|--------|------|------------|
-| `id` | text | Stable identity for the file (you choose it). |
-| `path` | text | Absolute path like `/docs/readme.md`. Parent directories are auto-created in `lix_directory`. |
-| `data` | blob | File contents as bytes. |
-| `hidden` | bool | UI hint; doesn't affect storage. |
-| `lixcol_*` | various | Version metadata (`lixcol_version_id`, `lixcol_global`, `lixcol_untracked`, `lixcol_change_id`, `lixcol_commit_id`, ...). |
+Accessors return `undefined` when the cell kind does not match. Branch on `value.kind` if a column can hold multiple types. Public kind strings are `"null"`, `"boolean"`, `"integer"`, `"real"`, `"text"`, `"json"`, and `"blob"`.
 
-`lix_file_by_version` exists for cross-version file reads/writes, exactly like any other entity surface.
-
-**Files-as-entities (upcoming).** A future plugin API will let a registered parser turn a file's contents into rows in your schema tables on write — so `messages.json` becomes per-key entities and two translators editing different keys merge cleanly. Not shipped through `@lix-js/sdk` yet; don't promise it in demos. Today, `lix_file` versions bytes only.
+`Row` also has convenience methods when native JS values are enough: `get(name)`, `tryGet(name)`, `getAt(index)`, `toObject()`, and `toValueMap()`.
 
 ## Registering Schemas
 
-Use stable, namespaced `x-lix-key` and `x-lix-version`. Prefer names that describe a domain entity (`acme_brochure`, `crm_contact`, `cms_page`) — never generic ones (`task`, `item`).
-
-Include `x-lix-primary-key` so the engine can derive entity identity. Each entry is a **JSON Pointer (RFC 6901)** into the entity, leading slash required:
-
-- `["/id"]` — top-level `id` property.
-- `["/owner/email"]` — nested property `owner.email`.
-- `["/owner", "/slug"]` — composite key over two top-level fields.
-
-Without `x-lix-primary-key`, table-style INSERTs fail with `requires lixcol_entity_id because the schema has no x-lix-primary-key`.
-
-Do **not** add generic `created_at` or `updated_at` fields to registered app schemas by default. Lix already records creation/update semantics through `lix_change`, history tables, and `lixcol_*` metadata. Add timestamp fields only when they are domain data (`due_at`, `occurred_at`, `published_at`, `active_from`, etc.), not row lifecycle bookkeeping.
-
-## Reading Results
-
-`lix.execute()` returns a discriminated `ExecuteResult`:
+Register app schemas by inserting JSON into `lix_registered_schema.value`:
 
 ```ts
-type ExecuteResult =
-  | { kind: "rows"; rows: { columns: string[]; rows: Value[][] } }
-  | { kind: "affectedRows"; affectedRows: number };
+await lix.execute(
+  "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+  [JSON.stringify(schema)],
+);
 ```
 
-`SELECT` returns `kind: "rows"`. `INSERT` / `UPDATE` / `DELETE` return `kind: "affectedRows"`. Always narrow on `result.kind` before reading `result.rows`.
+Schema basics:
 
-Cells in `result.rows.rows[i][j]` are `Value` instances (also exported from `@lix-js/sdk`), not raw JS primitives. Use the typed accessors:
+- `x-lix-key` becomes the generated SQL table name.
+- `x-lix-version` versions your schema contract.
+- `x-lix-primary-key` tells Lix how to derive entity identity.
+- Primary-key entries are JSON Pointers with a leading slash, such as `["/id"]` or `["/owner/email"]`.
+- Use `additionalProperties: false` so accidental fields fail fast.
+
+Without `x-lix-primary-key`, table-style INSERTs fail with an error like `requires lixcol_entity_id because the schema has no x-lix-primary-key`.
+
+Uniqueness is not inferred from ordinary JSON Schema fields. If a non-primary-key field must be unique, declare it explicitly:
 
 ```ts
-import { openLix, Value } from "@lix-js/sdk";
+const companyDomainSchema = {
+  "x-lix-key": "crm_company_domain",
+  "x-lix-version": "1",
+  "x-lix-primary-key": ["/id"],
+  "x-lix-unique": [["/domain"]],
+  type: "object",
+  required: ["id", "domain"],
+  properties: {
+    id: { type: "string" },
+    domain: { type: "string" },
+  },
+  additionalProperties: false,
+};
+```
 
-const r = await lix.execute("SELECT id, headline, price_usd FROM acme_brochure");
-if (r.kind === "rows") {
-  for (const row of r.rows.rows) {
-    const id = row[0].asText();        // string | undefined
-    const headline = row[1].asText();  // string | undefined
-    const price = row[2].asReal();     // number | undefined
-  }
+Do not add generic `created_at` or `updated_at` fields by default. Lix already records lifecycle history through `lix_change` and `lixcol_*` metadata. Add timestamp fields only when they are domain data, such as `due_at`, `published_at`, or `occurred_at`.
+
+Discover live schemas before guessing:
+
+```ts
+const schemas = await lix.execute(
+  "SELECT lixcol_entity_id, value FROM lix_registered_schema ORDER BY lixcol_entity_id",
+);
+
+for (const row of schemas.rows) {
+  const schema = row.get("value") as { "x-lix-key"?: string };
+  console.log(schema["x-lix-key"]);
 }
 ```
 
-| Method | Returns | Use for |
-|--------|---------|---------|
-| `asText()` | `string \| undefined` | `string` (note: `asText`, not `asString`) |
-| `asBoolean()` | `boolean \| undefined` | `boolean` |
-| `asInteger()` | `number \| undefined` | `integer` |
-| `asReal()` | `number \| undefined` | `number` |
-| `asJson()` | `JsonValue \| undefined` | `object` / `array` |
-| `asBlob()` | `Uint8Array \| undefined` | binary |
-| `kindValue()` | `"text" \| "bool" \| "int" \| "float" \| "json" \| "blob" \| "null"` | discriminator |
+## Versions And `_by_version`
 
-Each accessor returns `undefined` if the cell's kind doesn't match — branch on `kindValue()` first if you need to handle multiple types. Note the naming mismatch: accessors are `asInteger` / `asReal`, but `kindValue()` returns the short forms `"int"` / `"float"`.
-
-## Versions
-
-Capture the initial active version id rather than hardcoding `"main"`:
+Capture the initial active version id instead of hardcoding `"main"`:
 
 ```ts
 const published = await lix.activeVersionId();
 ```
 
-Create a version with a name from the user's vocabulary:
+Create versions with names from the user's domain:
 
 ```ts
-const draft = await lix.createVersion({ name: "Marketing edit" });
+const marketing = await lix.createVersion({ name: "Marketing edit" });
+const legal = await lix.createVersion({ name: "Legal review" });
 ```
 
-For demos, agent flows, sync, and any read path that touches more than one version, **write through `<schema>_by_version` with `lixcol_version_id`** (see the canonical demo) — you don't need to switch.
+Every registered schema `X` gets a sibling table `X_by_version` with `lixcol_version_id`. Use it for side-by-side reads and for writes to non-active versions.
 
-`switchVersion` is for app code that has a "current working version" concept and wants subsequent unqualified writes (`UPDATE acme_section SET …`) to land there. `mergeVersion` always merges *into the active version*, so if you're merging into something other than the currently active version, switch first.
+```ts
+await lix.execute(
+  `UPDATE acme_note_by_version
+      SET title = $1
+    WHERE id = $2 AND lixcol_version_id = $3`,
+  ["Sharper launch copy", "n1", marketing.id],
+);
+
+const sideBySide = await lix.execute(
+  `SELECT v.name, n.title
+     FROM acme_note_by_version n
+     JOIN lix_version v ON v.id = n.lixcol_version_id
+    WHERE n.id = $1
+      AND n.lixcol_version_id IN ($2, $3)
+    ORDER BY v.name`,
+  ["n1", published, marketing.id],
+);
+```
+
+Rules for `_by_version`:
+
+- Reads filter by `lixcol_version_id`, or omit the filter to scan all versions.
+- INSERTs require `lixcol_version_id`.
+- UPDATEs and DELETEs must include `lixcol_version_id` in the WHERE clause.
+- The non-suffixed table is the active-version view.
+
+`switchVersion()` is for app code with a current working version concept. `mergeVersion()` always merges into the active version, so switch first if you need a different target.
 
 ## Merging
 
-`mergeVersion()` merges the source version into the **currently active** version (no `targetVersionId`):
+`mergeVersion()` merges the source version into the currently active version:
 
 ```ts
-const merge = await lix.mergeVersion({ sourceVersionId: draft.versionId });
+try {
+  const merge = await lix.mergeVersion({ sourceVersionId: marketing.id });
+  console.log(merge.outcome, merge.changeStats.total);
+} catch (error) {
+  console.error("Merge conflict", error);
+}
 ```
 
-The result is a structured receipt:
+Common outcomes:
+
+- `"alreadyUpToDate"` - source has no commits the target lacks.
+- `"fastForward"` - target advanced to source without a merge commit.
+- `"mergeCommitted"` - a new merge commit was created.
+
+`mergeVersionPreview()` reports the same merge decision without advancing refs, staging changes, or creating commits. Merge conflicts are returned as preview data.
+
+Conflicts throw from `mergeVersion()`. If both versions modified the same entity since their merge base, Lix raises a `LixError`. Conflict detection is row-level today, not field-level. To reproduce a conflict in a demo, fork all contending versions from the same base before merging any of them.
+
+## Demo Pattern To Imitate
+
+For richer demos, show these four things:
+
+1. Isolation: one SELECT against `<schema>_by_version` shows several versions side by side.
+2. Clean parallel merges: two reviewers edit different entities and both land.
+3. Audit history: `lix_change` is queryable SQL.
+4. Conflict handling: two versions edit the same entity and `mergeVersion()` throws.
+
+Shape the domain as a collection of small entities:
+
+- Good: brochure sections, document blocks, paragraph rows, message keys, line items.
+- Risky: one huge document row with many editable fields.
+
+Demo recipe:
+
+1. Register a schema such as `acme_section`.
+2. Seed several rows in the published version.
+3. Create all reviewer versions up front from the same base.
+4. Write each reviewer's changes through `acme_section_by_version`.
+5. Read side by side by joining `acme_section_by_version` to `lix_version`.
+6. Merge non-overlapping row edits successfully.
+7. Query `lix_change`.
+8. Catch the deliberate same-row conflict.
+
+## Files With `lix_file`
+
+`lix_file` stores files as versioned bytes. Parent directories are created automatically.
 
 ```ts
-type MergeVersionResult = {
-  outcome: "alreadyUpToDate" | "fastForward" | "mergeCommitted";
-  changeStats: {
-    total: number;
-    added: number;
-    modified: number;
-    removed: number;
-  };
-  targetVersionId: string;
-  sourceVersionId: string;
-  baseCommitId: string;
-  targetHeadBeforeCommitId: string;
-  sourceHeadBeforeCommitId: string;
-  targetHeadAfterCommitId: string;
-  createdMergeCommitId: string | null;
-};
+await lix.execute("INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)", [
+  "file-readme",
+  "/docs/readme.md",
+  new TextEncoder().encode("# Hello\n"),
+]);
 
-type MergeVersionPreviewResult = {
-  outcome: "alreadyUpToDate" | "fastForward" | "mergeCommitted";
-  changeStats: {
-    total: number;
-    added: number;
-    modified: number;
-    removed: number;
-  };
-  targetVersionId: string;
-  sourceVersionId: string;
-  baseCommitId: string;
-  targetHeadCommitId: string;
-  sourceHeadCommitId: string;
-  conflicts: Array<{
-    kind: "sameEntityChanged";
-    schemaKey: string;
-    entityId: string;
-    fileId: string | null;
-    target: { kind: "added" | "modified" | "removed"; beforeChangeId: string | null; afterChangeId: string | null };
-    source: { kind: "added" | "modified" | "removed"; beforeChangeId: string | null; afterChangeId: string | null };
-  }>;
-};
+const result = await lix.execute(
+  "SELECT path, data FROM lix_file WHERE id = $1",
+  ["file-readme"],
+);
+
+const file = result.rows[0]!;
+console.log(
+  file.value("path").asText(),
+  new TextDecoder().decode(file.value("data").asBlob()!),
+);
 ```
 
-- `outcome: "alreadyUpToDate"` — the source has no commits the target lacks. Nothing applied.
-- `mergeVersionPreview()` returns the same outcome and change stats without advancing refs, staging changes, or creating commits. Merge conflicts are returned as `conflicts` data in the preview.
-- `outcome: "fastForward"` — the target ref advanced to the source head without creating a merge commit; `changeStats` counts source-side tracked changes made visible in the target, and `createdMergeCommitId` is `null`.
-- `outcome: "mergeCommitted"` — a new merge commit was created; `changeStats` counts source-side tracked changes adopted into the target, and `createdMergeCommitId` is set.
+Columns consumers usually need:
 
-**Conflicts throw.** If both versions modified the same entity (the same row, identified by `x-lix-key` + primary key) since their merge base, `mergeVersion` raises a `LixError` with a message like `engine2 merge_version found N tracked-state conflict(s)`. Conflicts are detected at row identity, not at field level — disjoint-field edits to the same row still conflict. The current SDK does not expose programmatic conflict resolution — wrap in `try/catch` and surface the error to the user (see the canonical demo above).
+| Column     | What it is                                                            |
+| ---------- | --------------------------------------------------------------------- |
+| `id`       | Stable identity for the file.                                         |
+| `path`     | Absolute path like `/docs/readme.md`.                                 |
+| `data`     | File contents as bytes.                                               |
+| `hidden`   | UI hint; does not affect storage.                                     |
+| `lixcol_*` | Version/change metadata, including `lixcol_version_id` where exposed. |
 
-## SQL Parameters and UDFs
+`lix_file_by_version` exists for cross-version file reads and writes. Files-as-parsed-entities are product direction, not current JS SDK behavior.
 
-Use DataFusion-style numbered placeholders. Bare `?` is rejected with `Failed to parse placeholder id`:
+## The Change Journal
 
-```ts
-await lix.execute("SELECT * FROM acme_brochure WHERE id = $1", ["spring-2026"]);
-```
+`lix_change` is an immutable SQL table of changes across registered schemas and versions. Use it for audit logs, blame, history, activity feeds, and undo-style UI.
 
-The only UDF the canonical demo uses is `lix_json($1)` — it parses a TEXT parameter as a JSON value, required when writing JSON-typed columns like `lix_registered_schema.value`. Other UDFs (`lix_json_get`, `lix_json_get_text`, `lix_uuid_v7`, `lix_text_encode`/`_decode`, `lix_empty_blob`, …) live in [packages/engine/src/sql2/udfs](https://github.com/opral/lix/tree/561f92b5bc3fa68e48a863ed3a02129645a57011/packages/engine/src/sql2/udfs) — read source when you need them.
-
-## Built-in Queryable Tables
-
-The four tables demos actually touch:
-
-| Table | What it gives you |
-|-------|-------------------|
-| `lix_version` | List of versions (`id`, `name`, `hidden`, `commit_id`). Use this instead of hardcoding `"main"`. |
-| `lix_change` | The immutable journal — every change with `entity_id`, `schema_key`, `snapshot_content`, `created_at`. See the next section. |
-| `lix_file` | Built-in file storage (covered above). |
-| `lix_registered_schema` | Your registered schemas (and built-ins). |
-
-The engine ships ~20 more built-ins (commit graph, change sets, key-value, labels, file/directory descriptors, low-level state, etc.) — see [packages/engine/src/schema/builtin](https://github.com/opral/lix/tree/561f92b5bc3fa68e48a863ed3a02129645a57011/packages/engine/src/schema/builtin) when you need them. `lix_account` / `lix_change_author` are declared but **not yet implemented; don't rely on them.**
-
-## The Change Journal (`lix_change`)
-
-`lix_change` is the most reliable feature in the SDK and the most under-marketed one. Every write — INSERT, UPDATE, DELETE, on any registered schema, on any version — appends an immutable row. That row is **just SQL you can query**. Audit logs, blame, undo, "what changed since Tuesday", "show me everything Marketing edited" — none of this is a separate subsystem; it's all `SELECT FROM lix_change`.
-
-Columns that matter: `id`, `entity_id`, `schema_key`, `schema_version`, `snapshot_content` (TEXT JSON — `JSON.parse(asText())`, not `asJson()`), `created_at`, plus `lixcol_*` for version metadata.
+Important columns include `id`, `entity_id`, `schema_key`, `schema_version`, `snapshot_content`, `created_at`, and `lixcol_*` metadata.
 
 ```ts
-// Audit log: every change to a single entity, oldest to newest.
+// Audit log for one entity, oldest to newest.
 await lix.execute(
   `SELECT created_at, snapshot_content
      FROM lix_change
     WHERE schema_key = $1 AND entity_id = $2
     ORDER BY created_at`,
-  ["acme_section", "s-headline"],
+  ["acme_note", "n1"],
 );
 
-// Blame: who/what last touched this entity.
-await lix.execute(
-  `SELECT created_at, snapshot_content
-     FROM lix_change
-    WHERE schema_key = $1 AND entity_id = $2
-    ORDER BY created_at DESC
-    LIMIT 1`,
-  ["acme_section", "s-headline"],
-);
-
-// Activity feed: latest 20 changes across the whole schema.
+// Latest activity across a schema.
 await lix.execute(
   `SELECT created_at, entity_id, snapshot_content
      FROM lix_change
     WHERE schema_key = $1
     ORDER BY created_at DESC
     LIMIT 20`,
-  ["acme_section"],
+  ["acme_note"],
 );
 ```
 
-Reach for `lix_change` whenever an app needs history, audit, undo, or activity feeds. It replaces a hand-rolled audit table.
+`snapshot_content` can be null or absent for tombstones, removals, or rows where content was not materialized. In the JS SDK, read it with `row.value("snapshot_content").asJson()` or `row.get("snapshot_content")`, then handle null. Do not blindly `JSON.parse` it as text.
 
-## Gotchas
+## Built-In Tables And UDFs
 
-A short list of things that will burn a fresh agent on the first run.
+Common tables:
 
-- **`type: "number"` columns require float literals.** JS numerics bind as Int64 by default, so seeding a `number` column with `899` fails with `expected Float64 but found Int64`. JS has no integer/float distinction, so `899.0` doesn't help either — pass a value with a fractional part (e.g. `899.5`), or model whole-number fields as `type: "integer"` and use `asInteger()` to read.
-- **`lix_change.snapshot_content` is currently a TEXT column** (a JSON string), not native JSON. Reading it with `Value.asJson()` returns `undefined`. Use `JSON.parse(cell.asText())` instead.
-- **Merge is per-entity, not per-field.** Two versions modifying the same row conflict even if their fields are disjoint. Model concurrent-edit domains as collections of small entities (see the canonical demo).
-- **Conflict reproduction is order-dependent.** Fork *all* contending versions from the same base before any merge happens. A version forked *after* a merge has the merged state as its base, so its edit becomes a clean fast-forward instead of a conflict.
-- **`mergeVersion` always merges into the active version.** There is no `targetVersionId` parameter. If you need a non-active target, `switchVersion` first.
-- **Bare `?` placeholders are rejected** with `Failed to parse placeholder id`. Always use `$1`, `$2`, ...
+| Table                   | What it gives consumers                                                                                 |
+| ----------------------- | ------------------------------------------------------------------------------------------------------- |
+| `lix_version`           | Writable version surface: `id`, `name`, `hidden`, `commit_id`.                                          |
+| `lix_change`            | Immutable change journal.                                                                               |
+| `lix_file`              | Versioned byte storage for files.                                                                       |
+| `lix_registered_schema` | Registry of app schemas plus built-ins; also exposes the Lix schema-definition meta-schema at runtime. |
 
-## Safety Rules
+`lix_version` can be updated for admin flows:
 
-- Never use `sqlite3`, `sql.js`, or raw database access against a `.lix`; use `createBetterSqlite3Backend()` instead of opening the file yourself.
-- Never import from `@lix-js/sdk/engine-wasm` or other private internals.
-- Use `$1`, `$2`, `$3` placeholders, never bare `?`.
-- Schema keys: stable, namespaced, lowercase-snake-case, domain-shaped (`acme_brochure`, not `task`).
-- Always include `x-lix-primary-key` and `additionalProperties: false` on registered schemas.
-- Name versions in the end-user's vocabulary (`"Marketing edit"`, `"Q3 pricing draft"`), never developer jargon (`"Draft"`, `"branch-1"`).
-- Wrap `mergeVersion` in `try/catch` if there is any chance of a conflicting edit.
-- Close handles in scripts/tests with `await lix.close()`.
+```ts
+await lix.execute("UPDATE lix_version SET hidden = true WHERE id = $1", [
+  marketing.id,
+]);
+```
+
+There is no documented `deleteVersion()` helper in this preview. If the product wants reversible cleanup, hide the version. If it wants removal, `DELETE FROM lix_version WHERE id = $1` is the SQL surface; the engine rejects deleting the global version and active version.
+
+Use `lix_json($1)` to parse JSON text parameters when writing JSON-typed columns:
+
+```ts
+await lix.execute(
+  "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+  [JSON.stringify(schema)],
+);
+```
+
+Other UDFs, such as `lix_json_get`, `lix_uuid_v7`, `lix_text_encode`, and `lix_empty_blob`, live in `dist-engine-src/src/sql2/udfs/` in the installed package.
+
+## Do And Avoid
+
+| Do | Avoid |
+| --- | --- |
+| Use `createBetterSqlite3Backend({ path })` for persistent state. | Opening `.lix` files with raw SQLite libraries. |
+| Use public imports from `@lix-js/sdk` and `@lix-js/sdk/sqlite`. | Importing `engine-wasm` or private internals. |
+| Use `$1`, `$2`, `$3` placeholders. | Bare `?` placeholders. |
+| Use `lix_json($1)` for JSON parameters. | Inlining stringified JSON directly into SQL. |
+| Use `_by_version` for cross-version reads/writes. | Switching versions just to render a side-by-side view. |
+| Name versions in user vocabulary. | User-facing words like branch, branch-1, or generic Draft. |
+| Model collaborative data as small rows. | One giant row when multiple reviewers edit different parts. |
+| Add `x-lix-unique` for non-primary unique fields. | Assuming JSON Schema property metadata creates uniqueness. |
+| Read `snapshot_content` as JSON/native and handle null. | Blindly `JSON.parse(row.value(...).asText())`. |
+| Wrap `mergeVersion()` in `try/catch`. | Assuming merges cannot conflict. |
 
 ## Reporting SDK Friction
 
-If you encounter an SDK bug, missing API, confusing error, documentation gap, or large implementation friction while using this skill, pause and ask the user whether they want you to open a GitHub issue via the `gh` CLI installed on their computer. Do not file the issue without confirmation. If they approve, include a minimal reproduction, expected behavior, actual behavior, the installed `@lix-js/sdk` package version, runtime/version details, and any relevant error output.
+If you encounter an SDK bug, missing API, confusing error, documentation gap, or large implementation friction while using this skill, pause and ask the user whether they want you to open a GitHub issue via the `gh` CLI installed on their computer. Do not file an issue without confirmation.
+
+Before filing, scan existing issues to avoid duplicates. If the user approves a report, include a minimal reproduction, expected behavior, actual behavior, the installed `@lix-js/sdk` version, runtime details, and relevant error output. Do not include private data, customer content, credentials, tokens, local paths, database contents, or proprietary schemas.

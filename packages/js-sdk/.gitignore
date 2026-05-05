@@ -1,4 +1,6 @@
 /dist
+/dist-engine-src
+/engine-src
 
 # wasm-bindgen generated engine outputs
 /src/engine-wasm/wasm
