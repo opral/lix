@@ -177,22 +177,49 @@ impl From<backend::BackendKvValueBatch> for KvValueBatch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KvValueGroup {
-    pub(crate) namespace: String,
-    pub(crate) values: Vec<Option<Vec<u8>>>,
+    namespace: String,
+    values: BytePage,
+    present: Vec<bool>,
 }
 
 impl From<backend::BackendKvValueGroup> for KvValueGroup {
     fn from(group: backend::BackendKvValueGroup) -> Self {
+        let (namespace, values, present) = group.into_parts();
         Self {
-            namespace: group.namespace,
-            values: group.values,
+            namespace,
+            values,
+            present,
         }
     }
 }
 
 impl KvValueGroup {
-    pub(crate) fn pop_value(&mut self) -> Option<Vec<u8>> {
-        self.values.pop().flatten()
+    pub(crate) fn len(&self) -> usize {
+        self.present.len()
+    }
+
+    pub(crate) fn value(&self, index: usize) -> Option<Option<&[u8]>> {
+        let present = *self.present.get(index)?;
+        if present {
+            Some(Some(
+                self.values
+                    .get(index)
+                    .expect("storage value batch invariant violated"),
+            ))
+        } else {
+            Some(None)
+        }
+    }
+
+    pub(crate) fn values_iter(&self) -> impl Iterator<Item = Option<&[u8]>> {
+        (0..self.len()).filter_map(|index| self.value(index))
+    }
+
+    pub(crate) fn single_value_owned(&self) -> Option<Vec<u8>> {
+        if self.len() != 1 {
+            return None;
+        }
+        self.value(0).flatten().map(<[u8]>::to_vec)
     }
 }
 
@@ -326,22 +353,19 @@ impl KvWriteBatch {
     ) {
         let namespace = namespace.into();
         let group = self.group_mut(namespace);
-        group.puts.push(KvPut {
-            key: key.into(),
-            value: value.into(),
-        });
+        group.put(key.into(), value.into());
     }
 
     pub(crate) fn delete(&mut self, namespace: impl Into<String>, key: impl Into<Vec<u8>>) {
         let namespace = namespace.into();
         let group = self.group_mut(namespace);
-        group.deletes.push(key.into());
+        group.delete(key.into());
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.groups
             .iter()
-            .all(|group| group.puts.is_empty() && group.deletes.is_empty())
+            .all(|group| group.put_count() == 0 && group.delete_count() == 0)
     }
 
     fn group_mut(&mut self, namespace: String) -> &mut KvWriteGroup {
@@ -354,8 +378,9 @@ impl KvWriteBatch {
         }
         self.groups.push(KvWriteGroup {
             namespace,
-            puts: Vec::new(),
-            deletes: Vec::new(),
+            put_keys: backend::BytePageBuilder::new(),
+            put_values: backend::BytePageBuilder::new(),
+            deletes: backend::BytePageBuilder::new(),
         });
         self.groups.last_mut().expect("group just pushed")
     }
@@ -371,33 +396,60 @@ impl From<KvWriteBatch> for backend::BackendKvWriteBatch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KvWriteGroup {
-    pub(crate) namespace: String,
-    pub(crate) puts: Vec<KvPut>,
-    pub(crate) deletes: Vec<Vec<u8>>,
+    namespace: String,
+    put_keys: backend::BytePageBuilder,
+    put_values: backend::BytePageBuilder,
+    deletes: backend::BytePageBuilder,
 }
 
 impl From<KvWriteGroup> for backend::BackendKvWriteGroup {
     fn from(group: KvWriteGroup) -> Self {
-        Self {
-            namespace: group.namespace,
-            puts: group.puts.into_iter().map(Into::into).collect(),
-            deletes: group.deletes,
-        }
+        Self::from_pages(
+            group.namespace,
+            group.put_keys.finish(),
+            group.put_values.finish(),
+            group.deletes.finish(),
+        )
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct KvPut {
-    pub(crate) key: Vec<u8>,
-    pub(crate) value: Vec<u8>,
-}
-
-impl From<KvPut> for backend::BackendKvPut {
-    fn from(put: KvPut) -> Self {
+impl KvWriteGroup {
+    pub(crate) fn new(namespace: impl Into<String>) -> Self {
         Self {
-            key: put.key,
-            value: put.value,
+            namespace: namespace.into(),
+            put_keys: backend::BytePageBuilder::new(),
+            put_values: backend::BytePageBuilder::new(),
+            deletes: backend::BytePageBuilder::new(),
         }
+    }
+
+    pub(crate) fn put(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) {
+        self.put_keys.push(key);
+        self.put_values.push(value);
+    }
+
+    pub(crate) fn delete(&mut self, key: impl AsRef<[u8]>) {
+        self.deletes.push(key);
+    }
+
+    pub(crate) fn put_count(&self) -> usize {
+        self.put_keys.len()
+    }
+
+    pub(crate) fn delete_count(&self) -> usize {
+        self.deletes.len()
+    }
+
+    pub(crate) fn put_key(&self, index: usize) -> Option<&[u8]> {
+        self.put_keys.get(index)
+    }
+
+    pub(crate) fn put_value(&self, index: usize) -> Option<&[u8]> {
+        self.put_values.get(index)
+    }
+
+    pub(crate) fn delete_key(&self, index: usize) -> Option<&[u8]> {
+        self.deletes.get(index)
     }
 }
 

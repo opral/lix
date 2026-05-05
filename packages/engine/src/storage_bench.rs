@@ -335,8 +335,7 @@ pub async fn storage_api_get_values_hits_prepared(
         .await?;
     transaction.rollback().await?;
     let verified_rows = result.groups[0]
-        .values
-        .iter()
+        .values_iter()
         .filter(|value| value.is_some())
         .count();
     Ok(StorageBenchReport {
@@ -395,8 +394,7 @@ pub async fn storage_api_get_values_misses_prepared(
         .await?;
     transaction.rollback().await?;
     let verified_rows = result.groups[0]
-        .values
-        .iter()
+        .values_iter()
         .filter(|value| value.is_none())
         .count();
     Ok(StorageBenchReport {
@@ -431,8 +429,7 @@ pub async fn storage_api_get_values_mixed_hit_miss_prepared(
         .await?;
     transaction.rollback().await?;
     let verified_rows = result.groups[0]
-        .values
-        .iter()
+        .values_iter()
         .filter(|value| value.is_some())
         .count();
     Ok(StorageBenchReport {
@@ -488,7 +485,7 @@ pub async fn storage_api_get_values_multi_namespace(
     let verified_rows = result
         .groups
         .iter()
-        .map(|group| group.values.iter().filter(|value| value.is_some()).count())
+        .map(|group| group.values_iter().filter(|value| value.is_some()).count())
         .sum();
     Ok(StorageBenchReport {
         measured_rows: reads,
@@ -516,8 +513,7 @@ pub async fn storage_api_get_values_duplicate_keys_prepared(
         .await?;
     transaction.rollback().await?;
     let verified_rows = result.groups[0]
-        .values
-        .iter()
+        .values_iter()
         .filter(|value| value.is_some())
         .count();
     Ok(StorageBenchReport {

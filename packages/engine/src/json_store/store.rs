@@ -2,7 +2,7 @@ use crate::json_store::compression::{compress_json_payload, decode_json_zstd_pay
 use crate::json_store::encoded::{EncodedJson, JsonCodec};
 use crate::json_store::types::JsonRef;
 use crate::storage::{
-    KvGetGroup, KvGetRequest, KvPut, KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
+    KvGetGroup, KvGetRequest, KvWriteBatch, KvWriteGroup, StorageReader, StorageWriter,
 };
 use crate::LixError;
 use std::borrow::Cow;
@@ -103,14 +103,11 @@ pub(crate) async fn persist_stored_json_payload(
 ) -> Result<(), LixError> {
     writer
         .write_kv_batch(KvWriteBatch {
-            groups: vec![KvWriteGroup {
-                namespace: JSON_NAMESPACE.to_string(),
-                puts: vec![KvPut {
-                    key: json_ref.as_hash_bytes().to_vec(),
-                    value: stored_payload.to_vec(),
-                }],
-                deletes: Vec::new(),
-            }],
+            groups: {
+                let mut group = KvWriteGroup::new(JSON_NAMESPACE);
+                group.put(json_ref.as_hash_bytes(), stored_payload);
+                vec![group]
+            },
         })
         .await?;
     Ok(())
@@ -131,7 +128,7 @@ pub(crate) async fn load_json_bytes(
         .groups
         .into_iter()
         .next()
-        .and_then(|mut group| group.pop_value());
+        .and_then(|group| group.single_value_owned());
     let Some(bytes) = result else {
         return Ok(None);
     };
