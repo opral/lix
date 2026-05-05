@@ -15,8 +15,8 @@ use crate::tracked_state::{
     TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
 };
 use crate::untracked_state::{
-    UntrackedStateContext, UntrackedStateFilter, UntrackedStateProjection, UntrackedStateRow,
-    UntrackedStateRowRequest, UntrackedStateScanRequest,
+    MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter,
+    UntrackedStateProjection, UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
 use crate::{Backend, LixError, NullableKeyFilter};
 use std::sync::Arc;
@@ -718,7 +718,7 @@ pub struct TrackedStateDiffFixture {
 
 pub struct UntrackedStateWriteFixture {
     context: UntrackedStateContext,
-    rows: Vec<UntrackedStateRow>,
+    rows: Vec<MaterializedUntrackedStateRow>,
 }
 
 pub struct UntrackedStateReadFixture {
@@ -2804,7 +2804,7 @@ async fn scan_tracked(
 async fn write_untracked_rows(
     backend: &Arc<dyn Backend + Send + Sync>,
     context: &UntrackedStateContext,
-    rows: &[UntrackedStateRow],
+    rows: &[MaterializedUntrackedStateRow],
 ) -> Result<(), LixError> {
     let storage = StorageContext::new(Arc::clone(backend));
     let mut transaction = storage.begin_write_transaction().await?;
@@ -2819,7 +2819,7 @@ async fn scan_untracked(
     backend: &Arc<dyn Backend + Send + Sync>,
     context: &UntrackedStateContext,
     request: UntrackedStateScanRequest,
-) -> Result<Vec<UntrackedStateRow>, LixError> {
+) -> Result<Vec<MaterializedUntrackedStateRow>, LixError> {
     let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
     reader.scan_rows(&request).await
 }
@@ -2927,9 +2927,9 @@ fn tracked_rows_file_selective(
         .collect()
 }
 
-fn untracked_rows(config: StorageBenchConfig) -> Vec<UntrackedStateRow> {
+fn untracked_rows(config: StorageBenchConfig) -> Vec<MaterializedUntrackedStateRow> {
     (0..config.rows)
-        .map(|index| UntrackedStateRow {
+        .map(|index| MaterializedUntrackedStateRow {
             entity_id: EntityIdentity::single(entity_id("untracked", index, config.key_pattern)),
             schema_key: untracked_schema_key(index, config.selectivity),
             file_id: Some("bench.json".to_string()),
