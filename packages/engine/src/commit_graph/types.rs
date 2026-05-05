@@ -13,6 +13,7 @@ use crate::{
 /// newly minted copies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphCommit {
+    pub(crate) canonical_change: CanonicalChange,
     pub(crate) change: MaterializedCanonicalChange,
     pub(crate) commit_id: String,
     pub(crate) change_set_id: String,
@@ -137,7 +138,7 @@ pub(crate) trait CommitGraphReader: Send + Sync {
 /// traversal rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphEntity {
-    pub(crate) change: MaterializedCanonicalChange,
+    pub(crate) change: CanonicalChange,
     pub(crate) source_commit_id: String,
     pub(crate) depth: u32,
     pub(crate) created_at: String,

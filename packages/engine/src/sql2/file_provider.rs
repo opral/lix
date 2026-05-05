@@ -27,7 +27,7 @@ use serde::Deserialize;
 
 use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::functions::FunctionProviderHandle;
-use crate::live_state::LiveStateRow;
+use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
@@ -976,7 +976,7 @@ struct FileDescriptorRecord {
     directory_id: Option<String>,
     name: String,
     hidden: bool,
-    live: LiveStateRow,
+    live: MaterializedLiveStateRow,
 }
 
 #[derive(Debug, Clone)]
@@ -1066,7 +1066,7 @@ fn lix_file_delete_stage_from_batch(
 }
 
 fn blob_ref_file_ids_from_live_rows(
-    rows: &[LiveStateRow],
+    rows: &[MaterializedLiveStateRow],
 ) -> std::result::Result<BTreeSet<String>, LixError> {
     let mut file_ids = BTreeSet::new();
     for row in rows {
@@ -1599,7 +1599,7 @@ async fn file_path_resolvers_from_live_state(
 async fn lix_file_record_batch(
     schema: &SchemaRef,
     blob_reader: &Arc<dyn BlobDataReader>,
-    rows: Vec<LiveStateRow>,
+    rows: Vec<MaterializedLiveStateRow>,
 ) -> Result<RecordBatch, LixError> {
     let projected_columns = schema
         .fields()
@@ -2306,7 +2306,7 @@ mod tests {
     use crate::functions::{
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
-    use crate::live_state::LiveStateRow;
+    use crate::live_state::MaterializedLiveStateRow;
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
     use crate::sql2::dml::InsertSink;
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
@@ -2361,7 +2361,7 @@ mod tests {
 
     #[derive(Default)]
     struct CapturingWriteContext {
-        rows: Vec<LiveStateRow>,
+        rows: Vec<MaterializedLiveStateRow>,
         writes: Vec<StageWrite>,
     }
 
@@ -2371,7 +2371,10 @@ mod tests {
             &self,
             hashes: &[crate::binary_cas::BlobHash],
         ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
-            Ok(crate::binary_cas::BlobBytesBatch::missing(hashes.len()))
+            Ok(crate::binary_cas::BlobBytesBatch::new(vec![
+                None;
+                hashes.len()
+            ]))
         }
     }
 
@@ -2399,7 +2402,7 @@ mod tests {
         async fn scan_live_state(
             &mut self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
@@ -2421,7 +2424,7 @@ mod tests {
 
     #[derive(Default)]
     struct RowsLiveStateReader {
-        rows: Vec<LiveStateRow>,
+        rows: Vec<MaterializedLiveStateRow>,
     }
 
     #[async_trait]
@@ -2429,14 +2432,14 @@ mod tests {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
         async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<LiveStateRow>, LixError> {
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
             Ok(None)
         }
     }
@@ -2445,8 +2448,8 @@ mod tests {
         entity_id: &str,
         version_id: &str,
         snapshot_content: &str,
-    ) -> LiveStateRow {
-        LiveStateRow {
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
@@ -2464,8 +2467,12 @@ mod tests {
         }
     }
 
-    fn live_file_row(entity_id: &str, version_id: &str, snapshot_content: &str) -> LiveStateRow {
-        LiveStateRow {
+    fn live_file_row(
+        entity_id: &str,
+        version_id: &str,
+        snapshot_content: &str,
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: super::FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),

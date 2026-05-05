@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use crate::entity_identity::EntityIdentity;
-use crate::live_state::LiveStateRow;
-use crate::tracked_state::TrackedStateRow;
+use crate::live_state::MaterializedLiveStateRow;
+use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::untracked_state::MaterializedUntrackedStateRow;
 use crate::RowMetadata;
 
@@ -91,7 +91,7 @@ pub(crate) struct StageFileData {
 pub(crate) struct StageAdoptedChange {
     pub(crate) version_id: String,
     pub(crate) change_id: String,
-    pub(crate) projected_row: TrackedStateRow,
+    pub(crate) projected_row: MaterializedTrackedStateRow,
 }
 
 /// One decoded write batch before transaction hydration.
@@ -183,9 +183,9 @@ impl StagedAdoptedStateRow {
     }
 }
 
-impl From<StagedStateRow> for LiveStateRow {
+impl From<StagedStateRow> for MaterializedLiveStateRow {
     fn from(row: StagedStateRow) -> Self {
-        LiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: row.entity_id,
             schema_key: row.schema_key,
             file_id: row.file_id,
@@ -203,9 +203,9 @@ impl From<StagedStateRow> for LiveStateRow {
     }
 }
 
-impl From<&StagedStateRow> for LiveStateRow {
+impl From<&StagedStateRow> for MaterializedLiveStateRow {
     fn from(row: &StagedStateRow) -> Self {
-        LiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: row.entity_id.clone(),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
@@ -223,9 +223,9 @@ impl From<&StagedStateRow> for LiveStateRow {
     }
 }
 
-impl From<StagedAdoptedStateRow> for LiveStateRow {
+impl From<StagedAdoptedStateRow> for MaterializedLiveStateRow {
     fn from(row: StagedAdoptedStateRow) -> Self {
-        LiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: row.entity_id,
             schema_key: row.schema_key,
             file_id: row.file_id,
@@ -243,9 +243,9 @@ impl From<StagedAdoptedStateRow> for LiveStateRow {
     }
 }
 
-impl From<&StagedAdoptedStateRow> for LiveStateRow {
+impl From<&StagedAdoptedStateRow> for MaterializedLiveStateRow {
     fn from(row: &StagedAdoptedStateRow) -> Self {
-        LiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: row.entity_id.clone(),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),

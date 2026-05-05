@@ -25,7 +25,7 @@ use datafusion::scalar::ScalarValue;
 use futures_util::{stream, TryStreamExt};
 
 use crate::entity_identity::EntityIdentity;
-use crate::live_state::LiveStateRow;
+use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
@@ -1421,7 +1421,7 @@ fn is_null_literal(expr: &Expr) -> bool {
 
 fn lix_state_record_batch(
     schema: SchemaRef,
-    rows: &[LiveStateRow],
+    rows: &[MaterializedLiveStateRow],
 ) -> Result<RecordBatch, LixError> {
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
@@ -1529,7 +1529,9 @@ mod tests {
     use crate::version::{VersionHead, VersionRefReader};
     use crate::{
         entity_identity::EntityIdentity,
-        live_state::{LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest},
+        live_state::{
+            LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+        },
     };
     use crate::{LixError, NullableKeyFilter};
     use async_trait::async_trait;
@@ -1560,18 +1562,18 @@ mod tests {
     struct EmptyVersionRefReader;
     #[allow(dead_code)]
     struct RowsLiveStateReader {
-        rows: Vec<LiveStateRow>,
+        rows: Vec<MaterializedLiveStateRow>,
     }
     struct DummyBlobReader;
 
     #[derive(Default)]
     struct DummyWriteContext {
-        rows: Vec<LiveStateRow>,
+        rows: Vec<MaterializedLiveStateRow>,
     }
 
     #[derive(Default)]
     struct CapturingWriteContext {
-        rows: Vec<LiveStateRow>,
+        rows: Vec<MaterializedLiveStateRow>,
         writes: Vec<StageWrite>,
     }
 
@@ -1663,14 +1665,14 @@ mod tests {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(vec![])
         }
 
         async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<LiveStateRow>, LixError> {
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
             Ok(None)
         }
     }
@@ -1695,14 +1697,14 @@ mod tests {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
         async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<LiveStateRow>, LixError> {
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
             Ok(None)
         }
     }
@@ -1719,7 +1721,10 @@ mod tests {
             &self,
             hashes: &[crate::binary_cas::BlobHash],
         ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
-            Ok(crate::binary_cas::BlobBytesBatch::missing(hashes.len()))
+            Ok(crate::binary_cas::BlobBytesBatch::new(vec![
+                None;
+                hashes.len()
+            ]))
         }
     }
 
@@ -1747,7 +1752,7 @@ mod tests {
         async fn scan_live_state(
             &mut self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
@@ -1790,7 +1795,7 @@ mod tests {
         async fn scan_live_state(
             &mut self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
@@ -1864,8 +1869,8 @@ mod tests {
         .expect("valid stageable lix_state batch")
     }
 
-    fn live_row(entity_id: &str, metadata: Option<&str>) -> LiveStateRow {
-        LiveStateRow {
+    fn live_row(entity_id: &str, metadata: Option<&str>) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: EntityIdentity::from_string(entity_id).expect("entity id should decode"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,

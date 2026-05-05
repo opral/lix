@@ -11,7 +11,8 @@ use crate::commit_graph::CommitGraphReader;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreReader;
 use crate::live_state::{
-    LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+    LiveStateFilter, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
+    MaterializedLiveStateRow,
 };
 use crate::storage::{ScopedStorageReader, StorageReadTransaction};
 use crate::transaction::types::{StageWrite, StageWriteOutcome};
@@ -68,7 +69,7 @@ pub(crate) trait SqlWriteExecutionContext {
     async fn scan_live_state(
         &mut self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<LiveStateRow>, LixError>;
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError>;
 
     async fn load_version_head(&mut self, version_id: &str) -> Result<Option<String>, LixError>;
 
@@ -123,7 +124,7 @@ impl SqlWriteContext {
     pub(crate) async fn scan_live_state(
         &self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<LiveStateRow>, LixError> {
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let _guard = self.gate.lock().await;
         unsafe {
             self.ptr
@@ -249,14 +250,14 @@ impl LiveStateReader for WriteContextLiveStateReader {
     async fn scan_rows(
         &self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<LiveStateRow>, LixError> {
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         self.ctx.scan_live_state(request).await
     }
 
     async fn load_row(
         &self,
         request: &LiveStateRowRequest,
-    ) -> Result<Option<LiveStateRow>, LixError> {
+    ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         let mut rows = self
             .ctx
             .scan_live_state(&LiveStateScanRequest {

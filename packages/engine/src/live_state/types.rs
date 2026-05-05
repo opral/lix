@@ -1,8 +1,10 @@
 use crate::changelog::MaterializedCanonicalChange;
 use crate::entity_identity::EntityIdentity;
-use crate::tracked_state::TrackedStateRow;
+use crate::json_store::JsonRef;
+use crate::tracked_state::{MaterializedTrackedStateRow, TrackedStateRow};
 use crate::untracked_state::{
-    MaterializedUntrackedStateRow, UntrackedStateFilter, UntrackedStateRowRequest,
+    MaterializedUntrackedStateRow, UntrackedStateFilter, UntrackedStateRow,
+    UntrackedStateRowRequest,
 };
 use crate::{NullableKeyFilter, RowMetadata, Value};
 
@@ -11,7 +13,7 @@ use crate::{NullableKeyFilter, RowMetadata, Value};
 /// Unlike provider write rows, live-state rows are fully hydrated facts. Missing
 /// generated fields should be caught before this type is constructed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct LiveStateRow {
+pub(crate) struct MaterializedLiveStateRow {
     pub(crate) entity_id: EntityIdentity,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
@@ -27,8 +29,110 @@ pub(crate) struct LiveStateRow {
     pub(crate) version_id: String,
 }
 
-impl From<LiveStateRow> for MaterializedCanonicalChange {
-    fn from(row: LiveStateRow) -> Self {
+/// Ref-backed row accepted by live-state write boundaries.
+///
+/// The transaction layer owns materialized JSON -> JsonRef preparation. Live
+/// state only routes already-canonical rows into tracked and untracked stores.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveStateRow {
+    pub(crate) entity_id: EntityIdentity,
+    pub(crate) schema_key: String,
+    pub(crate) file_id: Option<String>,
+    pub(crate) snapshot_ref: Option<JsonRef>,
+    pub(crate) metadata_ref: Option<JsonRef>,
+    pub(crate) schema_version: String,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) global: bool,
+    pub(crate) change_id: Option<String>,
+    pub(crate) commit_id: Option<String>,
+    pub(crate) untracked: bool,
+    pub(crate) version_id: String,
+}
+
+/// Ref-backed live-state write batch.
+///
+/// Live-state reads are materialized, but writes should already carry JsonRefs
+/// prepared by the transaction boundary. This keeps json_store ownership out of
+/// live_state and makes root ancestry explicit instead of deriving it from
+/// staged commit JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveStateWriteBatch {
+    pub(crate) untracked_rows: Vec<LiveStateRow>,
+    pub(crate) tracked_roots: Vec<LiveStateTrackedRootWrite>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveStateTrackedRootWrite {
+    pub(crate) commit_id: String,
+    pub(crate) parent_commit_id: Option<String>,
+    pub(crate) rows: Vec<LiveStateRow>,
+}
+
+impl TryFrom<LiveStateRow> for UntrackedStateRow {
+    type Error = crate::LixError;
+
+    fn try_from(row: LiveStateRow) -> Result<Self, Self::Error> {
+        if !row.untracked {
+            return Err(crate::LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "untracked_state cannot store tracked live-state rows",
+            ));
+        }
+        Ok(UntrackedStateRow {
+            entity_id: row.entity_id,
+            schema_key: row.schema_key,
+            file_id: row.file_id,
+            snapshot_ref: row.snapshot_ref,
+            metadata_ref: row.metadata_ref,
+            schema_version: row.schema_version,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            global: row.global,
+            version_id: row.version_id,
+        })
+    }
+}
+
+impl TryFrom<LiveStateRow> for TrackedStateRow {
+    type Error = crate::LixError;
+
+    fn try_from(row: LiveStateRow) -> Result<Self, Self::Error> {
+        if row.untracked {
+            return Err(crate::LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked_state cannot store untracked live-state rows",
+            ));
+        }
+        let Some(change_id) = row.change_id else {
+            return Err(crate::LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked live-state rows require change_id",
+            ));
+        };
+        let Some(commit_id) = row.commit_id else {
+            return Err(crate::LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked live-state rows require commit_id",
+            ));
+        };
+        Ok(TrackedStateRow {
+            entity_id: row.entity_id,
+            schema_key: row.schema_key,
+            file_id: row.file_id,
+            snapshot_ref: row.snapshot_ref,
+            metadata_ref: row.metadata_ref,
+            schema_version: row.schema_version,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            change_id,
+            commit_id,
+        })
+    }
+}
+
+impl From<MaterializedLiveStateRow> for MaterializedCanonicalChange {
+    fn from(row: MaterializedLiveStateRow) -> Self {
         MaterializedCanonicalChange {
             id: row
                 .change_id
@@ -44,9 +148,9 @@ impl From<LiveStateRow> for MaterializedCanonicalChange {
     }
 }
 
-impl From<MaterializedUntrackedStateRow> for LiveStateRow {
+impl From<MaterializedUntrackedStateRow> for MaterializedLiveStateRow {
     fn from(row: MaterializedUntrackedStateRow) -> Self {
-        LiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: row.entity_id,
             schema_key: row.schema_key,
             file_id: row.file_id,
@@ -64,10 +168,10 @@ impl From<MaterializedUntrackedStateRow> for LiveStateRow {
     }
 }
 
-impl TryFrom<&LiveStateRow> for TrackedStateRow {
+impl TryFrom<&MaterializedLiveStateRow> for MaterializedTrackedStateRow {
     type Error = crate::LixError;
 
-    fn try_from(row: &LiveStateRow) -> Result<Self, Self::Error> {
+    fn try_from(row: &MaterializedLiveStateRow) -> Result<Self, Self::Error> {
         if row.untracked {
             return Err(crate::LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -87,7 +191,7 @@ impl TryFrom<&LiveStateRow> for TrackedStateRow {
             ));
         };
 
-        Ok(TrackedStateRow {
+        Ok(MaterializedTrackedStateRow {
             entity_id: row.entity_id.clone(),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
@@ -102,8 +206,8 @@ impl TryFrom<&LiveStateRow> for TrackedStateRow {
     }
 }
 
-impl From<&LiveStateRow> for MaterializedUntrackedStateRow {
-    fn from(row: &LiveStateRow) -> Self {
+impl From<&MaterializedLiveStateRow> for MaterializedUntrackedStateRow {
+    fn from(row: &MaterializedLiveStateRow) -> Self {
         MaterializedUntrackedStateRow {
             entity_id: row.entity_id.clone(),
             schema_key: row.schema_key.clone(),
@@ -228,7 +332,7 @@ pub(crate) struct LiveStateRowIdentity {
 }
 
 impl LiveStateRowIdentity {
-    pub(crate) fn from_row(row: &LiveStateRow) -> Self {
+    pub(crate) fn from_row(row: &MaterializedLiveStateRow) -> Self {
         Self {
             version_id: row.version_id.clone(),
             schema_key: row.schema_key.clone(),

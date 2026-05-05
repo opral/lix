@@ -21,7 +21,9 @@ use datafusion::physical_plan::{
 use futures_util::{stream, TryStreamExt};
 use serde_json::Value as JsonValue;
 
-use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateScanRequest};
+use crate::live_state::{
+    LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
+};
 use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::record_batch::record_batch_with_row_count;
 use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValues};
@@ -717,7 +719,7 @@ struct VersionDescriptor {
     hidden: bool,
 }
 
-fn parse_descriptor(row: &LiveStateRow) -> Result<VersionDescriptor, LixError> {
+fn parse_descriptor(row: &MaterializedLiveStateRow) -> Result<VersionDescriptor, LixError> {
     let snapshot = parse_snapshot(row, "lix_version_descriptor")?;
     let id = snapshot
         .get("id")
@@ -741,7 +743,7 @@ fn parse_descriptor(row: &LiveStateRow) -> Result<VersionDescriptor, LixError> {
     Ok(VersionDescriptor { id, name, hidden })
 }
 
-fn parse_snapshot(row: &LiveStateRow, schema_key: &str) -> Result<JsonValue, LixError> {
+fn parse_snapshot(row: &MaterializedLiveStateRow, schema_key: &str) -> Result<JsonValue, LixError> {
     let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",

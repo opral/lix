@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::live_state::LiveStateRow;
+use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
 use crate::LixError;
 
@@ -53,7 +53,7 @@ impl VisibleFilesystem {
 
     /// Builds filesystem lookup indexes from rows that are already known to be
     /// transaction-visible.
-    pub(crate) fn from_live_rows(rows: Vec<LiveStateRow>) -> Result<Self, LixError> {
+    pub(crate) fn from_live_rows(rows: Vec<MaterializedLiveStateRow>) -> Result<Self, LixError> {
         let mut visible = Self::default();
 
         for row in rows {
@@ -181,7 +181,7 @@ struct BlobRefSnapshot {
     size_bytes: Option<u64>,
 }
 
-fn filesystem_row_context(row: &LiveStateRow) -> FilesystemRowContext {
+fn filesystem_row_context(row: &MaterializedLiveStateRow) -> FilesystemRowContext {
     FilesystemRowContext {
         version_id: row.version_id.clone(),
         global: row.global,
@@ -195,7 +195,7 @@ fn filesystem_row_context(row: &LiveStateRow) -> FilesystemRowContext {
 mod tests {
     use async_trait::async_trait;
 
-    use crate::live_state::LiveStateRow;
+    use crate::live_state::MaterializedLiveStateRow;
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
     use crate::LixError;
 
@@ -281,12 +281,12 @@ mod tests {
         assert_eq!(blob_ref.size_bytes, Some(5));
     }
 
-    fn live_state(rows: Vec<LiveStateRow>) -> std::sync::Arc<dyn LiveStateReader> {
+    fn live_state(rows: Vec<MaterializedLiveStateRow>) -> std::sync::Arc<dyn LiveStateReader> {
         std::sync::Arc::new(RowsLiveStateReader { rows })
     }
 
     struct RowsLiveStateReader {
-        rows: Vec<LiveStateRow>,
+        rows: Vec<MaterializedLiveStateRow>,
     }
 
     #[async_trait]
@@ -294,7 +294,7 @@ mod tests {
         async fn scan_rows(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self
                 .rows
                 .iter()
@@ -311,12 +311,12 @@ mod tests {
         async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<LiveStateRow>, LixError> {
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
             Ok(None)
         }
     }
 
-    fn directory_row(entity_id: &str, snapshot_content: &str) -> LiveStateRow {
+    fn directory_row(entity_id: &str, snapshot_content: &str) -> MaterializedLiveStateRow {
         live_row(
             entity_id,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
@@ -325,7 +325,7 @@ mod tests {
         )
     }
 
-    fn file_row(entity_id: &str, snapshot_content: &str) -> LiveStateRow {
+    fn file_row(entity_id: &str, snapshot_content: &str) -> MaterializedLiveStateRow {
         live_row(
             entity_id,
             FILE_DESCRIPTOR_SCHEMA_KEY,
@@ -334,7 +334,7 @@ mod tests {
         )
     }
 
-    fn blob_ref_row(entity_id: &str, snapshot_content: &str) -> LiveStateRow {
+    fn blob_ref_row(entity_id: &str, snapshot_content: &str) -> MaterializedLiveStateRow {
         live_row(
             entity_id,
             BLOB_REF_SCHEMA_KEY,
@@ -348,8 +348,8 @@ mod tests {
         schema_key: &str,
         file_id: Option<String>,
         snapshot_content: &str,
-    ) -> LiveStateRow {
-        LiveStateRow {
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: schema_key.to_string(),

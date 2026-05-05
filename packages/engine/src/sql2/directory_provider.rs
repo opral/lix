@@ -26,7 +26,7 @@ use futures_util::{stream, TryStreamExt};
 use serde::Deserialize;
 
 use crate::functions::FunctionProviderHandle;
-use crate::live_state::LiveStateRow;
+use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
@@ -917,7 +917,7 @@ struct DirectoryDescriptorRecord {
     parent_id: Option<String>,
     name: String,
     hidden: bool,
-    live: LiveStateRow,
+    live: MaterializedLiveStateRow,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1313,7 +1313,7 @@ async fn directory_path_resolvers_from_live_state(
 
 fn lix_directory_record_batch(
     schema: &SchemaRef,
-    rows: Vec<LiveStateRow>,
+    rows: Vec<MaterializedLiveStateRow>,
 ) -> Result<RecordBatch, LixError> {
     let mut directory_rows = Vec::<DirectoryDescriptorRecord>::new();
 
@@ -1833,7 +1833,7 @@ mod tests {
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
     use crate::live_state::{
-        LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+        LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
     };
     use crate::sql2::dml::InsertSink;
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
@@ -1862,7 +1862,7 @@ mod tests {
 
     #[derive(Default)]
     struct CapturingWriteContext {
-        rows: Vec<LiveStateRow>,
+        rows: Vec<MaterializedLiveStateRow>,
         writes: Vec<StageWrite>,
     }
 
@@ -1872,7 +1872,10 @@ mod tests {
             &self,
             hashes: &[crate::binary_cas::BlobHash],
         ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
-            Ok(crate::binary_cas::BlobBytesBatch::missing(hashes.len()))
+            Ok(crate::binary_cas::BlobBytesBatch::new(vec![
+                None;
+                hashes.len()
+            ]))
         }
     }
 
@@ -1900,7 +1903,7 @@ mod tests {
         async fn scan_live_state(
             &mut self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
@@ -1923,7 +1926,7 @@ mod tests {
     #[derive(Default)]
     #[allow(dead_code)]
     struct RowsLiveStateReader {
-        rows: Vec<LiveStateRow>,
+        rows: Vec<MaterializedLiveStateRow>,
     }
 
     #[async_trait]
@@ -1931,19 +1934,23 @@ mod tests {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
         async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<LiveStateRow>, LixError> {
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
             Ok(None)
         }
     }
 
-    fn live_row(entity_id: &str, version_id: &str, snapshot_content: &str) -> LiveStateRow {
+    fn live_row(
+        entity_id: &str,
+        version_id: &str,
+        snapshot_content: &str,
+    ) -> MaterializedLiveStateRow {
         live_filesystem_row(
             entity_id,
             super::DIRECTORY_SCHEMA_KEY,
@@ -1959,8 +1966,8 @@ mod tests {
         file_id: Option<&str>,
         version_id: &str,
         snapshot_content: &str,
-    ) -> LiveStateRow {
-        LiveStateRow {
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: schema_key.to_string(),
@@ -1978,7 +1985,7 @@ mod tests {
         }
     }
 
-    fn filesystem_rows() -> Vec<LiveStateRow> {
+    fn filesystem_rows() -> Vec<MaterializedLiveStateRow> {
         vec![
             live_filesystem_row(
                 "dir-docs",

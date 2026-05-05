@@ -1,17 +1,16 @@
-use crate::changelog::{
-    canonicalize_materialized_change, ChangelogContext, MaterializedCanonicalChange,
-};
+use crate::changelog::{CanonicalChange, ChangelogContext};
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{
     FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
 };
 use crate::json_store::JsonStoreContext;
-use crate::live_state::{LiveStateContext, LiveStateRow};
+use crate::live_state::{
+    LiveStateContext, LiveStateRow, LiveStateTrackedRootWrite, LiveStateWriteBatch,
+};
 use crate::schema::{
     registered_schema_entity_id, schema_key_from_definition, seed_schema_definitions,
 };
 use crate::storage::{StorageContext, StorageWriteSet};
-use crate::untracked_state::MaterializedUntrackedStateRow;
 use crate::version::{
     VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_DESCRIPTOR_SCHEMA_VERSION, VERSION_REF_SCHEMA_KEY,
     VERSION_REF_SCHEMA_VERSION,
@@ -35,9 +34,31 @@ const REGISTERED_SCHEMA_VERSION: &str = "1";
 /// `lix_version_ref` are seeded as untracked local state so repository heads can
 /// advance without becoming commit members.
 pub(crate) struct InitSeedPlan {
-    pub(crate) changes: Vec<MaterializedCanonicalChange>,
-    pub(crate) untracked_rows: Vec<MaterializedUntrackedStateRow>,
+    changes: Vec<InitSeedChange>,
+    untracked_rows: Vec<InitSeedLiveRow>,
     pub(crate) receipt: InitReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InitSeedChange {
+    id: String,
+    entity_id: EntityIdentity,
+    schema_key: String,
+    schema_version: String,
+    snapshot_content: String,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InitSeedLiveRow {
+    entity_id: EntityIdentity,
+    schema_key: String,
+    schema_version: String,
+    snapshot_content: String,
+    created_at: String,
+    updated_at: String,
+    global: bool,
+    version_id: String,
 }
 
 /// Values generated while planning the initial repository seed.
@@ -191,23 +212,44 @@ pub(crate) async fn initialize(
         let canonical_changes = plan
             .changes
             .iter()
-            .map(|change| canonicalize_materialized_change(&mut writes, &mut json_writer, change))
+            .map(|change| seed_change_to_canonical_change(&mut writes, &mut json_writer, change))
             .collect::<Result<Vec<_>, _>>()?;
         let mut writer = changelog.writer(&mut writes);
         writer.stage_changes(&canonical_changes)?;
     }
 
-    let mut live_rows = plan
+    let tracked_rows = plan
         .changes
         .iter()
-        .map(|change| live_state_row_from_initial_change(change, &receipt.initial_commit_id))
-        .collect::<Vec<_>>();
-    live_rows.extend(plan.untracked_rows.into_iter().map(LiveStateRow::from));
+        .map(|change| {
+            live_state_row_from_initial_change(
+                &mut writes,
+                &mut json_writer,
+                change,
+                &receipt.initial_commit_id,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let untracked_rows = plan
+        .untracked_rows
+        .iter()
+        .map(|row| live_state_row_from_untracked_row(&mut writes, &mut json_writer, row))
+        .collect::<Result<Vec<_>, _>>()?;
 
     {
         let mut writer = live_state.writer(transaction.as_mut());
         writer
-            .stage_rows(&mut writes, &mut json_writer, &live_rows)
+            .stage_rows(
+                &mut writes,
+                LiveStateWriteBatch {
+                    untracked_rows,
+                    tracked_roots: vec![LiveStateTrackedRootWrite {
+                        commit_id: receipt.initial_commit_id.clone(),
+                        parent_commit_id: None,
+                        rows: tracked_rows,
+                    }],
+                },
+            )
             .await?;
     }
 
@@ -217,15 +259,17 @@ pub(crate) async fn initialize(
 }
 
 fn live_state_row_from_initial_change(
-    change: &MaterializedCanonicalChange,
+    writes: &mut StorageWriteSet,
+    json_writer: &mut crate::json_store::JsonStoreWriter,
+    change: &InitSeedChange,
     initial_commit_id: &str,
-) -> LiveStateRow {
-    LiveStateRow {
+) -> Result<LiveStateRow, LixError> {
+    Ok(LiveStateRow {
         entity_id: change.entity_id.clone(),
         schema_key: change.schema_key.clone(),
-        file_id: change.file_id.clone(),
-        snapshot_content: change.snapshot_content.clone(),
-        metadata: change.metadata.clone(),
+        file_id: None,
+        snapshot_ref: Some(json_writer.stage_bytes(writes, change.snapshot_content.as_bytes())?),
+        metadata_ref: None,
         schema_version: change.schema_version.clone(),
         created_at: change.created_at.clone(),
         updated_at: change.created_at.clone(),
@@ -234,7 +278,46 @@ fn live_state_row_from_initial_change(
         commit_id: Some(initial_commit_id.to_string()),
         untracked: false,
         version_id: GLOBAL_VERSION_ID.to_string(),
-    }
+    })
+}
+
+fn seed_change_to_canonical_change(
+    writes: &mut StorageWriteSet,
+    json_writer: &mut crate::json_store::JsonStoreWriter,
+    change: &InitSeedChange,
+) -> Result<CanonicalChange, LixError> {
+    Ok(CanonicalChange {
+        id: change.id.clone(),
+        entity_id: change.entity_id.clone(),
+        schema_key: change.schema_key.clone(),
+        schema_version: change.schema_version.clone(),
+        file_id: None,
+        snapshot_ref: Some(json_writer.stage_bytes(writes, change.snapshot_content.as_bytes())?),
+        metadata_ref: None,
+        created_at: change.created_at.clone(),
+    })
+}
+
+fn live_state_row_from_untracked_row(
+    writes: &mut StorageWriteSet,
+    json_writer: &mut crate::json_store::JsonStoreWriter,
+    row: &InitSeedLiveRow,
+) -> Result<LiveStateRow, LixError> {
+    Ok(LiveStateRow {
+        entity_id: row.entity_id.clone(),
+        schema_key: row.schema_key.clone(),
+        file_id: None,
+        snapshot_ref: Some(json_writer.stage_bytes(writes, row.snapshot_content.as_bytes())?),
+        metadata_ref: None,
+        schema_version: row.schema_version.clone(),
+        created_at: row.created_at.clone(),
+        updated_at: row.updated_at.clone(),
+        global: row.global,
+        change_id: None,
+        commit_id: None,
+        untracked: true,
+        version_id: row.version_id.clone(),
+    })
 }
 
 fn untracked_row(
@@ -243,13 +326,11 @@ fn untracked_row(
     schema_version: &str,
     snapshot_content: String,
     timestamp: &str,
-) -> MaterializedUntrackedStateRow {
-    MaterializedUntrackedStateRow {
+) -> InitSeedLiveRow {
+    InitSeedLiveRow {
         entity_id,
         schema_key: schema_key.to_string(),
-        file_id: None,
-        snapshot_content: Some(snapshot_content),
-        metadata: None,
+        snapshot_content,
         schema_version: schema_version.to_string(),
         created_at: timestamp.to_string(),
         updated_at: timestamp.to_string(),
@@ -265,15 +346,13 @@ fn canonical_change(
     schema_version: &str,
     snapshot_content: String,
     created_at: &str,
-) -> MaterializedCanonicalChange {
-    MaterializedCanonicalChange {
+) -> InitSeedChange {
+    InitSeedChange {
         id,
         entity_id,
         schema_key: schema_key.to_string(),
         schema_version: schema_version.to_string(),
-        file_id: None,
-        snapshot_content: Some(snapshot_content),
-        metadata: None,
+        snapshot_content,
         created_at: created_at.to_string(),
     }
 }
@@ -460,23 +539,12 @@ mod tests {
         );
     }
 
-    fn snapshot(change: &MaterializedCanonicalChange) -> JsonValue {
-        serde_json::from_str(
-            change
-                .snapshot_content
-                .as_deref()
-                .expect("change should have snapshot"),
-        )
-        .expect("snapshot should be JSON")
+    fn snapshot(change: &InitSeedChange) -> JsonValue {
+        serde_json::from_str(&change.snapshot_content).expect("snapshot should be JSON")
     }
 
-    fn untracked_snapshot(row: &MaterializedUntrackedStateRow) -> JsonValue {
-        serde_json::from_str(
-            row.snapshot_content
-                .as_deref()
-                .expect("row should have snapshot"),
-        )
-        .expect("snapshot should be JSON")
+    fn untracked_snapshot(row: &InitSeedLiveRow) -> JsonValue {
+        serde_json::from_str(&row.snapshot_content).expect("snapshot should be JSON")
     }
 
     fn test_functions() -> FunctionProviderHandle {

@@ -87,7 +87,7 @@ mod tests {
     use crate::backend::testing::UnitTestBackend;
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
     use crate::functions::{state::load_sequence, DeterministicSequence};
-    use crate::live_state::{LiveStateContext, LiveStateRow};
+    use crate::live_state::{LiveStateContext, LiveStateRow, LiveStateWriteBatch};
     use crate::storage::StorageContext;
     use crate::GLOBAL_VERSION_ID;
 
@@ -294,12 +294,18 @@ mod tests {
             "value": value,
         }))
         .expect("snapshot should serialize");
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
         let row = LiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::single(key),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
-            snapshot_content: Some(snapshot_content),
-            metadata: None,
+            snapshot_ref: Some(
+                json_writer
+                    .stage_bytes(&mut writes, snapshot_content.as_bytes())
+                    .expect("snapshot should stage"),
+            ),
+            metadata_ref: None,
             schema_version: "1".to_string(),
             created_at: "1970-01-01T00:00:00.000Z".to_string(),
             updated_at: "1970-01-01T00:00:00.000Z".to_string(),
@@ -309,12 +315,16 @@ mod tests {
             untracked: true,
             version_id: GLOBAL_VERSION_ID.to_string(),
         };
-        let mut writes = StorageWriteSet::new();
-        let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
         {
             let mut writer = live_state.writer(tx.as_mut());
             writer
-                .stage_rows(&mut writes, &mut json_writer, &[row])
+                .stage_rows(
+                    &mut writes,
+                    LiveStateWriteBatch {
+                        untracked_rows: vec![row],
+                        tracked_roots: Vec::new(),
+                    },
+                )
                 .await
                 .expect("test key-value should stage");
         }

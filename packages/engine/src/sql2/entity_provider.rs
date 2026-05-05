@@ -27,7 +27,7 @@ use serde_json::Value as JsonValue;
 
 use crate::commit_graph::CommitGraphReader;
 use crate::entity_identity::EntityIdentity;
-use crate::live_state::LiveStateRow;
+use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
@@ -1591,7 +1591,7 @@ fn entity_live_state_scan_request(
 fn entity_record_batch(
     spec: &EntitySurfaceSpec,
     schema: SchemaRef,
-    rows: &[LiveStateRow],
+    rows: &[MaterializedLiveStateRow],
 ) -> Result<RecordBatch> {
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
@@ -1616,7 +1616,7 @@ fn entity_record_batch(
 fn entity_column_array(
     spec: &EntitySurfaceSpec,
     column_name: &str,
-    rows: &[LiveStateRow],
+    rows: &[MaterializedLiveStateRow],
     snapshots: &[Option<JsonValue>],
 ) -> Result<ArrayRef> {
     if let Some(property_name) = column_name.strip_prefix("lixcol_") {
@@ -1665,7 +1665,10 @@ fn entity_column_array(
     })
 }
 
-fn entity_system_column_array(column_name: &str, rows: &[LiveStateRow]) -> Result<ArrayRef> {
+fn entity_system_column_array(
+    column_name: &str,
+    rows: &[MaterializedLiveStateRow],
+) -> Result<ArrayRef> {
     Ok(match column_name {
         "entity_id" => Arc::new(StringArray::from(
             rows.iter()
@@ -2052,7 +2055,7 @@ mod tests {
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
     use crate::live_state::{
-        LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+        LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
     };
     use crate::sql2::dml::InsertSink;
     use crate::sql2::write_normalization::InsertColumnIntents;
@@ -2065,7 +2068,7 @@ mod tests {
     struct EmptyVersionRefReader;
     #[derive(Default)]
     struct CapturingWriteContext {
-        rows: Vec<LiveStateRow>,
+        rows: Vec<MaterializedLiveStateRow>,
         writes: Vec<StageWrite>,
     }
 
@@ -2074,14 +2077,14 @@ mod tests {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(vec![])
         }
 
         async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<LiveStateRow>, LixError> {
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
             Ok(None)
         }
     }
@@ -2113,7 +2116,10 @@ mod tests {
             &self,
             hashes: &[crate::binary_cas::BlobHash],
         ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
-            Ok(crate::binary_cas::BlobBytesBatch::missing(hashes.len()))
+            Ok(crate::binary_cas::BlobBytesBatch::new(vec![
+                None;
+                hashes.len()
+            ]))
         }
     }
 
@@ -2141,7 +2147,7 @@ mod tests {
         async fn scan_live_state(
             &mut self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
@@ -2161,8 +2167,8 @@ mod tests {
         }
     }
 
-    fn live_row() -> LiveStateRow {
-        LiveStateRow {
+    fn live_row() -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
             schema_key: "project_message".to_string(),
             file_id: None,

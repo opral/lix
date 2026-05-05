@@ -3,7 +3,10 @@ use serde_json::Value as JsonValue;
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::json_store::JsonStoreWriter;
-use crate::live_state::{LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateWriter};
+use crate::live_state::{
+    LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateWriteBatch, LiveStateWriter,
+    MaterializedLiveStateRow,
+};
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
@@ -67,17 +70,27 @@ where
         )
     })?;
     let row = deterministic_key_value_row(
+        writes,
+        json_writer,
         DETERMINISTIC_SEQUENCE_KEY,
-        snapshot_content,
-        timestamp.to_string(),
-    );
-    writer.stage_rows(writes, json_writer, &[row]).await
+        &snapshot_content,
+        timestamp,
+    )?;
+    writer
+        .stage_rows(
+            writes,
+            LiveStateWriteBatch {
+                untracked_rows: vec![row],
+                tracked_roots: Vec::new(),
+            },
+        )
+        .await
 }
 
 async fn load_key_value_row(
     live_state: &dyn LiveStateReader,
     key: &str,
-) -> Result<Option<LiveStateRow>, LixError> {
+) -> Result<Option<MaterializedLiveStateRow>, LixError> {
     live_state
         .load_row(&LiveStateRowRequest {
             schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
@@ -88,7 +101,7 @@ async fn load_key_value_row(
         .await
 }
 
-fn key_value_payload(row: &LiveStateRow, key: &str) -> Result<JsonValue, LixError> {
+fn key_value_payload(row: &MaterializedLiveStateRow, key: &str) -> Result<JsonValue, LixError> {
     let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -152,25 +165,28 @@ fn parse_sequence_value(value: JsonValue) -> Result<DeterministicSequence, LixEr
 }
 
 fn deterministic_key_value_row(
+    writes: &mut StorageWriteSet,
+    json_writer: &mut JsonStoreWriter,
     key: &str,
-    snapshot_content: String,
-    timestamp: String,
-) -> LiveStateRow {
-    LiveStateRow {
+    snapshot_content: &str,
+    timestamp: &str,
+) -> Result<LiveStateRow, LixError> {
+    let snapshot_ref = json_writer.stage_bytes(writes, snapshot_content.as_bytes())?;
+    Ok(LiveStateRow {
         entity_id: crate::entity_identity::EntityIdentity::single(key),
         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
         file_id: None,
-        snapshot_content: Some(snapshot_content),
-        metadata: None,
+        snapshot_ref: Some(snapshot_ref),
+        metadata_ref: None,
         schema_version: KEY_VALUE_SCHEMA_VERSION.to_string(),
-        created_at: timestamp.clone(),
-        updated_at: timestamp,
+        created_at: timestamp.to_string(),
+        updated_at: timestamp.to_string(),
         global: true,
         change_id: None,
         commit_id: None,
         untracked: true,
         version_id: GLOBAL_VERSION_ID.to_string(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -340,17 +356,26 @@ mod tests {
             "value": value,
         }))
         .expect("snapshot should serialize");
-        let row = deterministic_key_value_row(
-            key,
-            snapshot_content,
-            "1970-01-01T00:00:00.000Z".to_string(),
-        );
         let mut writes = StorageWriteSet::new();
         let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
+        let row = deterministic_key_value_row(
+            &mut writes,
+            &mut json_writer,
+            key,
+            &snapshot_content,
+            "1970-01-01T00:00:00.000Z",
+        )
+        .expect("test key-value should canonicalize");
         {
             let mut writer = live_state.writer(tx.as_mut());
             writer
-                .stage_rows(&mut writes, &mut json_writer, &[row])
+                .stage_rows(
+                    &mut writes,
+                    LiveStateWriteBatch {
+                        untracked_rows: vec![row],
+                        tracked_roots: Vec::new(),
+                    },
+                )
                 .await
                 .expect("test key-value should stage");
         }
