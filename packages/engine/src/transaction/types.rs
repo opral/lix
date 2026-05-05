@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use crate::entity_identity::EntityIdentity;
 use crate::live_state::LiveStateRow;
 use crate::tracked_state::TrackedStateRow;
-use crate::untracked_state::UntrackedStateRow;
+use crate::untracked_state::MaterializedUntrackedStateRow;
 use crate::RowMetadata;
 
 /// Incoming state row before transaction hydration.
@@ -284,9 +284,9 @@ impl From<&StagedAdoptedStateRow> for StagedStateRow {
     }
 }
 
-impl From<StagedStateRow> for UntrackedStateRow {
+impl From<StagedStateRow> for MaterializedUntrackedStateRow {
     fn from(row: StagedStateRow) -> Self {
-        UntrackedStateRow {
+        MaterializedUntrackedStateRow {
             entity_id: row.entity_id,
             schema_key: row.schema_key,
             file_id: row.file_id,

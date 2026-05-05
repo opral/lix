@@ -6,8 +6,8 @@ use tokio::sync::Mutex;
 use crate::entity_identity::EntityIdentity;
 use crate::storage::{StorageReader, StorageWriter};
 use crate::untracked_state::{
-    UntrackedStateContext, UntrackedStateFilter, UntrackedStateRow, UntrackedStateRowRequest,
-    UntrackedStateScanRequest, UntrackedStateWriter,
+    MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter,
+    UntrackedStateRowRequest, UntrackedStateScanRequest, UntrackedStateWriter,
 };
 use crate::version::{VersionHead, VersionRefReader};
 use crate::version::{VERSION_REF_SCHEMA_KEY, VERSION_REF_SCHEMA_VERSION};
@@ -169,7 +169,7 @@ where
 
 fn decode_version_head(
     requested_version_id: &str,
-    row: &UntrackedStateRow,
+    row: &MaterializedUntrackedStateRow,
 ) -> Result<Option<VersionHead>, LixError> {
     let Some(snapshot_content) = row.snapshot_content.as_deref() else {
         return Ok(None);
@@ -200,7 +200,7 @@ fn version_ref_row(
     version_id: &str,
     commit_id: &str,
     timestamp: &str,
-) -> Result<UntrackedStateRow, LixError> {
+) -> Result<MaterializedUntrackedStateRow, LixError> {
     let snapshot_content = serde_json::to_string(&json!({
         "id": version_id,
         "commit_id": commit_id,
@@ -212,7 +212,7 @@ fn version_ref_row(
         )
     })?;
 
-    Ok(UntrackedStateRow {
+    Ok(MaterializedUntrackedStateRow {
         entity_id: crate::entity_identity::EntityIdentity::single(version_id),
         schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
         file_id: None,

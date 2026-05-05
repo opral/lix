@@ -1,6 +1,7 @@
 use crate::storage::{StorageReader, StorageWriter};
 use crate::untracked_state::{
-    UntrackedStateIdentity, UntrackedStateRow, UntrackedStateRowRequest, UntrackedStateScanRequest,
+    MaterializedUntrackedStateRow, UntrackedStateIdentity, UntrackedStateRowRequest,
+    UntrackedStateScanRequest,
 };
 use crate::LixError;
 
@@ -51,14 +52,14 @@ where
     pub(crate) async fn scan_rows(
         &mut self,
         request: &UntrackedStateScanRequest,
-    ) -> Result<Vec<UntrackedStateRow>, LixError> {
+    ) -> Result<Vec<MaterializedUntrackedStateRow>, LixError> {
         crate::untracked_state::storage::scan_rows(&mut self.store, request).await
     }
 
     pub(crate) async fn load_row(
         &mut self,
         request: &UntrackedStateRowRequest,
-    ) -> Result<Option<UntrackedStateRow>, LixError> {
+    ) -> Result<Option<MaterializedUntrackedStateRow>, LixError> {
         crate::untracked_state::storage::load_row(&mut self.store, request).await
     }
 }
@@ -76,7 +77,10 @@ where
     ///
     /// A row with `snapshot_content = None` is treated as removal because
     /// untracked state keeps only the current local value, not tombstones.
-    pub(crate) async fn write_rows(&mut self, rows: &[UntrackedStateRow]) -> Result<(), LixError> {
+    pub(crate) async fn write_rows(
+        &mut self,
+        rows: &[MaterializedUntrackedStateRow],
+    ) -> Result<(), LixError> {
         crate::untracked_state::storage::write_rows(&mut self.store, rows).await
     }
 

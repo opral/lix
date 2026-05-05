@@ -367,7 +367,7 @@ mod tests {
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
     use crate::storage::StorageContext;
     use crate::untracked_state::{
-        UntrackedStateContext, UntrackedStateRow, UntrackedStateRowRequest,
+        MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateRowRequest,
     };
     use crate::version::VersionContext;
     use crate::NullableKeyFilter;
@@ -525,7 +525,7 @@ mod tests {
             .expect("seed transaction should open");
         untracked_state
             .writer(seed_transaction.as_mut())
-            .write_rows(&[UntrackedStateRow::from(untracked_global_row(
+            .write_rows(&[MaterializedUntrackedStateRow::from(untracked_global_row(
                 "change-untracked",
             ))])
             .await
