@@ -19,8 +19,8 @@ impl JsonStoreContext {
         JsonStoreReader { store }
     }
 
-    pub(crate) fn writer<'a>(&self, writes: &'a mut StorageWriteSet) -> JsonStoreWriter<'a> {
-        JsonStoreWriter::new(writes)
+    pub(crate) fn writer(&self) -> JsonStoreWriter {
+        JsonStoreWriter::new()
     }
 
     pub(crate) async fn load_bytes(
@@ -89,20 +89,22 @@ where
     }
 }
 
-pub(crate) struct JsonStoreWriter<'a> {
-    writes: &'a mut StorageWriteSet,
+pub(crate) struct JsonStoreWriter {
     seen: HashSet<[u8; 32]>,
 }
 
-impl<'a> JsonStoreWriter<'a> {
-    fn new(writes: &'a mut StorageWriteSet) -> Self {
+impl JsonStoreWriter {
+    fn new() -> Self {
         Self {
-            writes,
             seen: HashSet::new(),
         }
     }
 
-    pub(crate) fn stage_bytes(&mut self, bytes: &[u8]) -> Result<JsonRef, LixError> {
+    pub(crate) fn stage_bytes(
+        &mut self,
+        writes: &mut StorageWriteSet,
+        bytes: &[u8],
+    ) -> Result<JsonRef, LixError> {
         let json = std::str::from_utf8(bytes).map_err(|error| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -117,7 +119,7 @@ impl<'a> JsonStoreWriter<'a> {
         }
         let (json_ref, stored_payload) =
             store::encode_json_str_for_storage_with_ref(json, json_ref)?;
-        self.writes.put(
+        writes.put(
             store::JSON_NAMESPACE,
             json_ref.as_hash_bytes().to_vec(),
             stored_payload,

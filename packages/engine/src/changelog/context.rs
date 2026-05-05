@@ -86,7 +86,7 @@ pub(crate) struct ChangelogWriter<'a> {
 
 impl ChangelogWriter<'_> {
     #[allow(dead_code)]
-    pub(crate) fn append_changes(&mut self, changes: &[CanonicalChange]) -> Result<(), LixError> {
-        crate::changelog::storage::append_changes(self.writes, changes)
+    pub(crate) fn stage_changes(&mut self, changes: &[CanonicalChange]) -> Result<(), LixError> {
+        crate::changelog::storage::stage_changes(self.writes, changes)
     }
 }

@@ -1439,16 +1439,18 @@ mod tests {
             .expect("transaction should open");
         let mut writes = StorageWriteSet::new();
         let canonical_changes = {
-            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            let mut json_writer = JsonStoreContext::new().writer();
             changes
                 .iter()
-                .map(|change| canonicalize_materialized_change(&mut json_writer, change))
+                .map(|change| {
+                    canonicalize_materialized_change(&mut writes, &mut json_writer, change)
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .expect("changes should canonicalize")
         };
         changelog
             .writer(&mut writes)
-            .append_changes(&canonical_changes)
+            .stage_changes(&canonical_changes)
             .expect("append should succeed");
         writes
             .apply(&mut tx.as_mut())

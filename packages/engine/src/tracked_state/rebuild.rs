@@ -1,6 +1,7 @@
 use crate::commit_graph::CommitGraphContext;
 use crate::commit_graph::CommitGraphEntity;
-use crate::storage::{StorageReader, StorageWriter};
+use crate::json_store::JsonStoreWriter;
+use crate::storage::{StorageReader, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateRow};
 use crate::LixError;
 
@@ -12,18 +13,19 @@ pub(crate) struct TrackedStateRebuildReport {
 
 /// Rebuilds tracked-state rows at one commit from the commit graph.
 ///
-/// The caller provides both stores explicitly so rebuilds can read from the
-/// desired KV snapshot and write through the desired transaction.
-pub(super) async fn rebuild_state_at_commit<R, W>(
+/// The caller provides the read stores and owns the transaction write set.
+pub(super) async fn rebuild_state_at_commit<R, S>(
     tracked_state: &TrackedStateContext,
     commit_graph: &CommitGraphContext,
     read_store: R,
-    write_store: W,
+    tracked_store: &mut S,
+    writes: &mut StorageWriteSet,
+    json_writer: &mut JsonStoreWriter,
     head_commit_id: &str,
 ) -> Result<TrackedStateRebuildReport, LixError>
 where
     R: StorageReader,
-    W: StorageWriter,
+    S: StorageReader + ?Sized,
 {
     let entities = commit_graph
         .reader(read_store)
@@ -32,8 +34,17 @@ where
     let rows = rows_from_entities(entities);
     let written_rows = rows.len();
 
-    let mut writer = tracked_state.writer(write_store);
-    writer.write_root(head_commit_id, None, &rows).await?;
+    tracked_state
+        .writer()
+        .stage_root(
+            tracked_store,
+            writes,
+            json_writer,
+            head_commit_id,
+            None,
+            &rows,
+        )
+        .await?;
 
     Ok(TrackedStateRebuildReport { written_rows })
 }
@@ -163,15 +174,23 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer();
         let report = rebuild_state_at_commit(
             &tracked_state,
             &commit_graph,
             storage.clone(),
             tx.as_mut(),
+            &mut writes,
+            &mut json_writer,
             "commit-1",
         )
         .await
         .expect("rebuild should succeed");
+        writes
+            .apply(&mut tx.as_mut())
+            .await
+            .expect("rebuild writes should apply");
         tx.commit().await.expect("transaction should commit");
 
         assert_eq!(report, TrackedStateRebuildReport { written_rows: 1 });
@@ -208,15 +227,23 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer();
         let report = rebuild_state_at_commit(
             &tracked_state,
             &commit_graph,
             storage.clone(),
             tx.as_mut(),
+            &mut writes,
+            &mut json_writer,
             "commit-1",
         )
         .await
         .expect("rebuild should succeed");
+        writes
+            .apply(&mut tx.as_mut())
+            .await
+            .expect("rebuild writes should apply");
         tx.commit().await.expect("transaction should commit");
 
         assert_eq!(report.written_rows, 1);
@@ -529,16 +556,18 @@ mod tests {
             .expect("transaction should open");
         let mut writes = StorageWriteSet::new();
         let canonical_changes = {
-            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            let mut json_writer = JsonStoreContext::new().writer();
             changes
                 .iter()
-                .map(|change| canonicalize_materialized_change(&mut json_writer, change))
+                .map(|change| {
+                    canonicalize_materialized_change(&mut writes, &mut json_writer, change)
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .expect("changes should canonicalize")
         };
         changelog
             .writer(&mut writes)
-            .append_changes(&canonical_changes)
+            .stage_changes(&canonical_changes)
             .expect("changes should append");
         writes
             .apply(&mut tx.as_mut())
@@ -557,11 +586,26 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        tracked_state
-            .writer(tx.as_mut())
-            .write_root(commit_id, None, rows)
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut json_writer = JsonStoreContext::new().writer();
+            tracked_state
+                .writer()
+                .stage_root(
+                    &mut tx.as_mut(),
+                    &mut writes,
+                    &mut json_writer,
+                    commit_id,
+                    None,
+                    rows,
+                )
+                .await
+                .expect("rows should seed");
+        }
+        writes
+            .apply(&mut tx.as_mut())
             .await
-            .expect("rows should seed");
+            .expect("rows should apply");
         tx.commit().await.expect("transaction should commit");
     }
 
@@ -575,15 +619,23 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer();
         let report = rebuild_state_at_commit(
             tracked_state,
             commit_graph,
             storage.clone(),
             tx.as_mut(),
+            &mut writes,
+            &mut json_writer,
             head_commit_id,
         )
         .await
         .expect("rebuild should succeed");
+        writes
+            .apply(&mut tx.as_mut())
+            .await
+            .expect("rebuild writes should apply");
         tx.commit().await.expect("transaction should commit");
         report
     }
@@ -631,11 +683,14 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
+        let mut writes = StorageWriteSet::new();
         tracked_state
-            .writer(tx.as_mut())
-            .delete_root_for_rebuild(commit_id)
+            .writer()
+            .stage_delete_root_for_rebuild(&mut writes, commit_id);
+        writes
+            .apply(&mut tx.as_mut())
             .await
-            .expect("root should delete");
+            .expect("root delete should apply");
         tx.commit().await.expect("transaction should commit");
     }
 

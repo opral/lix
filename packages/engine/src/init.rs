@@ -184,18 +184,17 @@ pub(crate) async fn initialize(
     let receipt = plan.receipt.clone();
 
     let mut transaction = storage.begin_write_transaction().await?;
+    let mut writes = StorageWriteSet::new();
+    let mut json_writer = JsonStoreContext::new().writer();
 
     {
-        let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer(&mut writes);
         let canonical_changes = plan
             .changes
             .iter()
-            .map(|change| canonicalize_materialized_change(&mut json_writer, change))
+            .map(|change| canonicalize_materialized_change(&mut writes, &mut json_writer, change))
             .collect::<Result<Vec<_>, _>>()?;
         let mut writer = changelog.writer(&mut writes);
-        writer.append_changes(&canonical_changes)?;
-        writes.apply(&mut transaction.as_mut()).await?;
+        writer.stage_changes(&canonical_changes)?;
     }
 
     let mut live_rows = plan
@@ -207,9 +206,12 @@ pub(crate) async fn initialize(
 
     {
         let mut writer = live_state.writer(transaction.as_mut());
-        writer.write_rows(&live_rows).await?;
+        writer
+            .stage_rows(&mut writes, &mut json_writer, &live_rows)
+            .await?;
     }
 
+    writes.apply(&mut transaction.as_mut()).await?;
     transaction.commit().await?;
     Ok(receipt)
 }

@@ -11,8 +11,7 @@ use crate::binary_cas::{
     BlobWrite, BlobWriteReceipt,
 };
 use crate::storage::{
-    KvGetGroup, KvGetRequest, KvScanRange, KvScanRequest, KvWriteBatch, KvWriteGroup,
-    StorageReader, StorageWriteSet, StorageWriter,
+    KvGetGroup, KvGetRequest, KvScanRange, KvScanRequest, StorageReader, StorageWriteSet,
 };
 use crate::LixError;
 use std::collections::{HashMap, HashSet};
@@ -61,18 +60,16 @@ pub(crate) async fn count_manifests(store: &mut impl StorageReader) -> Result<us
     .len())
 }
 
-pub(crate) async fn put_manifest(
-    writer: &mut impl StorageWriter,
+pub(crate) fn stage_manifest(
+    writes: &mut StorageWriteSet,
     blob_hash: BlobHash,
     manifest: &BinaryCasManifest,
-) -> Result<(), LixError> {
-    put_one(
-        writer,
+) {
+    writes.put(
         BINARY_CAS_MANIFEST_NAMESPACE,
         manifest_key(blob_hash),
         encode_binary_cas_manifest(manifest),
-    )
-    .await
+    );
 }
 
 pub(crate) async fn scan_manifest_chunks(
@@ -96,19 +93,17 @@ pub(crate) async fn scan_manifest_chunks(
     .collect()
 }
 
-pub(crate) async fn put_manifest_chunk(
-    writer: &mut impl StorageWriter,
+pub(crate) fn stage_manifest_chunk(
+    writes: &mut StorageWriteSet,
     blob_hash: BlobHash,
     chunk_index: u64,
     chunk: &KvBlobManifestChunk,
-) -> Result<(), LixError> {
-    put_one(
-        writer,
+) {
+    writes.put(
         BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
         manifest_chunk_key(blob_hash, chunk_index),
         encode_binary_cas_manifest_chunk(&chunk.chunk_hash, chunk.chunk_size),
-    )
-    .await
+    );
 }
 
 pub(crate) async fn load_chunk(
@@ -127,18 +122,12 @@ pub(crate) async fn load_chunk(
     }))
 }
 
-pub(crate) async fn put_chunk(
-    writer: &mut impl StorageWriter,
-    chunk_hash: BlobHash,
-    chunk: &KvChunk,
-) -> Result<(), LixError> {
-    put_one(
-        writer,
+pub(crate) fn stage_chunk(writes: &mut StorageWriteSet, chunk_hash: BlobHash, chunk: &KvChunk) {
+    writes.put(
         BINARY_CAS_CHUNK_NAMESPACE,
         chunk_key(chunk_hash),
         encode_binary_cas_chunk(chunk.codec, chunk.uncompressed_len, &chunk.data),
-    )
-    .await
+    );
 }
 
 async fn get_one(
@@ -175,24 +164,6 @@ async fn scan_all_values(
         .await?
         .values;
     Ok(page.iter().map(<[u8]>::to_vec).collect())
-}
-
-async fn put_one(
-    writer: &mut impl StorageWriter,
-    namespace: &str,
-    key: Vec<u8>,
-    value: Vec<u8>,
-) -> Result<(), LixError> {
-    writer
-        .write_kv_batch(KvWriteBatch {
-            groups: {
-                let mut group = KvWriteGroup::new(namespace);
-                group.put(key, value);
-                vec![group]
-            },
-        })
-        .await?;
-    Ok(())
 }
 
 pub(crate) async fn load_metadata_many(
@@ -548,46 +519,45 @@ pub(crate) fn stage_blob_write(
         return Ok(receipt);
     }
 
-    let manifest_key = manifest_key(blob_hash);
     match &layout {
         BlobLayout::Empty => {
-            writes.put(
-                BINARY_CAS_MANIFEST_NAMESPACE,
-                manifest_key,
-                encode_binary_cas_manifest(&BinaryCasManifest::Empty { size_bytes: 0 }),
+            stage_manifest(
+                writes,
+                blob_hash,
+                &BinaryCasManifest::Empty { size_bytes: 0 },
             );
         }
         BlobLayout::SingleChunk { chunk_hash } => {
             let chunk_hash = *chunk_hash;
-            writes.put(
-                BINARY_CAS_MANIFEST_NAMESPACE,
-                manifest_key,
-                encode_binary_cas_manifest(&BinaryCasManifest::SingleChunk {
+            stage_manifest(
+                writes,
+                blob_hash,
+                &BinaryCasManifest::SingleChunk {
                     size_bytes: write.bytes.len() as u64,
                     chunk_hash: chunk_hash.into_bytes(),
-                }),
+                },
             );
             if chunk_keys.insert(chunk_key(chunk_hash)) {
                 let encoded_chunk = encode_binary_chunk_payload(write.bytes);
-                writes.put(
-                    BINARY_CAS_CHUNK_NAMESPACE,
-                    chunk_key(chunk_hash),
-                    encode_binary_cas_chunk(
-                        encoded_chunk.codec,
-                        write.bytes.len() as u64,
-                        &encoded_chunk.data,
-                    ),
+                stage_chunk(
+                    writes,
+                    chunk_hash,
+                    &KvChunk {
+                        codec: encoded_chunk.codec,
+                        uncompressed_len: write.bytes.len() as u64,
+                        data: encoded_chunk.data,
+                    },
                 );
             }
         }
         BlobLayout::Chunked { chunk_count } => {
-            writes.put(
-                BINARY_CAS_MANIFEST_NAMESPACE,
-                manifest_key,
-                encode_binary_cas_manifest(&BinaryCasManifest::Chunked {
+            stage_manifest(
+                writes,
+                blob_hash,
+                &BinaryCasManifest::Chunked {
                     size_bytes: write.bytes.len() as u64,
                     chunk_count: *chunk_count,
-                }),
+                },
             );
 
             for (chunk_index, (start, end)) in chunk_ranges.into_iter().enumerate() {
@@ -596,24 +566,25 @@ pub(crate) fn stage_blob_write(
                 let chunk_key = chunk_key(chunk_hash);
                 if chunk_keys.insert(chunk_key.clone()) {
                     let encoded_chunk = encode_binary_chunk_payload(chunk_data);
-                    writes.put(
-                        BINARY_CAS_CHUNK_NAMESPACE,
-                        chunk_key,
-                        encode_binary_cas_chunk(
-                            encoded_chunk.codec,
-                            chunk_data.len() as u64,
-                            &encoded_chunk.data,
-                        ),
+                    stage_chunk(
+                        writes,
+                        chunk_hash,
+                        &KvChunk {
+                            codec: encoded_chunk.codec,
+                            uncompressed_len: chunk_data.len() as u64,
+                            data: encoded_chunk.data,
+                        },
                     );
                 }
 
-                writes.put(
-                    BINARY_CAS_MANIFEST_CHUNK_NAMESPACE,
-                    manifest_chunk_key(blob_hash, chunk_index as u64),
-                    encode_binary_cas_manifest_chunk(
-                        chunk_hash.as_bytes(),
-                        chunk_data.len() as u64,
-                    ),
+                stage_manifest_chunk(
+                    writes,
+                    blob_hash,
+                    chunk_index as u64,
+                    &KvBlobManifestChunk {
+                        chunk_hash: *chunk_hash.as_bytes(),
+                        chunk_size: chunk_data.len() as u64,
+                    },
                 );
             }
         }
@@ -684,13 +655,11 @@ mod tests {
     use super::*;
     use crate::backend::testing::UnitTestBackend;
     use crate::binary_cas::BinaryCasContext;
-    use crate::storage::{StorageContext, StorageWriteSet, StorageWriter};
+    use crate::storage::{StorageContext, StorageWriteSet};
 
-    async fn write_blob_to_store(store: &mut (impl StorageWriter + ?Sized), data: &[u8]) {
-        let mut writes = StorageWriteSet::new();
-        let mut writer = BinaryCasContext::new().writer(&mut writes);
+    fn stage_blob_to_writes(writes: &mut StorageWriteSet, data: &[u8]) {
+        let mut writer = BinaryCasContext::new().writer(writes);
         writer.stage_bytes(data).expect("blob write should persist");
-        writes.apply(store).await.expect("blob write should apply");
     }
 
     #[tokio::test]
@@ -705,39 +674,37 @@ mod tests {
         let chunk_b_hash = BlobHash::from_content(b"chunk-b").into_bytes();
 
         {
-            let mut writer = transaction.as_mut();
-            put_manifest(
-                &mut writer,
+            let mut writes = StorageWriteSet::new();
+            stage_manifest(
+                &mut writes,
                 blob_hash,
                 &BinaryCasManifest::Chunked {
                     size_bytes: 12,
                     chunk_count: 2,
                 },
-            )
-            .await
-            .expect("manifest should persist");
-            put_manifest_chunk(
-                &mut writer,
+            );
+            stage_manifest_chunk(
+                &mut writes,
                 blob_hash,
                 1,
                 &KvBlobManifestChunk {
                     chunk_hash: chunk_b_hash,
                     chunk_size: 6,
                 },
-            )
-            .await
-            .expect("chunk ref should persist");
-            put_manifest_chunk(
-                &mut writer,
+            );
+            stage_manifest_chunk(
+                &mut writes,
                 blob_hash,
                 0,
                 &KvBlobManifestChunk {
                     chunk_hash: chunk_a_hash,
                     chunk_size: 6,
                 },
-            )
-            .await
-            .expect("chunk ref should persist");
+            );
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("manifest writes should apply");
         }
         transaction.commit().await.expect("commit should succeed");
 
@@ -790,10 +757,12 @@ mod tests {
         let chunk_hash = BlobHash::from_content(b"chunk-a");
 
         {
-            let mut writer = transaction.as_mut();
-            put_chunk(&mut writer, chunk_hash, &chunk)
+            let mut writes = StorageWriteSet::new();
+            stage_chunk(&mut writes, chunk_hash, &chunk);
+            writes
+                .apply(&mut transaction.as_mut())
                 .await
-                .expect("chunk should persist");
+                .expect("chunk should apply");
         }
         transaction.commit().await.expect("commit should succeed");
 
@@ -835,7 +804,14 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        write_blob_to_store(transaction.as_mut(), data).await;
+        {
+            let mut writes = StorageWriteSet::new();
+            stage_blob_to_writes(&mut writes, data);
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("blob write should apply");
+        }
         transaction.commit().await.expect("commit should succeed");
 
         let mut store = storage
@@ -896,7 +872,14 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        write_blob_to_store(transaction.as_mut(), data).await;
+        {
+            let mut writes = StorageWriteSet::new();
+            stage_blob_to_writes(&mut writes, data);
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("blob write should apply");
+        }
         transaction.commit().await.expect("commit should succeed");
 
         let mut transaction = storage
@@ -904,15 +887,16 @@ mod tests {
             .await
             .expect("transaction should open");
         {
-            let mut writer = transaction.as_mut();
-            put_one(
-                &mut writer,
+            let mut writes = StorageWriteSet::new();
+            writes.put(
                 BINARY_CAS_CHUNK_NAMESPACE,
                 chunk_key(blob_hash),
                 encode_binary_cas_chunk(BinaryChunkCodec::Raw, corrupted.len() as u64, corrupted),
-            )
-            .await
-            .expect("corrupt chunk should overwrite");
+            );
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("corrupt chunk should overwrite");
         }
         transaction.commit().await.expect("commit should succeed");
 
@@ -942,39 +926,37 @@ mod tests {
             .await
             .expect("transaction should open");
         {
-            let mut writer = transaction.as_mut();
-            put_manifest(
-                &mut writer,
+            let mut writes = StorageWriteSet::new();
+            stage_manifest(
+                &mut writes,
                 expected_blob_hash,
                 &BinaryCasManifest::Chunked {
                     size_bytes: expected.len() as u64,
                     chunk_count: 1,
                 },
-            )
-            .await
-            .expect("manifest should persist");
-            put_manifest_chunk(
-                &mut writer,
+            );
+            stage_manifest_chunk(
+                &mut writes,
                 expected_blob_hash,
                 0,
                 &KvBlobManifestChunk {
                     chunk_hash: BlobHash::from_content(substituted).into_bytes(),
                     chunk_size: substituted.len() as u64,
                 },
-            )
-            .await
-            .expect("manifest chunk should persist");
-            put_chunk(
-                &mut writer,
+            );
+            stage_chunk(
+                &mut writes,
                 substituted_chunk_hash,
                 &KvChunk {
                     codec: BinaryChunkCodec::Raw,
                     uncompressed_len: substituted.len() as u64,
                     data: substituted.to_vec(),
                 },
-            )
-            .await
-            .expect("chunk should persist");
+            );
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("wrong manifest fixture should apply");
         }
         transaction.commit().await.expect("commit should succeed");
 
@@ -1000,7 +982,14 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        write_blob_to_store(transaction.as_mut(), data).await;
+        {
+            let mut writes = StorageWriteSet::new();
+            stage_blob_to_writes(&mut writes, data);
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("blob write should apply");
+        }
         transaction.commit().await.expect("commit should succeed");
 
         let mut store = storage
@@ -1038,7 +1027,14 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        write_blob_to_store(transaction.as_mut(), &data).await;
+        {
+            let mut writes = StorageWriteSet::new();
+            stage_blob_to_writes(&mut writes, &data);
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("blob write should apply");
+        }
         transaction.commit().await.expect("commit should succeed");
 
         let mut store = storage

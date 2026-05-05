@@ -2,8 +2,9 @@ use crate::functions::{
     state, DeterministicFunctionProvider, DeterministicSequence, FunctionProvider,
     FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
 };
+use crate::json_store::JsonStoreWriter;
 use crate::live_state::{LiveStateReader, LiveStateWriter};
-use crate::storage::StorageWriter;
+use crate::storage::{StorageReader, StorageWriteSet};
 use crate::LixError;
 
 /// Execution-scoped runtime function context.
@@ -55,19 +56,23 @@ impl FunctionContext {
     ///
     /// System functions report no sequence state, so this is a no-op when
     /// deterministic mode is disabled.
-    pub(crate) async fn persist_if_needed<S>(
+    pub(crate) async fn stage_persist_if_needed<S>(
         &self,
         writer: &mut LiveStateWriter<S>,
+        writes: &mut StorageWriteSet,
+        json_writer: &mut JsonStoreWriter,
     ) -> Result<(), LixError>
     where
-        S: StorageWriter,
+        S: StorageReader,
     {
         let Some(highest_seen) = self.functions.deterministic_sequence_persist_highest_seen()
         else {
             return Ok(());
         };
-        state::write_sequence(
+        state::stage_sequence(
             writer,
+            writes,
+            json_writer,
             DeterministicSequence { highest_seen },
             &self.bookkeeping_timestamp,
         )
@@ -219,10 +224,20 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
         context
-            .persist_if_needed(&mut live_state.writer(tx.as_mut()))
+            .stage_persist_if_needed(
+                &mut live_state.writer(tx.as_mut()),
+                &mut writes,
+                &mut json_writer,
+            )
             .await
-            .expect("sequence should persist");
+            .expect("sequence should stage");
+        writes
+            .apply(&mut tx.as_mut())
+            .await
+            .expect("sequence should apply");
         tx.commit().await.expect("transaction should commit");
 
         let reader = live_state.reader(storage.clone());
@@ -244,10 +259,17 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
         context
-            .persist_if_needed(&mut live_state.writer(tx.as_mut()))
+            .stage_persist_if_needed(
+                &mut live_state.writer(tx.as_mut()),
+                &mut writes,
+                &mut json_writer,
+            )
             .await
             .expect("persist should no-op");
+        assert!(writes.is_empty());
         tx.commit().await.expect("transaction should commit");
 
         let reader = live_state.reader(storage.clone());
@@ -287,11 +309,19 @@ mod tests {
             untracked: true,
             version_id: GLOBAL_VERSION_ID.to_string(),
         };
-        live_state
-            .writer(tx.as_mut())
-            .write_rows(&[row])
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
+        {
+            let mut writer = live_state.writer(tx.as_mut());
+            writer
+                .stage_rows(&mut writes, &mut json_writer, &[row])
+                .await
+                .expect("test key-value should stage");
+        }
+        writes
+            .apply(&mut tx.as_mut())
             .await
-            .expect("test key-value should write");
+            .expect("test key-value should apply");
         tx.commit().await.expect("transaction should commit");
     }
 }

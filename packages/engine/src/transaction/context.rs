@@ -155,17 +155,11 @@ impl Transaction {
             &self.changelog,
             &self.live_state,
             self.version_ctx.as_ref(),
+            Some(runtime_functions),
             self.storage_transaction.as_mut(),
             staged_writes,
         )
         .await
-        {
-            let _ = self.storage_transaction.rollback().await;
-            return Err(error);
-        }
-        if let Err(error) = runtime_functions
-            .persist_if_needed(&mut self.live_state.writer(self.storage_transaction.as_mut()))
-            .await
         {
             let _ = self.storage_transaction.rollback().await;
             return Err(error);
@@ -336,8 +330,9 @@ impl Transaction {
         let timestamp = self.functions.call_timestamp();
         let mut writes = StorageWriteSet::new();
         let canonical_row = {
-            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            let mut json_writer = JsonStoreContext::new().writer();
             self.version_ctx.canonical_ref_row(
+                &mut writes,
                 &mut json_writer,
                 version_id,
                 commit_id,
@@ -1226,11 +1221,19 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("schema fixture transaction should open");
-        live_state
-            .writer(storage_transaction.as_mut())
-            .write_rows(&rows)
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer();
+        {
+            let mut writer = live_state.writer(storage_transaction.as_mut());
+            writer
+                .stage_rows(&mut writes, &mut json_writer, &rows)
+                .await
+                .expect("schema fixture rows should stage");
+        }
+        writes
+            .apply(&mut storage_transaction.as_mut())
             .await
-            .expect("schema fixture rows should write");
+            .expect("schema fixture rows should apply");
         storage_transaction
             .commit()
             .await

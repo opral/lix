@@ -3,10 +3,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::backend::{Backend, BackendReadTransaction, BackendWriteTransaction};
+use crate::storage::types::{KvWriteBatch, StorageWriter};
 use crate::storage::{
     KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch, KvValuePage,
-    KvWriteBatch, KvWriteStats, StorageReadTransaction, StorageReader, StorageWriteTransaction,
-    StorageWriter,
+    KvWriteStats, StorageReadTransaction, StorageReader, StorageWriteTransaction,
 };
 use crate::LixError;
 
@@ -242,7 +242,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::backend::testing::UnitTestBackend;
-    use crate::storage::{KvGetGroup, KvScanRange, KvWriteBatch, StorageWriteSet};
+    use crate::storage::types::KvWriteBatch;
+    use crate::storage::{KvGetGroup, KvScanRange, StorageWriteSet};
 
     use super::*;
 

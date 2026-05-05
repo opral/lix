@@ -2,12 +2,11 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::commit_graph::{CommitGraphCommit, CommitGraphContext};
-use crate::json_store::JsonStoreContext;
 use crate::live_state::visibility;
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
 };
-use crate::storage::{StorageReader, StorageWriteSet, StorageWriter};
+use crate::storage::{StorageReader, StorageWriteSet};
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateFilter, TrackedStateProjection, TrackedStateRow,
     TrackedStateRowRequest, TrackedStateScanRequest,
@@ -57,14 +56,14 @@ impl LiveStateContext {
         }
     }
 
-    /// Creates a visible live-state writer over a caller-provided KV writer.
+    /// Creates a visible live-state writer over a caller-provided KV reader.
     ///
     /// The writer owns the tracked/untracked routing rule: tracked rows update
     /// the tracked projection and clear matching untracked overlay rows, while
     /// untracked rows update only the local untracked overlay.
     pub(crate) fn writer<S>(&self, store: S) -> LiveStateWriter<S>
     where
-        S: StorageWriter,
+        S: StorageReader,
     {
         LiveStateWriter {
             store,
@@ -260,7 +259,7 @@ where
     }
 }
 
-/// Writer for visible live-state rows over a caller-provided KV writer.
+/// Writer for visible live-state rows over a caller-provided KV reader.
 pub(crate) struct LiveStateWriter<S> {
     store: S,
     tracked_state: TrackedStateContext,
@@ -269,9 +268,14 @@ pub(crate) struct LiveStateWriter<S> {
 
 impl<S> LiveStateWriter<S>
 where
-    S: StorageWriter,
+    S: StorageReader,
 {
-    pub(crate) async fn write_rows(&mut self, rows: &[LiveStateRow]) -> Result<(), LixError> {
+    pub(crate) async fn stage_rows(
+        &mut self,
+        writes: &mut StorageWriteSet,
+        json_writer: &mut crate::json_store::JsonStoreWriter,
+        rows: &[LiveStateRow],
+    ) -> Result<(), LixError> {
         let (tracked_rows, untracked_rows): (Vec<_>, Vec<_>) =
             rows.iter().partition(|row| !row.untracked);
 
@@ -280,18 +284,13 @@ where
                 .into_iter()
                 .map(MaterializedUntrackedStateRow::from)
                 .collect::<Vec<_>>();
-            let mut writes = StorageWriteSet::new();
-            let canonical_rows = {
-                let mut json_writer = JsonStoreContext::new().writer(&mut writes);
-                untracked_rows
-                    .iter()
-                    .map(|row| canonicalize_materialized_row(&mut json_writer, row))
-                    .collect::<Result<Vec<_>, _>>()?
-            };
+            let canonical_rows = untracked_rows
+                .iter()
+                .map(|row| canonicalize_materialized_row(writes, json_writer, row))
+                .collect::<Result<Vec<_>, _>>()?;
             self.untracked_state
-                .writer(&mut writes)
-                .write_rows(&canonical_rows)?;
-            writes.apply(&mut self.store).await?;
+                .writer(writes)
+                .stage_rows(&canonical_rows)?;
         }
 
         if tracked_rows.is_empty() {
@@ -309,13 +308,9 @@ where
                 })
             })
             .collect::<Result<Vec<_>, LixError>>()?;
-        {
-            let mut writes = StorageWriteSet::new();
-            self.untracked_state
-                .writer(&mut writes)
-                .delete_rows(&identities);
-            writes.apply(&mut self.store).await?;
-        }
+        self.untracked_state
+            .writer(writes)
+            .stage_delete_rows(&identities);
 
         for (commit_id, rows) in grouped_live_rows_by_commit(&tracked_rows)? {
             let parent_commit_id = parent_commit_id_for_commit_rows(commit_id, &rows)?;
@@ -328,10 +323,16 @@ where
                 .filter(|row| row.schema_key != COMMIT_SCHEMA_KEY)
                 .map(|row| TrackedStateRow::try_from(*row))
                 .collect::<Result<Vec<_>, _>>()?;
-            let store: &mut dyn StorageWriter = &mut self.store;
             self.tracked_state
-                .writer(store)
-                .write_root(commit_id, parent_commit_id.as_deref(), &root_rows)
+                .writer()
+                .stage_root(
+                    &mut self.store,
+                    writes,
+                    json_writer,
+                    commit_id,
+                    parent_commit_id.as_deref(),
+                    &root_rows,
+                )
                 .await?;
         }
 
@@ -757,7 +758,7 @@ mod tests {
     use crate::entity_identity::EntityIdentity;
     use crate::json_store::JsonStoreContext;
     use crate::live_state::LiveStateFilter;
-    use crate::storage::{StorageContext, StorageWriter};
+    use crate::storage::{StorageContext, StorageWriteTransaction};
     use crate::tracked_state::TrackedStateScanRequest;
     use crate::untracked_state::{MaterializedUntrackedStateRow, UntrackedStateContext};
     use crate::NullableKeyFilter;
@@ -772,20 +773,20 @@ mod tests {
     }
 
     async fn write_untracked_rows_to_store(
-        store: &mut (impl StorageWriter + ?Sized),
+        store: &mut (impl StorageWriteTransaction + ?Sized),
         rows: &[MaterializedUntrackedStateRow],
     ) {
         let mut writes = StorageWriteSet::new();
         let canonical_rows = {
-            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            let mut json_writer = JsonStoreContext::new().writer();
             rows.iter()
-                .map(|row| canonicalize_materialized_row(&mut json_writer, row))
+                .map(|row| canonicalize_materialized_row(&mut writes, &mut json_writer, row))
                 .collect::<Result<Vec<_>, _>>()
                 .expect("untracked rows should canonicalize")
         };
         UntrackedStateContext::new()
             .writer(&mut writes)
-            .write_rows(&canonical_rows)
+            .stage_rows(&canonical_rows)
             .expect("untracked rows should write");
         writes
             .apply(store)
@@ -803,15 +804,29 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[tracked_row_with_commit(
-                "tracked-value",
-                Some("change-tracked"),
-                "commit-tracked",
-            )])
-            .await
-            .expect("tracked row should write");
+        {
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            {
+                let mut writer = live_state.writer(transaction.as_mut());
+                writer
+                    .stage_rows(
+                        &mut writes,
+                        &mut json_writer,
+                        &[tracked_row_with_commit(
+                            "tracked-value",
+                            Some("change-tracked"),
+                            "commit-tracked",
+                        )],
+                    )
+                    .await
+                    .expect("tracked row should stage");
+            }
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("tracked row should apply");
+        }
         write_untracked_rows_to_store(
             transaction.as_mut(),
             &[
@@ -861,15 +876,29 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[tracked_row_with_commit(
-                "tracked-value",
-                Some("change-tracked"),
-                "commit-tracked",
-            )])
-            .await
-            .expect("tracked row should write");
+        {
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            {
+                let mut writer = live_state.writer(transaction.as_mut());
+                writer
+                    .stage_rows(
+                        &mut writes,
+                        &mut json_writer,
+                        &[tracked_row_with_commit(
+                            "tracked-value",
+                            Some("change-tracked"),
+                            "commit-tracked",
+                        )],
+                    )
+                    .await
+                    .expect("tracked row should stage");
+            }
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("tracked row should apply");
+        }
         write_untracked_rows_to_store(
             transaction.as_mut(),
             &[version_ref_row("global", "commit-tracked")],
@@ -899,15 +928,29 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[tracked_row_with_commit(
-                "tracked-value",
-                Some("change-tracked"),
-                "commit-tracked",
-            )])
-            .await
-            .expect("tracked row should write");
+        {
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            {
+                let mut writer = live_state.writer(transaction.as_mut());
+                writer
+                    .stage_rows(
+                        &mut writes,
+                        &mut json_writer,
+                        &[tracked_row_with_commit(
+                            "tracked-value",
+                            Some("change-tracked"),
+                            "commit-tracked",
+                        )],
+                    )
+                    .await
+                    .expect("tracked row should stage");
+            }
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("tracked row should apply");
+        }
         write_untracked_rows_to_store(
             transaction.as_mut(),
             &[
@@ -920,7 +963,7 @@ mod tests {
             let mut writes = StorageWriteSet::new();
             UntrackedStateContext::new()
                 .writer(&mut writes)
-                .delete_rows(&[crate::untracked_state::UntrackedStateIdentity {
+                .stage_delete_rows(&[crate::untracked_state::UntrackedStateIdentity {
                     version_id: "global".to_string(),
                     schema_key: "lix_key_value".to_string(),
                     entity_id: EntityIdentity::single("selected-tab"),
@@ -955,15 +998,26 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[tracked_row_with_commit(
+        {
+            let rows = [tracked_row_with_commit(
                 "global-tracked",
                 Some("change-global"),
                 "commit-global",
-            )])
-            .await
-            .expect("tracked row should write");
+            )];
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            {
+                let mut writer = live_state.writer(transaction.as_mut());
+                writer
+                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("tracked row should stage");
+            }
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("tracked row should apply");
+        }
         write_untracked_rows_to_store(
             transaction.as_mut(),
             &[
@@ -1003,15 +1057,26 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[tracked_row_with_commit(
+        {
+            let rows = [tracked_row_with_commit(
                 "global-tracked",
                 Some("change-global"),
                 "commit-global",
-            )])
-            .await
-            .expect("global tracked row should write");
+            )];
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            {
+                let mut writer = live_state.writer(transaction.as_mut());
+                writer
+                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("global tracked row should stage");
+            }
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("global tracked row should apply");
+        }
         write_untracked_rows_to_store(
             transaction.as_mut(),
             &[
@@ -1052,9 +1117,8 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        {
+            let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
                 tracked_row_at_with_commit(
                     "version-a",
@@ -1062,9 +1126,21 @@ mod tests {
                     Some("change-version"),
                     "commit-version",
                 ),
-            ])
-            .await
-            .expect("tracked rows should write");
+            ];
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            {
+                let mut writer = live_state.writer(transaction.as_mut());
+                writer
+                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("tracked rows should stage");
+            }
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("tracked rows should apply");
+        }
         write_untracked_rows_to_store(
             transaction.as_mut(),
             &[
@@ -1098,9 +1174,8 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        {
+            let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
                 tracked_row_at_with_commit(
                     "main",
@@ -1108,9 +1183,21 @@ mod tests {
                     Some("change-main"),
                     "commit-main",
                 ),
-            ])
-            .await
-            .expect("tracked rows should write");
+            ];
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            {
+                let mut writer = live_state.writer(transaction.as_mut());
+                writer
+                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("tracked rows should stage");
+            }
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("tracked rows should apply");
+        }
         write_untracked_rows_to_store(
             transaction.as_mut(),
             &[
@@ -1144,9 +1231,8 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        {
+            let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
                 tracked_row_at_with_commit(
                     "version-a",
@@ -1154,9 +1240,21 @@ mod tests {
                     Some("change-version"),
                     "commit-version",
                 ),
-            ])
-            .await
-            .expect("tracked rows should write");
+            ];
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            {
+                let mut writer = live_state.writer(transaction.as_mut());
+                writer
+                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("tracked rows should stage");
+            }
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("tracked rows should apply");
+        }
         write_untracked_rows_to_store(
             transaction.as_mut(),
             &[
@@ -1192,9 +1290,8 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        {
+            let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
                 tracked_row_at_with_commit(
                     "version-a",
@@ -1202,9 +1299,21 @@ mod tests {
                     Some("change-version"),
                     "commit-version",
                 ),
-            ])
-            .await
-            .expect("rows should write");
+            ];
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            {
+                let mut writer = live_state.writer(transaction.as_mut());
+                writer
+                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("rows should stage");
+            }
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("rows should apply");
+        }
         write_untracked_rows_to_store(
             transaction.as_mut(),
             &[
@@ -1237,15 +1346,26 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[tracked_row_with_commit(
+        {
+            let rows = [tracked_row_with_commit(
                 "global-tracked",
                 Some("change-global"),
                 "commit-global",
-            )])
-            .await
-            .expect("rows should write");
+            )];
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            {
+                let mut writer = live_state.writer(transaction.as_mut());
+                writer
+                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("rows should stage");
+            }
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("rows should apply");
+        }
         write_untracked_rows_to_store(
             transaction.as_mut(),
             &[
@@ -1279,15 +1399,26 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[tracked_row_with_commit(
+        {
+            let rows = [tracked_row_with_commit(
                 "global-tracked",
                 Some("change-global"),
                 "commit-global",
-            )])
-            .await
-            .expect("tracked row should write");
+            )];
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            {
+                let mut writer = live_state.writer(transaction.as_mut());
+                writer
+                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("tracked row should stage");
+            }
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("tracked row should apply");
+        }
         write_untracked_rows_to_store(
             transaction.as_mut(),
             &[version_ref_row("global", "commit-global")],
@@ -1316,18 +1447,29 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        {
+            let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
                 tombstone_tracked_row_at_with_commit(
                     "version-a",
                     Some("change-tombstone"),
                     "commit-version",
                 ),
-            ])
-            .await
-            .expect("rows should write");
+            ];
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            {
+                let mut writer = live_state.writer(transaction.as_mut());
+                writer
+                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("rows should stage");
+            }
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("rows should apply");
+        }
         write_untracked_rows_to_store(
             transaction.as_mut(),
             &[
@@ -1361,18 +1503,29 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        {
+            let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
                 tombstone_tracked_row_at_with_commit(
                     "main",
                     Some("change-main-tombstone"),
                     "commit-main",
                 ),
-            ])
-            .await
-            .expect("tracked rows should write");
+            ];
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            {
+                let mut writer = live_state.writer(transaction.as_mut());
+                writer
+                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("tracked rows should stage");
+            }
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("tracked rows should apply");
+        }
         write_untracked_rows_to_store(
             transaction.as_mut(),
             &[
@@ -1489,9 +1642,8 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        let error = live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        let error = {
+            let rows = [
                 tracked_row_at_with_commit(
                     "global",
                     "global-row",
@@ -1504,9 +1656,15 @@ mod tests {
                     Some("change-version"),
                     "commit-shared",
                 ),
-            ])
-            .await
-            .expect_err("one tracked root must not mix global and version rows");
+            ];
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            let mut writer = live_state.writer(transaction.as_mut());
+            writer
+                .stage_rows(&mut writes, &mut json_writer, &rows)
+                .await
+        }
+        .expect_err("one tracked root must not mix global and version rows");
 
         assert!(
             error.message.contains("mixes multiple storage scopes"),
@@ -1527,11 +1685,16 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        let error = live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[invalid_row])
-            .await
-            .expect_err("global rows must be stored in the global root only");
+        let error = {
+            let rows = [invalid_row];
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            let mut writer = live_state.writer(transaction.as_mut());
+            writer
+                .stage_rows(&mut writes, &mut json_writer, &rows)
+                .await
+        }
+        .expect_err("global rows must be stored in the global root only");
 
         assert!(
             error.message.contains("invalid storage scope"),
@@ -1549,9 +1712,8 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        {
+            let rows = [
                 tracked_row_at_with_commit(
                     "version-a",
                     "version-row",
@@ -1559,9 +1721,21 @@ mod tests {
                     "commit-version",
                 ),
                 commit_live_state_row("commit-version"),
-            ])
-            .await
-            .expect("commit facts are changelog projections, not root-local rows");
+            ];
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            {
+                let mut writer = live_state.writer(transaction.as_mut());
+                writer
+                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("commit facts are changelog projections, not root-local rows");
+            }
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("commit fact rows should apply");
+        }
         write_untracked_rows_to_store(
             transaction.as_mut(),
             &[version_ref_row("version-a", "commit-version")],
@@ -1588,11 +1762,26 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("seed transaction should open");
-        TrackedStateContext::new()
-            .writer(seed_transaction.as_mut())
-            .write_root("parent-left", None, &[])
+        let mut writes = StorageWriteSet::new();
+        {
+            let mut json_writer = JsonStoreContext::new().writer();
+            TrackedStateContext::new()
+                .writer()
+                .stage_root(
+                    &mut seed_transaction.as_mut(),
+                    &mut writes,
+                    &mut json_writer,
+                    "parent-left",
+                    None,
+                    &[],
+                )
+                .await
+                .expect("first parent root should exist");
+        }
+        writes
+            .apply(&mut seed_transaction.as_mut())
             .await
-            .expect("first parent root should exist");
+            .expect("first parent root should apply");
         seed_transaction
             .commit()
             .await
@@ -1603,9 +1792,8 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        {
+            let rows = [
                 tracked_row_at_with_commit(
                     "version-a",
                     "version-row",
@@ -1616,9 +1804,21 @@ mod tests {
                     "commit-merge",
                     &["parent-left", "parent-right"],
                 ),
-            ])
-            .await
-            .expect("merge commit should use first parent as tracked-root base");
+            ];
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            {
+                let mut writer = live_state.writer(transaction.as_mut());
+                writer
+                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("merge commit should use first parent as tracked-root base");
+            }
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("merge commit rows should apply");
+        }
     }
 
     #[tokio::test]
@@ -1631,9 +1831,8 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        let error = live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        let error = {
+            let rows = [
                 tracked_row_at_with_commit(
                     "version-a",
                     "version-row",
@@ -1648,9 +1847,15 @@ mod tests {
                         "change_ids": ["change-version"],
                     }),
                 ),
-            ])
-            .await
-            .expect_err("commit roots must declare parent_commit_ids");
+            ];
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            let mut writer = live_state.writer(transaction.as_mut());
+            writer
+                .stage_rows(&mut writes, &mut json_writer, &rows)
+                .await
+        }
+        .expect_err("commit roots must declare parent_commit_ids");
 
         assert!(
             error.message.contains("missing parent_commit_ids"),
@@ -1668,9 +1873,8 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        let error = live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        let error = {
+            let rows = [
                 tracked_row_at_with_commit(
                     "version-a",
                     "version-row",
@@ -1686,9 +1890,15 @@ mod tests {
                         "parent_commit_ids": "parent-1",
                     }),
                 ),
-            ])
-            .await
-            .expect_err("commit root parent_commit_ids must be an array");
+            ];
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            let mut writer = live_state.writer(transaction.as_mut());
+            writer
+                .stage_rows(&mut writes, &mut json_writer, &rows)
+                .await
+        }
+        .expect_err("commit root parent_commit_ids must be an array");
 
         assert!(
             error.message.contains("parent_commit_ids must be an array"),
@@ -1711,9 +1921,8 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        live_state
-            .writer(transaction.as_mut())
-            .write_rows(&[
+        {
+            let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
                 tracked_row_at_with_commit(
                     "main",
@@ -1721,9 +1930,21 @@ mod tests {
                     Some("change-main"),
                     "commit-main",
                 ),
-            ])
-            .await
-            .expect("tracked rows should write");
+            ];
+            let mut writes = StorageWriteSet::new();
+            let mut json_writer = JsonStoreContext::new().writer();
+            {
+                let mut writer = live_state.writer(transaction.as_mut());
+                writer
+                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                    .await
+                    .expect("tracked rows should stage");
+            }
+            writes
+                .apply(&mut transaction.as_mut())
+                .await
+                .expect("tracked rows should apply");
+        }
         transaction.commit().await.expect("commit should persist");
 
         let global_root_rows =
@@ -1908,15 +2129,15 @@ mod tests {
             .expect("version-ref transaction should open");
         let mut writes = StorageWriteSet::new();
         let canonical_refs = {
-            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
+            let mut json_writer = JsonStoreContext::new().writer();
             refs.iter()
-                .map(|row| canonicalize_materialized_row(&mut json_writer, row))
+                .map(|row| canonicalize_materialized_row(&mut writes, &mut json_writer, row))
                 .collect::<Result<Vec<_>, _>>()
                 .expect("version refs should canonicalize")
         };
         UntrackedStateContext::new()
             .writer(&mut writes)
-            .write_rows(&canonical_refs)
+            .stage_rows(&canonical_refs)
             .expect("version refs should write");
         writes
             .apply(&mut transaction.as_mut())
@@ -1996,13 +2217,13 @@ mod tests {
         };
         let mut writes = StorageWriteSet::new();
         let canonical_change = {
-            let mut json_writer = JsonStoreContext::new().writer(&mut writes);
-            canonicalize_materialized_change(&mut json_writer, &change)
+            let mut json_writer = JsonStoreContext::new().writer();
+            canonicalize_materialized_change(&mut writes, &mut json_writer, &change)
                 .expect("commit change should canonicalize")
         };
         changelog
             .writer(&mut writes)
-            .append_changes(&[canonical_change])
+            .stage_changes(&[canonical_change])
             .expect("commit change should append");
         writes
             .apply(&mut transaction.as_mut())

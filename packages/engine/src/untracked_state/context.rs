@@ -67,16 +67,16 @@ pub(crate) struct UntrackedStateWriter<'a> {
 }
 
 impl UntrackedStateWriter<'_> {
-    /// Writes the latest untracked rows for their identities.
+    /// Stages the latest untracked rows for their identities.
     ///
     /// A row with `snapshot_ref = None` is treated as removal because
     /// untracked state keeps only the current local value, not tombstones.
-    pub(crate) fn write_rows(&mut self, rows: &[UntrackedStateRow]) -> Result<(), LixError> {
-        crate::untracked_state::storage::write_rows(self.writes, rows)
+    pub(crate) fn stage_rows(&mut self, rows: &[UntrackedStateRow]) -> Result<(), LixError> {
+        crate::untracked_state::storage::stage_rows(self.writes, rows)
     }
 
     /// Removes untracked rows by exact identity.
-    pub(crate) fn delete_rows(&mut self, identities: &[UntrackedStateIdentity]) {
-        crate::untracked_state::storage::delete_rows(self.writes, identities)
+    pub(crate) fn stage_delete_rows(&mut self, identities: &[UntrackedStateIdentity]) {
+        crate::untracked_state::storage::stage_delete_rows(self.writes, identities)
     }
 }
