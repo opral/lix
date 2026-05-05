@@ -10,7 +10,10 @@ use crate::LixError;
 #[async_trait]
 pub(crate) trait ChangelogReader: Send + Sync {
     #[allow(dead_code)]
-    async fn load_change(&self, change_id: &str) -> Result<Option<CanonicalChange>, LixError>;
+    async fn load_changes(
+        &self,
+        change_ids: &[String],
+    ) -> Result<Vec<Option<CanonicalChange>>, LixError>;
 
     #[allow(dead_code)]
     async fn scan_changes(

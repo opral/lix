@@ -250,9 +250,13 @@ where
         change_id: &str,
         source_commit_id: &str,
     ) -> Result<CanonicalChange, LixError> {
+        let change_ids = vec![change_id.to_string()];
         self.changelog_reader
-            .load_change(change_id)
+            .load_changes(&change_ids)
             .await?
+            .into_iter()
+            .next()
+            .flatten()
             .ok_or_else(|| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
@@ -312,10 +316,14 @@ where
         change_id: &str,
         source_commit_id: &str,
     ) -> Result<MaterializedCanonicalChange, LixError> {
+        let change_ids = vec![change_id.to_string()];
         let change = self
             .changelog_reader
-            .load_change(change_id)
+            .load_changes(&change_ids)
             .await?
+            .into_iter()
+            .next()
+            .flatten()
             .ok_or_else(|| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",

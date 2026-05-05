@@ -6,26 +6,50 @@ use crate::LixError;
 
 const CHANGELOG_CHANGE_NAMESPACE: &str = "changelog.change";
 
-pub(crate) async fn load_change(
+pub(crate) async fn load_changes(
     store: &mut impl StorageReader,
-    change_id: &str,
-) -> Result<Option<CanonicalChange>, LixError> {
-    let bytes = store
+    change_ids: &[String],
+) -> Result<Vec<Option<CanonicalChange>>, LixError> {
+    if change_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let result = store
         .get_values(KvGetRequest {
             groups: vec![KvGetGroup {
                 namespace: CHANGELOG_CHANGE_NAMESPACE.to_string(),
-                keys: vec![encode_change_key(change_id)],
+                keys: change_ids
+                    .iter()
+                    .map(|change_id| encode_change_key(change_id))
+                    .collect(),
             }],
         })
-        .await?
-        .groups
-        .into_iter()
-        .next()
-        .and_then(|group| group.single_value_owned());
-    let Some(bytes) = bytes else {
-        return Ok(None);
-    };
-    decode_change(&bytes).map(Some)
+        .await?;
+    let group = result.groups.into_iter().next().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "changelog batch load returned no result group",
+        )
+    })?;
+    if group.len() != change_ids.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "changelog batch load returned {} values for {} requested change ids",
+                group.len(),
+                change_ids.len()
+            ),
+        ));
+    }
+
+    let mut changes = Vec::with_capacity(group.len());
+    for index in 0..group.len() {
+        let change = match group.value(index).flatten() {
+            Some(bytes) => Some(decode_change(bytes)?),
+            None => None,
+        };
+        changes.push(change);
+    }
+    Ok(changes)
 }
 
 pub(crate) async fn scan_changes(
@@ -77,7 +101,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn append_and_load_change_roundtrips() {
+    async fn append_and_load_changes_roundtrips() {
         let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let changelog = ChangelogContext::new();
         let change = test_change("change-1");
@@ -212,9 +236,12 @@ mod tests {
         let canonical = {
             let reader = changelog.reader(storage.clone());
             reader
-                .load_change(change_id)
+                .load_changes(&[change_id.to_string()])
                 .await
                 .expect("load should succeed")
+                .into_iter()
+                .next()
+                .flatten()
         }?;
         let mut json_reader = JsonStoreContext::new().reader(storage);
         materialize_change(&mut json_reader, canonical)
