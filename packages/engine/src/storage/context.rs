@@ -275,8 +275,8 @@ mod tests {
             })
             .await
             .expect("batch reads");
-        assert_eq!(result.groups[0].values[0], Some(b"1".to_vec()));
-        assert_eq!(result.groups[0].values[1], Some(b"2".to_vec()));
+        assert_eq!(result.groups[0].value(0), Some(Some(b"1".as_slice())));
+        assert_eq!(result.groups[0].value(1), Some(Some(b"2".as_slice())));
 
         let exists = tx
             .exists_many(KvGetRequest {

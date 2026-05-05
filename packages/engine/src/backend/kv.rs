@@ -49,7 +49,7 @@ impl<'a> Iterator for BytePageIter<'a> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BytePageBuilder {
     bytes: Vec<u8>,
     offsets: Vec<u32>,
@@ -70,6 +70,27 @@ impl BytePageBuilder {
             bytes: Vec::with_capacity(bytes),
             offsets,
         }
+    }
+
+    pub fn from_page(page: BytePage) -> Self {
+        Self {
+            bytes: page.bytes,
+            offsets: page.offsets,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, index: usize) -> Option<&[u8]> {
+        let start = usize::try_from(*self.offsets.get(index)?).ok()?;
+        let end = usize::try_from(*self.offsets.get(index + 1)?).ok()?;
+        self.bytes.get(start..end)
     }
 
     pub fn push(&mut self, value: impl AsRef<[u8]>) {
@@ -122,6 +143,12 @@ pub struct BackendKvGetGroup {
     pub keys: Vec<Vec<u8>>,
 }
 
+impl BackendKvGetGroup {
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendKvValueBatch {
     pub groups: Vec<BackendKvValueGroup>,
@@ -129,13 +156,56 @@ pub struct BackendKvValueBatch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendKvValueGroup {
-    pub namespace: String,
-    pub values: Vec<Option<Vec<u8>>>,
+    namespace: String,
+    values: BytePage,
+    present: Vec<bool>,
 }
 
 impl BackendKvValueGroup {
-    pub fn pop_value(&mut self) -> Option<Vec<u8>> {
-        self.values.pop().flatten()
+    pub fn new(namespace: impl Into<String>, values: BytePage, present: Vec<bool>) -> Self {
+        assert_eq!(
+            values.len(),
+            present.len(),
+            "backend value batch must have one value slot per presence bit"
+        );
+        Self {
+            namespace: namespace.into(),
+            values,
+            present,
+        }
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn len(&self) -> usize {
+        self.present.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.present.is_empty()
+    }
+
+    pub fn value(&self, index: usize) -> Option<Option<&[u8]>> {
+        let present = *self.present.get(index)?;
+        if present {
+            Some(Some(
+                self.values
+                    .get(index)
+                    .expect("backend value batch invariant violated"),
+            ))
+        } else {
+            Some(None)
+        }
+    }
+
+    pub fn values_iter(&self) -> impl Iterator<Item = Option<&[u8]>> {
+        (0..self.len()).filter_map(|index| self.value(index))
+    }
+
+    pub fn into_parts(self) -> (String, BytePage, Vec<bool>) {
+        (self.namespace, self.values, self.present)
     }
 }
 
@@ -202,15 +272,82 @@ pub struct BackendKvWriteBatch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendKvWriteGroup {
-    pub namespace: String,
-    pub puts: Vec<BackendKvPut>,
-    pub deletes: Vec<Vec<u8>>,
+    namespace: String,
+    put_keys: BytePageBuilder,
+    put_values: BytePageBuilder,
+    deletes: BytePageBuilder,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendKvPut {
-    pub key: Vec<u8>,
-    pub value: Vec<u8>,
+impl BackendKvWriteGroup {
+    pub fn new(namespace: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            put_keys: BytePageBuilder::new(),
+            put_values: BytePageBuilder::new(),
+            deletes: BytePageBuilder::new(),
+        }
+    }
+
+    pub fn from_pages(
+        namespace: impl Into<String>,
+        put_keys: BytePage,
+        put_values: BytePage,
+        deletes: BytePage,
+    ) -> Self {
+        assert_eq!(
+            put_keys.len(),
+            put_values.len(),
+            "backend write batch must have one value per put key"
+        );
+        Self {
+            namespace: namespace.into(),
+            put_keys: BytePageBuilder::from_page(put_keys),
+            put_values: BytePageBuilder::from_page(put_values),
+            deletes: BytePageBuilder::from_page(deletes),
+        }
+    }
+
+    pub fn put(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) {
+        self.put_keys.push(key);
+        self.put_values.push(value);
+    }
+
+    pub fn delete(&mut self, key: impl AsRef<[u8]>) {
+        self.deletes.push(key);
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn put_count(&self) -> usize {
+        self.put_keys.len()
+    }
+
+    pub fn delete_count(&self) -> usize {
+        self.deletes.len()
+    }
+
+    pub fn put_key(&self, index: usize) -> Option<&[u8]> {
+        self.put_keys.get(index)
+    }
+
+    pub fn put_value(&self, index: usize) -> Option<&[u8]> {
+        self.put_values.get(index)
+    }
+
+    pub fn delete_key(&self, index: usize) -> Option<&[u8]> {
+        self.deletes.get(index)
+    }
+
+    pub fn into_parts(self) -> (String, BytePage, BytePage, BytePage) {
+        (
+            self.namespace,
+            self.put_keys.finish(),
+            self.put_values.finish(),
+            self.deletes.finish(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

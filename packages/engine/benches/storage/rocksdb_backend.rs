@@ -71,13 +71,16 @@ impl BackendReadTransaction for RocksDbBenchTransaction {
     ) -> Result<BackendKvValueBatch, LixError> {
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
-            let mut values = vec![None; group.keys.len()];
+            let namespace = group.namespace.clone();
+            let mut resolved_values = vec![None; group.keys.len()];
             let mut committed_keys = Vec::new();
             let mut committed_positions = Vec::new();
             for (position, key) in group.keys.into_iter().enumerate() {
-                let encoded_key = encode_key(&group.namespace, &key);
+                let encoded_key = encode_key(namespace.as_str(), &key);
                 match self.pending.get(&encoded_key) {
-                    Some(PendingWrite::Put(value)) => values[position] = Some(value.clone()),
+                    Some(PendingWrite::Put(value)) => {
+                        resolved_values[position] = Some(value.clone())
+                    }
                     Some(PendingWrite::Delete) => {}
                     None => {
                         committed_positions.push(position);
@@ -88,14 +91,26 @@ impl BackendReadTransaction for RocksDbBenchTransaction {
             let committed_values = self.inner.db.multi_get(committed_keys);
             for (position, value) in committed_positions.into_iter().zip(committed_values) {
                 match value.map_err(rocksdb_error)? {
-                    Some(value) => values[position] = Some(value),
+                    Some(value) => resolved_values[position] = Some(value),
                     None => {}
                 }
             }
-            groups.push(BackendKvValueGroup {
-                namespace: group.namespace,
-                values,
-            });
+            let mut values = BytePageBuilder::with_capacity(resolved_values.len(), 0);
+            let mut present = Vec::with_capacity(resolved_values.len());
+            for value in resolved_values {
+                if let Some(value) = value {
+                    values.push(value);
+                    present.push(true);
+                } else {
+                    values.push([]);
+                    present.push(false);
+                }
+            }
+            groups.push(BackendKvValueGroup::new(
+                namespace,
+                values.finish(),
+                present,
+            ));
         }
         Ok(BackendKvValueBatch { groups })
     }
@@ -141,19 +156,32 @@ impl BackendWriteTransaction for RocksDbBenchTransaction {
     ) -> Result<BackendKvWriteStats, LixError> {
         let mut stats = BackendKvWriteStats::default();
         for group in batch.groups {
-            for put in group.puts {
+            let namespace = group.namespace().to_string();
+            for index in 0..group.put_count() {
+                let key = group.put_key(index).ok_or_else(|| {
+                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put key")
+                })?;
+                let value = group.put_value(index).ok_or_else(|| {
+                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put value")
+                })?;
                 stats.puts += 1;
-                stats.bytes_written += put.key.len() + put.value.len();
+                stats.bytes_written += key.len() + value.len();
                 self.pending.insert(
-                    encode_key(&group.namespace, &put.key),
-                    PendingWrite::Put(put.value),
+                    encode_key(namespace.as_str(), key),
+                    PendingWrite::Put(value.to_vec()),
                 );
             }
-            for key in group.deletes {
+            for index in 0..group.delete_count() {
+                let key = group.delete_key(index).ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "backend write batch missing delete key",
+                    )
+                })?;
                 stats.deletes += 1;
                 stats.bytes_written += key.len();
                 self.pending
-                    .insert(encode_key(&group.namespace, &key), PendingWrite::Delete);
+                    .insert(encode_key(namespace.as_str(), key), PendingWrite::Delete);
             }
         }
         Ok(stats)
@@ -187,11 +215,12 @@ fn rocksdb_get_exists_many(
 ) -> Result<BackendKvExistsBatch, LixError> {
     let mut groups = Vec::with_capacity(request.groups.len());
     for group in request.groups {
+        let namespace = group.namespace.clone();
         let mut exists = vec![false; group.keys.len()];
         let mut committed = Vec::new();
 
         for (position, key) in group.keys.into_iter().enumerate() {
-            let encoded_key = encode_key(&group.namespace, &key);
+            let encoded_key = encode_key(namespace.as_str(), &key);
             match pending.get(&encoded_key) {
                 Some(PendingWrite::Put(_)) => exists[position] = true,
                 Some(PendingWrite::Delete) => {}
@@ -202,10 +231,7 @@ fn rocksdb_get_exists_many(
         }
 
         fill_committed_exists(db, &mut exists, committed)?;
-        groups.push(BackendKvExistsGroup {
-            namespace: group.namespace,
-            exists,
-        });
+        groups.push(BackendKvExistsGroup { namespace, exists });
     }
 
     Ok(BackendKvExistsBatch { groups })
