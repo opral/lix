@@ -1,13 +1,28 @@
 use crate::entity_identity::EntityIdentity;
+use crate::json_store::JsonRef;
 use crate::{NullableKeyFilter, RowMetadata};
 
 /// Durable local row excluded from changelog and commit membership.
 ///
-/// This mirrors live-state identity and payload fields, but intentionally has
-/// no `change_id` or `commit_id`: untracked rows are local overlay state rather
-/// than canonical history facts.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// This is the canonical physical shape: identity/header fields are stored
+/// directly, while JSON payloads live in json_store and are referenced by hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UntrackedStateRow {
+    pub(crate) entity_id: EntityIdentity,
+    pub(crate) schema_key: String,
+    pub(crate) file_id: Option<String>,
+    pub(crate) snapshot_ref: Option<JsonRef>,
+    pub(crate) metadata_ref: Option<JsonRef>,
+    pub(crate) schema_version: String,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) global: bool,
+    pub(crate) version_id: String,
+}
+
+/// Hydrated boundary shape for callers that still work with JSON payloads.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct MaterializedUntrackedStateRow {
     pub(crate) entity_id: EntityIdentity,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
@@ -30,7 +45,7 @@ pub(crate) struct UntrackedStateIdentity {
 }
 
 impl UntrackedStateIdentity {
-    pub(crate) fn from_row(row: &UntrackedStateRow) -> Self {
+    pub(crate) fn from_materialized_row(row: &MaterializedUntrackedStateRow) -> Self {
         Self {
             version_id: row.version_id.clone(),
             schema_key: row.schema_key.clone(),

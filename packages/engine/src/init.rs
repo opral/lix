@@ -11,7 +11,7 @@ use crate::schema::{
     registered_schema_entity_id, schema_key_from_definition, seed_schema_definitions,
 };
 use crate::storage::StorageContext;
-use crate::untracked_state::UntrackedStateRow;
+use crate::untracked_state::MaterializedUntrackedStateRow;
 use crate::version::{
     VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_DESCRIPTOR_SCHEMA_VERSION, VERSION_REF_SCHEMA_KEY,
     VERSION_REF_SCHEMA_VERSION,
@@ -36,7 +36,7 @@ const REGISTERED_SCHEMA_VERSION: &str = "1";
 /// advance without becoming commit members.
 pub(crate) struct InitSeedPlan {
     pub(crate) changes: Vec<MaterializedCanonicalChange>,
-    pub(crate) untracked_rows: Vec<UntrackedStateRow>,
+    pub(crate) untracked_rows: Vec<MaterializedUntrackedStateRow>,
     pub(crate) receipt: InitReceipt,
 }
 
@@ -240,8 +240,8 @@ fn untracked_row(
     schema_version: &str,
     snapshot_content: String,
     timestamp: &str,
-) -> UntrackedStateRow {
-    UntrackedStateRow {
+) -> MaterializedUntrackedStateRow {
+    MaterializedUntrackedStateRow {
         entity_id,
         schema_key: schema_key.to_string(),
         file_id: None,
@@ -467,7 +467,7 @@ mod tests {
         .expect("snapshot should be JSON")
     }
 
-    fn untracked_snapshot(row: &UntrackedStateRow) -> JsonValue {
+    fn untracked_snapshot(row: &MaterializedUntrackedStateRow) -> JsonValue {
         serde_json::from_str(
             row.snapshot_content
                 .as_deref()

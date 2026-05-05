@@ -1,10 +1,12 @@
+use crate::json_store::JsonStoreContext;
 use crate::storage::KvScanRange;
 use crate::storage::{
     KvGetGroup, KvGetRequest, KvPut, KvScanRequest, KvWriteBatch, KvWriteGroup, StorageReader,
     StorageWriter,
 };
 use crate::untracked_state::{
-    UntrackedStateIdentity, UntrackedStateRow, UntrackedStateRowRequest, UntrackedStateScanRequest,
+    MaterializedUntrackedStateRow, UntrackedMaterializationProjection, UntrackedStateIdentity,
+    UntrackedStateRow, UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
 use crate::{LixError, NullableKeyFilter};
 
@@ -13,19 +15,27 @@ const UNTRACKED_STATE_ROW_NAMESPACE: &str = "untracked_state.row";
 pub(crate) async fn scan_rows(
     store: &mut impl StorageReader,
     request: &UntrackedStateScanRequest,
-) -> Result<Vec<UntrackedStateRow>, LixError> {
-    let mut rows = scan_all_untracked_rows(store).await?;
+) -> Result<Vec<MaterializedUntrackedStateRow>, LixError> {
+    let mut rows = scan_all_canonical_rows(store).await?;
     rows.retain(|row| row_matches_scan(row, request));
     if let Some(limit) = request.limit {
         rows.truncate(limit);
     }
-    Ok(rows)
+    let projection = UntrackedMaterializationProjection::from_columns(&request.projection.columns);
+    let mut json_reader = JsonStoreContext::new().reader(store);
+    let mut materialized = Vec::with_capacity(rows.len());
+    for row in rows {
+        materialized.push(
+            crate::untracked_state::materialize_row(&mut json_reader, row, &projection).await?,
+        );
+    }
+    Ok(materialized)
 }
 
 pub(crate) async fn load_row(
     store: &mut impl StorageReader,
     request: &UntrackedStateRowRequest,
-) -> Result<Option<UntrackedStateRow>, LixError> {
+) -> Result<Option<MaterializedUntrackedStateRow>, LixError> {
     let Some(identity) = identity_from_request(request) else {
         return Ok(None);
     };
@@ -44,26 +54,38 @@ pub(crate) async fn load_row(
     let Some(bytes) = bytes else {
         return Ok(None);
     };
-    decode_untracked_state_row(&bytes).map(Some)
+    let row = crate::untracked_state::codec::decode_row(&bytes)?;
+    let mut json_reader = JsonStoreContext::new().reader(store);
+    crate::untracked_state::materialize_row(
+        &mut json_reader,
+        row,
+        &UntrackedMaterializationProjection::full(),
+    )
+    .await
+    .map(Some)
 }
 
 pub(crate) async fn write_rows(
     writer: &mut impl StorageWriter,
-    rows: &[UntrackedStateRow],
+    rows: &[MaterializedUntrackedStateRow],
 ) -> Result<(), LixError> {
     let mut puts = Vec::with_capacity(rows.len());
     let mut deletes = Vec::new();
+    let mut json_writer = JsonStoreContext::new().writer();
     for row in rows {
-        let identity = UntrackedStateIdentity::from_row(row);
+        let identity = UntrackedStateIdentity::from_materialized_row(row);
         if row.snapshot_content.is_none() {
             deletes.push(encode_untracked_state_row_key(&identity));
         } else {
+            let canonical =
+                crate::untracked_state::canonicalize_materialized_row(&mut json_writer, row)?;
             puts.push(KvPut {
                 key: encode_untracked_state_row_key(&identity),
-                value: encode_untracked_state_row(row)?,
+                value: crate::untracked_state::codec::encode_row(&canonical)?,
             });
         }
     }
+    json_writer.flush(&mut *writer).await?;
     write_untracked_batch(writer, puts, deletes).await?;
     Ok(())
 }
@@ -80,7 +102,7 @@ pub(crate) async fn delete_rows(
     Ok(())
 }
 
-async fn scan_all_untracked_rows(
+async fn scan_all_canonical_rows(
     store: &mut impl StorageReader,
 ) -> Result<Vec<UntrackedStateRow>, LixError> {
     let page = store
@@ -91,7 +113,10 @@ async fn scan_all_untracked_rows(
             limit: usize::MAX,
         })
         .await?;
-    page.values.iter().map(decode_untracked_state_row).collect()
+    page.values
+        .iter()
+        .map(crate::untracked_state::codec::decode_row)
+        .collect()
 }
 
 fn row_matches_scan(row: &UntrackedStateRow, request: &UntrackedStateScanRequest) -> bool {
@@ -144,24 +169,6 @@ async fn write_untracked_batch(
         })
         .await?;
     Ok(())
-}
-
-fn encode_untracked_state_row(row: &UntrackedStateRow) -> Result<Vec<u8>, LixError> {
-    serde_json::to_vec(row).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("failed to encode untracked-state row: {error}"),
-        )
-    })
-}
-
-fn decode_untracked_state_row(bytes: &[u8]) -> Result<UntrackedStateRow, LixError> {
-    serde_json::from_slice(bytes).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("failed to decode untracked-state row: {error}"),
-        )
-    })
 }
 
 fn encode_untracked_state_row_key(identity: &UntrackedStateIdentity) -> Vec<u8> {
@@ -281,7 +288,7 @@ mod tests {
         let storage = StorageContext::new(backend.clone());
         let context = UntrackedStateContext::new();
         let row = untracked_row("global", "lix_key_value", "ui-tab");
-        let identity = UntrackedStateIdentity::from_row(&row);
+        let identity = UntrackedStateIdentity::from_materialized_row(&row);
 
         let mut transaction = storage
             .begin_write_transaction()
@@ -313,8 +320,12 @@ mod tests {
         assert_eq!(loaded, None);
     }
 
-    fn untracked_row(version_id: &str, schema_key: &str, entity_id: &str) -> UntrackedStateRow {
-        UntrackedStateRow {
+    fn untracked_row(
+        version_id: &str,
+        schema_key: &str,
+        entity_id: &str,
+    ) -> MaterializedUntrackedStateRow {
+        MaterializedUntrackedStateRow {
             entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
             schema_key: schema_key.to_string(),
             file_id: None,

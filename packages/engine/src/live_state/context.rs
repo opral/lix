@@ -12,8 +12,8 @@ use crate::tracked_state::{
     TrackedStateRowRequest, TrackedStateScanRequest,
 };
 use crate::untracked_state::{
-    UntrackedStateContext, UntrackedStateIdentity, UntrackedStateRow, UntrackedStateRowRequest,
-    UntrackedStateScanRequest,
+    MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateIdentity,
+    UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
 use crate::version::VERSION_REF_SCHEMA_KEY;
 use crate::LixError;
@@ -277,7 +277,7 @@ where
         if !untracked_rows.is_empty() {
             let untracked_rows = untracked_rows
                 .into_iter()
-                .map(UntrackedStateRow::from)
+                .map(MaterializedUntrackedStateRow::from)
                 .collect::<Vec<_>>();
             let store: &mut dyn StorageWriter = &mut self.store;
             self.untracked_state
@@ -751,7 +751,7 @@ mod tests {
     use crate::live_state::LiveStateFilter;
     use crate::storage::StorageContext;
     use crate::tracked_state::TrackedStateScanRequest;
-    use crate::untracked_state::{UntrackedStateContext, UntrackedStateRow};
+    use crate::untracked_state::{MaterializedUntrackedStateRow, UntrackedStateContext};
     use crate::NullableKeyFilter;
     use serde_json::json;
 
@@ -1828,12 +1828,12 @@ mod tests {
         }
     }
 
-    fn untracked_row(value: &str) -> UntrackedStateRow {
+    fn untracked_row(value: &str) -> MaterializedUntrackedStateRow {
         untracked_row_at("global", value)
     }
 
-    fn untracked_row_at(version_id: &str, value: &str) -> UntrackedStateRow {
-        UntrackedStateRow {
+    fn untracked_row_at(version_id: &str, value: &str) -> MaterializedUntrackedStateRow {
+        MaterializedUntrackedStateRow {
             entity_id: identity("selected-tab"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
@@ -1847,8 +1847,8 @@ mod tests {
         }
     }
 
-    fn version_ref_row(version_id: &str, commit_id: &str) -> UntrackedStateRow {
-        UntrackedStateRow {
+    fn version_ref_row(version_id: &str, commit_id: &str) -> MaterializedUntrackedStateRow {
+        MaterializedUntrackedStateRow {
             entity_id: identity(version_id),
             schema_key: "lix_version_ref".to_string(),
             file_id: None,
@@ -1868,7 +1868,7 @@ mod tests {
         }
     }
 
-    async fn write_version_refs(storage: StorageContext, refs: &[UntrackedStateRow]) {
+    async fn write_version_refs(storage: StorageContext, refs: &[MaterializedUntrackedStateRow]) {
         let mut transaction = storage
             .begin_write_transaction()
             .await
