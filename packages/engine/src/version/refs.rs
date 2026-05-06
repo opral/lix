@@ -145,7 +145,9 @@ pub(super) struct VersionRefWriter<'a> {
 
 impl VersionRefWriter<'_> {
     pub(crate) fn stage_rows(&mut self, rows: &[UntrackedStateRow]) -> Result<(), LixError> {
-        self.untracked_state.writer(self.writes).stage_rows(rows)
+        self.untracked_state
+            .writer(self.writes)
+            .stage_rows(rows.iter().map(|row| row.as_ref()))
     }
 }
 

@@ -1,10 +1,8 @@
 use crate::changelog::MaterializedCanonicalChange;
 use crate::entity_identity::EntityIdentity;
-use crate::json_store::JsonRef;
-use crate::tracked_state::{MaterializedTrackedStateRow, TrackedStateRow};
+use crate::tracked_state::{MaterializedTrackedStateRow, TrackedStateRowRef};
 use crate::untracked_state::{
-    MaterializedUntrackedStateRow, UntrackedStateFilter, UntrackedStateRow,
-    UntrackedStateRowRequest,
+    MaterializedUntrackedStateRow, UntrackedStateFilter, UntrackedStateRowRequest,
 };
 use crate::{NullableKeyFilter, Value};
 
@@ -29,105 +27,25 @@ pub(crate) struct MaterializedLiveStateRow {
     pub(crate) version_id: String,
 }
 
-/// Ref-backed row accepted by live-state write boundaries.
+/// Borrowed tracked write row plus live-state routing metadata.
 ///
-/// The transaction layer owns materialized JSON -> JsonRef preparation. Live
-/// state only routes already-canonical rows into tracked and untracked stores.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LiveStateRow {
-    pub(crate) entity_id: EntityIdentity,
-    pub(crate) schema_key: String,
-    pub(crate) file_id: Option<String>,
-    pub(crate) snapshot_ref: Option<JsonRef>,
-    pub(crate) metadata_ref: Option<JsonRef>,
-    pub(crate) schema_version: String,
-    pub(crate) created_at: String,
-    pub(crate) updated_at: String,
+/// The tracked-state owner only sees `row`; live-state uses `global` and
+/// `version_id` to enforce that one tracked root contains exactly one storage
+/// scope before delegating to tracked_state.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LiveStateTrackedRowRef<'a> {
+    pub(crate) row: TrackedStateRowRef<'a>,
     pub(crate) global: bool,
-    pub(crate) change_id: Option<String>,
-    pub(crate) commit_id: Option<String>,
-    pub(crate) untracked: bool,
-    pub(crate) version_id: String,
+    pub(crate) version_id: &'a str,
 }
 
-/// Ref-backed live-state write batch.
-///
-/// Live-state reads are materialized, but writes should already carry JsonRefs
-/// prepared by the transaction boundary. This keeps json_store ownership out of
-/// live_state and makes root ancestry explicit instead of deriving it from
-/// staged commit JSON.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LiveStateWriteBatch {
-    pub(crate) untracked_rows: Vec<LiveStateRow>,
-    pub(crate) tracked_roots: Vec<LiveStateTrackedRootWrite>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LiveStateTrackedRootWrite {
-    pub(crate) commit_id: String,
-    pub(crate) parent_commit_id: Option<String>,
-    pub(crate) rows: Vec<LiveStateRow>,
-}
-
-impl TryFrom<LiveStateRow> for UntrackedStateRow {
-    type Error = crate::LixError;
-
-    fn try_from(row: LiveStateRow) -> Result<Self, Self::Error> {
-        if !row.untracked {
-            return Err(crate::LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "untracked_state cannot store tracked live-state rows",
-            ));
+impl LiveStateTrackedRowRef<'_> {
+    pub(crate) fn storage_version_id(&self) -> &str {
+        if self.global {
+            crate::GLOBAL_VERSION_ID
+        } else {
+            self.version_id
         }
-        Ok(UntrackedStateRow {
-            entity_id: row.entity_id,
-            schema_key: row.schema_key,
-            file_id: row.file_id,
-            snapshot_ref: row.snapshot_ref,
-            metadata_ref: row.metadata_ref,
-            schema_version: row.schema_version,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            global: row.global,
-            version_id: row.version_id,
-        })
-    }
-}
-
-impl TryFrom<LiveStateRow> for TrackedStateRow {
-    type Error = crate::LixError;
-
-    fn try_from(row: LiveStateRow) -> Result<Self, Self::Error> {
-        if row.untracked {
-            return Err(crate::LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked_state cannot store untracked live-state rows",
-            ));
-        }
-        let Some(change_id) = row.change_id else {
-            return Err(crate::LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked live-state rows require change_id",
-            ));
-        };
-        let Some(commit_id) = row.commit_id else {
-            return Err(crate::LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked live-state rows require commit_id",
-            ));
-        };
-        Ok(TrackedStateRow {
-            entity_id: row.entity_id,
-            schema_key: row.schema_key,
-            file_id: row.file_id,
-            snapshot_ref: row.snapshot_ref,
-            metadata_ref: row.metadata_ref,
-            schema_version: row.schema_version,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            change_id,
-            commit_id,
-        })
     }
 }
 

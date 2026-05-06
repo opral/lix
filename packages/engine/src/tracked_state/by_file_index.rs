@@ -1,7 +1,10 @@
-use crate::tracked_state::tree_types::{
-    TrackedStateKey, TrackedStateTreeScanRequest, TrackedStateValue,
+use crate::tracked_state::codec::{
+    encode_key_ref as encode_tracked_key_ref, encode_value_ref as encode_tracked_value_ref,
 };
-use crate::tracked_state::{TrackedStateRow, TrackedStateScanRequest};
+use crate::tracked_state::tree_types::{
+    TrackedStateKey, TrackedStateKeyRef, TrackedStateTreeScanRequest, TrackedStateValueRef,
+};
+use crate::tracked_state::TrackedStateScanRequest;
 use crate::NullableKeyFilter;
 
 const NULL_COMPONENT: &str = "\0";
@@ -48,12 +51,13 @@ impl ByFileIndex {
         }
     }
 
-    pub(crate) fn key_from_row(row: &TrackedStateRow) -> TrackedStateKey {
-        TrackedStateKey {
-            schema_key: component(row.file_id.as_deref()),
-            file_id: Some(row.schema_key.clone()),
-            entity_id: row.entity_id.clone(),
-        }
+    pub(crate) fn encode_key_ref(row: TrackedStateKeyRef<'_>) -> Vec<u8> {
+        let schema_key = component(row.file_id);
+        encode_tracked_key_ref(TrackedStateKeyRef {
+            schema_key: &schema_key,
+            file_id: Some(row.schema_key),
+            entity_id: row.entity_id,
+        })
     }
 
     pub(crate) fn primary_key_from_index_key(
@@ -67,17 +71,17 @@ impl ByFileIndex {
         })
     }
 
-    pub(crate) fn header_value_from_primary(value: &TrackedStateValue) -> TrackedStateValue {
-        TrackedStateValue {
+    pub(crate) fn encode_header_value_ref(value: TrackedStateValueRef<'_>) -> Vec<u8> {
+        encode_tracked_value_ref(TrackedStateValueRef {
             snapshot_ref: None,
             metadata_ref: None,
-            schema_version: value.schema_version.clone(),
-            created_at: value.created_at.clone(),
-            updated_at: value.updated_at.clone(),
-            change_id: value.change_id.clone(),
-            commit_id: value.commit_id.clone(),
+            schema_version: value.schema_version,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            change_id: value.change_id,
+            commit_id: value.commit_id,
             deleted: value.deleted,
-        }
+        })
     }
 }
 

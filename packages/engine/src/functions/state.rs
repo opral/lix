@@ -5,10 +5,10 @@ use crate::entity_identity::EntityIdentity;
 use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::json_store::{JsonStoreWriter, NormalizedJson};
 use crate::live_state::{
-    LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateWriteBatch, LiveStateWriter,
-    MaterializedLiveStateRow,
+    LiveStateReader, LiveStateRowRequest, LiveStateWriter, MaterializedLiveStateRow,
 };
 use crate::storage::{StorageReader, StorageWriteSet};
+use crate::untracked_state::UntrackedStateRow;
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
@@ -76,15 +76,7 @@ where
         &snapshot_content,
         timestamp,
     )?;
-    writer
-        .stage_rows(
-            writes,
-            LiveStateWriteBatch {
-                untracked_rows: vec![row],
-                tracked_roots: Vec::new(),
-            },
-        )
-        .await
+    writer.stage_untracked_rows(writes, std::iter::once(row.as_ref()))
 }
 
 async fn load_key_value_row(
@@ -169,11 +161,11 @@ fn deterministic_key_value_row(
     key: &str,
     snapshot_content: &str,
     timestamp: &str,
-) -> Result<LiveStateRow, LixError> {
+) -> Result<UntrackedStateRow, LixError> {
     let snapshot_ref = json_writer.prepare_json(NormalizedJson::from_arc_unchecked(Arc::from(
         snapshot_content,
     )))?;
-    Ok(LiveStateRow {
+    Ok(UntrackedStateRow {
         entity_id: crate::entity_identity::EntityIdentity::single(key),
         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
         file_id: None,
@@ -183,9 +175,6 @@ fn deterministic_key_value_row(
         created_at: timestamp.to_string(),
         updated_at: timestamp.to_string(),
         global: true,
-        change_id: None,
-        commit_id: None,
-        untracked: true,
         version_id: GLOBAL_VERSION_ID.to_string(),
     })
 }
@@ -370,14 +359,7 @@ mod tests {
         {
             let mut writer = live_state.writer(tx.as_mut());
             writer
-                .stage_rows(
-                    &mut writes,
-                    LiveStateWriteBatch {
-                        untracked_rows: vec![row],
-                        tracked_roots: Vec::new(),
-                    },
-                )
-                .await
+                .stage_untracked_rows(&mut writes, std::iter::once(row.as_ref()))
                 .expect("test key-value should stage");
         }
         json_writer.flush_into(&mut writes);

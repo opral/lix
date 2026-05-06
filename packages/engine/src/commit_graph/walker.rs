@@ -745,7 +745,7 @@ mod tests {
         };
         changelog
             .writer(&mut writes)
-            .stage_changes(&canonical_changes)
+            .stage_changes(canonical_changes.iter().map(|change| change.as_ref()))
             .expect("append should succeed");
         writes
             .apply(&mut tx.as_mut())

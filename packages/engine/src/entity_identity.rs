@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use base64::Engine as _;
 use serde_json::Value as JsonValue;
 
@@ -114,6 +116,10 @@ impl EntityIdentity {
     }
 
     pub(crate) fn as_string(&self) -> Result<String, LixError> {
+        Ok(self.as_cow_str()?.into_owned())
+    }
+
+    pub(crate) fn as_cow_str(&self) -> Result<Cow<'_, str>, LixError> {
         if self.parts.is_empty() {
             return Err(LixError::unknown(
                 "entity identity must contain at least one primary-key part",
@@ -121,7 +127,7 @@ impl EntityIdentity {
         }
 
         if let [EntityIdentityPart::String(value)] = self.parts.as_slice() {
-            return Ok(value.clone());
+            return Ok(Cow::Borrowed(value.as_str()));
         }
 
         let payload = serde_json::to_vec(self).map_err(|error| {
@@ -129,10 +135,10 @@ impl EntityIdentity {
                 "failed to encode composite entity identity: {error}"
             ))
         })?;
-        Ok(format!(
+        Ok(Cow::Owned(format!(
             "{COMPOSITE_ENTITY_ID_PREFIX}{}",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
-        ))
+        )))
     }
 
     pub(crate) fn from_string(entity_id: &str) -> Result<Self, EntityIdentityError> {

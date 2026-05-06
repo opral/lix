@@ -4,13 +4,13 @@ use crate::functions::{
     FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
 };
 use crate::json_store::{JsonStoreContext, NormalizedJson};
-use crate::live_state::{
-    LiveStateContext, LiveStateRow, LiveStateTrackedRootWrite, LiveStateWriteBatch,
-};
+use crate::live_state::{LiveStateContext, LiveStateTrackedRowRef};
 use crate::schema::{
     registered_schema_entity_id, schema_key_from_definition, seed_schema_definitions,
 };
 use crate::storage::{StorageContext, StorageWriteSet};
+use crate::tracked_state::TrackedStateRow;
+use crate::untracked_state::UntrackedStateRow;
 use crate::version::{
     VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_DESCRIPTOR_SCHEMA_VERSION, VERSION_REF_SCHEMA_KEY,
     VERSION_REF_SCHEMA_VERSION,
@@ -216,35 +216,39 @@ pub(crate) async fn initialize(
             .map(|change| seed_change_to_canonical_change(&mut json_writer, change))
             .collect::<Result<Vec<_>, _>>()?;
         let mut writer = changelog.writer(&mut writes);
-        writer.stage_changes(&canonical_changes)?;
+        writer.stage_changes(canonical_changes.iter().map(|change| change.as_ref()))?;
     }
 
     let tracked_rows = plan
         .changes
         .iter()
         .map(|change| {
-            live_state_row_from_initial_change(&mut json_writer, change, &receipt.initial_commit_id)
+            tracked_row_from_initial_change(&mut json_writer, change, &receipt.initial_commit_id)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let untracked_rows = plan
         .untracked_rows
         .iter()
-        .map(|row| live_state_row_from_untracked_row(&mut json_writer, row))
+        .map(|row| untracked_state_row_from_seed(&mut json_writer, row))
         .collect::<Result<Vec<_>, _>>()?;
 
     {
         let mut writer = live_state.writer(transaction.as_mut());
+        writer.stage_untracked_rows(&mut writes, untracked_rows.iter().map(|row| row.as_ref()))?;
         writer
-            .stage_rows(
+            .stage_tracked_root(
                 &mut writes,
-                LiveStateWriteBatch {
-                    untracked_rows,
-                    tracked_roots: vec![LiveStateTrackedRootWrite {
-                        commit_id: receipt.initial_commit_id.clone(),
-                        parent_commit_id: None,
-                        rows: tracked_rows,
-                    }],
-                },
+                GLOBAL_VERSION_ID,
+                &receipt.initial_commit_id,
+                None,
+                tracked_rows
+                    .iter()
+                    .filter(|row| row.schema_key != COMMIT_SCHEMA_KEY)
+                    .map(|row| LiveStateTrackedRowRef {
+                        row: row.as_ref(),
+                        global: true,
+                        version_id: GLOBAL_VERSION_ID,
+                    }),
             )
             .await?;
     }
@@ -255,12 +259,12 @@ pub(crate) async fn initialize(
     Ok(receipt)
 }
 
-fn live_state_row_from_initial_change(
+fn tracked_row_from_initial_change(
     json_writer: &mut crate::json_store::JsonStoreWriter,
     change: &InitSeedChange,
     initial_commit_id: &str,
-) -> Result<LiveStateRow, LixError> {
-    Ok(LiveStateRow {
+) -> Result<TrackedStateRow, LixError> {
+    Ok(TrackedStateRow {
         entity_id: change.entity_id.clone(),
         schema_key: change.schema_key.clone(),
         file_id: None,
@@ -271,11 +275,8 @@ fn live_state_row_from_initial_change(
         schema_version: change.schema_version.clone(),
         created_at: change.created_at.clone(),
         updated_at: change.created_at.clone(),
-        global: true,
-        change_id: Some(change.id.clone()),
-        commit_id: Some(initial_commit_id.to_string()),
-        untracked: false,
-        version_id: GLOBAL_VERSION_ID.to_string(),
+        change_id: change.id.clone(),
+        commit_id: initial_commit_id.to_string(),
     })
 }
 
@@ -297,11 +298,11 @@ fn seed_change_to_canonical_change(
     })
 }
 
-fn live_state_row_from_untracked_row(
+fn untracked_state_row_from_seed(
     json_writer: &mut crate::json_store::JsonStoreWriter,
     row: &InitSeedLiveRow,
-) -> Result<LiveStateRow, LixError> {
-    Ok(LiveStateRow {
+) -> Result<UntrackedStateRow, LixError> {
+    Ok(UntrackedStateRow {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
         file_id: None,
@@ -313,9 +314,6 @@ fn live_state_row_from_untracked_row(
         created_at: row.created_at.clone(),
         updated_at: row.updated_at.clone(),
         global: row.global,
-        change_id: None,
-        commit_id: None,
-        untracked: true,
         version_id: row.version_id.clone(),
     })
 }

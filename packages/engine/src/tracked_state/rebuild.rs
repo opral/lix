@@ -34,7 +34,13 @@ where
 
     tracked_state
         .writer()
-        .stage_root(tracked_store, writes, head_commit_id, None, &rows)
+        .stage_root(
+            tracked_store,
+            writes,
+            head_commit_id,
+            None,
+            rows.iter().map(|row| row.as_ref()),
+        )
         .await?;
 
     Ok(TrackedStateRebuildReport { written_rows })
@@ -572,7 +578,7 @@ mod tests {
         };
         changelog
             .writer(&mut writes)
-            .stage_changes(&canonical_changes)
+            .stage_changes(canonical_changes.iter().map(|change| change.as_ref()))
             .expect("changes should append");
         writes
             .apply(&mut tx.as_mut())
@@ -612,7 +618,7 @@ mod tests {
                     &mut writes,
                     commit_id,
                     None,
-                    &canonical_rows,
+                    canonical_rows.iter().map(|row| row.as_ref()),
                 )
                 .await
                 .expect("rows should seed");

@@ -432,7 +432,7 @@ mod tests {
                     &mut writes,
                     commit_id,
                     parent_commit_id,
-                    &canonical_rows,
+                    canonical_rows.iter().map(|row| row.as_ref()),
                 )
                 .await?;
         }

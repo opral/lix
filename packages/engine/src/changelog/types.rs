@@ -14,6 +14,37 @@ pub(crate) struct CanonicalChange {
     pub(crate) created_at: String,
 }
 
+impl CanonicalChange {
+    pub(crate) fn as_ref(&self) -> CanonicalChangeRef<'_> {
+        CanonicalChangeRef {
+            id: &self.id,
+            entity_id: &self.entity_id,
+            schema_key: &self.schema_key,
+            schema_version: &self.schema_version,
+            file_id: self.file_id.as_deref(),
+            snapshot_ref: self.snapshot_ref.as_ref(),
+            metadata_ref: self.metadata_ref.as_ref(),
+            created_at: &self.created_at,
+        }
+    }
+}
+
+/// Borrowed changelog write row.
+///
+/// Changelog owns this storage-facing shape; transaction code may adapt into it
+/// but changelog never depends on transaction/commit types.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CanonicalChangeRef<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) entity_id: &'a EntityIdentity,
+    pub(crate) schema_key: &'a str,
+    pub(crate) schema_version: &'a str,
+    pub(crate) file_id: Option<&'a str>,
+    pub(crate) snapshot_ref: Option<&'a JsonRef>,
+    pub(crate) metadata_ref: Option<&'a JsonRef>,
+    pub(crate) created_at: &'a str,
+}
+
 /// Boundary shape for callers that still work with materialized JSON payloads.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MaterializedCanonicalChange {
