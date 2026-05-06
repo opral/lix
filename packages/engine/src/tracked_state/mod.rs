@@ -23,6 +23,8 @@ pub(crate) use merge::{
     plan_merge, TrackedStateMergeConflict, TrackedStateMergePatch, TrackedStateMergePlan,
 };
 #[allow(unused_imports)]
+pub(crate) use tree_types::{TrackedStateKeyRef, TrackedStateRowRef, TrackedStateValueRef};
+#[allow(unused_imports)]
 pub(crate) use types::{
     MaterializedTrackedStateRow, TrackedStateFilter, TrackedStateProjection, TrackedStateRow,
     TrackedStateRowRequest, TrackedStateScanRequest,

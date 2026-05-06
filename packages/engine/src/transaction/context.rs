@@ -703,7 +703,6 @@ mod tests {
     use super::*;
     use crate::backend::testing::UnitTestBackend;
     use crate::changelog::ChangelogScanRequest;
-    use crate::live_state::{LiveStateRow, LiveStateWriteBatch};
     use crate::tracked_state::{TrackedStateRowRequest, TrackedStateScanRequest};
     use crate::transaction::types::TransactionJson;
     use crate::untracked_state::{UntrackedStateContext, UntrackedStateRowRequest};
@@ -1242,7 +1241,7 @@ mod tests {
                 let key = crate::schema::schema_key_from_definition(schema)
                     .expect("seed schema key should derive");
                 let snapshot_content = json!({ "value": schema }).to_string();
-                LiveStateRow {
+                crate::untracked_state::UntrackedStateRow {
                     entity_id: crate::schema::registered_schema_entity_id(
                         &key.schema_key,
                         &key.schema_version,
@@ -1262,9 +1261,6 @@ mod tests {
                     metadata_ref: None,
                     created_at: "1970-01-01T00:00:00.000Z".to_string(),
                     updated_at: "1970-01-01T00:00:00.000Z".to_string(),
-                    change_id: None,
-                    commit_id: None,
-                    untracked: true,
                     global: true,
                 }
             })
@@ -1277,14 +1273,7 @@ mod tests {
         {
             let mut writer = live_state.writer(storage_transaction.as_mut());
             writer
-                .stage_rows(
-                    &mut writes,
-                    LiveStateWriteBatch {
-                        untracked_rows: rows,
-                        tracked_roots: Vec::new(),
-                    },
-                )
-                .await
+                .stage_untracked_rows(&mut writes, rows.iter().map(|row| row.as_ref()))
                 .expect("schema fixture rows should stage");
         }
         writes

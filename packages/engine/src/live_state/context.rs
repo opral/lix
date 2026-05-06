@@ -4,8 +4,8 @@ use tokio::sync::Mutex;
 use crate::commit_graph::{CommitGraphCommit, CommitGraphContext};
 use crate::live_state::visibility;
 use crate::live_state::{
-    LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
-    LiveStateWriteBatch, MaterializedLiveStateRow,
+    LiveStateFilter, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
+    LiveStateTrackedRowRef, MaterializedLiveStateRow,
 };
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::tracked_state::{
@@ -13,8 +13,8 @@ use crate::tracked_state::{
     TrackedStateRowRequest, TrackedStateScanRequest,
 };
 use crate::untracked_state::{
-    UntrackedStateContext, UntrackedStateIdentity, UntrackedStateRowRequest,
-    UntrackedStateScanRequest,
+    UntrackedStateContext, UntrackedStateIdentityRef, UntrackedStateRowRef,
+    UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
 use crate::version::VERSION_REF_SCHEMA_KEY;
 use crate::LixError;
@@ -271,63 +271,92 @@ impl<S> LiveStateWriter<S>
 where
     S: StorageReader,
 {
-    pub(crate) async fn stage_rows(
+    pub(crate) fn stage_untracked_rows<'a>(
         &mut self,
         writes: &mut StorageWriteSet,
-        batch: LiveStateWriteBatch,
+        rows: impl IntoIterator<Item = UntrackedStateRowRef<'a>>,
     ) -> Result<(), LixError> {
-        if !batch.untracked_rows.is_empty() {
-            let untracked_rows = batch
-                .untracked_rows
-                .into_iter()
-                .map(crate::untracked_state::UntrackedStateRow::try_from)
-                .collect::<Result<Vec<_>, _>>()?;
-            self.untracked_state
-                .writer(writes)
-                .stage_rows(&untracked_rows)?;
-        }
+        self.untracked_state.writer(writes).stage_rows(rows)
+    }
 
-        if batch.tracked_roots.is_empty() {
-            return Ok(());
-        }
-
-        let identities = batch
-            .tracked_roots
-            .iter()
-            .flat_map(|root| root.rows.iter())
-            .map(|row| UntrackedStateIdentity {
-                version_id: row.version_id.clone(),
-                schema_key: row.schema_key.clone(),
-                entity_id: row.entity_id.clone(),
-                file_id: row.file_id.clone(),
-            })
-            .collect::<Vec<_>>();
+    pub(crate) fn stage_delete_untracked_rows<'a>(
+        &mut self,
+        writes: &mut StorageWriteSet,
+        identities: impl IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
+    ) {
         self.untracked_state
             .writer(writes)
-            .stage_delete_rows(&identities);
+            .stage_delete_rows(identities);
+    }
 
-        for root in batch.tracked_roots {
-            validate_root_local_write_batch(&root.commit_id, &root.rows)?;
-            let root_rows = root
-                .rows
-                .into_iter()
-                .filter(|row| row.schema_key != COMMIT_SCHEMA_KEY)
-                .map(crate::tracked_state::TrackedStateRow::try_from)
-                .collect::<Result<Vec<_>, _>>()?;
-            self.tracked_state
-                .writer()
-                .stage_root(
-                    &mut self.store,
-                    writes,
-                    &root.commit_id,
-                    root.parent_commit_id.as_deref(),
-                    &root_rows,
-                )
-                .await?;
-        }
-
+    pub(crate) async fn stage_tracked_root<'a>(
+        &mut self,
+        writes: &mut StorageWriteSet,
+        storage_version_id: &str,
+        commit_id: &str,
+        parent_commit_id: Option<&str>,
+        rows: impl IntoIterator<Item = LiveStateTrackedRowRef<'a>>,
+    ) -> Result<(), LixError> {
+        let rows = rows.into_iter().collect::<Vec<_>>();
+        validate_root_ref_write_batch(storage_version_id, commit_id, &rows)?;
+        self.tracked_state
+            .writer()
+            .stage_root(
+                &mut self.store,
+                writes,
+                commit_id,
+                parent_commit_id,
+                rows.iter().map(|row| row.row),
+            )
+            .await?;
         Ok(())
     }
+}
+
+fn validate_root_ref_write_batch(
+    storage_version_id: &str,
+    commit_id: &str,
+    rows: &[LiveStateTrackedRowRef<'_>],
+) -> Result<(), LixError> {
+    for row in rows {
+        require_valid_storage_scope(row.version_id, row.global)?;
+        let row_storage_version_id = row.storage_version_id();
+        if row_storage_version_id != storage_version_id {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "tracked live-state root '{}' mixes multiple storage scopes: root storage scope is '{}' but row schema '{}' belongs to '{}'",
+                    commit_id, storage_version_id, row.row.key.schema_key, row_storage_version_id
+                ),
+            ));
+        }
+        if row.row.value.commit_id != commit_id {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "tracked live-state row for schema '{}' has commit_id '{}' but root commit_id is '{}'",
+                    row.row.key.schema_key, row.row.value.commit_id, commit_id
+                ),
+            ));
+        }
+        if row.row.key.schema_key == COMMIT_SCHEMA_KEY {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked_state roots must not store lix_commit rows",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_valid_storage_scope(version_id: &str, global: bool) -> Result<(), LixError> {
+    if global != (version_id == GLOBAL_VERSION_ID) {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("invalid storage scope: version_id='{version_id}', global={global}"),
+        ));
+    }
+    Ok(())
 }
 
 fn tracked_scan_request_from_live(request: &LiveStateScanRequest) -> TrackedStateScanRequest {
@@ -549,45 +578,6 @@ fn nullable_filter_matches(
     }
 }
 
-fn validate_root_local_write_batch(commit_id: &str, rows: &[LiveStateRow]) -> Result<(), LixError> {
-    let mut storage_scope: Option<&str> = None;
-    for row in rows
-        .iter()
-        .filter(|row| row.schema_key != COMMIT_SCHEMA_KEY)
-    {
-        if row.global != (row.version_id == GLOBAL_VERSION_ID) {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "tracked root write for commit '{commit_id}' contains row with invalid storage scope"
-                ),
-            ));
-        }
-        if let Some(scope) = storage_scope {
-            if scope != row.version_id {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "tracked root write for commit '{commit_id}' mixes multiple storage scopes"
-                    ),
-                ));
-            }
-        } else {
-            storage_scope = Some(&row.version_id);
-        }
-        if row.commit_id.as_deref() != Some(commit_id) {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "tracked root write for commit '{commit_id}' contains row for commit '{:?}'",
-                    row.commit_id
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiveStateLookupSource {
     Untracked,
@@ -692,7 +682,7 @@ mod tests {
         };
         UntrackedStateContext::new()
             .writer(&mut writes)
-            .stage_rows(&canonical_rows)
+            .stage_rows(canonical_rows.iter().map(|row| row.as_ref()))
             .expect("untracked rows should write");
         writes
             .apply(store)
@@ -711,16 +701,26 @@ mod tests {
     {
         let mut untracked_rows = Vec::new();
         let mut tracked_rows_by_commit =
-            std::collections::BTreeMap::<String, Vec<crate::live_state::LiveStateRow>>::new();
+            std::collections::BTreeMap::<String, Vec<TestTrackedLiveRow>>::new();
         let mut parent_by_commit = std::collections::BTreeMap::<String, Option<String>>::new();
 
         for row in rows {
-            let canonical =
-                crate::test_support::live_state_row_from_materialized(writes, json_writer, row)?;
             if row.untracked {
+                let materialized = crate::untracked_state::MaterializedUntrackedStateRow::from(row);
+                let canonical = crate::test_support::untracked_state_row_from_materialized(
+                    writes,
+                    json_writer,
+                    &materialized,
+                )?;
                 untracked_rows.push(canonical);
                 continue;
             }
+            let materialized = MaterializedTrackedStateRow::try_from(row)?;
+            let canonical = crate::test_support::tracked_state_row_from_materialized(
+                writes,
+                json_writer,
+                &materialized,
+            )?;
             let commit_id = row.commit_id.clone().ok_or_else(|| {
                 LixError::new("LIX_ERROR_UNKNOWN", "test tracked row missing commit_id")
             })?;
@@ -733,28 +733,57 @@ mod tests {
             tracked_rows_by_commit
                 .entry(commit_id)
                 .or_default()
-                .push(canonical);
+                .push(TestTrackedLiveRow {
+                    row: canonical,
+                    global: row.global,
+                    version_id: row.version_id.clone(),
+                });
         }
 
-        let tracked_roots = tracked_rows_by_commit
-            .into_iter()
-            .map(
-                |(commit_id, rows)| crate::live_state::LiveStateTrackedRootWrite {
-                    parent_commit_id: parent_by_commit.remove(&commit_id).flatten(),
-                    commit_id,
-                    rows,
-                },
-            )
-            .collect();
-        writer
-            .stage_rows(
-                writes,
-                crate::live_state::LiveStateWriteBatch {
-                    untracked_rows,
-                    tracked_roots,
-                },
-            )
-            .await
+        writer.stage_untracked_rows(writes, untracked_rows.iter().map(|row| row.as_ref()))?;
+        for (commit_id, rows) in tracked_rows_by_commit {
+            let parent_commit_id = parent_by_commit.remove(&commit_id).flatten();
+            let storage_version_id = rows
+                .first()
+                .map(TestTrackedLiveRow::storage_version_id)
+                .unwrap_or(GLOBAL_VERSION_ID);
+            writer
+                .stage_tracked_root(
+                    writes,
+                    storage_version_id,
+                    &commit_id,
+                    parent_commit_id.as_deref(),
+                    rows.iter()
+                        .filter(|row| row.row.schema_key != COMMIT_SCHEMA_KEY)
+                        .map(TestTrackedLiveRow::as_ref),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    struct TestTrackedLiveRow {
+        row: crate::tracked_state::TrackedStateRow,
+        global: bool,
+        version_id: String,
+    }
+
+    impl TestTrackedLiveRow {
+        fn as_ref(&self) -> LiveStateTrackedRowRef<'_> {
+            LiveStateTrackedRowRef {
+                row: self.row.as_ref(),
+                global: self.global,
+                version_id: &self.version_id,
+            }
+        }
+
+        fn storage_version_id(&self) -> &str {
+            if self.global {
+                GLOBAL_VERSION_ID
+            } else {
+                &self.version_id
+            }
+        }
     }
 
     fn parent_commit_id_from_test_commit_row(
@@ -945,14 +974,15 @@ mod tests {
         .await;
         {
             let mut writes = StorageWriteSet::new();
+            let identity = crate::untracked_state::UntrackedStateIdentity {
+                version_id: "global".to_string(),
+                schema_key: "lix_key_value".to_string(),
+                entity_id: EntityIdentity::single("selected-tab"),
+                file_id: None,
+            };
             UntrackedStateContext::new()
                 .writer(&mut writes)
-                .stage_delete_rows(&[crate::untracked_state::UntrackedStateIdentity {
-                    version_id: "global".to_string(),
-                    schema_key: "lix_key_value".to_string(),
-                    entity_id: EntityIdentity::single("selected-tab"),
-                    file_id: None,
-                }]);
+                .stage_delete_rows(std::iter::once(identity.as_ref()));
             writes
                 .apply(&mut transaction.as_mut())
                 .await
@@ -1740,7 +1770,7 @@ mod tests {
                     &mut writes,
                     "parent-left",
                     None,
-                    &[],
+                    std::iter::empty(),
                 )
                 .await
                 .expect("first parent root should exist");
@@ -2023,7 +2053,7 @@ mod tests {
         };
         UntrackedStateContext::new()
             .writer(&mut writes)
-            .stage_rows(&canonical_refs)
+            .stage_rows(canonical_refs.iter().map(|row| row.as_ref()))
             .expect("version refs should write");
         writes
             .apply(&mut transaction.as_mut())
@@ -2113,7 +2143,7 @@ mod tests {
         };
         changelog
             .writer(&mut writes)
-            .stage_changes(&[canonical_change])
+            .stage_changes(std::iter::once(canonical_change.as_ref()))
             .expect("commit change should append");
         writes
             .apply(&mut transaction.as_mut())

@@ -1,5 +1,5 @@
-use crate::changelog::codec::{decode_change, encode_change};
-use crate::changelog::{CanonicalChange, ChangelogScanRequest};
+use crate::changelog::codec::decode_change;
+use crate::changelog::{CanonicalChange, CanonicalChangeRef, ChangelogScanRequest};
 use crate::storage::KvScanRange;
 use crate::storage::{KvGetGroup, KvGetRequest, KvScanRequest, StorageReader, StorageWriteSet};
 use crate::LixError;
@@ -69,15 +69,15 @@ pub(crate) async fn scan_changes(
     page.values.iter().map(decode_change).collect()
 }
 
-pub(crate) fn stage_changes(
-    writes: &mut StorageWriteSet,
-    changes: &[CanonicalChange],
-) -> Result<(), LixError> {
+pub(crate) fn stage_changes<'a, I>(writes: &mut StorageWriteSet, changes: I) -> Result<(), LixError>
+where
+    I: IntoIterator<Item = CanonicalChangeRef<'a>>,
+{
     for change in changes {
         writes.put(
             CHANGELOG_CHANGE_NAMESPACE,
-            encode_change_key(&change.id),
-            encode_change(change)?,
+            encode_change_key(change.id),
+            crate::changelog::codec::encode_change_ref(change)?,
         );
     }
     Ok(())
@@ -220,7 +220,7 @@ mod tests {
             .expect("changes should canonicalize");
         let mut writer = changelog.writer(&mut writes);
         writer
-            .stage_changes(&canonical_changes)
+            .stage_changes(canonical_changes.iter().map(|change| change.as_ref()))
             .expect("append should succeed");
         writes
             .apply(&mut tx.as_mut())

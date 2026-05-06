@@ -1,11 +1,16 @@
-use std::{collections::BTreeMap, future::Future, ops::Range, pin::Pin};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    future::Future,
+    ops::Range,
+    pin::Pin,
+};
 
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::tracked_state::codec::{
     boundary_trigger, child_summary_from_node, decode_key, decode_node, decode_value,
-    encode_internal_node, encode_key, encode_leaf_node, encode_schema_file_prefix,
-    encode_schema_key_prefix, encode_value, ChildSummary, DecodedNode, EncodedLeafEntry,
-    PendingChunkWrite,
+    encode_internal_node, encode_internal_node_refs, encode_key, encode_leaf_node,
+    encode_leaf_node_refs, encode_schema_file_prefix, encode_schema_key_prefix, ChildSummary,
+    ChildSummaryRef, DecodedNode, EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkWrite,
 };
 use crate::tracked_state::storage;
 use crate::tracked_state::tree_types::{
@@ -20,6 +25,11 @@ pub(crate) struct TrackedStateTreeOptions {
     pub(crate) target_chunk_bytes: usize,
     pub(crate) min_chunk_bytes: usize,
     pub(crate) max_chunk_bytes: usize,
+}
+
+enum MutationApply<T> {
+    Applied(TrackedStateApplyResult),
+    Fallback(T),
 }
 
 impl Default for TrackedStateTreeOptions {
@@ -215,38 +225,41 @@ impl TrackedStateTree {
         store: &mut (impl StorageReader + ?Sized),
         writes: &mut StorageWriteSet,
         base_root: Option<&TrackedStateRootId>,
-        mutations: Vec<TrackedStateMutation>,
+        mut mutations: Vec<TrackedStateMutation>,
         commit_id: Option<&str>,
     ) -> Result<TrackedStateApplyResult, LixError> {
         let mut overlay = storage::TrackedStateChunkOverlay::new();
         if let Some(root_id) = base_root {
             if mutations.len() == 1 {
-                if let Some(result) = self
+                let mutation = mutations.pop().expect("single mutation should exist");
+                match self
                     .apply_single_mutation(
                         store,
                         writes,
                         &mut overlay,
                         root_id,
-                        &mutations[0],
+                        mutation,
                         commit_id,
                     )
                     .await?
                 {
-                    return Ok(result);
+                    MutationApply::Applied(result) => return Ok(result),
+                    MutationApply::Fallback(mutation) => mutations = vec![mutation],
                 }
             } else if mutations.len() > 1 {
-                if let Some(result) = self
+                match self
                     .apply_sorted_mutations_chunker(
                         store,
                         writes,
                         &mut overlay,
                         root_id,
-                        &mutations,
+                        mutations,
                         commit_id,
                     )
                     .await?
                 {
-                    return Ok(result);
+                    MutationApply::Applied(result) => return Ok(result),
+                    MutationApply::Fallback(fallback_mutations) => mutations = fallback_mutations,
                 }
             }
         }
@@ -264,11 +277,7 @@ impl TrackedStateTree {
         // Apply in caller order so repeated writes to the same key behave like
         // normal transaction staging: the latest mutation wins.
         for mutation in mutations {
-            match mutation {
-                TrackedStateMutation::Put { key, value } => {
-                    entries.insert(encode_key(&key), encode_value(&value));
-                }
-            }
+            entries.insert(mutation.encoded_key, mutation.encoded_value);
         }
 
         let built = self.build_tree_from_entries(
@@ -301,60 +310,71 @@ impl TrackedStateTree {
         writes: &mut StorageWriteSet,
         overlay: &mut storage::TrackedStateChunkOverlay,
         root_id: &TrackedStateRootId,
-        mutation: &TrackedStateMutation,
+        mutation: TrackedStateMutation,
         commit_id: Option<&str>,
-    ) -> Result<Option<TrackedStateApplyResult>, LixError> {
-        let TrackedStateMutation::Put { key, value } = mutation;
-        let encoded_key = encode_key(key);
-        let encoded_value = encode_value(value);
-
-        if let Some(result) = self
+    ) -> Result<MutationApply<TrackedStateMutation>, LixError> {
+        let mutation = match self
             .apply_single_mutation_from_seek_path(
-                store,
-                writes,
-                overlay,
-                root_id,
-                &encoded_key,
-                &encoded_value,
-                commit_id,
+                store, writes, overlay, root_id, mutation, commit_id,
             )
             .await?
         {
-            return Ok(result);
-        }
+            MutationApply::Applied(result) => return Ok(MutationApply::Applied(result)),
+            MutationApply::Fallback(mutation) => mutation,
+        };
+
+        let TrackedStateMutation {
+            encoded_key,
+            encoded_value,
+        } = mutation;
 
         let levels = self
             .collect_summary_levels_with_overlay(store, overlay, root_id)
             .await?;
         let Some(leaves) = levels.first() else {
-            return Ok(None);
+            return Ok(MutationApply::Fallback(TrackedStateMutation {
+                encoded_key,
+                encoded_value,
+            }));
         };
         let target_leaf_index = leaves
             .iter()
             .position(|leaf| leaf.last_key.as_slice() >= encoded_key.as_slice())
             .unwrap_or_else(|| leaves.len().saturating_sub(1));
         let Some(target_leaf) = leaves.get(target_leaf_index).cloned() else {
-            return Ok(None);
+            return Ok(MutationApply::Fallback(TrackedStateMutation {
+                encoded_key,
+                encoded_value,
+            }));
         };
 
         let mut entries = self
             .load_leaf_entries_with_overlay(store, overlay, &target_leaf.child_hash)
             .await?;
-        match entries.binary_search_by(|entry| entry.key.as_slice().cmp(&encoded_key)) {
+        let mutation_entry_index = match entries
+            .binary_search_by(|entry| entry.key.as_slice().cmp(encoded_key.as_slice()))
+        {
             Ok(index) => {
-                if entries[index].value == encoded_value {
-                    return Ok(None);
+                if entries[index].value.as_slice() == encoded_value.as_slice() {
+                    return Ok(MutationApply::Fallback(TrackedStateMutation {
+                        encoded_key,
+                        encoded_value,
+                    }));
                 }
                 entries[index].value = encoded_value;
+                index
             }
-            Err(index) => entries.insert(
-                index,
-                EncodedLeafEntry {
-                    key: encoded_key.clone(),
-                    value: encoded_value,
-                },
-            ),
-        }
+            Err(index) => {
+                entries.insert(
+                    index,
+                    EncodedLeafEntry {
+                        key: encoded_key,
+                        value: encoded_value,
+                    },
+                );
+                index
+            }
+        };
 
         let mut chunks = BTreeMap::new();
         let mut suffix_entries = entries;
@@ -366,20 +386,25 @@ impl TrackedStateTree {
         // existing post-mutation leaf, then reuse the rest of the old suffix.
         loop {
             let mut candidate_chunks = BTreeMap::new();
-            let candidate_summaries =
-                self.build_leaf_level(suffix_entries.clone(), &mut candidate_chunks);
+            let candidate_summaries = self.build_leaf_level_from_refs(
+                suffix_entries.iter().map(EncodedLeafEntry::as_ref),
+                &mut candidate_chunks,
+            );
 
             if let Some((generated_resync_index, existing_resync_index)) = first_resync_index(
                 &candidate_summaries,
                 &leaves[target_leaf_index..],
-                &encoded_key,
+                suffix_entries[mutation_entry_index].key.as_slice(),
             ) {
                 for summary in &candidate_summaries[..generated_resync_index] {
                     if let Some(chunk) = candidate_chunks.remove(&summary.child_hash) {
                         chunks.entry(chunk.hash).or_insert(chunk);
                     }
                 }
-                replacement_leaves = candidate_summaries[..generated_resync_index].to_vec();
+                replacement_leaves = candidate_summaries
+                    .into_iter()
+                    .take(generated_resync_index)
+                    .collect();
                 old_leaf_count = existing_resync_index;
                 break;
             }
@@ -408,7 +433,7 @@ impl TrackedStateTree {
             old_leaf_count,
             std::mem::take(&mut replacement_leaves),
             chunks,
-            &encoded_key,
+            suffix_entries[mutation_entry_index].key.as_slice(),
         )?;
         overlay.stage_chunks(writes, &built.chunks);
         let persisted_root = if let Some(commit_id) = commit_id {
@@ -418,7 +443,7 @@ impl TrackedStateTree {
             false
         };
 
-        Ok(Some(TrackedStateApplyResult {
+        Ok(MutationApply::Applied(TrackedStateApplyResult {
             root_id: built.root_id,
             row_count: built.row_count,
             tree_height: built.tree_height,
@@ -652,48 +677,65 @@ impl TrackedStateTree {
         writes: &mut StorageWriteSet,
         overlay: &mut storage::TrackedStateChunkOverlay,
         root_id: &TrackedStateRootId,
-        mutations: &[TrackedStateMutation],
+        mutations: Vec<TrackedStateMutation>,
         commit_id: Option<&str>,
-    ) -> Result<Option<TrackedStateApplyResult>, LixError> {
+    ) -> Result<MutationApply<Vec<TrackedStateMutation>>, LixError> {
         let mut mutation_map = BTreeMap::new();
         for mutation in mutations {
-            let TrackedStateMutation::Put { key, value } = mutation;
-            mutation_map.insert(encode_key(key), encode_value(value));
+            mutation_map.insert(mutation.encoded_key, mutation.encoded_value);
         }
         if mutation_map.is_empty() {
-            return Ok(None);
+            return Ok(MutationApply::Fallback(Vec::new()));
         }
-
-        let mutations = mutation_map.into_iter().collect::<Vec<_>>();
 
         let levels = self
             .collect_summary_levels_with_overlay(store, overlay, root_id)
             .await?;
         let Some(leaves) = levels.first() else {
-            return Ok(None);
+            return Ok(MutationApply::Fallback(
+                mutation_map
+                    .into_iter()
+                    .map(|(encoded_key, encoded_value)| TrackedStateMutation {
+                        encoded_key,
+                        encoded_value,
+                    })
+                    .collect(),
+            ));
         };
 
         let base_row_count = leaves
             .iter()
             .map(|leaf| leaf.subtree_count as usize)
             .sum::<usize>();
+        let first_mutation_key = mutation_map
+            .keys()
+            .next()
+            .expect("non-empty mutation map should have first key");
         let append_only = leaves
             .last()
-            .is_some_and(|leaf| mutations[0].0.as_slice() > leaf.last_key.as_slice());
-        if !append_only && mutations.len() * 2 > base_row_count {
-            return Ok(None);
+            .is_some_and(|leaf| first_mutation_key.as_slice() > leaf.last_key.as_slice());
+        if !append_only && mutation_map.len() * 2 > base_row_count {
+            return Ok(MutationApply::Fallback(
+                mutation_map
+                    .into_iter()
+                    .map(|(encoded_key, encoded_value)| TrackedStateMutation {
+                        encoded_key,
+                        encoded_value,
+                    })
+                    .collect(),
+            ));
         }
 
+        let mut mutations = mutation_map.into_iter().collect::<VecDeque<_>>();
         let mut output_leaves = Vec::new();
         let mut chunks = BTreeMap::new();
         let mut leaf_index = 0usize;
-        let mut next_mutation_index = 0usize;
 
         while leaf_index < leaves.len() {
-            if next_mutation_index >= mutations.len()
-                || mutations[next_mutation_index].0.as_slice()
-                    > leaves[leaf_index].last_key.as_slice()
-            {
+            let current_leaf_has_mutation = mutations
+                .front()
+                .is_some_and(|(key, _)| key.as_slice() <= leaves[leaf_index].last_key.as_slice());
+            if !current_leaf_has_mutation {
                 output_leaves.push(leaves[leaf_index].clone());
                 leaf_index += 1;
                 continue;
@@ -701,7 +743,10 @@ impl TrackedStateTree {
 
             let window_start = leaf_index;
             let mut window_entries = BTreeMap::new();
-            let mut window_mutation_ceiling = mutations[next_mutation_index].0.clone();
+            let mut window_mutation_ceiling = mutations
+                .front()
+                .map(|(key, _)| key.clone())
+                .expect("window with mutation should have front mutation");
 
             loop {
                 if leaf_index < leaves.len() {
@@ -713,46 +758,45 @@ impl TrackedStateTree {
                         window_entries.insert(entry.key, entry.value);
                     }
 
-                    while next_mutation_index < mutations.len()
-                        && mutations[next_mutation_index].0.as_slice() <= leaf.last_key.as_slice()
+                    while mutations
+                        .front()
+                        .is_some_and(|(key, _)| key.as_slice() <= leaf.last_key.as_slice())
                     {
-                        let (key, value) = &mutations[next_mutation_index];
-                        window_entries.insert(key.clone(), value.clone());
+                        let (key, value) = mutations
+                            .pop_front()
+                            .expect("front mutation should be present");
                         window_mutation_ceiling = key.clone();
-                        next_mutation_index += 1;
+                        window_entries.insert(key, value);
                     }
                     leaf_index += 1;
                 }
 
-                while next_mutation_index < mutations.len() {
-                    let (key, value) = &mutations[next_mutation_index];
+                while let Some((key, _)) = mutations.front() {
                     if leaf_index < leaves.len()
                         && key.as_slice() >= leaves[leaf_index].first_key.as_slice()
                     {
                         break;
                     }
-                    window_entries.insert(key.clone(), value.clone());
+                    let (key, value) = mutations
+                        .pop_front()
+                        .expect("front mutation should be present");
                     window_mutation_ceiling = key.clone();
-                    next_mutation_index += 1;
+                    window_entries.insert(key, value);
                 }
 
-                if next_mutation_index < mutations.len()
-                    && leaf_index < leaves.len()
-                    && mutations[next_mutation_index].0.as_slice()
-                        <= leaves[leaf_index].last_key.as_slice()
+                if leaf_index < leaves.len()
+                    && mutations.front().is_some_and(|(key, _)| {
+                        key.as_slice() <= leaves[leaf_index].last_key.as_slice()
+                    })
                 {
                     continue;
                 }
 
                 let mut candidate_chunks = BTreeMap::new();
-                let candidate_leaves = self.build_leaf_level(
+                let candidate_leaves = self.build_leaf_level_from_refs(
                     window_entries
                         .iter()
-                        .map(|(key, value)| EncodedLeafEntry {
-                            key: key.clone(),
-                            value: value.clone(),
-                        })
-                        .collect(),
+                        .map(|(key, value)| EncodedLeafEntryRef { key, value }),
                     &mut candidate_chunks,
                 );
 
@@ -766,7 +810,7 @@ impl TrackedStateTree {
                             chunks.entry(chunk.hash).or_insert(chunk);
                         }
                     }
-                    output_leaves.extend_from_slice(&candidate_leaves[..generated_resync_index]);
+                    output_leaves.extend(candidate_leaves.into_iter().take(generated_resync_index));
                     leaf_index = window_start + existing_resync_index;
                     break;
                 }
@@ -779,20 +823,19 @@ impl TrackedStateTree {
             }
         }
 
-        if next_mutation_index < mutations.len() {
-            let mut entries = Vec::new();
-            for (key, value) in &mutations[next_mutation_index..] {
-                entries.push(EncodedLeafEntry {
-                    key: key.clone(),
-                    value: value.clone(),
-                });
-            }
+        if !mutations.is_empty() {
+            let entries = mutations
+                .into_iter()
+                .map(|(key, value)| EncodedLeafEntry { key, value })
+                .collect();
             output_leaves.extend(self.build_leaf_level(entries, &mut chunks));
         }
 
         let built = self.build_tree_from_leaf_summaries(output_leaves, chunks)?;
-        self.persist_built_tree(writes, overlay, built, commit_id)
-            .await
+        Ok(MutationApply::Applied(
+            self.persist_built_tree(writes, overlay, built, commit_id)
+                .await?,
+        ))
     }
 
     async fn apply_single_mutation_from_seek_path(
@@ -801,10 +844,13 @@ impl TrackedStateTree {
         writes: &mut StorageWriteSet,
         overlay: &mut storage::TrackedStateChunkOverlay,
         root_id: &TrackedStateRootId,
-        encoded_key: &[u8],
-        encoded_value: &[u8],
+        mutation: TrackedStateMutation,
         commit_id: Option<&str>,
-    ) -> Result<Option<Option<TrackedStateApplyResult>>, LixError> {
+    ) -> Result<MutationApply<TrackedStateMutation>, LixError> {
+        let TrackedStateMutation {
+            encoded_key,
+            encoded_value,
+        } = mutation;
         let mut current = *root_id.as_bytes();
         let mut path = Vec::new();
         let mut entries = loop {
@@ -817,7 +863,7 @@ impl TrackedStateTree {
                     let children = internal.children().to_vec();
                     let child_index = children
                         .iter()
-                        .position(|child| child.last_key.as_slice() >= encoded_key)
+                        .position(|child| child.last_key.as_slice() >= encoded_key.as_slice())
                         .or_else(|| (!children.is_empty()).then_some(children.len() - 1))
                         .ok_or_else(|| {
                             LixError::new(
@@ -834,21 +880,30 @@ impl TrackedStateTree {
             }
         };
 
-        match entries.binary_search_by(|entry| entry.key.as_slice().cmp(encoded_key)) {
+        let mutation_entry_index = match entries
+            .binary_search_by(|entry| entry.key.as_slice().cmp(encoded_key.as_slice()))
+        {
             Ok(index) => {
-                if entries[index].value == encoded_value {
-                    return Ok(Some(None));
+                if entries[index].value.as_slice() == encoded_value.as_slice() {
+                    return Ok(MutationApply::Fallback(TrackedStateMutation {
+                        encoded_key,
+                        encoded_value,
+                    }));
                 }
-                entries[index].value = encoded_value.to_vec();
+                entries[index].value = encoded_value;
+                index
             }
-            Err(index) => entries.insert(
-                index,
-                EncodedLeafEntry {
-                    key: encoded_key.to_vec(),
-                    value: encoded_value.to_vec(),
-                },
-            ),
-        }
+            Err(index) => {
+                entries.insert(
+                    index,
+                    EncodedLeafEntry {
+                        key: encoded_key,
+                        value: encoded_value,
+                    },
+                );
+                index
+            }
+        };
 
         let mut chunks = BTreeMap::new();
         let mut replacement_children;
@@ -856,10 +911,10 @@ impl TrackedStateTree {
 
         let Some(leaf_parent) = path.pop() else {
             let built = self.build_tree_from_entries(entries)?;
-            return self
-                .persist_built_tree(writes, overlay, built, commit_id)
-                .await
-                .map(Some);
+            return Ok(MutationApply::Applied(
+                self.persist_built_tree(writes, overlay, built, commit_id)
+                    .await?,
+            ));
         };
         let mutation_is_right_edge = leaf_parent.child_index + 1 == leaf_parent.children.len()
             && path
@@ -870,26 +925,35 @@ impl TrackedStateTree {
         let mut next_leaf_index = leaf_parent.child_index + 1;
         loop {
             let mut candidate_chunks = BTreeMap::new();
-            let candidate_leaves =
-                self.build_leaf_level(leaf_entries.clone(), &mut candidate_chunks);
+            let candidate_leaves = self.build_leaf_level_from_refs(
+                leaf_entries.iter().map(EncodedLeafEntry::as_ref),
+                &mut candidate_chunks,
+            );
             if let Some((generated_resync_index, existing_resync_index)) = first_resync_index(
                 &candidate_leaves,
                 &leaf_parent.children[leaf_parent.child_index..],
-                encoded_key,
+                leaf_entries[mutation_entry_index].key.as_slice(),
             ) {
                 for summary in &candidate_leaves[..generated_resync_index] {
                     if let Some(chunk) = candidate_chunks.remove(&summary.child_hash) {
                         chunks.entry(chunk.hash).or_insert(chunk);
                     }
                 }
-                replacement_children = candidate_leaves[..generated_resync_index].to_vec();
+                replacement_children = candidate_leaves
+                    .into_iter()
+                    .take(generated_resync_index)
+                    .collect();
                 old_child_count = existing_resync_index;
                 break;
             }
 
             if next_leaf_index >= leaf_parent.children.len() {
                 if !mutation_is_right_edge {
-                    return Ok(None);
+                    let entry = leaf_entries.remove(mutation_entry_index);
+                    return Ok(MutationApply::Fallback(TrackedStateMutation {
+                        encoded_key: entry.key,
+                        encoded_value: entry.value,
+                    }));
                 }
                 chunks.extend(candidate_chunks);
                 replacement_children = candidate_leaves;
@@ -941,10 +1005,10 @@ impl TrackedStateTree {
                     tree_height,
                     chunk_bytes,
                 };
-                return self
-                    .persist_built_tree(writes, overlay, built, commit_id)
-                    .await
-                    .map(Some);
+                return Ok(MutationApply::Applied(
+                    self.persist_built_tree(writes, overlay, built, commit_id)
+                        .await?,
+                ));
             };
 
             child_index = frame.child_index;
@@ -959,7 +1023,7 @@ impl TrackedStateTree {
         overlay: &mut storage::TrackedStateChunkOverlay,
         built: BuiltTree,
         commit_id: Option<&str>,
-    ) -> Result<Option<TrackedStateApplyResult>, LixError> {
+    ) -> Result<TrackedStateApplyResult, LixError> {
         overlay.stage_chunks(writes, &built.chunks);
         let persisted_root = if let Some(commit_id) = commit_id {
             storage::stage_root(writes, commit_id, &built.root_id);
@@ -967,14 +1031,14 @@ impl TrackedStateTree {
         } else {
             false
         };
-        Ok(Some(TrackedStateApplyResult {
+        Ok(TrackedStateApplyResult {
             root_id: built.root_id,
             row_count: built.row_count,
             tree_height: built.tree_height,
             chunk_count: built.chunks.len(),
             chunk_bytes: built.chunk_bytes,
             persisted_root,
-        }))
+        })
     }
 
     fn build_tree_from_entries(
@@ -1130,15 +1194,23 @@ impl TrackedStateTree {
         let parent_end_child_range =
             child_range_for_parent(old_children, &old_parents[parent_end])?;
         let mut window_children = Vec::new();
-        window_children.extend_from_slice(&old_children[parent_child_range.start..child_start]);
-        window_children.extend(replacement_children);
-        window_children.extend_from_slice(&old_children[old_child_end..parent_end_child_range.end]);
+        window_children.extend(
+            old_children[parent_child_range.start..child_start]
+                .iter()
+                .map(ChildSummary::as_ref),
+        );
+        window_children.extend(replacement_children.iter().map(ChildSummary::as_ref));
+        window_children.extend(
+            old_children[old_child_end..parent_end_child_range.end]
+                .iter()
+                .map(ChildSummary::as_ref),
+        );
         let mut next_parent_index = parent_end + 1;
 
         loop {
             let mut candidate_chunks = BTreeMap::new();
-            let candidate_parents = self.build_internal_level(
-                window_children.clone(),
+            let candidate_parents = self.build_internal_level_from_refs(
+                window_children.iter().copied(),
                 parent_level,
                 &mut candidate_chunks,
             );
@@ -1156,7 +1228,10 @@ impl TrackedStateTree {
                 return Ok(ParentLevelPatch {
                     parent_start,
                     old_parent_count: existing_resync_index,
-                    replacement_parents: candidate_parents[..generated_resync_index].to_vec(),
+                    replacement_parents: candidate_parents
+                        .into_iter()
+                        .take(generated_resync_index)
+                        .collect(),
                 });
             }
 
@@ -1170,7 +1245,7 @@ impl TrackedStateTree {
             }
 
             let next_range = child_range_for_parent(old_children, &old_parents[next_parent_index])?;
-            window_children.extend_from_slice(&old_children[next_range]);
+            window_children.extend(old_children[next_range].iter().map(ChildSummary::as_ref));
             next_parent_index += 1;
         }
     }
@@ -1204,6 +1279,35 @@ impl TrackedStateTree {
             .collect()
     }
 
+    fn build_leaf_level_from_refs<'a>(
+        &self,
+        entries: impl IntoIterator<Item = EncodedLeafEntryRef<'a>>,
+        chunks: &mut BTreeMap<[u8; TRACKED_STATE_HASH_BYTES], PendingChunkWrite>,
+    ) -> Vec<ChildSummary> {
+        let groups = chunk_leaf_entry_refs(entries, &self.options);
+        groups
+            .into_iter()
+            .map(|group| {
+                let subtree_count = group.entries.len() as u64;
+                let first_key = group
+                    .entries
+                    .first()
+                    .map(|entry| entry.key.to_vec())
+                    .unwrap_or_default();
+                let last_key = group
+                    .entries
+                    .last()
+                    .map(|entry| entry.key.to_vec())
+                    .unwrap_or_default();
+                let node = encode_leaf_node_refs(&group.entries);
+                let (chunk, summary) =
+                    child_summary_from_node(node, first_key, last_key, subtree_count);
+                chunks.entry(chunk.hash).or_insert(chunk);
+                summary
+            })
+            .collect()
+    }
+
     fn build_internal_level(
         &self,
         children: Vec<ChildSummary>,
@@ -1226,6 +1330,36 @@ impl TrackedStateTree {
                     .map(|child| child.last_key.clone())
                     .unwrap_or_default();
                 let node = encode_internal_node(&group.children);
+                let (chunk, summary) =
+                    child_summary_from_node(node, first_key, last_key, subtree_count);
+                chunks.entry(chunk.hash).or_insert(chunk);
+                summary
+            })
+            .collect()
+    }
+
+    fn build_internal_level_from_refs<'a>(
+        &self,
+        children: impl IntoIterator<Item = ChildSummaryRef<'a>>,
+        level: usize,
+        chunks: &mut BTreeMap<[u8; TRACKED_STATE_HASH_BYTES], PendingChunkWrite>,
+    ) -> Vec<ChildSummary> {
+        let groups = chunk_internal_entry_refs(children, &self.options, level);
+        groups
+            .into_iter()
+            .map(|group| {
+                let subtree_count = group.children.iter().map(|child| child.subtree_count).sum();
+                let first_key = group
+                    .children
+                    .first()
+                    .map(|child| child.first_key.to_vec())
+                    .unwrap_or_default();
+                let last_key = group
+                    .children
+                    .last()
+                    .map(|child| child.last_key.to_vec())
+                    .unwrap_or_default();
+                let node = encode_internal_node_refs(&group.children);
                 let (chunk, summary) =
                     child_summary_from_node(node, first_key, last_key, subtree_count);
                 chunks.entry(chunk.hash).or_insert(chunk);
@@ -1703,8 +1837,22 @@ struct LeafChunkAccumulator {
 }
 
 #[derive(Debug, Default)]
+struct BorrowedLeafChunkAccumulator<'a> {
+    entries: Vec<EncodedLeafEntryRef<'a>>,
+    key_bytes: usize,
+    value_bytes: usize,
+}
+
+#[derive(Debug, Default)]
 struct InternalChunkAccumulator {
     children: Vec<ChildSummary>,
+    first_key_bytes: usize,
+    last_key_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct BorrowedInternalChunkAccumulator<'a> {
+    children: Vec<ChildSummaryRef<'a>>,
     first_key_bytes: usize,
     last_key_bytes: usize,
 }
@@ -1758,6 +1906,56 @@ fn chunk_leaf_entries(
     groups
 }
 
+fn chunk_leaf_entry_refs<'a>(
+    entries: impl IntoIterator<Item = EncodedLeafEntryRef<'a>>,
+    options: &TrackedStateTreeOptions,
+) -> Vec<BorrowedLeafChunkAccumulator<'a>> {
+    let mut iter = entries.into_iter().peekable();
+    if iter.peek().is_none() {
+        return vec![BorrowedLeafChunkAccumulator::default()];
+    }
+    let mut groups = Vec::new();
+    let mut current = BorrowedLeafChunkAccumulator::default();
+    for entry in iter {
+        let item_size = entry.key.len() + entry.value.len();
+        let projected_size = estimate_leaf_chunk_size(
+            current.entries.len() + 1,
+            current.key_bytes + entry.key.len(),
+            current.value_bytes + entry.value.len(),
+        );
+        if !current.entries.is_empty() && projected_size > options.max_chunk_bytes {
+            groups.push(std::mem::take(&mut current));
+        }
+
+        current.key_bytes += entry.key.len();
+        current.value_bytes += entry.value.len();
+        current.entries.push(entry);
+        let current_size = estimate_leaf_chunk_size(
+            current.entries.len(),
+            current.key_bytes,
+            current.value_bytes,
+        );
+        if current_size >= options.min_chunk_bytes
+            && (current_size >= options.max_chunk_bytes
+                || current.entries.last().is_some_and(|entry| {
+                    boundary_trigger(
+                        entry.key,
+                        0,
+                        current_size,
+                        item_size,
+                        options.target_chunk_bytes,
+                    )
+                }))
+        {
+            groups.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.entries.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
 fn chunk_internal_entries(
     children: Vec<ChildSummary>,
     options: &TrackedStateTreeOptions,
@@ -1792,6 +1990,56 @@ fn chunk_internal_entries(
                 || current.children.last().is_some_and(|child| {
                     boundary_trigger(
                         &child.first_key,
+                        level,
+                        current_size,
+                        item_size,
+                        options.target_chunk_bytes,
+                    )
+                }))
+        {
+            groups.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.children.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
+fn chunk_internal_entry_refs<'a>(
+    children: impl IntoIterator<Item = ChildSummaryRef<'a>>,
+    options: &TrackedStateTreeOptions,
+    level: usize,
+) -> Vec<BorrowedInternalChunkAccumulator<'a>> {
+    let mut groups = Vec::new();
+    let mut current = BorrowedInternalChunkAccumulator::default();
+    for child in children {
+        let item_size = child.first_key.len()
+            + child.last_key.len()
+            + TRACKED_STATE_HASH_BYTES
+            + std::mem::size_of::<u64>();
+        let projected_size = estimate_internal_chunk_size(
+            current.children.len() + 1,
+            current.first_key_bytes + child.first_key.len(),
+            current.last_key_bytes + child.last_key.len(),
+        );
+        if !current.children.is_empty() && projected_size > options.max_chunk_bytes {
+            groups.push(std::mem::take(&mut current));
+        }
+
+        current.first_key_bytes += child.first_key.len();
+        current.last_key_bytes += child.last_key.len();
+        current.children.push(child);
+        let current_size = estimate_internal_chunk_size(
+            current.children.len(),
+            current.first_key_bytes,
+            current.last_key_bytes,
+        );
+        if current_size >= options.min_chunk_bytes
+            && (current_size >= options.max_chunk_bytes
+                || current.children.last().is_some_and(|child| {
+                    boundary_trigger(
+                        child.first_key,
                         level,
                         current_size,
                         item_size,
@@ -2113,6 +2361,7 @@ mod tests {
     use crate::backend::testing::UnitTestBackend;
     use crate::entity_identity::EntityIdentity;
     use crate::storage::{StorageContext, StorageWriteTransaction};
+    use crate::tracked_state::codec::encode_value;
 
     #[tokio::test]
     async fn exact_read_roundtrips_from_stored_root() {
@@ -2129,7 +2378,7 @@ mod tests {
             &tree,
             transaction.as_mut(),
             None,
-            vec![TrackedStateMutation::put(key.clone(), value.clone())],
+            vec![mutation(&key, &value)],
             Some("commit-1"),
         )
         .await
@@ -2159,6 +2408,8 @@ mod tests {
         let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let tree = TrackedStateTree::new();
         let key = key("schema", None, "entity");
+        let old_value = value("change-old", Some("{\"v\":1}"));
+        let new_value = value("change-new", Some("{\"v\":2}"));
 
         let mut transaction = storage
             .begin_write_transaction()
@@ -2168,10 +2419,7 @@ mod tests {
             &tree,
             transaction.as_mut(),
             None,
-            vec![
-                TrackedStateMutation::put(key.clone(), value("change-old", Some("{\"v\":1}"))),
-                TrackedStateMutation::put(key.clone(), value("change-new", Some("{\"v\":2}"))),
-            ],
+            vec![mutation(&key, &old_value), mutation(&key, &new_value)],
             None,
         )
         .await
@@ -2208,12 +2456,9 @@ mod tests {
             transaction.as_mut(),
             None,
             vec![
-                TrackedStateMutation::put(
-                    key("schema-a", None, "visible"),
-                    value("c1", Some("{}")),
-                ),
-                TrackedStateMutation::put(key("schema-a", None, "deleted"), value("c2", None)),
-                TrackedStateMutation::put(key("schema-b", None, "other"), value("c3", Some("{}"))),
+                mutation_owned(key("schema-a", None, "visible"), value("c1", Some("{}"))),
+                mutation_owned(key("schema-a", None, "deleted"), value("c2", None)),
+                mutation_owned(key("schema-b", None, "other"), value("c3", Some("{}"))),
             ],
             None,
         )
@@ -2257,19 +2502,19 @@ mod tests {
             transaction.as_mut(),
             None,
             vec![
-                TrackedStateMutation::put(
+                mutation_owned(
                     key("schema-a", Some("file-a"), "entity-a"),
                     value("c1", Some("{}")),
                 ),
-                TrackedStateMutation::put(
+                mutation_owned(
                     key("schema-a", Some("file-b"), "entity-a"),
                     value("c2", Some("{}")),
                 ),
-                TrackedStateMutation::put(
+                mutation_owned(
                     key("schema-a", Some("file-a"), "entity-b"),
                     value("c3", Some("{}")),
                 ),
-                TrackedStateMutation::put(
+                mutation_owned(
                     key("schema-b", Some("file-a"), "entity-a"),
                     value("c4", Some("{}")),
                 ),
@@ -2313,6 +2558,9 @@ mod tests {
         let tree = TrackedStateTree::new();
         let unchanged_key = key("schema", None, "unchanged");
         let changed_key = key("schema", None, "changed");
+        let unchanged_value = value("c1", Some("{}"));
+        let old_changed_value = value("c2", Some("{\"old\":true}"));
+        let new_changed_value = value("c3", Some("{\"new\":true}"));
 
         let mut transaction = storage
             .begin_write_transaction()
@@ -2323,8 +2571,8 @@ mod tests {
             transaction.as_mut(),
             None,
             vec![
-                TrackedStateMutation::put(unchanged_key.clone(), value("c1", Some("{}"))),
-                TrackedStateMutation::put(changed_key.clone(), value("c2", Some("{\"old\":true}"))),
+                mutation(&unchanged_key, &unchanged_value),
+                mutation(&changed_key, &old_changed_value),
             ],
             None,
         )
@@ -2334,10 +2582,7 @@ mod tests {
             &tree,
             transaction.as_mut(),
             Some(&base.root_id),
-            vec![TrackedStateMutation::put(
-                changed_key.clone(),
-                value("c3", Some("{\"new\":true}")),
-            )],
+            vec![mutation(&changed_key, &new_changed_value)],
             None,
         )
         .await
@@ -2373,6 +2618,9 @@ mod tests {
         let shared_key = key("schema", None, "shared");
         let branch_a_key = key("schema", None, "branch-a");
         let branch_b_key = key("schema", None, "branch-b");
+        let shared_value = value("shared-change", Some("{\"shared\":true}"));
+        let branch_a_value = value("branch-a-change", Some("{\"branch\":\"a\"}"));
+        let branch_b_value = value("branch-b-change", Some("{\"branch\":\"b\"}"));
 
         let mut transaction = storage
             .begin_write_transaction()
@@ -2382,10 +2630,7 @@ mod tests {
             &tree,
             transaction.as_mut(),
             None,
-            vec![TrackedStateMutation::put(
-                shared_key.clone(),
-                value("shared-change", Some("{\"shared\":true}")),
-            )],
+            vec![mutation(&shared_key, &shared_value)],
             Some("commit-base"),
         )
         .await
@@ -2394,10 +2639,7 @@ mod tests {
             &tree,
             transaction.as_mut(),
             Some(&base.root_id),
-            vec![TrackedStateMutation::put(
-                branch_a_key.clone(),
-                value("branch-a-change", Some("{\"branch\":\"a\"}")),
-            )],
+            vec![mutation(&branch_a_key, &branch_a_value)],
             Some("commit-a"),
         )
         .await
@@ -2406,10 +2648,7 @@ mod tests {
             &tree,
             transaction.as_mut(),
             Some(&base.root_id),
-            vec![TrackedStateMutation::put(
-                branch_b_key.clone(),
-                value("branch-b-change", Some("{\"branch\":\"b\"}")),
-            )],
+            vec![mutation(&branch_b_key, &branch_b_value)],
             Some("commit-b"),
         )
         .await
@@ -2455,7 +2694,7 @@ mod tests {
         });
         let rows = (0..100)
             .map(|index| {
-                TrackedStateMutation::put(
+                mutation_owned(
                     key("schema", None, &format!("entity-{index:03}")),
                     value(&format!("c-{index}"), Some(&format!("{{\"v\":{index}}}"))),
                 )
@@ -2475,10 +2714,7 @@ mod tests {
             &tree,
             transaction.as_mut(),
             Some(&base.root_id),
-            vec![TrackedStateMutation::put(
-                changed_key.clone(),
-                changed_value.clone(),
-            )],
+            vec![mutation(&changed_key, &changed_value)],
             None,
         )
         .await
@@ -2513,7 +2749,7 @@ mod tests {
         });
         let rows = (0..100)
             .map(|index| {
-                TrackedStateMutation::put(
+                mutation_owned(
                     key("schema", None, &format!("entity-{index:03}")),
                     value(&format!("c-{index}"), Some(&format!("{{\"v\":{index}}}"))),
                 )
@@ -2533,10 +2769,7 @@ mod tests {
             &tree,
             transaction.as_mut(),
             Some(&base.root_id),
-            vec![TrackedStateMutation::put(
-                inserted_key.clone(),
-                inserted_value.clone(),
-            )],
+            vec![mutation(&inserted_key, &inserted_value)],
             None,
         )
         .await
@@ -2574,7 +2807,7 @@ mod tests {
         });
         let rows = (0..100)
             .map(|index| {
-                TrackedStateMutation::put(
+                mutation_owned(
                     key("schema", None, &format!("entity-{index:03}")),
                     value(&format!("c-{index}"), Some(&format!("{{\"v\":{index}}}"))),
                 )
@@ -2582,7 +2815,7 @@ mod tests {
             .collect::<Vec<_>>();
         let updates = (10..25)
             .map(|index| {
-                TrackedStateMutation::put(
+                (
                     key("schema", None, &format!("entity-{index:03}")),
                     value(
                         &format!("changed-{index}"),
@@ -2603,7 +2836,10 @@ mod tests {
             &tree,
             transaction.as_mut(),
             Some(&base.root_id),
-            updates.clone(),
+            updates
+                .iter()
+                .map(|(key, value)| mutation(key, value))
+                .collect(),
             None,
         )
         .await
@@ -2612,8 +2848,7 @@ mod tests {
             .collect_leaf_entries(&mut transaction.as_mut(), &base.root_id)
             .await
             .expect("base entries should collect");
-        for update in updates {
-            let TrackedStateMutation::Put { key, value } = update;
+        for (key, value) in updates {
             let encoded_key = encode_key(&key);
             let encoded_value = encode_value(&value);
             let index = canonical_entries
@@ -2638,7 +2873,7 @@ mod tests {
         });
         let rows = (0..100)
             .map(|index| {
-                TrackedStateMutation::put(
+                mutation_owned(
                     key("schema", None, &format!("entity-{index:03}")),
                     value(&format!("c-{index}"), Some(&format!("{{\"v\":{index}}}"))),
                 )
@@ -2648,7 +2883,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, entity_id)| {
-                TrackedStateMutation::put(
+                (
                     key("schema", None, entity_id),
                     value(
                         &format!("inserted-{index}"),
@@ -2669,7 +2904,10 @@ mod tests {
             &tree,
             transaction.as_mut(),
             Some(&base.root_id),
-            inserts.clone(),
+            inserts
+                .iter()
+                .map(|(key, value)| mutation(key, value))
+                .collect(),
             None,
         )
         .await
@@ -2678,8 +2916,7 @@ mod tests {
             .collect_leaf_entries(&mut transaction.as_mut(), &base.root_id)
             .await
             .expect("base entries should collect");
-        for insert in inserts {
-            let TrackedStateMutation::Put { key, value } = insert;
+        for (key, value) in inserts {
             let encoded_key = encode_key(&key);
             let encoded_value = encode_value(&value);
             let index = canonical_entries
@@ -2713,6 +2950,14 @@ mod tests {
             .await?;
         writes.apply(transaction).await?;
         Ok(result)
+    }
+
+    fn mutation(key: &TrackedStateKey, value: &TrackedStateValue) -> TrackedStateMutation {
+        TrackedStateMutation::put_encoded(encode_key(key), encode_value(value))
+    }
+
+    fn mutation_owned(key: TrackedStateKey, value: TrackedStateValue) -> TrackedStateMutation {
+        mutation(&key, &value)
     }
 
     fn key(schema_key: &str, file_id: Option<&str>, entity_id: &str) -> TrackedStateKey {

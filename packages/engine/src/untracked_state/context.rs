@@ -1,6 +1,6 @@
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::untracked_state::{
-    MaterializedUntrackedStateRow, UntrackedStateIdentity, UntrackedStateRow,
+    MaterializedUntrackedStateRow, UntrackedStateIdentityRef, UntrackedStateRowRef,
     UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
 use crate::LixError;
@@ -71,12 +71,18 @@ impl UntrackedStateWriter<'_> {
     ///
     /// A row with `snapshot_ref = None` is treated as removal because
     /// untracked state keeps only the current local value, not tombstones.
-    pub(crate) fn stage_rows(&mut self, rows: &[UntrackedStateRow]) -> Result<(), LixError> {
+    pub(crate) fn stage_rows<'a, I>(&mut self, rows: I) -> Result<(), LixError>
+    where
+        I: IntoIterator<Item = UntrackedStateRowRef<'a>>,
+    {
         crate::untracked_state::storage::stage_rows(self.writes, rows)
     }
 
     /// Removes untracked rows by exact identity.
-    pub(crate) fn stage_delete_rows(&mut self, identities: &[UntrackedStateIdentity]) {
+    pub(crate) fn stage_delete_rows<'a, I>(&mut self, identities: I)
+    where
+        I: IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
+    {
         crate::untracked_state::storage::stage_delete_rows(self.writes, identities)
     }
 }

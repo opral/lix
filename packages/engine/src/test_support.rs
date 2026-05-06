@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use crate::changelog::{CanonicalChange, MaterializedCanonicalChange};
 use crate::json_store::{JsonStoreContext, NormalizedJson};
-use crate::live_state::{LiveStateRow, MaterializedLiveStateRow};
 use crate::storage::StorageContext;
 use crate::storage::StorageWriteSet;
 use crate::tracked_state::{MaterializedTrackedStateRow, TrackedStateContext, TrackedStateRow};
@@ -78,7 +77,7 @@ pub(crate) async fn seed_version_head_with_rows(
                 &mut writes,
                 commit_id,
                 None,
-                &canonical_rows,
+                canonical_rows.iter().map(|row| row.as_ref()),
             )
             .await
             .expect("tracked root should write");
@@ -161,41 +160,6 @@ pub(crate) fn untracked_state_row_from_materialized(
         created_at: row.created_at.clone(),
         updated_at: row.updated_at.clone(),
         global: row.global,
-        version_id: row.version_id.clone(),
-    };
-    json_writer.flush_into(writes);
-    Ok(row)
-}
-
-pub(crate) fn live_state_row_from_materialized(
-    writes: &mut StorageWriteSet,
-    json_writer: &mut crate::json_store::JsonStoreWriter,
-    row: &MaterializedLiveStateRow,
-) -> Result<LiveStateRow, crate::LixError> {
-    let row = LiveStateRow {
-        entity_id: row.entity_id.clone(),
-        schema_key: row.schema_key.clone(),
-        file_id: row.file_id.clone(),
-        snapshot_ref: row
-            .snapshot_content
-            .as_deref()
-            .map(|value| prepare_json_ref(json_writer, value))
-            .transpose()?,
-        metadata_ref: row
-            .metadata
-            .as_ref()
-            .map(|value| {
-                let serialized = crate::serialize_row_metadata(value);
-                prepare_json_ref(json_writer, &serialized)
-            })
-            .transpose()?,
-        schema_version: row.schema_version.clone(),
-        created_at: row.created_at.clone(),
-        updated_at: row.updated_at.clone(),
-        global: row.global,
-        change_id: row.change_id.clone(),
-        commit_id: row.commit_id.clone(),
-        untracked: row.untracked,
         version_id: row.version_id.clone(),
     };
     json_writer.flush_into(writes);

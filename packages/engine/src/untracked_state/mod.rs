@@ -10,6 +10,6 @@ pub(crate) use materialization::{materialize_row, UntrackedMaterializationProjec
 #[allow(unused_imports)]
 pub(crate) use types::{
     MaterializedUntrackedStateRow, UntrackedStateFilter, UntrackedStateIdentity,
-    UntrackedStateProjection, UntrackedStateRow, UntrackedStateRowRequest,
-    UntrackedStateScanRequest,
+    UntrackedStateIdentityRef, UntrackedStateProjection, UntrackedStateRow, UntrackedStateRowRef,
+    UntrackedStateRowRequest, UntrackedStateScanRequest,
 };

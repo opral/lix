@@ -6,7 +6,7 @@ use crate::entity_identity::EntityIdentity;
 use crate::entity_identity::EntityIdentityPart;
 use crate::json_store::context::JsonStoreContext;
 use crate::json_store::types::{JsonProjectionPath, JsonRef, NormalizedJson};
-use crate::live_state::{LiveStateContext, LiveStateRow, LiveStateWriteBatch};
+use crate::live_state::LiveStateContext;
 use crate::schema_registry::SchemaRegistry;
 use crate::session::SessionMode;
 use crate::storage::{
@@ -604,7 +604,7 @@ async fn seed_transaction_visible_schema_rows(
             let key = crate::schema::schema_key_from_definition(&schema)
                 .expect("seed schema key should derive");
             let snapshot_content = serde_json::json!({ "value": schema }).to_string();
-            Ok(LiveStateRow {
+            Ok(crate::untracked_state::UntrackedStateRow {
                 entity_id: crate::schema::registered_schema_entity_id(
                     &key.schema_key,
                     &key.schema_version,
@@ -621,9 +621,6 @@ async fn seed_transaction_visible_schema_rows(
                 metadata_ref: None,
                 created_at: "1970-01-01T00:00:00.000Z".to_string(),
                 updated_at: "1970-01-01T00:00:00.000Z".to_string(),
-                change_id: None,
-                commit_id: None,
-                untracked: true,
                 global: true,
             })
         })
@@ -631,15 +628,7 @@ async fn seed_transaction_visible_schema_rows(
     let mut transaction = storage.begin_write_transaction().await?;
     {
         let mut writer = live_state.writer(transaction.as_mut());
-        writer
-            .stage_rows(
-                &mut writes,
-                LiveStateWriteBatch {
-                    untracked_rows: rows,
-                    tracked_roots: Vec::new(),
-                },
-            )
-            .await?;
+        writer.stage_untracked_rows(&mut writes, rows.iter().map(|row| row.as_ref()))?;
     }
     json_writer.flush_into(&mut writes);
     writes.apply(&mut transaction.as_mut()).await?;
@@ -2368,7 +2357,7 @@ pub async fn prepare_changelog_codec(
     let changes = changelog_changes(config);
     let encoded_changes = changes
         .iter()
-        .map(crate::changelog::codec::encode_change)
+        .map(|change| crate::changelog::codec::encode_change_ref(change.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ChangelogCodecFixture {
         changes,
@@ -2436,7 +2425,7 @@ pub async fn changelog_encode_only_prepared(
     let mut verified_rows = 0;
     let mut encoded_bytes = 0;
     for change in &fixture.changes {
-        encoded_bytes += crate::changelog::codec::encode_change(change)?.len();
+        encoded_bytes += crate::changelog::codec::encode_change_ref(change.as_ref())?.len();
         verified_rows += 1;
     }
     Ok(report(
@@ -3458,7 +3447,7 @@ async fn write_tracked_root(
                     &mut writes,
                     commit_id,
                     parent_commit_id,
-                    &canonical_rows,
+                    canonical_rows.iter().map(|row| row.as_ref()),
                 )
                 .await?;
         }
@@ -3500,7 +3489,7 @@ async fn write_untracked_rows(
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut writer = context.writer(&mut writes);
-        writer.stage_rows(&canonical_rows)?;
+        writer.stage_rows(canonical_rows.iter().map(|row| row.as_ref()))?;
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await
@@ -3538,7 +3527,7 @@ async fn append_changelog_changes(
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut writer = context.writer(&mut writes);
-        writer.stage_changes(&canonical_changes)?;
+        writer.stage_changes(canonical_changes.iter().map(|change| change.as_ref()))?;
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await

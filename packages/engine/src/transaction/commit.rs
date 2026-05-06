@@ -1,21 +1,26 @@
 use crate::binary_cas::BinaryCasContext;
-use crate::changelog::{CanonicalChange, ChangelogContext};
+use crate::changelog::{CanonicalChange, CanonicalChangeRef, ChangelogContext};
 use crate::functions::FunctionContext;
 #[cfg(test)]
 use crate::json_store::{JsonStoreContext, JsonStoreWriter, NormalizedJson};
-use crate::live_state::{
-    LiveStateContext, LiveStateRow, LiveStateTrackedRootWrite, LiveStateWriteBatch,
-};
+use crate::live_state::{LiveStateContext, LiveStateTrackedRowRef, LiveStateWriter};
 use crate::storage::{StorageReader, StorageWriteSet, StorageWriteTransaction};
+use crate::tracked_state::{TrackedStateKeyRef, TrackedStateRowRef, TrackedStateValueRef};
 use crate::transaction::prepare_version_ref_row;
 use crate::transaction::staging::PreparedWriteSet;
 use crate::transaction::types::{
     PreparedAdoptedStateRow, PreparedStateRow, StagedCommitMembers, TransactionJson,
 };
+use crate::untracked_state::{UntrackedStateIdentityRef, UntrackedStateRowRef};
 use crate::version::{VersionContext, VersionRefReader};
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 use std::collections::{BTreeMap, BTreeSet};
+
+const COMMIT_SCHEMA_KEY: &str = "lix_commit";
+
+type RowIndex = usize;
+type AdoptedRowIndex = usize;
 
 /// Commits prepared transaction rows into durable tracked and untracked stores.
 ///
@@ -43,10 +48,7 @@ pub(crate) async fn commit_prepared_writes(
         }
     }
 
-    let (mut changelog_rows, untracked_rows): (Vec<_>, Vec<_>) = prepared_writes
-        .state_rows
-        .into_iter()
-        .partition(|row| !row.untracked);
+    let mut state_rows = prepared_writes.state_rows;
     let adopted_rows = prepared_writes.adopted_rows;
     let finalized = finalize_commit_rows(
         prepared_writes.commit_members_by_version,
@@ -56,9 +58,11 @@ pub(crate) async fn commit_prepared_writes(
         &mut json_writer,
     )
     .await?;
-    changelog_rows.extend(finalized.commit_rows);
+    state_rows.extend(finalized.commit_rows);
     let version_heads = finalized.version_heads;
     let tracked_roots = finalized.tracked_roots;
+    let row_index = index_prepared_rows(&state_rows)?;
+    let adopted_index = index_adopted_rows(&adopted_rows);
 
     if let Some(runtime_functions) = runtime_functions {
         let mut writer = live_state.writer(&mut *transaction);
@@ -67,47 +71,69 @@ pub(crate) async fn commit_prepared_writes(
             .await?;
     }
 
-    if changelog_rows.is_empty()
+    if state_rows.is_empty()
         && adopted_rows.is_empty()
-        && untracked_rows.is_empty()
         && version_heads.is_empty()
         && writes.is_empty()
     {
         return Ok(());
     }
 
-    let canonical_changes = if !changelog_rows.is_empty() {
-        let canonical_changes =
-            new_canonical_changes(changelog, transaction, &changelog_rows).await?;
+    if !row_index.changelog_row_indices.is_empty() {
+        validate_new_canonical_changes(
+            changelog,
+            transaction,
+            &state_rows,
+            &row_index.changelog_row_indices,
+        )
+        .await?;
         {
             let mut writer = changelog.writer(&mut writes);
-            writer.stage_changes(&canonical_changes)?;
+            for &row_index in &row_index.changelog_row_indices {
+                writer.stage_changes(std::iter::once(canonical_change_ref_from_state_row(
+                    &state_rows[row_index],
+                )?))?;
+            }
         }
-        canonical_changes
-    } else {
-        Vec::new()
-    };
-    let adopted_changes = if !adopted_rows.is_empty() {
-        validate_adopted_canonical_changes(changelog, transaction, &adopted_rows).await?
-    } else {
-        Vec::new()
-    };
+    }
+    if !adopted_rows.is_empty() {
+        validate_adopted_canonical_changes(changelog, transaction, &adopted_rows).await?;
+    }
 
     // The serving projection is updated in the same backend transaction as the
     // changelog append. Tracked rows become prolly mutations under their owning
     // commit root; untracked rows remain in the separate local overlay store.
-    let live_state_batch = live_state_batch_from_committed_rows(
-        &changelog_rows,
-        &canonical_changes,
-        &adopted_rows,
-        &adopted_changes,
-        &untracked_rows,
-        tracked_roots,
-    )?;
-
     {
         let mut writer = live_state.writer(&mut *transaction);
-        writer.stage_rows(&mut writes, live_state_batch).await?;
+        writer.stage_untracked_rows(
+            &mut writes,
+            row_index
+                .untracked_row_indices
+                .iter()
+                .map(|&row_index| untracked_row_ref_from_state_row(&state_rows[row_index])),
+        )?;
+        writer.stage_delete_untracked_rows(
+            &mut writes,
+            row_index
+                .changelog_row_indices
+                .iter()
+                .map(|&row_index| untracked_identity_ref_from_state_row(&state_rows[row_index]))
+                .chain(
+                    adopted_rows
+                        .iter()
+                        .map(untracked_identity_ref_from_adopted_row),
+                ),
+        );
+        stage_tracked_roots(
+            &mut writer,
+            &mut writes,
+            &state_rows,
+            row_index.tracked_row_indices_by_commit,
+            &adopted_rows,
+            adopted_index.tracked_row_indices_by_commit,
+            tracked_roots,
+        )
+        .await?;
     }
 
     for version_head in version_heads {
@@ -125,18 +151,71 @@ pub(crate) async fn commit_prepared_writes(
     Ok(())
 }
 
-async fn new_canonical_changes(
+struct PreparedRowIndex {
+    changelog_row_indices: Vec<RowIndex>,
+    untracked_row_indices: Vec<RowIndex>,
+    tracked_row_indices_by_commit: BTreeMap<String, Vec<RowIndex>>,
+}
+
+struct PreparedAdoptedRowIndex {
+    tracked_row_indices_by_commit: BTreeMap<String, Vec<AdoptedRowIndex>>,
+}
+
+fn index_prepared_rows(rows: &[PreparedStateRow]) -> Result<PreparedRowIndex, LixError> {
+    let mut changelog_row_indices = Vec::new();
+    let mut untracked_row_indices = Vec::new();
+    let mut tracked_row_indices_by_commit = BTreeMap::<String, Vec<RowIndex>>::new();
+
+    for (row_index, row) in rows.iter().enumerate() {
+        if row.untracked {
+            untracked_row_indices.push(row_index);
+            continue;
+        }
+        let Some(commit_id) = row.commit_id.as_ref() else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked prepared row is missing commit_id before commit indexing",
+            ));
+        };
+        changelog_row_indices.push(row_index);
+        tracked_row_indices_by_commit
+            .entry(commit_id.clone())
+            .or_default()
+            .push(row_index);
+    }
+
+    Ok(PreparedRowIndex {
+        changelog_row_indices,
+        untracked_row_indices,
+        tracked_row_indices_by_commit,
+    })
+}
+
+fn index_adopted_rows(rows: &[PreparedAdoptedStateRow]) -> PreparedAdoptedRowIndex {
+    let mut tracked_row_indices_by_commit = BTreeMap::<String, Vec<AdoptedRowIndex>>::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        tracked_row_indices_by_commit
+            .entry(row.commit_id.clone())
+            .or_default()
+            .push(row_index);
+    }
+    PreparedAdoptedRowIndex {
+        tracked_row_indices_by_commit,
+    }
+}
+
+async fn validate_new_canonical_changes(
     changelog: &ChangelogContext,
     transaction: &mut (impl StorageReader + ?Sized),
     rows: &[PreparedStateRow],
-) -> Result<Vec<CanonicalChange>, LixError> {
+    row_indices: &[RowIndex],
+) -> Result<(), LixError> {
     let reader = changelog.reader(&mut *transaction);
-    let mut changes = Vec::with_capacity(rows.len());
-    let mut change_ids = Vec::with_capacity(rows.len());
+    let mut change_ids = Vec::with_capacity(row_indices.len());
     let mut seen_change_ids = BTreeSet::new();
-    for row in rows {
-        let change = canonical_change_from_staged_row(row)?;
-        if !seen_change_ids.insert(change.id.clone()) {
+    for &row_index in row_indices {
+        let change = canonical_change_ref_from_state_row(&rows[row_index])?;
+        if !seen_change_ids.insert(change.id) {
             return Err(LixError::new(
                 LixError::CODE_UNIQUE,
                 format!(
@@ -145,11 +224,10 @@ async fn new_canonical_changes(
                 ),
             ));
         }
-        change_ids.push(change.id.clone());
-        changes.push(change);
+        change_ids.push(change.id.to_string());
     }
     let existing_changes = reader.load_changes(&change_ids).await?;
-    for (change, existing) in changes.iter().zip(existing_changes) {
+    for (change_id, existing) in change_ids.iter().zip(existing_changes) {
         let Some(existing) = existing else {
             continue;
         };
@@ -161,24 +239,23 @@ async fn new_canonical_changes(
             LixError::CODE_UNIQUE,
             format!(
                 "canonical change id '{}' already exists with different content for schema '{}' entity '{}'",
-                change.id, existing.schema_key, entity_id
+                change_id, existing.schema_key, entity_id
             ),
         ));
     }
-    Ok(changes)
+    Ok(())
 }
 
 async fn validate_adopted_canonical_changes(
     changelog: &ChangelogContext,
     transaction: &mut (impl StorageReader + ?Sized),
     rows: &[PreparedAdoptedStateRow],
-) -> Result<Vec<CanonicalChange>, LixError> {
-    let mut changes = Vec::with_capacity(rows.len());
+) -> Result<(), LixError> {
     let mut change_ids = Vec::with_capacity(rows.len());
     let mut seen_change_ids = BTreeSet::new();
     for row in rows {
-        let expected = canonical_change_from_adopted_row(row)?;
-        if !seen_change_ids.insert(expected.id.clone()) {
+        let expected = canonical_change_ref_from_adopted_row(row);
+        if !seen_change_ids.insert(expected.id) {
             return Err(LixError::new(
                 LixError::CODE_UNIQUE,
                 format!(
@@ -187,15 +264,17 @@ async fn validate_adopted_canonical_changes(
                 ),
             ));
         }
-        change_ids.push(expected.id.clone());
-        changes.push(expected);
+        change_ids.push(expected.id.to_string());
     }
     let reader = changelog.reader(&mut *transaction);
     let existing_changes = reader.load_changes(&change_ids).await?;
-    let mut loaded_changes = Vec::with_capacity(changes.len());
-    for (expected, existing) in changes.into_iter().zip(existing_changes) {
+    for (expected, existing) in rows
+        .iter()
+        .map(canonical_change_ref_from_adopted_row)
+        .zip(existing_changes)
+    {
         match existing {
-            Some(existing) if existing == expected => loaded_changes.push(existing),
+            Some(existing) if canonical_change_matches_ref(&existing, expected) => {}
             Some(existing) => {
                 let entity_id = existing
                     .entity_id
@@ -220,186 +299,217 @@ async fn validate_adopted_canonical_changes(
             }
         }
     }
-    Ok(loaded_changes)
+    Ok(())
 }
 
-fn live_state_batch_from_committed_rows(
-    changelog_rows: &[PreparedStateRow],
-    canonical_changes: &[CanonicalChange],
+async fn stage_tracked_roots<S>(
+    writer: &mut LiveStateWriter<S>,
+    writes: &mut StorageWriteSet,
+    state_rows: &[PreparedStateRow],
+    mut tracked_row_indices_by_commit: BTreeMap<String, Vec<RowIndex>>,
     adopted_rows: &[PreparedAdoptedStateRow],
-    adopted_changes: &[CanonicalChange],
-    untracked_rows: &[PreparedStateRow],
+    mut adopted_row_indices_by_commit: BTreeMap<String, Vec<AdoptedRowIndex>>,
     tracked_roots: Vec<PendingTrackedRoot>,
-) -> Result<LiveStateWriteBatch, LixError> {
-    let mut tracked_rows_by_commit = BTreeMap::<String, Vec<LiveStateRow>>::new();
-    for (row, change) in changelog_rows.iter().zip(canonical_changes) {
-        let Some(commit_id) = row.commit_id.as_ref() else {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked staged row is missing commit_id before live_state write",
-            ));
-        };
-        tracked_rows_by_commit
-            .entry(commit_id.clone())
-            .or_default()
-            .push(live_state_row_from_canonical_change(row, change, commit_id));
-    }
-    for (row, change) in adopted_rows.iter().zip(adopted_changes) {
-        tracked_rows_by_commit
-            .entry(row.commit_id.clone())
-            .or_default()
-            .push(live_state_row_from_adopted_change(row, change));
-    }
-
-    let mut live_tracked_roots = Vec::new();
+) -> Result<(), LixError>
+where
+    S: StorageReader,
+{
     for root in tracked_roots {
-        let rows = tracked_rows_by_commit
+        let state_row_indices = tracked_row_indices_by_commit
             .remove(&root.commit_id)
             .unwrap_or_default();
-        live_tracked_roots.push(LiveStateTrackedRootWrite {
-            commit_id: root.commit_id,
-            parent_commit_id: root.parent_commit_id,
-            rows,
-        });
+        let adopted_row_indices = adopted_row_indices_by_commit
+            .remove(&root.commit_id)
+            .unwrap_or_default();
+        let mut root_rows = Vec::with_capacity(state_row_indices.len() + adopted_row_indices.len());
+        for row_index in state_row_indices {
+            if let Some(row) = tracked_state_row_ref_from_state_row(&state_rows[row_index])? {
+                root_rows.push(row);
+            }
+        }
+        for row_index in adopted_row_indices {
+            root_rows.push(tracked_state_row_ref_from_adopted_row(
+                &adopted_rows[row_index],
+            ));
+        }
+        writer
+            .stage_tracked_root(
+                writes,
+                &root.version_id,
+                &root.commit_id,
+                root.parent_commit_id.as_deref(),
+                root_rows,
+            )
+            .await?;
     }
-    if !tracked_rows_by_commit.is_empty() {
+    if !tracked_row_indices_by_commit.is_empty() || !adopted_row_indices_by_commit.is_empty() {
+        let mut commit_ids = tracked_row_indices_by_commit
+            .keys()
+            .chain(adopted_row_indices_by_commit.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        commit_ids.sort();
+        commit_ids.dedup();
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
                 "tracked live_state rows have no finalized root metadata for commit ids: {}",
-                tracked_rows_by_commit
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                commit_ids.join(", ")
             ),
         ));
     }
-
-    let untracked_rows = untracked_rows
-        .iter()
-        .map(live_state_row_from_untracked_staged_row)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(LiveStateWriteBatch {
-        untracked_rows,
-        tracked_roots: live_tracked_roots,
-    })
+    Ok(())
 }
 
-fn live_state_row_from_canonical_change(
-    row: &PreparedStateRow,
+fn canonical_change_matches_ref(
     change: &CanonicalChange,
-    commit_id: &str,
-) -> LiveStateRow {
-    LiveStateRow {
-        entity_id: change.entity_id.clone(),
-        schema_key: change.schema_key.clone(),
-        file_id: change.file_id.clone(),
-        snapshot_ref: change.snapshot_ref.clone(),
-        metadata_ref: change.metadata_ref.clone(),
-        schema_version: change.schema_version.clone(),
-        created_at: change.created_at.clone(),
-        updated_at: row.updated_at.clone(),
-        global: row.global,
-        change_id: Some(change.id.clone()),
-        commit_id: Some(commit_id.to_string()),
-        untracked: false,
-        version_id: row.version_id.clone(),
-    }
+    expected: CanonicalChangeRef<'_>,
+) -> bool {
+    change.id == expected.id
+        && &change.entity_id == expected.entity_id
+        && change.schema_key == expected.schema_key
+        && change.schema_version == expected.schema_version
+        && change.file_id.as_deref() == expected.file_id
+        && change.snapshot_ref.as_ref() == expected.snapshot_ref
+        && change.metadata_ref.as_ref() == expected.metadata_ref
+        && change.created_at == expected.created_at
 }
 
-fn live_state_row_from_adopted_change(
-    row: &PreparedAdoptedStateRow,
-    change: &CanonicalChange,
-) -> LiveStateRow {
-    LiveStateRow {
-        entity_id: change.entity_id.clone(),
-        schema_key: change.schema_key.clone(),
-        file_id: change.file_id.clone(),
-        snapshot_ref: change.snapshot_ref.clone(),
-        metadata_ref: change.metadata_ref.clone(),
-        schema_version: change.schema_version.clone(),
-        created_at: change.created_at.clone(),
-        updated_at: row.updated_at.clone(),
-        global: row.global,
-        change_id: Some(change.id.clone()),
-        commit_id: Some(row.commit_id.clone()),
-        untracked: false,
-        version_id: row.version_id.clone(),
-    }
-}
-
-fn live_state_row_from_untracked_staged_row(
+fn canonical_change_ref_from_state_row(
     row: &PreparedStateRow,
-) -> Result<LiveStateRow, LixError> {
-    Ok(LiveStateRow {
-        entity_id: row.entity_id.clone(),
-        schema_key: row.schema_key.clone(),
-        file_id: row.file_id.clone(),
-        snapshot_ref: row
-            .snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.json_ref.clone()),
-        metadata_ref: row
-            .metadata
-            .as_ref()
-            .map(|metadata| metadata.json_ref.clone()),
-        schema_version: row.schema_version.clone(),
-        created_at: row.created_at.clone(),
-        updated_at: row.updated_at.clone(),
-        global: row.global,
-        change_id: None,
-        commit_id: None,
-        untracked: true,
-        version_id: row.version_id.clone(),
-    })
-}
-
-fn canonical_change_from_staged_row(row: &PreparedStateRow) -> Result<CanonicalChange, LixError> {
-    let Some(change_id) = row.change_id.as_ref() else {
+) -> Result<CanonicalChangeRef<'_>, LixError> {
+    let Some(change_id) = row.change_id.as_deref() else {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             "tracked staged row is missing change_id before changelog append",
         ));
     };
 
-    Ok(CanonicalChange {
-        id: change_id.clone(),
-        entity_id: row.entity_id.clone(),
-        schema_key: row.schema_key.clone(),
-        schema_version: row.schema_version.clone(),
-        file_id: row.file_id.clone(),
-        snapshot_ref: row
-            .snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.json_ref.clone()),
-        metadata_ref: row
-            .metadata
-            .as_ref()
-            .map(|metadata| metadata.json_ref.clone()),
-        created_at: row.created_at.clone(),
+    Ok(CanonicalChangeRef {
+        id: change_id,
+        entity_id: &row.entity_id,
+        schema_key: &row.schema_key,
+        schema_version: &row.schema_version,
+        file_id: row.file_id.as_deref(),
+        snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
+        metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
+        created_at: &row.created_at,
     })
 }
 
-fn canonical_change_from_adopted_row(
+fn canonical_change_ref_from_adopted_row(row: &PreparedAdoptedStateRow) -> CanonicalChangeRef<'_> {
+    CanonicalChangeRef {
+        id: &row.change_id,
+        entity_id: &row.entity_id,
+        schema_key: &row.schema_key,
+        schema_version: &row.schema_version,
+        file_id: row.file_id.as_deref(),
+        snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
+        metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
+        created_at: &row.created_at,
+    }
+}
+
+fn untracked_row_ref_from_state_row(row: &PreparedStateRow) -> UntrackedStateRowRef<'_> {
+    UntrackedStateRowRef {
+        entity_id: &row.entity_id,
+        schema_key: &row.schema_key,
+        file_id: row.file_id.as_deref(),
+        snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
+        metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
+        schema_version: &row.schema_version,
+        created_at: &row.created_at,
+        updated_at: &row.updated_at,
+        global: row.global,
+        version_id: &row.version_id,
+    }
+}
+
+fn untracked_identity_ref_from_state_row(row: &PreparedStateRow) -> UntrackedStateIdentityRef<'_> {
+    UntrackedStateIdentityRef {
+        version_id: &row.version_id,
+        schema_key: &row.schema_key,
+        entity_id: &row.entity_id,
+        file_id: row.file_id.as_deref(),
+    }
+}
+
+fn untracked_identity_ref_from_adopted_row(
     row: &PreparedAdoptedStateRow,
-) -> Result<CanonicalChange, LixError> {
-    Ok(CanonicalChange {
-        id: row.change_id.clone(),
-        entity_id: row.entity_id.clone(),
-        schema_key: row.schema_key.clone(),
-        schema_version: row.schema_version.clone(),
-        file_id: row.file_id.clone(),
-        snapshot_ref: row
-            .snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.json_ref.clone()),
-        metadata_ref: row
-            .metadata
-            .as_ref()
-            .map(|metadata| metadata.json_ref.clone()),
-        created_at: row.created_at.clone(),
-    })
+) -> UntrackedStateIdentityRef<'_> {
+    UntrackedStateIdentityRef {
+        version_id: &row.version_id,
+        schema_key: &row.schema_key,
+        entity_id: &row.entity_id,
+        file_id: row.file_id.as_deref(),
+    }
+}
+
+fn tracked_state_row_ref_from_state_row(
+    row: &PreparedStateRow,
+) -> Result<Option<LiveStateTrackedRowRef<'_>>, LixError> {
+    if row.schema_key == COMMIT_SCHEMA_KEY {
+        return Ok(None);
+    }
+    let Some(change_id) = row.change_id.as_deref() else {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked staged row is missing change_id before tracked_state write",
+        ));
+    };
+    let Some(commit_id) = row.commit_id.as_deref() else {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked staged row is missing commit_id before tracked_state write",
+        ));
+    };
+    Ok(Some(LiveStateTrackedRowRef {
+        global: row.global,
+        version_id: &row.version_id,
+        row: TrackedStateRowRef {
+            key: TrackedStateKeyRef {
+                schema_key: &row.schema_key,
+                file_id: row.file_id.as_deref(),
+                entity_id: &row.entity_id,
+            },
+            value: TrackedStateValueRef {
+                snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
+                metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
+                schema_version: &row.schema_version,
+                created_at: &row.created_at,
+                updated_at: &row.updated_at,
+                change_id,
+                commit_id,
+                deleted: row.snapshot.is_none(),
+            },
+        },
+    }))
+}
+
+fn tracked_state_row_ref_from_adopted_row(
+    row: &PreparedAdoptedStateRow,
+) -> LiveStateTrackedRowRef<'_> {
+    LiveStateTrackedRowRef {
+        global: row.global,
+        version_id: &row.version_id,
+        row: TrackedStateRowRef {
+            key: TrackedStateKeyRef {
+                schema_key: &row.schema_key,
+                file_id: row.file_id.as_deref(),
+                entity_id: &row.entity_id,
+            },
+            value: TrackedStateValueRef {
+                snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
+                metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
+                schema_version: &row.schema_version,
+                created_at: &row.created_at,
+                updated_at: &row.updated_at,
+                change_id: &row.change_id,
+                commit_id: &row.commit_id,
+                deleted: row.snapshot.is_none(),
+            },
+        },
+    }
 }
 
 /// Materializes tracked staged membership into `lix_commit` rows.
@@ -434,6 +544,7 @@ struct PendingVersionHead {
 }
 
 struct PendingTrackedRoot {
+    version_id: String,
     commit_id: String,
     parent_commit_id: Option<String>,
 }
@@ -505,11 +616,12 @@ async fn finalize_commit_rows(
             version_id: GLOBAL_VERSION_ID.to_string(),
         });
         version_heads.push(PendingVersionHead {
-            version_id,
+            version_id: version_id.clone(),
             commit_id: commit_id.clone(),
             timestamp,
         });
         tracked_roots.push(PendingTrackedRoot {
+            version_id,
             commit_id,
             parent_commit_id,
         });
@@ -550,9 +662,7 @@ mod tests {
         BackendWriteTransaction,
     };
     use crate::changelog::ChangelogContext;
-    use crate::live_state::{
-        LiveStateContext, LiveStateRow, LiveStateRowRequest, LiveStateWriteBatch,
-    };
+    use crate::live_state::{LiveStateContext, LiveStateRowRequest};
     use crate::storage::StorageContext;
     use crate::untracked_state::{
         MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateRowRequest,
@@ -737,7 +847,7 @@ mod tests {
         };
         untracked_state
             .writer(&mut writes)
-            .stage_rows(&[canonical_row])
+            .stage_rows(std::iter::once(canonical_row.as_ref()))
             .expect("untracked seed should write");
         writes
             .apply(&mut seed_transaction.as_mut())
@@ -829,32 +939,23 @@ mod tests {
                 )))
                 .expect("deterministic mode snapshot should stage");
             {
+                let row = crate::untracked_state::UntrackedStateRow {
+                    entity_id: crate::entity_identity::EntityIdentity::single(
+                        DETERMINISTIC_MODE_KEY,
+                    ),
+                    schema_key: "lix_key_value".to_string(),
+                    file_id: None,
+                    snapshot_ref: Some(mode_snapshot_ref),
+                    metadata_ref: None,
+                    schema_version: "1".to_string(),
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    global: true,
+                    version_id: GLOBAL_VERSION_ID.to_string(),
+                };
                 let mut writer = live_state.writer(seed_transaction.as_mut());
                 writer
-                    .stage_rows(
-                        &mut writes,
-                        LiveStateWriteBatch {
-                            untracked_rows: vec![LiveStateRow {
-                                entity_id: crate::entity_identity::EntityIdentity::single(
-                                    DETERMINISTIC_MODE_KEY,
-                                ),
-                                schema_key: "lix_key_value".to_string(),
-                                file_id: None,
-                                snapshot_ref: Some(mode_snapshot_ref),
-                                metadata_ref: None,
-                                schema_version: "1".to_string(),
-                                created_at: "2026-01-01T00:00:00Z".to_string(),
-                                updated_at: "2026-01-01T00:00:00Z".to_string(),
-                                global: true,
-                                change_id: None,
-                                commit_id: None,
-                                untracked: true,
-                                version_id: GLOBAL_VERSION_ID.to_string(),
-                            }],
-                            tracked_roots: Vec::new(),
-                        },
-                    )
-                    .await
+                    .stage_untracked_rows(&mut writes, std::iter::once(row.as_ref()))
                     .expect("deterministic mode should stage");
             }
             json_writer.flush_into(&mut writes);

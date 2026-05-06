@@ -2,6 +2,7 @@ use crate::commit_graph::CommitGraphContext;
 use crate::json_store::JsonStoreContext;
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::tracked_state::by_file_index::ByFileIndex;
+use crate::tracked_state::codec::{encode_key_ref, encode_value_ref};
 use crate::tracked_state::diff::{diff_commits, TrackedStateDiff, TrackedStateDiffRequest};
 use crate::tracked_state::materialize_value;
 use crate::tracked_state::merge::{self, TrackedStateMergePlan};
@@ -9,10 +10,11 @@ use crate::tracked_state::rebuild::TrackedStateRebuildReport;
 use crate::tracked_state::storage;
 use crate::tracked_state::tree::TrackedStateTree;
 use crate::tracked_state::tree_types::{
-    TrackedStateKey, TrackedStateMutation, TrackedStateTreeScanRequest, TrackedStateValue,
+    TrackedStateKey, TrackedStateMutation, TrackedStateRowRef, TrackedStateTreeScanRequest,
+    TrackedStateValue,
 };
 use crate::tracked_state::{
-    MaterializedTrackedStateRow, TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
+    MaterializedTrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
 };
 use crate::LixError;
 
@@ -315,14 +317,18 @@ impl TrackedStateWriter {
     /// `parent_commit_id` is the tracked-state root to layer mutations on top
     /// of. Rebuild passes `None` because it has already materialized the full
     /// entity set for the requested head.
-    pub(crate) async fn stage_root(
+    pub(crate) async fn stage_root<'a, I>(
         &mut self,
         store: &mut (impl StorageReader + ?Sized),
         writes: &mut StorageWriteSet,
         commit_id: &str,
         parent_commit_id: Option<&str>,
-        rows: &[TrackedStateRow],
-    ) -> Result<TrackedStateWriteReceipt, LixError> {
+        rows: I,
+    ) -> Result<TrackedStateWriteReceipt, LixError>
+    where
+        I: IntoIterator<Item = TrackedStateRowRef<'a>>,
+    {
+        let rows = rows.into_iter().collect::<Vec<_>>();
         let base_root = match parent_commit_id {
             Some(parent_commit_id) => {
                 let Some(root) = self.tree.load_root(store, parent_commit_id).await? else {
@@ -337,15 +343,17 @@ impl TrackedStateWriter {
             }
             None => None,
         };
-        let mut stored_rows = Vec::with_capacity(rows.len());
         let mut mutations = Vec::with_capacity(rows.len());
-        for row in rows {
-            let stored_value = TrackedStateValue::from_row(row);
-            mutations.push(TrackedStateMutation::put(
-                TrackedStateKey::from_row(row),
-                stored_value.clone(),
+        let mut by_file_mutations = Vec::with_capacity(rows.len());
+        for row in &rows {
+            mutations.push(TrackedStateMutation::put_encoded(
+                encode_key_ref(row.key),
+                encode_value_ref(row.value),
             ));
-            stored_rows.push((row, stored_value));
+            by_file_mutations.push(TrackedStateMutation::put_encoded(
+                ByFileIndex::encode_key_ref(row.key),
+                ByFileIndex::encode_header_value_ref(row.value),
+            ));
         }
         let result = self
             .tree
@@ -372,13 +380,6 @@ impl TrackedStateWriter {
                 .map(Some)?,
             None => None,
         };
-        let mut by_file_mutations = Vec::with_capacity(rows.len());
-        for (row, stored_value) in &stored_rows {
-            by_file_mutations.push(TrackedStateMutation::put(
-                ByFileIndex::key_from_row(row),
-                ByFileIndex::header_value_from_primary(stored_value),
-            ));
-        }
         let by_file_result = self
             .tree
             .apply_mutations(
@@ -945,7 +946,7 @@ mod tests {
                     &mut writes,
                     commit_id,
                     parent_commit_id,
-                    &canonical_rows,
+                    canonical_rows.iter().map(|row| row.as_ref()),
                 )
                 .await?
         };
