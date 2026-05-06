@@ -18,7 +18,7 @@ simulation_test!(
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine2_history_table_type\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+             lix_json('{\"x-lix-key\":\"engine_history_table_type\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
              false,\
              true\
              )",
@@ -35,14 +35,14 @@ simulation_test!(
            'lix_state_history',\
            'lix_file_history',\
            'lix_directory_history',\
-           'engine2_history_table_type_history'\
+           'engine_history_table_type_history'\
          ) \
          ORDER BY table_name",
         )
         .await;
 
         let expected = [
-            "engine2_history_table_type_history",
+            "engine_history_table_type_history",
             "lix_directory_history",
             "lix_file_history",
             "lix_state_history",
@@ -76,7 +76,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine2_history_contract_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"active\":{\"type\":\"boolean\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"count\",\"active\",\"meta\"],\"additionalProperties\":false}'),\
+                 lix_json('{\"x-lix-key\":\"engine_history_contract_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"active\":{\"type\":\"boolean\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"count\",\"active\",\"meta\"],\"additionalProperties\":false}'),\
                  false,\
                  true\
                  )",
@@ -92,7 +92,7 @@ simulation_test!(
              WHERE table_name IN (\
                'lix_file_history',\
                'lix_directory_history',\
-               'engine2_history_contract_schema_history'\
+               'engine_history_contract_schema_history'\
              ) \
                AND (\
                  column_name IN ('path', 'directory_id', 'parent_id', 'name', 'hidden', 'data', 'id', 'count', 'active', 'meta') \
@@ -103,15 +103,15 @@ simulation_test!(
         .await;
 
         let expected = vec![
-            ("engine2_history_contract_schema_history", "active", "YES"),
-            ("engine2_history_contract_schema_history", "count", "YES"),
-            ("engine2_history_contract_schema_history", "id", "YES"),
+            ("engine_history_contract_schema_history", "active", "YES"),
+            ("engine_history_contract_schema_history", "count", "YES"),
+            ("engine_history_contract_schema_history", "id", "YES"),
             (
-                "engine2_history_contract_schema_history",
+                "engine_history_contract_schema_history",
                 "lixcol_snapshot_content",
                 "YES",
             ),
-            ("engine2_history_contract_schema_history", "meta", "YES"),
+            ("engine_history_contract_schema_history", "meta", "YES"),
             ("lix_directory_history", "hidden", "YES"),
             ("lix_directory_history", "id", "NO"),
             ("lix_directory_history", "lixcol_snapshot_content", "YES"),
@@ -156,7 +156,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine2_history_conformance\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}'),\
+                 lix_json('{\"x-lix-key\":\"engine_history_conformance\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}'),\
                  false,\
                  true\
                  )",
@@ -167,7 +167,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO engine2_history_conformance \
+                "INSERT INTO engine_history_conformance \
                  (lixcol_entity_id, id, value, lixcol_untracked) \
                  VALUES ('history-conformance-entity', 'history-conformance-entity', 'one', false)",
                 &[],
@@ -176,7 +176,7 @@ simulation_test!(
             .expect("entity insert should succeed");
         session
             .execute(
-                "UPDATE engine2_history_conformance \
+                "UPDATE engine_history_conformance \
                  SET value = 'two' \
                  WHERE lixcol_entity_id = 'history-conformance-entity'",
                 &[],
@@ -185,7 +185,7 @@ simulation_test!(
             .expect("entity update should succeed");
         session
             .execute(
-                "DELETE FROM engine2_history_conformance \
+                "DELETE FROM engine_history_conformance \
                  WHERE lixcol_entity_id = 'history-conformance-entity'",
                 &[],
             )
@@ -195,7 +195,7 @@ simulation_test!(
         let typed_rows = select_rows(
             &session,
             "SELECT id, value, lixcol_entity_id, lixcol_snapshot_content, lixcol_depth \
-             FROM engine2_history_conformance_history \
+             FROM engine_history_conformance_history \
              WHERE lixcol_start_commit_id = lix_active_version_commit_id() \
                AND lixcol_entity_id = 'history-conformance-entity' \
              ORDER BY lixcol_depth",
@@ -218,7 +218,7 @@ simulation_test!(
             "SELECT snapshot_content, depth \
              FROM lix_state_history \
              WHERE start_commit_id = lix_active_version_commit_id() \
-               AND schema_key = 'engine2_history_conformance' \
+               AND schema_key = 'engine_history_conformance' \
                AND entity_id = 'history-conformance-entity' \
                AND snapshot_content IS NULL",
         )
@@ -306,7 +306,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine2_history_composite_pk\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/namespace\",\"/id\"],\"type\":\"object\",\"properties\":{\"namespace\":{\"type\":\"string\"},\"id\":{\"type\":\"integer\"},\"value\":{\"type\":\"string\"}},\"required\":[\"namespace\",\"id\",\"value\"],\"additionalProperties\":false}'),\
+                 lix_json('{\"x-lix-key\":\"engine_history_composite_pk\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/namespace\",\"/id\"],\"type\":\"object\",\"properties\":{\"namespace\":{\"type\":\"string\"},\"id\":{\"type\":\"integer\"},\"value\":{\"type\":\"string\"}},\"required\":[\"namespace\",\"id\",\"value\"],\"additionalProperties\":false}'),\
                  false,\
                  true\
                  )",
@@ -317,7 +317,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO engine2_history_composite_pk \
+                "INSERT INTO engine_history_composite_pk \
                  (namespace, id, value, lixcol_untracked) \
                  VALUES ('messages', 7, 'one', false)",
                 &[],
@@ -326,7 +326,7 @@ simulation_test!(
             .expect("composite entity insert should succeed");
         session
             .execute(
-                "DELETE FROM engine2_history_composite_pk \
+                "DELETE FROM engine_history_composite_pk \
                  WHERE namespace = 'messages' AND id = 7",
                 &[],
             )
@@ -336,7 +336,7 @@ simulation_test!(
         let rows = select_rows(
             &session,
             "SELECT namespace, id, value, lixcol_snapshot_content, lixcol_depth \
-             FROM engine2_history_composite_pk_history \
+             FROM engine_history_composite_pk_history \
              WHERE lixcol_start_commit_id = lix_active_version_commit_id() \
                AND namespace = 'messages' \
                AND id = 7 \

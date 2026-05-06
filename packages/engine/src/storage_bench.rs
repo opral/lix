@@ -5,7 +5,7 @@ use crate::changelog::{
 use crate::entity_identity::EntityIdentity;
 use crate::entity_identity::EntityIdentityPart;
 use crate::json_store::context::JsonStoreContext;
-use crate::json_store::types::{JsonProjectionPath, JsonRef};
+use crate::json_store::types::{JsonProjectionPath, JsonRef, NormalizedJson};
 use crate::live_state::{LiveStateContext, LiveStateRow, LiveStateWriteBatch};
 use crate::schema_registry::SchemaRegistry;
 use crate::session::SessionMode;
@@ -18,19 +18,34 @@ use crate::tracked_state::{
     TrackedStateProjection, TrackedStateRowRequest, TrackedStateScanRequest,
 };
 use crate::transaction::open_transaction;
-use crate::transaction::types::{StageRow, StageWrite, StageWriteMode};
+use crate::transaction::types::{
+    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
+};
 use crate::untracked_state::{
     MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter,
     UntrackedStateProjection, UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
 use crate::version::VersionContext;
-use crate::{Backend, LixError, NullableKeyFilter, RowMetadata};
+use crate::{Backend, LixError, NullableKeyFilter};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+fn prepare_json_ref(
+    writer: &mut crate::json_store::JsonStoreWriter,
+    document: &[u8],
+) -> Result<JsonRef, LixError> {
+    let text = std::str::from_utf8(document).map_err(|error| {
+        LixError::new(
+            LixError::CODE_UNKNOWN,
+            format!("benchmark JSON document is invalid UTF-8: {error}"),
+        )
+    })?;
+    writer.prepare_json(NormalizedJson::from_arc_unchecked(Arc::from(text)))
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct StorageBenchConfig {
@@ -154,7 +169,7 @@ pub struct TransactionBenchFixture {
     changelog: Arc<ChangelogContext>,
     version_ctx: Arc<VersionContext>,
     schema_registry: Arc<SchemaRegistry>,
-    rows: Vec<StageRow>,
+    rows: Vec<TransactionWriteRow>,
 }
 
 pub struct TransactionCommitOnlyFixture {
@@ -399,8 +414,8 @@ pub async fn transaction_commit_prepared(
     let started_at = Instant::now();
     if !fixture.rows.is_empty() {
         transaction
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(TransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: fixture.rows.clone(),
             })
             .await?;
@@ -459,8 +474,8 @@ pub async fn transaction_stage_only_prepared(
     let started_at = Instant::now();
     if !fixture.rows.is_empty() {
         transaction
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(TransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: fixture.rows.clone(),
             })
             .await?;
@@ -495,8 +510,8 @@ pub async fn prepare_transaction_commit_only(
     let rows = fixture.rows.len();
     if !fixture.rows.is_empty() {
         transaction
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(TransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: fixture.rows,
             })
             .await?;
@@ -548,7 +563,7 @@ async fn prepare_transaction_payload_fixture(
 
 async fn prepare_transaction_fixture(
     backend: Arc<dyn Backend + Send + Sync>,
-    rows: Vec<StageRow>,
+    rows: Vec<TransactionWriteRow>,
 ) -> Result<TransactionBenchFixture, LixError> {
     let storage = StorageContext::new(backend);
     let tracked_state = Arc::new(TrackedStateContext::new());
@@ -599,9 +614,10 @@ async fn seed_transaction_visible_schema_rows(
                 file_id: None,
                 version_id: crate::GLOBAL_VERSION_ID.to_string(),
                 schema_version: "1".to_string(),
-                snapshot_ref: Some(
-                    json_writer.stage_bytes(&mut writes, snapshot_content.as_bytes())?,
-                ),
+                snapshot_ref: Some(prepare_json_ref(
+                    &mut json_writer,
+                    snapshot_content.as_bytes(),
+                )?),
                 metadata_ref: None,
                 created_at: "1970-01-01T00:00:00.000Z".to_string(),
                 updated_at: "1970-01-01T00:00:00.000Z".to_string(),
@@ -625,6 +641,7 @@ async fn seed_transaction_visible_schema_rows(
             )
             .await?;
     }
+    json_writer.flush_into(&mut writes);
     writes.apply(&mut transaction.as_mut()).await?;
     transaction.commit().await
 }
@@ -668,17 +685,17 @@ struct TransactionEntityRows {
     key_prefix: &'static str,
 }
 
-fn transaction_entity_rows(config: TransactionEntityRows) -> Vec<StageRow> {
+fn transaction_entity_rows(config: TransactionEntityRows) -> Vec<TransactionWriteRow> {
     (0..config.rows)
         .map(|index| {
             let key = format!("{}-{index:06}", config.key_prefix);
             let value_index = payload_pattern_index(config.payload_pattern, index);
             let metadata_index = payload_pattern_index(config.metadata_pattern, index);
-            StageRow {
+            TransactionWriteRow {
                 entity_id: Some(EntityIdentity::single(key.clone())),
                 schema_key: TRANSACTION_BENCH_SCHEMA_KEY.to_string(),
                 file_id: None,
-                snapshot_content: Some(transaction_snapshot_json(
+                snapshot: Some(transaction_snapshot_json(
                     &key,
                     value_index,
                     config.payload_bytes,
@@ -698,7 +715,7 @@ fn transaction_entity_rows(config: TransactionEntityRows) -> Vec<StageRow> {
         .collect()
 }
 
-fn transaction_registered_schema_row() -> StageRow {
+fn transaction_registered_schema_row() -> TransactionWriteRow {
     let schema = serde_json::json!({
         "x-lix-key": "bench_transaction_schema",
         "x-lix-version": "1",
@@ -713,14 +730,16 @@ fn transaction_registered_schema_row() -> StageRow {
     });
     let key =
         crate::schema::schema_key_from_definition(&schema).expect("seed schema key should derive");
-    StageRow {
+    TransactionWriteRow {
         entity_id: Some(
             crate::schema::registered_schema_entity_id(&key.schema_key, &key.schema_version)
                 .expect("registered schema identity should derive"),
         ),
         schema_key: "lix_registered_schema".to_string(),
         file_id: None,
-        snapshot_content: Some(serde_json::json!({ "value": schema }).to_string()),
+        snapshot: Some(TransactionJson::from_value_unchecked(
+            serde_json::json!({ "value": schema }),
+        )),
         metadata: None,
         origin: None,
         schema_version: "1".to_string(),
@@ -734,7 +753,11 @@ fn transaction_registered_schema_row() -> StageRow {
     }
 }
 
-fn transaction_snapshot_json(_key: &str, payload_index: usize, target_bytes: usize) -> String {
+fn transaction_snapshot_json(
+    _key: &str,
+    payload_index: usize,
+    target_bytes: usize,
+) -> TransactionJson {
     let base_value = format!("/entities/{payload_index}/value");
     let value = if target_bytes == 0 {
         base_value
@@ -749,14 +772,13 @@ fn transaction_snapshot_json(_key: &str, payload_index: usize, target_bytes: usi
     };
     let mut object = serde_json::Map::new();
     object.insert("value".to_string(), serde_json::Value::String(value));
-    serde_json::to_string(&serde_json::Value::Object(object))
-        .expect("transaction bench snapshot should serialize")
+    TransactionJson::from_value_unchecked(serde_json::Value::Object(object))
 }
 
 fn transaction_metadata(
     pattern: TransactionPayloadPattern,
     metadata_index: usize,
-) -> Option<RowMetadata> {
+) -> Option<TransactionJson> {
     match pattern {
         TransactionPayloadPattern::None => None,
         TransactionPayloadPattern::Unique
@@ -772,7 +794,9 @@ fn transaction_metadata(
                 serde_json::Value::String(metadata_index.to_string()),
             );
             pad_json_object(&mut object, 1024);
-            Some(serde_json::Value::Object(object))
+            Some(TransactionJson::from_value_unchecked(
+                serde_json::Value::Object(object),
+            ))
         }
     }
 }
@@ -2690,8 +2714,9 @@ pub async fn json_store_write_prepared(
         let mut writes = StorageWriteSet::new();
         let mut writer = fixture.context.writer();
         for document in &fixture.documents {
-            writer.stage_bytes(&mut writes, document)?;
+            prepare_json_ref(&mut writer, document)?;
         }
+        writer.flush_into(&mut writes);
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await?;
@@ -2731,8 +2756,9 @@ pub async fn prepare_json_store_projection_read(
         let mut writes = StorageWriteSet::new();
         let mut writer = context.writer();
         for document in documents {
-            refs.push(writer.stage_bytes(&mut writes, &document)?);
+            refs.push(prepare_json_ref(&mut writer, &document)?);
         }
+        writer.flush_into(&mut writes);
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await?;
@@ -2823,8 +2849,9 @@ async fn prepare_json_store_base_update(
         let mut writes = StorageWriteSet::new();
         let mut writer = context.writer();
         for document in documents {
-            refs.push(writer.stage_bytes(&mut writes, &document)?);
+            refs.push(prepare_json_ref(&mut writer, &document)?);
         }
+        writer.flush_into(&mut writes);
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await?;
@@ -2867,8 +2894,9 @@ async fn json_store_write_against_base_prepared(
         let mut writer = fixture.context.writer();
         for (index, _json_ref) in fixture.refs.iter().enumerate() {
             let updated = updated_json_document(shape, index);
-            writer.stage_bytes(&mut writes, &updated)?;
+            prepare_json_ref(&mut writer, &updated)?;
         }
+        writer.flush_into(&mut writes);
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await?;
@@ -3864,9 +3892,8 @@ fn snapshot_content(index: usize, target_bytes: usize) -> String {
     value.to_string()
 }
 
-fn snapshot_metadata(index: usize, target_bytes: usize) -> serde_json::Value {
-    serde_json::from_str(&snapshot_content(index, target_bytes))
-        .expect("bench snapshot content should be valid JSON metadata")
+fn snapshot_metadata(index: usize, target_bytes: usize) -> String {
+    snapshot_content(index, target_bytes)
 }
 
 fn tracked_state_header_columns() -> Vec<String> {

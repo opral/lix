@@ -9,7 +9,7 @@ use crate::{LixError, NullableKeyFilter, GLOBAL_VERSION_ID};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
-/// Engine2 schema visibility boundary.
+/// Engine schema visibility boundary.
 ///
 /// SQL planning receives a schema snapshot from live state. System schemas are
 /// seeded as ordinary `lix_registered_schema` rows during initialization, so
@@ -157,7 +157,7 @@ mod tests {
         let schemas = registry
             .visible_schemas(
                 &RowsLiveStateReader::new(vec![registered_schema_row(
-                    "engine2_dynamic_schema",
+                    "engine_dynamic_schema",
                     "1",
                 )]),
                 "global",
@@ -166,7 +166,7 @@ mod tests {
             .expect("schema visibility should load");
 
         assert!(schemas.iter().any(|schema| {
-            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("engine2_dynamic_schema")
+            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("engine_dynamic_schema")
         }));
     }
 

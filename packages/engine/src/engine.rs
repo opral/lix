@@ -28,7 +28,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Seeds an empty backend with the engine2 repository bootstrap facts.
+    /// Seeds an empty backend with the engine repository bootstrap facts.
     ///
     /// Initialization is a storage lifecycle operation, separate from runtime
     /// construction. Call this before `Engine::new(...)` for a brand-new
@@ -226,6 +226,6 @@ async fn assert_initialized(
 
     Err(LixError::new(
         "LIX_ERROR_NOT_INITIALIZED",
-        "engine2 backend is not initialized; call Engine::initialize(...) before Engine::new(...)",
+        "engine backend is not initialized; call Engine::initialize(...) before Engine::new(...)",
     ))
 }

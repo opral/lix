@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use crate::transaction::types::StageWrite;
+use crate::transaction::types::TransactionWrite;
 use crate::version::VersionRefReader;
 use crate::LixError;
 
@@ -300,7 +300,7 @@ impl SessionContext {
                 }
 
                 transaction
-                    .stage_write(StageWrite::AdoptedChanges {
+                    .stage_write(TransactionWrite::AdoptedChanges {
                         changes: adopted_changes,
                     })
                     .await?;

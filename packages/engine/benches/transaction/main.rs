@@ -21,6 +21,7 @@ const ENTITY_ROWS: usize = 10_000;
 const LARGE_ENTITY_ROWS: usize = 1_000;
 const UPDATE_ROWS_SMALL: usize = 1;
 const UPDATE_ROWS_BATCH: usize = 100;
+const SCALING_ROWS: &[usize] = &[1_000, 2_000, 5_000, 10_000, 20_000];
 
 fn transaction_benches(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -643,6 +644,182 @@ fn transaction_benches(c: &mut Criterion) {
     });
 
     io_group.finish();
+
+    let mut scaling_group = c.benchmark_group("transaction_scaling");
+    for &rows in SCALING_ROWS {
+        let label = row_count_label(rows);
+
+        scaling_group.bench_function(
+            format!("stage_only_entities_no_payload/{label}"),
+            |b| {
+                b.iter_batched(
+                    || {
+                        runtime
+                            .block_on(
+                                storage_bench::prepare_transaction_commit_entities_no_payload(
+                                    BenchBackend::new(),
+                                    rows,
+                                ),
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "prepare transaction_scaling/stage_only_entities_no_payload/{label}: {error}"
+                                )
+                            })
+                    },
+                    |fixture| {
+                        stage_only(
+                            &runtime,
+                            fixture,
+                            "transaction_scaling/stage_only_entities_no_payload",
+                        )
+                    },
+                    BatchSize::LargeInput,
+                )
+            },
+        );
+
+        scaling_group.bench_function(
+            format!("commit_only_entities_no_payload/{label}"),
+            |b| {
+                b.iter_batched(
+                    || {
+                        let fixture = runtime
+                            .block_on(
+                                storage_bench::prepare_transaction_commit_entities_no_payload(
+                                    BenchBackend::new(),
+                                    rows,
+                                ),
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "prepare transaction_scaling/commit_only_entities_no_payload/{label} fixture: {error}"
+                                )
+                            });
+                        runtime
+                            .block_on(storage_bench::prepare_transaction_commit_only(fixture))
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "prepare transaction_scaling/commit_only_entities_no_payload/{label}: {error}"
+                                )
+                            })
+                    },
+                    |fixture| {
+                        commit_only(
+                            &runtime,
+                            fixture,
+                            "transaction_scaling/commit_only_entities_no_payload",
+                        )
+                    },
+                    BatchSize::LargeInput,
+                )
+            },
+        );
+
+        scaling_group.bench_function(
+            format!("stage_plus_commit_entities_payload_1k_same/{label}"),
+            |b| {
+                b.iter_batched(
+                    || {
+                        runtime
+                            .block_on(
+                                storage_bench::prepare_transaction_commit_entities_payload_1k_same(
+                                    BenchBackend::new(),
+                                    rows,
+                                ),
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "prepare transaction_scaling/stage_plus_commit_entities_payload_1k_same/{label}: {error}"
+                                )
+                            })
+                    },
+                    |fixture| {
+                        commit(
+                            &runtime,
+                            fixture,
+                            "transaction_scaling/stage_plus_commit_entities_payload_1k_same",
+                        )
+                    },
+                    BatchSize::LargeInput,
+                )
+            },
+        );
+
+        scaling_group.bench_function(
+            format!("stage_plus_commit_entities_payload_1k_unique/{label}"),
+            |b| {
+                b.iter_batched(
+                    || {
+                        runtime
+                            .block_on(
+                                storage_bench::prepare_transaction_commit_entities_payload_1k_unique(
+                                    BenchBackend::new(),
+                                    rows,
+                                ),
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "prepare transaction_scaling/stage_plus_commit_entities_payload_1k_unique/{label}: {error}"
+                                )
+                            })
+                    },
+                    |fixture| {
+                        commit(
+                            &runtime,
+                            fixture,
+                            "transaction_scaling/stage_plus_commit_entities_payload_1k_unique",
+                        )
+                    },
+                    BatchSize::LargeInput,
+                )
+            },
+        );
+    }
+    scaling_group.finish();
+
+    let mut scaling_io_group = c.benchmark_group("transaction_scaling_io_100us");
+    for &rows in SCALING_ROWS {
+        let label = row_count_label(rows);
+        scaling_io_group.bench_function(
+            format!("stage_plus_commit_entities_payload_1k_same/{label}"),
+            |b| {
+                b.iter_batched(
+                    || {
+                        runtime
+                            .block_on(
+                                storage_bench::prepare_transaction_commit_entities_payload_1k_same(
+                                    latency_backend(),
+                                    rows,
+                                ),
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "prepare transaction_scaling_io_100us/stage_plus_commit_entities_payload_1k_same/{label}: {error}"
+                                )
+                            })
+                    },
+                    |fixture| {
+                        commit(
+                            &runtime,
+                            fixture,
+                            "transaction_scaling_io_100us/stage_plus_commit_entities_payload_1k_same",
+                        )
+                    },
+                    BatchSize::LargeInput,
+                )
+            },
+        );
+    }
+    scaling_io_group.finish();
+}
+
+fn row_count_label(rows: usize) -> String {
+    if rows % 1_000 == 0 {
+        format!("{}k", rows / 1_000)
+    } else {
+        rows.to_string()
+    }
 }
 
 fn commit(

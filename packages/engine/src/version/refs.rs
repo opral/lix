@@ -160,7 +160,7 @@ fn decode_version_head(
         serde_json::from_str::<serde_json::Value>(snapshot_content).map_err(|error| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                format!("engine2 version-ref snapshot parse failed: {error}"),
+                format!("engine version-ref snapshot parse failed: {error}"),
             )
         })?;
     let commit_id = snapshot
@@ -325,7 +325,9 @@ mod tests {
     ) -> Result<(), LixError> {
         let canonical_row = {
             let mut json_writer = JsonStoreContext::new().writer();
-            prepare_version_ref_row(writes, &mut json_writer, version_id, commit_id, timestamp)?
+            let row = prepare_version_ref_row(&mut json_writer, version_id, commit_id, timestamp)?;
+            json_writer.flush_into(writes);
+            row
         };
         version_ref.writer(writes).stage_rows(&[canonical_row])
     }

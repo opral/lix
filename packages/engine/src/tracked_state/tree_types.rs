@@ -91,7 +91,7 @@ impl TrackedStateValue {
         self,
         key: TrackedStateKey,
         snapshot_content: Option<String>,
-        metadata: Option<crate::RowMetadata>,
+        metadata: Option<String>,
     ) -> MaterializedTrackedStateRow {
         MaterializedTrackedStateRow {
             entity_id: key.entity_id,

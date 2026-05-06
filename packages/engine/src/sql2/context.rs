@@ -15,7 +15,7 @@ use crate::live_state::{
     MaterializedLiveStateRow,
 };
 use crate::storage::{ScopedStorageReader, StorageReadTransaction};
-use crate::transaction::types::{StageWrite, StageWriteOutcome};
+use crate::transaction::types::{TransactionWrite, TransactionWriteOutcome};
 use crate::version::{VersionHead, VersionRefReader};
 use crate::LixError;
 
@@ -53,9 +53,9 @@ pub(crate) trait SqlExecutionContext {
 
 /// Write-capable SQL runtime boundary.
 ///
-/// Providers that mutate engine2 state should target this shape instead of
+/// Providers that mutate engine state should target this shape instead of
 /// reaching through session/backend escape hatches. The request and write
-/// payloads stay in the existing engine2 forms so this boundary centralizes
+/// payloads stay in the existing engine forms so this boundary centralizes
 /// authority without adding another translation layer.
 #[async_trait]
 #[allow(dead_code)]
@@ -73,7 +73,10 @@ pub(crate) trait SqlWriteExecutionContext {
 
     async fn load_version_head(&mut self, version_id: &str) -> Result<Option<String>, LixError>;
 
-    async fn stage_write(&mut self, write: StageWrite) -> Result<StageWriteOutcome, LixError>;
+    async fn stage_write(
+        &mut self,
+        write: TransactionWrite,
+    ) -> Result<TransactionWriteOutcome, LixError>;
 }
 
 #[derive(Clone)]
@@ -171,8 +174,8 @@ impl SqlWriteContext {
 
     pub(crate) async fn stage_write(
         &self,
-        write: StageWrite,
-    ) -> Result<StageWriteOutcome, LixError> {
+        write: TransactionWrite,
+    ) -> Result<TransactionWriteOutcome, LixError> {
         let _guard = self.gate.lock().await;
         unsafe {
             self.ptr

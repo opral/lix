@@ -2,7 +2,7 @@ use crate::json_store::{JsonRef, JsonStoreReader};
 use crate::storage::StorageReader;
 use crate::tracked_state::tree_types::{TrackedStateKey, TrackedStateValue};
 use crate::tracked_state::MaterializedTrackedStateRow;
-use crate::{validate_row_metadata, LixError, RowMetadata};
+use crate::{parse_row_metadata, LixError};
 
 pub(crate) async fn materialize_value<S>(
     json_reader: &mut JsonStoreReader<S>,
@@ -54,20 +54,14 @@ impl TrackedMaterializationProjection {
 async fn load_optional_metadata<S>(
     json_reader: &mut JsonStoreReader<S>,
     json_ref: Option<&JsonRef>,
-) -> Result<Option<RowMetadata>, LixError>
+) -> Result<Option<String>, LixError>
 where
     S: StorageReader,
 {
     let Some(json) = load_optional_json(json_reader, json_ref, "metadata_ref").await? else {
         return Ok(None);
     };
-    let metadata = serde_json::from_str::<RowMetadata>(&json).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_INVALID_JSON",
-            format!("tracked_state metadata_ref is invalid JSON: {error}"),
-        )
-    })?;
-    validate_row_metadata(metadata, "tracked_state metadata_ref").map(Some)
+    parse_row_metadata(&json, "tracked_state metadata_ref").map(Some)
 }
 
 async fn load_optional_json<S>(
