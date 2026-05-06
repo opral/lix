@@ -1,5 +1,5 @@
 import { createFileRoute, notFound, redirect } from "@tanstack/react-router";
-import tableOfContents from "../../../content/docs/table_of_contents.json";
+import tableOfContents from "../../../../../docs/table_of_contents.json";
 import {
   buildDocMaps,
   normalizeRelativePath,
@@ -19,7 +19,7 @@ function resolveDocsRedirect(pathname: string): string | undefined {
   return redirectMap[normalized] ?? redirectMap[pathname];
 }
 
-const docs = import.meta.glob<string>("/content/docs/**/*.md", {
+const docs = import.meta.glob<string>("../../../../../docs/**/*.md", {
   eager: true,
   import: "default",
   query: "?raw",
@@ -44,9 +44,9 @@ export const Route = createFileRoute("/docs/")({
     }
 
     const toc = tableOfContents as Toc;
-    const firstFile = toc.sidebar[0]?.items[0]?.file;
-    const firstRelative = firstFile
-      ? normalizeRelativePath(firstFile)
+    const firstPath = Object.values(toc)[0]?.[0]?.path;
+    const firstRelative = firstPath
+      ? normalizeRelativePath(firstPath)
       : undefined;
     const firstDoc =
       (firstRelative && docsByRelativePath[firstRelative]) ||

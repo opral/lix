@@ -10,14 +10,14 @@ import {
 describe("buildDocMaps", () => {
   test("creates slug records from markdown frontmatter", () => {
     const { bySlug } = buildDocMaps({
-      "/content/docs/guide/hello-world.md": `---
+      "/docs/guide/hello-world.md": `---
 slug: hello-doc
 title: Hello World
 description: Sample doc
 ---
 
 # Hello world`,
-      "/content/docs/reference/api.md": `---
+      "/docs/reference/api.md": `---
 title: API
 ---
 
@@ -32,14 +32,9 @@ API contents`,
 describe("buildTocMap", () => {
   test("normalizes relative file paths", () => {
     const tocMap = buildTocMap({
-      sidebar: [
-        {
-          label: "Overview",
-          items: [
-            { file: "./what-is-lix.md", label: "What is Lix?" },
-            { file: "/content/docs/guide/setup.md", label: "Setup" },
-          ],
-        },
+      Overview: [
+        { path: "./what-is-lix.md", label: "What is Lix?" },
+        { path: "/docs/guide/setup.md", label: "Setup" },
       ],
     });
 
@@ -49,7 +44,13 @@ describe("buildTocMap", () => {
 });
 
 describe("path helpers", () => {
-  test("normalizeRelativePath removes content/docs prefix", () => {
+  test("normalizeRelativePath removes docs prefix", () => {
+    expect(normalizeRelativePath("/docs/guide/setup.md")).toBe(
+      "./guide/setup.md",
+    );
+  });
+
+  test("normalizeRelativePath handles website-local legacy docs paths", () => {
     expect(normalizeRelativePath("/content/docs/guide/setup.md")).toBe(
       "./guide/setup.md",
     );

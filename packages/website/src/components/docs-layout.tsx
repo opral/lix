@@ -97,7 +97,7 @@ export function DocsLayout({
           <h2 className="text-sm font-semibold text-slate-900">
             {section.label}
           </h2>
-          <ul className="space-y-2">
+          <ul>
             {section.items.map((item) => {
               const isActive = item.relativePath === activeRelativePath;
               return (
@@ -106,7 +106,7 @@ export function DocsLayout({
                     to={item.href}
                     onClick={() => setIsMobileMenuOpen(false)}
                     className={[
-                      "block py-1 text-sm transition-colors",
+                      "block py-1 text-sm leading-6 transition-colors",
                       isActive
                         ? "font-medium text-[#0891B2]"
                         : "text-slate-600 hover:text-slate-900",

@@ -1,0 +1,8 @@
+{
+  "Overview": [
+    { "path": "./what-is-lix.md", "label": "What is Lix?" },
+    { "path": "./getting-started.md", "label": "Getting Started" },
+    { "path": "./comparison-to-git.md", "label": "Comparison to Git" },
+    { "path": "./lix-for-ai-agents.md", "label": "Lix for AI Agents" }
+  ]
+}
