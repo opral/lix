@@ -7,14 +7,14 @@ use crate::json_store::{JsonStoreContext, JsonStoreWriter};
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{LiveStateRowIdentity, LiveStateScanRequest, MaterializedLiveStateRow};
+use crate::transaction::normalization::SchemaPlanId;
+#[cfg(test)]
+use crate::transaction::types::{stage_json_from_value, TransactionJson};
 use crate::transaction::types::{
-    stage_json_from_value, LogicalPrimaryKey, PreparedTransactionWrite, TransactionAdoptedChange,
-    TransactionFileData, TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
-    TransactionWriteOutcome,
+    LogicalPrimaryKey, PreparedTransactionWrite, TransactionFileData, TransactionWriteMode,
+    TransactionWriteOperation, TransactionWriteOrigin, TransactionWriteOutcome,
 };
-use crate::transaction::types::{
-    PreparedAdoptedStateRow, PreparedStateRow, StagedCommitMembers, TransactionJson,
-};
+use crate::transaction::types::{PreparedAdoptedStateRow, PreparedStateRow, StagedCommitMembers};
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
@@ -75,6 +75,13 @@ impl<'a> PreparedValidationRow<'a> {
         match self {
             Self::State(row) => &row.entity_id,
             Self::Adopted(row) => &row.entity_id,
+        }
+    }
+
+    pub(crate) fn schema_plan_id(&self) -> SchemaPlanId {
+        match self {
+            Self::State(row) => row.schema_plan_id,
+            Self::Adopted(row) => row.schema_plan_id,
         }
     }
 
@@ -456,23 +463,10 @@ impl TransactionWriteBuffer {
         let (mode, count) = match &write {
             PreparedTransactionWrite::Rows { mode, rows } => (Some(*mode), rows.len() as u64),
             PreparedTransactionWrite::RowsWithFileData { mode, count, .. } => (Some(*mode), *count),
-            PreparedTransactionWrite::AdoptedChanges { changes } => (None, changes.len() as u64),
+            PreparedTransactionWrite::AdoptedChanges { rows } => (None, rows.len() as u64),
         };
         let mut functions = self.functions.clone();
-        let mut json_writer_guard = self.json_writer.lock().map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "failed to acquire transaction staged JSON writer lock",
-            )
-        })?;
-        let json_writer = json_writer_guard.as_mut().ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "cannot stage writes after transaction staged JSON writer was drained",
-            )
-        })?;
-        let (rows, adopted_rows, file_data_writes) =
-            self.state_rows_from_stage_write(write, json_writer)?;
+        let (rows, adopted_rows, file_data_writes) = self.state_rows_from_stage_write(write)?;
         for row in &rows {
             validate_commit_membership_support(row)?;
         }
@@ -583,7 +577,6 @@ impl TransactionWriteBuffer {
     fn state_rows_from_stage_write(
         &self,
         write: PreparedTransactionWrite,
-        json_writer: &mut JsonStoreWriter,
     ) -> Result<
         (
             Vec<PreparedStateRow>,
@@ -605,24 +598,11 @@ impl TransactionWriteBuffer {
                 state_rows.extend(rows);
                 file_data_writes.extend(file_data);
             }
-            PreparedTransactionWrite::AdoptedChanges { changes } => {
-                self.push_adopted_rows(&mut adopted_rows, changes, json_writer)?;
+            PreparedTransactionWrite::AdoptedChanges { rows } => {
+                adopted_rows.extend(rows);
             }
         }
         Ok((state_rows, adopted_rows, file_data_writes))
-    }
-
-    fn push_adopted_rows(
-        &self,
-        adopted_rows: &mut Vec<PreparedAdoptedStateRow>,
-        changes: Vec<TransactionAdoptedChange>,
-        json_writer: &mut JsonStoreWriter,
-    ) -> Result<(), LixError> {
-        adopted_rows.reserve(changes.len());
-        for change in changes {
-            adopted_rows.push(hydrate_adopted_state_row(change, json_writer)?);
-        }
-        Ok(())
     }
 }
 
@@ -847,63 +827,6 @@ impl From<&MaterializedLiveStateRow> for PreparedStateRowIdentity {
             version_id: row.version_id.clone(),
         }
     }
-}
-
-fn hydrate_adopted_state_row(
-    change: TransactionAdoptedChange,
-    json_writer: &mut JsonStoreWriter,
-) -> Result<PreparedAdoptedStateRow, LixError> {
-    if change.change_id != change.projected_row.change_id {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "adopted change '{}' does not match projected row change_id '{}'",
-                change.change_id, change.projected_row.change_id
-            ),
-        ));
-    }
-    let row = change.projected_row;
-    let snapshot = row
-        .snapshot_content
-        .as_deref()
-        .map(|value| {
-            stage_materialized_json_text(json_writer, value, "adopted row snapshot_content")
-        })
-        .transpose()?;
-    let metadata = row
-        .metadata
-        .as_deref()
-        .map(|value| stage_materialized_json_text(json_writer, value, "adopted row metadata"))
-        .transpose()?;
-    Ok(PreparedAdoptedStateRow {
-        entity_id: row.entity_id,
-        schema_key: row.schema_key,
-        file_id: row.file_id,
-        snapshot,
-        metadata,
-        schema_version: row.schema_version,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        global: change.version_id == GLOBAL_VERSION_ID,
-        change_id: change.change_id,
-        commit_id: String::new(),
-        version_id: change.version_id,
-    })
-}
-
-fn stage_materialized_json_text(
-    json_writer: &mut JsonStoreWriter,
-    value: &str,
-    context: &str,
-) -> Result<crate::transaction::types::StageJson, LixError> {
-    let parsed = serde_json::from_str::<serde_json::Value>(value).map_err(|error| {
-        LixError::new(
-            LixError::CODE_UNKNOWN,
-            format!("{context} is invalid JSON: {error}"),
-        )
-    })?;
-    let prepared = TransactionJson::from_value(parsed, context)?;
-    stage_json_from_value(json_writer, prepared, context)
 }
 
 fn validate_commit_membership_support(row: &PreparedStateRow) -> Result<(), LixError> {
@@ -1692,6 +1615,8 @@ mod tests {
         )
         .expect("test snapshot should prepare");
         PreparedStateRow {
+            schema_plan_id: SchemaPlanId::for_test(0),
+            facts: crate::transaction::types::PreparedRowFacts::default(),
             entity_id: crate::entity_identity::EntityIdentity::single(key),
             schema_key: "lix_key_value".to_string(),
             file_id: None,

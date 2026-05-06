@@ -9,12 +9,11 @@ use crate::tracked_state::{TrackedStateKeyRef, TrackedStateRowRef, TrackedStateV
 use crate::transaction::prepare_version_ref_row;
 use crate::transaction::staging::PreparedWriteSet;
 use crate::transaction::types::{
-    PreparedAdoptedStateRow, PreparedStateRow, StagedCommitMembers, TransactionJson,
+    PreparedAdoptedStateRow, PreparedStateRow, StageJson, StagedCommitMembers, TransactionJson,
 };
 use crate::untracked_state::{UntrackedStateIdentityRef, UntrackedStateRowRef};
 use crate::version::{VersionContext, VersionRefReader};
 use crate::LixError;
-use crate::GLOBAL_VERSION_ID;
 use std::collections::{BTreeMap, BTreeSet};
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
@@ -48,7 +47,7 @@ pub(crate) async fn commit_prepared_writes(
         }
     }
 
-    let mut state_rows = prepared_writes.state_rows;
+    let state_rows = prepared_writes.state_rows;
     let adopted_rows = prepared_writes.adopted_rows;
     let finalized = finalize_commit_rows(
         prepared_writes.commit_members_by_version,
@@ -58,7 +57,7 @@ pub(crate) async fn commit_prepared_writes(
         &mut json_writer,
     )
     .await?;
-    state_rows.extend(finalized.commit_rows);
+    let commit_rows = finalized.commit_rows;
     let version_heads = finalized.version_heads;
     let tracked_roots = finalized.tracked_roots;
     let row_index = index_prepared_rows(&state_rows)?;
@@ -73,18 +72,20 @@ pub(crate) async fn commit_prepared_writes(
 
     if state_rows.is_empty()
         && adopted_rows.is_empty()
+        && commit_rows.is_empty()
         && version_heads.is_empty()
         && writes.is_empty()
     {
         return Ok(());
     }
 
-    if !row_index.changelog_row_indices.is_empty() {
+    if !row_index.changelog_row_indices.is_empty() || !commit_rows.is_empty() {
         validate_new_canonical_changes(
             changelog,
             transaction,
             &state_rows,
             &row_index.changelog_row_indices,
+            &commit_rows,
         )
         .await?;
         {
@@ -93,6 +94,11 @@ pub(crate) async fn commit_prepared_writes(
                 writer.stage_changes(std::iter::once(canonical_change_ref_from_state_row(
                     &state_rows[row_index],
                 )?))?;
+            }
+            for commit_row in &commit_rows {
+                writer.stage_changes(std::iter::once(canonical_change_ref_from_commit_row(
+                    commit_row,
+                )))?;
             }
         }
     }
@@ -209,12 +215,26 @@ async fn validate_new_canonical_changes(
     transaction: &mut (impl StorageReader + ?Sized),
     rows: &[PreparedStateRow],
     row_indices: &[RowIndex],
+    commit_rows: &[FinalizedCommitRow],
 ) -> Result<(), LixError> {
     let reader = changelog.reader(&mut *transaction);
-    let mut change_ids = Vec::with_capacity(row_indices.len());
+    let mut change_ids = Vec::with_capacity(row_indices.len() + commit_rows.len());
     let mut seen_change_ids = BTreeSet::new();
     for &row_index in row_indices {
         let change = canonical_change_ref_from_state_row(&rows[row_index])?;
+        if !seen_change_ids.insert(change.id) {
+            return Err(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!(
+                    "canonical change id '{}' appears more than once in the same transaction",
+                    change.id
+                ),
+            ));
+        }
+        change_ids.push(change.id.to_string());
+    }
+    for commit_row in commit_rows {
+        let change = canonical_change_ref_from_commit_row(commit_row);
         if !seen_change_ids.insert(change.id) {
             return Err(LixError::new(
                 LixError::CODE_UNIQUE,
@@ -410,6 +430,19 @@ fn canonical_change_ref_from_adopted_row(row: &PreparedAdoptedStateRow) -> Canon
     }
 }
 
+fn canonical_change_ref_from_commit_row(row: &FinalizedCommitRow) -> CanonicalChangeRef<'_> {
+    CanonicalChangeRef {
+        id: &row.change_id,
+        entity_id: &row.entity_id,
+        schema_key: COMMIT_SCHEMA_KEY,
+        schema_version: "1",
+        file_id: None,
+        snapshot_ref: Some(&row.snapshot.json_ref),
+        metadata_ref: None,
+        created_at: &row.created_at,
+    }
+}
+
 fn untracked_row_ref_from_state_row(row: &PreparedStateRow) -> UntrackedStateRowRef<'_> {
     UntrackedStateRowRef {
         entity_id: &row.entity_id,
@@ -520,9 +553,9 @@ fn tracked_state_row_ref_from_adopted_row(
 /// the commit introduces relative to its first parent; merge commits may later
 /// populate this list with existing source-parent changes instead of copied
 /// changelog facts.
-/// This function turns those membership sets into normal `PreparedStateRow`s with
-/// `schema_key = "lix_commit"`, so the changelog/live_state flush can treat
-/// commit rows exactly like any other staged state row.
+/// This function turns those membership sets into finalized commit rows for the
+/// changelog. Commit rows are graph facts, not normalized state rows, so they
+/// do not carry transaction schema-plan ids.
 ///
 /// Commit finalization output split by durability target.
 ///
@@ -532,9 +565,16 @@ fn tracked_state_row_ref_from_adopted_row(
 /// `version_heads` are moving refs. They are written through `VersionContext`
 /// and must never be appended to changelog.
 struct FinalizedCommitRows {
-    commit_rows: Vec<PreparedStateRow>,
+    commit_rows: Vec<FinalizedCommitRow>,
     version_heads: Vec<PendingVersionHead>,
     tracked_roots: Vec<PendingTrackedRoot>,
+}
+
+struct FinalizedCommitRow {
+    entity_id: crate::entity_identity::EntityIdentity,
+    snapshot: StageJson,
+    created_at: String,
+    change_id: String,
 }
 
 struct PendingVersionHead {
@@ -599,21 +639,11 @@ async fn finalize_commit_rows(
             "engine commit row snapshot_content",
         )?;
 
-        commit_rows.push(PreparedStateRow {
+        commit_rows.push(FinalizedCommitRow {
             entity_id: crate::entity_identity::EntityIdentity::single(&commit_id),
-            schema_key: "lix_commit".to_string(),
-            file_id: None,
-            snapshot: Some(snapshot),
-            metadata: None,
-            origin: None,
-            schema_version: "1".to_string(),
+            snapshot,
             created_at: timestamp.clone(),
-            updated_at: timestamp.clone(),
-            global: true,
-            change_id: Some(commit_change_id),
-            commit_id: Some(commit_id.clone()),
-            untracked: false,
-            version_id: GLOBAL_VERSION_ID.to_string(),
+            change_id: commit_change_id,
         });
         version_heads.push(PendingVersionHead {
             version_id: version_id.clone(),
@@ -664,11 +694,14 @@ mod tests {
     use crate::changelog::ChangelogContext;
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
     use crate::storage::StorageContext;
+    use crate::transaction::normalization::SchemaPlanId;
+    use crate::transaction::types::PreparedRowFacts;
     use crate::untracked_state::{
         MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateRowRequest,
     };
     use crate::version::VersionContext;
     use crate::NullableKeyFilter;
+    use crate::GLOBAL_VERSION_ID;
 
     const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
     const DETERMINISTIC_SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
@@ -1199,23 +1232,11 @@ mod tests {
         assert_eq!(rows.version_heads.len(), 1);
         let row = &rows.commit_rows[0];
         assert_eq!(row.entity_id.as_string().as_deref(), Ok("test-uuid-1"));
-        assert_eq!(row.schema_key, "lix_commit");
-        assert_eq!(row.schema_version, "1");
-        assert_eq!(row.change_id.as_deref(), Some("test-uuid-2"));
-        assert_eq!(row.commit_id.as_deref(), Some("test-uuid-1"));
-        assert!(row.global);
-        assert!(!row.untracked);
-        assert_eq!(row.version_id, GLOBAL_VERSION_ID);
+        assert_eq!(row.change_id, "test-uuid-2");
         assert_eq!(row.created_at, "test-timestamp-1");
-        assert_eq!(row.updated_at, "test-timestamp-1");
 
-        let snapshot = serde_json::from_str::<JsonValue>(
-            row.snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.normalized.as_ref())
-                .expect("commit row should have snapshot"),
-        )
-        .expect("commit snapshot should be JSON");
+        let snapshot = serde_json::from_str::<JsonValue>(row.snapshot.normalized.as_ref())
+            .expect("commit snapshot should be JSON");
         assert_eq!(
             snapshot.get("id").and_then(JsonValue::as_str),
             Some("test-uuid-1")
@@ -1298,14 +1319,9 @@ mod tests {
         .await
         .expect("active-version commit finalization should resolve parent");
 
-        let snapshot = serde_json::from_str::<JsonValue>(
-            rows.commit_rows[0]
-                .snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.normalized.as_ref())
-                .expect("commit row should have snapshot"),
-        )
-        .expect("commit snapshot should be JSON");
+        let snapshot =
+            serde_json::from_str::<JsonValue>(rows.commit_rows[0].snapshot.normalized.as_ref())
+                .expect("commit snapshot should be JSON");
         assert_eq!(
             snapshot
                 .get("parent_commit_ids")
@@ -1341,14 +1357,9 @@ mod tests {
         .await
         .expect("merge commit finalization should resolve parents");
 
-        let snapshot = serde_json::from_str::<JsonValue>(
-            rows.commit_rows[0]
-                .snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.normalized.as_ref())
-                .expect("commit row should have snapshot"),
-        )
-        .expect("commit snapshot should be JSON");
+        let snapshot =
+            serde_json::from_str::<JsonValue>(rows.commit_rows[0].snapshot.normalized.as_ref())
+                .expect("commit snapshot should be JSON");
         assert_eq!(
             snapshot
                 .get("parent_commit_ids")
@@ -1384,6 +1395,8 @@ mod tests {
         change_id: &str,
     ) -> PreparedStateRow {
         PreparedStateRow {
+            schema_plan_id: SchemaPlanId::for_test(0),
+            facts: PreparedRowFacts::default(),
             entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
             schema_key: "test_schema".to_string(),
             file_id: None,

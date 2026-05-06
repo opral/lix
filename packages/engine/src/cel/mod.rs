@@ -5,4 +5,4 @@ mod runtime;
 mod value;
 
 pub(crate) use provider::CelFunctionProvider;
-pub(crate) use runtime::{shared_runtime, CelEvaluator};
+pub(crate) use runtime::shared_runtime;
