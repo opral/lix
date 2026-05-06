@@ -6,6 +6,7 @@ mod lix_json_get;
 mod lix_json_get_text;
 mod lix_text_decode;
 mod lix_text_encode;
+mod lix_timestamp;
 mod lix_uuid_v7;
 
 use datafusion::execution::context::SessionContext;
@@ -34,7 +35,10 @@ pub(crate) fn register_sql2_functions(
     ctx.register_udf(ScalarUDF::from(lix_text_encode::LixTextEncode::new()));
     ctx.register_udf(ScalarUDF::from(lix_json::LixJson));
     ctx.register_udf(ScalarUDF::from(lix_empty_blob::LixEmptyBlob));
-    ctx.register_udf(ScalarUDF::from(lix_uuid_v7::LixUuidV7 { functions }));
+    ctx.register_udf(ScalarUDF::from(lix_uuid_v7::LixUuidV7 {
+        functions: functions.clone(),
+    }));
+    ctx.register_udf(ScalarUDF::from(lix_timestamp::LixTimestamp { functions }));
 }
 
 #[cfg(test)]
