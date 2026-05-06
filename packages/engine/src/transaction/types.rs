@@ -4,6 +4,7 @@ use crate::entity_identity::EntityIdentity;
 use crate::json_store::{JsonRef, JsonStoreWriter, NormalizedJson};
 use crate::live_state::MaterializedLiveStateRow;
 use crate::tracked_state::MaterializedTrackedStateRow;
+use crate::transaction::normalization::SchemaPlanId;
 use crate::untracked_state::MaterializedUntrackedStateRow;
 use crate::LixError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -224,7 +225,7 @@ pub(crate) enum PreparedTransactionWrite {
         count: u64,
     },
     AdoptedChanges {
-        changes: Vec<TransactionAdoptedChange>,
+        rows: Vec<PreparedAdoptedStateRow>,
     },
 }
 
@@ -268,6 +269,13 @@ pub(crate) fn stage_json_from_value(
     })
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PreparedRowFacts {
+    /// Placeholder for the next cut: row-derived constraint facts will be
+    /// computed once during normalization and consumed by validation.
+    pub(crate) _sealed: (),
+}
+
 /// Prepared state row owned by the transaction write buffer.
 ///
 /// This is the first boundary that owns `StageJson`: JSON has been normalized,
@@ -276,6 +284,8 @@ pub(crate) fn stage_json_from_value(
 /// type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedStateRow {
+    pub(crate) schema_plan_id: SchemaPlanId,
+    pub(crate) facts: PreparedRowFacts,
     pub(crate) entity_id: EntityIdentity,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
@@ -305,6 +315,8 @@ impl PreparedStateRow {
 /// Transaction-hydrated projection for an adopted canonical change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedAdoptedStateRow {
+    pub(crate) schema_plan_id: SchemaPlanId,
+    pub(crate) facts: PreparedRowFacts,
     pub(crate) entity_id: EntityIdentity,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,

@@ -1,16 +1,17 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use jsonschema::JSONSchema;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::common::normalize_path_segment;
 use crate::entity_identity::{EntityIdentity, EntityIdentityError};
 use crate::functions::FunctionProviderHandle;
 use crate::schema::{
-    apply_schema_defaults_with_shared_runtime, is_seed_schema_key,
-    reject_unsupported_registered_schema_version, schema_from_registered_snapshot,
-    schema_key_from_definition, validate_lix_schema, validate_lix_schema_definition, SchemaKey,
+    compile_lix_schema, is_seed_schema_key, reject_unsupported_registered_schema_version,
+    schema_from_registered_snapshot, schema_key_from_definition, validate_lix_schema,
+    validate_lix_schema_definition, SchemaKey,
 };
-use crate::transaction::types::{TransactionJson, TransactionWriteRow};
+use crate::transaction::types::{PreparedRowFacts, TransactionJson, TransactionWriteRow};
 use crate::LixError;
 
 pub(crate) const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -21,6 +22,8 @@ const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 pub(crate) struct NormalizedTransactionWriteRow {
     pub(crate) row: TransactionWriteRow,
     pub(crate) snapshot: Option<TransactionJson>,
+    pub(crate) schema_plan_id: SchemaPlanId,
+    pub(crate) facts: PreparedRowFacts,
 }
 
 /// Transaction-local schema catalog used while transaction write rows are prepared.
@@ -30,9 +33,20 @@ pub(crate) struct NormalizedTransactionWriteRow {
 /// entity id. The catalog starts with session-visible schemas and is updated as
 /// pending `lix_registered_schema` rows are prepared, so later rows in the
 /// same transaction can target newly registered schemas.
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub(crate) struct TransactionSchemaCatalog {
-    schemas_by_key: BTreeMap<SchemaCatalogKey, JsonValue>,
+    plans: Vec<TransactionSchemaPlan>,
+    by_key: BTreeMap<SchemaCatalogKey, SchemaPlanId>,
+    by_schema_key: BTreeMap<String, SchemaPlanId>,
+}
+
+impl std::fmt::Debug for TransactionSchemaCatalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransactionSchemaCatalog")
+            .field("plan_count", &self.plans.len())
+            .field("keys", &self.by_key.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl TransactionSchemaCatalog {
@@ -40,51 +54,217 @@ impl TransactionSchemaCatalog {
         let mut catalog = Self::default();
         for schema in visible_schemas {
             let key = schema_key_from_definition(schema)?;
-            catalog.insert_schema(key, schema.clone());
+            catalog.insert_schema(key, schema.clone())?;
         }
         Ok(catalog)
     }
 
     pub(crate) fn schema(&self, schema_key: &str, schema_version: &str) -> Option<&JsonValue> {
-        self.schemas_by_key.get(&SchemaCatalogKey {
-            schema_key: schema_key.to_string(),
-            schema_version: schema_version.to_string(),
-        })
+        self.plan_for_key(schema_key, schema_version)
+            .map(|(_, plan)| plan.schema.as_ref())
     }
 
-    pub(crate) fn insert_schema(&mut self, key: SchemaKey, schema: JsonValue) {
-        self.schemas_by_key
-            .insert(SchemaCatalogKey::from_schema_key(key), schema);
+    pub(crate) fn insert_schema(
+        &mut self,
+        key: SchemaKey,
+        schema: JsonValue,
+    ) -> Result<SchemaPlanId, LixError> {
+        let key = SchemaCatalogKey::from_schema_key(key);
+        let plan = TransactionSchemaPlan::compile(key.clone(), schema)?;
+        if let Some(existing) = self.by_key.get(&key).copied() {
+            self.plans[existing.index()] = plan;
+            return Ok(existing);
+        }
+        let plan_id = SchemaPlanId(self.plans.len() as u32);
+        self.by_schema_key
+            .entry(key.schema_key.clone())
+            .or_insert(plan_id);
+        self.by_key.insert(key, plan_id);
+        self.plans.push(plan);
+        Ok(plan_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn contains(&self, schema_key: &str, schema_version: &str) -> bool {
-        self.schemas_by_key.contains_key(&SchemaCatalogKey {
-            schema_key: schema_key.to_string(),
-            schema_version: schema_version.to_string(),
-        })
+        self.plan_for_key(schema_key, schema_version).is_some()
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.schemas_by_key.len()
-    }
-
-    pub(crate) fn schema_by_key(&self, schema_key: &str) -> Option<&JsonValue> {
-        self.schemas_by_key
-            .iter()
-            .find_map(|(key, schema)| (key.schema_key == schema_key).then_some(schema))
+        self.plans.len()
     }
 
     pub(crate) fn schema_key_by_key(&self, schema_key: &str) -> Option<SchemaCatalogKey> {
-        self.schemas_by_key
-            .keys()
-            .find(|key| key.schema_key == schema_key)
-            .cloned()
+        self.by_schema_key
+            .get(schema_key)
+            .and_then(|plan_id| self.plan(*plan_id))
+            .map(|plan| plan.key.clone())
     }
 
-    pub(crate) fn schemas(&self) -> impl Iterator<Item = (&SchemaCatalogKey, &JsonValue)> {
-        self.schemas_by_key.iter()
+    pub(crate) fn plan_by_schema_key(&self, schema_key: &str) -> Option<&TransactionSchemaPlan> {
+        self.by_schema_key
+            .get(schema_key)
+            .and_then(|plan_id| self.plan(*plan_id))
     }
+
+    pub(crate) fn plans(&self) -> impl Iterator<Item = &TransactionSchemaPlan> {
+        self.plans.iter()
+    }
+
+    pub(crate) fn plan(&self, plan_id: SchemaPlanId) -> Option<&TransactionSchemaPlan> {
+        self.plans.get(plan_id.index())
+    }
+
+    pub(crate) fn plan_for_key(
+        &self,
+        schema_key: &str,
+        schema_version: &str,
+    ) -> Option<(SchemaPlanId, &TransactionSchemaPlan)> {
+        let key = SchemaCatalogKey {
+            schema_key: schema_key.to_string(),
+            schema_version: schema_version.to_string(),
+        };
+        let plan_id = *self.by_key.get(&key)?;
+        let plan = self.plan(plan_id)?;
+        Some((plan_id, plan))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct SchemaPlanId(u32);
+
+impl SchemaPlanId {
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(index: u32) -> Self {
+        Self(index)
+    }
+}
+
+pub(crate) type PointerGroup = Vec<Vec<String>>;
+
+pub(crate) struct TransactionSchemaPlan {
+    pub(crate) key: SchemaCatalogKey,
+    pub(crate) schema: Arc<JsonValue>,
+    pub(crate) compiled_schema: JSONSchema,
+    pub(crate) defaults: DefaultPlan,
+    pub(crate) primary_key: Option<PointerGroup>,
+    pub(crate) uniques: Vec<PointerGroup>,
+    pub(crate) foreign_keys: Vec<ForeignKeyPlan>,
+}
+
+impl TransactionSchemaPlan {
+    fn compile(key: SchemaCatalogKey, schema: JsonValue) -> Result<Self, LixError> {
+        let compiled_schema = compile_lix_schema(&schema)?;
+        let defaults = DefaultPlan::from_schema(&schema);
+        let primary_key = primary_key_paths(&schema)?;
+        let uniques = pointer_groups(&schema, "x-lix-unique")?;
+        let foreign_keys = foreign_key_plans(&schema)?;
+        Ok(Self {
+            key,
+            schema: Arc::new(schema),
+            compiled_schema,
+            defaults,
+            primary_key,
+            uniques,
+            foreign_keys,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DefaultPlan {
+    properties: Vec<DefaultPropertyPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DefaultPropertyPlan {
+    field_name: String,
+    default: DefaultValuePlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DefaultValuePlan {
+    Json(JsonValue),
+    Cel(String),
+}
+
+impl DefaultPlan {
+    fn from_schema(schema: &JsonValue) -> Self {
+        let Some(properties) = schema.get("properties").and_then(JsonValue::as_object) else {
+            return Self::default();
+        };
+        let mut ordered_properties = properties.iter().collect::<Vec<_>>();
+        ordered_properties.sort_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
+
+        let properties = ordered_properties
+            .into_iter()
+            .filter_map(|(field_name, field_schema)| {
+                if let Some(expression) = field_schema
+                    .get("x-lix-default")
+                    .and_then(JsonValue::as_str)
+                {
+                    return Some(DefaultPropertyPlan {
+                        field_name: field_name.clone(),
+                        default: DefaultValuePlan::Cel(expression.to_string()),
+                    });
+                }
+                field_schema
+                    .get("default")
+                    .map(|value| DefaultPropertyPlan {
+                        field_name: field_name.clone(),
+                        default: DefaultValuePlan::Json(value.clone()),
+                    })
+            })
+            .collect();
+        Self { properties }
+    }
+
+    fn apply(
+        &self,
+        snapshot: &mut JsonMap<String, JsonValue>,
+        functions: FunctionProviderHandle,
+        schema_key: &str,
+        schema_version: &str,
+    ) -> Result<bool, LixError> {
+        let mut changed = false;
+        let mut cel_context = None::<JsonMap<String, JsonValue>>;
+        for property in &self.properties {
+            if snapshot.contains_key(&property.field_name) {
+                continue;
+            }
+            let value = match &property.default {
+                DefaultValuePlan::Json(value) => value.clone(),
+                DefaultValuePlan::Cel(expression) => {
+                    let context = cel_context.get_or_insert_with(|| snapshot.clone());
+                    crate::cel::shared_runtime()
+                        .evaluate_with_functions(expression, context, functions.clone())
+                        .map_err(|err| LixError {
+                            code: "LIX_ERROR_UNKNOWN".to_string(),
+                            message: format!(
+                                "failed to evaluate x-lix-default for '{}.{}' ({}): {}",
+                                schema_key, property.field_name, schema_version, err.message
+                            ),
+                            hint: None,
+                            details: None,
+                        })?
+                }
+            };
+            snapshot.insert(property.field_name.clone(), value);
+            changed = true;
+        }
+        Ok(changed)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForeignKeyPlan {
+    pub(crate) local_properties: PointerGroup,
+    pub(crate) referenced_schema_key: String,
+    pub(crate) referenced_properties: PointerGroup,
 }
 
 /// Normalizes one incoming row into a row with final snapshot/entity identity.
@@ -105,9 +285,8 @@ pub(crate) fn normalize_transaction_write_row(
 ) -> Result<NormalizedTransactionWriteRow, LixError> {
     validate_transaction_write_row_schema_identity(&row)?;
 
-    let Some(schema) = schema_catalog
-        .schema(&row.schema_key, &row.schema_version)
-        .cloned()
+    let Some((schema_plan_id, schema_plan)) =
+        schema_catalog.plan_for_key(&row.schema_key, &row.schema_version)
     else {
         return Err(LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
@@ -120,10 +299,10 @@ pub(crate) fn normalize_transaction_write_row(
 
     let normalized_snapshot = if let Some(snapshot) = row.snapshot.take() {
         let (mut snapshot, normalized) = snapshot_object_from_transaction_json(snapshot, &row)?;
-        let defaults_changed = apply_defaults(&mut snapshot, &schema, &row, functions)?;
+        let defaults_changed = apply_defaults(&mut snapshot, schema_plan, &row, functions)?;
         let descriptor_changed = normalize_filesystem_descriptor_snapshot(&row, &mut snapshot)?;
         let snapshot = JsonValue::Object(snapshot);
-        row.entity_id = Some(resolve_entity_id(&row, &schema, &snapshot)?);
+        row.entity_id = Some(resolve_entity_id(&row, schema_plan, &snapshot)?);
         if defaults_changed || descriptor_changed {
             Some(TransactionJson::from_value(
                 snapshot,
@@ -154,6 +333,8 @@ pub(crate) fn normalize_transaction_write_row(
     Ok(NormalizedTransactionWriteRow {
         row,
         snapshot: normalized_snapshot,
+        schema_plan_id,
+        facts: PreparedRowFacts::default(),
     })
 }
 
@@ -198,17 +379,13 @@ fn snapshot_object_from_transaction_json(
 
 fn apply_defaults(
     snapshot: &mut JsonMap<String, JsonValue>,
-    schema: &JsonValue,
+    schema_plan: &TransactionSchemaPlan,
     row: &TransactionWriteRow,
     functions: FunctionProviderHandle,
 ) -> Result<bool, LixError> {
-    apply_schema_defaults_with_shared_runtime(
-        snapshot,
-        schema,
-        functions,
-        &row.schema_key,
-        &row.schema_version,
-    )
+    schema_plan
+        .defaults
+        .apply(snapshot, functions, &row.schema_key, &row.schema_version)
 }
 
 fn normalize_filesystem_descriptor_snapshot(
@@ -273,10 +450,10 @@ fn optional_string_field<'a>(
 
 fn resolve_entity_id(
     row: &TransactionWriteRow,
-    schema: &JsonValue,
+    schema_plan: &TransactionSchemaPlan,
     snapshot: &JsonValue,
 ) -> Result<EntityIdentity, LixError> {
-    let Some(primary_key_paths) = primary_key_paths(schema)? else {
+    let Some(primary_key_paths) = schema_plan.primary_key.as_ref() else {
         return row.entity_id.clone().ok_or_else(|| {
             LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
@@ -287,8 +464,8 @@ fn resolve_entity_id(
             )
         });
     };
-    let derived = EntityIdentity::from_primary_key_paths(snapshot, &primary_key_paths)
-        .map_err(|error| entity_id_derivation_error(row, &primary_key_paths, error))?;
+    let derived = EntityIdentity::from_primary_key_paths(snapshot, primary_key_paths)
+        .map_err(|error| entity_id_derivation_error(row, primary_key_paths, error))?;
     if let Some(entity_id) = row.entity_id.as_ref() {
         if entity_id != &derived {
             return Err(LixError::new(
@@ -327,6 +504,135 @@ fn primary_key_paths(schema: &JsonValue) -> Result<Option<Vec<Vec<String>>>, Lix
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
+}
+
+fn pointer_groups(schema: &JsonValue, field: &str) -> Result<Vec<PointerGroup>, LixError> {
+    let Some(value) = schema.get(field) else {
+        return Ok(Vec::new());
+    };
+    let groups = value
+        .as_array()
+        .map(|groups| groups.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    groups
+        .into_iter()
+        .map(|group| {
+            let group = group.as_array().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    format!("schema {field} must contain arrays of JSON Pointers"),
+                )
+            })?;
+            group
+                .iter()
+                .enumerate()
+                .map(|(index, pointer)| {
+                    let pointer = pointer.as_str().ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_SCHEMA_DEFINITION,
+                            format!("schema {field} entry at index {index} must be a string"),
+                        )
+                    })?;
+                    parse_json_pointer(pointer)
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect()
+}
+
+fn foreign_key_plans(schema: &JsonValue) -> Result<Vec<ForeignKeyPlan>, LixError> {
+    let Some(value) = schema.get("x-lix-foreign-keys") else {
+        return Ok(Vec::new());
+    };
+    let Some(foreign_keys) = value.as_array() else {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            "schema x-lix-foreign-keys must be an array",
+        ));
+    };
+
+    foreign_keys
+        .iter()
+        .enumerate()
+        .map(|(index, foreign_key)| {
+            let object = foreign_key.as_object().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    format!("x-lix-foreign-keys[{index}] must be an object"),
+                )
+            })?;
+            let references = object
+                .get("references")
+                .and_then(JsonValue::as_object)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_DEFINITION,
+                        format!("x-lix-foreign-keys[{index}].references must be an object"),
+                    )
+                })?;
+            let referenced_schema_key = references
+                .get("schemaKey")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_DEFINITION,
+                        format!(
+                            "x-lix-foreign-keys[{index}].references.schemaKey must be a string"
+                        ),
+                    )
+                })?
+                .to_string();
+            let local_properties = pointer_array(
+                object.get("properties"),
+                &format!("x-lix-foreign-keys[{index}].properties"),
+            )?;
+            let referenced_properties = pointer_array(
+                references.get("properties"),
+                &format!("x-lix-foreign-keys[{index}].references.properties"),
+            )?;
+            if local_properties.len() != referenced_properties.len() {
+                return Err(LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    format!(
+                        "x-lix-foreign-keys[{index}] properties and references.properties must have the same length"
+                    ),
+                ));
+            }
+            Ok(ForeignKeyPlan {
+                local_properties,
+                referenced_schema_key,
+                referenced_properties,
+            })
+        })
+        .collect()
+}
+
+fn pointer_array(value: Option<&JsonValue>, context: &str) -> Result<PointerGroup, LixError> {
+    let Some(value) = value else {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            format!("{context} must be an array of JSON Pointers"),
+        ));
+    };
+    let Some(array) = value.as_array() else {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            format!("{context} must be an array of JSON Pointers"),
+        ));
+    };
+    array
+        .iter()
+        .enumerate()
+        .map(|(index, pointer)| {
+            let pointer = pointer.as_str().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    format!("{context}[{index}] must be a string"),
+                )
+            })?;
+            parse_json_pointer(pointer)
+        })
+        .collect()
 }
 
 fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
@@ -430,18 +736,6 @@ pub(crate) fn remember_pending_registered_schema(
             "lix_registered_schema rows cannot be deleted yet; schema deletion is not supported",
         ));
     };
-    let registered_schema_definition = schema_catalog
-        .schema(REGISTERED_SCHEMA_KEY, "1")
-        .cloned()
-        .ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_SCHEMA_DEFINITION,
-            "lix_registered_schema schema is not visible to this transaction",
-        )
-    })?;
-    if !snapshot.get("value").is_some_and(JsonValue::is_object) {
-        validate_lix_schema(&registered_schema_definition, &snapshot)?;
-    }
     let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
     reject_unsupported_registered_schema_version(&key)?;
     if is_seed_schema_key(&key.schema_key) {
@@ -454,8 +748,21 @@ pub(crate) fn remember_pending_registered_schema(
         ));
     }
     validate_lix_schema_definition(&schema)?;
-    validate_lix_schema(&registered_schema_definition, &snapshot)?;
-    schema_catalog.insert_schema(key, schema);
+    {
+        let registered_schema_definition = schema_catalog
+            .schema(REGISTERED_SCHEMA_KEY, "1")
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    "lix_registered_schema schema is not visible to this transaction",
+                )
+            })?;
+        if !snapshot.get("value").is_some_and(JsonValue::is_object) {
+            validate_lix_schema(registered_schema_definition, &snapshot)?;
+        }
+        validate_lix_schema(registered_schema_definition, &snapshot)?;
+    }
+    schema_catalog.insert_schema(key, schema)?;
     Ok(())
 }
 

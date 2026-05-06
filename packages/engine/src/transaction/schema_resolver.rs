@@ -9,15 +9,18 @@ use crate::live_state::{
 };
 use crate::schema_registry::SchemaRegistry;
 use crate::transaction::live_state_overlay::overlay_scan_rows;
-use crate::transaction::normalization::{
-    remember_pending_registered_schema, TransactionSchemaCatalog, REGISTERED_SCHEMA_KEY,
-};
-use crate::transaction::staging::{PreparedStateRowOverlay, PreparedWriteValidationSet};
+use crate::transaction::normalization::TransactionSchemaCatalog;
+use crate::transaction::staging::PreparedStateRowOverlay;
 use crate::LixError;
 
 pub(crate) struct TransactionSchemaResolver {
     registry: Arc<SchemaRegistry>,
-    catalogs_by_version: BTreeMap<String, TransactionSchemaCatalog>,
+    catalogs_by_version: BTreeMap<String, TransactionSchemaCatalogEntry>,
+}
+
+enum TransactionSchemaCatalogEntry {
+    VisibleSchemas(Vec<JsonValue>),
+    Catalog(TransactionSchemaCatalog),
 }
 
 impl TransactionSchemaResolver {
@@ -31,20 +34,47 @@ impl TransactionSchemaResolver {
     async fn load_catalog_for_version(
         &mut self,
         live_state: &dyn LiveStateReader,
-        staged: &PreparedStateRowOverlay,
+        staged: Option<&PreparedStateRowOverlay>,
         version_id: &str,
     ) -> Result<(), LixError> {
-        if !self.catalogs_by_version.contains_key(version_id) {
+        let needs_load = !self.catalogs_by_version.contains_key(version_id);
+        if needs_load {
+            let schemas = if let Some(staged) = staged {
+                let reader = TransactionSchemaLiveStateReader {
+                    base: live_state,
+                    staged,
+                };
+                self.registry.visible_schemas(&reader, version_id).await?
+            } else {
+                self.registry
+                    .visible_schemas(live_state, version_id)
+                    .await?
+            };
+            self.catalogs_by_version.insert(
+                version_id.to_string(),
+                TransactionSchemaCatalogEntry::VisibleSchemas(schemas),
+            );
+        }
+
+        let should_materialize = self
+            .catalogs_by_version
+            .get(version_id)
+            .is_some_and(|entry| matches!(entry, TransactionSchemaCatalogEntry::VisibleSchemas(_)));
+        if should_materialize {
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_transaction_schema_catalog_load();
-            let reader = TransactionSchemaLiveStateReader {
-                base: live_state,
-                staged,
+            let entry = self
+                .catalogs_by_version
+                .remove(version_id)
+                .expect("schema catalog entry should exist after load");
+            let TransactionSchemaCatalogEntry::VisibleSchemas(schemas) = entry else {
+                unreachable!("catalog entry was checked as raw visible schemas");
             };
-            let schemas = self.registry.visible_schemas(&reader, version_id).await?;
             let catalog = TransactionSchemaCatalog::from_visible_schemas(&schemas)?;
-            self.catalogs_by_version
-                .insert(version_id.to_string(), catalog);
+            self.catalogs_by_version.insert(
+                version_id.to_string(),
+                TransactionSchemaCatalogEntry::Catalog(catalog),
+            );
         }
         Ok(())
     }
@@ -55,53 +85,50 @@ impl TransactionSchemaResolver {
         staged: &PreparedStateRowOverlay,
         version_id: &str,
     ) -> Result<&mut TransactionSchemaCatalog, LixError> {
-        self.load_catalog_for_version(live_state, staged, version_id)
+        self.load_catalog_for_version(live_state, Some(staged), version_id)
             .await?;
-        Ok(self
+        match self
             .catalogs_by_version
             .get_mut(version_id)
-            .expect("catalog cache should contain requested version"))
+            .expect("catalog cache should contain requested version")
+        {
+            TransactionSchemaCatalogEntry::Catalog(catalog) => Ok(catalog),
+            TransactionSchemaCatalogEntry::VisibleSchemas(_) => {
+                unreachable!("schema catalog should be materialized before mutable access")
+            }
+        }
     }
 
     pub(crate) async fn catalog_for_validation(
         &mut self,
         live_state: &dyn LiveStateReader,
-        staged_writes: &PreparedWriteValidationSet<'_>,
         version_id: &str,
-    ) -> Result<TransactionSchemaCatalog, LixError> {
-        #[cfg(feature = "storage-benches")]
-        crate::storage_bench::record_transaction_schema_catalog_load();
-        let schemas = self
-            .registry
-            .visible_schemas(live_state, version_id)
+    ) -> Result<&TransactionSchemaCatalog, LixError> {
+        self.load_catalog_for_version(live_state, None, version_id)
             .await?;
-        let mut catalog = TransactionSchemaCatalog::from_visible_schemas(&schemas)?;
-        absorb_registered_schema_writes(&mut catalog, staged_writes)?;
-        Ok(catalog)
+        match self
+            .catalogs_by_version
+            .get(version_id)
+            .expect("catalog cache should contain requested version")
+        {
+            TransactionSchemaCatalogEntry::Catalog(catalog) => Ok(catalog),
+            TransactionSchemaCatalogEntry::VisibleSchemas(_) => {
+                unreachable!("schema catalog should be materialized before validation access")
+            }
+        }
     }
 
     pub(crate) fn remember_visible_schemas(
         &mut self,
         version_id: impl Into<String>,
         schemas: Vec<JsonValue>,
-    ) -> Result<(), LixError> {
+    ) {
         let version_id = version_id.into();
-        let catalog = TransactionSchemaCatalog::from_visible_schemas(&schemas)?;
-        self.catalogs_by_version.insert(version_id, catalog);
-        Ok(())
+        self.catalogs_by_version.insert(
+            version_id,
+            TransactionSchemaCatalogEntry::VisibleSchemas(schemas),
+        );
     }
-}
-
-fn absorb_registered_schema_writes(
-    schema_catalog: &mut TransactionSchemaCatalog,
-    staged_writes: &PreparedWriteValidationSet<'_>,
-) -> Result<(), LixError> {
-    for row in staged_writes.rows() {
-        if row.schema_key() == REGISTERED_SCHEMA_KEY {
-            remember_pending_registered_schema(row.snapshot_json(), schema_catalog)?;
-        }
-    }
-    Ok(())
 }
 
 struct TransactionSchemaLiveStateReader<'a> {
