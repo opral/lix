@@ -60,30 +60,30 @@ export function DocsLayout({
 
     if (headings.length === 0) return;
 
-    setActiveTocId(headings[0].id);
+    const updateActiveHeading = () => {
+      const activationOffset = 96;
+      let activeHeading = headings[0];
 
-    const observer = new IntersectionObserver(
-      (entries) => {
-        const visible = entries
-          .filter((entry) => entry.isIntersecting)
-          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
-
-        if (visible[0]?.target instanceof HTMLElement) {
-          setActiveTocId(visible[0].target.id);
+      for (const heading of headings) {
+        if (heading.getBoundingClientRect().top <= activationOffset) {
+          activeHeading = heading;
+        } else {
+          break;
         }
-      },
-      {
-        rootMargin: "0px 0px -70% 0px",
-        threshold: [0, 1],
-      },
-    );
+      }
 
-    for (const heading of headings) {
-      observer.observe(heading);
-    }
+      setActiveTocId((current) =>
+        current === activeHeading.id ? current : activeHeading.id,
+      );
+    };
+
+    updateActiveHeading();
+    window.addEventListener("scroll", updateActiveHeading, { passive: true });
+    window.addEventListener("resize", updateActiveHeading);
 
     return () => {
-      observer.disconnect();
+      window.removeEventListener("scroll", updateActiveHeading);
+      window.removeEventListener("resize", updateActiveHeading);
     };
   }, [pageToc]);
 

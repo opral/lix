@@ -1,57 +1,96 @@
 # Lix for AI Agents
 
-![AI agent changes need to be visible and controllable](/blame-what-did-you-change.svg)
+AI agents can make large, fast, and useful changes. They can also make changes that need review.
 
-AI agents edit your product's **state** (files, documents, configs, database-backed content). Those edits need the same guarantees teams expect from Git—**diff, review, rollback**—as a library you can import.
+Lix gives agentic applications a place to put those changes before they become the main state.
 
-**Lix is a version control library.**
+## The problem
 
-Import Lix, route agent writes through it, and your UI can show **semantic diffs**, **attribution**, **proposals**, and **rollback**—all as queryable data.
+An agent might edit:
 
-## Key concepts
+- Files
+- Documents
+- Configuration
+- Structured records
+- Database-backed application state
 
-- **Version**: an isolated branch of your application state. Run agents safely without touching production.
-- **Change proposal**: a review unit (diff + discussion + approval). Humans decide what ships.
+Without version control inside the app, those edits are hard to inspect. The user sees the result, but not the path that produced it.
 
-## Review every agent edit
+For agent workflows, that is not enough. Users need to review, compare, approve, reject, and recover.
 
-- **Attribution**: see which agent (or human) changed what. → [/docs/attribution](/docs/attribution)
-- **Diffs**: review what changed before it's merged or published. → [/docs/diffs](/docs/diffs)
-- **Queryable history**: answer "Which agent changed this setting last week?" via SQL.
+## The Lix model
 
-## Keep humans in control
+Route agent writes through Lix.
 
-Agents draft. Humans approve.
+Then each agent task can have its own isolated version of state:
 
-- Use **change proposals** to bundle edits into a reviewable unit. → [/docs/change-proposals](/docs/change-proposals)
-- Use **conversations** to comment, request revisions, loop in stakeholders. → [/docs/conversations](/docs/conversations)
-- Merge when ready—or reject and iterate.
+1. Create a version for the agent task.
+2. Switch the agent into that version.
+3. Let the agent make changes.
+4. Preview what changed.
+5. Ask a human or policy to approve the result.
+6. Merge or discard the version.
 
-## Run agents in isolated versions
+The app stays in control of the workflow.
 
-Use **versions** to give each agent task its own branch of state. → [/docs/versions](/docs/versions)
+## Why versions matter for agents
 
-- Run agents in parallel: one version per task.
-- Compare outcomes, merge the best, discard the rest.
-- Something went wrong? **Restore** a known-good state. → [/docs/restore](/docs/restore)
+Versions let agents work without immediately changing the main state.
 
-## Typical workflow
+That unlocks safer product experiences:
 
-1. Create a new **version** for an agent task.
-2. Run the agent—Lix records semantic changes + attribution.
-3. Open a **change proposal** from the version diff.
-4. Review, comment, request revisions, approve.
-5. Merge the proposal (or discard it). Restore if needed.
+- Run multiple agents in parallel.
+- Compare different proposed outcomes.
+- Keep the main state stable while work is in progress.
+- Merge only the changes that pass review.
+- Discard a bad attempt without manual cleanup.
 
-## Coming soon: automated guardrails
+## What users should see
 
-> [!NOTE]
-> [Validation rules](/docs/validation-rules) are upcoming. Define checks agents can run before opening a proposal—schema constraints, required fields, invariants. Follow the issue for progress.
+Lix is infrastructure. Your product still decides the UI.
 
-![Validation rules for AI agents](/validation-rules-agent.svg)
+A good agent review UI usually shows:
 
-## Next steps
+- The task the agent was asked to complete.
+- The files or records that changed.
+- A human-readable diff.
+- Any validation or policy checks.
+- Buttons to approve, request changes, or discard.
 
-- Wire Lix into your agent pipeline: [/docs/getting-started](/docs/getting-started)
-- Learn diff, merge, and experimentation with versions: [/docs/versions](/docs/versions)
-- See proposals in action: [prosemirror-example.onrender.com](https://prosemirror-example.onrender.com/)
+The important part is that the product can present agent work as a reviewable change, not as an invisible mutation.
+
+## Minimal flow
+
+```ts
+const mainVersionId = await lix.activeVersionId();
+
+const agentVersion = await lix.createVersion({
+  id: "agent-task-123",
+  name: "Agent task 123",
+});
+
+await lix.switchVersion({ versionId: agentVersion.id });
+
+// Run the agent here. Any writes routed through Lix are isolated.
+
+await lix.switchVersion({ versionId: mainVersionId });
+
+const preview = await lix.mergeVersionPreview({
+  sourceVersionId: agentVersion.id,
+});
+
+console.log(preview.changeStats);
+```
+
+Once the user approves the change:
+
+```ts
+await lix.mergeVersion({
+  sourceVersionId: agentVersion.id,
+});
+```
+
+## Next
+
+- Learn the basics in [Getting Started](/docs/getting-started)
+- Compare the mental model in [Comparison to Git](/docs/comparison-to-git)

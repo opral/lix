@@ -521,40 +521,17 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
                 </div>
                 <div className="p-5 text-sm leading-relaxed font-mono text-left overflow-x-auto whitespace-pre-wrap">
                   <span className="text-indigo-600">import</span>{" "}
-                  <span className="text-gray-900">
-                    {"{ openLix, InMemoryEnvironment }"}
-                  </span>{" "}
+                  <span className="text-gray-900">{"{ openLix }"}</span>{" "}
                   <span className="text-indigo-600">from</span>{" "}
                   <span className="text-amber-600">"@lix-js/sdk"</span>
                   <span className="text-gray-900">;</span>
                   <br />
-                  <span className="text-indigo-600">import</span>{" "}
-                  <span className="text-gray-900">{"{ plugin "}</span>
-                  <span className="text-indigo-600">as</span>
-                  <span className="text-gray-900">{" json }"}</span>{" "}
-                  <span className="text-indigo-600">from</span>{" "}
-                  <span className="text-amber-600">"@lix-js/plugin-json"</span>
-                  <span className="text-gray-900">;</span>
-                  <br />
-                  <br />
                   <span className="text-indigo-600">const</span>{" "}
                   <span className="text-gray-900">lix</span>{" "}
-                  <span className="text-gray-900">= openLix</span>
-                  <span className="text-gray-900">{"({"}</span>
-                  <br />
-                  <span className="text-sky-600">{"  environment"}</span>
-                  <span className="text-gray-900">{": "}</span>
-                  <span className="text-indigo-600">new</span>
-                  <span className="text-gray-900">
-                    {" InMemoryEnvironment(),"}
-                  </span>
-                  <br />
-                  <span className="text-sky-600">{"  providePlugins"}</span>
-                  <span className="text-gray-900">{": ["}</span>
-                  <span className="text-gray-900">json</span>
-                  <span className="text-gray-900">{"]"}</span>
-                  <br />
-                  <span className="text-gray-900">{"})"}</span>
+                  <span className="text-gray-900">= </span>
+                  <span className="text-indigo-600">await</span>{" "}
+                  <span className="text-gray-900">openLix</span>
+                  <span className="text-gray-900">{"()"}</span>
                 </div>
               </div>
             </div>

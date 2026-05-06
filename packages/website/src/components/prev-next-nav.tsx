@@ -41,14 +41,14 @@ export function PrevNextNav({
 
   return (
     <nav
-      className={`grid grid-cols-2 gap-4 border-t border-slate-200 pt-8 ${className}`}
+      className={`grid grid-cols-1 gap-4 border-t border-slate-200 pt-8 sm:grid-cols-2 ${className}`}
     >
-      <div>
+      <div className="min-w-0">
         {prev && (
           <Link
             to={`${basePath}/$${paramName}` as string}
             params={{ [paramName]: prev.slug } as Record<string, string>}
-            className="group block rounded-xl border border-slate-200 p-4 transition-colors hover:border-slate-300"
+            className="group block w-full rounded-xl border border-slate-200 p-4 transition-colors hover:border-slate-300"
           >
             <span className="flex items-center gap-1.5 text-sm text-slate-400">
               <svg
@@ -71,12 +71,12 @@ export function PrevNextNav({
         )}
       </div>
 
-      <div className="flex justify-end">
+      <div className="min-w-0">
         {next && (
           <Link
             to={`${basePath}/$${paramName}` as string}
             params={{ [paramName]: next.slug } as Record<string, string>}
-            className="group block rounded-xl border border-slate-200 p-4 transition-colors hover:border-slate-300"
+            className="group block w-full rounded-xl border border-slate-200 p-4 transition-colors hover:border-slate-300"
           >
             <span className="flex items-center justify-end gap-1.5 text-sm text-slate-400">
               {nextLabel}

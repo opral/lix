@@ -1,92 +1,42 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { MarkdownPage } from "../../components/markdown-page";
-import { DocsLayout } from "../../components/docs-layout";
-import { parse } from "@opral/markdown-wc";
-import markdownPageCss from "../../components/markdown-page.style.css?url";
-import pluginRegistry from "./plugin.registry.json";
-import { buildPluginSidebarSections } from "../../lib/plugin-sidebar";
+import { Header } from "../../components/header";
+import { Footer } from "../../components/footer";
 import {
-  buildCanonicalUrl,
   buildBreadcrumbJsonLd,
+  buildCanonicalUrl,
   buildWebPageJsonLd,
-  extractOgMeta,
-  extractTwitterMeta,
-  getMarkdownDescription,
-  getMarkdownTitle,
-  resolveOgImage,
 } from "../../lib/seo";
 
-const pluginIndexMarkdownFiles = import.meta.glob<string>(
-  "/content/plugins/index.md",
-  {
-    eager: true,
-    import: "default",
-    query: "?raw",
-  },
-);
-const pluginIndexMarkdown =
-  pluginIndexMarkdownFiles["/content/plugins/index.md"];
+const title = "Lix Plugins";
+const description = "Plugins are coming soon.";
 
 export const Route = createFileRoute("/plugins/")({
-  head: ({ loaderData }) => {
-    const frontmatter = loaderData?.frontmatter as
-      | Record<string, unknown>
-      | undefined;
-    const rawMarkdown = loaderData?.markdown ?? "";
-    const title =
-      getMarkdownTitle({ rawMarkdown, frontmatter }) ??
-      "Lix Plugins | JSON, CSV, Markdown, and ProseMirror change tracking";
-    const description =
-      getMarkdownDescription({ rawMarkdown, frontmatter }) ??
-      "Discover Lix plugins and integrations for tracking semantic changes across JSON, CSV, Markdown, ProseMirror, and more.";
+  head: () => {
     const canonicalUrl = buildCanonicalUrl("/plugins");
-    const ogImage = resolveOgImage(frontmatter);
-    const ogMeta = extractOgMeta(frontmatter);
-    const twitterMeta = extractTwitterMeta(frontmatter);
     const jsonLd = buildWebPageJsonLd({
       title,
       description,
       canonicalUrl,
-      image: ogImage.url,
     });
     const breadcrumbJsonLd = buildBreadcrumbJsonLd([
       { name: "Lix", item: buildCanonicalUrl("/") },
       { name: "Plugins", item: canonicalUrl },
     ]);
-    const meta: Array<
-      | { title: string }
-      | { name: string; content: string }
-      | { property: string; content: string }
-    > = [
-      { title },
-      { name: "description", content: description },
-      { property: "og:title", content: title },
-      { property: "og:description", content: description },
-      { property: "og:url", content: canonicalUrl },
-      { property: "og:type", content: "website" },
-      { property: "og:site_name", content: "Lix" },
-      { property: "og:locale", content: "en_US" },
-      { property: "og:image", content: ogImage.url },
-      { property: "og:image:alt", content: ogImage.alt },
-      { name: "twitter:card", content: "summary_large_image" },
-      { name: "twitter:title", content: title },
-      { name: "twitter:description", content: description },
-      { name: "twitter:image", content: ogImage.url },
-      { name: "twitter:image:alt", content: ogImage.alt },
-    ];
 
     return {
-      meta: [...meta, ...ogMeta, ...twitterMeta],
-      links: [
-        {
-          rel: "stylesheet",
-          href: markdownPageCss,
-        },
-        {
-          rel: "canonical",
-          href: canonicalUrl,
-        },
+      meta: [
+        { title },
+        { name: "description", content: description },
+        { property: "og:title", content: title },
+        { property: "og:description", content: description },
+        { property: "og:url", content: canonicalUrl },
+        { property: "og:type", content: "website" },
+        { property: "og:site_name", content: "Lix" },
+        { name: "twitter:card", content: "summary" },
+        { name: "twitter:title", content: title },
+        { name: "twitter:description", content: description },
       ],
+      links: [{ rel: "canonical", href: canonicalUrl }],
       scripts: [
         {
           type: "application/ld+json",
@@ -99,33 +49,25 @@ export const Route = createFileRoute("/plugins/")({
       ],
     };
   },
-  loader: async () => {
-    const parsed = await parse(pluginIndexMarkdown, { externalLinks: true });
-    return {
-      html: parsed.html,
-      frontmatter: parsed.frontmatter,
-      markdown: pluginIndexMarkdown,
-    };
-  },
-  component: PluginsIndexPage,
+  component: PluginsComingSoonPage,
 });
 
-/**
- * Renders the plugins landing page from markdown content.
- *
- * @example
- * <PluginsIndexPage />
- */
-function PluginsIndexPage() {
-  const { html, frontmatter, markdown } = Route.useLoaderData();
-
+function PluginsComingSoonPage() {
   return (
-    <DocsLayout sidebarSections={buildPluginSidebarSections(pluginRegistry)}>
-      <MarkdownPage
-        html={html}
-        markdown={markdown}
-        imports={(frontmatter.imports as string[] | undefined) ?? undefined}
-      />
-    </DocsLayout>
+    <div className="min-h-screen bg-white text-slate-900">
+      <Header />
+      <main className="mx-auto flex min-h-[60vh] w-full max-w-3xl flex-col justify-center px-6 py-24 text-center">
+        <p className="text-sm font-medium uppercase tracking-wide text-[#0891B2]">
+          Plugins
+        </p>
+        <h1 className="mt-4 text-4xl font-semibold tracking-tight sm:text-5xl">
+          Plugins are coming soon
+        </h1>
+        <p className="mt-6 text-lg leading-8 text-slate-600">
+          We are rewriting this section as part of the website cleanup.
+        </p>
+      </main>
+      <Footer />
+    </div>
   );
 }
