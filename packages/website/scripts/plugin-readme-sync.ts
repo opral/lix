@@ -1,4 +1,5 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import type { Plugin } from "vite";
 
@@ -99,8 +100,27 @@ async function syncPluginReadmes(registry: PluginRegistry, contentDir: string) {
         throw new Error(`Missing readme entry for plugin ${plugin?.key ?? ""}`);
       }
 
-      const response = await fetch(plugin.readme);
+      const destination = path.join(contentDir, `${plugin.key}.md`);
+      let response: Response;
+      try {
+        response = await fetch(plugin.readme);
+      } catch (error) {
+        if (existsSync(destination)) {
+          console.warn(
+            `Failed to fetch ${plugin.readme}; using cached ${destination}`,
+          );
+          return;
+        }
+        throw error;
+      }
+
       if (!response.ok) {
+        if (existsSync(destination)) {
+          console.warn(
+            `Failed to fetch ${plugin.readme} (${response.status} ${response.statusText}); using cached ${destination}`,
+          );
+          return;
+        }
         throw new Error(
           `Failed to fetch ${plugin.readme} (${response.status} ${response.statusText})`,
         );
@@ -111,7 +131,6 @@ async function syncPluginReadmes(registry: PluginRegistry, contentDir: string) {
         plugin.readme,
       );
       const content = `${buildSeoFrontmatter(plugin)}${markdown}`;
-      const destination = path.join(contentDir, `${plugin.key}.md`);
       await writeFile(destination, content);
     }),
   );

@@ -71,11 +71,8 @@ class DocCodeSnippetElement extends HTMLElement {
       | undefined;
     const src = sourcesByName.get(exampleName);
     if (!loader || !src) {
-      throw new Error(
-        `Unknown docs example "${exampleName}". Expected one of: ${[
-          ...modulesByName.keys(),
-        ].join(", ")}`,
-      );
+      this.replaceChildren();
+      return;
     }
 
     const seq = ++this.renderSeq;

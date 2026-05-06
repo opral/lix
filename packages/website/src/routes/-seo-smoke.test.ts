@@ -43,17 +43,17 @@ function findMetaContent(
 describe("SEO route smoke tests", () => {
   test("docs head stays canonical and strips the rendered h1 once", async () => {
     const rawMarkdown = readFileSync(
-      new URL("../../content/docs/validation-rules.md", import.meta.url),
+      new URL("../../content/docs/comparison-to-git.md", import.meta.url),
       "utf8",
     );
     const parsed = await parse(rawMarkdown, {
       externalLinks: true,
-      assetBaseUrl: "/docs/validation-rules/",
+      assetBaseUrl: "/docs/comparison-to-git/",
     });
     const rendered = splitTitleFromHtml(parsed.html);
     const head = buildDocsPageHead({
       doc: {
-        slug: "validation-rules",
+        slug: "comparison-to-git",
         content: rawMarkdown,
       },
       frontmatter: parsed.frontmatter,
@@ -64,15 +64,15 @@ describe("SEO route smoke tests", () => {
     } as any);
 
     expect(findLink(head.links, "canonical")).toBe(
-      "https://lix.dev/docs/validation-rules",
+      "https://lix.dev/docs/comparison-to-git",
     );
     expect(findMetaContent(head.meta, "og:title")).toBe(
-      "Validation Rules | Lix Documentation",
+      "Comparison to Git | Lix Documentation",
     );
     expect(findMetaContent(head.meta, "twitter:description")).toBe(
-      "Validation rules let Lix catch bad changes automatically so agents and humans can fix issues before review or release.",
+      "See when to use Git, when to use Lix, and how semantic change tracking differs from snapshot-based source control.",
     );
-    expect(rendered.title).toBe("Validation Rules");
+    expect(rendered.title).toBe("Comparison to Git");
     expect(rendered.body).not.toContain("<h1");
   });
 

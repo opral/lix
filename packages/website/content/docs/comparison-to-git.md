@@ -4,111 +4,61 @@ description: See when to use Git, when to use Lix, and how semantic change track
 
 # Comparison to Git
 
-> [!TIP]
->
-> Lix does not replace Git. They solve different problems.
+Lix and Git are both version-control systems, but they are built for different places in the stack.
 
-**Use Git for source code. Use Lix when you need version control as a library.**
+Use Git for source code. Use Lix when version control needs to live inside your app.
 
-Git is typically used as an external developer toolchain (CLI + hosting workflows). Lix is a library you import. Agents can propose changes and users can review/approve in your UI. Git stores snapshots and derives diffs by comparing versions. Lix stores semantic changes (deltas) as data, so diffs, audit trails, and rollback are native and queryable.
+## The short version
 
-- **Git**: "line 5 changed"
-- **Lix**: "price changed from $10 to $12"
+| Question | Git | Lix |
+| :-- | :-- | :-- |
+| Where does it run? | Outside your app | Inside your app |
+| Main interface | CLI and hosting platforms | JavaScript/TypeScript SDK |
+| Best for | Source-code repositories | Product state, files, and agent workflows |
+| Review flow | Pull requests | App-defined review flows |
+| History | Git commits | Queryable application data |
+| Diff model | Mostly text/snapshot oriented | Designed for semantic changes |
 
-|               | Git                                      | Lix                                      |
-| :------------ | :--------------------------------------- | :--------------------------------------- |
-| Architecture  | Snapshot-first                           | Change-first (semantic deltas)           |
-| Primary use   | Code repositories                        | Library for applications                 |
-| Interface     | CLI + external services                  | SDK (JS, soon Rust/Python)               |
-| Diffs         | Computed from snapshots                  | Semantic change records                  |
-| History       | git log                                  | SQL queries                              |
-| Metadata      | Review workflow usually external (PRs, comments) | Workflow data lives with the repo (queryable) |
+## Git is a developer tool
 
-## When to Use Git
+Git is excellent for source code:
 
-- Source code repositories
-- Developer workflows (branches, PRs, CI/CD)
-- Text-based config files
-- Collaboration via GitHub/GitLab
+- Branches
+- Commits
+- Pull requests
+- CI integration
+- Collaboration through GitHub, GitLab, or similar platforms
 
-Git excels here. Don't replace it with Lix for these use cases.
+That workflow is perfect when the user is a developer and the artifact is a repository.
 
-## When to Use Lix
+## Lix is an application primitive
 
-- **Version control as a library**: Users review and approve changes without leaving your product
-- **AI agent workflows**: Agents propose changes, humans review before merging
-- **Queryable history**: Audit trails, blame, and rollback via SQL
-- **Non-code formats**: Structured diffs for JSON, CSV, and other formats via plugins
-- **Portable repository**: Self-contained repos (often a single SQLite file), designed to integrate with SQL backends
+Lix is for products that need version control as part of the user experience.
 
-## Technical Differences
+For example:
 
-### 1. Change-First Architecture
+- An AI agent edits a document and a human reviews the result.
+- A product lets users draft changes before publishing them.
+- A workflow needs history, rollback, and auditability.
+- A structured file or app state needs semantic diffs instead of plain text diffs.
 
-In Git, diffs are derived by comparing snapshots. In Lix, semantic changes are stored as first-class records at write time, so diffs, audit trails, and rollback are native and queryable.
+In these cases, asking users to open Git is the wrong abstraction. The version-control workflow belongs in the app.
 
-Lix can track:
+## Snapshots vs changes
 
-- **JSON**: Individual properties (price changed from $10 to $12)
-- **CSV**: Specific cells or rows
-- **Excel**: Individual cells with row/column context (with plugin)
+Git stores snapshots and computes diffs between them.
 
-This enables:
+Lix is designed around changes as data. That makes it easier for an app to ask product-level questions:
 
-- **Precise diffs**: "price field changed from $10 to $12" instead of line numbers
-- **Granular queries**: SQL queries like "show all price changes in the last week"
-- **Smarter conflict resolution**: Semantic merging reduces conflicts
+- Which fields changed?
+- Which agent made this edit?
+- What would happen if we merge this version?
+- What changed since the user opened this review?
 
-Because changes are stored as data, you can query history directly:
+## They can be used together
 
-```sql
-SELECT
-  change_id,
-  snapshot_content,
-  account.display_name
-FROM state_history
-JOIN change_author ON change_author.change_id = state_history.change_id
-JOIN account ON account.id = change_author.account_id
-WHERE entity_id = '/product/price'
-ORDER BY lixcol_depth ASC;
-```
+Lix does not need to replace Git.
 
-### 2. Plugin System for Any File Format
+A product can use Git to version its source code while using Lix to version the state that users and agents edit at runtime.
 
-Format support depends on plugins. Plugins teach Lix what a "change" means for each format:
-
-- **What to track**: A cell, a row, a JSON property
-- **What changed**: The semantic delta (not just bytes)
-- **How to reconstruct**: Rebuild files from change history
-
-Once a plugin exists, that format gets queryable, diffable, mergeable changes.
-
-[Read more about plugins →](https://lix.dev/docs/plugins)
-
-### 3. Runs on SQL Databases
-
-Lix uses SQL databases as query engine and persistence layer.
-
-```
-┌─────────────────────────────────────────────────┐
-│                      Lix                        │
-│                                                 │
-│ ┌────────────┐ ┌──────────┐ ┌─────────┐ ┌─────┐ │
-│ │ Filesystem │ │ Branches │ │ History │ │ ... │ │
-│ └────────────┘ └──────────┘ └─────────┘ └─────┘ │
-└────────────────────────┬────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────┐
-│                  SQL database                   │
-│            (SQLite, Postgres, etc.)             │
-└─────────────────────────────────────────────────┘
-```
-
-[Read more about Lix architecture →](https://lix.dev/docs/architecture)
-
-## FAQ
-
-### Why not Git + diff drivers?
-
-Git diff drivers can improve display for some formats, but Git remains snapshot-first and toolchain-oriented. Lix is a library: semantic deltas, approvals, and queryable history as data.
+That separation is the point: Git remains the developer workflow, while Lix becomes the product workflow.
