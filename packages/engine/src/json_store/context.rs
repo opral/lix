@@ -1,8 +1,8 @@
 use crate::json_store::store;
-use crate::json_store::types::{JsonProjection, JsonProjectionPath, JsonRef};
+use crate::json_store::types::{JsonProjection, JsonProjectionPath, JsonRef, NormalizedJson};
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::LixError;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct JsonStoreContext;
@@ -90,42 +90,47 @@ where
 }
 
 pub(crate) struct JsonStoreWriter {
-    seen: HashSet<[u8; 32]>,
+    pending: HashMap<[u8; 32], PendingJsonWrite>,
+    flushed: HashSet<[u8; 32]>,
+}
+
+struct PendingJsonWrite {
+    key: Vec<u8>,
+    value: Vec<u8>,
 }
 
 impl JsonStoreWriter {
     fn new() -> Self {
         Self {
-            seen: HashSet::new(),
+            pending: HashMap::new(),
+            flushed: HashSet::new(),
         }
     }
 
-    pub(crate) fn stage_bytes(
-        &mut self,
-        writes: &mut StorageWriteSet,
-        bytes: &[u8],
-    ) -> Result<JsonRef, LixError> {
-        let json = std::str::from_utf8(bytes).map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("json bytes are invalid UTF-8: {error}"),
-            )
-        })?;
-        let hash = blake3::hash(bytes);
+    pub(crate) fn prepare_json(&mut self, normalized: NormalizedJson) -> Result<JsonRef, LixError> {
+        let hash = blake3::hash(normalized.as_bytes());
         let hash_bytes = *hash.as_bytes();
         #[cfg(feature = "storage-benches")]
         crate::storage_bench::record_json_store_stage_bytes(hash_bytes);
         let json_ref = JsonRef::from_hash(hash);
-        if !self.seen.insert(hash_bytes) {
+        if self.flushed.contains(&hash_bytes) {
             return Ok(json_ref);
         }
-        let (json_ref, stored_payload) =
-            store::encode_json_str_for_storage_with_ref(json, json_ref)?;
-        writes.put(
-            store::JSON_NAMESPACE,
-            json_ref.as_hash_bytes().to_vec(),
-            stored_payload,
-        );
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.pending.entry(hash_bytes) {
+            let (json_ref, stored_payload) =
+                store::encode_json_str_for_storage_with_ref(normalized.as_str(), json_ref.clone())?;
+            entry.insert(PendingJsonWrite {
+                key: json_ref.as_hash_bytes().to_vec(),
+                value: stored_payload,
+            });
+        }
         Ok(json_ref)
+    }
+
+    pub(crate) fn flush_into(&mut self, writes: &mut StorageWriteSet) {
+        for (hash, pending) in std::mem::take(&mut self.pending) {
+            writes.put(store::JSON_NAMESPACE, pending.key, pending.value);
+            self.flushed.insert(hash);
+        }
     }
 }

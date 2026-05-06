@@ -1,56 +1,59 @@
-use std::collections::{BTreeMap, BTreeSet};
-
 use crate::binary_cas::BinaryCasContext;
 use crate::changelog::{CanonicalChange, ChangelogContext};
 use crate::functions::FunctionContext;
-use crate::json_store::{JsonRef, JsonStoreContext, JsonStoreWriter};
+#[cfg(test)]
+use crate::json_store::{JsonStoreContext, JsonStoreWriter, NormalizedJson};
 use crate::live_state::{
     LiveStateContext, LiveStateRow, LiveStateTrackedRootWrite, LiveStateWriteBatch,
 };
 use crate::storage::{StorageReader, StorageWriteSet, StorageWriteTransaction};
 use crate::transaction::prepare_version_ref_row;
-use crate::transaction::staging::StagedWriteSet;
-use crate::transaction::types::{StagedAdoptedStateRow, StagedCommitMembers, StagedStateRow};
+use crate::transaction::staging::PreparedWriteSet;
+use crate::transaction::types::{
+    PreparedAdoptedStateRow, PreparedStateRow, StagedCommitMembers, TransactionJson,
+};
 use crate::version::{VersionContext, VersionRefReader};
+use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
-use crate::{serialize_row_metadata, LixError, RowMetadata};
+use std::collections::{BTreeMap, BTreeSet};
 
-/// Commits transaction-staged rows into durable tracked and untracked stores.
+/// Commits prepared transaction rows into durable tracked and untracked stores.
 ///
-/// Providers decode DataFusion DML into hydrated `StagedStateRow`s. Untracked
+/// Providers decode DataFusion DML into hydrated `PreparedStateRow`s. Untracked
 /// rows are durable local overlay state and bypass changelog/commit rows.
 /// Tracked rows receive normal `lix_commit` rows, append canonical changelog
 /// facts, then update the live-state serving projection. The tracked side of
 /// that projection is a prolly root keyed by the new commit id.
-pub(crate) async fn commit_staged_writes(
+pub(crate) async fn commit_prepared_writes(
     binary_cas: &BinaryCasContext,
     changelog: &ChangelogContext,
     live_state: &LiveStateContext,
     version_ctx: &VersionContext,
     runtime_functions: Option<&FunctionContext>,
     transaction: &mut (impl StorageWriteTransaction + ?Sized),
-    staged_writes: StagedWriteSet,
+    prepared_writes: PreparedWriteSet,
 ) -> Result<(), LixError> {
     let mut writes = StorageWriteSet::new();
-    let mut json_writer = JsonStoreContext::new().writer();
+    let mut json_writer = prepared_writes.json_writer;
 
-    if !staged_writes.file_data_writes.is_empty() {
+    if !prepared_writes.file_data_writes.is_empty() {
         let mut blob_writer = binary_cas.writer(&mut writes);
-        for write in &staged_writes.file_data_writes {
+        for write in &prepared_writes.file_data_writes {
             blob_writer.stage_bytes(&write.data)?;
         }
     }
 
-    let (mut changelog_rows, untracked_rows): (Vec<_>, Vec<_>) = staged_writes
+    let (mut changelog_rows, untracked_rows): (Vec<_>, Vec<_>) = prepared_writes
         .state_rows
         .into_iter()
         .partition(|row| !row.untracked);
-    let adopted_rows = staged_writes.adopted_rows;
+    let adopted_rows = prepared_writes.adopted_rows;
     let finalized = finalize_commit_rows(
-        staged_writes.commit_members_by_version,
-        staged_writes.extra_commit_parents_by_version,
+        prepared_writes.commit_members_by_version,
+        prepared_writes.extra_commit_parents_by_version,
         version_ctx,
         transaction,
+        &mut json_writer,
     )
     .await?;
     changelog_rows.extend(finalized.commit_rows);
@@ -74,14 +77,8 @@ pub(crate) async fn commit_staged_writes(
     }
 
     let canonical_changes = if !changelog_rows.is_empty() {
-        let canonical_changes = new_canonical_changes(
-            changelog,
-            transaction,
-            &mut writes,
-            &mut json_writer,
-            &changelog_rows,
-        )
-        .await?;
+        let canonical_changes =
+            new_canonical_changes(changelog, transaction, &changelog_rows).await?;
         {
             let mut writer = changelog.writer(&mut writes);
             writer.stage_changes(&canonical_changes)?;
@@ -100,8 +97,6 @@ pub(crate) async fn commit_staged_writes(
     // changelog append. Tracked rows become prolly mutations under their owning
     // commit root; untracked rows remain in the separate local overlay store.
     let live_state_batch = live_state_batch_from_committed_rows(
-        &mut writes,
-        &mut json_writer,
         &changelog_rows,
         &canonical_changes,
         &adopted_rows,
@@ -117,7 +112,6 @@ pub(crate) async fn commit_staged_writes(
 
     for version_head in version_heads {
         let canonical_row = prepare_version_ref_row(
-            &mut writes,
             &mut json_writer,
             &version_head.version_id,
             &version_head.commit_id,
@@ -126,6 +120,7 @@ pub(crate) async fn commit_staged_writes(
         version_ctx.stage_canonical_ref_rows(&mut writes, &[canonical_row])?;
     }
 
+    json_writer.flush_into(&mut writes);
     writes.apply(transaction).await?;
     Ok(())
 }
@@ -133,16 +128,14 @@ pub(crate) async fn commit_staged_writes(
 async fn new_canonical_changes(
     changelog: &ChangelogContext,
     transaction: &mut (impl StorageReader + ?Sized),
-    writes: &mut StorageWriteSet,
-    json_writer: &mut JsonStoreWriter,
-    rows: &[StagedStateRow],
+    rows: &[PreparedStateRow],
 ) -> Result<Vec<CanonicalChange>, LixError> {
     let reader = changelog.reader(&mut *transaction);
     let mut changes = Vec::with_capacity(rows.len());
     let mut change_ids = Vec::with_capacity(rows.len());
     let mut seen_change_ids = BTreeSet::new();
     for row in rows {
-        let change = canonical_change_from_staged_row(writes, json_writer, row)?;
+        let change = canonical_change_from_staged_row(row)?;
         if !seen_change_ids.insert(change.id.clone()) {
             return Err(LixError::new(
                 LixError::CODE_UNIQUE,
@@ -178,15 +171,13 @@ async fn new_canonical_changes(
 async fn validate_adopted_canonical_changes(
     changelog: &ChangelogContext,
     transaction: &mut (impl StorageReader + ?Sized),
-    rows: &[StagedAdoptedStateRow],
+    rows: &[PreparedAdoptedStateRow],
 ) -> Result<Vec<CanonicalChange>, LixError> {
-    let mut writes = StorageWriteSet::new();
-    let mut json_writer = JsonStoreContext::new().writer();
     let mut changes = Vec::with_capacity(rows.len());
     let mut change_ids = Vec::with_capacity(rows.len());
     let mut seen_change_ids = BTreeSet::new();
     for row in rows {
-        let expected = canonical_change_from_adopted_row(&mut writes, &mut json_writer, row)?;
+        let expected = canonical_change_from_adopted_row(row)?;
         if !seen_change_ids.insert(expected.id.clone()) {
             return Err(LixError::new(
                 LixError::CODE_UNIQUE,
@@ -233,13 +224,11 @@ async fn validate_adopted_canonical_changes(
 }
 
 fn live_state_batch_from_committed_rows(
-    writes: &mut StorageWriteSet,
-    json_writer: &mut JsonStoreWriter,
-    changelog_rows: &[StagedStateRow],
+    changelog_rows: &[PreparedStateRow],
     canonical_changes: &[CanonicalChange],
-    adopted_rows: &[StagedAdoptedStateRow],
+    adopted_rows: &[PreparedAdoptedStateRow],
     adopted_changes: &[CanonicalChange],
-    untracked_rows: &[StagedStateRow],
+    untracked_rows: &[PreparedStateRow],
     tracked_roots: Vec<PendingTrackedRoot>,
 ) -> Result<LiveStateWriteBatch, LixError> {
     let mut tracked_rows_by_commit = BTreeMap::<String, Vec<LiveStateRow>>::new();
@@ -289,7 +278,7 @@ fn live_state_batch_from_committed_rows(
 
     let untracked_rows = untracked_rows
         .iter()
-        .map(|row| live_state_row_from_untracked_staged_row(writes, json_writer, row))
+        .map(live_state_row_from_untracked_staged_row)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(LiveStateWriteBatch {
         untracked_rows,
@@ -298,7 +287,7 @@ fn live_state_batch_from_committed_rows(
 }
 
 fn live_state_row_from_canonical_change(
-    row: &StagedStateRow,
+    row: &PreparedStateRow,
     change: &CanonicalChange,
     commit_id: &str,
 ) -> LiveStateRow {
@@ -320,7 +309,7 @@ fn live_state_row_from_canonical_change(
 }
 
 fn live_state_row_from_adopted_change(
-    row: &StagedAdoptedStateRow,
+    row: &PreparedAdoptedStateRow,
     change: &CanonicalChange,
 ) -> LiveStateRow {
     LiveStateRow {
@@ -341,16 +330,20 @@ fn live_state_row_from_adopted_change(
 }
 
 fn live_state_row_from_untracked_staged_row(
-    writes: &mut StorageWriteSet,
-    json_writer: &mut JsonStoreWriter,
-    row: &StagedStateRow,
+    row: &PreparedStateRow,
 ) -> Result<LiveStateRow, LixError> {
     Ok(LiveStateRow {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
-        snapshot_ref: stage_optional_json(writes, json_writer, row.snapshot_content.as_deref())?,
-        metadata_ref: stage_optional_metadata(writes, json_writer, row.metadata.as_ref())?,
+        snapshot_ref: row
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.json_ref.clone()),
+        metadata_ref: row
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.json_ref.clone()),
         schema_version: row.schema_version.clone(),
         created_at: row.created_at.clone(),
         updated_at: row.updated_at.clone(),
@@ -362,11 +355,7 @@ fn live_state_row_from_untracked_staged_row(
     })
 }
 
-fn canonical_change_from_staged_row(
-    writes: &mut StorageWriteSet,
-    json_writer: &mut JsonStoreWriter,
-    row: &StagedStateRow,
-) -> Result<CanonicalChange, LixError> {
+fn canonical_change_from_staged_row(row: &PreparedStateRow) -> Result<CanonicalChange, LixError> {
     let Some(change_id) = row.change_id.as_ref() else {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -380,41 +369,20 @@ fn canonical_change_from_staged_row(
         schema_key: row.schema_key.clone(),
         schema_version: row.schema_version.clone(),
         file_id: row.file_id.clone(),
-        snapshot_ref: stage_optional_json(writes, json_writer, row.snapshot_content.as_deref())?,
-        metadata_ref: stage_optional_metadata(writes, json_writer, row.metadata.as_ref())?,
+        snapshot_ref: row
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.json_ref.clone()),
+        metadata_ref: row
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.json_ref.clone()),
         created_at: row.created_at.clone(),
     })
 }
 
-fn stage_optional_json(
-    writes: &mut StorageWriteSet,
-    json_writer: &mut JsonStoreWriter,
-    value: Option<&str>,
-) -> Result<Option<JsonRef>, LixError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    json_writer.stage_bytes(writes, value.as_bytes()).map(Some)
-}
-
-fn stage_optional_metadata(
-    writes: &mut StorageWriteSet,
-    json_writer: &mut JsonStoreWriter,
-    value: Option<&RowMetadata>,
-) -> Result<Option<JsonRef>, LixError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let serialized = serialize_row_metadata(value);
-    json_writer
-        .stage_bytes(writes, serialized.as_bytes())
-        .map(Some)
-}
-
 fn canonical_change_from_adopted_row(
-    writes: &mut StorageWriteSet,
-    json_writer: &mut JsonStoreWriter,
-    row: &StagedAdoptedStateRow,
+    row: &PreparedAdoptedStateRow,
 ) -> Result<CanonicalChange, LixError> {
     Ok(CanonicalChange {
         id: row.change_id.clone(),
@@ -422,8 +390,14 @@ fn canonical_change_from_adopted_row(
         schema_key: row.schema_key.clone(),
         schema_version: row.schema_version.clone(),
         file_id: row.file_id.clone(),
-        snapshot_ref: stage_optional_json(writes, json_writer, row.snapshot_content.as_deref())?,
-        metadata_ref: stage_optional_metadata(writes, json_writer, row.metadata.as_ref())?,
+        snapshot_ref: row
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.json_ref.clone()),
+        metadata_ref: row
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.json_ref.clone()),
         created_at: row.created_at.clone(),
     })
 }
@@ -436,7 +410,7 @@ fn canonical_change_from_adopted_row(
 /// the commit introduces relative to its first parent; merge commits may later
 /// populate this list with existing source-parent changes instead of copied
 /// changelog facts.
-/// This function turns those membership sets into normal `StagedStateRow`s with
+/// This function turns those membership sets into normal `PreparedStateRow`s with
 /// `schema_key = "lix_commit"`, so the changelog/live_state flush can treat
 /// commit rows exactly like any other staged state row.
 ///
@@ -448,7 +422,7 @@ fn canonical_change_from_adopted_row(
 /// `version_heads` are moving refs. They are written through `VersionContext`
 /// and must never be appended to changelog.
 struct FinalizedCommitRows {
-    commit_rows: Vec<StagedStateRow>,
+    commit_rows: Vec<PreparedStateRow>,
     version_heads: Vec<PendingVersionHead>,
     tracked_roots: Vec<PendingTrackedRoot>,
 }
@@ -469,6 +443,7 @@ async fn finalize_commit_rows(
     extra_commit_parents_by_version: BTreeMap<String, Vec<String>>,
     version_ctx: &VersionContext,
     transaction: &mut (impl StorageReader + ?Sized),
+    json_writer: &mut crate::json_store::JsonStoreWriter,
 ) -> Result<FinalizedCommitRows, LixError> {
     let mut commit_rows = Vec::new();
     let mut version_heads = Vec::new();
@@ -498,25 +473,26 @@ async fn finalize_commit_rows(
                 .unwrap_or_default(),
         );
         let parent_commit_id = parent_commit_ids.first().cloned();
-        let snapshot_content = serde_json::to_string(&serde_json::json!({
-            "id": commit_id,
-            "change_set_id": change_set_id,
-            "change_ids": change_ids,
-            "author_account_ids": [],
-            "parent_commit_ids": parent_commit_ids,
-        }))
-        .map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("engine2 commit row snapshot serialization failed: {error}"),
-            )
-        })?;
+        let snapshot = crate::transaction::types::stage_json_from_value(
+            json_writer,
+            TransactionJson::from_value(
+                serde_json::json!({
+                    "id": commit_id,
+                    "change_set_id": change_set_id,
+                    "change_ids": change_ids,
+                    "author_account_ids": [],
+                    "parent_commit_ids": parent_commit_ids,
+                }),
+                "engine commit row snapshot_content",
+            )?,
+            "engine commit row snapshot_content",
+        )?;
 
-        commit_rows.push(StagedStateRow {
+        commit_rows.push(PreparedStateRow {
             entity_id: crate::entity_identity::EntityIdentity::single(&commit_id),
             schema_key: "lix_commit".to_string(),
             file_id: None,
-            snapshot_content: Some(snapshot_content),
+            snapshot: Some(snapshot),
             metadata: None,
             origin: None,
             schema_version: "1".to_string(),
@@ -608,16 +584,18 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        commit_staged_writes(
+        let mut json_writer = JsonStoreContext::new().writer();
+        let state_rows = vec![tracked_global_row(&mut json_writer, "change-1")];
+        commit_prepared_writes(
             &binary_cas,
             &changelog,
             live_state.as_ref(),
             &version_ctx,
             None,
             transaction.as_mut(),
-            StagedWriteSet {
+            PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
-                state_rows: vec![tracked_global_row("change-1")],
+                state_rows,
                 adopted_rows: Vec::new(),
                 commit_members_by_version: BTreeMap::from([(
                     GLOBAL_VERSION_ID.to_string(),
@@ -625,6 +603,7 @@ mod tests {
                 )]),
                 extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
+                json_writer,
             },
         )
         .await
@@ -675,20 +654,23 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        commit_staged_writes(
+        let mut json_writer = JsonStoreContext::new().writer();
+        let state_rows = vec![untracked_global_row(&mut json_writer, "change-untracked")];
+        commit_prepared_writes(
             &binary_cas,
             &changelog,
             live_state.as_ref(),
             &version_ctx,
             None,
             transaction.as_mut(),
-            StagedWriteSet {
+            PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
-                state_rows: vec![untracked_global_row("change-untracked")],
+                state_rows,
                 adopted_rows: Vec::new(),
                 commit_members_by_version: BTreeMap::new(),
                 extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
+                json_writer,
             },
         )
         .await
@@ -743,12 +725,15 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         let canonical_row = {
             let mut json_writer = JsonStoreContext::new().writer();
-            crate::test_support::untracked_state_row_from_materialized(
+            let staged_row = untracked_global_row(&mut json_writer, "change-untracked");
+            let canonical_row = crate::test_support::untracked_state_row_from_materialized(
                 &mut writes,
                 &mut json_writer,
-                &MaterializedUntrackedStateRow::from(untracked_global_row("change-untracked")),
+                &MaterializedUntrackedStateRow::from(staged_row),
             )
-            .expect("untracked seed should canonicalize")
+            .expect("untracked seed should canonicalize");
+            json_writer.flush_into(&mut writes);
+            canonical_row
         };
         untracked_state
             .writer(&mut writes)
@@ -767,16 +752,18 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        commit_staged_writes(
+        let mut json_writer = JsonStoreContext::new().writer();
+        let state_rows = vec![tracked_global_row(&mut json_writer, "change-tracked")];
+        commit_prepared_writes(
             &binary_cas,
             &changelog,
             live_state.as_ref(),
             &version_ctx,
             None,
             transaction.as_mut(),
-            StagedWriteSet {
+            PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
-                state_rows: vec![tracked_global_row("change-tracked")],
+                state_rows,
                 adopted_rows: Vec::new(),
                 commit_members_by_version: BTreeMap::from([(
                     GLOBAL_VERSION_ID.to_string(),
@@ -784,6 +771,7 @@ mod tests {
                 )]),
                 extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
+                json_writer,
             },
         )
         .await
@@ -836,7 +824,9 @@ mod tests {
             }))
             .expect("mode snapshot should serialize");
             let mode_snapshot_ref = json_writer
-                .stage_bytes(&mut writes, mode_snapshot.as_bytes())
+                .prepare_json(NormalizedJson::from_arc_unchecked(Arc::from(
+                    mode_snapshot.as_str(),
+                )))
                 .expect("deterministic mode snapshot should stage");
             {
                 let mut writer = live_state.writer(seed_transaction.as_mut());
@@ -867,6 +857,7 @@ mod tests {
                     .await
                     .expect("deterministic mode should stage");
             }
+            json_writer.flush_into(&mut writes);
             writes
                 .apply(&mut seed_transaction.as_mut())
                 .await
@@ -889,19 +880,21 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        let mut untracked_row = untracked_global_row("change-untracked");
+        let mut json_writer = JsonStoreContext::new().writer();
+        let tracked_row = tracked_global_row(&mut json_writer, "change-tracked");
+        let mut untracked_row = untracked_global_row(&mut json_writer, "change-untracked");
         untracked_row.entity_id = crate::entity_identity::EntityIdentity::single("entity-2");
 
-        commit_staged_writes(
+        commit_prepared_writes(
             &binary_cas,
             &changelog,
             live_state.as_ref(),
             &version_ctx,
             Some(&runtime_functions),
             transaction.as_mut(),
-            StagedWriteSet {
+            PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
-                state_rows: vec![tracked_global_row("change-tracked"), untracked_row],
+                state_rows: vec![tracked_row, untracked_row],
                 adopted_rows: Vec::new(),
                 commit_members_by_version: BTreeMap::from([(
                     GLOBAL_VERSION_ID.to_string(),
@@ -909,6 +902,7 @@ mod tests {
                 )]),
                 extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
+                json_writer,
             },
         )
         .await
@@ -997,16 +991,22 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        commit_staged_writes(
+        let mut json_writer = JsonStoreContext::new().writer();
+        let state_rows = vec![tracked_version_row(
+            &mut json_writer,
+            "version-a",
+            "change-version-a",
+        )];
+        commit_prepared_writes(
             &binary_cas,
             &changelog,
             live_state.as_ref(),
             &version_ctx,
             None,
             transaction.as_mut(),
-            StagedWriteSet {
+            PreparedWriteSet {
                 insert_identities: BTreeMap::new(),
-                state_rows: vec![tracked_version_row("version-a", "change-version-a")],
+                state_rows,
                 adopted_rows: Vec::new(),
                 commit_members_by_version: BTreeMap::from([(
                     "version-a".to_string(),
@@ -1014,6 +1014,7 @@ mod tests {
                 )]),
                 extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
+                json_writer,
             },
         )
         .await
@@ -1079,6 +1080,7 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
+        let mut json_writer = JsonStoreContext::new().writer();
         let rows = finalize_commit_rows(
             BTreeMap::from([(
                 GLOBAL_VERSION_ID.to_string(),
@@ -1087,6 +1089,7 @@ mod tests {
             BTreeMap::new(),
             &version_ctx,
             transaction.as_mut(),
+            &mut json_writer,
         )
         .await
         .expect("global commit row should finalize");
@@ -1106,8 +1109,9 @@ mod tests {
         assert_eq!(row.updated_at, "test-timestamp-1");
 
         let snapshot = serde_json::from_str::<JsonValue>(
-            row.snapshot_content
-                .as_deref()
+            row.snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref())
                 .expect("commit row should have snapshot"),
         )
         .expect("commit snapshot should be JSON");
@@ -1150,6 +1154,7 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
+        let mut json_writer = JsonStoreContext::new().writer();
         let rows = finalize_commit_rows(
             BTreeMap::from([(
                 GLOBAL_VERSION_ID.to_string(),
@@ -1158,6 +1163,7 @@ mod tests {
             BTreeMap::new(),
             &version_ctx,
             transaction.as_mut(),
+            &mut json_writer,
         )
         .await
         .expect("empty members should be ignored");
@@ -1180,19 +1186,22 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
+        let mut json_writer = JsonStoreContext::new().writer();
         let rows = finalize_commit_rows(
             BTreeMap::from([("version-a".to_string(), members(["change-a"]))]),
             BTreeMap::new(),
             &version_ctx,
             transaction.as_mut(),
+            &mut json_writer,
         )
         .await
         .expect("active-version commit finalization should resolve parent");
 
         let snapshot = serde_json::from_str::<JsonValue>(
             rows.commit_rows[0]
-                .snapshot_content
-                .as_deref()
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref())
                 .expect("commit row should have snapshot"),
         )
         .expect("commit snapshot should be JSON");
@@ -1220,19 +1229,22 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
+        let mut json_writer = JsonStoreContext::new().writer();
         let rows = finalize_commit_rows(
             BTreeMap::from([("version-a".to_string(), members(["change-a"]))]),
             BTreeMap::from([("version-a".to_string(), vec!["source-head".to_string()])]),
             &version_ctx,
             transaction.as_mut(),
+            &mut json_writer,
         )
         .await
         .expect("merge commit finalization should resolve parents");
 
         let snapshot = serde_json::from_str::<JsonValue>(
             rows.commit_rows[0]
-                .snapshot_content
-                .as_deref()
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref())
                 .expect("commit row should have snapshot"),
         )
         .expect("commit snapshot should be JSON");
@@ -1261,16 +1273,29 @@ mod tests {
         members
     }
 
-    fn tracked_global_row(change_id: &str) -> StagedStateRow {
-        tracked_version_row(GLOBAL_VERSION_ID, change_id)
+    fn tracked_global_row(json_writer: &mut JsonStoreWriter, change_id: &str) -> PreparedStateRow {
+        tracked_version_row(json_writer, GLOBAL_VERSION_ID, change_id)
     }
 
-    fn tracked_version_row(version_id: &str, change_id: &str) -> StagedStateRow {
-        StagedStateRow {
+    fn tracked_version_row(
+        json_writer: &mut JsonStoreWriter,
+        version_id: &str,
+        change_id: &str,
+    ) -> PreparedStateRow {
+        PreparedStateRow {
             entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
             schema_key: "test_schema".to_string(),
             file_id: None,
-            snapshot_content: Some("{\"value\":1}".to_string()),
+            snapshot: Some(
+                crate::transaction::types::stage_json_from_value(
+                    json_writer,
+                    crate::transaction::types::TransactionJson::from_value_for_test(
+                        serde_json::json!({ "value": 1 }),
+                    ),
+                    "test tracked row snapshot",
+                )
+                .expect("test snapshot should stage"),
+            ),
             metadata: None,
             origin: None,
             schema_version: "1".to_string(),
@@ -1284,13 +1309,26 @@ mod tests {
         }
     }
 
-    fn untracked_global_row(change_id: &str) -> StagedStateRow {
-        StagedStateRow {
-            snapshot_content: Some("{\"value\":\"untracked\"}".to_string()),
+    fn untracked_global_row(
+        json_writer: &mut JsonStoreWriter,
+        change_id: &str,
+    ) -> PreparedStateRow {
+        let mut row = tracked_global_row(json_writer, change_id);
+        row.snapshot = Some(
+            crate::transaction::types::stage_json_from_value(
+                json_writer,
+                crate::transaction::types::TransactionJson::from_value_for_test(
+                    serde_json::json!({ "value": "untracked" }),
+                ),
+                "test untracked row snapshot",
+            )
+            .expect("test snapshot should stage"),
+        );
+        PreparedStateRow {
             change_id: None,
             commit_id: None,
             untracked: true,
-            ..tracked_global_row(change_id)
+            ..row
         }
     }
 

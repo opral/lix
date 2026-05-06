@@ -16,7 +16,7 @@ use super::filesystem_planner::{
 
 /// Execution-visible filesystem metadata decoded from live-state rows.
 ///
-/// The helper intentionally depends only on `LiveStateReader`. In engine2
+/// The helper intentionally depends only on `LiveStateReader`. In engine
 /// write execution that context may include staged rows, so filesystem planning
 /// sees pending writes without reaching into write-execution internals.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -74,7 +74,7 @@ impl VisibleFilesystem {
                         parent_id: snapshot.parent_id,
                         name: snapshot.name,
                         hidden: snapshot.hidden.unwrap_or(false),
-                        context: filesystem_row_context(&row),
+                        context: filesystem_row_context(&row)?,
                     };
                     visible
                         .directory_children_by_parent_id
@@ -98,7 +98,7 @@ impl VisibleFilesystem {
                         directory_id: snapshot.directory_id,
                         name: snapshot.name,
                         hidden: snapshot.hidden,
-                        context: filesystem_row_context(&row),
+                        context: filesystem_row_context(&row)?,
                     };
                     visible
                         .files_by_directory_id
@@ -120,7 +120,7 @@ impl VisibleFilesystem {
                             file_id: snapshot.id,
                             blob_hash: snapshot.blob_hash,
                             size_bytes: snapshot.size_bytes,
-                            context: filesystem_row_context(&row),
+                            context: filesystem_row_context(&row)?,
                         },
                     );
                 }
@@ -181,14 +181,29 @@ struct BlobRefSnapshot {
     size_bytes: Option<u64>,
 }
 
-fn filesystem_row_context(row: &MaterializedLiveStateRow) -> FilesystemRowContext {
-    FilesystemRowContext {
+fn filesystem_row_context(
+    row: &MaterializedLiveStateRow,
+) -> Result<FilesystemRowContext, LixError> {
+    Ok(FilesystemRowContext {
         version_id: row.version_id.clone(),
         global: row.global,
         untracked: row.untracked,
         file_id: row.file_id.clone(),
-        metadata: row.metadata.clone(),
-    }
+        metadata: row
+            .metadata
+            .as_deref()
+            .map(|metadata| {
+                crate::parse_row_metadata_value(metadata, "filesystem row metadata").and_then(
+                    |metadata| {
+                        crate::transaction::types::TransactionJson::from_value(
+                            metadata,
+                            "filesystem row metadata",
+                        )
+                    },
+                )
+            })
+            .transpose()?,
+    })
 }
 
 #[cfg(test)]

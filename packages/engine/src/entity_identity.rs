@@ -8,7 +8,7 @@ const COMPOSITE_ENTITY_ID_PREFIX: &str = "pk:v1:";
 
 /// Logical entity identity derived from a schema primary key.
 ///
-/// Keep this as typed tuple data inside engine2. The string projection exists
+/// Keep this as typed tuple data inside engine. The string projection exists
 /// only for SQL/canonical boundaries that still expose a single `entity_id`.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,

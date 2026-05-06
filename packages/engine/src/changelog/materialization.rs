@@ -1,7 +1,7 @@
 use crate::changelog::{CanonicalChange, MaterializedCanonicalChange};
 use crate::json_store::{JsonRef, JsonStoreReader};
 use crate::storage::StorageReader;
-use crate::{validate_row_metadata, LixError, RowMetadata};
+use crate::{parse_row_metadata, LixError};
 
 pub(crate) async fn materialize_change<S>(
     json_reader: &mut JsonStoreReader<S>,
@@ -28,20 +28,14 @@ where
 async fn load_optional_metadata<S>(
     json_reader: &mut JsonStoreReader<S>,
     json_ref: Option<&JsonRef>,
-) -> Result<Option<RowMetadata>, LixError>
+) -> Result<Option<String>, LixError>
 where
     S: StorageReader,
 {
     let Some(json) = load_optional_json(json_reader, json_ref, "metadata_ref").await? else {
         return Ok(None);
     };
-    let metadata = serde_json::from_str::<RowMetadata>(&json).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_INVALID_JSON",
-            format!("metadata_ref is invalid JSON: {error}"),
-        )
-    })?;
-    validate_row_metadata(metadata, "metadata_ref").map(Some)
+    parse_row_metadata(&json, "metadata_ref").map(Some)
 }
 
 async fn load_optional_json<S>(

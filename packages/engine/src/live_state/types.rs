@@ -6,7 +6,7 @@ use crate::untracked_state::{
     MaterializedUntrackedStateRow, UntrackedStateFilter, UntrackedStateRow,
     UntrackedStateRowRequest,
 };
-use crate::{NullableKeyFilter, RowMetadata, Value};
+use crate::{NullableKeyFilter, Value};
 
 /// Durable row visible through live_state reads.
 ///
@@ -18,7 +18,7 @@ pub(crate) struct MaterializedLiveStateRow {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<String>,
-    pub(crate) metadata: Option<RowMetadata>,
+    pub(crate) metadata: Option<String>,
     pub(crate) schema_version: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
@@ -291,7 +291,7 @@ pub(crate) struct LiveStateProjection {
     pub(crate) columns: Vec<String>,
 }
 
-/// First-principles scan request for engine2-owned reads.
+/// First-principles scan request for engine-owned reads.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct LiveStateScanRequest {
     #[serde(default)]

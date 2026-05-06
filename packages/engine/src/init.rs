@@ -3,7 +3,7 @@ use crate::entity_identity::EntityIdentity;
 use crate::functions::{
     FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
 };
-use crate::json_store::JsonStoreContext;
+use crate::json_store::{JsonStoreContext, NormalizedJson};
 use crate::live_state::{
     LiveStateContext, LiveStateRow, LiveStateTrackedRootWrite, LiveStateWriteBatch,
 };
@@ -18,6 +18,7 @@ use crate::version::{
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 use serde_json::json;
+use std::sync::Arc;
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const KEY_VALUE_SCHEMA_VERSION: &str = "1";
@@ -28,7 +29,7 @@ const COMMIT_SCHEMA_VERSION: &str = "1";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const REGISTERED_SCHEMA_VERSION: &str = "1";
 
-/// Pure seed plan for initializing an engine2 repository.
+/// Pure seed plan for initializing an engine repository.
 ///
 /// Tracked bootstrap facts go to the changelog. Moving refs such as
 /// `lix_version_ref` are seeded as untracked local state so repository heads can
@@ -70,7 +71,7 @@ pub struct InitReceipt {
     pub initial_commit_id: String,
 }
 
-/// Builds the canonical bootstrap changes for a new engine2 repository.
+/// Builds the canonical bootstrap changes for a new engine repository.
 ///
 /// The initial commit tracks durable content rows. Version refs are moving
 /// pointers and therefore live in untracked local state instead of changelog.
@@ -187,7 +188,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     })
 }
 
-/// Initializes an empty engine2 repository in one backend transaction.
+/// Initializes an empty engine repository in one backend transaction.
 ///
 /// The pure seed planner decides which bootstrap facts exist. This function is
 /// only responsible for durably writing those facts to their owning stores:
@@ -212,7 +213,7 @@ pub(crate) async fn initialize(
         let canonical_changes = plan
             .changes
             .iter()
-            .map(|change| seed_change_to_canonical_change(&mut writes, &mut json_writer, change))
+            .map(|change| seed_change_to_canonical_change(&mut json_writer, change))
             .collect::<Result<Vec<_>, _>>()?;
         let mut writer = changelog.writer(&mut writes);
         writer.stage_changes(&canonical_changes)?;
@@ -222,18 +223,13 @@ pub(crate) async fn initialize(
         .changes
         .iter()
         .map(|change| {
-            live_state_row_from_initial_change(
-                &mut writes,
-                &mut json_writer,
-                change,
-                &receipt.initial_commit_id,
-            )
+            live_state_row_from_initial_change(&mut json_writer, change, &receipt.initial_commit_id)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let untracked_rows = plan
         .untracked_rows
         .iter()
-        .map(|row| live_state_row_from_untracked_row(&mut writes, &mut json_writer, row))
+        .map(|row| live_state_row_from_untracked_row(&mut json_writer, row))
         .collect::<Result<Vec<_>, _>>()?;
 
     {
@@ -253,13 +249,13 @@ pub(crate) async fn initialize(
             .await?;
     }
 
+    json_writer.flush_into(&mut writes);
     writes.apply(&mut transaction.as_mut()).await?;
     transaction.commit().await?;
     Ok(receipt)
 }
 
 fn live_state_row_from_initial_change(
-    writes: &mut StorageWriteSet,
     json_writer: &mut crate::json_store::JsonStoreWriter,
     change: &InitSeedChange,
     initial_commit_id: &str,
@@ -268,7 +264,9 @@ fn live_state_row_from_initial_change(
         entity_id: change.entity_id.clone(),
         schema_key: change.schema_key.clone(),
         file_id: None,
-        snapshot_ref: Some(json_writer.stage_bytes(writes, change.snapshot_content.as_bytes())?),
+        snapshot_ref: Some(json_writer.prepare_json(NormalizedJson::from_arc_unchecked(
+            Arc::from(change.snapshot_content.as_str()),
+        ))?),
         metadata_ref: None,
         schema_version: change.schema_version.clone(),
         created_at: change.created_at.clone(),
@@ -282,7 +280,6 @@ fn live_state_row_from_initial_change(
 }
 
 fn seed_change_to_canonical_change(
-    writes: &mut StorageWriteSet,
     json_writer: &mut crate::json_store::JsonStoreWriter,
     change: &InitSeedChange,
 ) -> Result<CanonicalChange, LixError> {
@@ -292,14 +289,15 @@ fn seed_change_to_canonical_change(
         schema_key: change.schema_key.clone(),
         schema_version: change.schema_version.clone(),
         file_id: None,
-        snapshot_ref: Some(json_writer.stage_bytes(writes, change.snapshot_content.as_bytes())?),
+        snapshot_ref: Some(json_writer.prepare_json(NormalizedJson::from_arc_unchecked(
+            Arc::from(change.snapshot_content.as_str()),
+        ))?),
         metadata_ref: None,
         created_at: change.created_at.clone(),
     })
 }
 
 fn live_state_row_from_untracked_row(
-    writes: &mut StorageWriteSet,
     json_writer: &mut crate::json_store::JsonStoreWriter,
     row: &InitSeedLiveRow,
 ) -> Result<LiveStateRow, LixError> {
@@ -307,7 +305,9 @@ fn live_state_row_from_untracked_row(
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
         file_id: None,
-        snapshot_ref: Some(json_writer.stage_bytes(writes, row.snapshot_content.as_bytes())?),
+        snapshot_ref: Some(json_writer.prepare_json(NormalizedJson::from_arc_unchecked(
+            Arc::from(row.snapshot_content.as_str()),
+        ))?),
         metadata_ref: None,
         schema_version: row.schema_version.clone(),
         created_at: row.created_at.clone(),
@@ -402,7 +402,7 @@ fn encode_snapshot(value: serde_json::Value) -> Result<String, LixError> {
     serde_json::to_string(&value).map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("engine2 init seed snapshot serialization failed: {error}"),
+            format!("engine init seed snapshot serialization failed: {error}"),
         )
     })
 }

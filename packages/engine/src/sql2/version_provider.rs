@@ -31,7 +31,8 @@ use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
 use crate::transaction::types::{
-    LogicalPrimaryKey, StageRow, StageRowOrigin, StageWrite, StageWriteMode, StageWriteOperation,
+    LogicalPrimaryKey, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
+    TransactionWriteOrigin, TransactionWriteRow,
 };
 use crate::version::{
     version_descriptor_stage_row, version_descriptor_tombstone_row, version_ref_stage_row,
@@ -270,8 +271,8 @@ impl InsertSink for LixVersionInsertSink {
 
         if !rows.is_empty() {
             self.write_ctx
-                .stage_write(StageWrite::Rows {
-                    mode: StageWriteMode::Insert,
+                .stage_write(TransactionWrite::Rows {
+                    mode: TransactionWriteMode::Insert,
                     rows,
                 })
                 .await
@@ -399,8 +400,8 @@ impl ExecutionPlan for LixVersionDeleteExec {
 
             if !rows.is_empty() {
                 write_ctx
-                    .stage_write(StageWrite::Rows {
-                        mode: StageWriteMode::Replace,
+                    .stage_write(TransactionWrite::Rows {
+                        mode: TransactionWriteMode::Replace,
                         rows,
                     })
                     .await
@@ -542,8 +543,8 @@ impl ExecutionPlan for LixVersionUpdateExec {
 
             if !rows.is_empty() {
                 write_ctx
-                    .stage_write(StageWrite::Rows {
-                        mode: StageWriteMode::Replace,
+                    .stage_write(TransactionWrite::Rows {
+                        mode: TransactionWriteMode::Replace,
                         rows,
                     })
                     .await
@@ -905,7 +906,10 @@ fn version_update_rows_from_batch(
         .collect()
 }
 
-fn version_stage_rows(row: VersionRow, origin: Option<StageRowOrigin>) -> Vec<StageRow> {
+fn version_stage_rows(
+    row: VersionRow,
+    origin: Option<TransactionWriteOrigin>,
+) -> Vec<TransactionWriteRow> {
     vec![
         with_origin(
             version_descriptor_stage_row(&row.id, &row.name, row.hidden),
@@ -915,31 +919,40 @@ fn version_stage_rows(row: VersionRow, origin: Option<StageRowOrigin>) -> Vec<St
     ]
 }
 
-fn version_tombstone_rows(row: VersionRow) -> Vec<StageRow> {
-    let origin = Some(lix_version_origin(StageWriteOperation::Delete, &row.id));
+fn version_tombstone_rows(row: VersionRow) -> Vec<TransactionWriteRow> {
+    let origin = Some(lix_version_origin(
+        TransactionWriteOperation::Delete,
+        &row.id,
+    ));
     vec![
         with_origin(version_descriptor_tombstone_row(&row.id), origin.clone()),
         with_origin(version_ref_tombstone_row(&row.id), origin),
     ]
 }
 
-fn version_insert_stage_rows(row: VersionRow) -> Vec<StageRow> {
-    let origin = lix_version_origin(StageWriteOperation::Insert, &row.id);
+fn version_insert_stage_rows(row: VersionRow) -> Vec<TransactionWriteRow> {
+    let origin = lix_version_origin(TransactionWriteOperation::Insert, &row.id);
     version_stage_rows(row, Some(origin))
 }
 
-fn version_update_stage_rows(row: VersionRow) -> Vec<StageRow> {
-    let origin = lix_version_origin(StageWriteOperation::Update, &row.id);
+fn version_update_stage_rows(row: VersionRow) -> Vec<TransactionWriteRow> {
+    let origin = lix_version_origin(TransactionWriteOperation::Update, &row.id);
     version_stage_rows(row, Some(origin))
 }
 
-fn with_origin(mut row: StageRow, origin: Option<StageRowOrigin>) -> StageRow {
+fn with_origin(
+    mut row: TransactionWriteRow,
+    origin: Option<TransactionWriteOrigin>,
+) -> TransactionWriteRow {
     row.origin = origin;
     row
 }
 
-fn lix_version_origin(operation: StageWriteOperation, version_id: &str) -> StageRowOrigin {
-    StageRowOrigin {
+fn lix_version_origin(
+    operation: TransactionWriteOperation,
+    version_id: &str,
+) -> TransactionWriteOrigin {
+    TransactionWriteOrigin {
         surface: "lix_version".to_string(),
         operation,
         primary_key: Some(LogicalPrimaryKey {

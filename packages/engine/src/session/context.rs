@@ -31,13 +31,13 @@ pub(crate) enum SessionMode {
     Workspace,
 }
 
-/// Session-context state for engine2 execution.
+/// Session-context state for engine execution.
 ///
 /// A session context pins the active version selector and shared execution
 /// services. Each call to `execute(...)` projects this state into a read-only
 /// SQL context or a transaction-owned write context.
 ///
-/// Write transaction invariant: any engine2 operation that may write must enter
+/// Write transaction invariant: any engine operation that may write must enter
 /// through `SessionContext::with_write_transaction`. Reads that influence writes
 /// are only available from that transaction capability, not from session-level
 /// helpers.

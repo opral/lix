@@ -56,7 +56,7 @@ pub(crate) async fn scan_changes(
     store: &mut impl StorageReader,
     request: &ChangelogScanRequest,
 ) -> Result<Vec<CanonicalChange>, LixError> {
-    // TODO(engine2): scan by a durable append sequence instead of change id.
+    // TODO(engine): scan by a durable append sequence instead of change id.
     // This first index is enough for exact lookup and deterministic debug scans.
     let page = store
         .scan_values(KvScanRequest {

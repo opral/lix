@@ -1,4 +1,4 @@
-use crate::transaction::types::{StageWrite, StageWriteMode};
+use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 use crate::version::{version_descriptor_stage_row, version_ref_stage_row, VersionRefReader};
 use crate::LixError;
 
@@ -7,7 +7,7 @@ use super::context::SessionContext;
 /// Options for creating a new version from the session's active version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateVersionOptions {
-    /// Optional caller-provided version id. If omitted, engine2 generates one.
+    /// Optional caller-provided version id. If omitted, engine generates one.
     pub id: Option<String>,
     /// User-facing version name.
     pub name: String,
@@ -58,8 +58,8 @@ impl SessionContext {
                 };
 
                 transaction
-                    .stage_write(StageWrite::Rows {
-                        mode: StageWriteMode::Insert,
+                    .stage_write(TransactionWrite::Rows {
+                        mode: TransactionWriteMode::Insert,
                         rows: vec![
                             version_descriptor_stage_row(&version_id, &options.name, false),
                             version_ref_stage_row(&version_id, &source_head),

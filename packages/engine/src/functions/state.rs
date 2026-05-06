@@ -1,8 +1,9 @@
 use serde_json::Value as JsonValue;
+use std::sync::Arc;
 
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{DeterministicMode, DeterministicSequence};
-use crate::json_store::JsonStoreWriter;
+use crate::json_store::{JsonStoreWriter, NormalizedJson};
 use crate::live_state::{
     LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateWriteBatch, LiveStateWriter,
     MaterializedLiveStateRow,
@@ -70,7 +71,6 @@ where
         )
     })?;
     let row = deterministic_key_value_row(
-        writes,
         json_writer,
         DETERMINISTIC_SEQUENCE_KEY,
         &snapshot_content,
@@ -165,13 +165,14 @@ fn parse_sequence_value(value: JsonValue) -> Result<DeterministicSequence, LixEr
 }
 
 fn deterministic_key_value_row(
-    writes: &mut StorageWriteSet,
     json_writer: &mut JsonStoreWriter,
     key: &str,
     snapshot_content: &str,
     timestamp: &str,
 ) -> Result<LiveStateRow, LixError> {
-    let snapshot_ref = json_writer.stage_bytes(writes, snapshot_content.as_bytes())?;
+    let snapshot_ref = json_writer.prepare_json(NormalizedJson::from_arc_unchecked(Arc::from(
+        snapshot_content,
+    )))?;
     Ok(LiveStateRow {
         entity_id: crate::entity_identity::EntityIdentity::single(key),
         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
@@ -312,6 +313,7 @@ mod tests {
             .await
             .expect("sequence should stage");
         }
+        json_writer.flush_into(&mut writes);
         writes
             .apply(&mut tx.as_mut())
             .await
@@ -359,7 +361,6 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
         let row = deterministic_key_value_row(
-            &mut writes,
             &mut json_writer,
             key,
             &snapshot_content,
@@ -379,6 +380,7 @@ mod tests {
                 .await
                 .expect("test key-value should stage");
         }
+        json_writer.flush_into(&mut writes);
         writes
             .apply(&mut tx.as_mut())
             .await

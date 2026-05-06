@@ -1,7 +1,7 @@
 /// Decoded deterministic-mode setting.
 ///
 /// Storage can decide where this setting lives. The type only describes the
-/// behavior engine2 should apply while preparing runtime functions.
+/// behavior engine should apply while preparing runtime functions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DeterministicMode {
     pub(crate) enabled: bool,

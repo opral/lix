@@ -12,7 +12,7 @@ use crate::transaction::live_state_overlay::overlay_scan_rows;
 use crate::transaction::normalization::{
     remember_pending_registered_schema, TransactionSchemaCatalog, REGISTERED_SCHEMA_KEY,
 };
-use crate::transaction::staging::{StagedStateRowOverlay, StagedWriteSet};
+use crate::transaction::staging::{PreparedStateRowOverlay, PreparedWriteValidationSet};
 use crate::LixError;
 
 pub(crate) struct TransactionSchemaResolver {
@@ -31,7 +31,7 @@ impl TransactionSchemaResolver {
     async fn load_catalog_for_version(
         &mut self,
         live_state: &dyn LiveStateReader,
-        staged: StagedStateRowOverlay,
+        staged: &PreparedStateRowOverlay,
         version_id: &str,
     ) -> Result<(), LixError> {
         if !self.catalogs_by_version.contains_key(version_id) {
@@ -52,7 +52,7 @@ impl TransactionSchemaResolver {
     pub(crate) async fn catalog_for_row_normalization(
         &mut self,
         live_state: &dyn LiveStateReader,
-        staged: StagedStateRowOverlay,
+        staged: &PreparedStateRowOverlay,
         version_id: &str,
     ) -> Result<&mut TransactionSchemaCatalog, LixError> {
         self.load_catalog_for_version(live_state, staged, version_id)
@@ -66,7 +66,7 @@ impl TransactionSchemaResolver {
     pub(crate) async fn catalog_for_validation(
         &mut self,
         live_state: &dyn LiveStateReader,
-        staged_writes: &StagedWriteSet,
+        staged_writes: &PreparedWriteValidationSet<'_>,
         version_id: &str,
     ) -> Result<TransactionSchemaCatalog, LixError> {
         #[cfg(feature = "storage-benches")]
@@ -76,7 +76,7 @@ impl TransactionSchemaResolver {
             .visible_schemas(live_state, version_id)
             .await?;
         let mut catalog = TransactionSchemaCatalog::from_visible_schemas(&schemas)?;
-        absorb_registered_schema_writes(&mut catalog, staged_writes, version_id)?;
+        absorb_registered_schema_writes(&mut catalog, staged_writes)?;
         Ok(catalog)
     }
 
@@ -94,17 +94,11 @@ impl TransactionSchemaResolver {
 
 fn absorb_registered_schema_writes(
     schema_catalog: &mut TransactionSchemaCatalog,
-    staged_writes: &StagedWriteSet,
-    version_id: &str,
+    staged_writes: &PreparedWriteValidationSet<'_>,
 ) -> Result<(), LixError> {
-    for row in &staged_writes.state_rows {
-        if row.schema_scope_version_id() == version_id && row.schema_key == REGISTERED_SCHEMA_KEY {
-            remember_pending_registered_schema(row.snapshot_content.as_deref(), schema_catalog)?;
-        }
-    }
-    for row in &staged_writes.adopted_rows {
-        if row.schema_scope_version_id() == version_id && row.schema_key == REGISTERED_SCHEMA_KEY {
-            remember_pending_registered_schema(row.snapshot_content.as_deref(), schema_catalog)?;
+    for row in staged_writes.rows() {
+        if row.schema_key() == REGISTERED_SCHEMA_KEY {
+            remember_pending_registered_schema(row.snapshot_json(), schema_catalog)?;
         }
     }
     Ok(())
@@ -112,7 +106,7 @@ fn absorb_registered_schema_writes(
 
 struct TransactionSchemaLiveStateReader<'a> {
     base: &'a dyn LiveStateReader,
-    staged: StagedStateRowOverlay,
+    staged: &'a PreparedStateRowOverlay,
 }
 
 #[async_trait]
@@ -121,7 +115,7 @@ impl LiveStateReader for TransactionSchemaLiveStateReader<'_> {
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        overlay_scan_rows(self.base, &self.staged, request).await
+        overlay_scan_rows(self.base, self.staged, request).await
     }
 
     async fn load_row(

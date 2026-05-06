@@ -17,7 +17,7 @@ pub use identity::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
 };
 pub(crate) use metadata::{
-    parse_row_metadata, serialize_row_metadata, validate_row_metadata, RowMetadata,
+    parse_row_metadata, parse_row_metadata_value, serialize_row_metadata, validate_row_metadata,
 };
 pub use types::{LixNotice, NullableKeyFilter, SqlQueryResult, Value, WriteReceipt};
 pub use wire::{WireQueryResult, WireValue};

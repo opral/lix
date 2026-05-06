@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
 
-use crate::common::json_pointer_get;
+use crate::common::{json_pointer_get, validate_row_metadata};
 use crate::entity_identity::{EntityIdentity, EntityIdentityError, EntityIdentityPart};
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateRowIdentity, LiveStateRowRequest,
@@ -19,10 +19,13 @@ use crate::schema::{
 };
 use crate::transaction::normalization::{SchemaCatalogKey, TransactionSchemaCatalog};
 use crate::transaction::staging::duplicate_insert_identity_message;
-use crate::transaction::staging::StagedWriteSet;
-use crate::transaction::types::StagedStateRow;
+#[cfg(test)]
+use crate::transaction::staging::PreparedWriteSet;
+use crate::transaction::staging::{PreparedValidationRow, PreparedWriteValidationSet};
+#[cfg(test)]
+use crate::transaction::types::PreparedStateRow;
 use crate::version::{VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_REF_SCHEMA_KEY};
-use crate::{validate_row_metadata, LixError, NullableKeyFilter};
+use crate::{LixError, NullableKeyFilter};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -36,14 +39,14 @@ const MAX_DIRECTORY_PARENT_DEPTH: usize = 1024;
 /// hydrated generated fields, but before changelog, tracked-state, untracked
 /// state, or binary CAS writes are flushed.
 pub(crate) struct TransactionValidationInput<'a> {
-    staged_writes: &'a StagedWriteSet,
+    staged_writes: &'a PreparedWriteValidationSet<'a>,
     schema_catalog: &'a TransactionSchemaCatalog,
     live_state: &'a dyn LiveStateReader,
 }
 
 impl<'a> TransactionValidationInput<'a> {
     pub(crate) fn new(
-        staged_writes: &'a StagedWriteSet,
+        staged_writes: &'a PreparedWriteValidationSet<'a>,
         schema_catalog: &'a TransactionSchemaCatalog,
         live_state: &'a dyn LiveStateReader,
     ) -> Self {
@@ -56,7 +59,7 @@ impl<'a> TransactionValidationInput<'a> {
 
     #[cfg(test)]
     fn from_visible_schemas_for_tests(
-        staged_writes: &'a StagedWriteSet,
+        staged_writes: &'a PreparedWriteSet,
         visible_schemas: &'a [JsonValue],
         live_state: &'a dyn LiveStateReader,
     ) -> Self {
@@ -64,13 +67,14 @@ impl<'a> TransactionValidationInput<'a> {
             TransactionSchemaCatalog::from_visible_schemas(visible_schemas)
                 .expect("test schema catalog should build"),
         ));
-        Self::new(staged_writes, catalog, live_state)
+        let validation_set = Box::leak(Box::new(staged_writes.validation_set_for_tests()));
+        Self::new(validation_set, catalog, live_state)
     }
 }
 
 /// Validates the final transaction write set before durable persistence.
 ///
-/// The validator owns semantic write correctness for every engine2 write
+/// The validator owns semantic write correctness for every engine write
 /// frontend. It builds one transaction-visible schema catalog, validates pending
 /// schema registrations, checks exact schema existence, and validates each
 /// non-tombstone snapshot against the compiled JSON Schema for its
@@ -79,32 +83,34 @@ impl<'a> TransactionValidationInput<'a> {
 /// Cross-row constraints such as `x-lix-unique` and foreign keys should also
 /// live here so they can share transaction-local indexes and see the final
 /// coalesced staged write set.
-pub(crate) async fn validate_staged_writes(
+pub(crate) async fn validate_prepared_writes(
     input: TransactionValidationInput<'_>,
 ) -> Result<(), LixError> {
     validate_foreign_key_definitions(input.schema_catalog)?;
     let schema_catalog = input.schema_catalog.clone();
     let pending_file_descriptors =
         PendingFileDescriptorIndex::from_staged_writes(input.staged_writes);
-    let staged_rows = input.staged_writes.state_rows_for_validation();
+    let staged_rows = input.staged_writes.rows().collect::<Vec<_>>();
     validate_registered_schema_identity_is_canonical(&input, &staged_rows).await?;
     let mut compiled_schemas = CompiledSchemaCatalog::new(&schema_catalog);
     let mut pending_constraints = PendingConstraintIndexes::default();
     let mut staged_snapshots = Vec::new();
     for row in &staged_rows {
+        let row = *row;
         validate_staged_row_shape(row)?;
         validate_staged_row_metadata(row)?;
         validate_schema_exists(row, &schema_catalog)?;
         let snapshot = validate_snapshot_content(row, &mut compiled_schemas)?;
-        if let Some(snapshot) = snapshot.as_ref() {
+        if let Some(snapshot) = snapshot {
             let schema = schema_catalog
-                .schema(&row.schema_key, &row.schema_version)
+                .schema(row.schema_key(), row.schema_version())
                 .ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_SCHEMA_DEFINITION,
                         format!(
                             "schema '{}' version '{}' is not visible to this transaction",
-                            row.schema_key, row.schema_version
+                            row.schema_key(),
+                            row.schema_version()
                         ),
                     )
                 })?;
@@ -117,7 +123,7 @@ pub(crate) async fn validate_staged_writes(
                 schema,
                 snapshot,
             )?;
-            staged_snapshots.push((row, schema, snapshot.clone()));
+            staged_snapshots.push((row, schema, snapshot));
         } else {
             pending_constraints.remember_tombstone(row);
         }
@@ -161,7 +167,7 @@ struct FileDescriptorSnapshot {
 
 async fn validate_directory_descriptor_parent_graph(
     input: &TransactionValidationInput<'_>,
-    staged_rows: &[StagedStateRow],
+    staged_rows: &[PreparedValidationRow<'_>],
 ) -> Result<(), LixError> {
     let scopes = staged_directory_descriptor_scopes(staged_rows);
     for scope in scopes {
@@ -174,11 +180,11 @@ async fn validate_directory_descriptor_parent_graph(
 
 async fn validate_registered_schema_identity_is_canonical(
     input: &TransactionValidationInput<'_>,
-    staged_rows: &[StagedStateRow],
+    staged_rows: &[PreparedValidationRow<'_>],
 ) -> Result<(), LixError> {
     let pending_schema_rows = staged_rows
         .iter()
-        .filter(|row| row.schema_key == REGISTERED_SCHEMA_KEY && row.snapshot_content.is_some())
+        .filter(|row| row.schema_key() == REGISTERED_SCHEMA_KEY && row.snapshot_json().is_some())
         .collect::<Vec<_>>();
     if pending_schema_rows.is_empty() {
         return Ok(());
@@ -186,7 +192,7 @@ async fn validate_registered_schema_identity_is_canonical(
 
     let pending_entity_ids = pending_schema_rows
         .iter()
-        .map(|row| row.entity_id.clone())
+        .map(|row| row.entity_id().clone())
         .collect::<Vec<_>>();
     let committed_rows = input
         .live_state
@@ -209,18 +215,15 @@ async fn validate_registered_schema_identity_is_canonical(
         let snapshot = parse_registered_schema_snapshot(snapshot_content)?;
         let Some(pending_row) = pending_schema_rows
             .iter()
-            .find(|pending_row| pending_row.entity_id == row.entity_id)
+            .find(|pending_row| pending_row.entity_id() == &row.entity_id)
         else {
             continue;
         };
-        let pending_snapshot = parse_registered_schema_snapshot(
-            pending_row
-                .snapshot_content
-                .as_deref()
-                .expect("pending registered schema row has snapshot_content"),
-        )?;
-        if snapshot != pending_snapshot {
-            let (key, _) = schema_from_registered_snapshot(&pending_snapshot)?;
+        let pending_snapshot = pending_row
+            .snapshot_json()
+            .expect("pending registered schema row has snapshot_content");
+        if &snapshot != pending_snapshot {
+            let (key, _) = schema_from_registered_snapshot(pending_snapshot)?;
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
                 format!(
@@ -244,16 +247,16 @@ fn parse_registered_schema_snapshot(snapshot_content: &str) -> Result<JsonValue,
 }
 
 fn staged_directory_descriptor_scopes(
-    staged_rows: &[StagedStateRow],
+    staged_rows: &[PreparedValidationRow<'_>],
 ) -> BTreeSet<DirectoryDescriptorScope> {
     staged_rows
         .iter()
-        .filter(|row| row.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
+        .filter(|row| row.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
         .map(|row| DirectoryDescriptorScope {
-            version_id: row.version_id.clone(),
-            schema_version: row.schema_version.clone(),
-            untracked: row.untracked,
-            file_id: row.file_id.clone(),
+            version_id: row.version_id().to_string(),
+            schema_version: row.schema_version().to_string(),
+            untracked: row.untracked(),
+            file_id: row.file_id().clone(),
         })
         .collect()
 }
@@ -300,25 +303,25 @@ fn committed_directory_row_is_in_scope(
 }
 
 fn apply_staged_directory_parent_rows(
-    staged_rows: &[StagedStateRow],
+    staged_rows: &[PreparedValidationRow<'_>],
     scope: &DirectoryDescriptorScope,
     parents: &mut BTreeMap<String, Option<String>>,
 ) -> Result<(), LixError> {
     for row in staged_rows {
-        if row.schema_key != DIRECTORY_DESCRIPTOR_SCHEMA_KEY
-            || row.version_id != scope.version_id
-            || row.schema_version != scope.schema_version
-            || row.untracked != scope.untracked
-            || row.file_id != scope.file_id
+        if row.schema_key() != DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+            || row.version_id() != scope.version_id
+            || row.schema_version() != scope.schema_version
+            || row.untracked() != scope.untracked
+            || row.file_id() != &scope.file_id
         {
             continue;
         }
-        let id = row.entity_id.as_string()?;
-        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+        let id = row.entity_id().as_string()?;
+        let Some(snapshot) = row.snapshot_json() else {
             parents.remove(&id);
             continue;
         };
-        let snapshot = parse_directory_descriptor_snapshot(&row.schema_version, snapshot_content)?;
+        let snapshot = directory_descriptor_snapshot_from_value(row.schema_version(), snapshot)?;
         parents.insert(snapshot.id, snapshot.parent_id);
     }
     Ok(())
@@ -334,6 +337,82 @@ fn parse_directory_descriptor_snapshot(
             format!(
                 "lix_directory_descriptor version '{schema_version}' snapshot_content is invalid JSON: {error}"
             ),
+        )
+    })
+}
+
+fn directory_descriptor_snapshot_from_value(
+    schema_version: &str,
+    snapshot: &JsonValue,
+) -> Result<DirectoryDescriptorSnapshot, LixError> {
+    Ok(DirectoryDescriptorSnapshot {
+        id: required_snapshot_string(snapshot, "lix_directory_descriptor", schema_version, "id")?,
+        parent_id: optional_snapshot_string(
+            snapshot,
+            "lix_directory_descriptor",
+            schema_version,
+            "parent_id",
+        )?,
+        name: required_snapshot_string(
+            snapshot,
+            "lix_directory_descriptor",
+            schema_version,
+            "name",
+        )?,
+    })
+}
+
+fn file_descriptor_snapshot_from_value(
+    schema_version: &str,
+    snapshot: &JsonValue,
+) -> Result<FileDescriptorSnapshot, LixError> {
+    Ok(FileDescriptorSnapshot {
+        directory_id: optional_snapshot_string(
+            snapshot,
+            "lix_file_descriptor",
+            schema_version,
+            "directory_id",
+        )?,
+        name: required_snapshot_string(snapshot, "lix_file_descriptor", schema_version, "name")?,
+    })
+}
+
+fn required_snapshot_string(
+    snapshot: &JsonValue,
+    schema_key: &str,
+    schema_version: &str,
+    field: &str,
+) -> Result<String, LixError> {
+    let Some(value) = snapshot.get(field) else {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!("{schema_key} version '{schema_version}' snapshot_content is missing field '{field}'"),
+        ));
+    };
+    value.as_str().map(str::to_string).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!("{schema_key} version '{schema_version}' snapshot_content field '{field}' must be a string"),
+        )
+    })
+}
+
+fn optional_snapshot_string(
+    snapshot: &JsonValue,
+    schema_key: &str,
+    schema_version: &str,
+    field: &str,
+) -> Result<Option<String>, LixError> {
+    let Some(value) = snapshot.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value.as_str().map(|value| Some(value.to_string())).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!("{schema_key} version '{schema_version}' snapshot_content field '{field}' must be a string or null"),
         )
     })
 }
@@ -396,7 +475,7 @@ impl FilesystemNamespaceOccupant {
 
 async fn validate_filesystem_namespace(
     input: &TransactionValidationInput<'_>,
-    staged_rows: &[StagedStateRow],
+    staged_rows: &[PreparedValidationRow<'_>],
 ) -> Result<(), LixError> {
     // Filesystem namespace constraints are storage-scope local. Global rows are
     // validated in the global scope and may be projected into version reads, but
@@ -412,18 +491,18 @@ async fn validate_filesystem_namespace(
 }
 
 fn staged_filesystem_namespace_scopes(
-    staged_rows: &[StagedStateRow],
+    staged_rows: &[PreparedValidationRow<'_>],
 ) -> BTreeSet<FilesystemStorageScope> {
     staged_rows
         .iter()
         .filter(|row| {
-            row.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
-                || row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+            row.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                || row.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY
         })
         .map(|row| FilesystemStorageScope {
-            version_id: row.version_id.clone(),
-            untracked: row.untracked,
-            file_id: row.file_id.clone(),
+            version_id: row.version_id().to_string(),
+            untracked: row.untracked(),
+            file_id: row.file_id().clone(),
         })
         .collect()
 }
@@ -471,30 +550,30 @@ fn committed_filesystem_row_is_in_scope(
 }
 
 fn apply_staged_filesystem_namespace_rows(
-    staged_rows: &[StagedStateRow],
+    staged_rows: &[PreparedValidationRow<'_>],
     scope: &FilesystemStorageScope,
     occupants: &mut BTreeMap<FilesystemNamespaceIdentity, FilesystemNamespaceOccupant>,
 ) -> Result<(), LixError> {
     for row in staged_rows {
-        if (row.schema_key != DIRECTORY_DESCRIPTOR_SCHEMA_KEY
-            && row.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY)
-            || row.version_id != scope.version_id
-            || row.untracked != scope.untracked
-            || row.file_id != scope.file_id
+        if (row.schema_key() != DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+            && row.schema_key() != FILE_DESCRIPTOR_SCHEMA_KEY)
+            || row.version_id() != scope.version_id
+            || row.untracked() != scope.untracked
+            || row.file_id() != &scope.file_id
         {
             continue;
         }
         let identity = FilesystemNamespaceIdentity {
-            schema_key: row.schema_key.clone(),
-            entity_id: row.entity_id.clone(),
+            schema_key: row.schema_key().to_string(),
+            entity_id: row.entity_id().clone(),
         };
-        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+        let Some(snapshot) = row.snapshot_json() else {
             occupants.remove(&identity);
             continue;
         };
         occupants.insert(
             identity,
-            filesystem_namespace_occupant_from_staged_row(row, snapshot_content)?,
+            filesystem_namespace_occupant_from_staged_row(*row, snapshot)?,
         );
     }
     Ok(())
@@ -523,21 +602,21 @@ fn filesystem_namespace_occupant_from_live_row(
 }
 
 fn filesystem_namespace_occupant_from_staged_row(
-    row: &StagedStateRow,
-    snapshot_content: &str,
+    row: PreparedValidationRow<'_>,
+    snapshot: &JsonValue,
 ) -> Result<FilesystemNamespaceOccupant, LixError> {
-    match row.schema_key.as_str() {
+    match row.schema_key() {
         DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-            directory_namespace_occupant(&row.schema_version, &row.entity_id, snapshot_content)
+            directory_namespace_occupant_from_value(row.schema_version(), row.entity_id(), snapshot)
         }
         FILE_DESCRIPTOR_SCHEMA_KEY => {
-            file_namespace_occupant(&row.schema_version, &row.entity_id, snapshot_content)
+            file_namespace_occupant_from_value(row.schema_version(), row.entity_id(), snapshot)
         }
         _ => Err(LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
             format!(
                 "filesystem namespace validation cannot parse schema '{}'",
-                row.schema_key
+                row.schema_key()
             ),
         )),
     }
@@ -549,6 +628,19 @@ fn directory_namespace_occupant(
     snapshot_content: &str,
 ) -> Result<FilesystemNamespaceOccupant, LixError> {
     let snapshot = parse_directory_descriptor_snapshot(schema_version, snapshot_content)?;
+    Ok(FilesystemNamespaceOccupant::Directory {
+        entity_id: entity_id.clone(),
+        parent_id: snapshot.parent_id,
+        name: snapshot.name,
+    })
+}
+
+fn directory_namespace_occupant_from_value(
+    schema_version: &str,
+    entity_id: &EntityIdentity,
+    snapshot: &JsonValue,
+) -> Result<FilesystemNamespaceOccupant, LixError> {
+    let snapshot = directory_descriptor_snapshot_from_value(schema_version, snapshot)?;
     Ok(FilesystemNamespaceOccupant::Directory {
         entity_id: entity_id.clone(),
         parent_id: snapshot.parent_id,
@@ -569,6 +661,19 @@ fn file_namespace_occupant(
             ),
         )
     })?;
+    Ok(FilesystemNamespaceOccupant::File {
+        entity_id: entity_id.clone(),
+        directory_id: snapshot.directory_id,
+        entry_name: snapshot.name,
+    })
+}
+
+fn file_namespace_occupant_from_value(
+    schema_version: &str,
+    entity_id: &EntityIdentity,
+    snapshot: &JsonValue,
+) -> Result<FilesystemNamespaceOccupant, LixError> {
+    let snapshot = file_descriptor_snapshot_from_value(schema_version, snapshot)?;
     Ok(FilesystemNamespaceOccupant::File {
         entity_id: entity_id.clone(),
         directory_id: snapshot.directory_id,
@@ -705,7 +810,7 @@ async fn validate_committed_insert_identities(
     input: &TransactionValidationInput<'_>,
     pending_constraints: &PendingConstraintIndexes,
 ) -> Result<(), LixError> {
-    for (identity, origin) in &input.staged_writes.insert_identities {
+    for (identity, origin) in input.staged_writes.insert_identities() {
         let Some(committed_row) = input
             .live_state
             .load_row(&LiveStateRowRequest {
@@ -731,7 +836,7 @@ async fn validate_committed_insert_identities(
                 &committed_row.schema_version,
                 &identity.entity_id,
                 None,
-                origin.as_ref(),
+                origin,
             ),
         ));
     }
@@ -820,21 +925,21 @@ struct PendingFileDescriptorIndex {
 }
 
 impl PendingFileDescriptorIndex {
-    fn from_staged_writes(staged_writes: &StagedWriteSet) -> Self {
+    fn from_staged_writes(staged_writes: &PreparedWriteValidationSet<'_>) -> Self {
         let mut index = Self::default();
-        for row in staged_writes.state_rows_for_validation() {
-            if row.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || row.file_id.is_some() {
+        for row in staged_writes.rows() {
+            if row.schema_key() != FILE_DESCRIPTOR_SCHEMA_KEY || row.file_id().is_some() {
                 continue;
             }
-            if let Ok(file_id) = row.entity_id.as_string() {
-                let state = if row.snapshot_content.is_some() {
+            if let Ok(file_id) = row.entity_id().as_string() {
+                let state = if row.snapshot_json().is_some() {
                     PendingFileDescriptorState::Present
                 } else {
                     PendingFileDescriptorState::Tombstone
                 };
                 index
                     .by_version_and_file_id
-                    .insert((row.version_id.clone(), file_id), state);
+                    .insert((row.version_id().to_string(), file_id), state);
             }
         }
         index
@@ -850,17 +955,17 @@ impl PendingFileDescriptorIndex {
 async fn validate_file_owner_reference(
     input: &TransactionValidationInput<'_>,
     pending_file_descriptors: &PendingFileDescriptorIndex,
-    row: &StagedStateRow,
+    row: PreparedValidationRow<'_>,
 ) -> Result<(), LixError> {
-    let Some(file_id) = row.file_id.as_deref() else {
+    let Some(file_id) = row.file_id().as_deref() else {
         return Ok(());
     };
 
-    if pending_file_descriptor_exists(pending_file_descriptors, &row.version_id, file_id) {
+    if pending_file_descriptor_exists(pending_file_descriptors, row.version_id(), file_id) {
         return Ok(());
     }
 
-    if committed_file_descriptor_exists(input.live_state, &row.version_id, file_id).await? {
+    if committed_file_descriptor_exists(input.live_state, row.version_id(), file_id).await? {
         return Ok(());
     }
 
@@ -910,92 +1015,87 @@ async fn committed_file_descriptor_exists_in_exact_version(
 }
 
 fn missing_file_owner_reference_error(
-    row: &StagedStateRow,
+    row: PreparedValidationRow<'_>,
     file_id: &str,
 ) -> Result<LixError, LixError> {
     Ok(LixError::new(
         LixError::CODE_FILE_NOT_FOUND,
         format!(
             "file ownership validation failed for schema '{}': entity '{}' references missing file_id '{}' in effective file scope for version '{}'",
-            row.schema_key,
-            row.entity_id.as_string()?,
+            row.schema_key(),
+            row.entity_id().as_string()?,
             file_id,
-            row.version_id
+            row.version_id()
         ),
     )
     .with_hint("Insert a row into lix_file with this id first, or use null for a global entity."))
 }
 
-fn validate_staged_row_shape(row: &StagedStateRow) -> Result<(), LixError> {
-    if row.schema_key.is_empty() {
+fn validate_staged_row_shape(row: PreparedValidationRow<'_>) -> Result<(), LixError> {
+    if row.schema_key().is_empty() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "engine2 transaction validation requires non-empty schema_key",
+            "engine transaction validation requires non-empty schema_key",
         ));
     }
-    if row.schema_version.is_empty() {
+    if row.schema_version().is_empty() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "engine2 transaction validation requires non-empty schema_version",
+            "engine transaction validation requires non-empty schema_version",
         ));
     }
     Ok(())
 }
 
-fn validate_staged_row_metadata(row: &StagedStateRow) -> Result<(), LixError> {
-    let Some(metadata) = row.metadata.as_ref() else {
+fn validate_staged_row_metadata(row: PreparedValidationRow<'_>) -> Result<(), LixError> {
+    let Some(metadata) = row.metadata_json() else {
         return Ok(());
     };
     validate_row_metadata(
-        metadata.clone(),
+        metadata,
         format!(
             "metadata for schema '{}' version '{}'",
-            row.schema_key, row.schema_version
+            row.schema_key(),
+            row.schema_version()
         ),
     )?;
     Ok(())
 }
 
 fn validate_schema_exists(
-    row: &StagedStateRow,
+    row: PreparedValidationRow<'_>,
     schema_catalog: &TransactionSchemaCatalog,
 ) -> Result<(), LixError> {
-    if !schema_catalog.contains(&row.schema_key, &row.schema_version) {
+    if !schema_catalog.contains(row.schema_key(), row.schema_version()) {
         return Err(LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
             format!(
                 "schema '{}' version '{}' is not visible to this transaction",
-                row.schema_key, row.schema_version
+                row.schema_key(),
+                row.schema_version()
             ),
         ));
     }
     Ok(())
 }
 
-fn validate_snapshot_content(
-    row: &StagedStateRow,
+fn validate_snapshot_content<'a>(
+    row: PreparedValidationRow<'a>,
     compiled_schemas: &mut CompiledSchemaCatalog<'_>,
-) -> Result<Option<JsonValue>, LixError> {
-    let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+) -> Result<Option<&'a JsonValue>, LixError> {
+    let Some(snapshot) = row.snapshot_json() else {
         return Ok(None);
     };
-    let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
-        LixError::new(
-            LixError::CODE_SCHEMA_VALIDATION,
-            format!(
-                "snapshot_content for schema '{}' version '{}' is invalid JSON: {error}",
-                row.schema_key, row.schema_version
-            ),
-        )
-    })?;
-    let compiled_schema = compiled_schemas.compiled_schema(&row.schema_key, &row.schema_version)?;
+    let compiled_schema =
+        compiled_schemas.compiled_schema(row.schema_key(), row.schema_version())?;
     if let Err(errors) = compiled_schema.validate(&snapshot) {
         let details = format_lix_schema_validation_errors(errors);
         return Err(LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
             format!(
                 "snapshot_content validation failed for schema '{}' version '{}': {details}",
-                row.schema_key, row.schema_version
+                row.schema_key(),
+                row.schema_version()
             ),
         ));
     }
@@ -1003,7 +1103,7 @@ fn validate_snapshot_content(
 }
 
 fn validate_primary_key_identity(
-    row: &StagedStateRow,
+    row: PreparedValidationRow<'_>,
     schema: &JsonValue,
     snapshot: &JsonValue,
 ) -> Result<(), LixError> {
@@ -1015,14 +1115,14 @@ fn validate_primary_key_identity(
     };
     let derived = EntityIdentity::from_primary_key_paths(snapshot, &primary_key_paths)
         .map_err(|error| primary_key_identity_error(row, &primary_key_paths, error))?;
-    if row.entity_id != derived {
+    if row.entity_id() != &derived {
         return Err(LixError::new(
             LixError::CODE_UNIQUE,
             format!(
                 "primary-key constraint violation on schema '{}' version '{}': entity_id '{}' does not match derived primary key '{}'",
-                row.schema_key,
-                row.schema_version,
-                row.entity_id.as_string()?,
+                row.schema_key(),
+                row.schema_version(),
+                row.entity_id().as_string()?,
                 derived.as_string()?
             ),
         ));
@@ -1040,21 +1140,21 @@ struct PendingConstraintIndexes {
 }
 
 impl PendingConstraintIndexes {
-    fn remember_tombstone(&mut self, row: &StagedStateRow) {
+    fn remember_tombstone(&mut self, row: PreparedValidationRow<'_>) {
         self.tombstones.push(PendingTombstone {
             identity: LiveStateRowIdentity {
-                version_id: row.version_id.clone(),
-                schema_key: row.schema_key.clone(),
-                entity_id: row.entity_id.clone(),
-                file_id: row.file_id.clone(),
+                version_id: row.version_id().to_string(),
+                schema_key: row.schema_key().to_string(),
+                entity_id: row.entity_id().clone(),
+                file_id: row.file_id().clone(),
             },
-            schema_version: row.schema_version.clone(),
+            schema_version: row.schema_version().to_string(),
         });
     }
 
     fn remember_row(
         &mut self,
-        row: &StagedStateRow,
+        row: PreparedValidationRow<'_>,
         schema: &JsonValue,
         snapshot: &JsonValue,
     ) -> Result<(), LixError> {
@@ -1064,18 +1164,18 @@ impl PendingConstraintIndexes {
         Ok(())
     }
 
-    fn remember_identity_target(&mut self, row: &StagedStateRow) {
+    fn remember_identity_target(&mut self, row: PreparedValidationRow<'_>) {
         self.identity_targets.push(LiveStateRowIdentity {
-            version_id: row.version_id.clone(),
-            schema_key: row.schema_key.clone(),
-            entity_id: row.entity_id.clone(),
-            file_id: row.file_id.clone(),
+            version_id: row.version_id().to_string(),
+            schema_key: row.schema_key().to_string(),
+            entity_id: row.entity_id().clone(),
+            file_id: row.file_id().clone(),
         });
     }
 
     fn remember_primary_key_target(
         &mut self,
-        row: &StagedStateRow,
+        row: PreparedValidationRow<'_>,
         schema: &JsonValue,
         snapshot: &JsonValue,
     ) -> Result<(), LixError> {
@@ -1087,7 +1187,7 @@ impl PendingConstraintIndexes {
 
     fn remember_unique_targets(
         &mut self,
-        row: &StagedStateRow,
+        row: PreparedValidationRow<'_>,
         schema: &JsonValue,
         snapshot: &JsonValue,
     ) -> Result<(), LixError> {
@@ -1097,28 +1197,28 @@ impl PendingConstraintIndexes {
             };
             self.remember_fk_target(row, &unique_paths, snapshot);
             let key = PendingUniqueKey {
-                schema_key: row.schema_key.clone(),
-                schema_version: row.schema_version.clone(),
-                version_id: row.version_id.clone(),
-                untracked: row.untracked,
-                file_id: row.file_id.clone(),
+                schema_key: row.schema_key().to_string(),
+                schema_version: row.schema_version().to_string(),
+                version_id: row.version_id().to_string(),
+                untracked: row.untracked(),
+                file_id: row.file_id().clone(),
                 pointer_group: unique_paths.clone(),
                 value,
             };
             if let Some(existing_entity_id) = self
                 .unique_values
-                .insert(key.clone(), row.entity_id.clone())
+                .insert(key.clone(), row.entity_id().clone())
             {
-                if existing_entity_id != row.entity_id {
+                if existing_entity_id != *row.entity_id() {
                     return Err(LixError::new(
                         LixError::CODE_UNIQUE,
                         format!(
                             "unique constraint violation on {}.{} for value {}: rows '{}' and '{}' conflict",
-                            row.schema_key,
+                            row.schema_key(),
                             format_pointer_group(&key.pointer_group),
                             key.value.display(),
                             existing_entity_id.as_string()?,
-                            row.entity_id.as_string()?
+                            row.entity_id().as_string()?
                         ),
                     ));
                 }
@@ -1129,7 +1229,7 @@ impl PendingConstraintIndexes {
 
     fn remember_fk_target(
         &mut self,
-        row: &StagedStateRow,
+        row: PreparedValidationRow<'_>,
         pointer_group: &[Vec<String>],
         snapshot: &JsonValue,
     ) {
@@ -1138,21 +1238,21 @@ impl PendingConstraintIndexes {
         };
         self.fk_targets
             .entry(PendingForeignKeyTargetKey {
-                schema_key: row.schema_key.clone(),
-                schema_version: row.schema_version.clone(),
-                version_id: row.version_id.clone(),
-                file_id: row.file_id.clone(),
+                schema_key: row.schema_key().to_string(),
+                schema_version: row.schema_version().to_string(),
+                version_id: row.version_id().to_string(),
+                file_id: row.file_id().clone(),
                 pointer_group: pointer_group.to_vec(),
                 value,
             })
             .or_default()
-            .push(row.entity_id.clone());
+            .push(row.entity_id().clone());
     }
 
     fn remember_foreign_key_references(
         &mut self,
         schema_catalog: &TransactionSchemaCatalog,
-        row: &StagedStateRow,
+        row: PreparedValidationRow<'_>,
         schema: &JsonValue,
         snapshot: &JsonValue,
     ) -> Result<(), LixError> {
@@ -1165,7 +1265,7 @@ impl PendingConstraintIndexes {
             };
             let target = if foreign_key.referenced_schema_key == STATE_SURFACE_SCHEMA_KEY {
                 PendingForeignKeyReferenceTarget::StateSurfaceIdentity(
-                    state_surface_target_identity(&row.version_id, &foreign_key, snapshot)?,
+                    state_surface_target_identity(row.version_id(), &foreign_key, snapshot)?,
                 )
             } else {
                 let target_key = schema_catalog
@@ -1175,15 +1275,16 @@ impl PendingConstraintIndexes {
                             LixError::CODE_SCHEMA_DEFINITION,
                             format!(
                                 "foreign key on schema '{}' references missing schema '{}'",
-                                row.schema_key, foreign_key.referenced_schema_key
+                                row.schema_key(),
+                                foreign_key.referenced_schema_key
                             ),
                         )
                     })?;
                 PendingForeignKeyReferenceTarget::Key(PendingForeignKeyTargetKey {
                     schema_key: target_key.schema_key,
                     schema_version: target_key.schema_version,
-                    version_id: row.version_id.clone(),
-                    file_id: row.file_id.clone(),
+                    version_id: row.version_id().to_string(),
+                    file_id: row.file_id().clone(),
                     pointer_group: foreign_key.referenced_properties,
                     value: local_value,
                 })
@@ -1192,10 +1293,10 @@ impl PendingConstraintIndexes {
                 .entry(target)
                 .or_default()
                 .push(LiveStateRowIdentity {
-                    version_id: row.version_id.clone(),
-                    schema_key: row.schema_key.clone(),
-                    entity_id: row.entity_id.clone(),
-                    file_id: row.file_id.clone(),
+                    version_id: row.version_id().to_string(),
+                    schema_key: row.schema_key().to_string(),
+                    entity_id: row.entity_id().clone(),
+                    file_id: row.file_id().clone(),
                 });
         }
         Ok(())
@@ -1618,7 +1719,7 @@ enum UnresolvedForeignKeyTarget {
 fn validate_pending_foreign_keys(
     schema_catalog: &TransactionSchemaCatalog,
     pending_constraints: &PendingConstraintIndexes,
-    staged_snapshots: &[(&StagedStateRow, &JsonValue, JsonValue)],
+    staged_snapshots: &[(PreparedValidationRow<'_>, &JsonValue, &JsonValue)],
 ) -> Result<Vec<UnresolvedForeignKeyCheck>, LixError> {
     let mut unresolved = Vec::new();
     for (row, schema, snapshot) in staged_snapshots {
@@ -1631,7 +1732,7 @@ fn validate_pending_foreign_keys(
             };
             if foreign_key.referenced_schema_key == STATE_SURFACE_SCHEMA_KEY {
                 if let Some(check) = validate_pending_state_surface_foreign_key(
-                    row,
+                    *row,
                     &foreign_key,
                     snapshot,
                     pending_constraints,
@@ -1641,7 +1742,7 @@ fn validate_pending_foreign_keys(
             } else {
                 if let Some(check) = validate_pending_normal_foreign_key(
                     schema_catalog,
-                    row,
+                    *row,
                     &foreign_key,
                     local_value,
                     pending_constraints,
@@ -1656,7 +1757,7 @@ fn validate_pending_foreign_keys(
 
 fn validate_pending_normal_foreign_key(
     schema_catalog: &TransactionSchemaCatalog,
-    row: &StagedStateRow,
+    row: PreparedValidationRow<'_>,
     foreign_key: &ForeignKeyDefinition,
     local_value: UniqueConstraintValue,
     pending_constraints: &PendingConstraintIndexes,
@@ -1668,15 +1769,16 @@ fn validate_pending_normal_foreign_key(
                 LixError::CODE_SCHEMA_DEFINITION,
                 format!(
                     "foreign key on schema '{}' references missing schema '{}'",
-                    row.schema_key, foreign_key.referenced_schema_key
+                    row.schema_key(),
+                    foreign_key.referenced_schema_key
                 ),
             )
         })?;
     let key = PendingForeignKeyTargetKey {
         schema_key: target_key.schema_key,
         schema_version: target_key.schema_version,
-        version_id: row.version_id.clone(),
-        file_id: row.file_id.clone(),
+        version_id: row.version_id().to_string(),
+        file_id: row.file_id().clone(),
         pointer_group: foreign_key.referenced_properties.clone(),
         value: local_value,
     };
@@ -1685,30 +1787,30 @@ fn validate_pending_normal_foreign_key(
     }
     Ok(Some(UnresolvedForeignKeyCheck {
         source_identity: LiveStateRowIdentity {
-            version_id: row.version_id.clone(),
-            schema_key: row.schema_key.clone(),
-            entity_id: row.entity_id.clone(),
-            file_id: row.file_id.clone(),
+            version_id: row.version_id().to_string(),
+            schema_key: row.schema_key().to_string(),
+            entity_id: row.entity_id().clone(),
+            file_id: row.file_id().clone(),
         },
-        source_schema_key: row.schema_key.clone(),
+        source_schema_key: row.schema_key().to_string(),
         source_pointer_group: foreign_key.local_properties.clone(),
         target: UnresolvedForeignKeyTarget::Key(key),
     }))
 }
 
 fn validate_pending_state_surface_foreign_key(
-    row: &StagedStateRow,
+    row: PreparedValidationRow<'_>,
     foreign_key: &ForeignKeyDefinition,
     snapshot: &JsonValue,
     pending_constraints: &PendingConstraintIndexes,
 ) -> Result<Option<UnresolvedForeignKeyCheck>, LixError> {
-    let target_identity = state_surface_target_identity(&row.version_id, foreign_key, snapshot)?;
+    let target_identity = state_surface_target_identity(row.version_id(), foreign_key, snapshot)?;
     if pending_constraints.tombstones_target_identity(&target_identity) {
         return Err(LixError::new(
             LixError::CODE_FOREIGN_KEY,
             format!(
                 "foreign key on {}.{} references target deleted in this transaction",
-                row.schema_key,
+                row.schema_key(),
                 format_pointer_group(&foreign_key.local_properties)
             ),
         ));
@@ -1718,12 +1820,12 @@ fn validate_pending_state_surface_foreign_key(
     }
     Ok(Some(UnresolvedForeignKeyCheck {
         source_identity: LiveStateRowIdentity {
-            version_id: row.version_id.clone(),
-            schema_key: row.schema_key.clone(),
-            entity_id: row.entity_id.clone(),
-            file_id: row.file_id.clone(),
+            version_id: row.version_id().to_string(),
+            schema_key: row.schema_key().to_string(),
+            entity_id: row.entity_id().clone(),
+            file_id: row.file_id().clone(),
         },
-        source_schema_key: row.schema_key.clone(),
+        source_schema_key: row.schema_key().to_string(),
         source_pointer_group: foreign_key.local_properties.clone(),
         target: UnresolvedForeignKeyTarget::StateSurfaceIdentity(target_identity),
     }))
@@ -2216,7 +2318,7 @@ fn format_json_pointer(pointer: &[String]) -> String {
 }
 
 fn primary_key_identity_error(
-    row: &StagedStateRow,
+    row: PreparedValidationRow<'_>,
     primary_key_paths: &[Vec<String>],
     error: EntityIdentityError,
 ) -> LixError {
@@ -2249,7 +2351,8 @@ fn primary_key_identity_error(
         LixError::CODE_UNIQUE,
         format!(
             "primary-key constraint violation on schema '{}' version '{}': {reason}",
-            row.schema_key, row.schema_version
+            row.schema_key(),
+            row.schema_version()
         ),
     )
 }
@@ -2563,10 +2666,10 @@ impl<'a> CompiledSchemaCatalog<'a> {
 
 #[cfg(test)]
 fn validate_pending_registered_schema(
-    row: &StagedStateRow,
+    row: PreparedValidationRow<'_>,
     registered_schema_definition: &JsonValue,
 ) -> Result<(SchemaKey, JsonValue), LixError> {
-    let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
+    let snapshot_content = row.snapshot_content().ok_or_else(|| {
         LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
             "registered schema write requires snapshot_content",
@@ -2615,8 +2718,29 @@ mod tests {
     use super::*;
     use crate::live_state::{LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow};
     use crate::schema::{schema_key_from_definition, seed_schema_definition};
+    use crate::transaction::types::{StageJson, TransactionJson};
 
     struct EmptyLiveStateReader;
+
+    fn test_stage_json(value: &str) -> StageJson {
+        let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
+        let parsed = test_json_text(value).expect("test staged JSON should parse");
+        crate::transaction::types::stage_json_from_value(
+            &mut json_writer,
+            TransactionJson::from_value_for_test(parsed),
+            "test staged JSON",
+        )
+        .expect("test staged JSON should prepare")
+    }
+
+    fn test_json_text(value: &str) -> Result<serde_json::Value, LixError> {
+        serde_json::from_str::<serde_json::Value>(value).map_err(|error| {
+            LixError::new(
+                LixError::CODE_UNKNOWN,
+                format!("test staged JSON is invalid JSON: {error}"),
+            )
+        })
+    }
 
     #[async_trait]
     impl LiveStateReader for EmptyLiveStateReader {
@@ -2641,14 +2765,15 @@ mod tests {
     }
 
     fn validation_input<'a>(
-        staged_writes: &'a StagedWriteSet,
+        staged_writes: &'a PreparedWriteSet,
         visible_schemas: &'a [JsonValue],
     ) -> TransactionValidationInput<'a> {
         let catalog = Box::leak(Box::new(
             catalog_from_transaction_parts_unchecked(staged_writes, visible_schemas)
                 .expect("test schema catalog should build"),
         ));
-        TransactionValidationInput::new(staged_writes, catalog, &EmptyLiveStateReader)
+        let validation_set = Box::leak(Box::new(staged_writes.validation_set_for_tests()));
+        TransactionValidationInput::new(validation_set, catalog, &EmptyLiveStateReader)
     }
 
     fn catalog_from_transaction_input(
@@ -2660,18 +2785,17 @@ mod tests {
     }
 
     fn catalog_from_transaction_parts(
-        staged_writes: &StagedWriteSet,
+        staged_writes: &PreparedWriteSet,
         visible_schemas: &[JsonValue],
     ) -> Result<TransactionSchemaCatalog, LixError> {
         let catalog = catalog_from_transaction_parts_unchecked(staged_writes, visible_schemas)?;
         let mut pending_keys =
             BTreeMap::<SchemaCatalogKey, crate::entity_identity::EntityIdentity>::new();
         for row in staged_writes
-            .state_rows_for_validation()
-            .iter()
-            .filter(|row| row.schema_key == REGISTERED_SCHEMA_KEY)
+            .validation_rows()
+            .filter(|row| row.schema_key() == REGISTERED_SCHEMA_KEY)
         {
-            let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
+            let snapshot_content = row.snapshot_content().ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
                     "registered schema write requires snapshot_content",
@@ -2689,7 +2813,7 @@ mod tests {
             let (key, _) = schema_from_registered_snapshot(&snapshot)?;
             let catalog_key = SchemaCatalogKey::from_schema_key(key);
             if let Some(existing_entity_id) =
-                pending_keys.insert(catalog_key.clone(), row.entity_id.clone())
+                pending_keys.insert(catalog_key.clone(), row.entity_id().clone())
             {
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
@@ -2698,7 +2822,7 @@ mod tests {
                         catalog_key.schema_key,
                         catalog_key.schema_version,
                         existing_entity_id.as_string()?,
-                        row.entity_id.as_string()?
+                        row.entity_id().as_string()?
                     ),
                 ));
             }
@@ -2708,14 +2832,13 @@ mod tests {
     }
 
     fn catalog_from_transaction_parts_unchecked(
-        staged_writes: &StagedWriteSet,
+        staged_writes: &PreparedWriteSet,
         visible_schemas: &[JsonValue],
     ) -> Result<TransactionSchemaCatalog, LixError> {
         let mut catalog = TransactionSchemaCatalog::from_visible_schemas(visible_schemas)?;
-        let staged_rows = staged_writes.state_rows_for_validation();
-        for row in staged_rows
-            .iter()
-            .filter(|row| row.schema_key == REGISTERED_SCHEMA_KEY)
+        for row in staged_writes
+            .validation_rows()
+            .filter(|row| row.schema_key() == REGISTERED_SCHEMA_KEY)
         {
             let registered_schema_definition = catalog
                 .schema(REGISTERED_SCHEMA_KEY, "1")
@@ -2860,7 +2983,7 @@ mod tests {
                 "type": "object",
             }),
         ];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![pending_registered_schema_row("pending_schema", "1")],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
@@ -2887,7 +3010,7 @@ mod tests {
                 }
             }),
         ];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![pending_registered_schema_row("same_schema", "1")],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
@@ -2903,32 +3026,35 @@ mod tests {
     #[test]
     fn pending_registered_schema_requires_snapshot_content() {
         let mut row = pending_registered_schema_row("missing_snapshot", "1");
-        row.snapshot_content = None;
+        row.snapshot = None;
 
-        let error = validate_pending_registered_schema(&row, &registered_schema())
-            .expect_err("registered schema writes require snapshot_content");
+        let error = validate_pending_registered_schema(
+            PreparedValidationRow::State(&row),
+            &registered_schema(),
+        )
+        .expect_err("registered schema writes require snapshot_content");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
     }
 
     #[test]
     fn pending_registered_schema_rejects_invalid_snapshot_json() {
-        let mut row = pending_registered_schema_row("invalid_json", "1");
-        row.snapshot_content = Some("{not-json".to_string());
+        let error =
+            test_json_text("{not-json").expect_err("invalid JSON should fail before validation");
 
-        let error = validate_pending_registered_schema(&row, &registered_schema())
-            .expect_err("invalid JSON should fail");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert_eq!(error.code, LixError::CODE_UNKNOWN);
     }
 
     #[test]
     fn pending_registered_schema_uses_builtin_schema_for_outer_value_shape() {
         let mut row = pending_registered_schema_row("missing_value", "1");
-        row.snapshot_content = Some(json!({}).to_string());
+        row.snapshot = Some(test_stage_json(&json!({}).to_string()));
 
-        let error = validate_pending_registered_schema(&row, &registered_schema())
-            .expect_err("builtin lix_registered_schema validation should fail");
+        let error = validate_pending_registered_schema(
+            PreparedValidationRow::State(&row),
+            &registered_schema(),
+        )
+        .expect_err("builtin lix_registered_schema validation should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
     }
@@ -2936,8 +3062,8 @@ mod tests {
     #[test]
     fn pending_registered_schema_rejects_malformed_nested_lix_schema_definition() {
         let mut row = pending_registered_schema_row("bad_schema_version", "v1");
-        row.snapshot_content = Some(
-            json!({
+        row.snapshot = Some(test_stage_json(
+            &json!({
                 "value": {
                     "x-lix-key": "bad_schema_version",
                     "x-lix-version": "v1",
@@ -2950,10 +3076,13 @@ mod tests {
                 }
             })
             .to_string(),
-        );
+        ));
 
-        let error = validate_pending_registered_schema(&row, &registered_schema())
-            .expect_err("nested Lix schema definition should be rejected");
+        let error = validate_pending_registered_schema(
+            PreparedValidationRow::State(&row),
+            &registered_schema(),
+        )
+        .expect_err("nested Lix schema definition should be rejected");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
     }
@@ -2962,7 +3091,7 @@ mod tests {
     fn schema_catalog_rejects_duplicate_pending_registered_schema_identity() {
         let mut duplicate = pending_registered_schema_row("duplicate_schema", "1");
         duplicate.entity_id = registered_schema_entity_id("duplicate_schema_duplicate", "1");
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 pending_registered_schema_row("duplicate_schema", "1"),
                 duplicate,
@@ -2979,7 +3108,7 @@ mod tests {
 
     #[test]
     fn schema_catalog_allows_pending_foreign_key_to_pending_schema() {
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 pending_registered_schema_from_definition(fk_parent_schema()),
                 pending_registered_schema_from_definition(fk_child_schema()),
@@ -2998,7 +3127,7 @@ mod tests {
 
     #[test]
     fn schema_catalog_rejects_foreign_key_missing_target_schema() {
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![pending_registered_schema_from_definition(fk_child_schema())],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
@@ -3016,7 +3145,7 @@ mod tests {
     fn schema_catalog_rejects_foreign_key_missing_local_field() {
         let mut child = fk_child_schema();
         child["x-lix-foreign-keys"][0]["properties"] = json!(["/missing_parent_id"]);
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 pending_registered_schema_from_definition(fk_parent_schema()),
                 pending_registered_schema_from_definition(child),
@@ -3036,7 +3165,7 @@ mod tests {
     fn schema_catalog_rejects_foreign_key_missing_referenced_field() {
         let mut child = fk_child_schema();
         child["x-lix-foreign-keys"][0]["references"]["properties"] = json!(["/missing_id"]);
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 pending_registered_schema_from_definition(fk_parent_schema()),
                 pending_registered_schema_from_definition(child),
@@ -3058,7 +3187,7 @@ mod tests {
         parent["properties"]["name"] = json!({ "type": "string" });
         let mut child = fk_child_schema();
         child["x-lix-foreign-keys"][0]["references"]["properties"] = json!(["/name"]);
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 pending_registered_schema_from_definition(parent),
                 pending_registered_schema_from_definition(child),
@@ -3076,7 +3205,7 @@ mod tests {
 
     #[test]
     fn schema_catalog_allows_state_surface_foreign_key_target() {
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![pending_registered_schema_from_definition(
                 state_surface_ref_schema(),
             )],
@@ -3096,7 +3225,7 @@ mod tests {
         let mut schema = state_surface_ref_schema();
         schema["x-lix-foreign-keys"][0]["properties"] = json!(["/target_entity_id"]);
         schema["x-lix-foreign-keys"][0]["references"]["properties"] = json!(["/entity_id"]);
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![pending_registered_schema_from_definition(schema)],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
@@ -3113,7 +3242,7 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_unknown_schema_key() {
         let visible_schemas = vec![key_value_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![staged_row(
                 "unknown_schema",
                 "1",
@@ -3122,7 +3251,7 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        let error = validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+        let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect_err("unknown schema_key should fail");
 
@@ -3132,7 +3261,7 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_unknown_schema_version() {
         let visible_schemas = vec![key_value_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![staged_row(
                 "lix_key_value",
                 "2",
@@ -3141,7 +3270,7 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        let error = validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+        let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect_err("unknown schema_version should fail");
 
@@ -3151,13 +3280,13 @@ mod tests {
     #[tokio::test]
     async fn validation_checks_schema_existence_for_tombstones() {
         let visible_schemas = vec![key_value_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![staged_row("unknown_schema", "1", None)],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
-        let error = validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+        let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect_err("tombstone with unknown schema should fail");
 
@@ -3167,7 +3296,7 @@ mod tests {
     #[tokio::test]
     async fn validation_allows_pending_registered_schema_to_validate_later_rows() {
         let visible_schemas = vec![key_value_schema(), registered_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 pending_registered_schema_row("pending_schema", "1"),
                 staged_row(
@@ -3179,7 +3308,7 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+        validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect("pending registered schema should be visible to later staged rows");
     }
@@ -3187,7 +3316,7 @@ mod tests {
     #[tokio::test]
     async fn validation_validates_snapshot_content_against_schema() {
         let visible_schemas = vec![key_value_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![staged_row(
                 "lix_key_value",
                 "1",
@@ -3196,7 +3325,7 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        let error = validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+        let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect_err("missing required snapshot field should fail");
 
@@ -3205,33 +3334,22 @@ mod tests {
 
     #[tokio::test]
     async fn validation_rejects_invalid_snapshot_json() {
-        let visible_schemas = vec![key_value_schema()];
-        let staged_writes = StagedWriteSet {
-            state_rows: vec![staged_row(
-                "lix_key_value",
-                "1",
-                Some("{not-json".to_string()),
-            )],
-            ..empty_staged_write_set()
-        };
+        let error = test_json_text("{not-json")
+            .expect_err("invalid snapshot JSON should fail before validation");
 
-        let error = validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
-            .await
-            .expect_err("invalid snapshot JSON should fail");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        assert_eq!(error.code, LixError::CODE_UNKNOWN);
     }
 
     #[tokio::test]
     async fn validation_skips_snapshot_validation_for_tombstones() {
         let visible_schemas = vec![key_value_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![staged_row("lix_key_value", "1", None)],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
-        validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+        validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect("tombstone should only require schema existence");
     }
@@ -3239,14 +3357,14 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_missing_file_owner_reference() {
         let visible_schemas = vec![unique_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first")],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
         let error =
-            validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
                 &StrictEmptyLiveStateReader,
@@ -3264,7 +3382,7 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 staged_file_descriptor_row("file-a", "version-a"),
                 unique_row("post-1", "hello-world", "first"),
@@ -3272,7 +3390,7 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &StrictEmptyLiveStateReader,
@@ -3284,7 +3402,7 @@ mod tests {
     #[tokio::test]
     async fn validation_allows_committed_file_owner_reference() {
         let visible_schemas = vec![unique_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first")],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
@@ -3293,7 +3411,7 @@ mod tests {
             rows: vec![committed_file_descriptor_row("file-a", "version-a")],
         };
 
-        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3305,7 +3423,7 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_file_owner_reference_that_exists_only_in_global() {
         let visible_schemas = vec![unique_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first")],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
@@ -3318,7 +3436,7 @@ mod tests {
         };
 
         let error =
-            validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
                 &live_state,
@@ -3334,13 +3452,13 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let mut conflicting = unique_row("post-1", "hello-world", "first");
         conflicting.entity_id = crate::entity_identity::EntityIdentity::single("post-2");
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first"), conflicting],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
-        let error = validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+        let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect_err("same primary key under different identity should fail");
 
@@ -3350,7 +3468,7 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_pending_unique_value_duplicate() {
         let visible_schemas = vec![unique_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 unique_row("post-1", "hello-world", "first"),
                 unique_row("post-2", "hello-world", "second"),
@@ -3358,7 +3476,7 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        let error = validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+        let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect_err("duplicate pending unique value should fail");
 
@@ -3368,7 +3486,7 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_pending_unique_duplicate_with_null_component() {
         let visible_schemas = vec![nullable_unique_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 nullable_unique_row("row-1", None, "root-name"),
                 nullable_unique_row("row-2", None, "root-name"),
@@ -3376,7 +3494,7 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        let error = validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+        let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect_err("duplicate nullable unique value should fail");
 
@@ -3388,13 +3506,13 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let mut duplicate = unique_row("post-2", "hello-world", "second");
         duplicate.version_id = "version-a".to_string();
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first"), duplicate],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
-        let error = validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+        let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect_err("same unique value in the same version should fail");
 
@@ -3406,13 +3524,13 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let mut version_b = unique_row("post-2", "hello-world", "second");
         version_b.version_id = "version-b".to_string();
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first"), version_b],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
-        validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+        validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect("unique values should be scoped to the exact version_id");
     }
@@ -3420,7 +3538,7 @@ mod tests {
     #[tokio::test]
     async fn validation_allows_pending_unique_overwrite_of_same_identity() {
         let visible_schemas = vec![unique_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 unique_row("post-1", "hello-world", "first"),
                 unique_row("post-1", "hello-world", "updated"),
@@ -3428,7 +3546,7 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+        validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect("same identity should be treated as replacement, not duplicate");
     }
@@ -3437,14 +3555,14 @@ mod tests {
     async fn validation_skips_pending_unique_indexes_for_tombstones() {
         let visible_schemas = vec![unique_schema()];
         let mut tombstone = unique_row("post-1", "hello-world", "deleted");
-        tombstone.snapshot_content = None;
-        let staged_writes = StagedWriteSet {
+        tombstone.snapshot = None;
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![tombstone, unique_row("post-2", "hello-world", "second")],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
-        validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+        validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect("tombstones should not claim pending unique values");
     }
@@ -3456,7 +3574,7 @@ mod tests {
         different_file.file_id = Some("file-b".to_string());
         let mut different_version = unique_row("post-3", "hello-world", "third");
         different_version.version_id = "version-b".to_string();
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 unique_row("post-1", "hello-world", "first"),
                 different_file,
@@ -3465,7 +3583,7 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+        validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect("unique values are scoped by file and version");
     }
@@ -3473,7 +3591,7 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_committed_visible_unique_value_duplicate() {
         let visible_schemas = vec![unique_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-2", "hello-world", "second")],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
@@ -3483,7 +3601,7 @@ mod tests {
         };
 
         let error =
-            validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
                 &live_state,
@@ -3497,7 +3615,7 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_committed_unique_duplicate_with_null_component() {
         let visible_schemas = vec![nullable_unique_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![nullable_unique_row("row-2", None, "root-name")],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
@@ -3507,7 +3625,7 @@ mod tests {
         };
 
         let error =
-            validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
                 &live_state,
@@ -3521,7 +3639,7 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_committed_unique_same_value_in_same_version() {
         let visible_schemas = vec![unique_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-2", "hello-world", "second")],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
@@ -3531,7 +3649,7 @@ mod tests {
         };
 
         let error =
-            validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
                 &live_state,
@@ -3547,7 +3665,7 @@ mod tests {
         let visible_schemas = vec![unique_schema()];
         let mut version_b = unique_row("post-2", "hello-world", "second");
         version_b.version_id = "version-b".to_string();
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![version_b],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
@@ -3556,7 +3674,7 @@ mod tests {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
-        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3568,7 +3686,7 @@ mod tests {
     #[tokio::test]
     async fn validation_ignores_projected_live_state_rows_for_unique_constraints() {
         let visible_schemas = vec![unique_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-2", "hello-world", "second")],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
@@ -3580,7 +3698,7 @@ mod tests {
             rows: vec![projected_overlay_row],
         };
 
-        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3592,7 +3710,7 @@ mod tests {
     #[tokio::test]
     async fn validation_allows_committed_visible_unique_update_of_same_identity() {
         let visible_schemas = vec![unique_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "updated")],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
@@ -3601,7 +3719,7 @@ mod tests {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
-        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3614,8 +3732,8 @@ mod tests {
     async fn validation_ignores_committed_unique_owner_tombstoned_by_transaction() {
         let visible_schemas = vec![unique_schema()];
         let mut tombstone = unique_row("post-1", "hello-world", "deleted");
-        tombstone.snapshot_content = None;
-        let staged_writes = StagedWriteSet {
+        tombstone.snapshot = None;
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![tombstone, unique_row("post-2", "hello-world", "second")],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
@@ -3624,7 +3742,7 @@ mod tests {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
-        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3640,7 +3758,7 @@ mod tests {
         different_file.file_id = Some("file-b".to_string());
         let mut different_version = unique_row("post-3", "hello-world", "third");
         different_version.version_id = "version-b".to_string();
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![different_file, different_version],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
@@ -3649,7 +3767,7 @@ mod tests {
             rows: vec![committed_unique_row("post-1", "hello-world", "first")],
         };
 
-        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3661,13 +3779,13 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_foreign_key_target_missing_in_same_version() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![fk_child_row("child-1", "parent-1", "version-a")],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
-        let error = validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+        let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect_err("foreign key must resolve in the same version");
 
@@ -3677,7 +3795,7 @@ mod tests {
     #[tokio::test]
     async fn validation_allows_foreign_key_target_in_same_version() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 fk_parent_row("parent-1", "version-a"),
                 fk_child_row("child-1", "parent-1", "version-a"),
@@ -3685,7 +3803,7 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+        validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect("foreign key should resolve against pending rows in the same version");
     }
@@ -3693,7 +3811,7 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_foreign_key_target_that_exists_only_in_different_version() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 fk_parent_row("parent-1", "version-b"),
                 fk_child_row("child-1", "parent-1", "version-a"),
@@ -3701,7 +3819,7 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        let error = validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+        let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect_err("foreign key target in another version should not satisfy this version");
 
@@ -3711,7 +3829,7 @@ mod tests {
     #[tokio::test]
     async fn validation_allows_foreign_key_target_committed_in_same_version() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![fk_child_row("child-1", "parent-1", "version-a")],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
@@ -3723,7 +3841,7 @@ mod tests {
             ))],
         };
 
-        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3735,7 +3853,7 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_foreign_key_target_committed_only_in_different_version() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![fk_child_row("child-1", "parent-1", "version-a")],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
@@ -3748,7 +3866,7 @@ mod tests {
         };
 
         let error =
-            validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
                 &live_state,
@@ -3765,8 +3883,8 @@ mod tests {
     async fn validation_rejects_foreign_key_target_tombstoned_by_transaction() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let mut parent_delete = fk_parent_row("parent-1", "version-a");
-        parent_delete.snapshot_content = None;
-        let staged_writes = StagedWriteSet {
+        parent_delete.snapshot = None;
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 parent_delete,
                 fk_child_row("child-1", "parent-1", "version-a"),
@@ -3781,7 +3899,7 @@ mod tests {
         };
 
         let error =
-            validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
                 &live_state,
@@ -3796,8 +3914,8 @@ mod tests {
     async fn validation_rejects_pending_reference_to_deleted_identity() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let mut parent_delete = fk_parent_row("parent-1", "version-a");
-        parent_delete.snapshot_content = None;
-        let staged_writes = StagedWriteSet {
+        parent_delete.snapshot = None;
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 parent_delete,
                 fk_child_row("child-1", "parent-1", "version-a"),
@@ -3812,7 +3930,7 @@ mod tests {
         };
 
         let error =
-            validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
                 &live_state,
@@ -3827,8 +3945,8 @@ mod tests {
     async fn validation_allows_delete_with_pending_reference_in_different_version() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let mut parent_delete = fk_parent_row("parent-1", "version-a");
-        parent_delete.snapshot_content = None;
-        let staged_writes = StagedWriteSet {
+        parent_delete.snapshot = None;
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 parent_delete,
                 fk_parent_row("parent-1", "version-b"),
@@ -3837,7 +3955,7 @@ mod tests {
             ..empty_staged_write_set()
         };
 
-        validate_staged_writes(validation_input(&staged_writes, &visible_schemas))
+        validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
             .await
             .expect("pending references in another version should not block this delete");
     }
@@ -3845,7 +3963,7 @@ mod tests {
     #[tokio::test]
     async fn validation_allows_state_surface_fk_target_committed_by_exact_identity() {
         let visible_schemas = vec![fk_parent_schema(), state_surface_ref_schema()];
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![state_surface_ref_row(
                 "ref-1",
                 "target-1",
@@ -3861,7 +3979,7 @@ mod tests {
             ))],
         };
 
-        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3874,21 +3992,21 @@ mod tests {
     async fn validation_rejects_delete_when_same_version_reference_exists() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let mut parent_delete = fk_parent_row("parent-1", "version-a");
-        parent_delete.snapshot_content = None;
+        parent_delete.snapshot = None;
         let live_state = StaticLiveStateReader {
             rows: vec![
                 MaterializedLiveStateRow::from(fk_parent_row("parent-1", "version-a")),
                 MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "version-a")),
             ],
         };
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![parent_delete],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
         let error =
-            validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
                 &staged_writes,
                 &visible_schemas,
                 &live_state,
@@ -3903,20 +4021,20 @@ mod tests {
     async fn validation_allows_delete_when_only_different_version_reference_exists() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let mut parent_delete = fk_parent_row("parent-1", "version-a");
-        parent_delete.snapshot_content = None;
+        parent_delete.snapshot = None;
         let live_state = StaticLiveStateReader {
             rows: vec![
                 MaterializedLiveStateRow::from(fk_parent_row("parent-1", "version-a")),
                 MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "version-b")),
             ],
         };
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![parent_delete],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
-        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3929,22 +4047,22 @@ mod tests {
     async fn validation_allows_delete_when_committed_reference_is_also_deleted() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let mut parent_delete = fk_parent_row("parent-1", "version-a");
-        parent_delete.snapshot_content = None;
+        parent_delete.snapshot = None;
         let mut child_delete = fk_child_row("child-1", "parent-1", "version-a");
-        child_delete.snapshot_content = None;
+        child_delete.snapshot = None;
         let live_state = StaticLiveStateReader {
             rows: vec![
                 MaterializedLiveStateRow::from(fk_parent_row("parent-1", "version-a")),
                 MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "version-a")),
             ],
         };
-        let staged_writes = StagedWriteSet {
+        let staged_writes = PreparedWriteSet {
             state_rows: vec![parent_delete, child_delete],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
 
-        validate_staged_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
             &staged_writes,
             &visible_schemas,
             &live_state,
@@ -3976,14 +4094,19 @@ mod tests {
         let mut indexes = PendingConstraintIndexes::default();
         let row = fk_parent_row("parent-1", "version-a");
         let snapshot = serde_json::from_str::<JsonValue>(
-            row.snapshot_content
-                .as_deref()
+            row.snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref())
                 .expect("fixture should have snapshot"),
         )
         .expect("fixture JSON should parse");
 
         indexes
-            .remember_row(&row, &fk_parent_schema(), &snapshot)
+            .remember_row(
+                PreparedValidationRow::State(&row),
+                &fk_parent_schema(),
+                &snapshot,
+            )
             .expect("parent row should index");
 
         assert!(indexes
@@ -4013,14 +4136,19 @@ mod tests {
         let mut indexes = PendingConstraintIndexes::default();
         let row = unique_row("post-1", "hello-world", "first");
         let snapshot = serde_json::from_str::<JsonValue>(
-            row.snapshot_content
-                .as_deref()
+            row.snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref())
                 .expect("fixture should have snapshot"),
         )
         .expect("fixture JSON should parse");
 
         indexes
-            .remember_row(&row, &unique_schema(), &snapshot)
+            .remember_row(
+                PreparedValidationRow::State(&row),
+                &unique_schema(),
+                &snapshot,
+            )
             .expect("unique row should index");
 
         assert!(indexes
@@ -4040,8 +4168,9 @@ mod tests {
         let mut indexes = PendingConstraintIndexes::default();
         let row = fk_child_row("child-1", "parent-1", "version-a");
         let snapshot = serde_json::from_str::<JsonValue>(
-            row.snapshot_content
-                .as_deref()
+            row.snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref())
                 .expect("fixture should have snapshot"),
         )
         .expect("fixture JSON should parse");
@@ -4051,7 +4180,12 @@ mod tests {
         let catalog = catalog_from_transaction_input(&input).expect("catalog should build");
 
         indexes
-            .remember_foreign_key_references(&catalog, &row, &fk_child_schema(), &snapshot)
+            .remember_foreign_key_references(
+                &catalog,
+                PreparedValidationRow::State(&row),
+                &fk_child_schema(),
+                &snapshot,
+            )
             .expect("child row should index FK reference");
 
         assert!(indexes
@@ -4081,8 +4215,9 @@ mod tests {
         let mut indexes = PendingConstraintIndexes::default();
         let row = state_surface_ref_row("ref-1", "target-1", "fk_parent_schema", "file-a");
         let snapshot = serde_json::from_str::<JsonValue>(
-            row.snapshot_content
-                .as_deref()
+            row.snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref())
                 .expect("fixture should have snapshot"),
         )
         .expect("fixture JSON should parse");
@@ -4092,7 +4227,12 @@ mod tests {
         let catalog = catalog_from_transaction_input(&input).expect("catalog should build");
 
         indexes
-            .remember_foreign_key_references(&catalog, &row, &state_surface_ref_schema(), &snapshot)
+            .remember_foreign_key_references(
+                &catalog,
+                PreparedValidationRow::State(&row),
+                &state_surface_ref_schema(),
+                &snapshot,
+            )
             .expect("state-surface row should index FK reference");
 
         assert!(indexes.has_fk_reference_to_identity(LiveStateRowIdentity {
@@ -4107,14 +4247,15 @@ mod tests {
     fn pending_delete_restrictions_ignore_tombstoned_referencing_rows() {
         let mut indexes = PendingConstraintIndexes::default();
         let mut parent_delete = fk_parent_row("parent-1", "version-a");
-        parent_delete.snapshot_content = None;
-        indexes.remember_tombstone(&parent_delete);
+        parent_delete.snapshot = None;
+        indexes.remember_tombstone(PreparedValidationRow::State(&parent_delete));
 
         let child = fk_child_row("child-1", "parent-1", "version-a");
         let child_snapshot = serde_json::from_str::<JsonValue>(
             child
-                .snapshot_content
-                .as_deref()
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref())
                 .expect("fixture should have snapshot"),
         )
         .expect("fixture JSON should parse");
@@ -4123,12 +4264,17 @@ mod tests {
         let input = validation_input(&staged_writes, &visible_schemas);
         let catalog = catalog_from_transaction_input(&input).expect("catalog should build");
         indexes
-            .remember_foreign_key_references(&catalog, &child, &fk_child_schema(), &child_snapshot)
+            .remember_foreign_key_references(
+                &catalog,
+                PreparedValidationRow::State(&child),
+                &fk_child_schema(),
+                &child_snapshot,
+            )
             .expect("child row should index FK reference");
 
         let mut child_delete = fk_child_row("child-1", "parent-1", "version-a");
-        child_delete.snapshot_content = None;
-        indexes.remember_tombstone(&child_delete);
+        child_delete.snapshot = None;
+        indexes.remember_tombstone(PreparedValidationRow::State(&child_delete));
 
         validate_pending_delete_restrictions(&catalog, &indexes)
             .expect("a row deleted in the same transaction should not block target delete");
@@ -4139,8 +4285,9 @@ mod tests {
         let indexes = PendingConstraintIndexes::default();
         let row = fk_child_row("child-1", "parent-1", "version-a");
         let snapshot = serde_json::from_str::<JsonValue>(
-            row.snapshot_content
-                .as_deref()
+            row.snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref())
                 .expect("fixture should have snapshot"),
         )
         .expect("fixture JSON should parse");
@@ -4152,7 +4299,11 @@ mod tests {
         let unresolved = validate_pending_foreign_keys(
             &catalog,
             &indexes,
-            &[(&row, &fk_child_schema(), snapshot)],
+            &[(
+                PreparedValidationRow::State(&row),
+                &fk_child_schema(),
+                &snapshot,
+            )],
         )
         .expect("FK validation should collect unresolved checks");
 
@@ -4191,20 +4342,26 @@ mod tests {
         let parent = fk_parent_row("parent-1", "version-a");
         let parent_snapshot = serde_json::from_str::<JsonValue>(
             parent
-                .snapshot_content
-                .as_deref()
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref())
                 .expect("fixture should have snapshot"),
         )
         .expect("fixture JSON should parse");
         indexes
-            .remember_row(&parent, &fk_parent_schema(), &parent_snapshot)
+            .remember_row(
+                PreparedValidationRow::State(&parent),
+                &fk_parent_schema(),
+                &parent_snapshot,
+            )
             .expect("parent should index as pending FK target");
 
         let child = fk_child_row("child-1", "parent-1", "version-a");
         let child_snapshot = serde_json::from_str::<JsonValue>(
             child
-                .snapshot_content
-                .as_deref()
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref())
                 .expect("fixture should have snapshot"),
         )
         .expect("fixture JSON should parse");
@@ -4216,7 +4373,11 @@ mod tests {
         let unresolved = validate_pending_foreign_keys(
             &catalog,
             &indexes,
-            &[(&child, &fk_child_schema(), child_snapshot)],
+            &[(
+                PreparedValidationRow::State(&child),
+                &fk_child_schema(),
+                &child_snapshot,
+            )],
         )
         .expect("FK validation should inspect pending targets");
 
@@ -4232,20 +4393,26 @@ mod tests {
         let parent = fk_parent_row("parent-1", "version-b");
         let parent_snapshot = serde_json::from_str::<JsonValue>(
             parent
-                .snapshot_content
-                .as_deref()
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref())
                 .expect("fixture should have snapshot"),
         )
         .expect("fixture JSON should parse");
         indexes
-            .remember_row(&parent, &fk_parent_schema(), &parent_snapshot)
+            .remember_row(
+                PreparedValidationRow::State(&parent),
+                &fk_parent_schema(),
+                &parent_snapshot,
+            )
             .expect("parent should index as pending FK target");
 
         let child = fk_child_row("child-1", "parent-1", "version-a");
         let child_snapshot = serde_json::from_str::<JsonValue>(
             child
-                .snapshot_content
-                .as_deref()
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref())
                 .expect("fixture should have snapshot"),
         )
         .expect("fixture JSON should parse");
@@ -4257,7 +4424,11 @@ mod tests {
         let unresolved = validate_pending_foreign_keys(
             &catalog,
             &indexes,
-            &[(&child, &fk_child_schema(), child_snapshot)],
+            &[(
+                PreparedValidationRow::State(&child),
+                &fk_child_schema(),
+                &child_snapshot,
+            )],
         )
         .expect("FK validation should inspect pending targets");
 
@@ -4276,8 +4447,9 @@ mod tests {
         let indexes = PendingConstraintIndexes::default();
         let row = state_surface_ref_row("ref-1", "target-1", "fk_parent_schema", "file-a");
         let snapshot = serde_json::from_str::<JsonValue>(
-            row.snapshot_content
-                .as_deref()
+            row.snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref())
                 .expect("fixture should have snapshot"),
         )
         .expect("fixture JSON should parse");
@@ -4289,7 +4461,11 @@ mod tests {
         let unresolved = validate_pending_foreign_keys(
             &catalog,
             &indexes,
-            &[(&row, &state_surface_ref_schema(), snapshot)],
+            &[(
+                PreparedValidationRow::State(&row),
+                &state_surface_ref_schema(),
+                &snapshot,
+            )],
         )
         .expect("FK validation should collect unresolved checks");
 
@@ -4327,8 +4503,9 @@ mod tests {
         let child = fk_child_row("child-1", "parent-1", "version-a");
         let child_snapshot = serde_json::from_str::<JsonValue>(
             child
-                .snapshot_content
-                .as_deref()
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref())
                 .expect("fixture should have snapshot"),
         )
         .expect("fixture JSON should parse");
@@ -4339,7 +4516,11 @@ mod tests {
         let unresolved = validate_pending_foreign_keys(
             &catalog,
             &indexes,
-            &[(&child, &fk_child_schema(), child_snapshot)],
+            &[(
+                PreparedValidationRow::State(&child),
+                &fk_child_schema(),
+                &child_snapshot,
+            )],
         )
         .expect("pending FK validation should collect unresolved check");
         let live_state = StaticLiveStateReader {
@@ -4373,8 +4554,9 @@ mod tests {
         let child = fk_child_row("child-1", "parent-1", "version-a");
         let child_snapshot = serde_json::from_str::<JsonValue>(
             child
-                .snapshot_content
-                .as_deref()
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref())
                 .expect("fixture should have snapshot"),
         )
         .expect("fixture JSON should parse");
@@ -4385,7 +4567,11 @@ mod tests {
         let unresolved = validate_pending_foreign_keys(
             &catalog,
             &indexes,
-            &[(&child, &fk_child_schema(), child_snapshot)],
+            &[(
+                PreparedValidationRow::State(&child),
+                &fk_child_schema(),
+                &child_snapshot,
+            )],
         )
         .expect("pending FK validation should collect unresolved check");
         let live_state = StaticLiveStateReader {
@@ -4419,8 +4605,9 @@ mod tests {
         let indexes = PendingConstraintIndexes::default();
         let row = state_surface_ref_row("ref-1", "target-1", "fk_parent_schema", "file-a");
         let snapshot = serde_json::from_str::<JsonValue>(
-            row.snapshot_content
-                .as_deref()
+            row.snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref())
                 .expect("fixture should have snapshot"),
         )
         .expect("fixture JSON should parse");
@@ -4431,7 +4618,11 @@ mod tests {
         let unresolved = validate_pending_foreign_keys(
             &catalog,
             &indexes,
-            &[(&row, &state_surface_ref_schema(), snapshot)],
+            &[(
+                PreparedValidationRow::State(&row),
+                &state_surface_ref_schema(),
+                &snapshot,
+            )],
         )
         .expect("pending FK validation should collect unresolved check");
         let live_state = StaticLiveStateReader {
@@ -4459,14 +4650,15 @@ mod tests {
         );
     }
 
-    fn empty_staged_write_set() -> StagedWriteSet {
-        StagedWriteSet {
+    fn empty_staged_write_set() -> PreparedWriteSet {
+        PreparedWriteSet {
             state_rows: Vec::new(),
             adopted_rows: Vec::new(),
             insert_identities: BTreeMap::new(),
             commit_members_by_version: BTreeMap::new(),
             extra_commit_parents_by_version: BTreeMap::new(),
             file_data_writes: Vec::new(),
+            json_writer: crate::json_store::JsonStoreContext::new().writer(),
         }
     }
 
@@ -4505,7 +4697,7 @@ mod tests {
         ]
     }
 
-    fn pending_registered_schema_row(schema_key: &str, schema_version: &str) -> StagedStateRow {
+    fn pending_registered_schema_row(schema_key: &str, schema_version: &str) -> PreparedStateRow {
         pending_registered_schema_from_definition(json!({
             "x-lix-key": schema_key,
             "x-lix-version": schema_version,
@@ -4518,13 +4710,13 @@ mod tests {
         }))
     }
 
-    fn pending_registered_schema_from_definition(schema: JsonValue) -> StagedStateRow {
+    fn pending_registered_schema_from_definition(schema: JsonValue) -> PreparedStateRow {
         let key = schema_key_from_definition(&schema).expect("test schema should have a key");
-        StagedStateRow {
+        PreparedStateRow {
             entity_id: registered_schema_entity_id(&key.schema_key, &key.schema_version),
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
             file_id: None,
-            snapshot_content: Some(json!({ "value": schema }).to_string()),
+            snapshot: Some(test_stage_json(&json!({ "value": schema }).to_string())),
             metadata: None,
             origin: None,
             schema_version: "1".to_string(),
@@ -4675,7 +4867,7 @@ mod tests {
         })
     }
 
-    fn unique_row(entity_id: &str, slug: &str, title: &str) -> StagedStateRow {
+    fn unique_row(entity_id: &str, slug: &str, title: &str) -> PreparedStateRow {
         let mut row = staged_row(
             "unique_schema",
             "1",
@@ -4695,7 +4887,7 @@ mod tests {
         row
     }
 
-    fn nullable_unique_row(entity_id: &str, scope: Option<&str>, name: &str) -> StagedStateRow {
+    fn nullable_unique_row(entity_id: &str, scope: Option<&str>, name: &str) -> PreparedStateRow {
         let mut row = staged_row(
             "nullable_unique_schema",
             "1",
@@ -4715,7 +4907,7 @@ mod tests {
         row
     }
 
-    fn fk_parent_row(entity_id: &str, version_id: &str) -> StagedStateRow {
+    fn fk_parent_row(entity_id: &str, version_id: &str) -> PreparedStateRow {
         let mut row = staged_row(
             "fk_parent_schema",
             "1",
@@ -4728,7 +4920,7 @@ mod tests {
         row
     }
 
-    fn fk_child_row(entity_id: &str, parent_id: &str, version_id: &str) -> StagedStateRow {
+    fn fk_child_row(entity_id: &str, parent_id: &str, version_id: &str) -> PreparedStateRow {
         let mut row = staged_row(
             "fk_child_schema",
             "1",
@@ -4746,7 +4938,7 @@ mod tests {
         target_entity_id: &str,
         target_schema_key: &str,
         target_file_id: &str,
-    ) -> StagedStateRow {
+    ) -> PreparedStateRow {
         let mut row = staged_row(
             "state_surface_ref_schema",
             "1",
@@ -4767,7 +4959,7 @@ mod tests {
         row
     }
 
-    fn staged_file_descriptor_row(file_id: &str, version_id: &str) -> StagedStateRow {
+    fn staged_file_descriptor_row(file_id: &str, version_id: &str) -> PreparedStateRow {
         let mut row = staged_row(
             FILE_DESCRIPTOR_SCHEMA_KEY,
             "1",
@@ -4798,8 +4990,8 @@ mod tests {
             entity_id: row.entity_id,
             schema_key: row.schema_key,
             file_id: row.file_id,
-            snapshot_content: row.snapshot_content,
-            metadata: row.metadata,
+            snapshot_content: row.snapshot.as_ref().map(|snapshot| snapshot.materialize()),
+            metadata: row.metadata.as_ref().map(|metadata| metadata.materialize()),
             schema_version: row.schema_version,
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -4823,12 +5015,12 @@ mod tests {
         schema_key: &str,
         schema_version: &str,
         snapshot_content: Option<String>,
-    ) -> StagedStateRow {
-        StagedStateRow {
+    ) -> PreparedStateRow {
+        PreparedStateRow {
             entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
             schema_key: schema_key.to_string(),
             file_id: None,
-            snapshot_content,
+            snapshot: snapshot_content.as_deref().map(test_stage_json),
             metadata: None,
             origin: None,
             schema_version: schema_version.to_string(),

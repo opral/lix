@@ -47,7 +47,7 @@ impl FunctionContext {
         })
     }
 
-    /// Returns the engine2-owned provider used by SQL and transaction staging.
+    /// Returns the engine-owned provider used by SQL and transaction staging.
     pub(crate) fn provider(&self) -> FunctionProviderHandle {
         self.functions.clone()
     }
@@ -234,6 +234,7 @@ mod tests {
             )
             .await
             .expect("sequence should stage");
+        json_writer.flush_into(&mut writes);
         writes
             .apply(&mut tx.as_mut())
             .await
@@ -302,7 +303,9 @@ mod tests {
             file_id: None,
             snapshot_ref: Some(
                 json_writer
-                    .stage_bytes(&mut writes, snapshot_content.as_bytes())
+                    .prepare_json(crate::json_store::NormalizedJson::from_arc_unchecked(
+                        Arc::from(snapshot_content.as_str()),
+                    ))
                     .expect("snapshot should stage"),
             ),
             metadata_ref: None,
@@ -315,6 +318,7 @@ mod tests {
             untracked: true,
             version_id: GLOBAL_VERSION_ID.to_string(),
         };
+        json_writer.flush_into(&mut writes);
         {
             let mut writer = live_state.writer(tx.as_mut());
             writer
