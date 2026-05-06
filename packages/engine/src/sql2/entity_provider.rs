@@ -27,7 +27,7 @@ use serde_json::Value as JsonValue;
 
 use crate::commit_graph::CommitGraphReader;
 use crate::entity_identity::EntityIdentity;
-use crate::live_state::LiveStateRow;
+use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
@@ -40,9 +40,9 @@ use crate::sql2::version_scope::{
 use crate::sql2::write_normalization::{
     InsertCell, InsertColumnIntents, SqlCell, UpdateAssignmentValues, UpdateCell,
 };
-use crate::transaction::types::StageRow;
+use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::version::VersionRefReader;
-use crate::{parse_row_metadata, serialize_row_metadata, LixError, RowMetadata};
+use crate::{parse_row_metadata_value, serialize_row_metadata, LixError};
 
 use super::entity_history_provider::EntityHistoryProvider;
 use super::history_route::{
@@ -56,7 +56,7 @@ use crate::sql2::{
     SqlChangelogQuerySource, SqlWriteContext, WriteAccess, WriteContextLiveStateReader,
     WriteContextVersionRefReader,
 };
-use crate::transaction::types::{StageWrite, StageWriteMode};
+use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 
 pub(crate) async fn register_entity_providers(
     ctx: &SessionContext,
@@ -552,8 +552,8 @@ impl InsertSink for EntityInsertSink {
             .map_err(|_| DataFusionError::Execution("entity INSERT row count overflow".into()))?;
 
         self.write_ctx
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Insert,
+            .stage_write(TransactionWrite::Rows {
+                mode: TransactionWriteMode::Insert,
                 rows,
             })
             .await
@@ -694,7 +694,7 @@ impl ExecutionPlan for EntityDeleteExec {
                 version_binding.active_version_id(),
             )?;
             for row in &mut write_rows {
-                row.snapshot_content = None;
+                row.snapshot = None;
             }
             let count = u64::try_from(write_rows.len()).map_err(|_| {
                 DataFusionError::Execution("entity DELETE row count overflow".to_string())
@@ -702,8 +702,8 @@ impl ExecutionPlan for EntityDeleteExec {
 
             if count > 0 {
                 write_ctx
-                    .stage_write(StageWrite::Rows {
-                        mode: StageWriteMode::Replace,
+                    .stage_write(TransactionWrite::Rows {
+                        mode: TransactionWriteMode::Replace,
                         rows: write_rows,
                     })
                     .await
@@ -865,8 +865,8 @@ impl ExecutionPlan for EntityUpdateExec {
 
             if count > 0 {
                 write_ctx
-                    .stage_write(StageWrite::Rows {
-                        mode: StageWriteMode::Replace,
+                    .stage_write(TransactionWrite::Rows {
+                        mode: TransactionWriteMode::Replace,
                         rows: write_rows,
                     })
                     .await
@@ -953,7 +953,7 @@ fn entity_update_write_rows_from_batch(
     batch: &RecordBatch,
     assignments: &[(String, Arc<dyn PhysicalExpr>)],
     version_binding: Option<&str>,
-) -> Result<Vec<StageRow>> {
+) -> Result<Vec<TransactionWriteRow>> {
     let assignment_values = UpdateAssignmentValues::evaluate(batch, assignments)?;
     (0..batch.num_rows())
         .map(|row_index| {
@@ -974,7 +974,7 @@ fn entity_update_write_rows_from_batch(
                     ))
                 })?;
 
-            Ok(StageRow {
+            Ok(TransactionWriteRow {
                 entity_id: optional_string_value(batch, row_index, "lixcol_entity_id")?
                     .map(|entity_id| {
                         EntityIdentity::from_string(&entity_id).map_err(|error| {
@@ -987,12 +987,18 @@ fn entity_update_write_rows_from_batch(
                     .transpose()?,
                 schema_key: spec.schema_key.clone(),
                 file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
-                snapshot_content: Some(entity_update_snapshot_content_from_batch(
-                    spec,
-                    batch,
-                    &assignment_values,
-                    row_index,
-                )?),
+                snapshot: Some(
+                    TransactionJson::from_value(
+                        entity_update_snapshot_content_from_batch(
+                            spec,
+                            batch,
+                            &assignment_values,
+                            row_index,
+                        )?,
+                        &format!("{} update snapshot_content", spec.schema_key),
+                    )
+                    .map_err(super::error::lix_error_to_datafusion_error)?,
+                ),
                 metadata: entity_update_optional_metadata_value(
                     batch,
                     &assignment_values,
@@ -1020,7 +1026,7 @@ fn entity_update_snapshot_content_from_batch(
     batch: &RecordBatch,
     assignment_values: &UpdateAssignmentValues,
     row_index: usize,
-) -> Result<String> {
+) -> Result<JsonValue> {
     let snapshot_content = optional_string_value(batch, row_index, "lixcol_snapshot_content")?
         .ok_or_else(|| {
             DataFusionError::Execution(format!(
@@ -1055,12 +1061,7 @@ fn entity_update_snapshot_content_from_batch(
         };
         object.insert(column.name.clone(), value);
     }
-    serde_json::to_string(&JsonValue::Object(object)).map_err(|error| {
-        DataFusionError::Execution(format!(
-            "failed to serialize entity surface '{}' snapshot_content: {error}",
-            spec.schema_key
-        ))
-    })
+    Ok(JsonValue::Object(object))
 }
 
 fn entity_update_optional_string_value(
@@ -1088,10 +1089,13 @@ fn entity_update_optional_metadata_value(
     row_index: usize,
     column_name: &str,
     context: &str,
-) -> Result<Option<RowMetadata>> {
+) -> Result<Option<TransactionJson>> {
     entity_update_optional_string_value(batch, assignment_values, row_index, column_name)?
         .map(|value| {
-            parse_row_metadata(&value, context).map_err(super::error::lix_error_to_datafusion_error)
+            let metadata = parse_row_metadata_value(&value, context)
+                .map_err(super::error::lix_error_to_datafusion_error)?;
+            TransactionJson::from_value(metadata, &format!("{context} metadata"))
+                .map_err(super::error::lix_error_to_datafusion_error)
         })
         .transpose()
 }
@@ -1132,7 +1136,7 @@ fn entity_lix_state_write_rows_from_batch(
     batch: &RecordBatch,
     insert_column_intents: &InsertColumnIntents,
     version_binding: Option<&str>,
-) -> Result<Vec<StageRow>> {
+) -> Result<Vec<TransactionWriteRow>> {
     entity_lix_state_write_rows_from_batch_with_options(
         spec,
         batch,
@@ -1146,7 +1150,7 @@ fn entity_existing_lix_state_write_rows_from_batch(
     spec: &EntitySurfaceSpec,
     batch: &RecordBatch,
     version_binding: Option<&str>,
-) -> Result<Vec<StageRow>> {
+) -> Result<Vec<TransactionWriteRow>> {
     entity_lix_state_write_rows_from_batch_with_options(
         spec,
         batch,
@@ -1162,7 +1166,7 @@ fn entity_lix_state_write_rows_from_batch_with_options(
     insert_column_intents: &InsertColumnIntents,
     version_binding: Option<&str>,
     reject_read_only_fields: bool,
-) -> Result<Vec<StageRow>> {
+) -> Result<Vec<TransactionWriteRow>> {
     (0..batch.num_rows())
         .map(|row_index| {
             let scope = resolve_write_version_scope(
@@ -1231,12 +1235,21 @@ fn entity_lix_state_write_rows_from_batch_with_options(
                     .transpose()?
             };
 
-            Ok(StageRow {
+            Ok(TransactionWriteRow {
                 entity_id,
                 schema_key: spec.schema_key.clone(),
                 file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
-                snapshot_content: Some(snapshot_content),
-                metadata: optional_metadata_value(batch, row_index, "lixcol_metadata", &spec.schema_key)?,
+                snapshot: Some(TransactionJson::from_value(
+                    snapshot_content,
+                    &format!("{} insert snapshot_content", spec.schema_key),
+                )
+                .map_err(super::error::lix_error_to_datafusion_error)?),
+                metadata: optional_metadata_value(
+                    batch,
+                    row_index,
+                    "lixcol_metadata",
+                    &spec.schema_key,
+                )?,
                 origin: None,
                 schema_version: schema_version,
                 created_at: None,
@@ -1257,7 +1270,7 @@ fn entity_snapshot_content_from_batch(
     batch: &RecordBatch,
     insert_column_intents: &InsertColumnIntents,
     row_index: usize,
-) -> Result<String> {
+) -> Result<JsonValue> {
     let mut object = serde_json::Map::new();
     for column in &spec.columns {
         let value = match insert_column_intents.cell(batch, row_index, &column.name)? {
@@ -1271,12 +1284,7 @@ fn entity_snapshot_content_from_batch(
         };
         object.insert(column.name.clone(), value);
     }
-    serde_json::to_string(&JsonValue::Object(object)).map_err(|error| {
-        DataFusionError::Execution(format!(
-            "failed to serialize entity surface '{}' snapshot_content: {error}",
-            spec.schema_key
-        ))
-    })
+    Ok(JsonValue::Object(object))
 }
 
 fn entity_json_value_from_scalar(
@@ -1404,10 +1412,13 @@ fn optional_metadata_value(
     row_index: usize,
     column_name: &str,
     context: &str,
-) -> Result<Option<RowMetadata>> {
+) -> Result<Option<TransactionJson>> {
     optional_string_value(batch, row_index, column_name)?
         .map(|value| {
-            parse_row_metadata(&value, context).map_err(super::error::lix_error_to_datafusion_error)
+            let metadata = parse_row_metadata_value(&value, context)
+                .map_err(super::error::lix_error_to_datafusion_error)?;
+            TransactionJson::from_value(metadata, &format!("{context} metadata"))
+                .map_err(super::error::lix_error_to_datafusion_error)
         })
         .transpose()
 }
@@ -1591,7 +1602,7 @@ fn entity_live_state_scan_request(
 fn entity_record_batch(
     spec: &EntitySurfaceSpec,
     schema: SchemaRef,
-    rows: &[LiveStateRow],
+    rows: &[MaterializedLiveStateRow],
 ) -> Result<RecordBatch> {
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
@@ -1616,7 +1627,7 @@ fn entity_record_batch(
 fn entity_column_array(
     spec: &EntitySurfaceSpec,
     column_name: &str,
-    rows: &[LiveStateRow],
+    rows: &[MaterializedLiveStateRow],
     snapshots: &[Option<JsonValue>],
 ) -> Result<ArrayRef> {
     if let Some(property_name) = column_name.strip_prefix("lixcol_") {
@@ -1665,7 +1676,10 @@ fn entity_column_array(
     })
 }
 
-fn entity_system_column_array(column_name: &str, rows: &[LiveStateRow]) -> Result<ArrayRef> {
+fn entity_system_column_array(
+    column_name: &str,
+    rows: &[MaterializedLiveStateRow],
+) -> Result<ArrayRef> {
     Ok(match column_name {
         "entity_id" => Arc::new(StringArray::from(
             rows.iter()
@@ -1927,7 +1941,7 @@ fn parse_primary_key_paths(schema: &JsonValue) -> std::result::Result<Vec<Vec<St
         .collect()
 }
 
-// TODO(engine2): share JSON Pointer parsing with schema/canonical validation once
+// TODO(engine): share JSON Pointer parsing with schema/canonical validation once
 // those helpers have a clean module boundary for SQL providers.
 fn parse_json_pointer(pointer: &str) -> std::result::Result<Vec<String>, LixError> {
     if pointer.is_empty() {
@@ -2052,12 +2066,15 @@ mod tests {
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
     use crate::live_state::{
-        LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+        LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
     };
     use crate::sql2::dml::InsertSink;
     use crate::sql2::write_normalization::InsertColumnIntents;
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
-    use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWriteOutcome};
+    use crate::transaction::types::{
+        TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
+        TransactionWriteRow,
+    };
     use crate::version::{VersionHead, VersionRefReader};
     use crate::LixError;
 
@@ -2065,8 +2082,8 @@ mod tests {
     struct EmptyVersionRefReader;
     #[derive(Default)]
     struct CapturingWriteContext {
-        rows: Vec<LiveStateRow>,
-        writes: Vec<StageWrite>,
+        rows: Vec<MaterializedLiveStateRow>,
+        writes: Vec<TransactionWrite>,
     }
 
     #[async_trait]
@@ -2074,14 +2091,14 @@ mod tests {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(vec![])
         }
 
         async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<LiveStateRow>, LixError> {
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
             Ok(None)
         }
     }
@@ -2113,7 +2130,10 @@ mod tests {
             &self,
             hashes: &[crate::binary_cas::BlobHash],
         ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
-            Ok(crate::binary_cas::BlobBytesBatch::missing(hashes.len()))
+            Ok(crate::binary_cas::BlobBytesBatch::new(vec![
+                None;
+                hashes.len()
+            ]))
         }
     }
 
@@ -2141,7 +2161,7 @@ mod tests {
         async fn scan_live_state(
             &mut self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
@@ -2155,14 +2175,17 @@ mod tests {
             Ok(Some(format!("commit-{version_id}")))
         }
 
-        async fn stage_write(&mut self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
+        async fn stage_write(
+            &mut self,
+            write: TransactionWrite,
+        ) -> Result<TransactionWriteOutcome, LixError> {
             self.writes.push(write);
-            Ok(StageWriteOutcome { count: 0 })
+            Ok(TransactionWriteOutcome { count: 0 })
         }
     }
 
-    fn live_row() -> LiveStateRow {
-        LiveStateRow {
+    fn live_row() -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
             schema_key: "project_message".to_string(),
             file_id: None,
@@ -2170,7 +2193,7 @@ mod tests {
                 "{\"body\":\"hello\",\"rating\":4.5,\"count\":7,\"enabled\":true,\"meta\":{\"x\":1}}"
                     .to_string(),
             ),
-            metadata: Some(json!({"source": "test"})),
+            metadata: Some(json!({"source": "test"}).to_string()),
             schema_version: "1".to_string(),
             version_id: "version-a".to_string(),
             change_id: Some("change-a".to_string()),
@@ -2519,18 +2542,14 @@ mod tests {
         assert_eq!(rows[0].version_id, "version-a");
         assert_eq!(
             rows[0].metadata.as_ref(),
-            Some(&json!({"source": "entity"}))
+            Some(&TransactionJson::from_value_for_test(
+                json!({"source": "entity"})
+            ))
         );
         assert!(!rows[0].global);
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(
-                rows[0]
-                    .snapshot_content
-                    .as_deref()
-                    .expect("snapshot_content")
-            )
-            .expect("snapshot_content JSON"),
-            json!({
+            rows[0].snapshot.as_ref().expect("snapshot_content"),
+            &json!({
                 "body": "hello",
                 "count": 7,
                 "enabled": true,
@@ -2554,14 +2573,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_id, None);
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(
-                rows[0]
-                    .snapshot_content
-                    .as_deref()
-                    .expect("snapshot_content")
-            )
-            .expect("snapshot_content JSON"),
-            json!({
+            rows[0].snapshot.as_ref().expect("snapshot_content"),
+            &json!({
                 "body": "hello",
                 "id": "message-1"
             })
@@ -2675,15 +2688,18 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(
             write_context.writes.as_slice(),
-            &[StageWrite::Rows { mode: StageWriteMode::Insert, rows: vec![StageRow {
+            &[TransactionWrite::Rows {
+                mode: TransactionWriteMode::Insert,
+                rows: vec![TransactionWriteRow {
                     entity_id: Some(crate::entity_identity::EntityIdentity::single("entity-1")),
                     schema_key: "project_message".to_string(),
                     file_id: None,
-                    snapshot_content: Some(
-                        "{\"body\":\"hello\",\"count\":7,\"enabled\":true,\"meta\":{\"x\":1},\"rating\":4.5}"
-                            .to_string()
-                    ),
-                    metadata: Some(json!({"source": "entity"})),
+                    snapshot: Some(TransactionJson::from_value_for_test(
+                        json!({"body":"hello","count":7,"enabled":true,"meta":{"x":1},"rating":4.5})
+                    )),
+                    metadata: Some(TransactionJson::from_value_for_test(
+                        json!({"source": "entity"})
+                    )),
                     origin: None,
                     schema_version: "1".to_string(),
                     created_at: None,

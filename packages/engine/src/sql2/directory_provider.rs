@@ -26,7 +26,7 @@ use futures_util::{stream, TryStreamExt};
 use serde::Deserialize;
 
 use crate::functions::FunctionProviderHandle;
-use crate::live_state::LiveStateRow;
+use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
@@ -39,9 +39,12 @@ use crate::sql2::version_scope::{
     resolve_write_version_scope, VersionBinding,
 };
 use crate::sql2::write_normalization::{InsertCell, SqlCell, UpdateAssignmentValues};
-use crate::transaction::types::{LogicalPrimaryKey, StageRow, StageRowOrigin, StageWriteOperation};
+use crate::transaction::types::{
+    LogicalPrimaryKey, TransactionJson, TransactionWriteOperation, TransactionWriteOrigin,
+    TransactionWriteRow,
+};
 use crate::version::VersionRefReader;
-use crate::{parse_row_metadata, serialize_row_metadata, LixError, RowMetadata};
+use crate::{parse_row_metadata_value, serialize_row_metadata, LixError};
 
 use super::filesystem_planner::{
     directory_descriptor_write_row, directory_path_resolvers_from_state_rows,
@@ -53,7 +56,7 @@ use super::result_metadata::json_field;
 use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
-use crate::transaction::types::{StageWrite, StageWriteMode};
+use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 
 const DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -449,8 +452,8 @@ impl InsertSink for LixDirectoryInsertSink {
         }
 
         self.write_ctx
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Insert,
+            .stage_write(TransactionWrite::Rows {
+                mode: TransactionWriteMode::Insert,
                 rows,
             })
             .await
@@ -601,8 +604,8 @@ impl ExecutionPlan for LixDirectoryDeleteExec {
 
             if count > 0 {
                 write_ctx
-                    .stage_write(StageWrite::Rows {
-                        mode: StageWriteMode::Replace,
+                    .stage_write(TransactionWrite::Rows {
+                        mode: TransactionWriteMode::Replace,
                         rows: write_rows,
                     })
                     .await
@@ -759,8 +762,8 @@ impl ExecutionPlan for LixDirectoryUpdateExec {
 
             if count > 0 {
                 write_ctx
-                    .stage_write(StageWrite::Rows {
-                        mode: StageWriteMode::Replace,
+                    .stage_write(TransactionWrite::Rows {
+                        mode: TransactionWriteMode::Replace,
                         rows: write_rows,
                     })
                     .await
@@ -917,7 +920,7 @@ struct DirectoryDescriptorRecord {
     parent_id: Option<String>,
     name: String,
     hidden: bool,
-    live: LiveStateRow,
+    live: MaterializedLiveStateRow,
 }
 
 #[derive(Debug, Deserialize)]
@@ -932,7 +935,7 @@ struct DirectoryDescriptorSnapshot {
 fn lix_directory_write_rows_from_batch(
     batch: &RecordBatch,
     version_binding: Option<&str>,
-) -> Result<Vec<StageRow>> {
+) -> Result<Vec<TransactionWriteRow>> {
     lix_directory_write_rows_from_batch_with_options(batch, version_binding, "lix_directory", true)
 }
 
@@ -942,7 +945,7 @@ fn lix_directory_write_rows_from_batch_with_path_resolvers(
     surface_name: &str,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
     generate_directory_id: &mut dyn FnMut() -> String,
-) -> Result<Vec<StageRow>> {
+) -> Result<Vec<TransactionWriteRow>> {
     lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         batch,
         version_binding,
@@ -958,7 +961,7 @@ fn lix_directory_update_write_rows_from_batch(
     assignments: &[(String, Arc<dyn PhysicalExpr>)],
     version_binding: Option<&str>,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
-) -> Result<Vec<StageRow>> {
+) -> Result<Vec<TransactionWriteRow>> {
     let assignment_values = UpdateAssignmentValues::evaluate(batch, assignments)?;
     let mut rows = Vec::new();
     for row_index in 0..batch.num_rows() {
@@ -1010,7 +1013,7 @@ fn lix_directory_recursive_delete_rows_from_batch(
     batch: &RecordBatch,
     version_binding: Option<&str>,
     visible_filesystems: &BTreeMap<String, VisibleFilesystem>,
-) -> Result<(Vec<StageRow>, u64)> {
+) -> Result<(Vec<TransactionWriteRow>, u64)> {
     let mut rows = Vec::new();
     let mut seen = BTreeSet::new();
     let mut count = 0u64;
@@ -1036,7 +1039,7 @@ fn lix_directory_recursive_delete_rows_from_batch(
 }
 
 fn append_deduped_delete_plan(
-    rows: &mut Vec<StageRow>,
+    rows: &mut Vec<TransactionWriteRow>,
     seen: &mut BTreeSet<StateRowDedupeKey>,
     plan: FilesystemDeletePlan,
     count: &mut u64,
@@ -1051,7 +1054,7 @@ fn append_deduped_delete_plan(
     }
 }
 
-fn is_user_visible_filesystem_delete_row(row: &StageRow) -> bool {
+fn is_user_visible_filesystem_delete_row(row: &TransactionWriteRow) -> bool {
     matches!(
         row.schema_key.as_str(),
         "lix_directory_descriptor" | "lix_file_descriptor"
@@ -1068,8 +1071,8 @@ struct StateRowDedupeKey {
     untracked: bool,
 }
 
-impl From<&StageRow> for StateRowDedupeKey {
-    fn from(row: &StageRow) -> Self {
+impl From<&TransactionWriteRow> for StateRowDedupeKey {
+    fn from(row: &TransactionWriteRow) -> Self {
         Self {
             entity_id: row
                 .entity_id
@@ -1092,7 +1095,7 @@ fn lix_directory_write_rows_from_batch_with_options(
     version_binding: Option<&str>,
     surface_name: &str,
     reject_read_only_fields: bool,
-) -> Result<Vec<StageRow>> {
+) -> Result<Vec<TransactionWriteRow>> {
     lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         batch,
         version_binding,
@@ -1110,7 +1113,7 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
     reject_read_only_fields: bool,
     mut path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
     mut generate_directory_id: Option<&mut dyn FnMut() -> String>,
-) -> Result<Vec<StageRow>> {
+) -> Result<Vec<TransactionWriteRow>> {
     let mut rows = Vec::new();
     for row_index in 0..batch.num_rows() {
         if reject_read_only_fields {
@@ -1189,7 +1192,7 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
 }
 
 fn attach_lix_directory_insert_origin(
-    rows: &mut [StageRow],
+    rows: &mut [TransactionWriteRow],
     surface_name: &str,
     directory_id: &str,
 ) {
@@ -1211,10 +1214,10 @@ fn attach_lix_directory_insert_origin(
     }
 }
 
-fn lix_directory_insert_origin(surface_name: &str, directory_id: &str) -> StageRowOrigin {
-    StageRowOrigin {
+fn lix_directory_insert_origin(surface_name: &str, directory_id: &str) -> TransactionWriteOrigin {
+    TransactionWriteOrigin {
         surface: surface_name.to_string(),
-        operation: StageWriteOperation::Insert,
+        operation: TransactionWriteOperation::Insert,
         primary_key: Some(LogicalPrimaryKey {
             columns: vec!["id".to_string()],
             values: vec![directory_id.to_string()],
@@ -1313,7 +1316,7 @@ async fn directory_path_resolvers_from_live_state(
 
 fn lix_directory_record_batch(
     schema: &SchemaRef,
-    rows: Vec<LiveStateRow>,
+    rows: Vec<MaterializedLiveStateRow>,
 ) -> Result<RecordBatch, LixError> {
     let mut directory_rows = Vec::<DirectoryDescriptorRecord>::new();
 
@@ -1682,10 +1685,13 @@ fn update_optional_metadata_value(
     row_index: usize,
     column_name: &str,
     context: &str,
-) -> Result<Option<RowMetadata>> {
+) -> Result<Option<TransactionJson>> {
     update_optional_string_value(batch, assignment_values, row_index, column_name)?
         .map(|value| {
-            parse_row_metadata(&value, context).map_err(super::error::lix_error_to_datafusion_error)
+            let metadata = parse_row_metadata_value(&value, context)
+                .map_err(super::error::lix_error_to_datafusion_error)?;
+            TransactionJson::from_value(metadata, &format!("{context} metadata"))
+                .map_err(super::error::lix_error_to_datafusion_error)
         })
         .transpose()
 }
@@ -1730,10 +1736,13 @@ fn optional_metadata_value(
     row_index: usize,
     column_name: &str,
     context: &str,
-) -> Result<Option<RowMetadata>> {
+) -> Result<Option<TransactionJson>> {
     optional_string_value(batch, row_index, column_name)?
         .map(|value| {
-            parse_row_metadata(&value, context).map_err(super::error::lix_error_to_datafusion_error)
+            let metadata = parse_row_metadata_value(&value, context)
+                .map_err(super::error::lix_error_to_datafusion_error)?;
+            TransactionJson::from_value(metadata, &format!("{context} metadata"))
+                .map_err(super::error::lix_error_to_datafusion_error)
         })
         .transpose()
 }
@@ -1833,11 +1842,14 @@ mod tests {
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
     use crate::live_state::{
-        LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+        LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
     };
     use crate::sql2::dml::InsertSink;
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
-    use crate::transaction::types::{StageRow, StageWrite, StageWriteMode, StageWriteOutcome};
+    use crate::transaction::types::{
+        TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
+        TransactionWriteRow,
+    };
     use crate::LixError;
 
     use super::{
@@ -1862,8 +1874,8 @@ mod tests {
 
     #[derive(Default)]
     struct CapturingWriteContext {
-        rows: Vec<LiveStateRow>,
-        writes: Vec<StageWrite>,
+        rows: Vec<MaterializedLiveStateRow>,
+        writes: Vec<TransactionWrite>,
     }
 
     #[async_trait]
@@ -1872,7 +1884,10 @@ mod tests {
             &self,
             hashes: &[crate::binary_cas::BlobHash],
         ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
-            Ok(crate::binary_cas::BlobBytesBatch::missing(hashes.len()))
+            Ok(crate::binary_cas::BlobBytesBatch::new(vec![
+                None;
+                hashes.len()
+            ]))
         }
     }
 
@@ -1900,7 +1915,7 @@ mod tests {
         async fn scan_live_state(
             &mut self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
@@ -1914,16 +1929,19 @@ mod tests {
             Ok(Some(format!("commit-{version_id}")))
         }
 
-        async fn stage_write(&mut self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
+        async fn stage_write(
+            &mut self,
+            write: TransactionWrite,
+        ) -> Result<TransactionWriteOutcome, LixError> {
             self.writes.push(write);
-            Ok(StageWriteOutcome { count: 0 })
+            Ok(TransactionWriteOutcome { count: 0 })
         }
     }
 
     #[derive(Default)]
     #[allow(dead_code)]
     struct RowsLiveStateReader {
-        rows: Vec<LiveStateRow>,
+        rows: Vec<MaterializedLiveStateRow>,
     }
 
     #[async_trait]
@@ -1931,19 +1949,23 @@ mod tests {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
         async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<LiveStateRow>, LixError> {
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
             Ok(None)
         }
     }
 
-    fn live_row(entity_id: &str, version_id: &str, snapshot_content: &str) -> LiveStateRow {
+    fn live_row(
+        entity_id: &str,
+        version_id: &str,
+        snapshot_content: &str,
+    ) -> MaterializedLiveStateRow {
         live_filesystem_row(
             entity_id,
             super::DIRECTORY_SCHEMA_KEY,
@@ -1959,14 +1981,14 @@ mod tests {
         file_id: Option<&str>,
         version_id: &str,
         snapshot_content: &str,
-    ) -> LiveStateRow {
-        LiveStateRow {
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: schema_key.to_string(),
             file_id: file_id.map(ToOwned::to_owned),
             snapshot_content: Some(snapshot_content.to_string()),
-            metadata: Some(json!({"source": "test"})),
+            metadata: Some(json!({"source": "test"}).to_string()),
             schema_version: "1".to_string(),
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
@@ -1978,7 +2000,7 @@ mod tests {
         }
     }
 
-    fn filesystem_rows() -> Vec<LiveStateRow> {
+    fn filesystem_rows() -> Vec<MaterializedLiveStateRow> {
         vec![
             live_filesystem_row(
                 "dir-docs",
@@ -2169,15 +2191,16 @@ mod tests {
 
         assert_eq!(
             rows,
-            vec![StageRow {
+            vec![TransactionWriteRow {
                 entity_id: Some(crate::entity_identity::EntityIdentity::single("dir-docs")),
                 schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                 file_id: None,
-                snapshot_content: Some(
-                    "{\"hidden\":false,\"id\":\"dir-docs\",\"name\":\"docs\",\"parent_id\":null}"
-                        .to_string()
-                ),
-                metadata: Some(json!({"source": "directory"})),
+                snapshot: Some(TransactionJson::from_value_for_test(
+                    json!({"hidden":false,"id":"dir-docs","name":"docs","parent_id":null})
+                )),
+                metadata: Some(TransactionJson::from_value_for_test(
+                    json!({"source": "directory"})
+                )),
                 origin: Some(lix_directory_insert_origin("lix_directory", "dir-docs")),
                 schema_version: "1".to_string(),
                 created_at: None,
@@ -2247,8 +2270,7 @@ mod tests {
         .expect("directory path batch should decode");
 
         assert_eq!(rows.len(), 1);
-        let snapshot: serde_json::Value =
-            serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap()).unwrap();
+        let snapshot = rows[0].snapshot.as_ref().unwrap();
         assert_eq!(snapshot["id"], "dir-nested");
         assert_eq!(snapshot["parent_id"], "dir-docs");
         assert_eq!(snapshot["name"], "nested");
@@ -2290,7 +2312,7 @@ mod tests {
                 ("lix_directory_descriptor", "dir-docs".to_string()),
             ]
         );
-        assert!(rows.iter().all(|row| row.snapshot_content.is_none()));
+        assert!(rows.iter().all(|row| row.snapshot.is_none()));
     }
 
     #[test]
@@ -2342,15 +2364,18 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(
             write_context.writes.as_slice(),
-            &[StageWrite::Rows { mode: StageWriteMode::Insert, rows: vec![StageRow {
+            &[TransactionWrite::Rows {
+                mode: TransactionWriteMode::Insert,
+                rows: vec![TransactionWriteRow {
                     entity_id: Some(crate::entity_identity::EntityIdentity::single("dir-docs")),
                     schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                     file_id: None,
-                    snapshot_content: Some(
-                        "{\"hidden\":false,\"id\":\"dir-docs\",\"name\":\"docs\",\"parent_id\":null}"
-                            .to_string()
-                    ),
-                    metadata: Some(json!({"source": "directory"})),
+                    snapshot: Some(TransactionJson::from_value_for_test(
+                        json!({"hidden":false,"id":"dir-docs","name":"docs","parent_id":null})
+                    )),
+                    metadata: Some(TransactionJson::from_value_for_test(
+                        json!({"source": "directory"})
+                    )),
                     origin: Some(lix_directory_insert_origin(
                         "lix_directory_by_version",
                         "dir-docs"
@@ -2392,12 +2417,11 @@ mod tests {
             .expect("directory sink should stage path write");
 
         assert_eq!(count, 1);
-        let [StageWrite::Rows { rows, .. }] = write_context.writes.as_slice() else {
+        let [TransactionWrite::Rows { rows, .. }] = write_context.writes.as_slice() else {
             panic!("expected one directory staged write");
         };
         assert_eq!(rows.len(), 1);
-        let snapshot: serde_json::Value =
-            serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap()).unwrap();
+        let snapshot = rows[0].snapshot.as_ref().unwrap();
         assert_eq!(snapshot["id"], "dir-nested");
         assert_eq!(snapshot["parent_id"], "dir-docs");
         assert_eq!(snapshot["name"], "nested");

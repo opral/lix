@@ -1,12 +1,12 @@
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
-use crate::untracked_state::UntrackedStateRow;
+use crate::untracked_state::{UntrackedStateRow, UntrackedStateRowRef};
 use crate::LixError;
 
 const UNTRACKED_STATE_FILE_IDENTIFIER: &str = "LXUS";
 
-pub(crate) fn encode_row(row: &UntrackedStateRow) -> Result<Vec<u8>, LixError> {
-    let entity_id = row.entity_id.as_string().map_err(|error| {
+pub(crate) fn encode_row_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8>, LixError> {
+    let entity_id = row.entity_id.as_cow_str().map_err(|error| {
         LixError::unknown(format!(
             "failed to encode untracked-state entity identity: {error}"
         ))
@@ -14,23 +14,18 @@ pub(crate) fn encode_row(row: &UntrackedStateRow) -> Result<Vec<u8>, LixError> {
 
     let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(256);
     let entity_id = builder.create_string(&entity_id);
-    let schema_key = builder.create_string(&row.schema_key);
-    let file_id = row
-        .file_id
-        .as_ref()
-        .map(|value| builder.create_string(value));
+    let schema_key = builder.create_string(row.schema_key);
+    let file_id = row.file_id.map(|value| builder.create_string(value));
     let snapshot_ref = row
         .snapshot_ref
-        .as_ref()
         .map(|value| builder.create_vector(value.as_hash_bytes()));
     let metadata_ref = row
         .metadata_ref
-        .as_ref()
         .map(|value| builder.create_vector(value.as_hash_bytes()));
-    let schema_version = builder.create_string(&row.schema_version);
-    let created_at = builder.create_string(&row.created_at);
-    let updated_at = builder.create_string(&row.updated_at);
-    let version_id = builder.create_string(&row.version_id);
+    let schema_version = builder.create_string(row.schema_version);
+    let created_at = builder.create_string(row.created_at);
+    let updated_at = builder.create_string(row.updated_at);
+    let version_id = builder.create_string(row.version_id);
 
     let root = flatbuffer::create_untracked_state_row(
         &mut builder,

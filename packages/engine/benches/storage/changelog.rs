@@ -65,31 +65,31 @@ pub(crate) fn bench(c: &mut Criterion, runtime: &Runtime, args: Args) {
             BatchSize::LargeInput,
         )
     });
-    group.bench_function("load_change_hit/10k", |b| {
+    group.bench_function("load_changes_hit/10k", |b| {
         b.iter_batched(
             || prepare_read(runtime, args),
             |(backend, fixture)| {
                 black_box(
                     runtime
-                        .block_on(storage_bench::changelog_load_change_hit_prepared(
+                        .block_on(storage_bench::changelog_load_changes_hit_prepared(
                             &backend, &fixture,
                         ))
-                        .expect("changelog/load_change_hit succeeds"),
+                        .expect("changelog/load_changes_hit succeeds"),
                 )
             },
             BatchSize::LargeInput,
         )
     });
-    group.bench_function("load_change_miss/10k", |b| {
+    group.bench_function("load_changes_miss/10k", |b| {
         b.iter_batched(
             || prepare_read(runtime, args),
             |(backend, fixture)| {
                 black_box(
                     runtime
-                        .block_on(storage_bench::changelog_load_change_miss_prepared(
+                        .block_on(storage_bench::changelog_load_changes_miss_prepared(
                             &backend, &fixture,
                         ))
-                        .expect("changelog/load_change_miss succeeds"),
+                        .expect("changelog/load_changes_miss succeeds"),
                 )
             },
             BatchSize::LargeInput,

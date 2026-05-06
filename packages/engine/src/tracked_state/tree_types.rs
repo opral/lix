@@ -1,6 +1,6 @@
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
-use crate::tracked_state::TrackedStateRow;
+use crate::tracked_state::{MaterializedTrackedStateRow, TrackedStateRow};
 use crate::{LixError, NullableKeyFilter};
 
 pub(crate) const TRACKED_STATE_HASH_BYTES: usize = 32;
@@ -46,20 +46,18 @@ pub(crate) struct TrackedStateKey {
     pub(crate) entity_id: EntityIdentity,
 }
 
-impl TrackedStateKey {
-    pub(crate) fn from_row(row: &TrackedStateRow) -> Self {
-        Self {
-            schema_key: row.schema_key.clone(),
-            file_id: row.file_id.clone(),
-            entity_id: row.entity_id.clone(),
-        }
-    }
+/// Borrowed primary tracked-state key.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TrackedStateKeyRef<'a> {
+    pub(crate) schema_key: &'a str,
+    pub(crate) file_id: Option<&'a str>,
+    pub(crate) entity_id: &'a EntityIdentity,
 }
 
 /// Tracked entity payload stored at a commit root.
 ///
 /// This is deliberately the version-independent part of `TrackedStateRow`.
-/// Callers project it back to `TrackedStateRow` by supplying the version id
+/// Callers project it back to `MaterializedTrackedStateRow` by supplying the version id
 /// selected by the version ref.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateValue {
@@ -74,30 +72,13 @@ pub(crate) struct TrackedStateValue {
 }
 
 impl TrackedStateValue {
-    pub(crate) fn from_row_refs(
-        row: &TrackedStateRow,
-        snapshot_ref: Option<JsonRef>,
-        metadata_ref: Option<JsonRef>,
-    ) -> Self {
-        Self {
-            snapshot_ref,
-            metadata_ref,
-            schema_version: row.schema_version.clone(),
-            created_at: row.created_at.clone(),
-            updated_at: row.updated_at.clone(),
-            change_id: row.change_id.clone(),
-            commit_id: row.commit_id.clone(),
-            deleted: row.snapshot_content.is_none(),
-        }
-    }
-
     pub(crate) fn into_materialized_row(
         self,
         key: TrackedStateKey,
         snapshot_content: Option<String>,
-        metadata: Option<crate::RowMetadata>,
-    ) -> TrackedStateRow {
-        TrackedStateRow {
+        metadata: Option<String>,
+    ) -> MaterializedTrackedStateRow {
+        MaterializedTrackedStateRow {
             entity_id: key.entity_id,
             schema_key: key.schema_key,
             file_id: key.file_id,
@@ -112,17 +93,60 @@ impl TrackedStateValue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TrackedStateMutation {
-    Put {
-        key: TrackedStateKey,
-        value: TrackedStateValue,
-    },
+/// Borrowed tracked-state value.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TrackedStateValueRef<'a> {
+    pub(crate) snapshot_ref: Option<&'a JsonRef>,
+    pub(crate) metadata_ref: Option<&'a JsonRef>,
+    pub(crate) schema_version: &'a str,
+    pub(crate) created_at: &'a str,
+    pub(crate) updated_at: &'a str,
+    pub(crate) change_id: &'a str,
+    pub(crate) commit_id: &'a str,
+    pub(crate) deleted: bool,
+}
+
+/// Borrowed tracked-state write row.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TrackedStateRowRef<'a> {
+    pub(crate) key: TrackedStateKeyRef<'a>,
+    pub(crate) value: TrackedStateValueRef<'a>,
+}
+
+impl TrackedStateRow {
+    pub(crate) fn as_ref(&self) -> TrackedStateRowRef<'_> {
+        TrackedStateRowRef {
+            key: TrackedStateKeyRef {
+                schema_key: &self.schema_key,
+                file_id: self.file_id.as_deref(),
+                entity_id: &self.entity_id,
+            },
+            value: TrackedStateValueRef {
+                snapshot_ref: self.snapshot_ref.as_ref(),
+                metadata_ref: self.metadata_ref.as_ref(),
+                schema_version: &self.schema_version,
+                created_at: &self.created_at,
+                updated_at: &self.updated_at,
+                change_id: &self.change_id,
+                commit_id: &self.commit_id,
+                deleted: self.snapshot_ref.is_none(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TrackedStateMutation {
+    pub(crate) encoded_key: Vec<u8>,
+    pub(crate) encoded_value: Vec<u8>,
 }
 
 impl TrackedStateMutation {
-    pub(crate) fn put(key: TrackedStateKey, value: TrackedStateValue) -> Self {
-        Self::Put { key, value }
+    pub(crate) fn put_encoded(encoded_key: Vec<u8>, encoded_value: Vec<u8>) -> Self {
+        Self {
+            encoded_key,
+            encoded_value,
+        }
     }
 }
 

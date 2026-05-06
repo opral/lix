@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::transaction::types::StageRow;
+use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::version::VersionRefReader;
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
@@ -87,17 +87,17 @@ impl SessionContext {
     }
 }
 
-fn workspace_version_stage_row(version_id: &str) -> Result<StageRow, LixError> {
-    Ok(StageRow {
+fn workspace_version_stage_row(version_id: &str) -> Result<TransactionWriteRow, LixError> {
+    Ok(TransactionWriteRow {
         entity_id: Some(crate::entity_identity::EntityIdentity::single(
             WORKSPACE_VERSION_KEY,
         )),
         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
         file_id: None,
-        snapshot_content: Some(encode_snapshot(json!({
+        snapshot: Some(TransactionJson::from_value_unchecked(json!({
             "key": WORKSPACE_VERSION_KEY,
             "value": version_id,
-        }))?),
+        }))),
         metadata: None,
         origin: None,
         schema_version: KEY_VALUE_SCHEMA_VERSION.to_string(),
@@ -108,14 +108,5 @@ fn workspace_version_stage_row(version_id: &str) -> Result<StageRow, LixError> {
         commit_id: None,
         untracked: true,
         version_id: GLOBAL_VERSION_ID.to_string(),
-    })
-}
-
-fn encode_snapshot(value: serde_json::Value) -> Result<String, LixError> {
-    serde_json::to_string(&value).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("engine2 switch_version snapshot serialization failed: {error}"),
-        )
     })
 }

@@ -12,6 +12,12 @@ path = "benches/storage/main.rs"
 harness = false
 required-features = ["storage-benches"]
 
+[[bench]]
+name = "transaction"
+path = "benches/transaction/main.rs"
+harness = false
+required-features = ["storage-benches"]
+
 [dependencies]
 async-trait = "0.1"
 cel = { version = "0.12.0", features = ["json"] }

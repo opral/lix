@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::live_state::{LiveStateRow, LiveStateRowIdentity};
+use crate::live_state::{LiveStateRowIdentity, MaterializedLiveStateRow};
 
 /// Applies the local untracked overlay to tracked live-state rows.
 ///
@@ -9,9 +9,9 @@ use crate::live_state::{LiveStateRow, LiveStateRowIdentity};
 /// knowing whether a visible row came from tracked changelog projection or from
 /// local untracked state.
 pub(crate) fn overlay_untracked_rows(
-    tracked_rows: Vec<LiveStateRow>,
-    untracked_rows: Vec<LiveStateRow>,
-) -> Vec<LiveStateRow> {
+    tracked_rows: Vec<MaterializedLiveStateRow>,
+    untracked_rows: Vec<MaterializedLiveStateRow>,
+) -> Vec<MaterializedLiveStateRow> {
     let mut rows_by_identity = BTreeMap::new();
 
     for row in tracked_rows {
@@ -55,8 +55,8 @@ mod tests {
         assert_eq!(rows.len(), 2);
     }
 
-    fn live_row(value: &str, untracked: bool, change_id: Option<&str>) -> LiveStateRow {
-        LiveStateRow {
+    fn live_row(value: &str, untracked: bool, change_id: Option<&str>) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::single("entity"),
             schema_key: "schema".to_string(),
             file_id: None,

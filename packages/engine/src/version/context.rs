@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
-use crate::json_store::JsonStoreWriter;
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::untracked_state::{UntrackedStateContext, UntrackedStateRow};
 
-use super::refs::{canonical_version_ref_row, VersionRefContext};
+use super::refs::VersionRefContext;
 use super::VersionRefReader;
 
 /// Aggregate entrypoint for version-domain services.
@@ -29,17 +28,6 @@ impl VersionContext {
         S: StorageReader + Send,
     {
         self.refs.reader(store)
-    }
-
-    pub(crate) fn canonical_ref_row(
-        &self,
-        writes: &mut StorageWriteSet,
-        json_writer: &mut JsonStoreWriter,
-        version_id: &str,
-        commit_id: &str,
-        timestamp: &str,
-    ) -> Result<UntrackedStateRow, crate::LixError> {
-        canonical_version_ref_row(writes, json_writer, version_id, commit_id, timestamp)
     }
 
     pub(crate) fn stage_canonical_ref_rows(

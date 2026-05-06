@@ -1,6 +1,6 @@
 use datafusion::error::DataFusionError;
 
-use crate::transaction::types::StageRow;
+use crate::transaction::types::TransactionWriteRow;
 use crate::LixError;
 
 pub(crate) fn reject_read_only_entity_surface(
@@ -21,7 +21,7 @@ pub(crate) fn reject_read_only_entity_surface(
 }
 
 pub(crate) fn reject_read_only_stage_rows(
-    rows: &[StageRow],
+    rows: &[TransactionWriteRow],
     operation: &str,
 ) -> Result<(), DataFusionError> {
     for row in rows {

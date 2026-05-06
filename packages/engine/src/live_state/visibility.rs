@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::live_state::{LiveStateRow, LiveStateRowIdentity};
+use crate::live_state::{LiveStateRowIdentity, MaterializedLiveStateRow};
 use crate::GLOBAL_VERSION_ID;
 
 /// Expands a version-scoped storage read so global candidates are available for
@@ -32,10 +32,10 @@ pub(crate) fn expanded_version_ids(version_ids: &[String]) -> Vec<String> {
 /// validation remains exact storage-scope local unless a validator explicitly
 /// opts into overlay semantics.
 pub(crate) fn resolve_scan_rows(
-    rows: Vec<LiveStateRow>,
+    rows: Vec<MaterializedLiveStateRow>,
     requested_version_ids: &[String],
     include_tombstones: bool,
-) -> Vec<LiveStateRow> {
+) -> Vec<MaterializedLiveStateRow> {
     let mut rows = project_global_rows_into_requested_versions(rows, requested_version_ids);
     if !include_tombstones {
         rows.retain(|row| row.snapshot_content.is_some());
@@ -46,10 +46,10 @@ pub(crate) fn resolve_scan_rows(
 /// Resolves a row loaded through a concrete storage version into the row visible
 /// to the requested version scope.
 pub(crate) fn project_loaded_row(
-    mut row: LiveStateRow,
+    mut row: MaterializedLiveStateRow,
     requested_version_id: &str,
     matched_version_id: &str,
-) -> LiveStateRow {
+) -> MaterializedLiveStateRow {
     if row.global && requested_version_id != GLOBAL_VERSION_ID {
         row.version_id = requested_version_id.to_string();
     } else if matched_version_id == GLOBAL_VERSION_ID && requested_version_id != GLOBAL_VERSION_ID {
@@ -59,14 +59,14 @@ pub(crate) fn project_loaded_row(
 }
 
 fn project_global_rows_into_requested_versions(
-    rows: Vec<LiveStateRow>,
+    rows: Vec<MaterializedLiveStateRow>,
     requested_version_ids: &[String],
-) -> Vec<LiveStateRow> {
+) -> Vec<MaterializedLiveStateRow> {
     if requested_version_ids.is_empty() {
         return rows;
     }
 
-    let mut rows_by_identity = BTreeMap::<LiveStateRowIdentity, LiveStateRow>::new();
+    let mut rows_by_identity = BTreeMap::<LiveStateRowIdentity, MaterializedLiveStateRow>::new();
     for requested_version_id in requested_version_ids {
         for row in &rows {
             if row.version_id == GLOBAL_VERSION_ID {
@@ -191,8 +191,8 @@ mod tests {
         value: &str,
         global: bool,
         change_id: Option<&str>,
-    ) -> LiveStateRow {
-        LiveStateRow {
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::single("entity"),
             schema_key: "schema".to_string(),
             file_id: None,
@@ -209,8 +209,12 @@ mod tests {
         }
     }
 
-    fn tombstone_at(version_id: &str, global: bool, change_id: Option<&str>) -> LiveStateRow {
-        LiveStateRow {
+    fn tombstone_at(
+        version_id: &str,
+        global: bool,
+        change_id: Option<&str>,
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             snapshot_content: None,
             ..row_at(version_id, "ignored", global, change_id)
         }

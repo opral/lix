@@ -1,22 +1,22 @@
 use crate::changelog::MaterializedCanonicalChange;
 use crate::entity_identity::EntityIdentity;
-use crate::tracked_state::TrackedStateRow;
+use crate::tracked_state::{MaterializedTrackedStateRow, TrackedStateRowRef};
 use crate::untracked_state::{
     MaterializedUntrackedStateRow, UntrackedStateFilter, UntrackedStateRowRequest,
 };
-use crate::{NullableKeyFilter, RowMetadata, Value};
+use crate::{NullableKeyFilter, Value};
 
 /// Durable row visible through live_state reads.
 ///
 /// Unlike provider write rows, live-state rows are fully hydrated facts. Missing
 /// generated fields should be caught before this type is constructed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct LiveStateRow {
+pub(crate) struct MaterializedLiveStateRow {
     pub(crate) entity_id: EntityIdentity,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<String>,
-    pub(crate) metadata: Option<RowMetadata>,
+    pub(crate) metadata: Option<String>,
     pub(crate) schema_version: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
@@ -27,8 +27,30 @@ pub(crate) struct LiveStateRow {
     pub(crate) version_id: String,
 }
 
-impl From<LiveStateRow> for MaterializedCanonicalChange {
-    fn from(row: LiveStateRow) -> Self {
+/// Borrowed tracked write row plus live-state routing metadata.
+///
+/// The tracked-state owner only sees `row`; live-state uses `global` and
+/// `version_id` to enforce that one tracked root contains exactly one storage
+/// scope before delegating to tracked_state.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LiveStateTrackedRowRef<'a> {
+    pub(crate) row: TrackedStateRowRef<'a>,
+    pub(crate) global: bool,
+    pub(crate) version_id: &'a str,
+}
+
+impl LiveStateTrackedRowRef<'_> {
+    pub(crate) fn storage_version_id(&self) -> &str {
+        if self.global {
+            crate::GLOBAL_VERSION_ID
+        } else {
+            self.version_id
+        }
+    }
+}
+
+impl From<MaterializedLiveStateRow> for MaterializedCanonicalChange {
+    fn from(row: MaterializedLiveStateRow) -> Self {
         MaterializedCanonicalChange {
             id: row
                 .change_id
@@ -44,9 +66,9 @@ impl From<LiveStateRow> for MaterializedCanonicalChange {
     }
 }
 
-impl From<MaterializedUntrackedStateRow> for LiveStateRow {
+impl From<MaterializedUntrackedStateRow> for MaterializedLiveStateRow {
     fn from(row: MaterializedUntrackedStateRow) -> Self {
-        LiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: row.entity_id,
             schema_key: row.schema_key,
             file_id: row.file_id,
@@ -64,10 +86,10 @@ impl From<MaterializedUntrackedStateRow> for LiveStateRow {
     }
 }
 
-impl TryFrom<&LiveStateRow> for TrackedStateRow {
+impl TryFrom<&MaterializedLiveStateRow> for MaterializedTrackedStateRow {
     type Error = crate::LixError;
 
-    fn try_from(row: &LiveStateRow) -> Result<Self, Self::Error> {
+    fn try_from(row: &MaterializedLiveStateRow) -> Result<Self, Self::Error> {
         if row.untracked {
             return Err(crate::LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -87,7 +109,7 @@ impl TryFrom<&LiveStateRow> for TrackedStateRow {
             ));
         };
 
-        Ok(TrackedStateRow {
+        Ok(MaterializedTrackedStateRow {
             entity_id: row.entity_id.clone(),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
@@ -102,8 +124,8 @@ impl TryFrom<&LiveStateRow> for TrackedStateRow {
     }
 }
 
-impl From<&LiveStateRow> for MaterializedUntrackedStateRow {
-    fn from(row: &LiveStateRow) -> Self {
+impl From<&MaterializedLiveStateRow> for MaterializedUntrackedStateRow {
+    fn from(row: &MaterializedLiveStateRow) -> Self {
         MaterializedUntrackedStateRow {
             entity_id: row.entity_id.clone(),
             schema_key: row.schema_key.clone(),
@@ -187,7 +209,7 @@ pub(crate) struct LiveStateProjection {
     pub(crate) columns: Vec<String>,
 }
 
-/// First-principles scan request for engine2-owned reads.
+/// First-principles scan request for engine-owned reads.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct LiveStateScanRequest {
     #[serde(default)]
@@ -228,7 +250,7 @@ pub(crate) struct LiveStateRowIdentity {
 }
 
 impl LiveStateRowIdentity {
-    pub(crate) fn from_row(row: &LiveStateRow) -> Self {
+    pub(crate) fn from_row(row: &MaterializedLiveStateRow) -> Self {
         Self {
             version_id: row.version_id.clone(),
             schema_key: row.schema_key.clone(),

@@ -8,7 +8,7 @@ use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
 use super::context::{SessionContext, SessionSqlExecutionContext};
 
-/// Result of executing one SQL statement through engine2.
+/// Result of executing one SQL statement through engine.
 ///
 /// Column names live once at the result-set level. Individual rows only own
 /// values, which keeps the public API row-oriented without copying schema
@@ -380,6 +380,7 @@ impl SessionContext {
                 &mut json_writer,
             )
             .await?;
+        json_writer.flush_into(&mut writes);
         if !writes.is_empty() {
             writes.apply(&mut transaction.as_mut()).await?;
         }

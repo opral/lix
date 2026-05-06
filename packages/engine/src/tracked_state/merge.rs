@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::tracked_state::{
-    TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateRow,
+    MaterializedTrackedStateRow, TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity,
 };
 use crate::LixError;
 
@@ -34,7 +34,7 @@ pub(crate) enum TrackedStateMergePatch {
     Adopt {
         identity: TrackedStateDiffIdentity,
         change_id: String,
-        projected_row: TrackedStateRow,
+        projected_row: MaterializedTrackedStateRow,
     },
 }
 
@@ -52,7 +52,7 @@ impl TrackedStateMergePatch {
         }
     }
 
-    pub(crate) fn projected_row(&self) -> &TrackedStateRow {
+    pub(crate) fn projected_row(&self) -> &MaterializedTrackedStateRow {
         match self {
             Self::Adopt { projected_row, .. } => projected_row,
         }
@@ -168,11 +168,14 @@ fn same_final_state(target: &TrackedStateDiffEntry, source: &TrackedStateDiffEnt
     }
 }
 
-fn row_is_live(row: &TrackedStateRow) -> bool {
+fn row_is_live(row: &MaterializedTrackedStateRow) -> bool {
     row.snapshot_content.is_some()
 }
 
-fn tracked_row_payload_eq(left: &TrackedStateRow, right: &TrackedStateRow) -> bool {
+fn tracked_row_payload_eq(
+    left: &MaterializedTrackedStateRow,
+    right: &MaterializedTrackedStateRow,
+) -> bool {
     left.snapshot_content == right.snapshot_content
         && left.metadata == right.metadata
         && left.schema_version == right.schema_version
@@ -418,8 +421,8 @@ mod tests {
     fn entry(
         entity_id: &str,
         kind: TrackedStateDiffKind,
-        before: Option<TrackedStateRow>,
-        after: Option<TrackedStateRow>,
+        before: Option<MaterializedTrackedStateRow>,
+        after: Option<MaterializedTrackedStateRow>,
     ) -> TrackedStateDiffEntry {
         TrackedStateDiffEntry {
             identity: TrackedStateDiffIdentity {
@@ -447,18 +450,22 @@ mod tests {
             .collect()
     }
 
-    fn tombstone(entity_id: &str, change_id: &str) -> TrackedStateRow {
+    fn tombstone(entity_id: &str, change_id: &str) -> MaterializedTrackedStateRow {
         let mut row = row(entity_id, change_id);
         row.snapshot_content = None;
         row
     }
 
-    fn row(entity_id: &str, change_id: &str) -> TrackedStateRow {
+    fn row(entity_id: &str, change_id: &str) -> MaterializedTrackedStateRow {
         row_with_value(entity_id, change_id, "value")
     }
 
-    fn row_with_value(entity_id: &str, change_id: &str, value: &str) -> TrackedStateRow {
-        TrackedStateRow {
+    fn row_with_value(
+        entity_id: &str,
+        change_id: &str,
+        value: &str,
+    ) -> MaterializedTrackedStateRow {
+        MaterializedTrackedStateRow {
             entity_id: EntityIdentity::single(entity_id),
             schema_key: "test_schema".to_string(),
             file_id: None,

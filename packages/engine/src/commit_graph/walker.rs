@@ -223,9 +223,7 @@ mod tests {
     use serde_json::json;
 
     use crate::backend::testing::UnitTestBackend;
-    use crate::changelog::{
-        canonicalize_materialized_change, ChangelogContext, MaterializedCanonicalChange,
-    };
+    use crate::changelog::{ChangelogContext, MaterializedCanonicalChange};
     use crate::commit_graph::CommitGraphContext;
     use crate::json_store::JsonStoreContext;
     use crate::storage::{StorageContext, StorageWriteSet};
@@ -736,14 +734,18 @@ mod tests {
             changes
                 .iter()
                 .map(|change| {
-                    canonicalize_materialized_change(&mut writes, &mut json_writer, change)
+                    crate::test_support::canonical_change_from_materialized(
+                        &mut writes,
+                        &mut json_writer,
+                        change,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .expect("changes should canonicalize")
         };
         changelog
             .writer(&mut writes)
-            .stage_changes(&canonical_changes)
+            .stage_changes(canonical_changes.iter().map(|change| change.as_ref()))
             .expect("append should succeed");
         writes
             .apply(&mut tx.as_mut())

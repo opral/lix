@@ -19,7 +19,8 @@ pub(crate) mod sql2;
 pub(crate) mod storage;
 #[cfg(feature = "storage-benches")]
 pub mod storage_bench;
-#[cfg(test)]
+#[cfg_attr(feature = "storage-benches", allow(dead_code))]
+#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) mod test_support;
 pub(crate) mod tracked_state;
 pub mod transaction;
@@ -40,9 +41,7 @@ pub use backend::{
     BytePage, BytePageBuilder,
 };
 pub use common::LixError;
-pub(crate) use common::{
-    parse_row_metadata, serialize_row_metadata, validate_row_metadata, RowMetadata,
-};
+pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};
 pub use common::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
 };

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,9 +9,9 @@ use crate::changelog::ChangelogContext;
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
-use crate::json_store::JsonStoreContext;
+use crate::json_store::{JsonStoreContext, JsonStoreWriter};
 use crate::live_state::{
-    LiveStateContext, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+    LiveStateContext, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
 };
 use crate::schema_registry::SchemaRegistry;
 use crate::session::{SessionMode, WORKSPACE_VERSION_KEY};
@@ -20,13 +20,19 @@ use crate::storage::{StorageContext, StorageWriteSet, StorageWriteTransaction};
 use crate::tracked_state::{TrackedStateContext, TrackedStateStoreReader};
 use crate::transaction::commit;
 use crate::transaction::live_state_overlay::overlay_scan_rows;
-use crate::transaction::normalization::normalize_stage_row;
-use crate::transaction::schema_resolver::TransactionSchemaResolver;
-use crate::transaction::staging::{StagedWriteSet, TransactionStagedWrites};
-use crate::transaction::types::{
-    StageFileData, StageRow, StageWrite, StageWriteMode, StageWriteOutcome,
+use crate::transaction::normalization::{
+    normalize_transaction_write_row, remember_pending_registered_schema,
+    NormalizedTransactionWriteRow, REGISTERED_SCHEMA_KEY,
 };
-use crate::transaction::validation::{validate_staged_writes, TransactionValidationInput};
+use crate::transaction::prepare_version_ref_row;
+use crate::transaction::schema_resolver::TransactionSchemaResolver;
+use crate::transaction::staging::{PreparedWriteSet, TransactionWriteBuffer};
+use crate::transaction::types::{
+    stage_json_from_value, PreparedAdoptedStateRow, PreparedRowFacts, PreparedStateRow,
+    PreparedTransactionWrite, TransactionAdoptedChange, TransactionFileData, TransactionJson,
+    TransactionWrite, TransactionWriteMode, TransactionWriteOutcome, TransactionWriteRow,
+};
+use crate::transaction::validation::{validate_prepared_writes, TransactionValidationInput};
 use crate::version::{VersionContext, VersionRefReader};
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
@@ -34,14 +40,14 @@ use crate::{LixError, NullableKeyFilter};
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TransactionCommitOutcome;
 
-/// One execution-scoped transaction capability for engine2 write paths.
+/// One execution-scoped transaction capability for engine write paths.
 ///
 /// This is intentionally not a session-wide kitchen sink. It owns the backend
 /// write transaction for one `SessionContext::execute(...)` call and projects
-/// staged SQL writes back into the SQL DAG through an engine2-local live-state
+/// accepted SQL/provider writes back into the SQL DAG through an engine-local live-state
 /// overlay.
 ///
-/// Transaction invariant: this is the capability for engine2 operations
+/// Transaction invariant: this is the capability for engine operations
 /// that may write. Write-relevant reads must be exposed from this transaction,
 /// after the backend write transaction has begun, rather than from session-level
 /// helpers.
@@ -53,7 +59,7 @@ pub(crate) struct Transaction {
     changelog: Arc<ChangelogContext>,
     version_ctx: Arc<VersionContext>,
     schema_resolver: TransactionSchemaResolver,
-    staged_writes: Arc<TransactionStagedWrites>,
+    staged_writes: Arc<TransactionWriteBuffer>,
     storage_transaction: Box<dyn StorageWriteTransaction + Send + Sync + 'static>,
     visible_schemas: Vec<JsonValue>,
     functions: FunctionProviderHandle,
@@ -110,8 +116,8 @@ impl Transaction {
         };
         let mut schema_resolver = TransactionSchemaResolver::new(schema_registry);
         schema_resolver
-            .remember_visible_schemas(active_version_id.clone(), visible_schemas.clone())?;
-        let staged_writes = Arc::new(TransactionStagedWrites::new(functions.clone()));
+            .remember_visible_schemas(active_version_id.clone(), visible_schemas.clone());
+        let staged_writes = Arc::new(TransactionWriteBuffer::new(functions.clone()));
         Ok(OpenTransaction {
             transaction: Self {
                 active_version_id,
@@ -130,34 +136,37 @@ impl Transaction {
         })
     }
 
-    /// Commits staged writes, runtime function state, and the backend transaction.
+    /// Commits prepared writes, runtime function state, and the backend transaction.
     ///
-    /// Commit owns the execution boundary: provider-staged rows become
-    /// changelog facts, `lix_commit` rows, version-ref updates, and visible
-    /// live_state rows before the backend transaction is committed.
+    /// Commit owns the execution boundary: prepared rows become changelog
+    /// facts, `lix_commit` rows, version-ref updates, and visible live_state
+    /// rows before the backend transaction is committed.
     pub(crate) async fn commit(
         mut self,
         runtime_functions: &FunctionContext,
     ) -> Result<TransactionCommitOutcome, LixError> {
-        let staged_writes = match self.staged_writes.drain() {
-            Ok(staged_writes) => staged_writes,
+        let prepared_writes = match self.staged_writes.drain() {
+            Ok(prepared_writes) => prepared_writes,
             Err(error) => {
                 let _ = self.storage_transaction.rollback().await;
                 return Err(error);
             }
         };
-        if let Err(error) = self.validate_staged_writes_by_version(&staged_writes).await {
+        if let Err(error) = self
+            .validate_prepared_writes_by_version(&prepared_writes)
+            .await
+        {
             let _ = self.storage_transaction.rollback().await;
             return Err(error);
         }
-        if let Err(error) = commit::commit_staged_writes(
+        if let Err(error) = commit::commit_prepared_writes(
             &self.binary_cas,
             &self.changelog,
             &self.live_state,
             self.version_ctx.as_ref(),
             Some(runtime_functions),
             self.storage_transaction.as_mut(),
-            staged_writes,
+            prepared_writes,
         )
         .await
         {
@@ -181,75 +190,184 @@ impl Transaction {
     /// Stages one decoded write batch into this transaction.
     ///
     /// This is the programmatic write entrypoint used by non-SQL APIs. The
-    /// transaction still owns hydration from `StageRow` into `StagedStateRow`,
-    /// so generated timestamps, change ids, commit ids, and commit membership
-    /// stay in one place.
+    /// transaction still owns preparation from `TransactionWriteRow` into
+    /// `PreparedStateRow`, so generated timestamps, change ids, commit ids, and
+    /// commit membership stay in one place.
     #[allow(dead_code)]
     pub(crate) async fn stage_write(
         &mut self,
-        write: StageWrite,
-    ) -> Result<StageWriteOutcome, LixError> {
-        require_valid_stage_write_storage_scopes(&write)?;
-        self.require_existing_stage_write_version_ids(&write)
+        write: TransactionWrite,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        require_valid_transaction_write_storage_scopes(&write)?;
+        #[cfg(feature = "storage-benches")]
+        {
+            crate::storage_bench::record_transaction_rows_staged(transaction_write_row_count(
+                &write,
+            ));
+            crate::storage_bench::record_transaction_untracked_rows(
+                transaction_write_untracked_row_count(&write),
+            );
+        }
+        self.require_existing_transaction_write_version_ids(&write)
             .await?;
-        let write = self.normalize_stage_write(write).await?;
+        let write = self.prepare_transaction_write(write).await?;
         self.staged_writes.stage_write(write)
     }
 
-    async fn normalize_stage_write(&mut self, write: StageWrite) -> Result<StageWrite, LixError> {
+    async fn prepare_transaction_write(
+        &mut self,
+        write: TransactionWrite,
+    ) -> Result<PreparedTransactionWrite, LixError> {
         Ok(match write {
-            StageWrite::Rows { mode, rows } => StageWrite::Rows {
+            TransactionWrite::Rows { mode, rows } => PreparedTransactionWrite::Rows {
                 mode,
-                rows: self.normalize_stage_rows(rows).await?,
+                rows: self.prepare_transaction_rows(rows).await?,
             },
-            StageWrite::RowsWithFileData {
+            TransactionWrite::RowsWithFileData {
                 mode,
                 rows,
                 file_data,
                 count,
-            } => StageWrite::RowsWithFileData {
+            } => PreparedTransactionWrite::RowsWithFileData {
                 mode,
-                rows: self.normalize_stage_rows(rows).await?,
+                rows: self.prepare_transaction_rows(rows).await?,
                 file_data,
                 count,
             },
-            StageWrite::AdoptedChanges { changes } => StageWrite::AdoptedChanges { changes },
+            TransactionWrite::AdoptedChanges { changes } => {
+                PreparedTransactionWrite::AdoptedChanges {
+                    rows: self.prepare_adopted_changes(changes).await?,
+                }
+            }
         })
     }
 
-    async fn normalize_stage_rows(
+    async fn prepare_transaction_rows(
         &mut self,
-        rows: Vec<StageRow>,
-    ) -> Result<Vec<StageRow>, LixError> {
-        let mut normalized_rows = Vec::with_capacity(rows.len());
-        for row in rows {
-            let version_id = row.schema_scope_version_id().to_string();
-            let staged = self.staged_writes.staging_overlay()?;
-            let live_state = self.live_state.reader(self.storage_transaction.as_mut());
+        rows: Vec<TransactionWriteRow>,
+    ) -> Result<Vec<PreparedStateRow>, LixError> {
+        let row_count = rows.len();
+        let staged = self.staged_writes.staging_overlay()?;
+        let live_state = self.live_state.reader(self.storage_transaction.as_mut());
+        let mut rows_by_scope = BTreeMap::<String, Vec<(usize, TransactionWriteRow)>>::new();
+        for (index, row) in rows.into_iter().enumerate() {
+            rows_by_scope
+                .entry(row.schema_scope_version_id().to_string())
+                .or_default()
+                .push((index, row));
+        }
+
+        let mut prepared_rows = Vec::with_capacity(row_count);
+        prepared_rows.resize_with(row_count, || None);
+        for (version_id, rows) in rows_by_scope {
+            let functions = self.functions.clone();
             let catalog = self
                 .schema_resolver
-                .catalog_for_row_normalization(&live_state, staged, &version_id)
+                .catalog_for_row_normalization(&live_state, &staged, &version_id)
                 .await?;
-            let row = normalize_stage_row(row, catalog, self.functions.clone())?;
-            normalized_rows.push(row);
+            let normalized_rows = rows
+                .into_iter()
+                .map(|(index, row)| {
+                    normalize_transaction_write_row(row, catalog, functions.clone())
+                        .map(|row| (index, row))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.staged_writes.with_json_writer(|json_writer| {
+                for (index, row) in normalized_rows {
+                    prepared_rows[index] = Some(prepare_state_row(row, &functions, json_writer)?);
+                }
+                Ok(())
+            })?;
         }
-        Ok(normalized_rows)
+        Ok(prepared_rows
+            .into_iter()
+            .map(|row| {
+                row.expect("every row should be prepared exactly once by schema scope grouping")
+            })
+            .collect())
     }
 
-    async fn validate_staged_writes_by_version(
+    async fn prepare_adopted_changes(
         &mut self,
-        staged_writes: &StagedWriteSet,
+        changes: Vec<TransactionAdoptedChange>,
+    ) -> Result<Vec<PreparedAdoptedStateRow>, LixError> {
+        let change_count = changes.len();
+        let staged = self.staged_writes.staging_overlay()?;
+        let live_state = self.live_state.reader(self.storage_transaction.as_mut());
+        let mut changes_by_scope =
+            BTreeMap::<String, Vec<(usize, TransactionAdoptedChange)>>::new();
+        for (index, change) in changes.into_iter().enumerate() {
+            let schema_scope_version_id = if change.version_id == GLOBAL_VERSION_ID {
+                GLOBAL_VERSION_ID
+            } else {
+                change.version_id.as_str()
+            };
+            changes_by_scope
+                .entry(schema_scope_version_id.to_string())
+                .or_default()
+                .push((index, change));
+        }
+
+        let mut prepared_rows = Vec::with_capacity(change_count);
+        prepared_rows.resize_with(change_count, || None);
+        for (version_id, changes) in changes_by_scope {
+            let catalog = self
+                .schema_resolver
+                .catalog_for_row_normalization(&live_state, &staged, &version_id)
+                .await?;
+            let mut planned_changes = Vec::with_capacity(changes.len());
+            for (index, change) in changes {
+                let row = &change.projected_row;
+                let Some((schema_plan_id, _)) =
+                    catalog.plan_for_key(&row.schema_key, &row.schema_version)
+                else {
+                    return Err(LixError::new(
+                        LixError::CODE_SCHEMA_DEFINITION,
+                        format!(
+                            "schema '{}' version '{}' is not visible to this transaction",
+                            row.schema_key, row.schema_version
+                        ),
+                    ));
+                };
+                if row.schema_key == REGISTERED_SCHEMA_KEY {
+                    remember_adopted_registered_schema(row.snapshot_content.as_deref(), catalog)?;
+                }
+                planned_changes.push((index, change, schema_plan_id));
+            }
+            self.staged_writes.with_json_writer(|json_writer| {
+                for (index, change, schema_plan_id) in planned_changes {
+                    prepared_rows[index] = Some(prepare_adopted_state_row(
+                        change,
+                        schema_plan_id,
+                        json_writer,
+                    )?);
+                }
+                Ok(())
+            })?;
+        }
+        Ok(prepared_rows
+            .into_iter()
+            .map(|row| row.expect("every adopted row should be prepared exactly once"))
+            .collect())
+    }
+
+    async fn validate_prepared_writes_by_version(
+        &mut self,
+        prepared_writes: &PreparedWriteSet,
     ) -> Result<(), LixError> {
-        for version_id in staged_write_validation_version_ids(staged_writes) {
-            let version_staged_writes =
-                staged_write_set_for_schema_scope(staged_writes, &version_id);
+        let validation_index = prepared_writes.validation_index();
+        for version_id in validation_index.schema_scope_version_ids() {
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_transaction_validation_version();
+            let version_prepared_writes =
+                validation_index.validation_set_for_schema_scope(version_id);
             let live_state = self.live_state.reader(self.storage_transaction.as_mut());
             let schema_catalog = self
                 .schema_resolver
-                .catalog_for_validation(&live_state, staged_writes, &version_id)
+                .catalog_for_validation(&live_state, version_id)
                 .await?;
-            validate_staged_writes(TransactionValidationInput::new(
-                &version_staged_writes,
+            validate_prepared_writes(TransactionValidationInput::new(
+                &version_prepared_writes,
                 &schema_catalog,
                 &live_state,
             ))
@@ -262,20 +380,20 @@ impl Transaction {
     #[allow(dead_code)]
     pub(crate) async fn stage_rows(
         &mut self,
-        rows: Vec<StageRow>,
-    ) -> Result<StageWriteOutcome, LixError> {
-        self.stage_write(StageWrite::Rows {
-            mode: StageWriteMode::Replace,
+        rows: Vec<TransactionWriteRow>,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        self.stage_write(TransactionWrite::Rows {
+            mode: TransactionWriteMode::Replace,
             rows,
         })
         .await
     }
 
-    async fn require_existing_stage_write_version_ids(
+    async fn require_existing_transaction_write_version_ids(
         &mut self,
-        write: &StageWrite,
+        write: &TransactionWrite,
     ) -> Result<(), LixError> {
-        let version_ids = stage_write_version_ids(write);
+        let version_ids = transaction_write_version_ids(write);
         let reader = self
             .version_ctx
             .ref_reader(self.storage_transaction.as_mut());
@@ -331,13 +449,10 @@ impl Transaction {
         let mut writes = StorageWriteSet::new();
         let canonical_row = {
             let mut json_writer = JsonStoreContext::new().writer();
-            self.version_ctx.canonical_ref_row(
-                &mut writes,
-                &mut json_writer,
-                version_id,
-                commit_id,
-                &timestamp,
-            )?
+            let canonical_row =
+                prepare_version_ref_row(&mut json_writer, version_id, commit_id, &timestamp)?;
+            json_writer.flush_into(&mut writes);
+            canonical_row
         };
         self.version_ctx
             .stage_canonical_ref_rows(&mut writes, &[canonical_row])?;
@@ -378,6 +493,131 @@ impl Transaction {
         CommitGraphContext::new(self.changelog.as_ref().clone())
             .reader(self.storage_transaction.as_mut())
     }
+}
+
+fn prepare_state_row(
+    normalized: NormalizedTransactionWriteRow,
+    functions: &FunctionProviderHandle,
+    json_writer: &mut JsonStoreWriter,
+) -> Result<PreparedStateRow, LixError> {
+    let NormalizedTransactionWriteRow {
+        row,
+        snapshot,
+        schema_plan_id,
+        facts,
+    } = normalized;
+    let updated_at = row.updated_at.unwrap_or_else(|| functions.call_timestamp());
+    let snapshot = snapshot
+        .map(|value| stage_json_from_value(json_writer, value, "prepared row snapshot_content"))
+        .transpose()?;
+    let metadata = row
+        .metadata
+        .map(|value| stage_json_from_value(json_writer, value, "prepared row metadata"))
+        .transpose()?;
+    Ok(PreparedStateRow {
+        schema_plan_id,
+        facts,
+        entity_id: row.entity_id.ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "normalized transaction write row is missing entity_id",
+            )
+        })?,
+        schema_key: row.schema_key,
+        file_id: row.file_id,
+        snapshot,
+        metadata,
+        origin: row.origin,
+        schema_version: row.schema_version,
+        created_at: row.created_at.unwrap_or_else(|| updated_at.clone()),
+        updated_at,
+        global: row.global,
+        change_id: if row.untracked {
+            row.change_id
+        } else {
+            Some(row.change_id.unwrap_or_else(|| functions.call_uuid_v7()))
+        },
+        commit_id: row.commit_id,
+        untracked: row.untracked,
+        version_id: row.version_id,
+    })
+}
+
+fn remember_adopted_registered_schema(
+    snapshot_content: Option<&str>,
+    catalog: &mut crate::transaction::normalization::TransactionSchemaCatalog,
+) -> Result<(), LixError> {
+    let snapshot = snapshot_content
+        .map(|value| {
+            serde_json::from_str::<JsonValue>(value).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_UNKNOWN,
+                    format!("adopted registered schema snapshot_content is invalid JSON: {error}"),
+                )
+            })
+        })
+        .transpose()?;
+    remember_pending_registered_schema(snapshot.as_ref(), catalog)
+}
+
+fn prepare_adopted_state_row(
+    change: TransactionAdoptedChange,
+    schema_plan_id: crate::transaction::normalization::SchemaPlanId,
+    json_writer: &mut JsonStoreWriter,
+) -> Result<PreparedAdoptedStateRow, LixError> {
+    if change.change_id != change.projected_row.change_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "adopted change '{}' does not match projected row change_id '{}'",
+                change.change_id, change.projected_row.change_id
+            ),
+        ));
+    }
+    let row = change.projected_row;
+    let snapshot = row
+        .snapshot_content
+        .as_deref()
+        .map(|value| {
+            stage_materialized_json_text(json_writer, value, "adopted row snapshot_content")
+        })
+        .transpose()?;
+    let metadata = row
+        .metadata
+        .as_deref()
+        .map(|value| stage_materialized_json_text(json_writer, value, "adopted row metadata"))
+        .transpose()?;
+    Ok(PreparedAdoptedStateRow {
+        schema_plan_id,
+        facts: PreparedRowFacts::default(),
+        entity_id: row.entity_id,
+        schema_key: row.schema_key,
+        file_id: row.file_id,
+        snapshot,
+        metadata,
+        schema_version: row.schema_version,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        global: change.version_id == GLOBAL_VERSION_ID,
+        change_id: change.change_id,
+        commit_id: String::new(),
+        version_id: change.version_id,
+    })
+}
+
+fn stage_materialized_json_text(
+    json_writer: &mut JsonStoreWriter,
+    value: &str,
+    context: &str,
+) -> Result<crate::transaction::types::StageJson, LixError> {
+    let parsed = serde_json::from_str::<serde_json::Value>(value).map_err(|error| {
+        LixError::new(
+            LixError::CODE_UNKNOWN,
+            format!("{context} is invalid JSON: {error}"),
+        )
+    })?;
+    let prepared = TransactionJson::from_value(parsed, context)?;
+    stage_json_from_value(json_writer, prepared, context)
 }
 
 pub(crate) struct OpenTransaction {
@@ -432,7 +672,7 @@ impl SqlWriteExecutionContext for Transaction {
     async fn scan_live_state(
         &mut self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<LiveStateRow>, LixError> {
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let staged = self.staged_writes.staging_overlay()?;
         let base = self.live_state.reader(self.storage_transaction.as_mut());
         overlay_scan_rows(&base, &staged, request).await
@@ -445,115 +685,67 @@ impl SqlWriteExecutionContext for Transaction {
             .await
     }
 
-    async fn stage_write(&mut self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
+    async fn stage_write(
+        &mut self,
+        write: TransactionWrite,
+    ) -> Result<TransactionWriteOutcome, LixError> {
         Transaction::stage_write(self, write).await
     }
 }
 
-fn stage_write_version_ids(write: &StageWrite) -> BTreeSet<String> {
+fn transaction_write_version_ids(write: &TransactionWrite) -> BTreeSet<String> {
     match write {
-        StageWrite::Rows { rows, .. } => stage_row_version_ids(rows),
-        StageWrite::RowsWithFileData {
+        TransactionWrite::Rows { rows, .. } => transaction_write_row_version_ids(rows),
+        TransactionWrite::RowsWithFileData {
             rows, file_data, ..
-        } => stage_row_version_ids(rows)
+        } => transaction_write_row_version_ids(rows)
             .into_iter()
             .chain(stage_file_data_version_ids(file_data))
             .collect(),
-        StageWrite::AdoptedChanges { changes } => changes
+        TransactionWrite::AdoptedChanges { changes } => changes
             .iter()
             .map(|change| change.version_id.clone())
             .collect(),
     }
 }
 
-fn staged_write_validation_version_ids(staged_writes: &StagedWriteSet) -> BTreeSet<String> {
-    staged_writes
-        .state_rows
-        .iter()
-        .map(|row| row.schema_scope_version_id().to_string())
-        .chain(
-            staged_writes
-                .adopted_rows
-                .iter()
-                .map(|row| row.schema_scope_version_id().to_string()),
-        )
-        .collect()
-}
-
-fn staged_write_set_for_schema_scope(
-    staged_writes: &StagedWriteSet,
-    schema_scope_version_id: &str,
-) -> StagedWriteSet {
-    StagedWriteSet {
-        state_rows: staged_writes
-            .state_rows
-            .iter()
-            .filter(|row| row.schema_scope_version_id() == schema_scope_version_id)
-            .cloned()
-            .collect(),
-        adopted_rows: staged_writes
-            .adopted_rows
-            .iter()
-            .filter(|row| row.schema_scope_version_id() == schema_scope_version_id)
-            .cloned()
-            .collect(),
-        insert_identities: staged_writes
-            .insert_identities
-            .iter()
-            .filter(|(identity, _)| {
-                let identity_schema_scope = if identity.version_id == GLOBAL_VERSION_ID {
-                    GLOBAL_VERSION_ID
-                } else {
-                    identity.version_id.as_str()
-                };
-                identity_schema_scope == schema_scope_version_id
-            })
-            .map(|(identity, origin)| (identity.clone(), origin.clone()))
-            .collect(),
-        commit_members_by_version: staged_writes
-            .commit_members_by_version
-            .iter()
-            .filter(|(member_version_id, _)| {
-                let member_schema_scope = if member_version_id.as_str() == GLOBAL_VERSION_ID {
-                    GLOBAL_VERSION_ID
-                } else {
-                    member_version_id.as_str()
-                };
-                member_schema_scope == schema_scope_version_id
-            })
-            .map(|(member_version_id, members)| (member_version_id.clone(), members.clone()))
-            .collect(),
-        extra_commit_parents_by_version: staged_writes
-            .extra_commit_parents_by_version
-            .iter()
-            .filter(|(parent_version_id, _)| parent_version_id.as_str() == schema_scope_version_id)
-            .map(|(parent_version_id, parents)| (parent_version_id.clone(), parents.clone()))
-            .collect(),
-        file_data_writes: staged_writes
-            .file_data_writes
-            .iter()
-            .filter(|write| {
-                let write_schema_scope = if write.version_id == GLOBAL_VERSION_ID {
-                    GLOBAL_VERSION_ID
-                } else {
-                    write.version_id.as_str()
-                };
-                write_schema_scope == schema_scope_version_id
-            })
-            .cloned()
-            .collect(),
-    }
-}
-
-fn require_valid_stage_write_storage_scopes(write: &StageWrite) -> Result<(), LixError> {
+#[cfg(feature = "storage-benches")]
+fn transaction_write_row_count(write: &TransactionWrite) -> usize {
     match write {
-        StageWrite::Rows { rows, .. } => require_valid_stage_row_storage_scopes(rows),
-        StageWrite::RowsWithFileData { rows, .. } => require_valid_stage_row_storage_scopes(rows),
-        StageWrite::AdoptedChanges { .. } => Ok(()),
+        TransactionWrite::Rows { rows, .. } => rows.len(),
+        TransactionWrite::RowsWithFileData { rows, .. } => rows.len(),
+        TransactionWrite::AdoptedChanges { changes } => changes.len(),
     }
 }
 
-fn require_valid_stage_row_storage_scopes(rows: &[StageRow]) -> Result<(), LixError> {
+#[cfg(feature = "storage-benches")]
+fn transaction_write_untracked_row_count(write: &TransactionWrite) -> usize {
+    match write {
+        TransactionWrite::Rows { rows, .. } => rows.iter().filter(|row| row.untracked).count(),
+        TransactionWrite::RowsWithFileData { rows, .. } => {
+            rows.iter().filter(|row| row.untracked).count()
+        }
+        TransactionWrite::AdoptedChanges { .. } => 0,
+    }
+}
+
+fn require_valid_transaction_write_storage_scopes(
+    write: &TransactionWrite,
+) -> Result<(), LixError> {
+    match write {
+        TransactionWrite::Rows { rows, .. } => {
+            require_valid_transaction_write_row_storage_scopes(rows)
+        }
+        TransactionWrite::RowsWithFileData { rows, .. } => {
+            require_valid_transaction_write_row_storage_scopes(rows)
+        }
+        TransactionWrite::AdoptedChanges { .. } => Ok(()),
+    }
+}
+
+fn require_valid_transaction_write_row_storage_scopes(
+    rows: &[TransactionWriteRow],
+) -> Result<(), LixError> {
     for row in rows {
         require_valid_storage_scope(row.version_id.as_str(), row.global)?;
     }
@@ -570,11 +762,11 @@ fn require_valid_storage_scope(version_id: &str, global: bool) -> Result<(), Lix
     Ok(())
 }
 
-fn stage_row_version_ids(rows: &[StageRow]) -> BTreeSet<String> {
+fn transaction_write_row_version_ids(rows: &[TransactionWriteRow]) -> BTreeSet<String> {
     rows.iter().map(|row| row.version_id.clone()).collect()
 }
 
-fn stage_file_data_version_ids(file_data: &[StageFileData]) -> BTreeSet<String> {
+fn stage_file_data_version_ids(file_data: &[TransactionFileData]) -> BTreeSet<String> {
     file_data
         .iter()
         .map(|write| write.version_id.clone())
@@ -664,6 +856,7 @@ mod tests {
     use crate::backend::testing::UnitTestBackend;
     use crate::changelog::ChangelogScanRequest;
     use crate::tracked_state::{TrackedStateRowRequest, TrackedStateScanRequest};
+    use crate::transaction::types::TransactionJson;
     use crate::untracked_state::{UntrackedStateContext, UntrackedStateRowRequest};
     use crate::version::VersionContext;
     use crate::Backend;
@@ -836,7 +1029,9 @@ mod tests {
         let runtime_functions = opened.runtime_functions;
 
         let mut invalid_row = key_value_stage_row("invalid-programmatic", "invalid", false);
-        invalid_row.snapshot_content = Some("{\"key\":\"invalid-programmatic\"}".to_string());
+        invalid_row.snapshot = Some(TransactionJson::from_value_for_test(
+            json!({"key": "invalid-programmatic"}),
+        ));
         transaction
             .stage_rows(vec![invalid_row])
             .await
@@ -879,7 +1074,7 @@ mod tests {
             open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("invalid-metadata", "value", false);
-        row.metadata = Some(json!("not-an-object"));
+        row.metadata = Some(TransactionJson::from_value_for_test(json!("not-an-object")));
         transaction
             .stage_rows(vec![row])
             .await
@@ -1033,17 +1228,17 @@ mod tests {
         ) = open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("invalid-json", "value", false);
-        row.snapshot_content = Some("{".to_string());
+        row.snapshot = Some(TransactionJson::from_value_for_test(json!("not-an-object")));
 
         let error = transaction
             .stage_rows(vec![row])
             .await
-            .expect_err("invalid JSON should be rejected while staging");
+            .expect_err("non-object snapshot should be rejected while staging");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
         assert!(
-            error.message.contains("invalid JSON"),
-            "error should explain invalid JSON: {error:?}"
+            error.message.contains("must be a JSON object"),
+            "error should explain invalid snapshot shape: {error:?}"
         );
     }
 
@@ -1055,7 +1250,9 @@ mod tests {
             open_test_transaction(&backend).await;
 
         let mut row = key_value_stage_row("schema-mismatch", "value", false);
-        row.snapshot_content = Some(r#"{"key":"schema-mismatch"}"#.to_string());
+        row.snapshot = Some(TransactionJson::from_value_for_test(
+            json!({"key": "schema-mismatch"}),
+        ));
         transaction
             .stage_rows(vec![row])
             .await
@@ -1094,14 +1291,11 @@ mod tests {
 
         let mut row = key_value_stage_row("malformed-registered-schema", "value", false);
         row.schema_key = "lix_registered_schema".to_string();
-        row.snapshot_content = Some(
-            json!({
-                "value": {
-                    "x-lix-key": "malformed_registered_schema"
-                }
-            })
-            .to_string(),
-        );
+        row.snapshot = Some(TransactionJson::from_value_for_test(json!({
+            "value": {
+                "x-lix-key": "malformed_registered_schema"
+            }
+        })));
         row.entity_id = None;
 
         let error = transaction
@@ -1191,12 +1385,15 @@ mod tests {
     }
 
     async fn seed_visible_schema_rows(storage: StorageContext, live_state: &LiveStateContext) {
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer();
         let rows = crate::schema::seed_schema_definitions()
             .into_iter()
             .map(|schema| {
                 let key = crate::schema::schema_key_from_definition(schema)
                     .expect("seed schema key should derive");
-                LiveStateRow {
+                let snapshot_content = json!({ "value": schema }).to_string();
+                crate::untracked_state::UntrackedStateRow {
                     entity_id: crate::schema::registered_schema_entity_id(
                         &key.schema_key,
                         &key.schema_version,
@@ -1206,28 +1403,29 @@ mod tests {
                     file_id: None,
                     version_id: GLOBAL_VERSION_ID.to_string(),
                     schema_version: "1".to_string(),
-                    snapshot_content: Some(json!({ "value": schema }).to_string()),
-                    metadata: None,
+                    snapshot_ref: Some(
+                        json_writer
+                            .prepare_json(crate::json_store::NormalizedJson::from_arc_unchecked(
+                                Arc::from(snapshot_content.as_str()),
+                            ))
+                            .expect("schema snapshot should stage"),
+                    ),
+                    metadata_ref: None,
                     created_at: "1970-01-01T00:00:00.000Z".to_string(),
                     updated_at: "1970-01-01T00:00:00.000Z".to_string(),
-                    change_id: None,
-                    commit_id: None,
-                    untracked: true,
                     global: true,
                 }
             })
             .collect::<Vec<_>>();
+        json_writer.flush_into(&mut writes);
         let mut storage_transaction = storage
             .begin_write_transaction()
             .await
             .expect("schema fixture transaction should open");
-        let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer();
         {
             let mut writer = live_state.writer(storage_transaction.as_mut());
             writer
-                .stage_rows(&mut writes, &mut json_writer, &rows)
-                .await
+                .stage_untracked_rows(&mut writes, rows.iter().map(|row| row.as_ref()))
                 .expect("schema fixture rows should stage");
         }
         writes
@@ -1280,18 +1478,15 @@ mod tests {
         );
     }
 
-    fn key_value_stage_row(key: &str, value: &str, untracked: bool) -> StageRow {
-        StageRow {
+    fn key_value_stage_row(key: &str, value: &str, untracked: bool) -> TransactionWriteRow {
+        TransactionWriteRow {
             entity_id: Some(crate::entity_identity::EntityIdentity::single(key)),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
-            snapshot_content: Some(
-                json!({
-                    "key": key,
-                    "value": value,
-                })
-                .to_string(),
-            ),
+            snapshot: Some(TransactionJson::from_value_for_test(json!({
+                "key": key,
+                "value": value,
+            }))),
             metadata: None,
             origin: None,
             schema_version: "1".to_string(),

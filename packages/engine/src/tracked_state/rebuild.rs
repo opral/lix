@@ -1,6 +1,5 @@
 use crate::commit_graph::CommitGraphContext;
 use crate::commit_graph::CommitGraphEntity;
-use crate::json_store::JsonStoreWriter;
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::tracked_state::{TrackedStateContext, TrackedStateRow};
 use crate::LixError;
@@ -20,7 +19,6 @@ pub(super) async fn rebuild_state_at_commit<R, S>(
     read_store: R,
     tracked_store: &mut S,
     writes: &mut StorageWriteSet,
-    json_writer: &mut JsonStoreWriter,
     head_commit_id: &str,
 ) -> Result<TrackedStateRebuildReport, LixError>
 where
@@ -39,10 +37,9 @@ where
         .stage_root(
             tracked_store,
             writes,
-            json_writer,
             head_commit_id,
             None,
-            &rows,
+            rows.iter().map(|row| row.as_ref()),
         )
         .await?;
 
@@ -73,8 +70,8 @@ fn tracked_row_from_entity(entity: CommitGraphEntity) -> TrackedStateRow {
         entity_id: change.entity_id,
         schema_key: change.schema_key,
         file_id: change.file_id,
-        snapshot_content: change.snapshot_content,
-        metadata: change.metadata,
+        snapshot_ref: change.snapshot_ref,
+        metadata_ref: change.metadata_ref,
         schema_version: change.schema_version,
         created_at,
         updated_at,
@@ -93,13 +90,13 @@ mod tests {
     use std::sync::Arc;
 
     use crate::backend::testing::UnitTestBackend;
-    use crate::changelog::{
-        canonicalize_materialized_change, ChangelogContext, MaterializedCanonicalChange,
-    };
+    use crate::changelog::{ChangelogContext, MaterializedCanonicalChange};
     use crate::commit_graph::CommitGraphContext;
     use crate::json_store::JsonStoreContext;
     use crate::storage::{StorageContext, StorageWriteSet};
-    use crate::tracked_state::{TrackedStateFilter, TrackedStateScanRequest};
+    use crate::tracked_state::{
+        MaterializedTrackedStateRow, TrackedStateFilter, TrackedStateScanRequest,
+    };
     use serde_json::json;
 
     #[test]
@@ -114,8 +111,8 @@ mod tests {
         );
         assert_eq!(row.schema_key, "test_schema");
         assert_eq!(row.file_id.as_deref(), Some("file-1"));
-        assert_eq!(row.snapshot_content.as_deref(), Some("{}"));
-        assert_eq!(row.metadata.as_ref(), Some(&json!({"m": 1})));
+        assert!(row.snapshot_ref.is_some());
+        assert!(row.metadata_ref.is_some());
         assert_eq!(row.schema_version, "1");
         assert_eq!(row.change_id, "change-1");
         assert_eq!(row.commit_id, "commit-1");
@@ -125,7 +122,7 @@ mod tests {
     fn rows_from_entities_preserves_tombstones() {
         let rows = rows_from_entities(vec![entity("change-1", None)]);
 
-        assert_eq!(rows[0].snapshot_content, None);
+        assert_eq!(rows[0].snapshot_ref, None);
     }
 
     #[test]
@@ -175,14 +172,12 @@ mod tests {
             .await
             .expect("transaction should open");
         let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer();
         let report = rebuild_state_at_commit(
             &tracked_state,
             &commit_graph,
             storage.clone(),
             tx.as_mut(),
             &mut writes,
-            &mut json_writer,
             "commit-1",
         )
         .await
@@ -228,14 +223,12 @@ mod tests {
             .await
             .expect("transaction should open");
         let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer();
         let report = rebuild_state_at_commit(
             &tracked_state,
             &commit_graph,
             storage.clone(),
             tx.as_mut(),
             &mut writes,
-            &mut json_writer,
             "commit-1",
         )
         .await
@@ -516,14 +509,18 @@ mod tests {
 
     fn entity(change_id: &str, snapshot_content: Option<&str>) -> CommitGraphEntity {
         CommitGraphEntity {
-            change: MaterializedCanonicalChange {
+            change: crate::changelog::CanonicalChange {
                 id: change_id.to_string(),
                 entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
                 schema_key: "test_schema".to_string(),
                 schema_version: "1".to_string(),
                 file_id: Some("file-1".to_string()),
-                snapshot_content: snapshot_content.map(str::to_string),
-                metadata: Some(json!({"m": 1})),
+                snapshot_ref: snapshot_content.map(|content| {
+                    crate::json_store::JsonRef::from_hash(blake3::hash(content.as_bytes()))
+                }),
+                metadata_ref: Some(crate::json_store::JsonRef::from_hash(blake3::hash(
+                    br#"{"m":1}"#,
+                ))),
                 created_at: "ignored-change-created-at".to_string(),
             },
             source_commit_id: "commit-1".to_string(),
@@ -534,13 +531,23 @@ mod tests {
     }
 
     fn commit_entity(commit_id: &str) -> CommitGraphEntity {
+        let materialized = commit_change(
+            &format!("{commit_id}-change"),
+            commit_id,
+            &["change-1"],
+            &[],
+        );
         CommitGraphEntity {
-            change: commit_change(
-                &format!("{commit_id}-change"),
-                commit_id,
-                &["change-1"],
-                &[],
-            ),
+            change: crate::changelog::CanonicalChange {
+                id: materialized.id,
+                entity_id: materialized.entity_id,
+                schema_key: materialized.schema_key,
+                schema_version: materialized.schema_version,
+                file_id: materialized.file_id,
+                snapshot_ref: None,
+                metadata_ref: None,
+                created_at: materialized.created_at,
+            },
             source_commit_id: commit_id.to_string(),
             depth: 0,
             created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -560,14 +567,18 @@ mod tests {
             changes
                 .iter()
                 .map(|change| {
-                    canonicalize_materialized_change(&mut writes, &mut json_writer, change)
+                    crate::test_support::canonical_change_from_materialized(
+                        &mut writes,
+                        &mut json_writer,
+                        change,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .expect("changes should canonicalize")
         };
         changelog
             .writer(&mut writes)
-            .stage_changes(&canonical_changes)
+            .stage_changes(canonical_changes.iter().map(|change| change.as_ref()))
             .expect("changes should append");
         writes
             .apply(&mut tx.as_mut())
@@ -580,7 +591,7 @@ mod tests {
         tracked_state: &TrackedStateContext,
         storage: StorageContext,
         commit_id: &str,
-        rows: &[TrackedStateRow],
+        rows: &[MaterializedTrackedStateRow],
     ) {
         let mut tx = storage
             .begin_write_transaction()
@@ -589,15 +600,25 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         {
             let mut json_writer = JsonStoreContext::new().writer();
+            let canonical_rows = rows
+                .iter()
+                .map(|row| {
+                    crate::test_support::tracked_state_row_from_materialized(
+                        &mut writes,
+                        &mut json_writer,
+                        row,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .expect("rows should canonicalize");
             tracked_state
                 .writer()
                 .stage_root(
                     &mut tx.as_mut(),
                     &mut writes,
-                    &mut json_writer,
                     commit_id,
                     None,
-                    rows,
+                    canonical_rows.iter().map(|row| row.as_ref()),
                 )
                 .await
                 .expect("rows should seed");
@@ -620,14 +641,12 @@ mod tests {
             .await
             .expect("transaction should open");
         let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer();
         let report = rebuild_state_at_commit(
             tracked_state,
             commit_graph,
             storage.clone(),
             tx.as_mut(),
             &mut writes,
-            &mut json_writer,
             head_commit_id,
         )
         .await
@@ -644,7 +663,7 @@ mod tests {
         tracked_state: &TrackedStateContext,
         storage: StorageContext,
         commit_id: &str,
-    ) -> Vec<TrackedStateRow> {
+    ) -> Vec<MaterializedTrackedStateRow> {
         tracked_state
             .reader(storage)
             .scan_rows_at_commit(
@@ -754,8 +773,8 @@ mod tests {
         }
     }
 
-    fn stale_row(version_id: &str, entity_id: &str) -> TrackedStateRow {
-        TrackedStateRow {
+    fn stale_row(version_id: &str, entity_id: &str) -> MaterializedTrackedStateRow {
+        MaterializedTrackedStateRow {
             entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
             schema_key: "test_schema".to_string(),
             file_id: None,
