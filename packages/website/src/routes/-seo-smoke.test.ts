@@ -43,7 +43,7 @@ function findMetaContent(
 describe("SEO route smoke tests", () => {
   test("docs head stays canonical and strips the rendered h1 once", async () => {
     const rawMarkdown = readFileSync(
-      new URL("../../content/docs/comparison-to-git.md", import.meta.url),
+      new URL("../../../../docs/comparison-to-git.md", import.meta.url),
       "utf8",
     );
     const parsed = await parse(rawMarkdown, {

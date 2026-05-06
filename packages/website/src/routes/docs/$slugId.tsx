@@ -5,7 +5,7 @@ import {
   type SidebarSection,
 } from "../../components/docs-layout";
 import { MarkdownPage } from "../../components/markdown-page";
-import tableOfContents from "../../../content/docs/table_of_contents.json";
+import tableOfContents from "../../../../../docs/table_of_contents.json";
 import { DocsPrevNext } from "../../components/docs-prev-next";
 import {
   buildDocMaps,
@@ -27,7 +27,7 @@ import {
 import { parse } from "@opral/markdown-wc";
 import markdownPageCss from "../../components/markdown-page.style.css?url";
 
-const docs = import.meta.glob<string>("/content/docs/**/*.md", {
+const docs = import.meta.glob<string>("../../../../../docs/**/*.md", {
   eager: true,
   import: "default",
   query: "?raw",
@@ -90,11 +90,11 @@ function decodeHtmlEntities(input: string): string {
 }
 
 function buildSidebarSections(toc: Toc): SidebarSection[] {
-  return toc.sidebar
-    .map((section) => {
-      const items = section.items
+  return Object.entries(toc)
+    .map(([label, sectionItems]) => {
+      const items = sectionItems
         .map((item) => {
-          const relativePath = normalizeRelativePath(item.file);
+          const relativePath = normalizeRelativePath(item.path);
           const doc = docsByRelativePath[relativePath];
           if (!doc) {
             return null;
@@ -108,16 +108,16 @@ function buildSidebarSections(toc: Toc): SidebarSection[] {
         })
         .filter((value): value is NonNullable<typeof value> => Boolean(value));
 
-      return { label: section.label, items };
+      return { label, items };
     })
     .filter((section) => section.items.length > 0);
 }
 
 function buildDocsNavRoutes(toc: Toc) {
-  return toc.sidebar
-    .flatMap((section) =>
-      section.items.map((item) => {
-        const relativePath = normalizeRelativePath(item.file);
+  return Object.values(toc)
+    .flatMap((items) =>
+      items.map((item) => {
+        const relativePath = normalizeRelativePath(item.path);
         const doc = docsByRelativePath[relativePath];
         return {
           slug: doc?.slug ?? "",
@@ -254,7 +254,7 @@ function DocsPage() {
   const { doc, sidebarSections, html, frontmatter, pageToc } =
     Route.useLoaderData() as DocsLoaderData;
   const navRoutes = buildDocsNavRoutes(tableOfContents as Toc);
-  const editUrl = `https://github.com/opral/lix/blob/main/packages/website/content/docs/${doc.relativePath.replace(
+  const editUrl = `https://github.com/opral/lix/blob/main/docs/${doc.relativePath.replace(
     /^\.\//,
     "",
   )}`;

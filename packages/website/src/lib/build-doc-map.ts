@@ -1,14 +1,9 @@
 export type TocItem = {
-  file: string;
+  path: string;
   label: string;
 };
 
-export type Toc = {
-  sidebar: Array<{
-    label: string;
-    items: TocItem[];
-  }>;
-};
+export type Toc = Record<string, TocItem[]>;
 
 export type DocRecord = {
   slug: string;
@@ -23,14 +18,14 @@ export type DocRecord = {
  * Converts file path entries in the table of contents into a quick lookup map.
  *
  * @example
- * buildTocMap({ sidebar: [{ items: [{ file: "./what-is-lix.md", label: "What is Lix?" }] }] });
+ * buildTocMap({ Overview: [{ path: "./what-is-lix.md", label: "What is Lix?" }] });
  */
 export function buildTocMap(toc: Toc): Map<string, TocItem> {
   const map = new Map<string, TocItem>();
 
-  for (const section of toc.sidebar) {
-    for (const item of section.items) {
-      const normalized = normalizeRelativePath(item.file);
+  for (const items of Object.values(toc)) {
+    for (const item of items) {
+      const normalized = normalizeRelativePath(item.path);
       map.set(normalized, item);
     }
   }
@@ -42,7 +37,7 @@ export function buildTocMap(toc: Toc): Map<string, TocItem> {
  * Builds doc lookup maps keyed by slug.
  *
  * @example
- * buildDocMaps({ "/content/docs/what-is-lix.md": rawMarkdown });
+ * buildDocMaps({ "/docs/what-is-lix.md": rawMarkdown });
  */
 export function buildDocMaps(entries: Record<string, string>) {
   return Object.entries(entries).reduce(
@@ -72,13 +67,16 @@ export function buildDocMaps(entries: Record<string, string>) {
 }
 
 /**
- * Normalizes a doc file path to a relative form rooted at content/docs.
+ * Normalizes a doc file path to a relative form rooted at docs.
  *
  * @example
- * normalizeRelativePath("/content/docs/guide/setup.md") // "./guide/setup.md"
+ * normalizeRelativePath("/docs/guide/setup.md") // "./guide/setup.md"
  */
 export function normalizeRelativePath(filePath: string) {
-  return filePath.replace(/^\/?content\/docs\//, "./");
+  return filePath
+    .replace(/\\/g, "/")
+    .replace(/^.*\/docs\//, "./")
+    .replace(/^docs\//, "./");
 }
 
 /**
