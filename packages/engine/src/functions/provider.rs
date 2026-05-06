@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::cel::CelFunctionProvider;
 
-/// Engine2-owned runtime function provider trait.
+/// Engine-owned runtime function provider trait.
 pub(crate) trait FunctionProvider: Send {
     fn uuid_v7(&mut self) -> String;
     fn timestamp(&mut self) -> String;
@@ -38,7 +38,7 @@ impl<P> SharedFunctionProvider<P> {
         let guard = self
             .inner
             .lock()
-            .expect("engine2 function provider mutex poisoned");
+            .expect("engine function provider mutex poisoned");
         f(&guard)
     }
 
@@ -46,7 +46,7 @@ impl<P> SharedFunctionProvider<P> {
         let mut guard = self
             .inner
             .lock()
-            .expect("engine2 function provider mutex poisoned");
+            .expect("engine function provider mutex poisoned");
         f(&mut guard)
     }
 }
@@ -115,7 +115,7 @@ where
     }
 }
 
-/// System-backed engine2 function provider.
+/// System-backed engine function provider.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct SystemFunctionProvider;
 

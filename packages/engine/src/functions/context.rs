@@ -47,7 +47,7 @@ impl FunctionContext {
         })
     }
 
-    /// Returns the engine2-owned provider used by SQL and transaction staging.
+    /// Returns the engine-owned provider used by SQL and transaction staging.
     pub(crate) fn provider(&self) -> FunctionProviderHandle {
         self.functions.clone()
     }
@@ -87,7 +87,7 @@ mod tests {
     use crate::backend::testing::UnitTestBackend;
     use crate::functions::state::{DETERMINISTIC_MODE_KEY, DETERMINISTIC_SEQUENCE_KEY};
     use crate::functions::{state::load_sequence, DeterministicSequence};
-    use crate::live_state::{LiveStateContext, LiveStateRow};
+    use crate::live_state::LiveStateContext;
     use crate::storage::StorageContext;
     use crate::GLOBAL_VERSION_ID;
 
@@ -234,6 +234,7 @@ mod tests {
             )
             .await
             .expect("sequence should stage");
+        json_writer.flush_into(&mut writes);
         writes
             .apply(&mut tx.as_mut())
             .await
@@ -294,28 +295,31 @@ mod tests {
             "value": value,
         }))
         .expect("snapshot should serialize");
-        let row = LiveStateRow {
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
+        let row = crate::untracked_state::UntrackedStateRow {
             entity_id: crate::entity_identity::EntityIdentity::single(key),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
-            snapshot_content: Some(snapshot_content),
-            metadata: None,
+            snapshot_ref: Some(
+                json_writer
+                    .prepare_json(crate::json_store::NormalizedJson::from_arc_unchecked(
+                        Arc::from(snapshot_content.as_str()),
+                    ))
+                    .expect("snapshot should stage"),
+            ),
+            metadata_ref: None,
             schema_version: "1".to_string(),
             created_at: "1970-01-01T00:00:00.000Z".to_string(),
             updated_at: "1970-01-01T00:00:00.000Z".to_string(),
             global: true,
-            change_id: None,
-            commit_id: None,
-            untracked: true,
             version_id: GLOBAL_VERSION_ID.to_string(),
         };
-        let mut writes = StorageWriteSet::new();
-        let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
+        json_writer.flush_into(&mut writes);
         {
             let mut writer = live_state.writer(tx.as_mut());
             writer
-                .stage_rows(&mut writes, &mut json_writer, &[row])
-                .await
+                .stage_untracked_rows(&mut writes, std::iter::once(row.as_ref()))
                 .expect("test key-value should stage");
         }
         writes

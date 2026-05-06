@@ -1,69 +1,284 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
 
+use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionProvider, FunctionProviderHandle};
+use crate::json_store::{JsonStoreContext, JsonStoreWriter};
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
-use crate::live_state::{LiveStateRow, LiveStateRowIdentity, LiveStateScanRequest};
+use crate::live_state::{LiveStateRowIdentity, LiveStateScanRequest, MaterializedLiveStateRow};
+use crate::transaction::normalization::SchemaPlanId;
+#[cfg(test)]
+use crate::transaction::types::{stage_json_from_value, TransactionJson};
 use crate::transaction::types::{
-    LogicalPrimaryKey, StageAdoptedChange, StageFileData, StageRow, StageRowOrigin, StageWrite,
-    StageWriteMode, StageWriteOperation, StageWriteOutcome,
+    LogicalPrimaryKey, PreparedTransactionWrite, TransactionFileData, TransactionWriteMode,
+    TransactionWriteOperation, TransactionWriteOrigin, TransactionWriteOutcome,
 };
-use crate::transaction::types::{StagedAdoptedStateRow, StagedCommitMembers, StagedStateRow};
+use crate::transaction::types::{PreparedAdoptedStateRow, PreparedStateRow, StagedCommitMembers};
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
-/// Transaction-local writes decoded by DataFusion provider hooks.
+/// Transaction-local write buffer after transaction-boundary preparation.
 ///
-/// This is the engine2 seam between SQL execution and transaction ownership:
-/// write frontends stage decoded writes here, the transaction normalizes them into
-/// stable `StagedStateRow`s, reads build a `StagedStateRowOverlay` from those rows,
-/// and commit later drains the same rows.
-pub(crate) struct TransactionStagedWrites {
+/// This is the engine seam between SQL execution and transaction ownership:
+/// write frontends pass decoded `TransactionWriteRow`s to `Transaction`, the
+/// transaction prepares them into stable `PreparedStateRow`s, reads build a
+/// `PreparedStateRowOverlay` from those rows, and commit drains the same rows.
+pub(crate) struct TransactionWriteBuffer {
     functions: FunctionProviderHandle,
-    rows: Mutex<BTreeMap<StagedStateRowIdentity, StagedStateRow>>,
-    adopted_rows: Mutex<BTreeMap<StagedStateRowIdentity, StagedAdoptedStateRow>>,
-    insert_identities: Mutex<BTreeMap<LiveStateRowIdentity, Option<StageRowOrigin>>>,
+    rows: Mutex<Vec<Option<PreparedStateRow>>>,
+    adopted_rows: Mutex<Vec<Option<PreparedAdoptedStateRow>>>,
+    by_identity: Mutex<HashMap<PreparedStateRowIdentity, RowSlot>>,
+    insert_identities: Mutex<BTreeMap<LiveStateRowIdentity, Option<TransactionWriteOrigin>>>,
     commit_members_by_version: Mutex<BTreeMap<String, StagedCommitMembers>>,
     extra_commit_parents_by_version: Mutex<BTreeMap<String, Vec<String>>>,
-    file_data_writes: Mutex<Vec<StageFileData>>,
+    file_data_writes: Mutex<Vec<TransactionFileData>>,
+    json_writer: Mutex<Option<JsonStoreWriter>>,
 }
 
-/// Drained transaction-local writes ready for commit.
-pub(crate) struct StagedWriteSet {
-    pub(crate) state_rows: Vec<StagedStateRow>,
-    pub(crate) adopted_rows: Vec<StagedAdoptedStateRow>,
-    pub(crate) insert_identities: BTreeMap<LiveStateRowIdentity, Option<StageRowOrigin>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowSlot {
+    State(usize),
+    Adopted(usize),
+}
+
+/// Drained prepared transaction writes ready for commit.
+pub(crate) struct PreparedWriteSet {
+    pub(crate) state_rows: Vec<PreparedStateRow>,
+    pub(crate) adopted_rows: Vec<PreparedAdoptedStateRow>,
+    pub(crate) insert_identities: BTreeMap<LiveStateRowIdentity, Option<TransactionWriteOrigin>>,
     pub(crate) commit_members_by_version: BTreeMap<String, StagedCommitMembers>,
     pub(crate) extra_commit_parents_by_version: BTreeMap<String, Vec<String>>,
-    pub(crate) file_data_writes: Vec<StageFileData>,
+    pub(crate) file_data_writes: Vec<TransactionFileData>,
+    pub(crate) json_writer: JsonStoreWriter,
 }
 
-impl StagedWriteSet {
-    pub(crate) fn state_rows_for_validation(&self) -> Vec<StagedStateRow> {
-        self.state_rows
-            .iter()
-            .cloned()
-            .chain(self.adopted_rows.iter().map(StagedStateRow::from))
-            .collect()
+pub(crate) struct PreparedWriteValidationSet<'a> {
+    rows: Vec<PreparedValidationRow<'a>>,
+    insert_identities: Vec<(&'a LiveStateRowIdentity, Option<&'a TransactionWriteOrigin>)>,
+}
+
+pub(crate) struct PreparedWriteValidationIndex<'a> {
+    rows_by_schema_scope: BTreeMap<String, Vec<PreparedValidationRow<'a>>>,
+    insert_identities_by_schema_scope:
+        BTreeMap<String, Vec<(&'a LiveStateRowIdentity, Option<&'a TransactionWriteOrigin>)>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum PreparedValidationRow<'a> {
+    State(&'a PreparedStateRow),
+    Adopted(&'a PreparedAdoptedStateRow),
+}
+
+impl<'a> PreparedValidationRow<'a> {
+    pub(crate) fn entity_id(&self) -> &EntityIdentity {
+        match self {
+            Self::State(row) => &row.entity_id,
+            Self::Adopted(row) => &row.entity_id,
+        }
+    }
+
+    pub(crate) fn schema_plan_id(&self) -> SchemaPlanId {
+        match self {
+            Self::State(row) => row.schema_plan_id,
+            Self::Adopted(row) => row.schema_plan_id,
+        }
+    }
+
+    pub(crate) fn schema_key(&self) -> &str {
+        match self {
+            Self::State(row) => &row.schema_key,
+            Self::Adopted(row) => &row.schema_key,
+        }
+    }
+
+    pub(crate) fn file_id(&self) -> &Option<String> {
+        match self {
+            Self::State(row) => &row.file_id,
+            Self::Adopted(row) => &row.file_id,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_content(&self) -> Option<&str> {
+        match self {
+            Self::State(row) => row
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref()),
+            Self::Adopted(row) => row
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized.as_ref()),
+        }
+    }
+
+    pub(crate) fn snapshot_json(self) -> Option<&'a serde_json::Value> {
+        match self {
+            Self::State(row) => row
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.value.as_ref()),
+            Self::Adopted(row) => row
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.value.as_ref()),
+        }
+    }
+
+    pub(crate) fn metadata_json(self) -> Option<&'a serde_json::Value> {
+        match self {
+            Self::State(row) => row
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.value.as_ref()),
+            Self::Adopted(row) => row
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.value.as_ref()),
+        }
+    }
+
+    pub(crate) fn schema_version(&self) -> &str {
+        match self {
+            Self::State(row) => &row.schema_version,
+            Self::Adopted(row) => &row.schema_version,
+        }
+    }
+
+    pub(crate) fn untracked(&self) -> bool {
+        match self {
+            Self::State(row) => row.untracked,
+            Self::Adopted(_) => false,
+        }
+    }
+
+    pub(crate) fn version_id(&self) -> &str {
+        match self {
+            Self::State(row) => &row.version_id,
+            Self::Adopted(row) => &row.version_id,
+        }
     }
 }
 
-impl TransactionStagedWrites {
+impl<'a> PreparedWriteValidationIndex<'a> {
+    pub(crate) fn schema_scope_version_ids(&self) -> impl Iterator<Item = &str> {
+        self.rows_by_schema_scope.keys().map(String::as_str)
+    }
+
+    pub(crate) fn validation_set_for_schema_scope(
+        &self,
+        schema_scope_version_id: &str,
+    ) -> PreparedWriteValidationSet<'a> {
+        PreparedWriteValidationSet {
+            rows: self
+                .rows_by_schema_scope
+                .get(schema_scope_version_id)
+                .cloned()
+                .unwrap_or_default(),
+            insert_identities: self
+                .insert_identities_by_schema_scope
+                .get(schema_scope_version_id)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+}
+
+impl<'a> PreparedWriteValidationSet<'a> {
+    pub(crate) fn rows(&self) -> impl Iterator<Item = PreparedValidationRow<'a>> + '_ {
+        self.rows.iter().copied()
+    }
+
+    pub(crate) fn insert_identities(
+        &self,
+    ) -> impl Iterator<Item = (&LiveStateRowIdentity, Option<&TransactionWriteOrigin>)> {
+        self.insert_identities
+            .iter()
+            .map(|(identity, origin)| (*identity, *origin))
+    }
+}
+
+impl PreparedWriteSet {
+    #[cfg(test)]
+    pub(crate) fn validation_rows(&self) -> impl Iterator<Item = PreparedValidationRow<'_>> + '_ {
+        self.state_rows
+            .iter()
+            .map(PreparedValidationRow::State)
+            .chain(self.adopted_rows.iter().map(PreparedValidationRow::Adopted))
+    }
+
+    pub(crate) fn validation_index(&self) -> PreparedWriteValidationIndex<'_> {
+        let mut rows_by_schema_scope = BTreeMap::<String, Vec<PreparedValidationRow<'_>>>::new();
+        for row in &self.state_rows {
+            rows_by_schema_scope
+                .entry(row.schema_scope_version_id().to_string())
+                .or_default()
+                .push(PreparedValidationRow::State(row));
+        }
+        for row in &self.adopted_rows {
+            rows_by_schema_scope
+                .entry(row.schema_scope_version_id().to_string())
+                .or_default()
+                .push(PreparedValidationRow::Adopted(row));
+        }
+
+        let mut insert_identities_by_schema_scope =
+            BTreeMap::<String, Vec<(&LiveStateRowIdentity, Option<&TransactionWriteOrigin>)>>::new(
+            );
+        for (identity, origin) in &self.insert_identities {
+            insert_identities_by_schema_scope
+                .entry(staged_identity_schema_scope(identity).to_string())
+                .or_default()
+                .push((identity, origin.as_ref()));
+        }
+
+        PreparedWriteValidationIndex {
+            rows_by_schema_scope,
+            insert_identities_by_schema_scope,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validation_set_for_tests(&self) -> PreparedWriteValidationSet<'_> {
+        let rows = self.validation_rows().collect();
+        let insert_identities = self
+            .insert_identities
+            .iter()
+            .map(|(identity, origin)| (identity, origin.as_ref()))
+            .collect();
+        PreparedWriteValidationSet {
+            rows,
+            insert_identities,
+        }
+    }
+}
+
+fn staged_identity_schema_scope(identity: &LiveStateRowIdentity) -> &str {
+    if identity.version_id == GLOBAL_VERSION_ID {
+        GLOBAL_VERSION_ID
+    } else {
+        identity.version_id.as_str()
+    }
+}
+
+impl TransactionWriteBuffer {
     pub(crate) fn new(functions: FunctionProviderHandle) -> Self {
         Self {
             functions,
-            rows: Mutex::new(BTreeMap::new()),
-            adopted_rows: Mutex::new(BTreeMap::new()),
+            rows: Mutex::new(Vec::new()),
+            adopted_rows: Mutex::new(Vec::new()),
+            by_identity: Mutex::new(HashMap::new()),
             insert_identities: Mutex::new(BTreeMap::new()),
             commit_members_by_version: Mutex::new(BTreeMap::new()),
             extra_commit_parents_by_version: Mutex::new(BTreeMap::new()),
             file_data_writes: Mutex::new(Vec::new()),
+            json_writer: Mutex::new(Some(JsonStoreContext::new().writer())),
         }
     }
 
     /// Drains staged writes for commit.
-    pub(crate) fn drain(&self) -> Result<StagedWriteSet, LixError> {
+    pub(crate) fn drain(&self) -> Result<PreparedWriteSet, LixError> {
         let mut rows_guard = self.rows.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -74,6 +289,12 @@ impl TransactionStagedWrites {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "failed to acquire transaction staged adopted writes lock",
+            )
+        })?;
+        let mut by_identity_guard = self.by_identity.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged identity index lock",
             )
         })?;
         let mut file_data_guard = self.file_data_writes.lock().map_err(|_| {
@@ -101,16 +322,35 @@ impl TransactionStagedWrites {
                     "failed to acquire transaction staged extra commit parents lock",
                 )
             })?;
-        Ok(StagedWriteSet {
-            state_rows: std::mem::take(&mut *rows_guard).into_values().collect(),
+        let mut json_writer_guard = self.json_writer.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged JSON writer lock",
+            )
+        })?;
+        let json_writer = json_writer_guard.take().ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "transaction staged JSON writer has already been drained",
+            )
+        })?;
+        let result = Ok(PreparedWriteSet {
+            state_rows: std::mem::take(&mut *rows_guard)
+                .into_iter()
+                .flatten()
+                .collect(),
             adopted_rows: std::mem::take(&mut *adopted_rows_guard)
-                .into_values()
+                .into_iter()
+                .flatten()
                 .collect(),
             insert_identities: std::mem::take(&mut *insert_identities_guard),
             commit_members_by_version: std::mem::take(&mut *commit_members_guard),
             extra_commit_parents_by_version: std::mem::take(&mut *extra_parents_guard),
             file_data_writes: std::mem::take(&mut *file_data_guard),
-        })
+            json_writer,
+        });
+        by_identity_guard.clear();
+        result
     }
 
     /// Records an additional parent for the commit generated for `version_id`.
@@ -174,41 +414,59 @@ impl TransactionStagedWrites {
         Ok(members.commit_id.clone())
     }
 
-    /// Builds the transaction-local read overlay from currently staged writes.
-    pub(crate) fn staging_overlay(&self) -> Result<StagedStateRowOverlay, LixError> {
-        let guard = self.rows.lock().map_err(|_| {
+    pub(crate) fn with_json_writer<R>(
+        &self,
+        f: impl FnOnce(&mut JsonStoreWriter) -> Result<R, LixError>,
+    ) -> Result<R, LixError> {
+        let mut json_writer_guard = self.json_writer.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "failed to acquire transaction staged writes lock",
+                "failed to acquire transaction staged JSON writer lock",
             )
         })?;
-        let adopted_guard = self.adopted_rows.lock().map_err(|_| {
+        let json_writer = json_writer_guard.as_mut().ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "failed to acquire transaction staged adopted writes lock",
+                "cannot prepare JSON after transaction staged JSON writer was drained",
             )
         })?;
-        Ok(StagedStateRowOverlay::new(
-            guard.clone(),
-            adopted_guard.clone(),
-        ))
+        f(json_writer)
     }
 
-    /// Stages one decoded write batch into this transaction.
+    /// Builds the transaction-local read overlay from currently staged writes.
+    pub(crate) fn staging_overlay(self: &Arc<Self>) -> Result<PreparedStateRowOverlay, LixError> {
+        let by_identity_guard = self.by_identity.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged identity index lock",
+            )
+        })?;
+        let slots = by_identity_guard
+            .iter()
+            .map(|(identity, slot)| (identity.clone(), *slot))
+            .collect();
+        Ok(PreparedStateRowOverlay {
+            staged_writes: Arc::clone(self),
+            slots,
+        })
+    }
+
+    /// Stages one prepared write batch into this transaction.
     ///
-    /// This is the single hydration boundary for engine2 writes:
-    /// frontends hand us `StageRow`s, and this method assigns timestamps,
-    /// change ids, commit ids, and commit membership before commit routing ever
-    /// sees the rows.
-    pub(crate) fn stage_write(&self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
+    /// Frontends hand raw `TransactionWriteRow`s to `Transaction`; normalization prepares
+    /// stable `PreparedStateRow`s before this method indexes them for transaction-
+    /// local reads and commit routing.
+    pub(crate) fn stage_write(
+        &self,
+        write: PreparedTransactionWrite,
+    ) -> Result<TransactionWriteOutcome, LixError> {
         let (mode, count) = match &write {
-            StageWrite::Rows { mode, rows } => (Some(*mode), rows.len() as u64),
-            StageWrite::RowsWithFileData { mode, count, .. } => (Some(*mode), *count),
-            StageWrite::AdoptedChanges { changes } => (None, changes.len() as u64),
+            PreparedTransactionWrite::Rows { mode, rows } => (Some(*mode), rows.len() as u64),
+            PreparedTransactionWrite::RowsWithFileData { mode, count, .. } => (Some(*mode), *count),
+            PreparedTransactionWrite::AdoptedChanges { rows } => (None, rows.len() as u64),
         };
         let mut functions = self.functions.clone();
-        let (rows, adopted_rows, file_data_writes) =
-            self.state_rows_from_stage_write(write, &mut functions)?;
+        let (rows, adopted_rows, file_data_writes) = self.state_rows_from_stage_write(write)?;
         for row in &rows {
             validate_commit_membership_support(row)?;
         }
@@ -228,6 +486,12 @@ impl TransactionStagedWrites {
                 "failed to acquire transaction staged adopted writes lock",
             )
         })?;
+        let mut by_identity_guard = self.by_identity.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged identity index lock",
+            )
+        })?;
         let mut commit_members_guard = self.commit_members_by_version.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -241,41 +505,60 @@ impl TransactionStagedWrites {
             )
         })?;
         for mut row in rows {
-            let identity = StagedStateRowIdentity::from(&row);
-            if mode == Some(StageWriteMode::Insert)
-                && (guard.contains_key(&identity)
-                    || guard.contains_key(&identity.opposite_untracked())
-                    || adopted_guard.contains_key(&identity))
+            let identity = PreparedStateRowIdentity::from(&row);
+            if mode == Some(TransactionWriteMode::Insert)
+                && (by_identity_guard.contains_key(&identity)
+                    || by_identity_guard.contains_key(&identity.opposite_untracked()))
             {
                 return Err(duplicate_insert_identity_error(&row));
             }
-            if adopted_guard.contains_key(&identity) {
+            if matches!(by_identity_guard.get(&identity), Some(RowSlot::Adopted(_))) {
                 return Err(conflicting_adopted_identity_error(&row));
             }
-            if let Some(previous) = guard.remove(&identity.opposite_untracked()) {
-                remove_row_from_commit_members(&mut commit_members_guard, &previous);
+            if let Some(RowSlot::State(index)) =
+                by_identity_guard.remove(&identity.opposite_untracked())
+            {
+                if let Some(previous) = guard.get_mut(index).and_then(Option::take) {
+                    remove_row_from_commit_members(&mut commit_members_guard, &previous);
+                }
             }
-            if let Some(previous) = guard.remove(&identity) {
-                remove_row_from_commit_members(&mut commit_members_guard, &previous);
+            let existing_slot = by_identity_guard.remove(&identity);
+            if let Some(RowSlot::State(index)) = existing_slot {
+                if let Some(previous) = guard.get_mut(index).and_then(Option::take) {
+                    remove_row_from_commit_members(&mut commit_members_guard, &previous);
+                }
             }
             add_row_to_commit_members(&mut commit_members_guard, &mut row, &mut functions);
-            let identity = StagedStateRowIdentity::from(&row);
-            if mode == Some(StageWriteMode::Insert) {
+            let identity = PreparedStateRowIdentity::from(&row);
+            if mode == Some(TransactionWriteMode::Insert) {
                 insert_identities_guard.insert(
                     live_state_identity_from_staged_row(&row),
                     row.origin.clone(),
                 );
             }
-            guard.insert(identity, row);
+            let slot = match existing_slot {
+                Some(RowSlot::State(index)) => {
+                    guard[index] = Some(row);
+                    RowSlot::State(index)
+                }
+                _ => {
+                    let index = guard.len();
+                    guard.push(Some(row));
+                    RowSlot::State(index)
+                }
+            };
+            by_identity_guard.insert(identity, slot);
         }
         for mut row in adopted_rows {
-            let identity = StagedStateRowIdentity::from(&row);
-            if guard.contains_key(&identity) || adopted_guard.contains_key(&identity) {
+            let identity = PreparedStateRowIdentity::from(&row);
+            if by_identity_guard.contains_key(&identity) {
                 return Err(conflicting_adopted_projection_error(&row));
             }
             add_adopted_row_to_commit_members(&mut commit_members_guard, &mut row, &mut functions);
-            let identity = StagedStateRowIdentity::from(&row);
-            adopted_guard.insert(identity, row);
+            let identity = PreparedStateRowIdentity::from(&row);
+            let index = adopted_guard.len();
+            adopted_guard.push(Some(row));
+            by_identity_guard.insert(identity, RowSlot::Adopted(index));
         }
         if !file_data_writes.is_empty() {
             self.file_data_writes
@@ -288,18 +571,17 @@ impl TransactionStagedWrites {
                 })?
                 .extend(file_data_writes);
         }
-        Ok(StageWriteOutcome { count })
+        Ok(TransactionWriteOutcome { count })
     }
 
     fn state_rows_from_stage_write(
         &self,
-        write: StageWrite,
-        functions: &mut dyn FunctionProvider,
+        write: PreparedTransactionWrite,
     ) -> Result<
         (
-            Vec<StagedStateRow>,
-            Vec<StagedAdoptedStateRow>,
-            Vec<StageFileData>,
+            Vec<PreparedStateRow>,
+            Vec<PreparedAdoptedStateRow>,
+            Vec<TransactionFileData>,
         ),
         LixError,
     > {
@@ -307,136 +589,170 @@ impl TransactionStagedWrites {
         let mut adopted_rows = Vec::new();
         let mut file_data_writes = Vec::new();
         match write {
-            StageWrite::Rows { rows, .. } => {
-                self.push_state_rows(&mut state_rows, rows, functions)?;
+            PreparedTransactionWrite::Rows { rows, .. } => {
+                state_rows.extend(rows);
             }
-            StageWrite::RowsWithFileData {
+            PreparedTransactionWrite::RowsWithFileData {
                 rows, file_data, ..
             } => {
-                self.push_state_rows(&mut state_rows, rows, functions)?;
+                state_rows.extend(rows);
                 file_data_writes.extend(file_data);
             }
-            StageWrite::AdoptedChanges { changes } => {
-                self.push_adopted_rows(&mut adopted_rows, changes)?;
+            PreparedTransactionWrite::AdoptedChanges { rows } => {
+                adopted_rows.extend(rows);
             }
         }
         Ok((state_rows, adopted_rows, file_data_writes))
     }
-
-    fn push_state_rows(
-        &self,
-        state_rows: &mut Vec<StagedStateRow>,
-        rows: Vec<StageRow>,
-        functions: &mut dyn FunctionProvider,
-    ) -> Result<(), LixError> {
-        state_rows.reserve(rows.len());
-        for row in rows {
-            state_rows.push(hydrate_state_write_row(row, functions)?);
-        }
-        Ok(())
-    }
-
-    fn push_adopted_rows(
-        &self,
-        adopted_rows: &mut Vec<StagedAdoptedStateRow>,
-        changes: Vec<StageAdoptedChange>,
-    ) -> Result<(), LixError> {
-        adopted_rows.reserve(changes.len());
-        for change in changes {
-            adopted_rows.push(hydrate_adopted_state_row(change)?);
-        }
-        Ok(())
-    }
 }
 
 /// Read overlay derived from staged transaction writes.
-pub(crate) struct StagedStateRowOverlay {
-    rows: BTreeMap<StagedStateRowIdentity, StagedStateRow>,
-    adopted_rows: BTreeMap<StagedStateRowIdentity, StagedAdoptedStateRow>,
+pub(crate) struct PreparedStateRowOverlay {
+    staged_writes: Arc<TransactionWriteBuffer>,
+    slots: BTreeMap<PreparedStateRowIdentity, RowSlot>,
 }
 
-impl StagedStateRowOverlay {
-    fn new(
-        rows: BTreeMap<StagedStateRowIdentity, StagedStateRow>,
-        adopted_rows: BTreeMap<StagedStateRowIdentity, StagedAdoptedStateRow>,
-    ) -> Self {
-        Self { rows, adopted_rows }
-    }
+pub(crate) struct StagedScanParts {
+    pub(crate) rows: Vec<MaterializedLiveStateRow>,
+    pub(crate) hidden_identities: BTreeSet<PreparedStateRowIdentity>,
+}
 
+impl PreparedStateRowOverlay {
     /// Returns staged rows visible for a scan request.
-    pub(crate) fn scan(&self, request: &LiveStateScanRequest) -> Vec<LiveStateRow> {
-        self.rows
-            .values()
-            .filter(|row| staged_row_matches_scan(row, request))
-            .map(LiveStateRow::from)
-            .chain(
-                self.adopted_rows
-                    .values()
-                    .filter(|row| adopted_row_matches_scan(row, request))
-                    .map(LiveStateRow::from),
-            )
-            .collect()
-    }
-
-    /// Returns staged identities that should suppress base live-state rows.
-    ///
-    /// Tombstones also suppress base live-state rows, even when the caller is not
-    /// asking to see tombstone rows.
-    pub(crate) fn identities_matching_scan(
+    #[cfg(test)]
+    pub(crate) fn scan(
         &self,
         request: &LiveStateScanRequest,
-    ) -> BTreeSet<StagedStateRowIdentity> {
-        self.rows
-            .values()
-            .filter(|row| staged_row_identity_matches_scan(row, request))
-            .map(StagedStateRowIdentity::from)
-            .chain(
-                self.adopted_rows
-                    .values()
-                    .filter(|row| adopted_row_identity_matches_scan(row, request))
-                    .map(StagedStateRowIdentity::from),
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        Ok(self.scan_parts(request)?.rows)
+    }
+
+    /// Returns staged rows and base-row identities hidden by staged rows in one pass.
+    ///
+    /// Tombstones hide base rows even when the request does not include
+    /// tombstone rows in the visible result set.
+    pub(crate) fn scan_parts(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<StagedScanParts, LixError> {
+        let rows_guard = self.staged_writes.rows.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged writes lock",
             )
-            .collect()
+        })?;
+        let adopted_guard = self.staged_writes.adopted_rows.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged adopted writes lock",
+            )
+        })?;
+
+        let mut rows = Vec::new();
+        let mut hidden_identities = BTreeSet::new();
+        for (identity, slot) in &self.slots {
+            match *slot {
+                RowSlot::State(index) => {
+                    let Some(row) = rows_guard.get(index).and_then(Option::as_ref) else {
+                        continue;
+                    };
+                    if !staged_row_identity_matches_scan(row, request) {
+                        continue;
+                    }
+                    hidden_identities.insert(identity.clone());
+                    if row.snapshot.is_some() || request.filter.include_tombstones {
+                        rows.push(MaterializedLiveStateRow::from(row));
+                    }
+                }
+                RowSlot::Adopted(index) => {
+                    let Some(row) = adopted_guard.get(index).and_then(Option::as_ref) else {
+                        continue;
+                    };
+                    if !adopted_row_identity_matches_scan(row, request) {
+                        continue;
+                    }
+                    hidden_identities.insert(identity.clone());
+                    if row.snapshot.is_some() || request.filter.include_tombstones {
+                        rows.push(MaterializedLiveStateRow::from(row));
+                    }
+                }
+            }
+        }
+        Ok(StagedScanParts {
+            rows,
+            hidden_identities,
+        })
     }
 
     /// Returns a staged exact-row answer, if this transaction has one.
     #[cfg(test)]
     pub(crate) fn load_exact(&self, request: &LiveStateRowRequest) -> Option<StagedExactRow> {
-        let untracked_identity = StagedStateRowIdentity::from_exact_request(request, true)?;
-        if let Some(row) = self.rows.get(&untracked_identity) {
-            return Some(if row.snapshot_content.is_none() {
+        let untracked_identity = PreparedStateRowIdentity::from_exact_request(request, true)?;
+        if let Some(row) = self.load_state_slot(&untracked_identity) {
+            return Some(if row.snapshot.is_none() {
                 StagedExactRow::Tombstone
             } else {
-                StagedExactRow::Row(LiveStateRow::from(row))
+                StagedExactRow::Row(MaterializedLiveStateRow::from(&row))
             });
         }
 
-        let identity = StagedStateRowIdentity::from_exact_request(request, false)?;
-        if let Some(row) = self.rows.get(&identity) {
-            return Some(if row.snapshot_content.is_none() {
+        let identity = PreparedStateRowIdentity::from_exact_request(request, false)?;
+        if let Some(row) = self.load_state_slot(&identity) {
+            return Some(if row.snapshot.is_none() {
                 StagedExactRow::Tombstone
             } else {
-                StagedExactRow::Row(LiveStateRow::from(row))
+                StagedExactRow::Row(MaterializedLiveStateRow::from(&row))
             });
         }
-        self.adopted_rows.get(&identity).map(|row| {
-            if row.snapshot_content.is_none() {
+        self.load_adopted_slot(&identity).map(|row| {
+            if row.snapshot.is_none() {
                 StagedExactRow::Tombstone
             } else {
-                StagedExactRow::Row(LiveStateRow::from(row))
+                StagedExactRow::Row(MaterializedLiveStateRow::from(&row))
             }
         })
+    }
+
+    #[cfg(test)]
+    fn load_state_slot(&self, identity: &PreparedStateRowIdentity) -> Option<PreparedStateRow> {
+        let Some(RowSlot::State(index)) = self.slots.get(identity).copied() else {
+            return None;
+        };
+        self.staged_writes
+            .rows
+            .lock()
+            .ok()?
+            .get(index)?
+            .as_ref()
+            .cloned()
+    }
+
+    #[cfg(test)]
+    fn load_adopted_slot(
+        &self,
+        identity: &PreparedStateRowIdentity,
+    ) -> Option<PreparedAdoptedStateRow> {
+        let Some(RowSlot::Adopted(index)) = self.slots.get(identity).copied() else {
+            return None;
+        };
+        self.staged_writes
+            .adopted_rows
+            .lock()
+            .ok()?
+            .get(index)?
+            .as_ref()
+            .cloned()
     }
 }
 
 #[cfg(test)]
 pub(crate) enum StagedExactRow {
-    Row(LiveStateRow),
+    Row(MaterializedLiveStateRow),
     Tombstone,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct StagedStateRowIdentity {
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct PreparedStateRowIdentity {
     untracked: bool,
     schema_key: String,
     entity_id: crate::entity_identity::EntityIdentity,
@@ -444,8 +760,8 @@ pub(crate) struct StagedStateRowIdentity {
     version_id: String,
 }
 
-impl StagedStateRowIdentity {
-    fn from_staged_row(row: &StagedStateRow) -> Self {
+impl PreparedStateRowIdentity {
+    fn from_staged_row(row: &PreparedStateRow) -> Self {
         Self {
             untracked: row.untracked,
             schema_key: row.schema_key.clone(),
@@ -483,14 +799,14 @@ impl StagedStateRowIdentity {
     }
 }
 
-impl From<&StagedStateRow> for StagedStateRowIdentity {
-    fn from(row: &StagedStateRow) -> Self {
+impl From<&PreparedStateRow> for PreparedStateRowIdentity {
+    fn from(row: &PreparedStateRow) -> Self {
         Self::from_staged_row(row)
     }
 }
 
-impl From<&StagedAdoptedStateRow> for StagedStateRowIdentity {
-    fn from(row: &StagedAdoptedStateRow) -> Self {
+impl From<&PreparedAdoptedStateRow> for PreparedStateRowIdentity {
+    fn from(row: &PreparedAdoptedStateRow) -> Self {
         Self {
             untracked: false,
             schema_key: row.schema_key.clone(),
@@ -501,8 +817,8 @@ impl From<&StagedAdoptedStateRow> for StagedStateRowIdentity {
     }
 }
 
-impl From<&LiveStateRow> for StagedStateRowIdentity {
-    fn from(row: &LiveStateRow) -> Self {
+impl From<&MaterializedLiveStateRow> for PreparedStateRowIdentity {
+    fn from(row: &MaterializedLiveStateRow) -> Self {
         Self {
             untracked: row.untracked,
             schema_key: row.schema_key.clone(),
@@ -513,92 +829,33 @@ impl From<&LiveStateRow> for StagedStateRowIdentity {
     }
 }
 
-fn hydrate_state_write_row(
-    row: StageRow,
-    functions: &mut dyn FunctionProvider,
-) -> Result<StagedStateRow, LixError> {
-    let updated_at = row.updated_at.unwrap_or_else(|| functions.timestamp());
-    Ok(StagedStateRow {
-        entity_id: row.entity_id.ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "normalized staged row is missing entity_id",
-            )
-        })?,
-        schema_key: row.schema_key,
-        file_id: row.file_id,
-        snapshot_content: row.snapshot_content,
-        metadata: row.metadata,
-        origin: row.origin,
-        schema_version: row.schema_version,
-        created_at: row.created_at.unwrap_or_else(|| updated_at.clone()),
-        updated_at,
-        global: row.global,
-        change_id: if row.untracked {
-            row.change_id
-        } else {
-            Some(row.change_id.unwrap_or_else(|| functions.uuid_v7()))
-        },
-        commit_id: row.commit_id,
-        untracked: row.untracked,
-        version_id: row.version_id,
-    })
-}
-
-fn hydrate_adopted_state_row(
-    change: StageAdoptedChange,
-) -> Result<StagedAdoptedStateRow, LixError> {
-    if change.change_id != change.projected_row.change_id {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "adopted change '{}' does not match projected row change_id '{}'",
-                change.change_id, change.projected_row.change_id
-            ),
-        ));
-    }
-    let row = change.projected_row;
-    Ok(StagedAdoptedStateRow {
-        entity_id: row.entity_id,
-        schema_key: row.schema_key,
-        file_id: row.file_id,
-        snapshot_content: row.snapshot_content,
-        metadata: row.metadata,
-        schema_version: row.schema_version,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        global: change.version_id == GLOBAL_VERSION_ID,
-        change_id: change.change_id,
-        commit_id: String::new(),
-        version_id: change.version_id,
-    })
-}
-
-fn validate_commit_membership_support(row: &StagedStateRow) -> Result<(), LixError> {
+fn validate_commit_membership_support(row: &PreparedStateRow) -> Result<(), LixError> {
     if row.global && row.version_id != GLOBAL_VERSION_ID {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "engine2 global staged rows must use the global version id",
+            "engine global staged rows must use the global version id",
         ));
     }
     Ok(())
 }
 
-fn validate_adopted_commit_membership_support(row: &StagedAdoptedStateRow) -> Result<(), LixError> {
+fn validate_adopted_commit_membership_support(
+    row: &PreparedAdoptedStateRow,
+) -> Result<(), LixError> {
     if row.global && row.version_id != GLOBAL_VERSION_ID {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "engine2 global adopted rows must use the global version id",
+            "engine global adopted rows must use the global version id",
         ));
     }
     Ok(())
 }
 
-fn reject_duplicate_present_rows_in_batch(rows: &[StagedStateRow]) -> Result<(), LixError> {
-    let mut pending_present_rows = BTreeMap::<StagedStateRowIdentity, &StagedStateRow>::new();
+fn reject_duplicate_present_rows_in_batch(rows: &[PreparedStateRow]) -> Result<(), LixError> {
+    let mut pending_present_rows = BTreeMap::<PreparedStateRowIdentity, &PreparedStateRow>::new();
     for row in rows {
-        let identity = StagedStateRowIdentity::from(row);
-        if row.snapshot_content.is_none() {
+        let identity = PreparedStateRowIdentity::from(row);
+        if row.snapshot.is_none() {
             pending_present_rows.remove(&identity);
             continue;
         }
@@ -609,7 +866,10 @@ fn reject_duplicate_present_rows_in_batch(rows: &[StagedStateRow]) -> Result<(),
     Ok(())
 }
 
-fn duplicate_staged_present_row_error(row: &StagedStateRow, previous: &StagedStateRow) -> LixError {
+fn duplicate_staged_present_row_error(
+    row: &PreparedStateRow,
+    previous: &PreparedStateRow,
+) -> LixError {
     let message = logical_primary_key_violation_message(row.origin.as_ref())
         .unwrap_or_else(|| {
             format!(
@@ -631,7 +891,7 @@ pub(crate) fn duplicate_insert_identity_message(
     schema_version: &str,
     entity_id: &crate::entity_identity::EntityIdentity,
     version_id: Option<&str>,
-    origin: Option<&StageRowOrigin>,
+    origin: Option<&TransactionWriteOrigin>,
 ) -> String {
     if let Some(message) = logical_primary_key_violation_message(origin) {
         return message;
@@ -649,7 +909,7 @@ pub(crate) fn duplicate_insert_identity_message(
     }
 }
 
-fn duplicate_insert_identity_error(row: &StagedStateRow) -> LixError {
+fn duplicate_insert_identity_error(row: &PreparedStateRow) -> LixError {
     let message = duplicate_insert_identity_message(
         &row.schema_key,
         &row.schema_version,
@@ -660,9 +920,11 @@ fn duplicate_insert_identity_error(row: &StagedStateRow) -> LixError {
     LixError::new(LixError::CODE_UNIQUE, message)
 }
 
-fn logical_primary_key_violation_message(origin: Option<&StageRowOrigin>) -> Option<String> {
+fn logical_primary_key_violation_message(
+    origin: Option<&TransactionWriteOrigin>,
+) -> Option<String> {
     let origin = origin?;
-    if origin.operation != StageWriteOperation::Insert {
+    if origin.operation != TransactionWriteOperation::Insert {
         return None;
     }
     let primary_key = origin.primary_key.as_ref()?;
@@ -690,7 +952,7 @@ fn format_logical_primary_key(primary_key: &LogicalPrimaryKey) -> String {
         .join(", ")
 }
 
-fn conflicting_adopted_identity_error(row: &StagedStateRow) -> LixError {
+fn conflicting_adopted_identity_error(row: &PreparedStateRow) -> LixError {
     LixError::new(
         LixError::CODE_UNIQUE,
         format!(
@@ -704,7 +966,7 @@ fn conflicting_adopted_identity_error(row: &StagedStateRow) -> LixError {
     )
 }
 
-fn conflicting_adopted_projection_error(row: &StagedAdoptedStateRow) -> LixError {
+fn conflicting_adopted_projection_error(row: &PreparedAdoptedStateRow) -> LixError {
     LixError::new(
         LixError::CODE_UNIQUE,
         format!(
@@ -718,7 +980,7 @@ fn conflicting_adopted_projection_error(row: &StagedAdoptedStateRow) -> LixError
     )
 }
 
-fn live_state_identity_from_staged_row(row: &StagedStateRow) -> LiveStateRowIdentity {
+fn live_state_identity_from_staged_row(row: &PreparedStateRow) -> LiveStateRowIdentity {
     LiveStateRowIdentity {
         version_id: row.version_id.clone(),
         schema_key: row.schema_key.clone(),
@@ -729,7 +991,7 @@ fn live_state_identity_from_staged_row(row: &StagedStateRow) -> LiveStateRowIden
 
 fn add_row_to_commit_members(
     members_by_version: &mut BTreeMap<String, StagedCommitMembers>,
-    row: &mut StagedStateRow,
+    row: &mut PreparedStateRow,
     functions: &mut dyn FunctionProvider,
 ) {
     if row.untracked {
@@ -755,7 +1017,7 @@ fn add_row_to_commit_members(
 
 fn add_adopted_row_to_commit_members(
     members_by_version: &mut BTreeMap<String, StagedCommitMembers>,
-    row: &mut StagedAdoptedStateRow,
+    row: &mut PreparedAdoptedStateRow,
     functions: &mut dyn FunctionProvider,
 ) {
     let members = members_by_version
@@ -774,7 +1036,7 @@ fn add_adopted_row_to_commit_members(
 
 fn remove_row_from_commit_members(
     members_by_version: &mut BTreeMap<String, StagedCommitMembers>,
-    row: &StagedStateRow,
+    row: &PreparedStateRow,
 ) {
     if row.untracked {
         return;
@@ -791,18 +1053,8 @@ fn remove_row_from_commit_members(
     }
 }
 
-fn staged_row_matches_scan(row: &StagedStateRow, request: &LiveStateScanRequest) -> bool {
-    staged_row_identity_matches_scan(row, request)
-        && (row.snapshot_content.is_some() || request.filter.include_tombstones)
-}
-
-fn adopted_row_matches_scan(row: &StagedAdoptedStateRow, request: &LiveStateScanRequest) -> bool {
-    adopted_row_identity_matches_scan(row, request)
-        && (row.snapshot_content.is_some() || request.filter.include_tombstones)
-}
-
 fn adopted_row_identity_matches_scan(
-    row: &StagedAdoptedStateRow,
+    row: &PreparedAdoptedStateRow,
     request: &LiveStateScanRequest,
 ) -> bool {
     if !request.filter.schema_keys.is_empty()
@@ -822,7 +1074,10 @@ fn adopted_row_identity_matches_scan(
     nullable_key_matches_filters(&row.file_id, &request.filter.file_ids)
 }
 
-fn staged_row_identity_matches_scan(row: &StagedStateRow, request: &LiveStateScanRequest) -> bool {
+fn staged_row_identity_matches_scan(
+    row: &PreparedStateRow,
+    request: &LiveStateScanRequest,
+) -> bool {
     if !request.filter.schema_keys.is_empty()
         && !request.filter.schema_keys.contains(&row.schema_key)
     {
@@ -869,14 +1124,14 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![state_row("sql2-duplicate-key", "first")],
             })
             .expect("initial row should stage");
         staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![state_row("sql2-duplicate-key", "second")],
             })
             .expect("staging rows should succeed");
@@ -907,14 +1162,14 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![state_row("sql2-duplicate-key", "first")],
             })
             .expect("initial row should stage");
         staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![state_row("sql2-duplicate-key", "second")],
             })
             .expect("staging rows should succeed");
@@ -922,7 +1177,9 @@ mod tests {
         let overlay = staged_writes
             .staging_overlay()
             .expect("overlay should build from staged rows");
-        let rows = overlay.scan(&scan_request_for_key("sql2-duplicate-key", false));
+        let rows = overlay
+            .scan(&scan_request_for_key("sql2-duplicate-key", false))
+            .expect("overlay scan should succeed");
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
@@ -936,8 +1193,8 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![
                     state_row("sql2-delete-key", "visible"),
                     tombstone_row("sql2-delete-key"),
@@ -954,9 +1211,12 @@ mod tests {
         assert!(matches!(exact, StagedExactRow::Tombstone));
         assert!(overlay
             .scan(&scan_request_for_key("sql2-delete-key", false))
+            .expect("overlay scan should succeed")
             .is_empty());
 
-        let tombstones = overlay.scan(&scan_request_for_key("sql2-delete-key", true));
+        let tombstones = overlay
+            .scan(&scan_request_for_key("sql2-delete-key", true))
+            .expect("overlay scan should succeed");
         assert_eq!(tombstones.len(), 1);
         assert_eq!(tombstones[0].snapshot_content, None);
     }
@@ -966,8 +1226,8 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![
                     tombstone_row("sql2-resurrect-key"),
                     state_row("sql2-resurrect-key", "visible-again"),
@@ -992,6 +1252,7 @@ mod tests {
         assert_eq!(
             overlay
                 .scan(&scan_request_for_key("sql2-resurrect-key", false))
+                .expect("overlay scan should succeed")
                 .len(),
             1
         );
@@ -1002,8 +1263,8 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![
                     state_row("sql2-key-a", "first"),
                     state_row("sql2-key-b", "only"),
@@ -1011,8 +1272,8 @@ mod tests {
             })
             .expect("initial rows should stage");
         staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![state_row("sql2-key-a", "second")],
             })
             .expect("staging rows should succeed");
@@ -1022,12 +1283,18 @@ mod tests {
         assert_eq!(drained.state_rows.len(), 2);
         assert!(drained.state_rows.iter().any(|row| {
             row.entity_id == crate::entity_identity::EntityIdentity::single("sql2-key-a")
-                && row.snapshot_content.as_deref()
+                && row
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.normalized.as_ref())
                     == Some("{\"key\":\"sql2-key-a\",\"value\":\"second\"}")
         }));
         assert!(drained.state_rows.iter().any(|row| {
             row.entity_id == crate::entity_identity::EntityIdentity::single("sql2-key-b")
-                && row.snapshot_content.as_deref()
+                && row
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.normalized.as_ref())
                     == Some("{\"key\":\"sql2-key-b\",\"value\":\"only\"}")
         }));
     }
@@ -1037,10 +1304,10 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(StageWrite::RowsWithFileData {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::RowsWithFileData {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![state_row("file-readme", "descriptor")],
-                file_data: vec![StageFileData {
+                file_data: vec![TransactionFileData {
                     file_id: "file-readme".to_string(),
                     version_id: "global".to_string(),
                     untracked: true,
@@ -1063,8 +1330,8 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![state_row("tracked-key", "value").with_tracked()],
             })
             .expect("tracked global row should stage");
@@ -1076,7 +1343,7 @@ mod tests {
             .expect("global commit members should exist");
         assert_eq!(
             members.change_ids.iter().cloned().collect::<Vec<_>>(),
-            vec!["test-uuid-1".to_string()]
+            vec!["test-change-id".to_string()]
         );
     }
 
@@ -1085,8 +1352,8 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![state_row("untracked-key", "value")],
             })
             .expect("untracked row should stage");
@@ -1100,16 +1367,16 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![state_row("overwrite-key", "first")
                     .with_tracked()
                     .with_change_id("change-first")],
             })
             .expect("initial tracked row should stage");
         staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![state_row("overwrite-key", "second")
                     .with_tracked()
                     .with_change_id("change-second")],
@@ -1132,8 +1399,8 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![
                     state_row("tracked-to-untracked-key", "tracked")
                         .with_tracked()
@@ -1158,8 +1425,8 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         let error = staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![
                     state_row("duplicate-present-key", "first"),
                     state_row("duplicate-present-key", "second"),
@@ -1179,8 +1446,8 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![state_row("active-version-key", "value")
                     .with_tracked()
                     .with_version("version-a")],
@@ -1194,7 +1461,7 @@ mod tests {
             .expect("active-version commit members should exist");
         assert_eq!(
             members.change_ids.iter().cloned().collect::<Vec<_>>(),
-            vec!["test-uuid-1".to_string()]
+            vec!["test-change-id".to_string()]
         );
     }
 
@@ -1203,8 +1470,8 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         let error = staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![{
                     let mut row = state_row("invalid-global-key", "value");
                     row.version_id = "version-a".to_string();
@@ -1223,16 +1490,16 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![
                     state_row("shared-entity", "other-schema-version").with_schema_version("2")
                 ],
             })
             .expect("initial same-identity row should stage");
         staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![
                     state_row("shared-entity", "base"),
                     state_row("shared-entity", "other-version").with_version("version-b"),
@@ -1246,16 +1513,18 @@ mod tests {
         let overlay = staged_writes
             .staging_overlay()
             .expect("overlay should build from staged rows");
-        let rows = overlay.scan(&LiveStateScanRequest {
-            filter: LiveStateFilter {
-                entity_ids: vec![crate::entity_identity::EntityIdentity::single(
-                    "shared-entity",
-                )],
-                include_tombstones: true,
-                ..LiveStateFilter::default()
-            },
-            ..LiveStateScanRequest::default()
-        });
+        let rows = overlay
+            .scan(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    entity_ids: vec![crate::entity_identity::EntityIdentity::single(
+                        "shared-entity",
+                    )],
+                    include_tombstones: true,
+                    ..LiveStateFilter::default()
+                },
+                ..LiveStateScanRequest::default()
+            })
+            .expect("overlay scan should succeed");
 
         assert_eq!(rows.len(), 4);
         assert!(rows.iter().any(|row| {
@@ -1265,30 +1534,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn staged_writes_use_injected_function_provider_for_row_metadata() {
+    async fn staged_writes_use_injected_function_provider_for_commit_metadata() {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![state_row("sql2-functions-key", "value").with_tracked()],
             })
             .expect("staging rows should succeed");
 
         let drained = staged_writes.drain().expect("drain should succeed");
-        assert_eq!(drained.state_rows.len(), 1);
-        assert_eq!(
-            drained.state_rows[0].change_id.as_deref(),
-            Some("test-uuid-1")
-        );
-        assert_eq!(
-            drained.state_rows[0].created_at.as_str(),
-            "test-timestamp-1"
-        );
-        assert_eq!(
-            drained.state_rows[0].updated_at.as_str(),
-            "test-timestamp-1"
-        );
+        let members = drained
+            .commit_members_by_version
+            .get("global")
+            .expect("global commit members should exist");
+        assert_eq!(members.commit_id, "test-uuid-1");
+        assert_eq!(members.commit_change_id, "test-uuid-2");
+        assert_eq!(members.change_set_id, "test-uuid-3");
+        assert_eq!(members.created_at, "test-timestamp-1");
     }
 
     #[tokio::test]
@@ -1296,8 +1560,8 @@ mod tests {
         let staged_writes = test_staged_writes();
 
         staged_writes
-            .stage_write(StageWrite::Rows {
-                mode: StageWriteMode::Replace,
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
                 rows: vec![state_row("tracked-commit-key", "value").with_tracked()],
             })
             .expect("tracked row should stage");
@@ -1306,7 +1570,7 @@ mod tests {
         assert_eq!(drained.state_rows.len(), 1);
         assert_eq!(
             drained.state_rows[0].commit_id.as_deref(),
-            Some("test-uuid-2")
+            Some("test-uuid-1")
         );
         assert_eq!(
             drained
@@ -1314,15 +1578,14 @@ mod tests {
                 .get("global")
                 .expect("global commit members should exist")
                 .commit_id,
-            "test-uuid-2"
+            "test-uuid-1"
         );
     }
 
-    fn test_staged_writes() -> TransactionStagedWrites {
-        TransactionStagedWrites::new(SharedFunctionProvider::new(Box::new(
-            TestFunctionProvider::default(),
-        )
-            as Box<dyn FunctionProvider + Send>))
+    fn test_staged_writes() -> Arc<TransactionWriteBuffer> {
+        Arc::new(TransactionWriteBuffer::new(SharedFunctionProvider::new(
+            Box::new(TestFunctionProvider::default()) as Box<dyn FunctionProvider + Send>,
+        )))
     }
 
     #[derive(Default)]
@@ -1343,17 +1606,26 @@ mod tests {
         }
     }
 
-    fn state_row(key: &str, value: &str) -> StageRow {
-        StageRow {
-            entity_id: Some(crate::entity_identity::EntityIdentity::single(key)),
+    fn state_row(key: &str, value: &str) -> PreparedStateRow {
+        let mut json_writer = JsonStoreContext::new().writer();
+        let snapshot = stage_json_from_value(
+            &mut json_writer,
+            TransactionJson::from_value_for_test(serde_json::json!({ "key": key, "value": value })),
+            "test staged row snapshot_content",
+        )
+        .expect("test snapshot should prepare");
+        PreparedStateRow {
+            schema_plan_id: SchemaPlanId::for_test(0),
+            facts: crate::transaction::types::PreparedRowFacts::default(),
+            entity_id: crate::entity_identity::EntityIdentity::single(key),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
-            snapshot_content: Some(format!("{{\"key\":\"{key}\",\"value\":\"{value}\"}}")),
+            snapshot: Some(snapshot),
             metadata: None,
             origin: None,
             schema_version: "1".to_string(),
-            created_at: None,
-            updated_at: None,
+            created_at: "test-created-at".to_string(),
+            updated_at: "test-updated-at".to_string(),
             global: true,
             change_id: None,
             commit_id: None,
@@ -1362,11 +1634,10 @@ mod tests {
         }
     }
 
-    fn tombstone_row(key: &str) -> StageRow {
-        StageRow {
-            snapshot_content: None,
-            ..state_row(key, "deleted")
-        }
+    fn tombstone_row(key: &str) -> PreparedStateRow {
+        let mut row = state_row(key, "deleted");
+        row.snapshot = None;
+        row
     }
 
     fn exact_request_for_key(key: &str) -> LiveStateRowRequest {
@@ -1401,7 +1672,7 @@ mod tests {
         fn with_change_id(self, change_id: &str) -> Self;
     }
 
-    impl StateRowTestExt for StageRow {
+    impl StateRowTestExt for PreparedStateRow {
         fn with_schema(mut self, schema_key: &str) -> Self {
             self.schema_key = schema_key.to_string();
             self
@@ -1419,6 +1690,9 @@ mod tests {
 
         fn with_tracked(mut self) -> Self {
             self.untracked = false;
+            if self.change_id.is_none() {
+                self.change_id = Some("test-change-id".to_string());
+            }
             self
         }
 

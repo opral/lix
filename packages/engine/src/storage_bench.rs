@@ -1,28 +1,51 @@
 use crate::binary_cas::{BinaryCasContext, BlobHash, BlobWrite};
 use crate::changelog::{
-    canonicalize_materialized_change, CanonicalChange, ChangelogContext, ChangelogScanRequest,
-    MaterializedCanonicalChange,
+    CanonicalChange, ChangelogContext, ChangelogScanRequest, MaterializedCanonicalChange,
 };
 use crate::entity_identity::EntityIdentity;
 use crate::entity_identity::EntityIdentityPart;
 use crate::json_store::context::JsonStoreContext;
-use crate::json_store::types::{JsonProjectionPath, JsonRef};
+use crate::json_store::types::{JsonProjectionPath, JsonRef, NormalizedJson};
+use crate::live_state::LiveStateContext;
+use crate::schema_registry::SchemaRegistry;
+use crate::session::SessionMode;
 use crate::storage::{
     KvGetGroup, KvGetRequest, KvScanRange, KvScanRequest, KvWriteBatch, StorageContext,
     StorageWriteSet,
 };
 use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDiffRequest, TrackedStateFilter, TrackedStateProjection,
-    TrackedStateRow, TrackedStateRowRequest, TrackedStateScanRequest,
+    MaterializedTrackedStateRow, TrackedStateContext, TrackedStateDiffRequest, TrackedStateFilter,
+    TrackedStateProjection, TrackedStateRowRequest, TrackedStateScanRequest,
+};
+use crate::transaction::open_transaction;
+use crate::transaction::types::{
+    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
 };
 use crate::untracked_state::{
-    canonicalize_materialized_row, MaterializedUntrackedStateRow, UntrackedStateContext,
-    UntrackedStateFilter, UntrackedStateProjection, UntrackedStateRowRequest,
-    UntrackedStateScanRequest,
+    MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter,
+    UntrackedStateProjection, UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
+use crate::version::VersionContext;
 use crate::{Backend, LixError, NullableKeyFilter};
+use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+fn prepare_json_ref(
+    writer: &mut crate::json_store::JsonStoreWriter,
+    document: &[u8],
+) -> Result<JsonRef, LixError> {
+    let text = std::str::from_utf8(document).map_err(|error| {
+        LixError::new(
+            LixError::CODE_UNKNOWN,
+            format!("benchmark JSON document is invalid UTF-8: {error}"),
+        )
+    })?;
+    writer.prepare_json(NormalizedJson::from_arc_unchecked(Arc::from(text)))
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct StorageBenchConfig {
@@ -115,13 +138,665 @@ pub struct StorageBenchReport {
     pub elapsed: Duration,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransactionBenchCounters {
+    pub rows_staged: usize,
+    pub untracked_rows: usize,
+    pub validation_version_count: usize,
+    pub schema_catalog_loads: usize,
+    pub json_store_stage_bytes_calls: usize,
+    pub unique_json_refs: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransactionAccountingReport {
+    pub counters: TransactionBenchCounters,
+    pub storage_write_batches: usize,
+    pub kv_puts_by_namespace: BTreeMap<String, usize>,
+    pub bytes_by_namespace: BTreeMap<String, usize>,
+}
+
 pub struct StorageApiFixture {
     storage: StorageContext,
     rows: usize,
 }
 
+pub struct TransactionBenchFixture {
+    storage: StorageContext,
+    live_state: Arc<LiveStateContext>,
+    tracked_state: Arc<TrackedStateContext>,
+    binary_cas: Arc<BinaryCasContext>,
+    changelog: Arc<ChangelogContext>,
+    version_ctx: Arc<VersionContext>,
+    schema_registry: Arc<SchemaRegistry>,
+    rows: Vec<TransactionWriteRow>,
+}
+
+pub struct TransactionCommitOnlyFixture {
+    runtime_functions: crate::functions::FunctionContext,
+    transaction: crate::transaction::Transaction,
+    rows: usize,
+}
+
+static TRANSACTION_ROWS_STAGED: AtomicUsize = AtomicUsize::new(0);
+static TRANSACTION_UNTRACKED_ROWS: AtomicUsize = AtomicUsize::new(0);
+static TRANSACTION_VALIDATION_VERSION_COUNT: AtomicUsize = AtomicUsize::new(0);
+static TRANSACTION_SCHEMA_CATALOG_LOADS: AtomicUsize = AtomicUsize::new(0);
+static JSON_STORE_STAGE_BYTES_CALLS: AtomicUsize = AtomicUsize::new(0);
+static JSON_STORE_UNIQUE_REFS: OnceLock<Mutex<HashSet<[u8; 32]>>> = OnceLock::new();
+
 const STORAGE_API_NAMESPACE: &str = "bench.storage_api";
 const STORAGE_API_ALT_NAMESPACE: &str = "bench.storage_api.alt";
+const TRANSACTION_BENCH_SCHEMA_KEY: &str = "bench_transaction_entity";
+const TRANSACTION_BENCH_SCHEMA_VERSION: &str = "1";
+
+pub fn reset_transaction_bench_counters() {
+    TRANSACTION_ROWS_STAGED.store(0, Ordering::Relaxed);
+    TRANSACTION_UNTRACKED_ROWS.store(0, Ordering::Relaxed);
+    TRANSACTION_VALIDATION_VERSION_COUNT.store(0, Ordering::Relaxed);
+    TRANSACTION_SCHEMA_CATALOG_LOADS.store(0, Ordering::Relaxed);
+    JSON_STORE_STAGE_BYTES_CALLS.store(0, Ordering::Relaxed);
+    json_store_unique_refs()
+        .lock()
+        .expect("json store unique ref counter mutex should lock")
+        .clear();
+}
+
+pub fn transaction_bench_counters() -> TransactionBenchCounters {
+    TransactionBenchCounters {
+        rows_staged: TRANSACTION_ROWS_STAGED.load(Ordering::Relaxed),
+        untracked_rows: TRANSACTION_UNTRACKED_ROWS.load(Ordering::Relaxed),
+        validation_version_count: TRANSACTION_VALIDATION_VERSION_COUNT.load(Ordering::Relaxed),
+        schema_catalog_loads: TRANSACTION_SCHEMA_CATALOG_LOADS.load(Ordering::Relaxed),
+        json_store_stage_bytes_calls: JSON_STORE_STAGE_BYTES_CALLS.load(Ordering::Relaxed),
+        unique_json_refs: json_store_unique_refs()
+            .lock()
+            .expect("json store unique ref counter mutex should lock")
+            .len(),
+    }
+}
+
+pub(crate) fn record_transaction_rows_staged(rows: usize) {
+    TRANSACTION_ROWS_STAGED.fetch_add(rows, Ordering::Relaxed);
+}
+
+pub(crate) fn record_transaction_untracked_rows(rows: usize) {
+    TRANSACTION_UNTRACKED_ROWS.fetch_add(rows, Ordering::Relaxed);
+}
+
+pub(crate) fn record_transaction_validation_version() {
+    TRANSACTION_VALIDATION_VERSION_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_transaction_schema_catalog_load() {
+    TRANSACTION_SCHEMA_CATALOG_LOADS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_json_store_stage_bytes(hash: [u8; 32]) {
+    JSON_STORE_STAGE_BYTES_CALLS.fetch_add(1, Ordering::Relaxed);
+    json_store_unique_refs()
+        .lock()
+        .expect("json store unique ref counter mutex should lock")
+        .insert(hash);
+}
+
+fn json_store_unique_refs() -> &'static Mutex<HashSet<[u8; 32]>> {
+    JSON_STORE_UNIQUE_REFS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub async fn prepare_transaction_commit_empty(
+    backend: Arc<dyn Backend + Send + Sync>,
+) -> Result<TransactionBenchFixture, LixError> {
+    prepare_transaction_fixture(backend, Vec::new()).await
+}
+
+pub async fn prepare_transaction_commit_schema_only(
+    backend: Arc<dyn Backend + Send + Sync>,
+) -> Result<TransactionBenchFixture, LixError> {
+    prepare_transaction_fixture(backend, vec![transaction_registered_schema_row()]).await
+}
+
+pub async fn prepare_transaction_commit_entities_no_payload(
+    backend: Arc<dyn Backend + Send + Sync>,
+    rows: usize,
+) -> Result<TransactionBenchFixture, LixError> {
+    prepare_transaction_fixture(
+        backend,
+        transaction_entity_rows(TransactionEntityRows {
+            rows,
+            payload_bytes: 0,
+            payload_pattern: TransactionPayloadPattern::Unique,
+            metadata_pattern: TransactionPayloadPattern::None,
+            untracked: false,
+            key_prefix: "entity-no-payload",
+        }),
+    )
+    .await
+}
+
+pub async fn prepare_transaction_commit_entities_payload_1k_unique(
+    backend: Arc<dyn Backend + Send + Sync>,
+    rows: usize,
+) -> Result<TransactionBenchFixture, LixError> {
+    prepare_transaction_payload_fixture(
+        backend,
+        rows,
+        1024,
+        TransactionPayloadPattern::Unique,
+        false,
+        "entity-payload-1k-unique",
+    )
+    .await
+}
+
+pub async fn prepare_transaction_commit_entities_payload_1k_same(
+    backend: Arc<dyn Backend + Send + Sync>,
+    rows: usize,
+) -> Result<TransactionBenchFixture, LixError> {
+    prepare_transaction_payload_fixture(
+        backend,
+        rows,
+        1024,
+        TransactionPayloadPattern::Same,
+        false,
+        "entity-payload-1k-same",
+    )
+    .await
+}
+
+pub async fn prepare_transaction_commit_entities_payload_1k_half_duplicate(
+    backend: Arc<dyn Backend + Send + Sync>,
+    rows: usize,
+) -> Result<TransactionBenchFixture, LixError> {
+    prepare_transaction_payload_fixture(
+        backend,
+        rows,
+        1024,
+        TransactionPayloadPattern::HalfDuplicate,
+        false,
+        "entity-payload-1k-half-duplicate",
+    )
+    .await
+}
+
+pub async fn prepare_transaction_commit_entities_metadata_1k_same(
+    backend: Arc<dyn Backend + Send + Sync>,
+    rows: usize,
+) -> Result<TransactionBenchFixture, LixError> {
+    prepare_transaction_fixture(
+        backend,
+        transaction_entity_rows(TransactionEntityRows {
+            rows,
+            payload_bytes: 0,
+            payload_pattern: TransactionPayloadPattern::Unique,
+            metadata_pattern: TransactionPayloadPattern::Same,
+            untracked: false,
+            key_prefix: "entity-metadata-1k-same",
+        }),
+    )
+    .await
+}
+
+pub async fn prepare_transaction_commit_entities_payload_16k_unique(
+    backend: Arc<dyn Backend + Send + Sync>,
+    rows: usize,
+) -> Result<TransactionBenchFixture, LixError> {
+    prepare_transaction_payload_fixture(
+        backend,
+        rows,
+        16 * 1024,
+        TransactionPayloadPattern::Unique,
+        false,
+        "entity-payload-16k-unique",
+    )
+    .await
+}
+
+pub async fn prepare_transaction_commit_untracked_payload_1k_same(
+    backend: Arc<dyn Backend + Send + Sync>,
+    rows: usize,
+) -> Result<TransactionBenchFixture, LixError> {
+    prepare_transaction_payload_fixture(
+        backend,
+        rows,
+        1024,
+        TransactionPayloadPattern::Same,
+        true,
+        "untracked-payload-1k-same",
+    )
+    .await
+}
+
+pub async fn prepare_transaction_update_existing_payload_1k(
+    backend: Arc<dyn Backend + Send + Sync>,
+    root_rows: usize,
+    update_rows: usize,
+) -> Result<TransactionBenchFixture, LixError> {
+    let fixture = prepare_transaction_payload_fixture(
+        backend,
+        root_rows,
+        1024,
+        TransactionPayloadPattern::Unique,
+        false,
+        "update-existing-root",
+    )
+    .await?;
+    transaction_commit_prepared(&fixture).await?;
+    let rows = transaction_entity_rows(TransactionEntityRows {
+        rows: update_rows,
+        payload_bytes: 1024,
+        payload_pattern: TransactionPayloadPattern::Unique,
+        metadata_pattern: TransactionPayloadPattern::None,
+        untracked: false,
+        key_prefix: "update-existing-root",
+    });
+    Ok(TransactionBenchFixture { rows, ..fixture })
+}
+
+pub async fn transaction_commit_prepared(
+    fixture: &TransactionBenchFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let opened = open_transaction(
+        &SessionMode::Pinned {
+            version_id: crate::GLOBAL_VERSION_ID.to_string(),
+        },
+        fixture.storage.clone(),
+        Arc::clone(&fixture.live_state),
+        Arc::clone(&fixture.tracked_state),
+        Arc::clone(&fixture.binary_cas),
+        Arc::clone(&fixture.changelog),
+        Arc::clone(&fixture.version_ctx),
+        Arc::clone(&fixture.schema_registry),
+    )
+    .await?;
+    let mut transaction = opened.transaction;
+    let runtime_functions = opened.runtime_functions;
+    let started_at = Instant::now();
+    if !fixture.rows.is_empty() {
+        transaction
+            .stage_write(TransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: fixture.rows.clone(),
+            })
+            .await?;
+    }
+    transaction.commit(&runtime_functions).await?;
+    Ok(StorageBenchReport {
+        measured_rows: fixture.rows.len(),
+        verified_rows: fixture.rows.len(),
+        elapsed: started_at.elapsed(),
+    })
+}
+
+pub async fn transaction_open_empty_prepared(
+    fixture: &TransactionBenchFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let started_at = Instant::now();
+    let opened = open_transaction(
+        &SessionMode::Pinned {
+            version_id: crate::GLOBAL_VERSION_ID.to_string(),
+        },
+        fixture.storage.clone(),
+        Arc::clone(&fixture.live_state),
+        Arc::clone(&fixture.tracked_state),
+        Arc::clone(&fixture.binary_cas),
+        Arc::clone(&fixture.changelog),
+        Arc::clone(&fixture.version_ctx),
+        Arc::clone(&fixture.schema_registry),
+    )
+    .await?;
+    let elapsed = started_at.elapsed();
+    opened.transaction.rollback().await?;
+    Ok(StorageBenchReport {
+        measured_rows: 0,
+        verified_rows: 0,
+        elapsed,
+    })
+}
+
+pub async fn transaction_stage_only_prepared(
+    fixture: &TransactionBenchFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let opened = open_transaction(
+        &SessionMode::Pinned {
+            version_id: crate::GLOBAL_VERSION_ID.to_string(),
+        },
+        fixture.storage.clone(),
+        Arc::clone(&fixture.live_state),
+        Arc::clone(&fixture.tracked_state),
+        Arc::clone(&fixture.binary_cas),
+        Arc::clone(&fixture.changelog),
+        Arc::clone(&fixture.version_ctx),
+        Arc::clone(&fixture.schema_registry),
+    )
+    .await?;
+    let mut transaction = opened.transaction;
+    let started_at = Instant::now();
+    if !fixture.rows.is_empty() {
+        transaction
+            .stage_write(TransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: fixture.rows.clone(),
+            })
+            .await?;
+    }
+    let elapsed = started_at.elapsed();
+    transaction.rollback().await?;
+    Ok(StorageBenchReport {
+        measured_rows: fixture.rows.len(),
+        verified_rows: fixture.rows.len(),
+        elapsed,
+    })
+}
+
+pub async fn prepare_transaction_commit_only(
+    fixture: TransactionBenchFixture,
+) -> Result<TransactionCommitOnlyFixture, LixError> {
+    let opened = open_transaction(
+        &SessionMode::Pinned {
+            version_id: crate::GLOBAL_VERSION_ID.to_string(),
+        },
+        fixture.storage.clone(),
+        Arc::clone(&fixture.live_state),
+        Arc::clone(&fixture.tracked_state),
+        Arc::clone(&fixture.binary_cas),
+        Arc::clone(&fixture.changelog),
+        Arc::clone(&fixture.version_ctx),
+        Arc::clone(&fixture.schema_registry),
+    )
+    .await?;
+    let mut transaction = opened.transaction;
+    let runtime_functions = opened.runtime_functions;
+    let rows = fixture.rows.len();
+    if !fixture.rows.is_empty() {
+        transaction
+            .stage_write(TransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: fixture.rows,
+            })
+            .await?;
+    }
+    Ok(TransactionCommitOnlyFixture {
+        runtime_functions,
+        transaction,
+        rows,
+    })
+}
+
+pub async fn transaction_commit_only_prepared(
+    fixture: TransactionCommitOnlyFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let rows = fixture.rows;
+    let started_at = Instant::now();
+    fixture
+        .transaction
+        .commit(&fixture.runtime_functions)
+        .await?;
+    Ok(StorageBenchReport {
+        measured_rows: rows,
+        verified_rows: rows,
+        elapsed: started_at.elapsed(),
+    })
+}
+
+async fn prepare_transaction_payload_fixture(
+    backend: Arc<dyn Backend + Send + Sync>,
+    rows: usize,
+    payload_bytes: usize,
+    payload_pattern: TransactionPayloadPattern,
+    untracked: bool,
+    key_prefix: &'static str,
+) -> Result<TransactionBenchFixture, LixError> {
+    prepare_transaction_fixture(
+        backend,
+        transaction_entity_rows(TransactionEntityRows {
+            rows,
+            payload_bytes,
+            payload_pattern,
+            metadata_pattern: TransactionPayloadPattern::None,
+            untracked,
+            key_prefix,
+        }),
+    )
+    .await
+}
+
+async fn prepare_transaction_fixture(
+    backend: Arc<dyn Backend + Send + Sync>,
+    rows: Vec<TransactionWriteRow>,
+) -> Result<TransactionBenchFixture, LixError> {
+    let storage = StorageContext::new(backend);
+    let tracked_state = Arc::new(TrackedStateContext::new());
+    let untracked_state = Arc::new(UntrackedStateContext::new());
+    let changelog = Arc::new(ChangelogContext::new());
+    let live_state = Arc::new(LiveStateContext::new(
+        tracked_state.as_ref().clone(),
+        untracked_state.as_ref().clone(),
+        crate::commit_graph::CommitGraphContext::new(changelog.as_ref().clone()),
+    ));
+    let binary_cas = Arc::new(BinaryCasContext::new());
+    let version_ctx = Arc::new(VersionContext::new(untracked_state));
+    let schema_registry = Arc::new(SchemaRegistry::new());
+    seed_transaction_visible_schema_rows(storage.clone(), live_state.as_ref()).await?;
+    Ok(TransactionBenchFixture {
+        storage,
+        live_state,
+        tracked_state,
+        binary_cas,
+        changelog,
+        version_ctx,
+        schema_registry,
+        rows,
+    })
+}
+
+async fn seed_transaction_visible_schema_rows(
+    storage: StorageContext,
+    live_state: &LiveStateContext,
+) -> Result<(), LixError> {
+    let mut writes = StorageWriteSet::new();
+    let mut json_writer = JsonStoreContext::new().writer();
+    let rows = crate::schema::seed_schema_definitions()
+        .into_iter()
+        .cloned()
+        .chain(std::iter::once(transaction_entity_schema_definition()))
+        .map(|schema| {
+            let key = crate::schema::schema_key_from_definition(&schema)
+                .expect("seed schema key should derive");
+            let snapshot_content = serde_json::json!({ "value": schema }).to_string();
+            Ok(crate::untracked_state::UntrackedStateRow {
+                entity_id: crate::schema::registered_schema_entity_id(
+                    &key.schema_key,
+                    &key.schema_version,
+                )
+                .expect("registered schema identity should derive"),
+                schema_key: "lix_registered_schema".to_string(),
+                file_id: None,
+                version_id: crate::GLOBAL_VERSION_ID.to_string(),
+                schema_version: "1".to_string(),
+                snapshot_ref: Some(prepare_json_ref(
+                    &mut json_writer,
+                    snapshot_content.as_bytes(),
+                )?),
+                metadata_ref: None,
+                created_at: "1970-01-01T00:00:00.000Z".to_string(),
+                updated_at: "1970-01-01T00:00:00.000Z".to_string(),
+                global: true,
+            })
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let mut transaction = storage.begin_write_transaction().await?;
+    {
+        let mut writer = live_state.writer(transaction.as_mut());
+        writer.stage_untracked_rows(&mut writes, rows.iter().map(|row| row.as_ref()))?;
+    }
+    json_writer.flush_into(&mut writes);
+    writes.apply(&mut transaction.as_mut()).await?;
+    transaction.commit().await
+}
+
+fn transaction_entity_schema_definition() -> serde_json::Value {
+    serde_json::json!({
+        "x-lix-key": TRANSACTION_BENCH_SCHEMA_KEY,
+        "x-lix-version": TRANSACTION_BENCH_SCHEMA_VERSION,
+        "type": "object",
+        "properties": {
+            "value": {
+                "anyOf": [
+                    { "type": "string" },
+                    { "type": "object" },
+                    { "type": "array" },
+                    { "type": "number" },
+                    { "type": "boolean" },
+                    { "type": "null" }
+                ]
+            }
+        },
+        "required": ["value"],
+        "additionalProperties": false
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TransactionPayloadPattern {
+    None,
+    Unique,
+    Same,
+    HalfDuplicate,
+}
+
+struct TransactionEntityRows {
+    rows: usize,
+    payload_bytes: usize,
+    payload_pattern: TransactionPayloadPattern,
+    metadata_pattern: TransactionPayloadPattern,
+    untracked: bool,
+    key_prefix: &'static str,
+}
+
+fn transaction_entity_rows(config: TransactionEntityRows) -> Vec<TransactionWriteRow> {
+    (0..config.rows)
+        .map(|index| {
+            let key = format!("{}-{index:06}", config.key_prefix);
+            let value_index = payload_pattern_index(config.payload_pattern, index);
+            let metadata_index = payload_pattern_index(config.metadata_pattern, index);
+            TransactionWriteRow {
+                entity_id: Some(EntityIdentity::single(key.clone())),
+                schema_key: TRANSACTION_BENCH_SCHEMA_KEY.to_string(),
+                file_id: None,
+                snapshot: Some(transaction_snapshot_json(
+                    &key,
+                    value_index,
+                    config.payload_bytes,
+                )),
+                metadata: transaction_metadata(config.metadata_pattern, metadata_index),
+                origin: None,
+                schema_version: TRANSACTION_BENCH_SCHEMA_VERSION.to_string(),
+                created_at: None,
+                updated_at: None,
+                global: true,
+                change_id: None,
+                commit_id: None,
+                untracked: config.untracked,
+                version_id: crate::GLOBAL_VERSION_ID.to_string(),
+            }
+        })
+        .collect()
+}
+
+fn transaction_registered_schema_row() -> TransactionWriteRow {
+    let schema = serde_json::json!({
+        "x-lix-key": "bench_transaction_schema",
+        "x-lix-version": "1",
+        "x-lix-primary-key": ["/id"],
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "value": { "type": "string" }
+        },
+        "required": ["id", "value"],
+        "additionalProperties": false
+    });
+    let key =
+        crate::schema::schema_key_from_definition(&schema).expect("seed schema key should derive");
+    TransactionWriteRow {
+        entity_id: Some(
+            crate::schema::registered_schema_entity_id(&key.schema_key, &key.schema_version)
+                .expect("registered schema identity should derive"),
+        ),
+        schema_key: "lix_registered_schema".to_string(),
+        file_id: None,
+        snapshot: Some(TransactionJson::from_value_unchecked(
+            serde_json::json!({ "value": schema }),
+        )),
+        metadata: None,
+        origin: None,
+        schema_version: "1".to_string(),
+        created_at: None,
+        updated_at: None,
+        global: true,
+        change_id: None,
+        commit_id: None,
+        untracked: false,
+        version_id: crate::GLOBAL_VERSION_ID.to_string(),
+    }
+}
+
+fn transaction_snapshot_json(
+    _key: &str,
+    payload_index: usize,
+    target_bytes: usize,
+) -> TransactionJson {
+    let base_value = format!("/entities/{payload_index}/value");
+    let value = if target_bytes == 0 {
+        base_value
+    } else {
+        let current = serde_json::json!({
+            "value": base_value,
+        })
+        .to_string()
+        .len();
+        let padding = target_bytes.saturating_sub(current);
+        format!("{base_value}:{}", "x".repeat(padding))
+    };
+    let mut object = serde_json::Map::new();
+    object.insert("value".to_string(), serde_json::Value::String(value));
+    TransactionJson::from_value_unchecked(serde_json::Value::Object(object))
+}
+
+fn transaction_metadata(
+    pattern: TransactionPayloadPattern,
+    metadata_index: usize,
+) -> Option<TransactionJson> {
+    match pattern {
+        TransactionPayloadPattern::None => None,
+        TransactionPayloadPattern::Unique
+        | TransactionPayloadPattern::Same
+        | TransactionPayloadPattern::HalfDuplicate => {
+            let mut object = serde_json::Map::new();
+            object.insert(
+                "source".to_string(),
+                serde_json::Value::String("transaction-bench".to_string()),
+            );
+            object.insert(
+                "metadata_index".to_string(),
+                serde_json::Value::String(metadata_index.to_string()),
+            );
+            pad_json_object(&mut object, 1024);
+            Some(TransactionJson::from_value_unchecked(
+                serde_json::Value::Object(object),
+            ))
+        }
+    }
+}
+
+fn payload_pattern_index(pattern: TransactionPayloadPattern, index: usize) -> usize {
+    match pattern {
+        TransactionPayloadPattern::None | TransactionPayloadPattern::Unique => index,
+        TransactionPayloadPattern::Same => 0,
+        TransactionPayloadPattern::HalfDuplicate => index % 2,
+    }
+}
 
 pub async fn storage_api_write_kv_batch_puts(
     backend: Arc<dyn Backend + Send + Sync>,
@@ -689,7 +1364,7 @@ fn storage_api_updated_value(index: usize) -> Vec<u8> {
 
 pub struct TrackedStateWriteRootFixture {
     context: TrackedStateContext,
-    rows: Vec<TrackedStateRow>,
+    rows: Vec<MaterializedTrackedStateRow>,
 }
 
 pub struct TrackedStateReadFixture {
@@ -702,7 +1377,7 @@ pub struct TrackedStateReadFixture {
 
 pub struct TrackedStateUpdateFixture {
     context: TrackedStateContext,
-    rows: Vec<TrackedStateRow>,
+    rows: Vec<MaterializedTrackedStateRow>,
 }
 
 pub struct TrackedStateDiffFixture {
@@ -1682,7 +2357,7 @@ pub async fn prepare_changelog_codec(
     let changes = changelog_changes(config);
     let encoded_changes = changes
         .iter()
-        .map(crate::changelog::codec::encode_change)
+        .map(|change| crate::changelog::codec::encode_change_ref(change.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ChangelogCodecFixture {
         changes,
@@ -1750,7 +2425,7 @@ pub async fn changelog_encode_only_prepared(
     let mut verified_rows = 0;
     let mut encoded_bytes = 0;
     for change in &fixture.changes {
-        encoded_bytes += crate::changelog::codec::encode_change(change)?.len();
+        encoded_bytes += crate::changelog::codec::encode_change_ref(change.as_ref())?.len();
         verified_rows += 1;
     }
     Ok(report(
@@ -1777,43 +2452,41 @@ pub async fn changelog_decode_only_prepared(
     ))
 }
 
-pub async fn changelog_load_change_hit_prepared(
+pub async fn changelog_load_changes_hit_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &ChangelogReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let reader = fixture
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
-    let mut verified_rows = 0;
-    for index in 0..fixture.rows {
-        if reader
-            .load_change(&format!("bench-change-{index}"))
-            .await?
-            .is_some()
-        {
-            verified_rows += 1;
-        }
-    }
+    let change_ids = (0..fixture.rows)
+        .map(|index| format!("bench-change-{index}"))
+        .collect::<Vec<_>>();
+    let verified_rows = reader
+        .load_changes(&change_ids)
+        .await?
+        .into_iter()
+        .filter(Option::is_some)
+        .count();
     Ok(report(fixture.rows, verified_rows, Duration::ZERO))
 }
 
-pub async fn changelog_load_change_miss_prepared(
+pub async fn changelog_load_changes_miss_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &ChangelogReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let reader = fixture
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
-    let mut misses = 0;
-    for index in 0..fixture.rows {
-        if reader
-            .load_change(&format!("missing-change-{index}"))
-            .await?
-            .is_none()
-        {
-            misses += 1;
-        }
-    }
+    let change_ids = (0..fixture.rows)
+        .map(|index| format!("missing-change-{index}"))
+        .collect::<Vec<_>>();
+    let misses = reader
+        .load_changes(&change_ids)
+        .await?
+        .into_iter()
+        .filter(Option::is_none)
+        .count();
     Ok(report(fixture.rows, misses, Duration::ZERO))
 }
 
@@ -2030,8 +2703,9 @@ pub async fn json_store_write_prepared(
         let mut writes = StorageWriteSet::new();
         let mut writer = fixture.context.writer();
         for document in &fixture.documents {
-            writer.stage_bytes(&mut writes, document)?;
+            prepare_json_ref(&mut writer, document)?;
         }
+        writer.flush_into(&mut writes);
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await?;
@@ -2071,8 +2745,9 @@ pub async fn prepare_json_store_projection_read(
         let mut writes = StorageWriteSet::new();
         let mut writer = context.writer();
         for document in documents {
-            refs.push(writer.stage_bytes(&mut writes, &document)?);
+            refs.push(prepare_json_ref(&mut writer, &document)?);
         }
+        writer.flush_into(&mut writes);
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await?;
@@ -2163,8 +2838,9 @@ async fn prepare_json_store_base_update(
         let mut writes = StorageWriteSet::new();
         let mut writer = context.writer();
         for document in documents {
-            refs.push(writer.stage_bytes(&mut writes, &document)?);
+            refs.push(prepare_json_ref(&mut writer, &document)?);
         }
+        writer.flush_into(&mut writes);
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await?;
@@ -2207,8 +2883,9 @@ async fn json_store_write_against_base_prepared(
         let mut writer = fixture.context.writer();
         for (index, _json_ref) in fixture.refs.iter().enumerate() {
             let updated = updated_json_document(shape, index);
-            writer.stage_bytes(&mut writes, &updated)?;
+            prepare_json_ref(&mut writer, &updated)?;
         }
+        writer.flush_into(&mut writes);
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await?;
@@ -2571,7 +3248,7 @@ pub async fn changelog_append_changes(
     Ok(report(changes.len(), verified_rows, elapsed))
 }
 
-pub async fn changelog_load_change_hit(
+pub async fn changelog_load_changes_hit(
     backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
@@ -2581,20 +3258,19 @@ pub async fn changelog_load_change_hit(
     let reader = context.reader(StorageContext::new(Arc::clone(backend)));
 
     let started = Instant::now();
-    let mut verified_rows = 0;
-    for index in 0..config.rows {
-        if reader
-            .load_change(&format!("bench-change-{index}"))
-            .await?
-            .is_some()
-        {
-            verified_rows += 1;
-        }
-    }
+    let change_ids = (0..config.rows)
+        .map(|index| format!("bench-change-{index}"))
+        .collect::<Vec<_>>();
+    let verified_rows = reader
+        .load_changes(&change_ids)
+        .await?
+        .into_iter()
+        .filter(Option::is_some)
+        .count();
     Ok(report(config.rows, verified_rows, started.elapsed()))
 }
 
-pub async fn changelog_load_change_miss(
+pub async fn changelog_load_changes_miss(
     backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
@@ -2604,16 +3280,15 @@ pub async fn changelog_load_change_miss(
     let reader = context.reader(StorageContext::new(Arc::clone(backend)));
 
     let started = Instant::now();
-    let mut misses = 0;
-    for index in 0..config.rows {
-        if reader
-            .load_change(&format!("missing-change-{index}"))
-            .await?
-            .is_none()
-        {
-            misses += 1;
-        }
-    }
+    let change_ids = (0..config.rows)
+        .map(|index| format!("missing-change-{index}"))
+        .collect::<Vec<_>>();
+    let misses = reader
+        .load_changes(&change_ids)
+        .await?
+        .into_iter()
+        .filter(Option::is_none)
+        .count();
     Ok(report(config.rows, misses, started.elapsed()))
 }
 
@@ -2747,7 +3422,7 @@ async fn write_tracked_root(
     context: &TrackedStateContext,
     commit_id: &str,
     parent_commit_id: Option<&str>,
-    rows: &[TrackedStateRow],
+    rows: &[MaterializedTrackedStateRow],
 ) -> Result<(), LixError> {
     let storage = StorageContext::new(Arc::clone(backend));
     let mut transaction = storage.begin_write_transaction().await?;
@@ -2755,15 +3430,24 @@ async fn write_tracked_root(
         let mut writes = StorageWriteSet::new();
         {
             let mut json_writer = JsonStoreContext::new().writer();
+            let canonical_rows = rows
+                .iter()
+                .map(|row| {
+                    crate::test_support::tracked_state_row_from_materialized(
+                        &mut writes,
+                        &mut json_writer,
+                        row,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             context
                 .writer()
                 .stage_root(
                     &mut transaction.as_mut(),
                     &mut writes,
-                    &mut json_writer,
                     commit_id,
                     parent_commit_id,
-                    rows,
+                    canonical_rows.iter().map(|row| row.as_ref()),
                 )
                 .await?;
         }
@@ -2776,7 +3460,7 @@ async fn scan_tracked(
     backend: &Arc<dyn Backend + Send + Sync>,
     context: &TrackedStateContext,
     commit_id: &str,
-) -> Result<Vec<TrackedStateRow>, LixError> {
+) -> Result<Vec<MaterializedTrackedStateRow>, LixError> {
     let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
     reader
         .scan_rows_at_commit(commit_id, &TrackedStateScanRequest::default())
@@ -2795,11 +3479,17 @@ async fn write_untracked_rows(
         let canonical_rows = {
             let mut json_writer = JsonStoreContext::new().writer();
             rows.iter()
-                .map(|row| canonicalize_materialized_row(&mut writes, &mut json_writer, row))
+                .map(|row| {
+                    crate::test_support::untracked_state_row_from_materialized(
+                        &mut writes,
+                        &mut json_writer,
+                        row,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut writer = context.writer(&mut writes);
-        writer.stage_rows(&canonical_rows)?;
+        writer.stage_rows(canonical_rows.iter().map(|row| row.as_ref()))?;
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await
@@ -2828,12 +3518,16 @@ async fn append_changelog_changes(
             changes
                 .iter()
                 .map(|change| {
-                    canonicalize_materialized_change(&mut writes, &mut json_writer, change)
+                    crate::test_support::canonical_change_from_materialized(
+                        &mut writes,
+                        &mut json_writer,
+                        change,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut writer = context.writer(&mut writes);
-        writer.stage_changes(&canonical_changes)?;
+        writer.stage_changes(canonical_changes.iter().map(|change| change.as_ref()))?;
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await
@@ -2879,9 +3573,9 @@ const CHANGELOG_MATCH_SCHEMA_KEY: &str = "bench_changelog_entity";
 const CHANGELOG_OTHER_SCHEMA_KEY: &str = "bench_changelog_other_entity";
 const CHANGELOG_HISTORY_ENTITY_ID: &str = "change-entity-history-target";
 
-fn tracked_rows(config: StorageBenchConfig, commit_id: &str) -> Vec<TrackedStateRow> {
+fn tracked_rows(config: StorageBenchConfig, commit_id: &str) -> Vec<MaterializedTrackedStateRow> {
     (0..config.rows)
-        .map(|index| TrackedStateRow {
+        .map(|index| MaterializedTrackedStateRow {
             entity_id: EntityIdentity::single(entity_id("tracked", index, config.key_pattern)),
             schema_key: tracked_schema_key(index, config.selectivity),
             file_id: Some("bench.json".to_string()),
@@ -2899,9 +3593,9 @@ fn tracked_rows(config: StorageBenchConfig, commit_id: &str) -> Vec<TrackedState
 fn tracked_rows_file_selective(
     config: StorageBenchConfig,
     commit_id: &str,
-) -> Vec<TrackedStateRow> {
+) -> Vec<MaterializedTrackedStateRow> {
     (0..config.rows)
-        .map(|index| TrackedStateRow {
+        .map(|index| MaterializedTrackedStateRow {
             entity_id: EntityIdentity::single(entity_id("tracked", index, config.key_pattern)),
             schema_key: TRACKED_MATCH_SCHEMA_KEY.to_string(),
             file_id: Some(
@@ -3187,9 +3881,8 @@ fn snapshot_content(index: usize, target_bytes: usize) -> String {
     value.to_string()
 }
 
-fn snapshot_metadata(index: usize, target_bytes: usize) -> serde_json::Value {
-    serde_json::from_str(&snapshot_content(index, target_bytes))
-        .expect("bench snapshot content should be valid JSON metadata")
+fn snapshot_metadata(index: usize, target_bytes: usize) -> String {
+    snapshot_content(index, target_bytes)
 }
 
 fn tracked_state_header_columns() -> Vec<String> {

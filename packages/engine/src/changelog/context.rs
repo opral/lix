@@ -1,4 +1,6 @@
-use crate::changelog::{CanonicalChange, ChangelogReader, ChangelogScanRequest};
+use crate::changelog::{
+    CanonicalChange, CanonicalChangeRef, ChangelogReader, ChangelogScanRequest,
+};
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::LixError;
 use tokio::sync::Mutex;
@@ -43,13 +45,12 @@ impl<S> ChangelogStoreReader<S>
 where
     S: StorageReader,
 {
-    #[allow(dead_code)]
-    pub(crate) async fn load_change(
+    pub(crate) async fn load_changes(
         &self,
-        change_id: &str,
-    ) -> Result<Option<CanonicalChange>, LixError> {
+        change_ids: &[String],
+    ) -> Result<Vec<Option<CanonicalChange>>, LixError> {
         let mut store = self.store.lock().await;
-        crate::changelog::storage::load_change(&mut *store, change_id).await
+        crate::changelog::storage::load_changes(&mut *store, change_ids).await
     }
 
     #[allow(dead_code)]
@@ -67,8 +68,11 @@ impl<S> ChangelogReader for ChangelogStoreReader<S>
 where
     S: StorageReader,
 {
-    async fn load_change(&self, change_id: &str) -> Result<Option<CanonicalChange>, LixError> {
-        ChangelogStoreReader::load_change(self, change_id).await
+    async fn load_changes(
+        &self,
+        change_ids: &[String],
+    ) -> Result<Vec<Option<CanonicalChange>>, LixError> {
+        ChangelogStoreReader::load_changes(self, change_ids).await
     }
 
     async fn scan_changes(
@@ -86,7 +90,10 @@ pub(crate) struct ChangelogWriter<'a> {
 
 impl ChangelogWriter<'_> {
     #[allow(dead_code)]
-    pub(crate) fn stage_changes(&mut self, changes: &[CanonicalChange]) -> Result<(), LixError> {
+    pub(crate) fn stage_changes<'a, I>(&mut self, changes: I) -> Result<(), LixError>
+    where
+        I: IntoIterator<Item = CanonicalChangeRef<'a>>,
+    {
         crate::changelog::storage::stage_changes(self.writes, changes)
     }
 }

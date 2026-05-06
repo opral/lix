@@ -3,7 +3,8 @@ use crate::storage::KvScanRange;
 use crate::storage::{KvGetGroup, KvGetRequest, KvScanRequest, StorageReader, StorageWriteSet};
 use crate::untracked_state::{
     MaterializedUntrackedStateRow, UntrackedMaterializationProjection, UntrackedStateIdentity,
-    UntrackedStateRow, UntrackedStateRowRequest, UntrackedStateScanRequest,
+    UntrackedStateIdentityRef, UntrackedStateRow, UntrackedStateRowRef, UntrackedStateRowRequest,
+    UntrackedStateScanRequest,
 };
 use crate::{LixError, NullableKeyFilter};
 
@@ -62,36 +63,35 @@ pub(crate) async fn load_row(
     .map(Some)
 }
 
-pub(crate) fn stage_rows(
-    writes: &mut StorageWriteSet,
-    rows: &[UntrackedStateRow],
-) -> Result<(), LixError> {
+pub(crate) fn stage_rows<'a, I>(writes: &mut StorageWriteSet, rows: I) -> Result<(), LixError>
+where
+    I: IntoIterator<Item = UntrackedStateRowRef<'a>>,
+{
     for row in rows {
-        let identity = UntrackedStateIdentity::from_row(row);
         if row.snapshot_ref.is_none() {
             writes.delete(
                 UNTRACKED_STATE_ROW_NAMESPACE,
-                encode_untracked_state_row_key(&identity),
+                encode_untracked_state_row_key_ref(row.into()),
             );
         } else {
             writes.put(
                 UNTRACKED_STATE_ROW_NAMESPACE,
-                encode_untracked_state_row_key(&identity),
-                crate::untracked_state::codec::encode_row(row)?,
+                encode_untracked_state_row_key_ref(row.into()),
+                crate::untracked_state::codec::encode_row_ref(row)?,
             );
         }
     }
     Ok(())
 }
 
-pub(crate) fn stage_delete_rows(
-    writes: &mut StorageWriteSet,
-    identities: &[UntrackedStateIdentity],
-) {
+pub(crate) fn stage_delete_rows<'a, I>(writes: &mut StorageWriteSet, identities: I)
+where
+    I: IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
+{
     for identity in identities {
         writes.delete(
             UNTRACKED_STATE_ROW_NAMESPACE,
-            encode_untracked_state_row_key(identity),
+            encode_untracked_state_row_key_ref(identity),
         );
     }
 }
@@ -146,17 +146,19 @@ fn identity_from_request(request: &UntrackedStateRowRequest) -> Option<Untracked
 }
 
 fn encode_untracked_state_row_key(identity: &UntrackedStateIdentity) -> Vec<u8> {
+    encode_untracked_state_row_key_ref(identity.as_ref())
+}
+
+fn encode_untracked_state_row_key_ref(identity: UntrackedStateIdentityRef<'_>) -> Vec<u8> {
     let mut out = Vec::new();
-    push_component(&mut out, &identity.version_id);
-    push_component(&mut out, &identity.schema_key);
-    push_component(
-        &mut out,
-        &identity
-            .entity_id
-            .as_string()
-            .expect("untracked-state identity should project"),
-    );
-    match &identity.file_id {
+    push_component(&mut out, identity.version_id);
+    push_component(&mut out, identity.schema_key);
+    let entity_id = identity
+        .entity_id
+        .as_cow_str()
+        .expect("untracked-state identity should project");
+    push_component(&mut out, &entity_id);
+    match identity.file_id {
         Some(file_id) => {
             out.push(1);
             push_component(&mut out, file_id);
@@ -179,7 +181,7 @@ mod tests {
     use super::*;
     use crate::backend::testing::UnitTestBackend;
     use crate::storage::{StorageContext, StorageWriteTransaction};
-    use crate::untracked_state::{canonicalize_materialized_row, UntrackedStateContext};
+    use crate::untracked_state::UntrackedStateContext;
 
     async fn write_materialized_rows_to_store(
         context: &UntrackedStateContext,
@@ -190,13 +192,19 @@ mod tests {
         let canonical_rows = {
             let mut json_writer = JsonStoreContext::new().writer();
             rows.iter()
-                .map(|row| canonicalize_materialized_row(&mut writes, &mut json_writer, row))
+                .map(|row| {
+                    crate::test_support::untracked_state_row_from_materialized(
+                        &mut writes,
+                        &mut json_writer,
+                        row,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .expect("rows should canonicalize")
         };
         context
             .writer(&mut writes)
-            .stage_rows(&canonical_rows)
+            .stage_rows(canonical_rows.iter().map(|row| row.as_ref()))
             .expect("rows should write");
         writes.apply(store).await.expect("rows should apply");
     }
@@ -298,14 +306,18 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         let canonical_row = {
             let mut json_writer = JsonStoreContext::new().writer();
-            canonicalize_materialized_row(&mut writes, &mut json_writer, &row)
-                .expect("row should canonicalize")
+            crate::test_support::untracked_state_row_from_materialized(
+                &mut writes,
+                &mut json_writer,
+                &row,
+            )
+            .expect("row should canonicalize")
         };
         let mut writer = context.writer(&mut writes);
         writer
-            .stage_rows(&[canonical_row])
+            .stage_rows(std::iter::once(canonical_row.as_ref()))
             .expect("write should succeed");
-        writer.stage_delete_rows(&[identity]);
+        writer.stage_delete_rows(std::iter::once(identity.as_ref()));
         writes
             .apply(&mut transaction.as_mut())
             .await

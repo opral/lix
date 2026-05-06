@@ -4,16 +4,17 @@ use tokio::sync::Mutex;
 use crate::commit_graph::{CommitGraphCommit, CommitGraphContext};
 use crate::live_state::visibility;
 use crate::live_state::{
-    LiveStateFilter, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+    LiveStateFilter, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
+    LiveStateTrackedRowRef, MaterializedLiveStateRow,
 };
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::tracked_state::{
-    TrackedStateContext, TrackedStateFilter, TrackedStateProjection, TrackedStateRow,
+    MaterializedTrackedStateRow, TrackedStateContext, TrackedStateFilter, TrackedStateProjection,
     TrackedStateRowRequest, TrackedStateScanRequest,
 };
 use crate::untracked_state::{
-    canonicalize_materialized_row, MaterializedUntrackedStateRow, UntrackedStateContext,
-    UntrackedStateIdentity, UntrackedStateRowRequest, UntrackedStateScanRequest,
+    UntrackedStateContext, UntrackedStateIdentityRef, UntrackedStateRowRef,
+    UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
 use crate::version::VERSION_REF_SCHEMA_KEY;
 use crate::LixError;
@@ -88,7 +89,7 @@ where
     pub(crate) async fn scan_rows(
         &self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<LiveStateRow>, LixError> {
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let mut store = self.store.lock().await;
         let scope = scan_scope(&mut *store, &self.untracked_state, request).await?;
         let mut tracked_rows = Vec::new();
@@ -122,7 +123,7 @@ where
                 .await?
         }
         .into_iter()
-        .map(LiveStateRow::from)
+        .map(MaterializedLiveStateRow::from)
         .collect::<Vec<_>>();
 
         let mut commit_rows = if scope.includes_commit_graph_projection {
@@ -156,7 +157,7 @@ where
     pub(crate) async fn load_row(
         &self,
         request: &LiveStateRowRequest,
-    ) -> Result<Option<LiveStateRow>, LixError> {
+    ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         let mut store = self.store.lock().await;
         if !version_ref_exists(&mut *store, &self.untracked_state, &request.version_id).await? {
             return Ok(None);
@@ -179,7 +180,7 @@ where
                         .await?
                     {
                         return Ok(Some(visibility::project_loaded_row(
-                            LiveStateRow::from(row),
+                            MaterializedLiveStateRow::from(row),
                             &request.version_id,
                             &candidate.version_id,
                         )));
@@ -218,7 +219,7 @@ where
         &self,
         store: &mut dyn StorageReader,
         request: &LiveStateRowRequest,
-    ) -> Result<Option<LiveStateRow>, LixError> {
+    ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         if !nullable_filter_matches(&request.file_id, &None) {
             return Ok(None);
         }
@@ -247,14 +248,14 @@ where
     async fn scan_rows(
         &self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<LiveStateRow>, LixError> {
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         LiveStateStoreReader::scan_rows(self, request).await
     }
 
     async fn load_row(
         &self,
         request: &LiveStateRowRequest,
-    ) -> Result<Option<LiveStateRow>, LixError> {
+    ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         LiveStateStoreReader::load_row(self, request).await
     }
 }
@@ -270,74 +271,92 @@ impl<S> LiveStateWriter<S>
 where
     S: StorageReader,
 {
-    pub(crate) async fn stage_rows(
+    pub(crate) fn stage_untracked_rows<'a>(
         &mut self,
         writes: &mut StorageWriteSet,
-        json_writer: &mut crate::json_store::JsonStoreWriter,
-        rows: &[LiveStateRow],
+        rows: impl IntoIterator<Item = UntrackedStateRowRef<'a>>,
     ) -> Result<(), LixError> {
-        let (tracked_rows, untracked_rows): (Vec<_>, Vec<_>) =
-            rows.iter().partition(|row| !row.untracked);
+        self.untracked_state.writer(writes).stage_rows(rows)
+    }
 
-        if !untracked_rows.is_empty() {
-            let untracked_rows = untracked_rows
-                .into_iter()
-                .map(MaterializedUntrackedStateRow::from)
-                .collect::<Vec<_>>();
-            let canonical_rows = untracked_rows
-                .iter()
-                .map(|row| canonicalize_materialized_row(writes, json_writer, row))
-                .collect::<Result<Vec<_>, _>>()?;
-            self.untracked_state
-                .writer(writes)
-                .stage_rows(&canonical_rows)?;
-        }
-
-        if tracked_rows.is_empty() {
-            return Ok(());
-        }
-
-        let identities = tracked_rows
-            .iter()
-            .map(|row| {
-                Ok(UntrackedStateIdentity {
-                    version_id: row.version_id.clone(),
-                    schema_key: row.schema_key.clone(),
-                    entity_id: row.entity_id.clone(),
-                    file_id: row.file_id.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, LixError>>()?;
+    pub(crate) fn stage_delete_untracked_rows<'a>(
+        &mut self,
+        writes: &mut StorageWriteSet,
+        identities: impl IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
+    ) {
         self.untracked_state
             .writer(writes)
-            .stage_delete_rows(&identities);
+            .stage_delete_rows(identities);
+    }
 
-        for (commit_id, rows) in grouped_live_rows_by_commit(&tracked_rows)? {
-            let parent_commit_id = parent_commit_id_for_commit_rows(commit_id, &rows)?;
-            validate_root_local_write_batch(commit_id, &rows)?;
-            // Commit graph facts live in the changelog/commit_graph projection.
-            // They are present in the write batch so the tracked root can inherit
-            // parent metadata, but they are not stored as version entities.
-            let root_rows = rows
-                .iter()
-                .filter(|row| row.schema_key != COMMIT_SCHEMA_KEY)
-                .map(|row| TrackedStateRow::try_from(*row))
-                .collect::<Result<Vec<_>, _>>()?;
-            self.tracked_state
-                .writer()
-                .stage_root(
-                    &mut self.store,
-                    writes,
-                    json_writer,
-                    commit_id,
-                    parent_commit_id.as_deref(),
-                    &root_rows,
-                )
-                .await?;
-        }
-
+    pub(crate) async fn stage_tracked_root<'a>(
+        &mut self,
+        writes: &mut StorageWriteSet,
+        storage_version_id: &str,
+        commit_id: &str,
+        parent_commit_id: Option<&str>,
+        rows: impl IntoIterator<Item = LiveStateTrackedRowRef<'a>>,
+    ) -> Result<(), LixError> {
+        let rows = rows.into_iter().collect::<Vec<_>>();
+        validate_root_ref_write_batch(storage_version_id, commit_id, &rows)?;
+        self.tracked_state
+            .writer()
+            .stage_root(
+                &mut self.store,
+                writes,
+                commit_id,
+                parent_commit_id,
+                rows.iter().map(|row| row.row),
+            )
+            .await?;
         Ok(())
     }
+}
+
+fn validate_root_ref_write_batch(
+    storage_version_id: &str,
+    commit_id: &str,
+    rows: &[LiveStateTrackedRowRef<'_>],
+) -> Result<(), LixError> {
+    for row in rows {
+        require_valid_storage_scope(row.version_id, row.global)?;
+        let row_storage_version_id = row.storage_version_id();
+        if row_storage_version_id != storage_version_id {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "tracked live-state root '{}' mixes multiple storage scopes: root storage scope is '{}' but row schema '{}' belongs to '{}'",
+                    commit_id, storage_version_id, row.row.key.schema_key, row_storage_version_id
+                ),
+            ));
+        }
+        if row.row.value.commit_id != commit_id {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "tracked live-state row for schema '{}' has commit_id '{}' but root commit_id is '{}'",
+                    row.row.key.schema_key, row.row.value.commit_id, commit_id
+                ),
+            ));
+        }
+        if row.row.key.schema_key == COMMIT_SCHEMA_KEY {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked_state roots must not store lix_commit rows",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_valid_storage_scope(version_id: &str, global: bool) -> Result<(), LixError> {
+    if global != (version_id == GLOBAL_VERSION_ID) {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("invalid storage scope: version_id='{version_id}', global={global}"),
+        ));
+    }
+    Ok(())
 }
 
 fn tracked_scan_request_from_live(request: &LiveStateScanRequest) -> TrackedStateScanRequest {
@@ -475,9 +494,9 @@ async fn version_ref_exists(
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 
-fn live_state_row_from_commit(commit: CommitGraphCommit) -> LiveStateRow {
+fn live_state_row_from_commit(commit: CommitGraphCommit) -> MaterializedLiveStateRow {
     let change = commit.change;
-    LiveStateRow {
+    MaterializedLiveStateRow {
         entity_id: change.entity_id,
         schema_key: change.schema_key,
         file_id: change.file_id,
@@ -509,11 +528,11 @@ fn tracked_source_from_version_id(version_id: &str) -> TrackedRowSource {
 }
 
 fn project_tracked_row(
-    row: TrackedStateRow,
+    row: MaterializedTrackedStateRow,
     view_version_id: &str,
     source: TrackedRowSource,
-) -> LiveStateRow {
-    LiveStateRow {
+) -> MaterializedLiveStateRow {
+    MaterializedLiveStateRow {
         entity_id: row.entity_id,
         schema_key: row.schema_key,
         file_id: row.file_id,
@@ -530,7 +549,7 @@ fn project_tracked_row(
     }
 }
 
-fn live_state_row_matches_filter(row: &LiveStateRow, filter: &LiveStateFilter) -> bool {
+fn live_state_row_matches_filter(row: &MaterializedLiveStateRow, filter: &LiveStateFilter) -> bool {
     if !filter.schema_keys.is_empty() && !filter.schema_keys.contains(&row.schema_key) {
         return false;
     }
@@ -557,135 +576,6 @@ fn nullable_filter_matches(
         crate::NullableKeyFilter::Null => value.is_none(),
         crate::NullableKeyFilter::Value(expected) => value.as_ref() == Some(expected),
     }
-}
-
-fn grouped_live_rows_by_commit<'a>(
-    rows: &[&'a LiveStateRow],
-) -> Result<Vec<(&'a str, Vec<&'a LiveStateRow>)>, LixError> {
-    let mut grouped = Vec::<(&str, Vec<&LiveStateRow>)>::new();
-    for row in rows {
-        let commit_id = row.commit_id.as_deref().ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked live-state row is missing commit_id before tracked root write",
-            )
-        })?;
-        if let Some((_, bucket)) = grouped
-            .iter_mut()
-            .find(|(existing_commit_id, _)| *existing_commit_id == commit_id)
-        {
-            bucket.push(*row);
-        } else {
-            grouped.push((commit_id, vec![*row]));
-        }
-    }
-    Ok(grouped)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RootWriteScope {
-    version_id: String,
-    global: bool,
-}
-
-fn validate_root_local_write_batch(
-    commit_id: &str,
-    rows: &[&LiveStateRow],
-) -> Result<(), LixError> {
-    let mut root_scope = None::<RootWriteScope>;
-    for row in rows
-        .iter()
-        .copied()
-        .filter(|row| row.schema_key != COMMIT_SCHEMA_KEY)
-    {
-        let scope = RootWriteScope {
-            version_id: row.version_id.clone(),
-            global: row.global,
-        };
-        if row.global != (row.version_id == GLOBAL_VERSION_ID) {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "tracked root write for commit '{commit_id}' has invalid storage scope: version_id='{}', global={}",
-                    row.version_id, row.global
-                ),
-            ));
-        }
-        if let Some(existing) = &root_scope {
-            if existing != &scope {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "tracked root write for commit '{commit_id}' mixes multiple storage scopes"
-                    ),
-                ));
-            }
-        } else {
-            root_scope = Some(scope);
-        }
-    }
-    Ok(())
-}
-
-fn parent_commit_id_for_commit_rows(
-    commit_id: &str,
-    rows: &[&LiveStateRow],
-) -> Result<Option<String>, LixError> {
-    let Some(row) = rows.iter().find(|row| {
-        row.schema_key == COMMIT_SCHEMA_KEY
-            && row
-                .entity_id
-                .as_string()
-                .is_ok_and(|entity_id| entity_id == commit_id)
-    }) else {
-        return Ok(None);
-    };
-    parent_commit_id_from_commit_row(row)
-}
-
-fn parent_commit_id_from_commit_row(row: &&LiveStateRow) -> Result<Option<String>, LixError> {
-    let snapshot = serde_json::from_str::<serde_json::Value>(
-        row.snapshot_content.as_deref().ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "tracked root commit row is missing snapshot_content",
-            )
-        })?,
-    )
-    .map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked root commit snapshot parse failed: {error}"),
-        )
-    })?;
-    let Some(parent_commit_ids_value) = snapshot.get("parent_commit_ids") else {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked root commit row is missing parent_commit_ids",
-        ));
-    };
-    let Some(parent_commit_ids_array) = parent_commit_ids_value.as_array() else {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked root commit parent_commit_ids must be an array",
-        ));
-    };
-    let parent_commit_ids = parent_commit_ids_array
-        .iter()
-        .map(|value| {
-            value.as_str().map(str::to_string).ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "tracked root commit parent_commit_ids must contain strings",
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Tracked roots inherit from the first parent. Merge commits record
-    // additional parents for graph ancestry, but the merge operation has
-    // already materialized the source-side rows as target-version writes.
-    Ok(parent_commit_ids.into_iter().next())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -754,7 +644,7 @@ mod tests {
 
     use super::*;
     use crate::backend::{testing::UnitTestBackend, Backend};
-    use crate::changelog::{canonicalize_materialized_change, MaterializedCanonicalChange};
+    use crate::changelog::MaterializedCanonicalChange;
     use crate::entity_identity::EntityIdentity;
     use crate::json_store::JsonStoreContext;
     use crate::live_state::LiveStateFilter;
@@ -780,18 +670,141 @@ mod tests {
         let canonical_rows = {
             let mut json_writer = JsonStoreContext::new().writer();
             rows.iter()
-                .map(|row| canonicalize_materialized_row(&mut writes, &mut json_writer, row))
+                .map(|row| {
+                    crate::test_support::untracked_state_row_from_materialized(
+                        &mut writes,
+                        &mut json_writer,
+                        row,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .expect("untracked rows should canonicalize")
         };
         UntrackedStateContext::new()
             .writer(&mut writes)
-            .stage_rows(&canonical_rows)
+            .stage_rows(canonical_rows.iter().map(|row| row.as_ref()))
             .expect("untracked rows should write");
         writes
             .apply(store)
             .await
             .expect("untracked rows should apply");
+    }
+
+    async fn stage_materialized_live_rows<S>(
+        writer: &mut LiveStateWriter<S>,
+        writes: &mut StorageWriteSet,
+        json_writer: &mut crate::json_store::JsonStoreWriter,
+        rows: &[MaterializedLiveStateRow],
+    ) -> Result<(), LixError>
+    where
+        S: StorageReader,
+    {
+        let mut untracked_rows = Vec::new();
+        let mut tracked_rows_by_commit =
+            std::collections::BTreeMap::<String, Vec<TestTrackedLiveRow>>::new();
+        let mut parent_by_commit = std::collections::BTreeMap::<String, Option<String>>::new();
+
+        for row in rows {
+            if row.untracked {
+                let materialized = crate::untracked_state::MaterializedUntrackedStateRow::from(row);
+                let canonical = crate::test_support::untracked_state_row_from_materialized(
+                    writes,
+                    json_writer,
+                    &materialized,
+                )?;
+                untracked_rows.push(canonical);
+                continue;
+            }
+            let materialized = MaterializedTrackedStateRow::try_from(row)?;
+            let canonical = crate::test_support::tracked_state_row_from_materialized(
+                writes,
+                json_writer,
+                &materialized,
+            )?;
+            let commit_id = row.commit_id.clone().ok_or_else(|| {
+                LixError::new("LIX_ERROR_UNKNOWN", "test tracked row missing commit_id")
+            })?;
+            if row.schema_key == COMMIT_SCHEMA_KEY {
+                parent_by_commit.insert(
+                    commit_id.clone(),
+                    parent_commit_id_from_test_commit_row(row)?,
+                );
+            }
+            tracked_rows_by_commit
+                .entry(commit_id)
+                .or_default()
+                .push(TestTrackedLiveRow {
+                    row: canonical,
+                    global: row.global,
+                    version_id: row.version_id.clone(),
+                });
+        }
+
+        writer.stage_untracked_rows(writes, untracked_rows.iter().map(|row| row.as_ref()))?;
+        for (commit_id, rows) in tracked_rows_by_commit {
+            let parent_commit_id = parent_by_commit.remove(&commit_id).flatten();
+            let storage_version_id = rows
+                .first()
+                .map(TestTrackedLiveRow::storage_version_id)
+                .unwrap_or(GLOBAL_VERSION_ID);
+            writer
+                .stage_tracked_root(
+                    writes,
+                    storage_version_id,
+                    &commit_id,
+                    parent_commit_id.as_deref(),
+                    rows.iter()
+                        .filter(|row| row.row.schema_key != COMMIT_SCHEMA_KEY)
+                        .map(TestTrackedLiveRow::as_ref),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    struct TestTrackedLiveRow {
+        row: crate::tracked_state::TrackedStateRow,
+        global: bool,
+        version_id: String,
+    }
+
+    impl TestTrackedLiveRow {
+        fn as_ref(&self) -> LiveStateTrackedRowRef<'_> {
+            LiveStateTrackedRowRef {
+                row: self.row.as_ref(),
+                global: self.global,
+                version_id: &self.version_id,
+            }
+        }
+
+        fn storage_version_id(&self) -> &str {
+            if self.global {
+                GLOBAL_VERSION_ID
+            } else {
+                &self.version_id
+            }
+        }
+    }
+
+    fn parent_commit_id_from_test_commit_row(
+        row: &MaterializedLiveStateRow,
+    ) -> Result<Option<String>, LixError> {
+        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+            return Ok(None);
+        };
+        let snapshot =
+            serde_json::from_str::<serde_json::Value>(snapshot_content).map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("test commit row has invalid snapshot: {error}"),
+                )
+            })?;
+        Ok(snapshot
+            .get("parent_commit_ids")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|parents| parents.first())
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string))
     }
 
     #[tokio::test]
@@ -809,18 +822,18 @@ mod tests {
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 let mut writer = live_state.writer(transaction.as_mut());
-                writer
-                    .stage_rows(
-                        &mut writes,
-                        &mut json_writer,
-                        &[tracked_row_with_commit(
-                            "tracked-value",
-                            Some("change-tracked"),
-                            "commit-tracked",
-                        )],
-                    )
-                    .await
-                    .expect("tracked row should stage");
+                stage_materialized_live_rows(
+                    &mut writer,
+                    &mut writes,
+                    &mut json_writer,
+                    &[tracked_row_with_commit(
+                        "tracked-value",
+                        Some("change-tracked"),
+                        "commit-tracked",
+                    )],
+                )
+                .await
+                .expect("tracked row should stage");
             }
             writes
                 .apply(&mut transaction.as_mut())
@@ -881,18 +894,18 @@ mod tests {
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 let mut writer = live_state.writer(transaction.as_mut());
-                writer
-                    .stage_rows(
-                        &mut writes,
-                        &mut json_writer,
-                        &[tracked_row_with_commit(
-                            "tracked-value",
-                            Some("change-tracked"),
-                            "commit-tracked",
-                        )],
-                    )
-                    .await
-                    .expect("tracked row should stage");
+                stage_materialized_live_rows(
+                    &mut writer,
+                    &mut writes,
+                    &mut json_writer,
+                    &[tracked_row_with_commit(
+                        "tracked-value",
+                        Some("change-tracked"),
+                        "commit-tracked",
+                    )],
+                )
+                .await
+                .expect("tracked row should stage");
             }
             writes
                 .apply(&mut transaction.as_mut())
@@ -933,18 +946,18 @@ mod tests {
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 let mut writer = live_state.writer(transaction.as_mut());
-                writer
-                    .stage_rows(
-                        &mut writes,
-                        &mut json_writer,
-                        &[tracked_row_with_commit(
-                            "tracked-value",
-                            Some("change-tracked"),
-                            "commit-tracked",
-                        )],
-                    )
-                    .await
-                    .expect("tracked row should stage");
+                stage_materialized_live_rows(
+                    &mut writer,
+                    &mut writes,
+                    &mut json_writer,
+                    &[tracked_row_with_commit(
+                        "tracked-value",
+                        Some("change-tracked"),
+                        "commit-tracked",
+                    )],
+                )
+                .await
+                .expect("tracked row should stage");
             }
             writes
                 .apply(&mut transaction.as_mut())
@@ -961,14 +974,15 @@ mod tests {
         .await;
         {
             let mut writes = StorageWriteSet::new();
+            let identity = crate::untracked_state::UntrackedStateIdentity {
+                version_id: "global".to_string(),
+                schema_key: "lix_key_value".to_string(),
+                entity_id: EntityIdentity::single("selected-tab"),
+                file_id: None,
+            };
             UntrackedStateContext::new()
                 .writer(&mut writes)
-                .stage_delete_rows(&[crate::untracked_state::UntrackedStateIdentity {
-                    version_id: "global".to_string(),
-                    schema_key: "lix_key_value".to_string(),
-                    entity_id: EntityIdentity::single("selected-tab"),
-                    file_id: None,
-                }]);
+                .stage_delete_rows(std::iter::once(identity.as_ref()));
             writes
                 .apply(&mut transaction.as_mut())
                 .await
@@ -1008,8 +1022,7 @@ mod tests {
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 let mut writer = live_state.writer(transaction.as_mut());
-                writer
-                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&mut writer, &mut writes, &mut json_writer, &rows)
                     .await
                     .expect("tracked row should stage");
             }
@@ -1067,8 +1080,7 @@ mod tests {
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 let mut writer = live_state.writer(transaction.as_mut());
-                writer
-                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&mut writer, &mut writes, &mut json_writer, &rows)
                     .await
                     .expect("global tracked row should stage");
             }
@@ -1131,8 +1143,7 @@ mod tests {
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 let mut writer = live_state.writer(transaction.as_mut());
-                writer
-                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&mut writer, &mut writes, &mut json_writer, &rows)
                     .await
                     .expect("tracked rows should stage");
             }
@@ -1188,8 +1199,7 @@ mod tests {
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 let mut writer = live_state.writer(transaction.as_mut());
-                writer
-                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&mut writer, &mut writes, &mut json_writer, &rows)
                     .await
                     .expect("tracked rows should stage");
             }
@@ -1245,8 +1255,7 @@ mod tests {
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 let mut writer = live_state.writer(transaction.as_mut());
-                writer
-                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&mut writer, &mut writes, &mut json_writer, &rows)
                     .await
                     .expect("tracked rows should stage");
             }
@@ -1304,8 +1313,7 @@ mod tests {
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 let mut writer = live_state.writer(transaction.as_mut());
-                writer
-                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&mut writer, &mut writes, &mut json_writer, &rows)
                     .await
                     .expect("rows should stage");
             }
@@ -1356,8 +1364,7 @@ mod tests {
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 let mut writer = live_state.writer(transaction.as_mut());
-                writer
-                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&mut writer, &mut writes, &mut json_writer, &rows)
                     .await
                     .expect("rows should stage");
             }
@@ -1409,8 +1416,7 @@ mod tests {
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 let mut writer = live_state.writer(transaction.as_mut());
-                writer
-                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&mut writer, &mut writes, &mut json_writer, &rows)
                     .await
                     .expect("tracked row should stage");
             }
@@ -1460,8 +1466,7 @@ mod tests {
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 let mut writer = live_state.writer(transaction.as_mut());
-                writer
-                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&mut writer, &mut writes, &mut json_writer, &rows)
                     .await
                     .expect("rows should stage");
             }
@@ -1516,8 +1521,7 @@ mod tests {
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 let mut writer = live_state.writer(transaction.as_mut());
-                writer
-                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&mut writer, &mut writes, &mut json_writer, &rows)
                     .await
                     .expect("tracked rows should stage");
             }
@@ -1660,9 +1664,7 @@ mod tests {
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
             let mut writer = live_state.writer(transaction.as_mut());
-            writer
-                .stage_rows(&mut writes, &mut json_writer, &rows)
-                .await
+            stage_materialized_live_rows(&mut writer, &mut writes, &mut json_writer, &rows).await
         }
         .expect_err("one tracked root must not mix global and version rows");
 
@@ -1690,9 +1692,7 @@ mod tests {
             let mut writes = StorageWriteSet::new();
             let mut json_writer = JsonStoreContext::new().writer();
             let mut writer = live_state.writer(transaction.as_mut());
-            writer
-                .stage_rows(&mut writes, &mut json_writer, &rows)
-                .await
+            stage_materialized_live_rows(&mut writer, &mut writes, &mut json_writer, &rows).await
         }
         .expect_err("global rows must be stored in the global root only");
 
@@ -1726,8 +1726,7 @@ mod tests {
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 let mut writer = live_state.writer(transaction.as_mut());
-                writer
-                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&mut writer, &mut writes, &mut json_writer, &rows)
                     .await
                     .expect("commit facts are changelog projections, not root-local rows");
             }
@@ -1764,16 +1763,14 @@ mod tests {
             .expect("seed transaction should open");
         let mut writes = StorageWriteSet::new();
         {
-            let mut json_writer = JsonStoreContext::new().writer();
             TrackedStateContext::new()
                 .writer()
                 .stage_root(
                     &mut seed_transaction.as_mut(),
                     &mut writes,
-                    &mut json_writer,
                     "parent-left",
                     None,
-                    &[],
+                    std::iter::empty(),
                 )
                 .await
                 .expect("first parent root should exist");
@@ -1809,8 +1806,7 @@ mod tests {
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 let mut writer = live_state.writer(transaction.as_mut());
-                writer
-                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&mut writer, &mut writes, &mut json_writer, &rows)
                     .await
                     .expect("merge commit should use first parent as tracked-root base");
             }
@@ -1819,91 +1815,6 @@ mod tests {
                 .await
                 .expect("merge commit rows should apply");
         }
-    }
-
-    #[tokio::test]
-    async fn writer_rejects_commit_root_with_missing_parent_commit_ids() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
-        let live_state = live_state_context();
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-
-        let error = {
-            let rows = [
-                tracked_row_at_with_commit(
-                    "version-a",
-                    "version-row",
-                    Some("change-version"),
-                    "commit-malformed",
-                ),
-                commit_live_state_row_with_snapshot(
-                    "commit-malformed",
-                    json!({
-                        "id": "commit-malformed",
-                        "change_set_id": "change-set-commit-malformed",
-                        "change_ids": ["change-version"],
-                    }),
-                ),
-            ];
-            let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
-            let mut writer = live_state.writer(transaction.as_mut());
-            writer
-                .stage_rows(&mut writes, &mut json_writer, &rows)
-                .await
-        }
-        .expect_err("commit roots must declare parent_commit_ids");
-
-        assert!(
-            error.message.contains("missing parent_commit_ids"),
-            "unexpected error: {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn writer_rejects_commit_root_with_non_array_parent_commit_ids() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(Arc::clone(&backend));
-        let live_state = live_state_context();
-        let mut transaction = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-
-        let error = {
-            let rows = [
-                tracked_row_at_with_commit(
-                    "version-a",
-                    "version-row",
-                    Some("change-version"),
-                    "commit-malformed",
-                ),
-                commit_live_state_row_with_snapshot(
-                    "commit-malformed",
-                    json!({
-                        "id": "commit-malformed",
-                        "change_set_id": "change-set-commit-malformed",
-                        "change_ids": ["change-version"],
-                        "parent_commit_ids": "parent-1",
-                    }),
-                ),
-            ];
-            let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
-            let mut writer = live_state.writer(transaction.as_mut());
-            writer
-                .stage_rows(&mut writes, &mut json_writer, &rows)
-                .await
-        }
-        .expect_err("commit root parent_commit_ids must be an array");
-
-        assert!(
-            error.message.contains("parent_commit_ids must be an array"),
-            "unexpected error: {error:?}"
-        );
     }
 
     #[tokio::test]
@@ -1935,8 +1846,7 @@ mod tests {
             let mut json_writer = JsonStoreContext::new().writer();
             {
                 let mut writer = live_state.writer(transaction.as_mut());
-                writer
-                    .stage_rows(&mut writes, &mut json_writer, &rows)
+                stage_materialized_live_rows(&mut writer, &mut writes, &mut json_writer, &rows)
                     .await
                     .expect("tracked rows should stage");
             }
@@ -1967,7 +1877,7 @@ mod tests {
     async fn load_selected_tab(
         live_state: &LiveStateContext,
         storage: StorageContext,
-    ) -> Result<Option<LiveStateRow>, LixError> {
+    ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         live_state
             .reader(storage)
             .load_row(&LiveStateRowRequest {
@@ -1983,7 +1893,7 @@ mod tests {
         live_state: &LiveStateContext,
         storage: StorageContext,
         version_id: &str,
-    ) -> Result<Option<LiveStateRow>, LixError> {
+    ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         live_state
             .reader(storage)
             .load_row(&LiveStateRowRequest {
@@ -2000,7 +1910,7 @@ mod tests {
         storage: StorageContext,
         version_id: &str,
         include_tombstones: bool,
-    ) -> Result<Vec<LiveStateRow>, LixError> {
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         live_state
             .reader(storage)
             .scan_rows(&LiveStateScanRequest {
@@ -2023,7 +1933,7 @@ mod tests {
         tracked_state: &TrackedStateContext,
         storage: StorageContext,
         commit_id: &str,
-    ) -> Vec<TrackedStateRow> {
+    ) -> Vec<MaterializedTrackedStateRow> {
         tracked_state
             .reader(storage)
             .scan_rows_at_commit(
@@ -2044,7 +1954,7 @@ mod tests {
         value: &str,
         change_id: Option<&str>,
         commit_id: &str,
-    ) -> LiveStateRow {
+    ) -> MaterializedLiveStateRow {
         tracked_row_at_with_commit("global", value, change_id, commit_id)
     }
 
@@ -2053,8 +1963,8 @@ mod tests {
         value: &str,
         change_id: Option<&str>,
         commit_id: &str,
-    ) -> LiveStateRow {
-        LiveStateRow {
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: identity("selected-tab"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
@@ -2075,8 +1985,8 @@ mod tests {
         version_id: &str,
         change_id: Option<&str>,
         commit_id: &str,
-    ) -> LiveStateRow {
-        LiveStateRow {
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             snapshot_content: None,
             ..tracked_row_at_with_commit(version_id, "ignored", change_id, commit_id)
         }
@@ -2131,13 +2041,19 @@ mod tests {
         let canonical_refs = {
             let mut json_writer = JsonStoreContext::new().writer();
             refs.iter()
-                .map(|row| canonicalize_materialized_row(&mut writes, &mut json_writer, row))
+                .map(|row| {
+                    crate::test_support::untracked_state_row_from_materialized(
+                        &mut writes,
+                        &mut json_writer,
+                        row,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .expect("version refs should canonicalize")
         };
         UntrackedStateContext::new()
             .writer(&mut writes)
-            .stage_rows(&canonical_refs)
+            .stage_rows(canonical_refs.iter().map(|row| row.as_ref()))
             .expect("version refs should write");
         writes
             .apply(&mut transaction.as_mut())
@@ -2149,14 +2065,14 @@ mod tests {
             .expect("version-ref transaction should commit");
     }
 
-    fn commit_live_state_row(commit_id: &str) -> LiveStateRow {
+    fn commit_live_state_row(commit_id: &str) -> MaterializedLiveStateRow {
         commit_live_state_row_with_parents(commit_id, &[])
     }
 
     fn commit_live_state_row_with_parents(
         commit_id: &str,
         parent_commit_ids: &[&str],
-    ) -> LiveStateRow {
+    ) -> MaterializedLiveStateRow {
         commit_live_state_row_with_snapshot(
             commit_id,
             json!({
@@ -2171,8 +2087,8 @@ mod tests {
     fn commit_live_state_row_with_snapshot(
         commit_id: &str,
         snapshot: serde_json::Value,
-    ) -> LiveStateRow {
-        LiveStateRow {
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: identity(commit_id),
             schema_key: COMMIT_SCHEMA_KEY.to_string(),
             file_id: None,
@@ -2218,12 +2134,16 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         let canonical_change = {
             let mut json_writer = JsonStoreContext::new().writer();
-            canonicalize_materialized_change(&mut writes, &mut json_writer, &change)
-                .expect("commit change should canonicalize")
+            crate::test_support::canonical_change_from_materialized(
+                &mut writes,
+                &mut json_writer,
+                &change,
+            )
+            .expect("commit change should canonicalize")
         };
         changelog
             .writer(&mut writes)
-            .stage_changes(&[canonical_change])
+            .stage_changes(std::iter::once(canonical_change.as_ref()))
             .expect("commit change should append");
         writes
             .apply(&mut transaction.as_mut())

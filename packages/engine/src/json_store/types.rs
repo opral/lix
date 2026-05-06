@@ -1,4 +1,37 @@
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+use std::sync::Arc;
+
+use crate::LixError;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NormalizedJson(Arc<str>);
+
+impl NormalizedJson {
+    pub(crate) fn from_arc_unchecked(normalized: Arc<str>) -> Self {
+        Self(normalized)
+    }
+
+    pub(crate) fn from_value(value: &serde_json::Value, context: &str) -> Result<Self, LixError> {
+        let normalized: Arc<str> = serde_json::to_string(value)
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_UNKNOWN,
+                    format!("{context} failed to serialize as normalized JSON: {error}"),
+                )
+            })?
+            .into();
+        Ok(Self(normalized))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.as_str().as_bytes()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct JsonRef {
     hash: [u8; 32],
 }

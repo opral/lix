@@ -5,7 +5,6 @@ use crate::changelog::ChangelogContext;
 use crate::commit_graph::CommitGraphContext;
 use crate::entity_identity::EntityIdentity;
 use crate::init::InitReceipt;
-use crate::json_store::JsonStoreContext;
 use crate::live_state::LiveStateContext;
 use crate::live_state::LiveStateRowRequest;
 use crate::schema_registry::SchemaRegistry;
@@ -29,7 +28,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Seeds an empty backend with the engine2 repository bootstrap facts.
+    /// Seeds an empty backend with the engine repository bootstrap facts.
     ///
     /// Initialization is a storage lifecycle operation, separate from runtime
     /// construction. Call this before `Engine::new(...)` for a brand-new
@@ -85,11 +84,6 @@ impl Engine {
 
     pub(crate) fn storage(&self) -> StorageContext {
         self.storage.clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn tracked_state(&self) -> Arc<TrackedStateContext> {
-        Arc::clone(&self.tracked_state)
     }
 
     /// Loads the current commit head for a version.
@@ -174,7 +168,6 @@ impl Engine {
         let mut read_transaction = storage.begin_read_transaction().await?;
         let mut transaction = storage.begin_write_transaction().await?;
         let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer();
         let rebuild_result = self
             .tracked_state
             .rebuild_state_at_commit(
@@ -182,7 +175,6 @@ impl Engine {
                 read_transaction.as_mut(),
                 transaction.as_mut(),
                 &mut writes,
-                &mut json_writer,
                 &head_commit_id,
             )
             .await;
@@ -234,6 +226,6 @@ async fn assert_initialized(
 
     Err(LixError::new(
         "LIX_ERROR_NOT_INITIALIZED",
-        "engine2 backend is not initialized; call Engine::initialize(...) before Engine::new(...)",
+        "engine backend is not initialized; call Engine::initialize(...) before Engine::new(...)",
     ))
 }

@@ -1,6 +1,8 @@
 use crate::entity_identity::EntityIdentity;
 use crate::tracked_state::tree_types::TrackedStateTreeScanRequest;
-use crate::tracked_state::{TrackedStateFilter, TrackedStateRow, TrackedStateStoreReader};
+use crate::tracked_state::{
+    MaterializedTrackedStateRow, TrackedStateFilter, TrackedStateStoreReader,
+};
 use crate::LixError;
 
 /// Filter for comparing two tracked-state commit roots.
@@ -24,12 +26,12 @@ pub(crate) struct TrackedStateDiffEntry {
     ///
     /// This can be a tombstone. Callers that need user-visible semantics
     /// should use `visible_before()` instead of inspecting this directly.
-    pub(crate) before: Option<TrackedStateRow>,
+    pub(crate) before: Option<MaterializedTrackedStateRow>,
     /// Raw row in the right root.
     ///
     /// This can be a tombstone. Keeping the raw tombstone is what lets merge
     /// apply deletes without reloading the source root.
-    pub(crate) after: Option<TrackedStateRow>,
+    pub(crate) after: Option<MaterializedTrackedStateRow>,
 }
 
 /// Root-local tracked-state identity.
@@ -101,8 +103,8 @@ fn scan_request_for_diff(request: &TrackedStateDiffRequest) -> TrackedStateTreeS
 
 fn classify_diff(
     identity: TrackedStateDiffIdentity,
-    before: Option<TrackedStateRow>,
-    after: Option<TrackedStateRow>,
+    before: Option<MaterializedTrackedStateRow>,
+    after: Option<MaterializedTrackedStateRow>,
 ) -> Option<TrackedStateDiffEntry> {
     match (is_live_row(before.as_ref()), is_live_row(after.as_ref())) {
         (None, None) => None,
@@ -128,18 +130,21 @@ fn classify_diff(
     }
 }
 
-fn is_live_row(row: Option<&TrackedStateRow>) -> Option<&TrackedStateRow> {
+fn is_live_row(row: Option<&MaterializedTrackedStateRow>) -> Option<&MaterializedTrackedStateRow> {
     row.filter(|row| row.snapshot_content.is_some())
 }
 
-fn tracked_row_payload_eq(left: &TrackedStateRow, right: &TrackedStateRow) -> bool {
+fn tracked_row_payload_eq(
+    left: &MaterializedTrackedStateRow,
+    right: &MaterializedTrackedStateRow,
+) -> bool {
     left.snapshot_content == right.snapshot_content
         && left.metadata == right.metadata
         && left.schema_version == right.schema_version
 }
 
 impl TrackedStateDiffIdentity {
-    fn from_row(row: &TrackedStateRow) -> Result<Self, LixError> {
+    fn from_row(row: &MaterializedTrackedStateRow) -> Result<Self, LixError> {
         Ok(Self {
             schema_key: row.schema_key.clone(),
             entity_id: row.entity_id.clone(),
@@ -160,14 +165,14 @@ impl TrackedStateDiffEntry {
     }
 
     #[cfg(test)]
-    pub(crate) fn visible_before(&self) -> Option<&TrackedStateRow> {
+    pub(crate) fn visible_before(&self) -> Option<&MaterializedTrackedStateRow> {
         self.before
             .as_ref()
             .filter(|row| row.snapshot_content.is_some())
     }
 
     #[cfg(test)]
-    pub(crate) fn visible_after(&self) -> Option<&TrackedStateRow> {
+    pub(crate) fn visible_after(&self) -> Option<&MaterializedTrackedStateRow> {
         self.after
             .as_ref()
             .filter(|row| row.snapshot_content.is_some())
@@ -385,8 +390,8 @@ mod tests {
     }
 
     async fn seed_roots(
-        left_rows: &[TrackedStateRow],
-        right_rows: &[TrackedStateRow],
+        left_rows: &[MaterializedTrackedStateRow],
+        right_rows: &[MaterializedTrackedStateRow],
     ) -> (StorageContext, TrackedStateContext) {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
@@ -410,20 +415,24 @@ mod tests {
         tracked_state: &TrackedStateContext,
         commit_id: &str,
         parent_commit_id: Option<&str>,
-        rows: &[TrackedStateRow],
+        rows: &[MaterializedTrackedStateRow],
     ) -> Result<(), LixError> {
         let mut writes = StorageWriteSet::new();
         {
             let mut json_writer = JsonStoreContext::new().writer();
+            let canonical_rows = crate::test_support::tracked_state_rows_from_materialized(
+                &mut writes,
+                &mut json_writer,
+                rows,
+            )?;
             tracked_state
                 .writer()
                 .stage_root(
                     tx,
                     &mut writes,
-                    &mut json_writer,
                     commit_id,
                     parent_commit_id,
-                    rows,
+                    canonical_rows.iter().map(|row| row.as_ref()),
                 )
                 .await?;
         }
@@ -443,13 +452,17 @@ mod tests {
             .collect()
     }
 
-    fn tombstone(entity_id: &str, file_id: Option<&str>, change_id: &str) -> TrackedStateRow {
+    fn tombstone(
+        entity_id: &str,
+        file_id: Option<&str>,
+        change_id: &str,
+    ) -> MaterializedTrackedStateRow {
         let mut row = row(entity_id, file_id, change_id);
         row.snapshot_content = None;
         row
     }
 
-    fn row(entity_id: &str, file_id: Option<&str>, change_id: &str) -> TrackedStateRow {
+    fn row(entity_id: &str, file_id: Option<&str>, change_id: &str) -> MaterializedTrackedStateRow {
         row_with_schema(entity_id, file_id, "test_schema", change_id)
     }
 
@@ -458,7 +471,7 @@ mod tests {
         file_id: Option<&str>,
         schema_key: &str,
         change_id: &str,
-    ) -> TrackedStateRow {
+    ) -> MaterializedTrackedStateRow {
         row_with_schema_and_value(entity_id, file_id, schema_key, change_id, "value")
     }
 
@@ -467,7 +480,7 @@ mod tests {
         file_id: Option<&str>,
         change_id: &str,
         value: &str,
-    ) -> TrackedStateRow {
+    ) -> MaterializedTrackedStateRow {
         row_with_schema_and_value(entity_id, file_id, "test_schema", change_id, value)
     }
 
@@ -477,8 +490,8 @@ mod tests {
         schema_key: &str,
         change_id: &str,
         value: &str,
-    ) -> TrackedStateRow {
-        TrackedStateRow {
+    ) -> MaterializedTrackedStateRow {
+        MaterializedTrackedStateRow {
             entity_id: EntityIdentity::single(entity_id),
             schema_key: schema_key.to_string(),
             file_id: file_id.map(str::to_string),

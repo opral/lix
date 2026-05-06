@@ -1,29 +1,15 @@
-use crate::json_store::{JsonRef, JsonStoreReader, JsonStoreWriter};
-use crate::storage::{StorageReader, StorageWriteSet};
+use crate::json_store::{JsonRef, JsonStoreReader};
+use crate::storage::StorageReader;
 use crate::tracked_state::tree_types::{TrackedStateKey, TrackedStateValue};
-use crate::tracked_state::TrackedStateRow;
-use crate::{serialize_row_metadata, validate_row_metadata, LixError, RowMetadata};
-
-pub(crate) fn canonicalize_materialized_row(
-    writes: &mut StorageWriteSet,
-    json_writer: &mut JsonStoreWriter,
-    row: &TrackedStateRow,
-) -> Result<TrackedStateValue, LixError> {
-    let snapshot_ref = stage_optional_json(writes, json_writer, row.snapshot_content.as_deref())?;
-    let metadata_ref = stage_optional_metadata(writes, json_writer, row.metadata.as_ref())?;
-    Ok(TrackedStateValue::from_row_refs(
-        row,
-        snapshot_ref,
-        metadata_ref,
-    ))
-}
+use crate::tracked_state::MaterializedTrackedStateRow;
+use crate::{parse_row_metadata, LixError};
 
 pub(crate) async fn materialize_value<S>(
     json_reader: &mut JsonStoreReader<S>,
     key: TrackedStateKey,
     value: TrackedStateValue,
     projection: &TrackedMaterializationProjection,
-) -> Result<TrackedStateRow, LixError>
+) -> Result<MaterializedTrackedStateRow, LixError>
 where
     S: StorageReader,
 {
@@ -65,48 +51,17 @@ impl TrackedMaterializationProjection {
     }
 }
 
-fn stage_optional_json(
-    writes: &mut StorageWriteSet,
-    json_writer: &mut JsonStoreWriter,
-    value: Option<&str>,
-) -> Result<Option<JsonRef>, LixError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    json_writer.stage_bytes(writes, value.as_bytes()).map(Some)
-}
-
-fn stage_optional_metadata(
-    writes: &mut StorageWriteSet,
-    json_writer: &mut JsonStoreWriter,
-    value: Option<&RowMetadata>,
-) -> Result<Option<JsonRef>, LixError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let serialized = serialize_row_metadata(value);
-    json_writer
-        .stage_bytes(writes, serialized.as_bytes())
-        .map(Some)
-}
-
 async fn load_optional_metadata<S>(
     json_reader: &mut JsonStoreReader<S>,
     json_ref: Option<&JsonRef>,
-) -> Result<Option<RowMetadata>, LixError>
+) -> Result<Option<String>, LixError>
 where
     S: StorageReader,
 {
     let Some(json) = load_optional_json(json_reader, json_ref, "metadata_ref").await? else {
         return Ok(None);
     };
-    let metadata = serde_json::from_str::<RowMetadata>(&json).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_INVALID_JSON",
-            format!("tracked_state metadata_ref is invalid JSON: {error}"),
-        )
-    })?;
-    validate_row_metadata(metadata, "tracked_state metadata_ref").map(Some)
+    parse_row_metadata(&json, "tracked_state metadata_ref").map(Some)
 }
 
 async fn load_optional_json<S>(

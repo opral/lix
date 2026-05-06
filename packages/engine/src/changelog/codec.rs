@@ -1,35 +1,30 @@
-use crate::changelog::CanonicalChange;
+use crate::changelog::{CanonicalChange, CanonicalChangeRef};
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
 use crate::LixError;
 
 const CHANGELOG_FILE_IDENTIFIER: &str = "LXCH";
 
-pub(crate) fn encode_change(change: &CanonicalChange) -> Result<Vec<u8>, LixError> {
-    let entity_id = change.entity_id.as_string().map_err(|error| {
+pub(crate) fn encode_change_ref(change: CanonicalChangeRef<'_>) -> Result<Vec<u8>, LixError> {
+    let entity_id = change.entity_id.as_cow_str().map_err(|error| {
         LixError::unknown(format!(
             "failed to encode changelog entity identity: {error}"
         ))
     })?;
 
     let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(256);
-    let id = builder.create_string(&change.id);
+    let id = builder.create_string(change.id);
     let entity_id = builder.create_string(&entity_id);
-    let schema_key = builder.create_string(&change.schema_key);
-    let schema_version = builder.create_string(&change.schema_version);
-    let file_id = change
-        .file_id
-        .as_ref()
-        .map(|value| builder.create_string(value));
+    let schema_key = builder.create_string(change.schema_key);
+    let schema_version = builder.create_string(change.schema_version);
+    let file_id = change.file_id.map(|value| builder.create_string(value));
     let snapshot_ref = change
         .snapshot_ref
-        .as_ref()
         .map(|value| builder.create_vector(value.as_hash_bytes()));
     let metadata_ref = change
         .metadata_ref
-        .as_ref()
         .map(|value| builder.create_vector(value.as_hash_bytes()));
-    let created_at = builder.create_string(&change.created_at);
+    let created_at = builder.create_string(change.created_at);
 
     let root = flatbuffer::create_canonical_change(
         &mut builder,

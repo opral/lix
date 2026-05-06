@@ -1,4 +1,4 @@
-//! Engine2 runtime function boundary.
+//! Engine runtime function boundary.
 //!
 //! Sessions prepare one function context per execution. SQL, providers, and
 //! transaction staging receive only a function provider; deterministic mode is

@@ -1,7 +1,7 @@
 use serde_json::json;
 
 use crate::entity_identity::EntityIdentity;
-use crate::transaction::types::StageRow;
+use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::GLOBAL_VERSION_ID;
 
 pub(crate) const VERSION_DESCRIPTOR_SCHEMA_KEY: &str = "lix_version_descriptor";
@@ -9,12 +9,16 @@ pub(crate) const VERSION_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
 pub(crate) const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
 pub(crate) const VERSION_REF_SCHEMA_VERSION: &str = "1";
 
-pub(crate) fn version_descriptor_stage_row(version_id: &str, name: &str, hidden: bool) -> StageRow {
-    StageRow {
+pub(crate) fn version_descriptor_stage_row(
+    version_id: &str,
+    name: &str,
+    hidden: bool,
+) -> TransactionWriteRow {
+    TransactionWriteRow {
         entity_id: Some(EntityIdentity::single(version_id)),
         schema_key: VERSION_DESCRIPTOR_SCHEMA_KEY.to_string(),
         file_id: None,
-        snapshot_content: Some(encode_snapshot(json!({
+        snapshot: Some(TransactionJson::from_value_unchecked(json!({
             "id": version_id,
             "name": name,
             "hidden": hidden,
@@ -32,12 +36,12 @@ pub(crate) fn version_descriptor_stage_row(version_id: &str, name: &str, hidden:
     }
 }
 
-pub(crate) fn version_ref_stage_row(version_id: &str, commit_id: &str) -> StageRow {
-    StageRow {
+pub(crate) fn version_ref_stage_row(version_id: &str, commit_id: &str) -> TransactionWriteRow {
+    TransactionWriteRow {
         entity_id: Some(EntityIdentity::single(version_id)),
         schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
         file_id: None,
-        snapshot_content: Some(encode_snapshot(json!({
+        snapshot: Some(TransactionJson::from_value_unchecked(json!({
             "id": version_id,
             "commit_id": commit_id,
         }))),
@@ -54,18 +58,14 @@ pub(crate) fn version_ref_stage_row(version_id: &str, commit_id: &str) -> StageR
     }
 }
 
-pub(crate) fn version_descriptor_tombstone_row(version_id: &str) -> StageRow {
+pub(crate) fn version_descriptor_tombstone_row(version_id: &str) -> TransactionWriteRow {
     let mut row = version_descriptor_stage_row(version_id, "", false);
-    row.snapshot_content = None;
+    row.snapshot = None;
     row
 }
 
-pub(crate) fn version_ref_tombstone_row(version_id: &str) -> StageRow {
+pub(crate) fn version_ref_tombstone_row(version_id: &str) -> TransactionWriteRow {
     let mut row = version_ref_stage_row(version_id, "");
-    row.snapshot_content = None;
+    row.snapshot = None;
     row
-}
-
-fn encode_snapshot(value: serde_json::Value) -> String {
-    serde_json::to_string(&value).expect("version snapshot should be serializable")
 }

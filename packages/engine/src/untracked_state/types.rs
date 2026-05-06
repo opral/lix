@@ -1,6 +1,6 @@
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
-use crate::{NullableKeyFilter, RowMetadata};
+use crate::NullableKeyFilter;
 
 /// Durable local row excluded from changelog and commit membership.
 ///
@@ -20,6 +20,41 @@ pub(crate) struct UntrackedStateRow {
     pub(crate) version_id: String,
 }
 
+impl UntrackedStateRow {
+    pub(crate) fn as_ref(&self) -> UntrackedStateRowRef<'_> {
+        UntrackedStateRowRef {
+            entity_id: &self.entity_id,
+            schema_key: &self.schema_key,
+            file_id: self.file_id.as_deref(),
+            snapshot_ref: self.snapshot_ref.as_ref(),
+            metadata_ref: self.metadata_ref.as_ref(),
+            schema_version: &self.schema_version,
+            created_at: &self.created_at,
+            updated_at: &self.updated_at,
+            global: self.global,
+            version_id: &self.version_id,
+        }
+    }
+}
+
+/// Borrowed untracked-state write row.
+///
+/// Untracked state owns this storage-facing write shape. Callers adapt into it
+/// without making untracked_state depend on transaction or live-state types.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UntrackedStateRowRef<'a> {
+    pub(crate) entity_id: &'a EntityIdentity,
+    pub(crate) schema_key: &'a str,
+    pub(crate) file_id: Option<&'a str>,
+    pub(crate) snapshot_ref: Option<&'a JsonRef>,
+    pub(crate) metadata_ref: Option<&'a JsonRef>,
+    pub(crate) schema_version: &'a str,
+    pub(crate) created_at: &'a str,
+    pub(crate) updated_at: &'a str,
+    pub(crate) global: bool,
+    pub(crate) version_id: &'a str,
+}
+
 /// Hydrated boundary shape for callers that still work with JSON payloads.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MaterializedUntrackedStateRow {
@@ -27,7 +62,7 @@ pub(crate) struct MaterializedUntrackedStateRow {
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<String>,
-    pub(crate) metadata: Option<RowMetadata>,
+    pub(crate) metadata: Option<String>,
     pub(crate) schema_version: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
@@ -44,13 +79,32 @@ pub(crate) struct UntrackedStateIdentity {
     pub(crate) file_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UntrackedStateIdentityRef<'a> {
+    pub(crate) version_id: &'a str,
+    pub(crate) schema_key: &'a str,
+    pub(crate) entity_id: &'a EntityIdentity,
+    pub(crate) file_id: Option<&'a str>,
+}
+
 impl UntrackedStateIdentity {
-    pub(crate) fn from_row(row: &UntrackedStateRow) -> Self {
+    pub(crate) fn as_ref(&self) -> UntrackedStateIdentityRef<'_> {
+        UntrackedStateIdentityRef {
+            version_id: &self.version_id,
+            schema_key: &self.schema_key,
+            entity_id: &self.entity_id,
+            file_id: self.file_id.as_deref(),
+        }
+    }
+}
+
+impl<'a> From<UntrackedStateRowRef<'a>> for UntrackedStateIdentityRef<'a> {
+    fn from(row: UntrackedStateRowRef<'a>) -> Self {
         Self {
-            version_id: row.version_id.clone(),
-            schema_key: row.schema_key.clone(),
-            entity_id: row.entity_id.clone(),
-            file_id: row.file_id.clone(),
+            version_id: row.version_id,
+            schema_key: row.schema_key,
+            entity_id: row.entity_id,
+            file_id: row.file_id,
         }
     }
 }

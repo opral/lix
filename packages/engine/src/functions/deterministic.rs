@@ -2,7 +2,7 @@ use crate::functions::FunctionProvider;
 
 const DETERMINISTIC_UUID_COUNTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
-/// Deterministic function provider for engine2 execution.
+/// Deterministic function provider for engine execution.
 ///
 /// The provider is pure runtime state: it does not load or persist the sequence
 /// itself. Session/transaction code owns that boundary so tests can decide when

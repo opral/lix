@@ -3,7 +3,8 @@ use xxhash_rust::xxh3::xxh3_64_with_seed;
 use crate::entity_identity::{EntityIdentity, EntityIdentityPart};
 use crate::json_store::JsonRef;
 use crate::tracked_state::tree_types::{
-    TrackedStateKey, TrackedStateValue, TRACKED_STATE_HASH_BYTES,
+    TrackedStateKey, TrackedStateKeyRef, TrackedStateValue, TrackedStateValueRef,
+    TRACKED_STATE_HASH_BYTES,
 };
 use crate::LixError;
 
@@ -23,6 +24,21 @@ pub(crate) struct EncodedLeafEntry {
     pub(crate) value: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EncodedLeafEntryRef<'a> {
+    pub(crate) key: &'a [u8],
+    pub(crate) value: &'a [u8],
+}
+
+impl EncodedLeafEntry {
+    pub(crate) fn as_ref(&self) -> EncodedLeafEntryRef<'_> {
+        EncodedLeafEntryRef {
+            key: &self.key,
+            value: &self.value,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingChunkWrite {
     pub(crate) hash: [u8; TRACKED_STATE_HASH_BYTES],
@@ -35,6 +51,25 @@ pub(crate) struct ChildSummary {
     pub(crate) last_key: Vec<u8>,
     pub(crate) child_hash: [u8; TRACKED_STATE_HASH_BYTES],
     pub(crate) subtree_count: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChildSummaryRef<'a> {
+    pub(crate) first_key: &'a [u8],
+    pub(crate) last_key: &'a [u8],
+    pub(crate) child_hash: [u8; TRACKED_STATE_HASH_BYTES],
+    pub(crate) subtree_count: u64,
+}
+
+impl ChildSummary {
+    pub(crate) fn as_ref(&self) -> ChildSummaryRef<'_> {
+        ChildSummaryRef {
+            first_key: &self.first_key,
+            last_key: &self.last_key,
+            child_hash: self.child_hash,
+            subtree_count: self.subtree_count,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -70,16 +105,24 @@ pub(crate) fn hash_bytes(bytes: &[u8]) -> [u8; TRACKED_STATE_HASH_BYTES] {
 }
 
 pub(crate) fn encode_key(key: &TrackedStateKey) -> Vec<u8> {
+    encode_key_ref(TrackedStateKeyRef {
+        schema_key: &key.schema_key,
+        file_id: key.file_id.as_deref(),
+        entity_id: &key.entity_id,
+    })
+}
+
+pub(crate) fn encode_key_ref(key: TrackedStateKeyRef<'_>) -> Vec<u8> {
     let mut out = Vec::new();
     push_sized_bytes(&mut out, key.schema_key.as_bytes());
-    match &key.file_id {
+    match key.file_id {
         Some(file_id) => {
             out.push(1);
             push_sized_bytes(&mut out, file_id.as_bytes());
         }
         None => out.push(0),
     }
-    push_entity_identity(&mut out, &key.entity_id);
+    push_entity_identity(&mut out, key.entity_id);
     out
 }
 
@@ -128,11 +171,25 @@ pub(crate) fn decode_key(bytes: &[u8]) -> Result<TrackedStateKey, LixError> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn encode_value(value: &TrackedStateValue) -> Vec<u8> {
+    encode_value_ref(TrackedStateValueRef {
+        snapshot_ref: value.snapshot_ref.as_ref(),
+        metadata_ref: value.metadata_ref.as_ref(),
+        schema_version: &value.schema_version,
+        created_at: &value.created_at,
+        updated_at: &value.updated_at,
+        change_id: &value.change_id,
+        commit_id: &value.commit_id,
+        deleted: value.deleted,
+    })
+}
+
+pub(crate) fn encode_value_ref(value: TrackedStateValueRef<'_>) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(VALUE_VERSION);
-    push_optional_json_ref(&mut out, value.snapshot_ref.as_ref());
-    push_optional_json_ref(&mut out, value.metadata_ref.as_ref());
+    push_optional_json_ref(&mut out, value.snapshot_ref);
+    push_optional_json_ref(&mut out, value.metadata_ref);
     push_sized_bytes(&mut out, value.schema_version.as_bytes());
     push_sized_bytes(&mut out, value.created_at.as_bytes());
     push_sized_bytes(&mut out, value.updated_at.as_bytes());
@@ -240,25 +297,41 @@ fn read_optional_json_ref(
 }
 
 pub(crate) fn encode_leaf_node(entries: &[EncodedLeafEntry]) -> Vec<u8> {
+    let entries = entries
+        .iter()
+        .map(EncodedLeafEntry::as_ref)
+        .collect::<Vec<_>>();
+    encode_leaf_node_refs(&entries)
+}
+
+pub(crate) fn encode_leaf_node_refs(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(NODE_KIND_LEAF);
     out.push(NODE_VERSION);
     push_u32(&mut out, entries.len());
     for entry in entries {
-        push_sized_bytes(&mut out, &entry.key);
-        push_sized_bytes(&mut out, &entry.value);
+        push_sized_bytes(&mut out, entry.key);
+        push_sized_bytes(&mut out, entry.value);
     }
     out
 }
 
 pub(crate) fn encode_internal_node(children: &[ChildSummary]) -> Vec<u8> {
+    let children = children
+        .iter()
+        .map(ChildSummary::as_ref)
+        .collect::<Vec<_>>();
+    encode_internal_node_refs(&children)
+}
+
+pub(crate) fn encode_internal_node_refs(children: &[ChildSummaryRef<'_>]) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(NODE_KIND_INTERNAL);
     out.push(NODE_VERSION);
     push_u32(&mut out, children.len());
     for child in children {
-        push_sized_bytes(&mut out, &child.first_key);
-        push_sized_bytes(&mut out, &child.last_key);
+        push_sized_bytes(&mut out, child.first_key);
+        push_sized_bytes(&mut out, child.last_key);
         out.extend_from_slice(&child.child_hash);
         out.extend_from_slice(&child.subtree_count.to_be_bytes());
     }

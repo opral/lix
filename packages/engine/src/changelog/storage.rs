@@ -1,38 +1,62 @@
-use crate::changelog::codec::{decode_change, encode_change};
-use crate::changelog::{CanonicalChange, ChangelogScanRequest};
+use crate::changelog::codec::decode_change;
+use crate::changelog::{CanonicalChange, CanonicalChangeRef, ChangelogScanRequest};
 use crate::storage::KvScanRange;
 use crate::storage::{KvGetGroup, KvGetRequest, KvScanRequest, StorageReader, StorageWriteSet};
 use crate::LixError;
 
 const CHANGELOG_CHANGE_NAMESPACE: &str = "changelog.change";
 
-pub(crate) async fn load_change(
+pub(crate) async fn load_changes(
     store: &mut impl StorageReader,
-    change_id: &str,
-) -> Result<Option<CanonicalChange>, LixError> {
-    let bytes = store
+    change_ids: &[String],
+) -> Result<Vec<Option<CanonicalChange>>, LixError> {
+    if change_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let result = store
         .get_values(KvGetRequest {
             groups: vec![KvGetGroup {
                 namespace: CHANGELOG_CHANGE_NAMESPACE.to_string(),
-                keys: vec![encode_change_key(change_id)],
+                keys: change_ids
+                    .iter()
+                    .map(|change_id| encode_change_key(change_id))
+                    .collect(),
             }],
         })
-        .await?
-        .groups
-        .into_iter()
-        .next()
-        .and_then(|group| group.single_value_owned());
-    let Some(bytes) = bytes else {
-        return Ok(None);
-    };
-    decode_change(&bytes).map(Some)
+        .await?;
+    let group = result.groups.into_iter().next().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "changelog batch load returned no result group",
+        )
+    })?;
+    if group.len() != change_ids.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "changelog batch load returned {} values for {} requested change ids",
+                group.len(),
+                change_ids.len()
+            ),
+        ));
+    }
+
+    let mut changes = Vec::with_capacity(group.len());
+    for index in 0..group.len() {
+        let change = match group.value(index).flatten() {
+            Some(bytes) => Some(decode_change(bytes)?),
+            None => None,
+        };
+        changes.push(change);
+    }
+    Ok(changes)
 }
 
 pub(crate) async fn scan_changes(
     store: &mut impl StorageReader,
     request: &ChangelogScanRequest,
 ) -> Result<Vec<CanonicalChange>, LixError> {
-    // TODO(engine2): scan by a durable append sequence instead of change id.
+    // TODO(engine): scan by a durable append sequence instead of change id.
     // This first index is enough for exact lookup and deterministic debug scans.
     let page = store
         .scan_values(KvScanRequest {
@@ -45,15 +69,15 @@ pub(crate) async fn scan_changes(
     page.values.iter().map(decode_change).collect()
 }
 
-pub(crate) fn stage_changes(
-    writes: &mut StorageWriteSet,
-    changes: &[CanonicalChange],
-) -> Result<(), LixError> {
+pub(crate) fn stage_changes<'a, I>(writes: &mut StorageWriteSet, changes: I) -> Result<(), LixError>
+where
+    I: IntoIterator<Item = CanonicalChangeRef<'a>>,
+{
     for change in changes {
         writes.put(
             CHANGELOG_CHANGE_NAMESPACE,
-            encode_change_key(&change.id),
-            encode_change(change)?,
+            encode_change_key(change.id),
+            crate::changelog::codec::encode_change_ref(change)?,
         );
     }
     Ok(())
@@ -69,8 +93,7 @@ mod tests {
 
     use crate::backend::testing::UnitTestBackend;
     use crate::changelog::{
-        canonicalize_materialized_change, materialize_change, ChangelogContext,
-        ChangelogScanRequest, MaterializedCanonicalChange,
+        materialize_change, ChangelogContext, ChangelogScanRequest, MaterializedCanonicalChange,
     };
     use crate::json_store::JsonStoreContext;
     use crate::storage::{StorageContext, StorageWriteSet, StorageWriteTransaction};
@@ -78,7 +101,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn append_and_load_change_roundtrips() {
+    async fn append_and_load_changes_roundtrips() {
         let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let changelog = ChangelogContext::new();
         let change = test_change("change-1");
@@ -186,12 +209,18 @@ mod tests {
         let mut json_writer = JsonStoreContext::new().writer();
         let canonical_changes = changes
             .iter()
-            .map(|change| canonicalize_materialized_change(&mut writes, &mut json_writer, change))
+            .map(|change| {
+                crate::test_support::canonical_change_from_materialized(
+                    &mut writes,
+                    &mut json_writer,
+                    change,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()
             .expect("changes should canonicalize");
         let mut writer = changelog.writer(&mut writes);
         writer
-            .stage_changes(&canonical_changes)
+            .stage_changes(canonical_changes.iter().map(|change| change.as_ref()))
             .expect("append should succeed");
         writes
             .apply(&mut tx.as_mut())
@@ -207,9 +236,12 @@ mod tests {
         let canonical = {
             let reader = changelog.reader(storage.clone());
             reader
-                .load_change(change_id)
+                .load_changes(&[change_id.to_string()])
                 .await
                 .expect("load should succeed")
+                .into_iter()
+                .next()
+                .flatten()
         }?;
         let mut json_reader = JsonStoreContext::new().reader(storage);
         materialize_change(&mut json_reader, canonical)

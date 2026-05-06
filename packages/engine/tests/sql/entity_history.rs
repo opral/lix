@@ -19,7 +19,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine2_history_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"active\":{\"type\":\"boolean\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"count\",\"active\",\"meta\"],\"additionalProperties\":false}'),\
+                 lix_json('{\"x-lix-key\":\"engine_history_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"active\":{\"type\":\"boolean\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"count\",\"active\",\"meta\"],\"additionalProperties\":false}'),\
                  false,\
                  true\
                  )",
@@ -30,7 +30,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO engine2_history_schema \
+                "INSERT INTO engine_history_schema \
                  (lixcol_entity_id, id, count, active, meta, lixcol_untracked) \
                  VALUES ('history-entity', 'history-entity', 1, true, lix_json('{\"source\":\"insert\"}'), false)",
                 &[],
@@ -45,7 +45,7 @@ simulation_test!(
 
         session
             .execute(
-                "UPDATE engine2_history_schema \
+                "UPDATE engine_history_schema \
                  SET count = 2, active = false, meta = lix_json('{\"source\":\"update\"}') \
                  WHERE lixcol_entity_id = 'history-entity'",
                 &[],
@@ -63,7 +63,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT id, count, active, meta, lixcol_entity_id, lixcol_observed_commit_id, lixcol_start_commit_id, lixcol_depth \
-                     FROM engine2_history_schema_history \
+                     FROM engine_history_schema_history \
                      WHERE lixcol_start_commit_id = '{second_commit_id}' \
                        AND lixcol_entity_id = 'history-entity' \
                      ORDER BY lixcol_depth"
@@ -117,7 +117,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine2_history_error_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+                 lix_json('{\"x-lix-key\":\"engine_history_error_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
                  false,\
                  true\
                  )",
@@ -127,7 +127,7 @@ simulation_test!(
             .expect("registered schema insert should succeed");
 
         let error = session
-            .execute("SELECT id FROM engine2_history_error_schema_history", &[])
+            .execute("SELECT id FROM engine_history_error_schema_history", &[])
             .await
             .expect_err("typed history queries must provide start commit");
 
@@ -166,7 +166,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine2_history_bare_error_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+                 lix_json('{\"x-lix-key\":\"engine_history_bare_error_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
                  false,\
                  true\
                  )",
@@ -178,7 +178,7 @@ simulation_test!(
         let error = session
             .execute(
                 "SELECT id \
-                 FROM engine2_history_bare_error_schema_history \
+                 FROM engine_history_bare_error_schema_history \
                  WHERE start_commit_id = lix_active_version_commit_id()",
                 &[],
             )

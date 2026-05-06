@@ -10,11 +10,11 @@ use crate::common::{
     parent_directory_path, stable_content_fingerprint_hex, ParsedFilePath,
 };
 use crate::entity_identity::EntityIdentity;
-use crate::live_state::LiveStateRow;
-use crate::{LixError, RowMetadata};
+use crate::live_state::MaterializedLiveStateRow;
+use crate::LixError;
 
 use super::filesystem_visibility::VisibleFilesystem;
-use crate::transaction::types::{StageFileData, StageRow};
+use crate::transaction::types::{TransactionFileData, TransactionJson, TransactionWriteRow};
 
 pub(crate) const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 pub(crate) const FILE_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
@@ -31,8 +31,8 @@ pub(crate) const BLOB_REF_SCHEMA_VERSION: &str = "1";
 /// filesystem write surface.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct FilesystemWritePlan {
-    pub(crate) rows: Vec<StageRow>,
-    pub(crate) file_data: Vec<StageFileData>,
+    pub(crate) rows: Vec<TransactionWriteRow>,
+    pub(crate) file_data: Vec<TransactionFileData>,
     pub(crate) count: u64,
 }
 
@@ -40,7 +40,7 @@ pub(crate) struct FilesystemWritePlan {
 /// and the surface delete has been lowered into tombstone state rows.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct FilesystemDeletePlan {
-    pub(crate) rows: Vec<StageRow>,
+    pub(crate) rows: Vec<TransactionWriteRow>,
     pub(crate) count: u64,
 }
 
@@ -51,7 +51,7 @@ pub(crate) struct FilesystemRowContext {
     pub(crate) global: bool,
     pub(crate) untracked: bool,
     pub(crate) file_id: Option<String>,
-    pub(crate) metadata: Option<RowMetadata>,
+    pub(crate) metadata: Option<TransactionJson>,
 }
 
 impl FilesystemRowContext {
@@ -224,7 +224,7 @@ impl DirectoryPathResolver {
         context: FilesystemRowContext,
         hidden: bool,
         generate_directory_id: &mut dyn FnMut() -> String,
-    ) -> Result<Vec<StageRow>, LixError> {
+    ) -> Result<Vec<TransactionWriteRow>, LixError> {
         self.ensure_directory_path_with_leaf_id(
             directory_path,
             None,
@@ -241,7 +241,7 @@ impl DirectoryPathResolver {
         context: FilesystemRowContext,
         hidden: bool,
         generate_directory_id: &mut dyn FnMut() -> String,
-    ) -> Result<Vec<StageRow>, LixError> {
+    ) -> Result<Vec<TransactionWriteRow>, LixError> {
         self.plan_directory_path(
             directory_path,
             leaf_id,
@@ -259,7 +259,7 @@ impl DirectoryPathResolver {
         context: FilesystemRowContext,
         hidden: bool,
         generate_directory_id: &mut dyn FnMut() -> String,
-    ) -> Result<Vec<StageRow>, LixError> {
+    ) -> Result<Vec<TransactionWriteRow>, LixError> {
         self.plan_directory_path(
             directory_path,
             leaf_id,
@@ -278,7 +278,7 @@ impl DirectoryPathResolver {
         hidden: bool,
         generate_directory_id: &mut dyn FnMut() -> String,
         reject_existing_leaf: bool,
-    ) -> Result<Vec<StageRow>, LixError> {
+    ) -> Result<Vec<TransactionWriteRow>, LixError> {
         let directory_path = normalize_directory_path(directory_path)?;
         if directory_path == "/" {
             if reject_existing_leaf {
@@ -402,7 +402,7 @@ fn filesystem_namespace_conflict_error(
     )
 }
 
-pub(crate) fn directory_descriptor_row(input: DirectoryDescriptorRowInput) -> StageRow {
+pub(crate) fn directory_descriptor_row(input: DirectoryDescriptorRowInput) -> TransactionWriteRow {
     directory_descriptor_write_row(DirectoryDescriptorWriteIntent {
         id: Some(input.id),
         parent_id: input.parent_id,
@@ -412,7 +412,7 @@ pub(crate) fn directory_descriptor_row(input: DirectoryDescriptorRowInput) -> St
     })
 }
 
-pub(crate) fn file_descriptor_row(input: FileDescriptorRowInput) -> StageRow {
+pub(crate) fn file_descriptor_row(input: FileDescriptorRowInput) -> TransactionWriteRow {
     file_descriptor_write_row(FileDescriptorWriteIntent {
         id: Some(input.id),
         directory_id: input.directory_id,
@@ -422,7 +422,9 @@ pub(crate) fn file_descriptor_row(input: FileDescriptorRowInput) -> StageRow {
     })
 }
 
-pub(crate) fn directory_descriptor_write_row(input: DirectoryDescriptorWriteIntent) -> StageRow {
+pub(crate) fn directory_descriptor_write_row(
+    input: DirectoryDescriptorWriteIntent,
+) -> TransactionWriteRow {
     let mut snapshot = JsonMap::new();
     if let Some(id) = input.id.as_ref() {
         snapshot.insert("id".to_string(), JsonValue::String(id.clone()));
@@ -444,12 +446,12 @@ pub(crate) fn directory_descriptor_write_row(input: DirectoryDescriptorWriteInte
         input.id,
         DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
         DIRECTORY_DESCRIPTOR_SCHEMA_VERSION.to_string(),
-        Some(JsonValue::Object(snapshot).to_string()),
+        Some(JsonValue::Object(snapshot)),
         input.context,
     )
 }
 
-pub(crate) fn file_descriptor_write_row(input: FileDescriptorWriteIntent) -> StageRow {
+pub(crate) fn file_descriptor_write_row(input: FileDescriptorWriteIntent) -> TransactionWriteRow {
     let mut snapshot = JsonMap::new();
     if let Some(id) = input.id.as_ref() {
         snapshot.insert("id".to_string(), JsonValue::String(id.clone()));
@@ -471,12 +473,12 @@ pub(crate) fn file_descriptor_write_row(input: FileDescriptorWriteIntent) -> Sta
         input.id,
         FILE_DESCRIPTOR_SCHEMA_KEY,
         FILE_DESCRIPTOR_SCHEMA_VERSION.to_string(),
-        Some(JsonValue::Object(snapshot).to_string()),
+        Some(JsonValue::Object(snapshot)),
         input.context,
     )
 }
 
-pub(crate) fn blob_ref_row(input: BlobRefRowInput) -> Result<StageRow, LixError> {
+pub(crate) fn blob_ref_row(input: BlobRefRowInput) -> Result<TransactionWriteRow, LixError> {
     let size_bytes = u64::try_from(input.data.len()).map_err(|_| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -486,18 +488,17 @@ pub(crate) fn blob_ref_row(input: BlobRefRowInput) -> Result<StageRow, LixError>
             ),
         )
     })?;
-    let snapshot_content = json!({
+    let snapshot = json!({
         "id": input.file_id.clone(),
         "blob_hash": stable_content_fingerprint_hex(&input.data),
         "size_bytes": size_bytes,
-    })
-    .to_string();
+    });
 
     Ok(state_row(
         input.file_id.clone(),
         BLOB_REF_SCHEMA_KEY,
         BLOB_REF_SCHEMA_VERSION.to_string(),
-        Some(snapshot_content),
+        Some(snapshot),
         FilesystemRowContext {
             file_id: Some(input.file_id),
             ..input.context
@@ -549,7 +550,7 @@ pub(crate) fn plan_file_path_write(
                 ..input.context.clone()
             },
         })?);
-        file_data.push(StageFileData {
+        file_data.push(TransactionFileData {
             file_id,
             version_id: input.context.version_id,
             untracked: input.context.untracked,
@@ -675,7 +676,7 @@ pub(crate) fn plan_recursive_directory_delete(
 }
 
 pub(crate) fn directory_path_resolvers_from_state_rows(
-    rows: Vec<LiveStateRow>,
+    rows: Vec<MaterializedLiveStateRow>,
 ) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
     let mut directory_rows = BTreeMap::<String, BTreeMap<String, DirectoryDescriptorSeed>>::new();
     let mut file_rows = BTreeMap::<String, Vec<(Option<String>, String, String)>>::new();
@@ -815,14 +816,14 @@ fn state_row(
     entity_id: String,
     schema_key: &str,
     schema_version: String,
-    snapshot_content: Option<String>,
+    snapshot: Option<JsonValue>,
     context: FilesystemRowContext,
-) -> StageRow {
+) -> TransactionWriteRow {
     partial_state_row(
         Some(entity_id),
         schema_key,
         schema_version,
-        snapshot_content,
+        snapshot,
         context,
     )
 }
@@ -831,17 +832,18 @@ fn partial_state_row(
     entity_id: Option<String>,
     schema_key: &str,
     schema_version: String,
-    snapshot_content: Option<String>,
+    snapshot: Option<JsonValue>,
     context: FilesystemRowContext,
-) -> StageRow {
-    StageRow {
+) -> TransactionWriteRow {
+    let snapshot = snapshot.map(TransactionJson::from_value_unchecked);
+    TransactionWriteRow {
         entity_id: entity_id.map(|entity_id| {
             EntityIdentity::from_string(&entity_id)
                 .expect("filesystem entity id should decode as entity identity")
         }),
         schema_key: schema_key.to_string(),
         file_id: context.file_id,
-        snapshot_content,
+        snapshot,
         metadata: context.metadata,
         origin: None,
         schema_version,
@@ -860,7 +862,7 @@ fn tombstone_row(
     schema_key: &str,
     schema_version: String,
     context: FilesystemRowContext,
-) -> StageRow {
+) -> TransactionWriteRow {
     state_row(entity_id, schema_key, schema_version, None, context)
 }
 
@@ -868,7 +870,7 @@ fn collect_recursive_directory_delete(
     directory_id: &str,
     visible_filesystem: &VisibleFilesystem,
     context: &FilesystemRowContext,
-    rows: &mut Vec<StageRow>,
+    rows: &mut Vec<TransactionWriteRow>,
     count: &mut u64,
 ) {
     if let Some(child_ids) = visible_filesystem
@@ -920,7 +922,7 @@ mod tests {
     use crate::sql2::filesystem_visibility::{
         VisibleBlobRef, VisibleDirectory, VisibleFile, VisibleFilesystem,
     };
-    use crate::{entity_identity::EntityIdentity, live_state::LiveStateRow};
+    use crate::{entity_identity::EntityIdentity, live_state::MaterializedLiveStateRow};
 
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
         let mut ids = ids.iter();
@@ -944,8 +946,7 @@ mod tests {
         assert_eq!(row.schema_key, "lix_directory_descriptor");
         assert_eq!(row.schema_version.as_str(), "1");
         assert_eq!(row.version_id, "version-a");
-        let snapshot: JsonValue =
-            serde_json::from_str(row.snapshot_content.as_deref().unwrap()).unwrap();
+        let snapshot: JsonValue = row.snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["id"], "dir-docs");
         assert_eq!(snapshot["parent_id"], JsonValue::Null);
         assert_eq!(snapshot["name"], "docs");
@@ -970,8 +971,7 @@ mod tests {
         );
         assert_eq!(row.schema_key, "lix_file_descriptor");
         assert_eq!(row.schema_version.as_str(), "1");
-        let snapshot: JsonValue =
-            serde_json::from_str(row.snapshot_content.as_deref().unwrap()).unwrap();
+        let snapshot: JsonValue = row.snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["directory_id"], "dir-docs");
         assert_eq!(snapshot["name"], "readme.md");
     }
@@ -994,8 +994,7 @@ mod tests {
         assert_eq!(row.file_id.as_deref(), Some("file-readme"));
         assert_eq!(row.schema_key, "lix_binary_blob_ref");
         assert_eq!(row.schema_version.as_str(), "1");
-        let snapshot: JsonValue =
-            serde_json::from_str(row.snapshot_content.as_deref().unwrap()).unwrap();
+        let snapshot: JsonValue = row.snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["size_bytes"], 5);
         assert!(snapshot["blob_hash"]
@@ -1025,8 +1024,7 @@ mod tests {
             Some("dir-generated-nested")
         );
 
-        let snapshot: JsonValue =
-            serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap()).unwrap();
+        let snapshot: JsonValue = rows[0].snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["id"], "dir-generated-nested");
         assert_eq!(snapshot["parent_id"], "dir-docs");
         assert_eq!(snapshot["name"], "nested");
@@ -1057,8 +1055,7 @@ mod tests {
             .expect("nested directory should plan");
 
         assert_eq!(nested_rows.len(), 1);
-        let snapshot: JsonValue =
-            serde_json::from_str(nested_rows[0].snapshot_content.as_deref().unwrap()).unwrap();
+        let snapshot: JsonValue = nested_rows[0].snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["id"], "dir-generated-nested");
         assert_eq!(snapshot["parent_id"], "dir-generated-docs");
         assert_eq!(snapshot["name"], "nested");
@@ -1089,8 +1086,7 @@ mod tests {
             Some("dir-nested")
         );
 
-        let snapshot: JsonValue =
-            serde_json::from_str(rows[1].snapshot_content.as_deref().unwrap()).unwrap();
+        let snapshot: JsonValue = rows[1].snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["id"], "dir-nested");
         assert_eq!(snapshot["parent_id"], "dir-generated-docs");
         assert_eq!(snapshot["name"], "nested");
@@ -1163,8 +1159,7 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor row should be planned");
-        let snapshot: JsonValue =
-            serde_json::from_str(file_row.snapshot_content.as_deref().unwrap()).unwrap();
+        let snapshot: JsonValue = file_row.snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-generated-guides");
         assert_eq!(snapshot["name"], "readme.md");
@@ -1204,8 +1199,7 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor row should be planned");
-        let snapshot: JsonValue =
-            serde_json::from_str(file_row.snapshot_content.as_deref().unwrap()).unwrap();
+        let snapshot: JsonValue = file_row.snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["directory_id"], "dir-guides");
     }
 
@@ -1234,8 +1228,7 @@ mod tests {
             .iter()
             .all(|row| row.schema_key != "lix_binary_blob_ref"));
 
-        let snapshot: JsonValue =
-            serde_json::from_str(plan.rows[0].snapshot_content.as_deref().unwrap()).unwrap();
+        let snapshot: JsonValue = plan.rows[0].snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-docs");
         assert_eq!(snapshot["name"], "renamed.md");
@@ -1278,8 +1271,7 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor row should be planned");
-        let snapshot: JsonValue =
-            serde_json::from_str(file_row.snapshot_content.as_deref().unwrap()).unwrap();
+        let snapshot: JsonValue = file_row.snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["directory_id"], "dir-generated-guides");
         assert_eq!(snapshot["name"], "readme.md");
         assert_eq!(snapshot["hidden"], true);
@@ -1338,7 +1330,7 @@ mod tests {
             ))
         );
         assert_eq!(descriptor.file_id, None);
-        assert_eq!(descriptor.snapshot_content, None);
+        assert_eq!(descriptor.snapshot, None);
         assert_eq!(descriptor.schema_version.as_str(), "1");
 
         let blob_ref = plan
@@ -1353,7 +1345,7 @@ mod tests {
             ))
         );
         assert_eq!(blob_ref.file_id.as_deref(), Some("file-readme"));
-        assert_eq!(blob_ref.snapshot_content, None);
+        assert_eq!(blob_ref.snapshot, None);
         assert_eq!(blob_ref.schema_version.as_str(), "1");
     }
 
@@ -1368,7 +1360,7 @@ mod tests {
         assert_eq!(plan.count, 1);
         assert_eq!(plan.rows.len(), 1);
         assert_eq!(plan.rows[0].schema_key, "lix_file_descriptor");
-        assert_eq!(plan.rows[0].snapshot_content, None);
+        assert_eq!(plan.rows[0].snapshot, None);
     }
 
     #[test]
@@ -1386,7 +1378,7 @@ mod tests {
         );
         assert_eq!(plan.rows[0].schema_key, "lix_directory_descriptor");
         assert_eq!(plan.rows[0].file_id, None);
-        assert_eq!(plan.rows[0].snapshot_content, None);
+        assert_eq!(plan.rows[0].snapshot, None);
         assert_eq!(plan.rows[0].schema_version.as_str(), "1");
     }
 
@@ -1460,7 +1452,7 @@ mod tests {
                 ("lix_directory_descriptor", "dir-docs".to_string()),
             ]
         );
-        assert!(plan.rows.iter().all(|row| row.snapshot_content.is_none()));
+        assert!(plan.rows.iter().all(|row| row.snapshot.is_none()));
     }
 
     fn visible_directory(
@@ -1506,8 +1498,8 @@ mod tests {
         entity_id: &str,
         version_id: &str,
         snapshot_content: &str,
-    ) -> LiveStateRow {
-        LiveStateRow {
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: EntityIdentity::from_string(entity_id).expect("entity id should decode"),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id: None,

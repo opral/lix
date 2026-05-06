@@ -1,7 +1,7 @@
-//! Engine2 session boundary.
+//! Engine session boundary.
 //!
 //! Transaction invariant:
-//! any engine2 operation that may write must enter through
+//! any engine operation that may write must enter through
 //! `SessionContext::with_write_transaction`. Reads that influence writes are
 //! only available from the transaction capability. Session APIs must not
 //! open `Transaction` directly or use session-level read helpers inside write

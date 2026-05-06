@@ -6,4 +6,4 @@ pub(crate) mod types;
 
 #[allow(unused_imports)]
 pub(crate) use context::{JsonStoreContext, JsonStoreReader, JsonStoreWriter};
-pub(crate) use types::JsonRef;
+pub(crate) use types::{JsonRef, NormalizedJson};

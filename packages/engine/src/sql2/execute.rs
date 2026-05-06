@@ -671,7 +671,8 @@ mod tests {
     };
     use crate::json_store::JsonStoreContext;
     use crate::live_state::{
-        LiveStateContext, LiveStateReader, LiveStateRow, LiveStateRowRequest, LiveStateScanRequest,
+        LiveStateContext, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
+        MaterializedLiveStateRow,
     };
     use crate::sql2::{ChangelogQuerySource, SqlChangelogQuerySource};
     use crate::storage::{
@@ -680,7 +681,10 @@ mod tests {
         StorageWriteSet,
     };
     use crate::tracked_state::TrackedStateContext;
-    use crate::transaction::types::{StageRow, StageWrite, StageWriteOutcome};
+    use crate::transaction::prepare_version_ref_row;
+    use crate::transaction::types::{
+        TransactionWrite, TransactionWriteOutcome, TransactionWriteRow,
+    };
     use crate::untracked_state::UntrackedStateContext;
     use crate::version::VersionRefReader;
     use crate::{Engine, ExecuteResult, SessionContext};
@@ -689,7 +693,7 @@ mod tests {
     struct DummyBlobReader;
     struct DummyLiveStateReader;
     struct RowsLiveStateReader {
-        rows: Vec<LiveStateRow>,
+        rows: Vec<MaterializedLiveStateRow>,
     }
     struct BackendBlobReader(StorageContext);
     struct DummyChangelogReader;
@@ -747,7 +751,7 @@ mod tests {
 
     #[derive(Clone)]
     struct CapturedStageWrite {
-        rows: Vec<StageRow>,
+        rows: Vec<TransactionWriteRow>,
     }
 
     impl CapturedStageWrite {
@@ -759,7 +763,7 @@ mod tests {
     }
 
     struct CapturedStageOverlay {
-        rows: Vec<StageRow>,
+        rows: Vec<TransactionWriteRow>,
     }
 
     impl CapturedStageOverlay {
@@ -791,14 +795,14 @@ mod tests {
         version_id: String,
         file_id: Option<String>,
         snapshot_content: Option<String>,
-        metadata: Option<JsonValue>,
+        metadata: Option<String>,
         global: bool,
         untracked: bool,
         tombstone: bool,
     }
 
-    impl From<StageRow> for CapturedStageRow {
-        fn from(row: StageRow) -> Self {
+    impl From<TransactionWriteRow> for CapturedStageRow {
+        fn from(row: TransactionWriteRow) -> Self {
             Self {
                 entity_id: row
                     .entity_id
@@ -811,9 +815,9 @@ mod tests {
                 file_id: row.file_id,
                 global: row.global,
                 untracked: row.untracked,
-                tombstone: row.snapshot_content.is_none(),
-                snapshot_content: row.snapshot_content,
-                metadata: row.metadata,
+                tombstone: row.snapshot.is_none(),
+                snapshot_content: row.snapshot.map(|snapshot| snapshot.to_string()),
+                metadata: row.metadata.map(|metadata| metadata.to_string()),
             }
         }
     }
@@ -898,7 +902,7 @@ mod tests {
         async fn scan_live_state(
             &mut self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             self.live_state.scan_rows(request).await
         }
 
@@ -909,23 +913,26 @@ mod tests {
             Ok(Some(format!("commit-{version_id}")))
         }
 
-        async fn stage_write(&mut self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
+        async fn stage_write(
+            &mut self,
+            write: TransactionWrite,
+        ) -> Result<TransactionWriteOutcome, LixError> {
             let count = match &write {
-                StageWrite::Rows { rows, .. } => rows.len() as u64,
-                StageWrite::RowsWithFileData { count, .. } => *count,
-                StageWrite::AdoptedChanges { changes } => changes.len() as u64,
+                TransactionWrite::Rows { rows, .. } => rows.len() as u64,
+                TransactionWrite::RowsWithFileData { count, .. } => *count,
+                TransactionWrite::AdoptedChanges { changes } => changes.len() as u64,
             };
             let rows = match write {
-                StageWrite::Rows { rows, .. } => rows,
-                StageWrite::RowsWithFileData { rows, .. } => rows,
-                StageWrite::AdoptedChanges { .. } => Vec::new(),
+                TransactionWrite::Rows { rows, .. } => rows,
+                TransactionWrite::RowsWithFileData { rows, .. } => rows,
+                TransactionWrite::AdoptedChanges { .. } => Vec::new(),
             };
             self.staged_writes
                 .lock()
                 .expect("staged writes lock")
                 .deltas
                 .push(CapturedStageWrite { rows });
-            Ok(StageWriteOutcome { count })
+            Ok(TransactionWriteOutcome { count })
         }
     }
 
@@ -940,8 +947,11 @@ mod tests {
 
     #[async_trait]
     impl ChangelogReader for DummyChangelogReader {
-        async fn load_change(&self, _change_id: &str) -> Result<Option<CanonicalChange>, LixError> {
-            Ok(None)
+        async fn load_changes(
+            &self,
+            change_ids: &[String],
+        ) -> Result<Vec<Option<CanonicalChange>>, LixError> {
+            Ok(vec![None; change_ids.len()])
         }
 
         async fn scan_changes(
@@ -1034,14 +1044,14 @@ mod tests {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(vec![])
         }
 
         async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<LiveStateRow>, LixError> {
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
             Ok(None)
         }
     }
@@ -1051,14 +1061,14 @@ mod tests {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
         async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<LiveStateRow>, LixError> {
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
             Ok(None)
         }
     }
@@ -1069,7 +1079,10 @@ mod tests {
             &self,
             hashes: &[crate::binary_cas::BlobHash],
         ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
-            Ok(crate::binary_cas::BlobBytesBatch::missing(hashes.len()))
+            Ok(crate::binary_cas::BlobBytesBatch::new(vec![
+                None;
+                hashes.len()
+            ]))
         }
     }
 
@@ -1085,16 +1098,14 @@ mod tests {
         }
     }
 
-    fn live_lix_state_row(entity_id: &str, metadata: Option<&str>) -> LiveStateRow {
-        LiveStateRow {
+    fn live_lix_state_row(entity_id: &str, metadata: Option<&str>) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
-            metadata: metadata.map(|value| {
-                serde_json::from_str(value).expect("test metadata should be valid JSON")
-            }),
+            metadata: metadata.map(str::to_string),
             schema_version: "1".to_string(),
             version_id: "version-a".to_string(),
             change_id: Some(format!("change-{entity_id}")),
@@ -1106,14 +1117,14 @@ mod tests {
         }
     }
 
-    fn live_entity_row(entity_id: &str, version_id: &str, value: &str) -> LiveStateRow {
-        LiveStateRow {
+    fn live_entity_row(entity_id: &str, version_id: &str, value: &str) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: "test_state_schema".to_string(),
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
-            metadata: Some(json!({ "source": entity_id })),
+            metadata: Some(json!({ "source": entity_id }).to_string()),
             schema_version: "1".to_string(),
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
@@ -1131,8 +1142,8 @@ mod tests {
         parent_id: Option<&str>,
         name: &str,
         hidden: bool,
-    ) -> LiveStateRow {
-        LiveStateRow {
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: "lix_directory_descriptor".to_string(),
@@ -1146,7 +1157,7 @@ mod tests {
                 })
                 .to_string(),
             ),
-            metadata: Some(json!({ "source": entity_id })),
+            metadata: Some(json!({ "source": entity_id }).to_string()),
             schema_version: "1".to_string(),
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
@@ -1164,8 +1175,8 @@ mod tests {
         directory_id: Option<&str>,
         name: &str,
         hidden: bool,
-    ) -> LiveStateRow {
-        LiveStateRow {
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: "lix_file_descriptor".to_string(),
@@ -1179,7 +1190,7 @@ mod tests {
                 })
                 .to_string(),
             ),
-            metadata: Some(json!({ "source": entity_id })),
+            metadata: Some(json!({ "source": entity_id }).to_string()),
             schema_version: "1".to_string(),
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
@@ -1317,7 +1328,7 @@ mod tests {
         }));
     }
 
-    async fn setup_engine2_history_fixture() -> Result<(SessionContext, String), LixError> {
+    async fn setup_engine_history_fixture() -> Result<(SessionContext, String), LixError> {
         let backend = crate::backend::testing::UnitTestBackend::new();
         let init_receipt = Engine::initialize(Box::new(backend.clone())).await?;
         let engine = Engine::new(Box::new(backend)).await?;
@@ -1616,7 +1627,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_sql_reads_lix_state_history_from_history_context() {
-        let (session, head_commit_id) = setup_engine2_history_fixture()
+        let (session, head_commit_id) = setup_engine_history_fixture()
             .await
             .expect("history fixture should initialize");
         let result = session
@@ -1632,7 +1643,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("sql2 execute should read lix_state_history through real engine2 context");
+            .expect("sql2 execute should read lix_state_history through real engine context");
         let (columns, rows) = rows_from_execute_result(result);
 
         assert_eq!(
@@ -1655,7 +1666,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_sql_reads_entity_history_view_from_history_context() {
-        let (session, head_commit_id) = setup_engine2_history_fixture()
+        let (session, head_commit_id) = setup_engine_history_fixture()
             .await
             .expect("history fixture should initialize");
         let result = session
@@ -1669,7 +1680,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("sql2 execute should read entity history through real engine2 context");
+            .expect("sql2 execute should read entity history through real engine context");
         let (columns, rows) = rows_from_execute_result(result);
 
         assert_eq!(
@@ -1692,7 +1703,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_sql_reads_directory_history_view_from_history_context() {
-        let (session, head_commit_id) = setup_engine2_history_fixture()
+        let (session, head_commit_id) = setup_engine_history_fixture()
             .await
             .expect("history fixture should initialize");
         let result = session
@@ -1705,7 +1716,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("sql2 execute should read directory history through real engine2 context");
+            .expect("sql2 execute should read directory history through real engine context");
         assert!(
             result.notices().is_empty(),
             "identity-filtered directory history should not emit soft notices"
@@ -1754,7 +1765,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_sql_reads_file_history_view_from_history_context() {
-        let (session, head_commit_id) = setup_engine2_history_fixture()
+        let (session, head_commit_id) = setup_engine_history_fixture()
             .await
             .expect("history fixture should initialize");
         let result = session
@@ -1770,7 +1781,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("sql2 execute should read file history through real engine2 context");
+            .expect("sql2 execute should read file history through real engine context");
         assert!(
             result.notices().is_empty(),
             "identity-filtered file history should not emit soft notices"
@@ -1859,7 +1870,7 @@ mod tests {
             rows[0].snapshot_content.as_deref(),
             Some("{\"key\":\"hello\",\"value\":\"world\"}")
         );
-        assert_eq!(rows[0].metadata.as_ref(), Some(&json!({"source": "sql"})));
+        assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"sql\"}"));
     }
 
     #[tokio::test]
@@ -1952,10 +1963,7 @@ mod tests {
             rows[0].snapshot_content.as_deref(),
             Some("{\"key\":\"hello\",\"value\":\"from-select\"}")
         );
-        assert_eq!(
-            rows[0].metadata.as_ref(),
-            Some(&json!({"source": "select"}))
-        );
+        assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"select\"}"));
     }
 
     #[tokio::test]
@@ -2185,8 +2193,8 @@ mod tests {
             Some("{\"hidden\":true,\"id\":\"dir-docs\",\"name\":\"docs\",\"parent_id\":null}")
         );
         assert_eq!(
-            rows[0].metadata.as_ref(),
-            Some(&json!({"source": "directory-update"}))
+            rows[0].metadata.as_deref(),
+            Some("{\"source\":\"directory-update\"}")
         );
     }
 
@@ -2468,8 +2476,8 @@ mod tests {
         assert_eq!(snapshot["name"], "readme-updated.txt");
         assert_eq!(snapshot["hidden"], true);
         assert_eq!(
-            rows[0].metadata.as_ref(),
-            Some(&json!({"source": "file-update"}))
+            rows[0].metadata.as_deref(),
+            Some("{\"source\":\"file-update\"}")
         );
     }
 
@@ -2684,8 +2692,8 @@ mod tests {
             Some("{\"value\":\"updated\"}")
         );
         assert_eq!(
-            rows[0].metadata.as_ref(),
-            Some(&json!({"source": "entity-update"}))
+            rows[0].metadata.as_deref(),
+            Some("{\"source\":\"entity-update\"}")
         );
     }
 
@@ -2785,8 +2793,8 @@ mod tests {
             Some("{\"key\":\"hello\",\"value\":\"updated\"}")
         );
         assert_eq!(
-            rows[0].metadata.as_ref(),
-            Some(&json!({"schema_key": "lix_key_value"}))
+            rows[0].metadata.as_deref(),
+            Some("{\"schema_key\":\"lix_key_value\"}")
         );
     }
 
@@ -2893,22 +2901,22 @@ mod tests {
             let mut writes = StorageWriteSet::new();
             let canonical_rows = {
                 let mut json_writer = JsonStoreContext::new().writer();
-                vec![
-                    version_ctx.canonical_ref_row(
-                        &mut writes,
+                let rows = vec![
+                    prepare_version_ref_row(
                         &mut json_writer,
                         "version-a",
                         &init_receipt.initial_commit_id,
                         "1970-01-01T00:00:00.000Z",
                     )?,
-                    version_ctx.canonical_ref_row(
-                        &mut writes,
+                    prepare_version_ref_row(
                         &mut json_writer,
                         "version-b",
                         &init_receipt.initial_commit_id,
                         "1970-01-01T00:00:00.000Z",
                     )?,
-                ]
+                ];
+                json_writer.flush_into(&mut writes);
+                rows
             };
             version_ctx.stage_canonical_ref_rows(&mut writes, &canonical_rows)?;
             writes.apply(&mut transaction.as_mut()).await?;

@@ -21,7 +21,7 @@ use futures_util::{stream, TryStreamExt};
 use tokio::sync::Mutex;
 
 use crate::commit_graph::CommitGraphReader;
-use crate::{serialize_row_metadata, LixError, RowMetadata};
+use crate::{serialize_row_metadata, LixError};
 
 use super::history_route::{
     load_history_entries, parse_history_filter, HistoryColumnStyle, HistoryRoute,
@@ -303,7 +303,7 @@ struct StateHistorySqlRow {
     schema_key: String,
     file_id: Option<String>,
     snapshot_content: Option<String>,
-    metadata: Option<RowMetadata>,
+    metadata: Option<String>,
     schema_version: String,
     change_id: String,
     observed_commit_id: String,

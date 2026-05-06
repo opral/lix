@@ -27,7 +27,7 @@ use serde::Deserialize;
 
 use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::functions::FunctionProviderHandle;
-use crate::live_state::LiveStateRow;
+use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
@@ -45,9 +45,9 @@ use crate::sql2::write_normalization::{
     scalar_is_binary_or_null, InsertCell, InsertColumnIntents, SqlCell, UpdateAssignmentValues,
     UpdateCell,
 };
-use crate::transaction::types::StageRow;
+use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::version::VersionRefReader;
-use crate::{parse_row_metadata, serialize_row_metadata, LixError, RowMetadata};
+use crate::{parse_row_metadata_value, serialize_row_metadata, LixError};
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
@@ -65,8 +65,8 @@ use crate::sql2::{
     SqlWriteContext, WriteAccess, WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
 use crate::transaction::types::{
-    LogicalPrimaryKey, StageFileData, StageRowOrigin, StageWrite, StageWriteMode,
-    StageWriteOperation,
+    LogicalPrimaryKey, TransactionFileData, TransactionWrite, TransactionWriteMode,
+    TransactionWriteOperation, TransactionWriteOrigin,
 };
 
 pub(crate) async fn register_lix_file_providers(
@@ -473,13 +473,13 @@ impl InsertSink for LixFileInsertSink {
 
         if !staged.state_rows.is_empty() || !staged.file_data_writes.is_empty() {
             let intent = if staged.file_data_writes.is_empty() {
-                StageWrite::Rows {
-                    mode: StageWriteMode::Insert,
+                TransactionWrite::Rows {
+                    mode: TransactionWriteMode::Insert,
                     rows: staged.state_rows,
                 }
             } else {
-                StageWrite::RowsWithFileData {
-                    mode: StageWriteMode::Insert,
+                TransactionWrite::RowsWithFileData {
+                    mode: TransactionWriteMode::Insert,
                     rows: staged.state_rows,
                     file_data: staged.file_data_writes,
                     count: staged.count,
@@ -629,8 +629,8 @@ impl ExecutionPlan for LixFileDeleteExec {
 
             if count > 0 {
                 write_ctx
-                    .stage_write(StageWrite::Rows {
-                        mode: StageWriteMode::Replace,
+                    .stage_write(TransactionWrite::Rows {
+                        mode: TransactionWriteMode::Replace,
                         rows: staged.state_rows,
                     })
                     .await
@@ -804,13 +804,13 @@ impl ExecutionPlan for LixFileUpdateExec {
 
             if count > 0 {
                 let intent = if staged.file_data_writes.is_empty() {
-                    StageWrite::Rows {
-                        mode: StageWriteMode::Replace,
+                    TransactionWrite::Rows {
+                        mode: TransactionWriteMode::Replace,
                         rows: staged.state_rows,
                     }
                 } else {
-                    StageWrite::RowsWithFileData {
-                        mode: StageWriteMode::Replace,
+                    TransactionWrite::RowsWithFileData {
+                        mode: TransactionWriteMode::Replace,
                         rows: staged.state_rows,
                         file_data: staged.file_data_writes,
                         count,
@@ -976,7 +976,7 @@ struct FileDescriptorRecord {
     directory_id: Option<String>,
     name: String,
     hidden: bool,
-    live: LiveStateRow,
+    live: MaterializedLiveStateRow,
 }
 
 #[derive(Debug, Clone)]
@@ -1015,8 +1015,8 @@ struct DirectoryDescriptorSnapshot {
 
 #[derive(Debug, Default)]
 struct LixFileStagedBatch {
-    state_rows: Vec<StageRow>,
-    file_data_writes: Vec<StageFileData>,
+    state_rows: Vec<TransactionWriteRow>,
+    file_data_writes: Vec<TransactionFileData>,
     count: u64,
 }
 
@@ -1043,7 +1043,7 @@ impl LixFileStagedBatch {
 fn lix_file_write_rows_from_batch(
     batch: &RecordBatch,
     version_binding: Option<&str>,
-) -> Result<Vec<StageRow>> {
+) -> Result<Vec<TransactionWriteRow>> {
     Ok(lix_file_insert_stage_from_batch(batch, version_binding)?.state_rows)
 }
 
@@ -1066,7 +1066,7 @@ fn lix_file_delete_stage_from_batch(
 }
 
 fn blob_ref_file_ids_from_live_rows(
-    rows: &[LiveStateRow],
+    rows: &[MaterializedLiveStateRow],
 ) -> std::result::Result<BTreeSet<String>, LixError> {
     let mut file_ids = BTreeSet::new();
     for row in rows {
@@ -1462,7 +1462,7 @@ fn stage_lix_file_data_write(
     file_id: String,
     data: Vec<u8>,
     context: FilesystemRowContext,
-    origin: Option<StageRowOrigin>,
+    origin: Option<TransactionWriteOrigin>,
 ) -> Result<()> {
     let mut row = blob_ref_row(BlobRefRowInput {
         file_id: file_id.clone(),
@@ -1476,7 +1476,7 @@ fn stage_lix_file_data_write(
     .map_err(lix_error_to_datafusion_error)?;
     row.origin = origin;
     staged.state_rows.push(row);
-    staged.file_data_writes.push(StageFileData {
+    staged.file_data_writes.push(TransactionFileData {
         file_id,
         version_id: context.version_id,
         untracked: context.untracked,
@@ -1485,7 +1485,11 @@ fn stage_lix_file_data_write(
     Ok(())
 }
 
-fn attach_lix_file_insert_origin(rows: &mut [StageRow], surface_name: &str, file_id: &str) {
+fn attach_lix_file_insert_origin(
+    rows: &mut [TransactionWriteRow],
+    surface_name: &str,
+    file_id: &str,
+) {
     let origin = lix_file_insert_origin(surface_name, file_id);
     for row in rows {
         if row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY || row.schema_key == BLOB_REF_SCHEMA_KEY {
@@ -1494,10 +1498,10 @@ fn attach_lix_file_insert_origin(rows: &mut [StageRow], surface_name: &str, file
     }
 }
 
-fn lix_file_insert_origin(surface_name: &str, file_id: &str) -> StageRowOrigin {
-    StageRowOrigin {
+fn lix_file_insert_origin(surface_name: &str, file_id: &str) -> TransactionWriteOrigin {
+    TransactionWriteOrigin {
         surface: surface_name.to_string(),
-        operation: StageWriteOperation::Insert,
+        operation: TransactionWriteOperation::Insert,
         primary_key: Some(LogicalPrimaryKey {
             columns: vec!["id".to_string()],
             values: vec![file_id.to_string()],
@@ -1599,7 +1603,7 @@ async fn file_path_resolvers_from_live_state(
 async fn lix_file_record_batch(
     schema: &SchemaRef,
     blob_reader: &Arc<dyn BlobDataReader>,
-    rows: Vec<LiveStateRow>,
+    rows: Vec<MaterializedLiveStateRow>,
 ) -> Result<RecordBatch, LixError> {
     let projected_columns = schema
         .fields()
@@ -2098,10 +2102,13 @@ fn update_optional_metadata_value(
     row_index: usize,
     column_name: &str,
     context: &str,
-) -> Result<Option<RowMetadata>> {
+) -> Result<Option<TransactionJson>> {
     update_optional_string_value(batch, assignment_values, row_index, column_name)?
         .map(|value| {
-            parse_row_metadata(&value, context).map_err(super::error::lix_error_to_datafusion_error)
+            let metadata = parse_row_metadata_value(&value, context)
+                .map_err(super::error::lix_error_to_datafusion_error)?;
+            TransactionJson::from_value(metadata, &format!("{context} metadata"))
+                .map_err(super::error::lix_error_to_datafusion_error)
         })
         .transpose()
 }
@@ -2174,10 +2181,13 @@ fn optional_metadata_value(
     row_index: usize,
     column_name: &str,
     context: &str,
-) -> Result<Option<RowMetadata>> {
+) -> Result<Option<TransactionJson>> {
     optional_string_value(batch, row_index, column_name)?
         .map(|value| {
-            parse_row_metadata(&value, context).map_err(super::error::lix_error_to_datafusion_error)
+            let metadata = parse_row_metadata_value(&value, context)
+                .map_err(super::error::lix_error_to_datafusion_error)?;
+            TransactionJson::from_value(metadata, &format!("{context} metadata"))
+                .map_err(super::error::lix_error_to_datafusion_error)
         })
         .transpose()
 }
@@ -2300,17 +2310,19 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::execution::TaskContext;
     use datafusion::logical_expr::lit;
-    use serde_json::{json, Value as JsonValue};
+    use serde_json::Value as JsonValue;
 
     use crate::binary_cas::BlobDataReader;
     use crate::functions::{
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
-    use crate::live_state::LiveStateRow;
+    use crate::live_state::MaterializedLiveStateRow;
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
     use crate::sql2::dml::InsertSink;
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
-    use crate::transaction::types::{StageWrite, StageWriteMode, StageWriteOutcome};
+    use crate::transaction::types::{
+        TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
+    };
     use crate::LixError;
 
     use super::{
@@ -2361,8 +2373,8 @@ mod tests {
 
     #[derive(Default)]
     struct CapturingWriteContext {
-        rows: Vec<LiveStateRow>,
-        writes: Vec<StageWrite>,
+        rows: Vec<MaterializedLiveStateRow>,
+        writes: Vec<TransactionWrite>,
     }
 
     #[async_trait]
@@ -2371,7 +2383,10 @@ mod tests {
             &self,
             hashes: &[crate::binary_cas::BlobHash],
         ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
-            Ok(crate::binary_cas::BlobBytesBatch::missing(hashes.len()))
+            Ok(crate::binary_cas::BlobBytesBatch::new(vec![
+                None;
+                hashes.len()
+            ]))
         }
     }
 
@@ -2399,7 +2414,7 @@ mod tests {
         async fn scan_live_state(
             &mut self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
@@ -2413,15 +2428,18 @@ mod tests {
             Ok(Some(format!("commit-{version_id}")))
         }
 
-        async fn stage_write(&mut self, write: StageWrite) -> Result<StageWriteOutcome, LixError> {
+        async fn stage_write(
+            &mut self,
+            write: TransactionWrite,
+        ) -> Result<TransactionWriteOutcome, LixError> {
             self.writes.push(write);
-            Ok(StageWriteOutcome { count: 0 })
+            Ok(TransactionWriteOutcome { count: 0 })
         }
     }
 
     #[derive(Default)]
     struct RowsLiveStateReader {
-        rows: Vec<LiveStateRow>,
+        rows: Vec<MaterializedLiveStateRow>,
     }
 
     #[async_trait]
@@ -2429,14 +2447,14 @@ mod tests {
         async fn scan_rows(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<LiveStateRow>, LixError> {
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
         async fn load_row(
             &self,
             _request: &LiveStateRowRequest,
-        ) -> Result<Option<LiveStateRow>, LixError> {
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
             Ok(None)
         }
     }
@@ -2445,8 +2463,8 @@ mod tests {
         entity_id: &str,
         version_id: &str,
         snapshot_content: &str,
-    ) -> LiveStateRow {
-        LiveStateRow {
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
@@ -2464,8 +2482,12 @@ mod tests {
         }
     }
 
-    fn live_file_row(entity_id: &str, version_id: &str, snapshot_content: &str) -> LiveStateRow {
-        LiveStateRow {
+    fn live_file_row(
+        entity_id: &str,
+        version_id: &str,
+        snapshot_content: &str,
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
             entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
                 .expect("entity id should decode"),
             schema_key: super::FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
@@ -2654,10 +2676,13 @@ mod tests {
         assert_eq!(rows[0].schema_key, "lix_file_descriptor");
         assert_eq!(rows[0].version_id, "version-b");
         assert_eq!(rows[0].schema_version.as_str(), "1");
-        assert_eq!(rows[0].metadata.as_ref(), Some(&json!({"source": "file"})));
-        let snapshot: JsonValue =
-            serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap())
-                .expect("descriptor snapshot JSON");
+        assert_eq!(
+            rows[0].metadata.as_ref(),
+            Some(&TransactionJson::from_value_for_test(
+                serde_json::json!({"source": "file"})
+            ))
+        );
+        let snapshot = rows[0].snapshot.as_ref().expect("descriptor snapshot JSON");
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-docs");
         assert_eq!(snapshot["name"], "readme.md");
@@ -2743,9 +2768,7 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor row should be staged");
-        let snapshot: JsonValue =
-            serde_json::from_str(descriptor.snapshot_content.as_deref().unwrap())
-                .expect("descriptor snapshot JSON");
+        let snapshot: JsonValue = descriptor.snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-docs");
         assert_eq!(snapshot["name"], "renamed.md");
@@ -2825,9 +2848,12 @@ mod tests {
             .iter()
             .all(|row| row.schema_key != "lix_directory_descriptor"));
 
-        let snapshot: JsonValue =
-            serde_json::from_str(staged.state_rows[0].snapshot_content.as_deref().unwrap())
-                .expect("descriptor snapshot JSON");
+        let snapshot: JsonValue = staged.state_rows[0]
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .value()
+            .clone();
         assert_eq!(snapshot["directory_id"], "dir-docs");
         assert_eq!(snapshot["name"], "renamed.md");
     }
@@ -2882,9 +2908,7 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor should be staged");
-        let snapshot: JsonValue =
-            serde_json::from_str(descriptor.snapshot_content.as_deref().unwrap())
-                .expect("descriptor snapshot JSON");
+        let snapshot: JsonValue = descriptor.snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["directory_id"], "dir-generated-docs");
     }
 
@@ -3003,7 +3027,7 @@ mod tests {
             ))
         );
         assert_eq!(descriptor.file_id, None);
-        assert_eq!(descriptor.snapshot_content, None);
+        assert_eq!(descriptor.snapshot, None);
 
         let blob_ref = staged
             .state_rows
@@ -3017,7 +3041,7 @@ mod tests {
             ))
         );
         assert_eq!(blob_ref.file_id.as_deref(), Some("file-readme"));
-        assert_eq!(blob_ref.snapshot_content, None);
+        assert_eq!(blob_ref.snapshot, None);
     }
 
     #[test]
@@ -3035,7 +3059,7 @@ mod tests {
                 "file-readme"
             ))
         );
-        assert_eq!(staged.state_rows[0].snapshot_content, None);
+        assert_eq!(staged.state_rows[0].snapshot, None);
     }
 
     #[test]
@@ -3069,9 +3093,7 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor row should be staged");
-        let snapshot: JsonValue =
-            serde_json::from_str(descriptor.snapshot_content.as_deref().unwrap())
-                .expect("descriptor snapshot JSON");
+        let snapshot: JsonValue = descriptor.snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["directory_id"], "dir-guides");
         assert_eq!(snapshot["name"], "readme.md");
@@ -3105,9 +3127,7 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor row should be staged");
-        let snapshot: JsonValue =
-            serde_json::from_str(descriptor.snapshot_content.as_deref().unwrap())
-                .expect("descriptor snapshot JSON");
+        let snapshot: JsonValue = descriptor.snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["directory_id"], "dir-generated-guides");
     }
 
@@ -3133,8 +3153,8 @@ mod tests {
         let writes = &write_context.writes;
         assert_eq!(writes.len(), 1);
         match &writes[0] {
-            StageWrite::Rows { mode, rows } => {
-                assert_eq!(*mode, StageWriteMode::Insert);
+            TransactionWrite::Rows { mode, rows } => {
+                assert_eq!(*mode, TransactionWriteMode::Insert);
                 assert_eq!(rows.len(), 1);
                 assert_eq!(
                     rows[0].entity_id.as_ref(),
@@ -3170,14 +3190,14 @@ mod tests {
         let writes = &write_context.writes;
         assert_eq!(writes.len(), 1);
         match &writes[0] {
-            StageWrite::RowsWithFileData {
+            TransactionWrite::RowsWithFileData {
                 mode,
                 rows,
                 file_data,
                 count,
                 ..
             } => {
-                assert_eq!(*mode, StageWriteMode::Insert);
+                assert_eq!(*mode, TransactionWriteMode::Insert);
                 assert_eq!(*count, 1);
                 assert_eq!(rows.len(), 2);
                 assert!(rows
@@ -3230,7 +3250,7 @@ mod tests {
         let writes = &write_context.writes;
         assert_eq!(writes.len(), 1);
         match &writes[0] {
-            StageWrite::RowsWithFileData {
+            TransactionWrite::RowsWithFileData {
                 rows,
                 file_data,
                 count,
@@ -3243,9 +3263,7 @@ mod tests {
                     .iter()
                     .find(|row| row.schema_key == "lix_file_descriptor")
                     .expect("file descriptor row should be staged");
-                let snapshot: JsonValue =
-                    serde_json::from_str(descriptor.snapshot_content.as_deref().unwrap())
-                        .expect("descriptor snapshot JSON");
+                let snapshot: JsonValue = descriptor.snapshot.as_ref().unwrap().value().clone();
                 assert_eq!(snapshot["directory_id"], "dir-guides");
             }
             other => panic!("expected insert with file data staged write, got {other:?}"),
