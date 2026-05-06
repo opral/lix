@@ -57,6 +57,7 @@ Do not use this skill for raw SQLite access, private engine/wasm internals, SDK 
 - Use `createBetterSqlite3Backend()` for persistent apps, demos, and tests.
 - Use numbered SQL placeholders: `$1`, `$2`, `$3`; bare `?` is rejected.
 - Use `lix_json($1)` when inserting JSON text into JSON-typed columns.
+- Use scalar SQL functions `SELECT lix_uuid_v7()` and `SELECT lix_timestamp()` when consumer code needs Lix-generated UUID v7 ids or ISO timestamps. Do not call them as table functions with `SELECT * FROM ...`.
 - Use stable, namespaced, lowercase schema keys like `acme_section`, not generic names like `task`.
 - Always include `x-lix-primary-key` and `additionalProperties: false` on app schemas.
 - Use version names from the user's vocabulary, such as `"Marketing edit"` or `"Q3 pricing draft"`.
