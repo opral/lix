@@ -6,7 +6,7 @@ use crate::LixError;
 const CHANGELOG_FILE_IDENTIFIER: &str = "LXCH";
 
 pub(crate) fn encode_change_ref(change: CanonicalChangeRef<'_>) -> Result<Vec<u8>, LixError> {
-    let entity_id = change.entity_id.as_cow_str().map_err(|error| {
+    let entity_id = change.entity_id.as_json_array_text().map_err(|error| {
         LixError::unknown(format!(
             "failed to encode changelog entity identity: {error}"
         ))
@@ -61,7 +61,7 @@ pub(crate) fn decode_change(bytes: &[u8]) -> Result<CanonicalChange, LixError> {
     })?;
 
     let entity_id = required_str(change.entity_id(), "entity_id")?;
-    let entity_id = EntityIdentity::from_string(entity_id).map_err(|error| {
+    let entity_id = EntityIdentity::from_json_array_text(entity_id).map_err(|error| {
         LixError::unknown(format!(
             "failed to decode changelog entity identity: {error}"
         ))

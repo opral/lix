@@ -123,9 +123,9 @@ mod tests {
         let changelog = ChangelogContext::new();
         let mut change = test_change("change-composite");
         change.entity_id = crate::entity_identity::EntityIdentity::tuple(vec![
-            crate::entity_identity::EntityIdentityPart::String("entity".to_string()),
-            crate::entity_identity::EntityIdentityPart::Number("7".to_string()),
-            crate::entity_identity::EntityIdentityPart::Bool(true),
+            "entity".to_string(),
+            "7".to_string(),
+            "true".to_string(),
         ])
         .expect("composite identity should be valid");
 

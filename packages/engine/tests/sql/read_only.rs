@@ -65,7 +65,7 @@ simulation_test!(
             session
                 .execute(
                     "INSERT INTO lix_state (entity_id, schema_key, snapshot_content, schema_version) \
-                     VALUES ('orphan-descriptor', 'lix_version_descriptor', \
+                     VALUES (lix_json('[\"orphan-descriptor\"]'), 'lix_version_descriptor', \
                        lix_json('{\"id\":\"orphan-descriptor\",\"name\":\"Orphan\",\"hidden\":false}'), '1')",
                     &[],
                 )
@@ -177,7 +177,7 @@ simulation_test!(read_only_binary_blob_ref_rejects_writes, |sim| async move {
             .execute(
                 "DELETE FROM lix_state \
                  WHERE schema_key = 'lix_binary_blob_ref' \
-                   AND entity_id = 'file-with-data'",
+                   AND entity_id = lix_json('[\"file-with-data\"]')",
                 &[],
             )
             .await
@@ -236,7 +236,7 @@ simulation_test!(
             session
                 .execute(
                     "INSERT INTO lix_state (entity_id, schema_key, snapshot_content, schema_version, global) \
-                     VALUES ('fake-change', 'lix_change', \
+                     VALUES (lix_json('[\"fake-change\"]'), 'lix_change', \
                        lix_json('{\"id\":\"fake-change\",\"entity_id\":\"x\",\"schema_key\":\"lix_key_value\",\"schema_version\":\"1\"}'), '1', true)",
                     &[],
                 )

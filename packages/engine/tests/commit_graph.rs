@@ -174,8 +174,8 @@ async fn load_commit_snapshot(
         .execute(
             &format!(
                 "SELECT snapshot_content \
-                 FROM lix_state \
-                 WHERE schema_key = 'lix_commit' AND entity_id = '{commit_id}'"
+	             FROM lix_state \
+	             WHERE schema_key = 'lix_commit' AND entity_id = lix_json('[\"{commit_id}\"]')"
             ),
             &[],
         )

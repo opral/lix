@@ -2,12 +2,13 @@ use crate::tracked_state::{
     TrackedStateDiffEntry, TrackedStateDiffKind, TrackedStateMergeConflict, TrackedStateMergePlan,
 };
 use crate::LixError;
+use serde_json::Value as JsonValue;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MergeConflict {
     pub(crate) kind: MergeConflictKind,
     pub(crate) schema_key: String,
-    pub(crate) entity_id: String,
+    pub(crate) entity_id: JsonValue,
     pub(crate) file_id: Option<String>,
     pub(crate) target: MergeConflictSide,
     pub(crate) source: MergeConflictSide,
@@ -42,7 +43,7 @@ fn conflict_from_tracked(conflict: &TrackedStateMergeConflict) -> Result<MergeCo
     Ok(MergeConflict {
         kind: MergeConflictKind::SameEntityChanged,
         schema_key: conflict.identity.schema_key.clone(),
-        entity_id: conflict.identity.entity_id.as_string()?,
+        entity_id: conflict.identity.entity_id.as_json_array_value()?,
         file_id: conflict.identity.file_id.clone(),
         target: conflict_side_from_diff_entry(&conflict.target),
         source: conflict_side_from_diff_entry(&conflict.source),

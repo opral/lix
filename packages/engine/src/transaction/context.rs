@@ -916,16 +916,17 @@ mod tests {
             .await
             .expect("changelog should scan");
         assert!(
-            changes
-                .iter()
-                .any(|change| change.entity_id.as_string().as_deref() == Ok("tracked-programmatic")),
+            changes.iter().any(
+                |change| change.entity_id.as_single_string_owned().as_deref()
+                    == Ok("tracked-programmatic")
+            ),
             "tracked staged row should be appended to changelog"
         );
         assert!(
-            !changes
-                .iter()
-                .any(|change| change.entity_id.as_string().as_deref()
-                    == Ok("untracked-programmatic")),
+            !changes.iter().any(
+                |change| change.entity_id.as_single_string_owned().as_deref()
+                    == Ok("untracked-programmatic")
+            ),
             "untracked staged row must not be appended to changelog"
         );
 
@@ -996,7 +997,8 @@ mod tests {
         assert!(
             tracked_rows
                 .iter()
-                .all(|row| row.entity_id.as_string().as_deref() != Ok("untracked-programmatic")),
+                .all(|row| row.entity_id.as_single_string_owned().as_deref()
+                    != Ok("untracked-programmatic")),
             "untracked staged rows should not be written into tracked state"
         );
     }
