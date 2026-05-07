@@ -294,7 +294,10 @@ impl Transaction {
                 }
                 remember_pending_registered_schema(
                     row.snapshot.as_ref().map(TransactionJson::value),
-                    Domain::schema_catalog(row.schema_scope_version_id().to_string(), row.untracked),
+                    Domain::schema_catalog(
+                        row.schema_scope_version_id().to_string(),
+                        row.untracked,
+                    ),
                     catalog,
                 )?;
             }
