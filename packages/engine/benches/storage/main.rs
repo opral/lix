@@ -6,6 +6,7 @@ use lix_engine::storage_bench::{
 mod backend;
 mod binary_cas;
 mod changelog;
+mod commit_graph;
 mod json_store;
 mod rocksdb_backend;
 mod sqlite_backend;
@@ -63,6 +64,7 @@ fn storage_benches(c: &mut Criterion) {
     tracked_state::bench_fast(c, &runtime, args);
     untracked_state::bench(c, &runtime, args);
     changelog::bench(c, &runtime, args);
+    commit_graph::bench(c, &runtime, args);
     binary_cas::bench(c, &runtime, args);
     json_store::bench(c, &runtime, args);
 }

@@ -2,6 +2,7 @@ use crate::binary_cas::{BinaryCasContext, BlobHash, BlobWrite};
 use crate::changelog::{
     CanonicalChange, ChangelogContext, ChangelogScanRequest, MaterializedCanonicalChange,
 };
+use crate::commit_graph::CommitGraphChangeHistoryRequest;
 use crate::entity_identity::EntityIdentity;
 use crate::entity_identity::EntityIdentityPart;
 use crate::json_store::context::JsonStoreContext;
@@ -1414,6 +1415,13 @@ pub struct ChangelogCodecFixture {
     encoded_changes: Vec<Vec<u8>>,
 }
 
+pub struct CommitGraphReadFixture {
+    changelog: ChangelogContext,
+    commits: Vec<crate::commit_graph::CommitGraphCommit>,
+    head_commit_id: String,
+    rows: usize,
+}
+
 pub struct BinaryCasWriteFixture {
     context: BinaryCasContext,
     file_ids: Vec<String>,
@@ -2528,6 +2536,25 @@ pub async fn changelog_scan_limit_100_prepared(
     Ok(report(expected, verified_rows, Duration::ZERO))
 }
 
+pub async fn changelog_scan_change_set_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &ChangelogReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
+    let change_ids = (0..fixture.rows)
+        .map(|index| format!("bench-change-{index}"))
+        .collect::<Vec<_>>();
+    let verified_rows = reader
+        .load_changes(&change_ids)
+        .await?
+        .into_iter()
+        .filter(Option::is_some)
+        .count();
+    Ok(report(fixture.rows, verified_rows, Duration::ZERO))
+}
+
 pub async fn changelog_scan_schema_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &ChangelogReadFixture,
@@ -2570,6 +2597,56 @@ pub async fn changelog_scan_entity_history_prepared(
         verified_rows,
         Duration::ZERO,
     ))
+}
+
+pub async fn prepare_commit_graph_read(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    config: StorageBenchConfig,
+) -> Result<CommitGraphReadFixture, LixError> {
+    let changelog = ChangelogContext::new();
+    let mut changes = changelog_materialized_changes(config);
+    let head_commit_id = "bench-commit-head".to_string();
+    changes.push(commit_graph_materialized_commit_change(
+        &head_commit_id,
+        config.rows,
+    ));
+    append_changelog_changes(backend, &changelog, &changes).await?;
+
+    let graph = crate::commit_graph::CommitGraphContext::new(changelog.clone());
+    let mut reader = graph.reader(StorageContext::new(Arc::clone(backend)));
+    let commits = reader.all_commits().await?;
+    Ok(CommitGraphReadFixture {
+        changelog,
+        commits,
+        head_commit_id,
+        rows: config.rows,
+    })
+}
+
+pub async fn commit_graph_change_set_elements_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &CommitGraphReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let graph = crate::commit_graph::CommitGraphContext::new(fixture.changelog.clone());
+    let mut reader = graph.reader(StorageContext::new(Arc::clone(backend)));
+    let verified_rows = reader.change_set_elements(&fixture.commits).await?.len();
+    Ok(report(fixture.rows, verified_rows, Duration::ZERO))
+}
+
+pub async fn commit_graph_change_history_from_commit_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &CommitGraphReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let graph = crate::commit_graph::CommitGraphContext::new(fixture.changelog.clone());
+    let mut reader = graph.reader(StorageContext::new(Arc::clone(backend)));
+    let verified_rows = reader
+        .change_history_from_commit(
+            &fixture.head_commit_id,
+            &CommitGraphChangeHistoryRequest::default(),
+        )
+        .await?
+        .len();
+    Ok(report(fixture.rows, verified_rows, Duration::ZERO))
 }
 
 pub async fn prepare_binary_cas_write_blobs(
@@ -3658,6 +3735,34 @@ fn changelog_materialized_changes(config: StorageBenchConfig) -> Vec<Materialize
             created_at: timestamp(index),
         })
         .collect()
+}
+
+fn commit_graph_materialized_commit_change(
+    commit_id: &str,
+    rows: usize,
+) -> MaterializedCanonicalChange {
+    let change_ids = (0..rows)
+        .map(|index| format!("bench-change-{index}"))
+        .collect::<Vec<_>>();
+    let snapshot_content = serde_json::json!({
+        "id": commit_id,
+        "change_set_id": "bench-change-set",
+        "change_ids": change_ids,
+        "author_account_ids": ["bench-author"],
+        "parent_commit_ids": []
+    })
+    .to_string();
+
+    MaterializedCanonicalChange {
+        id: format!("bench-commit-change-{commit_id}"),
+        entity_id: EntityIdentity::single(commit_id.to_string()),
+        schema_key: "lix_commit".to_string(),
+        schema_version: "1".to_string(),
+        file_id: None,
+        snapshot_content: Some(snapshot_content),
+        metadata: None,
+        created_at: timestamp(rows),
+    }
 }
 
 fn canonical_changelog_bench_change(change: MaterializedCanonicalChange) -> CanonicalChange {
