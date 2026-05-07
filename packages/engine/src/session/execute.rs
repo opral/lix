@@ -325,8 +325,8 @@ impl SessionContext {
             let functions = runtime_functions.provider();
             let active_version_id = self.active_version_id_from_reader(&mut read_store).await?;
             let visible_schemas = self
-                .schema_registry
-                .visible_schemas(live_state.as_ref(), &active_version_id)
+                .schema_catalog_source
+                .schema_jsons_for_sql_read_planning(live_state.as_ref(), &active_version_id)
                 .await?;
             let ctx = SessionSqlExecutionContext {
                 active_version_id: &active_version_id,

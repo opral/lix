@@ -79,6 +79,7 @@
                 "type": "object",
                 "required": [
                   "schemaKey",
+                  "schemaVersion",
                   "properties"
                 ],
                 "additionalProperties": false,
@@ -86,6 +87,10 @@
                   "schemaKey": {
                     "type": "string",
                     "description": "The x-lix-key of the referenced schema"
+                  },
+                  "schemaVersion": {
+                    "type": "string",
+                    "description": "The x-lix-version of the referenced schema"
                   },
                   "properties": {
                     "type": "array",
@@ -105,11 +110,11 @@
         },
         "x-lix-state-foreign-keys": {
           "type": "array",
-          "description": "Foreign keys from local fields to arbitrary live state rows. Each entry is exactly three required local JSON Pointers ordered as `[entity_id, schema_key, file_id]`: index 0 points to the local entity_id JSON array, index 1 points to the local schema_key string, and index 2 points to the local file_id string-or-null. Use explicit null for global file_id targets; omitted fields are invalid. The referenced state row is resolved in the same version.",
+          "description": "Foreign keys from local fields to arbitrary live state rows. Each entry is exactly four required local JSON Pointers ordered as `[entity_id, schema_key, schema_version, file_id]`: index 0 points to the local entity_id JSON array, index 1 points to the local schema_key string, index 2 points to the local schema_version string, and index 3 points to the local file_id string-or-null. Use explicit null for global file_id targets; omitted fields are invalid. The referenced state row is resolved in the same version.",
           "items": {
             "type": "array",
-            "minItems": 3,
-            "maxItems": 3,
+            "minItems": 4,
+            "maxItems": 4,
             "uniqueItems": true,
             "prefixItems": [
               {
@@ -125,7 +130,12 @@
               {
                 "type": "string",
                 "format": "json-pointer",
-                "description": "[2] Local JSON Pointer for the target file_id. The value must be a string or null."
+                "description": "[2] Local JSON Pointer for the target schema_version. The value must be a string."
+              },
+              {
+                "type": "string",
+                "format": "json-pointer",
+                "description": "[3] Local JSON Pointer for the target file_id. The value must be a string or null."
               }
             ],
             "items": false

@@ -7,13 +7,14 @@ use serde_json::Value as JsonValue;
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobHash};
 use crate::changelog::ChangelogContext;
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
+use crate::domain::Domain;
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::json_store::{JsonStoreContext, JsonStoreWriter};
 use crate::live_state::{
     LiveStateContext, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
 };
-use crate::schema_registry::SchemaRegistry;
+use crate::schema_catalog::SchemaCatalogSource;
 use crate::session::{SessionMode, WORKSPACE_VERSION_KEY};
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage::{StorageContext, StorageWriteSet, StorageWriteTransaction};
@@ -76,7 +77,7 @@ impl Transaction {
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
         version_ctx: Arc<VersionContext>,
-        schema_registry: Arc<SchemaRegistry>,
+        schema_catalog_source: Arc<SchemaCatalogSource>,
     ) -> Result<OpenTransaction, LixError> {
         let mut storage_transaction = storage.begin_write_transaction().await?;
         let setup_result = async {
@@ -94,8 +95,17 @@ impl Transaction {
             let functions = runtime_functions.provider();
             let visible_schemas = {
                 let visible_live_state = live_state.reader(storage_transaction.as_mut());
-                schema_registry
-                    .visible_schemas(&visible_live_state, &active_version_id)
+                schema_catalog_source
+                    .schema_jsons_for_sql_read_planning(&visible_live_state, &active_version_id)
+                    .await?
+            };
+            let schema_facts = {
+                let visible_live_state = live_state.reader(storage_transaction.as_mut());
+                schema_catalog_source
+                    .schema_facts_for_domain(
+                        &visible_live_state,
+                        &Domain::schema_catalog(active_version_id.clone(), true),
+                    )
                     .await?
             };
             Ok::<_, LixError>((
@@ -103,20 +113,23 @@ impl Transaction {
                 runtime_functions,
                 functions,
                 visible_schemas,
+                schema_facts,
             ))
         }
         .await;
-        let (active_version_id, runtime_functions, functions, visible_schemas) = match setup_result
-        {
-            Ok(result) => result,
-            Err(error) => {
-                let _ = storage_transaction.rollback().await;
-                return Err(error);
-            }
-        };
-        let mut schema_resolver = TransactionSchemaResolver::new(schema_registry);
-        schema_resolver
-            .remember_visible_schemas(active_version_id.clone(), visible_schemas.clone());
+        let (active_version_id, runtime_functions, functions, visible_schemas, schema_facts) =
+            match setup_result {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = storage_transaction.rollback().await;
+                    return Err(error);
+                }
+            };
+        let mut schema_resolver = TransactionSchemaResolver::new(schema_catalog_source);
+        schema_resolver.remember_schema_facts(
+            &Domain::schema_catalog(active_version_id.clone(), true),
+            schema_facts,
+        );
         let staged_writes = Arc::new(TransactionWriteBuffer::new(functions.clone()));
         Ok(OpenTransaction {
             transaction: Self {
@@ -249,23 +262,42 @@ impl Transaction {
         let row_count = rows.len();
         let staged = self.staged_writes.staging_overlay()?;
         let live_state = self.live_state.reader(self.storage_transaction.as_mut());
-        let mut rows_by_scope =
-            BTreeMap::<(String, bool), Vec<(usize, TransactionWriteRow)>>::new();
+        let mut rows_by_scope = BTreeMap::<Domain, Vec<(usize, TransactionWriteRow)>>::new();
         for (index, row) in rows.into_iter().enumerate() {
             rows_by_scope
-                .entry((row.schema_scope_version_id().to_string(), row.untracked))
+                .entry(Domain::schema_catalog(
+                    row.schema_scope_version_id().to_string(),
+                    row.untracked,
+                ))
                 .or_default()
                 .push((index, row));
         }
 
         let mut prepared_rows = Vec::with_capacity(row_count);
         prepared_rows.resize_with(row_count, || None);
-        for ((version_id, untracked), rows) in rows_by_scope {
+        for (domain, rows) in rows_by_scope {
             let functions = self.functions.clone();
             let catalog = self
                 .schema_resolver
-                .catalog_for_row_normalization(&live_state, &staged, &version_id, untracked)
+                .catalog_for_row_normalization(&live_state, &staged, &domain)
                 .await?;
+            for (_, row) in &rows {
+                if row.schema_key != REGISTERED_SCHEMA_KEY {
+                    continue;
+                }
+                if row.file_id.is_some() {
+                    return Err(LixError::new(
+                        LixError::CODE_SCHEMA_DEFINITION,
+                        "lix_registered_schema rows must not be scoped to a file",
+                    )
+                    .with_hint("Schema definitions are scoped by version and durability only; write them with null file_id."));
+                }
+                remember_pending_registered_schema(
+                    row.snapshot.as_ref().map(TransactionJson::value),
+                    Domain::schema_catalog(row.schema_scope_version_id().to_string(), row.untracked),
+                    catalog,
+                )?;
+            }
             let normalized_rows = rows
                 .into_iter()
                 .map(|(index, row)| {
@@ -296,7 +328,7 @@ impl Transaction {
         let staged = self.staged_writes.staging_overlay()?;
         let live_state = self.live_state.reader(self.storage_transaction.as_mut());
         let mut changes_by_scope =
-            BTreeMap::<(String, bool), Vec<(usize, TransactionAdoptedChange)>>::new();
+            BTreeMap::<Domain, Vec<(usize, TransactionAdoptedChange)>>::new();
         for (index, change) in changes.into_iter().enumerate() {
             let schema_scope_version_id = if change.version_id == GLOBAL_VERSION_ID {
                 GLOBAL_VERSION_ID
@@ -304,18 +336,39 @@ impl Transaction {
                 change.version_id.as_str()
             };
             changes_by_scope
-                .entry((schema_scope_version_id.to_string(), false))
+                .entry(Domain::schema_catalog(
+                    schema_scope_version_id.to_string(),
+                    false,
+                ))
                 .or_default()
                 .push((index, change));
         }
 
         let mut prepared_rows = Vec::with_capacity(change_count);
         prepared_rows.resize_with(change_count, || None);
-        for ((version_id, untracked), changes) in changes_by_scope {
+        for (domain, changes) in changes_by_scope {
             let catalog = self
                 .schema_resolver
-                .catalog_for_row_normalization(&live_state, &staged, &version_id, untracked)
+                .catalog_for_row_normalization(&live_state, &staged, &domain)
                 .await?;
+            for (_, change) in &changes {
+                let row = &change.projected_row;
+                if row.schema_key != REGISTERED_SCHEMA_KEY {
+                    continue;
+                }
+                if row.file_id.is_some() {
+                    return Err(LixError::new(
+                        LixError::CODE_SCHEMA_DEFINITION,
+                        "lix_registered_schema rows must not be scoped to a file",
+                    )
+                    .with_hint("Schema definitions are scoped by version and durability only; write them with null file_id."));
+                }
+                remember_adopted_registered_schema(
+                    Domain::schema_catalog(change.version_id.clone(), false),
+                    row.snapshot_content.as_deref(),
+                    catalog,
+                )?;
+            }
             let mut planned_changes = Vec::with_capacity(changes.len());
             for (index, change) in changes {
                 let row = &change.projected_row;
@@ -331,7 +384,18 @@ impl Transaction {
                     ));
                 };
                 if row.schema_key == REGISTERED_SCHEMA_KEY {
-                    remember_adopted_registered_schema(row.snapshot_content.as_deref(), catalog)?;
+                    if row.file_id.is_some() {
+                        return Err(LixError::new(
+                            LixError::CODE_SCHEMA_DEFINITION,
+                            "lix_registered_schema rows must not be scoped to a file",
+                        )
+                        .with_hint("Schema definitions are scoped by version and durability only; write them with null file_id."));
+                    }
+                    remember_adopted_registered_schema(
+                        Domain::schema_catalog(change.version_id.clone(), false),
+                        row.snapshot_content.as_deref(),
+                        catalog,
+                    )?;
                 }
                 planned_changes.push((index, change, schema_plan_id));
             }
@@ -364,7 +428,7 @@ impl Transaction {
             let live_state = self.live_state.reader(self.storage_transaction.as_mut());
             let schema_catalog = self
                 .schema_resolver
-                .catalog_for_validation(&live_state, &scope.version_id, scope.untracked)
+                .catalog_for_validation(&live_state, scope)
                 .await?;
             validate_prepared_writes(TransactionValidationInput::new(
                 &version_prepared_writes,
@@ -544,8 +608,9 @@ fn prepare_state_row(
 }
 
 fn remember_adopted_registered_schema(
+    domain: Domain,
     snapshot_content: Option<&str>,
-    catalog: &mut crate::transaction::normalization::TransactionSchemaCatalog,
+    catalog: &mut crate::schema_catalog::SchemaCatalog,
 ) -> Result<(), LixError> {
     let snapshot = snapshot_content
         .map(|value| {
@@ -557,12 +622,12 @@ fn remember_adopted_registered_schema(
             })
         })
         .transpose()?;
-    remember_pending_registered_schema(snapshot.as_ref(), catalog)
+    remember_pending_registered_schema(snapshot.as_ref(), domain, catalog)
 }
 
 fn prepare_adopted_state_row(
     change: TransactionAdoptedChange,
-    schema_plan_id: crate::transaction::normalization::SchemaPlanId,
+    schema_plan_id: crate::schema_catalog::SchemaPlanId,
     json_writer: &mut JsonStoreWriter,
 ) -> Result<PreparedAdoptedStateRow, LixError> {
     if change.change_id != change.projected_row.change_id {
@@ -633,7 +698,7 @@ pub(crate) async fn open_transaction(
     binary_cas: Arc<BinaryCasContext>,
     changelog: Arc<ChangelogContext>,
     version_ctx: Arc<VersionContext>,
-    schema_registry: Arc<SchemaRegistry>,
+    schema_catalog_source: Arc<SchemaCatalogSource>,
 ) -> Result<OpenTransaction, LixError> {
     Transaction::open(
         mode,
@@ -643,7 +708,7 @@ pub(crate) async fn open_transaction(
         binary_cas,
         changelog,
         version_ctx,
-        schema_registry,
+        schema_catalog_source,
     )
     .await
 }
@@ -871,6 +936,8 @@ mod tests {
         )
     }
 
+    const SCHEMA_FIXTURE_COMMIT_ID: &str = "schema-fixture-commit";
+
     #[tokio::test]
     async fn stage_rows_routes_tracked_and_untracked_rows_without_sql() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
@@ -880,7 +947,7 @@ mod tests {
         let binary_cas = Arc::new(BinaryCasContext::new());
         let changelog = Arc::new(ChangelogContext::new());
         let version_ctx = Arc::new(VersionContext::new(Arc::new(UntrackedStateContext::new())));
-        let schema_registry = Arc::new(SchemaRegistry::new());
+        let schema_catalog_source = Arc::new(SchemaCatalogSource::new());
         let opened = open_transaction(
             &SessionMode::Pinned {
                 version_id: GLOBAL_VERSION_ID.to_string(),
@@ -891,7 +958,7 @@ mod tests {
             Arc::clone(&binary_cas),
             Arc::clone(&changelog),
             Arc::clone(&version_ctx),
-            Arc::clone(&schema_registry),
+            Arc::clone(&schema_catalog_source),
         )
         .await
         .expect("transaction should open");
@@ -1012,7 +1079,7 @@ mod tests {
         let binary_cas = Arc::new(BinaryCasContext::new());
         let changelog = Arc::new(ChangelogContext::new());
         let version_ctx = Arc::new(VersionContext::new(Arc::new(UntrackedStateContext::new())));
-        let schema_registry = Arc::new(SchemaRegistry::new());
+        let schema_catalog_source = Arc::new(SchemaCatalogSource::new());
         let opened = open_transaction(
             &SessionMode::Pinned {
                 version_id: GLOBAL_VERSION_ID.to_string(),
@@ -1023,7 +1090,7 @@ mod tests {
             Arc::clone(&binary_cas),
             Arc::clone(&changelog),
             Arc::clone(&version_ctx),
-            Arc::clone(&schema_registry),
+            Arc::clone(&schema_catalog_source),
         )
         .await
         .expect("transaction should open");
@@ -1063,8 +1130,9 @@ mod tests {
             .await
             .expect("version ref should load after failed commit");
         assert_eq!(
-            head, None,
-            "validation failure must happen before version-ref persistence"
+            head.as_deref(),
+            Some(SCHEMA_FIXTURE_COMMIT_ID),
+            "validation failure must not advance the version ref"
         );
     }
 
@@ -1358,7 +1426,7 @@ mod tests {
         let binary_cas = Arc::new(BinaryCasContext::new());
         let changelog = Arc::new(ChangelogContext::new());
         let version_ctx = Arc::new(VersionContext::new(Arc::new(UntrackedStateContext::new())));
-        let schema_registry = Arc::new(SchemaRegistry::new());
+        let schema_catalog_source = Arc::new(SchemaCatalogSource::new());
         let opened = open_transaction(
             &SessionMode::Pinned {
                 version_id: GLOBAL_VERSION_ID.to_string(),
@@ -1369,7 +1437,7 @@ mod tests {
             Arc::clone(&binary_cas),
             Arc::clone(&changelog),
             Arc::clone(&version_ctx),
-            schema_registry,
+            schema_catalog_source,
         )
         .await
         .expect("transaction should open");
@@ -1395,7 +1463,7 @@ mod tests {
                 let key = crate::schema::schema_key_from_definition(schema)
                     .expect("seed schema key should derive");
                 let snapshot_content = json!({ "value": schema }).to_string();
-                crate::untracked_state::UntrackedStateRow {
+                crate::tracked_state::TrackedStateRow {
                     entity_id: crate::schema::registered_schema_entity_id(
                         &key.schema_key,
                         &key.schema_version,
@@ -1403,7 +1471,6 @@ mod tests {
                     .expect("registered schema identity should derive"),
                     schema_key: "lix_registered_schema".to_string(),
                     file_id: None,
-                    version_id: GLOBAL_VERSION_ID.to_string(),
                     schema_version: "1".to_string(),
                     snapshot_ref: Some(
                         json_writer
@@ -1415,10 +1482,18 @@ mod tests {
                     metadata_ref: None,
                     created_at: "1970-01-01T00:00:00.000Z".to_string(),
                     updated_at: "1970-01-01T00:00:00.000Z".to_string(),
-                    global: true,
+                    change_id: format!("schema-fixture-{}-{}", key.schema_key, key.schema_version),
+                    commit_id: SCHEMA_FIXTURE_COMMIT_ID.to_string(),
                 }
             })
             .collect::<Vec<_>>();
+        let version_ref_row = prepare_version_ref_row(
+            &mut json_writer,
+            GLOBAL_VERSION_ID,
+            SCHEMA_FIXTURE_COMMIT_ID,
+            "1970-01-01T00:00:00.000Z",
+        )
+        .expect("schema fixture version ref should stage");
         json_writer.flush_into(&mut writes);
         let mut storage_transaction = storage
             .begin_write_transaction()
@@ -1427,8 +1502,23 @@ mod tests {
         {
             let mut writer = live_state.writer(storage_transaction.as_mut());
             writer
-                .stage_untracked_rows(&mut writes, rows.iter().map(|row| row.as_ref()))
+                .stage_tracked_root(
+                    &mut writes,
+                    GLOBAL_VERSION_ID,
+                    SCHEMA_FIXTURE_COMMIT_ID,
+                    None,
+                    rows.iter()
+                        .map(|row| crate::live_state::LiveStateTrackedRowRef {
+                            row: row.as_ref(),
+                            global: true,
+                            version_id: GLOBAL_VERSION_ID,
+                        }),
+                )
+                .await
                 .expect("schema fixture rows should stage");
+            writer
+                .stage_untracked_rows(&mut writes, [version_ref_row.as_ref()])
+                .expect("schema fixture version ref should stage");
         }
         writes
             .apply(&mut storage_transaction.as_mut())
@@ -1461,8 +1551,9 @@ mod tests {
             .await
             .expect("version ref should load after failed commit");
         assert_eq!(
-            head, None,
-            "validation failure must happen before version-ref persistence"
+            head.as_deref(),
+            Some(SCHEMA_FIXTURE_COMMIT_ID),
+            "validation failure must not advance the version ref"
         );
         let row = live_state
             .reader(storage)

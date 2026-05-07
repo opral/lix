@@ -1,14 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
+use crate::domain::{Domain, DomainRowIdentity};
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionProvider, FunctionProviderHandle};
 use crate::json_store::{JsonStoreContext, JsonStoreWriter};
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{LiveStateScanRequest, MaterializedLiveStateRow};
-use crate::transaction::domain::Domain;
-use crate::transaction::normalization::SchemaPlanId;
+use crate::schema_catalog::SchemaPlanId;
 #[cfg(test)]
 use crate::transaction::types::{stage_json_from_value, TransactionJson};
 use crate::transaction::types::{
@@ -170,6 +170,23 @@ impl<'a> PreparedValidationRow<'a> {
             Self::Adopted(row) => &row.version_id,
         }
     }
+
+    pub(crate) fn domain(&self) -> Domain {
+        Domain::exact_file(
+            self.version_id().to_string(),
+            self.untracked(),
+            self.file_id().clone(),
+        )
+    }
+
+    pub(crate) fn domain_row_identity(&self) -> DomainRowIdentity {
+        DomainRowIdentity::in_domain(
+            self.domain(),
+            self.schema_key().to_string(),
+            self.schema_version().to_string(),
+            self.entity_id().clone(),
+        )
+    }
 }
 
 impl<'a> PreparedWriteValidationIndex<'a> {
@@ -186,8 +203,9 @@ impl<'a> PreparedWriteValidationIndex<'a> {
             .iter()
             .flat_map(|(target_scope, rows)| {
                 rows.iter().copied().filter(move |row| {
-                    schema_scope.can_reach(target_scope)
-                        || (row.snapshot_json().is_none() && target_scope.can_reach(schema_scope))
+                    schema_scope.validation_scope_contains_constraint_domain(target_scope)
+                        || (row.snapshot_json().is_none()
+                            && target_scope.tombstone_domain_affects_validation_scope(schema_scope))
                 })
             })
             .collect();
@@ -239,14 +257,14 @@ impl PreparedWriteSet {
         for row in &self.state_rows {
             let row = PreparedValidationRow::State(row);
             rows_by_schema_scope
-                .entry(domain_for_validation_row(row).schema_catalog_domain())
+                .entry(row.domain().schema_catalog_domain())
                 .or_default()
                 .push(row);
         }
         for row in &self.adopted_rows {
             let row = PreparedValidationRow::Adopted(row);
             rows_by_schema_scope
-                .entry(domain_for_validation_row(row).schema_catalog_domain())
+                .entry(row.domain().schema_catalog_domain())
                 .or_default()
                 .push(row);
         }
@@ -257,7 +275,7 @@ impl PreparedWriteSet {
         >::new();
         for (identity, origin) in &self.insert_identities {
             insert_identities_by_schema_scope
-                .entry(domain_for_insert_identity(identity).schema_catalog_domain())
+                .entry(identity.domain().schema_catalog_domain())
                 .or_default()
                 .push((identity, origin.as_ref()));
         }
@@ -282,22 +300,6 @@ impl PreparedWriteSet {
             insert_identities,
         }
     }
-}
-
-fn domain_for_validation_row(row: PreparedValidationRow<'_>) -> Domain {
-    Domain::exact_file(
-        row.version_id().to_string(),
-        row.untracked(),
-        row.file_id().clone(),
-    )
-}
-
-fn domain_for_insert_identity(identity: &PreparedStateRowIdentity) -> Domain {
-    Domain::exact_file(
-        identity.version_id().to_string(),
-        identity.untracked(),
-        identity.file_id().clone(),
-    )
 }
 
 impl TransactionWriteBuffer {
@@ -782,6 +784,7 @@ pub(crate) enum StagedExactRow {
 pub(crate) struct PreparedStateRowIdentity {
     untracked: bool,
     schema_key: String,
+    schema_version: String,
     entity_id: crate::entity_identity::EntityIdentity,
     file_id: Option<String>,
     version_id: String,
@@ -792,6 +795,7 @@ impl PreparedStateRowIdentity {
         Self {
             untracked: row.untracked,
             schema_key: row.schema_key.clone(),
+            schema_version: row.schema_version.clone(),
             entity_id: row.entity_id.clone(),
             file_id: row.file_id.clone(),
             version_id: row.version_id.clone(),
@@ -809,30 +813,31 @@ impl PreparedStateRowIdentity {
         Some(Self {
             untracked,
             schema_key: request.schema_key.clone(),
+            schema_version: "1".to_string(),
             entity_id: request.entity_id.clone(),
             file_id,
             version_id: request.version_id.clone(),
         })
     }
 
-    pub(crate) fn untracked(&self) -> bool {
-        self.untracked
-    }
-
     pub(crate) fn schema_key(&self) -> &str {
         &self.schema_key
+    }
+
+    pub(crate) fn schema_version(&self) -> &str {
+        &self.schema_version
     }
 
     pub(crate) fn entity_id(&self) -> &crate::entity_identity::EntityIdentity {
         &self.entity_id
     }
 
-    pub(crate) fn file_id(&self) -> &Option<String> {
-        &self.file_id
-    }
-
-    pub(crate) fn version_id(&self) -> &str {
-        &self.version_id
+    pub(crate) fn domain(&self) -> Domain {
+        Domain::exact_file(
+            self.version_id.clone(),
+            self.untracked,
+            self.file_id.clone(),
+        )
     }
 }
 
@@ -847,6 +852,7 @@ impl From<&PreparedAdoptedStateRow> for PreparedStateRowIdentity {
         Self {
             untracked: false,
             schema_key: row.schema_key.clone(),
+            schema_version: row.schema_version.clone(),
             entity_id: row.entity_id.clone(),
             file_id: row.file_id.clone(),
             version_id: row.version_id.clone(),
@@ -859,6 +865,7 @@ impl From<&MaterializedLiveStateRow> for PreparedStateRowIdentity {
         Self {
             untracked: row.untracked,
             schema_key: row.schema_key.clone(),
+            schema_version: row.schema_version.clone(),
             entity_id: row.entity_id.clone(),
             file_id: row.file_id.clone(),
             version_id: row.version_id.clone(),
@@ -1601,7 +1608,7 @@ mod tests {
             })
             .expect("overlay scan should succeed");
 
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 6);
         assert_eq!(
             rows.iter()
                 .filter(|row| row.entity_id
@@ -1610,7 +1617,7 @@ mod tests {
                     && row.schema_key == "lix_key_value"
                     && row.file_id.is_none())
                 .count(),
-            2
+            3
         );
         assert!(rows.iter().any(|row| {
             row.snapshot_content.as_deref()

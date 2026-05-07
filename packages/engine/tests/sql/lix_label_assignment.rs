@@ -32,8 +32,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_label_assignment \
-                 (target_entity_id, target_schema_key, target_file_id, label_id) \
-                 VALUES (lix_json('[\"label-target\"]'), 'lix_key_value', NULL, 'label-a')",
+                 (target_entity_id, target_schema_key, target_schema_version, target_file_id, label_id) \
+                 VALUES (lix_json('[\"label-target\"]'), 'lix_key_value', '1', NULL, 'label-a')",
                 &[],
             )
             .await
@@ -41,7 +41,7 @@ simulation_test!(
 
         let rows = select_rows(
             &session,
-            "SELECT id, target_entity_id, target_schema_key, target_file_id, label_id \
+            "SELECT id, target_entity_id, target_schema_key, target_schema_version, target_file_id, label_id \
              FROM lix_label_assignment \
              WHERE target_entity_id = lix_json('[\"label-target\"]')",
         )
@@ -58,6 +58,7 @@ simulation_test!(
             &[
                 Value::Json(json!(["label-target"])),
                 Value::Text("lix_key_value".to_string()),
+                Value::Text("1".to_string()),
                 Value::Null,
                 Value::Text("label-a".to_string()),
             ]
@@ -66,8 +67,8 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_label_assignment \
-                 (target_entity_id, target_schema_key, target_file_id, label_id) \
-                 VALUES (lix_json('[\"label-target\"]'), 'lix_key_value', NULL, 'label-a')",
+                 (target_entity_id, target_schema_key, target_schema_version, target_file_id, label_id) \
+                 VALUES (lix_json('[\"label-target\"]'), 'lix_key_value', '1', NULL, 'label-a')",
                 &[],
             )
             .await
@@ -110,8 +111,8 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_label_assignment \
-                 (target_entity_id, target_schema_key, target_file_id, label_id) \
-                 VALUES (lix_json('[\"missing-target\"]'), 'lix_key_value', NULL, 'label-a')",
+                 (target_entity_id, target_schema_key, target_schema_version, target_file_id, label_id) \
+                 VALUES (lix_json('[\"missing-target\"]'), 'lix_key_value', '1', NULL, 'label-a')",
                 &[],
             )
             .await

@@ -17,6 +17,7 @@ impl SchemaKey {
         }
     }
 
+    #[cfg(test)]
     pub fn version_number(&self) -> Option<u64> {
         self.schema_version.parse::<u64>().ok()
     }

@@ -470,6 +470,7 @@ fn x_lix_foreign_keys_with_valid_structure() {
                 "properties": ["/author_id"],
                 "references": {
                     "schemaKey": "user_profile",
+                    "schemaVersion": "1",
                     "properties": ["/id"]
                 }
             },
@@ -477,6 +478,7 @@ fn x_lix_foreign_keys_with_valid_structure() {
                 "properties": ["/category_id"],
                 "references": {
                     "schemaKey": "post_category",
+                    "schemaVersion": "1",
                     "properties": ["/id"]
                 }
             }
@@ -504,6 +506,7 @@ fn x_lix_foreign_keys_reject_duplicate_pointers() {
                 "properties": ["/local", "/local"],
                 "references": {
                     "schemaKey": "remote_schema",
+                    "schemaVersion": "1",
                     "properties": ["/id", "/version"]
                 }
             }
@@ -541,7 +544,7 @@ fn x_lix_foreign_keys_fails_without_required_fields() {
 }
 
 #[test]
-fn x_lix_foreign_keys_rejects_schema_version() {
+fn x_lix_foreign_keys_requires_schema_version() {
     let schema = json!({
         "type": "object",
         "x-lix-key": "comment",
@@ -551,8 +554,7 @@ fn x_lix_foreign_keys_rejects_schema_version() {
                 "properties": ["/post_id"],
                 "references": {
                     "schemaKey": "blog_post",
-                    "properties": ["/id"],
-                    "schemaVersion": "1"
+                    "properties": ["/id"]
                 }
             }
         ],
@@ -564,7 +566,9 @@ fn x_lix_foreign_keys_rejects_schema_version() {
         "additionalProperties": false
     });
 
-    assert!(validate_lix_schema_definition(&schema).is_err());
+    let err = validate_lix_schema_definition(&schema)
+        .expect_err("foreign key target schemaVersion should be required");
+    assert!(err.to_string().contains("schemaVersion"));
 }
 
 #[test]
@@ -577,7 +581,7 @@ fn x_lix_foreign_keys_rejects_mode_field() {
         "x-lix-foreign-keys": [
             {
                 "properties": ["/parent_id"],
-                "references": { "schemaKey": "parent_entity", "properties": ["/id"] },
+                "references": { "schemaKey": "parent_entity", "schemaVersion": "1", "properties": ["/id"] },
                 "mode": "materialized"
             }
         ],
@@ -603,7 +607,7 @@ fn x_lix_foreign_keys_rejects_scope_field() {
         "x-lix-foreign-keys": [
             {
                 "properties": ["/parent_id"],
-                "references": { "schemaKey": "parent_entity", "properties": ["/id"] },
+                "references": { "schemaKey": "parent_entity", "schemaVersion": "1", "properties": ["/id"] },
                 "scope": ["file_id"]
             }
         ],
@@ -626,13 +630,14 @@ fn x_lix_state_foreign_keys_with_ordered_state_address_tuple() {
         "x-lix-key": "label_assignment",
         "x-lix-version": "1",
         "x-lix-state-foreign-keys": [
-            ["/target_entity_id", "/target_schema_key", "/target_file_id"]
+            ["/target_entity_id", "/target_schema_key", "/target_schema_version", "/target_file_id"]
         ],
         "x-lix-foreign-keys": [
             {
                 "properties": ["/label_id"],
                 "references": {
                     "schemaKey": "lix_label",
+                    "schemaVersion": "1",
                     "properties": ["/id"]
                 }
             }
@@ -644,10 +649,11 @@ fn x_lix_state_foreign_keys_with_ordered_state_address_tuple() {
                 "minItems": 1
             },
             "target_schema_key": { "type": "string" },
+            "target_schema_version": { "type": "string" },
             "target_file_id": { "type": ["string", "null"] },
             "label_id": { "type": "string" }
         },
-        "required": ["target_entity_id", "target_schema_key", "target_file_id", "label_id"],
+        "required": ["target_entity_id", "target_schema_key", "target_schema_version", "target_file_id", "label_id"],
         "additionalProperties": false
     });
 
@@ -661,7 +667,7 @@ fn x_lix_state_foreign_keys_rejects_wrong_tuple_order_by_type() {
         "x-lix-key": "bad_label_assignment",
         "x-lix-version": "1",
         "x-lix-state-foreign-keys": [
-            ["/target_schema_key", "/target_entity_id", "/target_file_id"]
+            ["/target_schema_key", "/target_entity_id", "/target_schema_version", "/target_file_id"]
         ],
         "properties": {
             "target_entity_id": {
@@ -670,16 +676,17 @@ fn x_lix_state_foreign_keys_rejects_wrong_tuple_order_by_type() {
                 "minItems": 1
             },
             "target_schema_key": { "type": "string" },
+            "target_schema_version": { "type": "string" },
             "target_file_id": { "type": ["string", "null"] }
         },
-        "required": ["target_entity_id", "target_schema_key", "target_file_id"],
+        "required": ["target_entity_id", "target_schema_key", "target_schema_version", "target_file_id"],
         "additionalProperties": false
     });
 
     let err =
         validate_lix_schema_definition(&schema).expect_err("wrong tuple order should be rejected");
     assert!(
-        err.message.contains("[entity_id, schema_key, file_id]"),
+        err.message.contains("[entity_id, schema_key, schema_version, file_id]"),
         "unexpected error: {err:?}"
     );
 }
@@ -691,7 +698,7 @@ fn x_lix_state_foreign_keys_requires_address_tuple_properties() {
         "x-lix-key": "optional_label_assignment",
         "x-lix-version": "1",
         "x-lix-state-foreign-keys": [
-            ["/target_entity_id", "/target_schema_key", "/target_file_id"]
+            ["/target_entity_id", "/target_schema_key", "/target_schema_version", "/target_file_id"]
         ],
         "properties": {
             "target_entity_id": {
@@ -700,9 +707,10 @@ fn x_lix_state_foreign_keys_requires_address_tuple_properties() {
                 "minItems": 1
             },
             "target_schema_key": { "type": "string" },
+            "target_schema_version": { "type": "string" },
             "target_file_id": { "type": ["string", "null"] }
         },
-        "required": ["target_entity_id", "target_schema_key"],
+        "required": ["target_entity_id", "target_schema_key", "target_schema_version"],
         "additionalProperties": false
     });
 
@@ -725,6 +733,7 @@ fn x_lix_foreign_keys_treat_schema_keys_literally() {
                 "properties": ["/label_id"],
                 "references": {
                     "schemaKey": "label",
+                    "schemaVersion": "1",
                     "properties": ["/id"]
                 }
             }

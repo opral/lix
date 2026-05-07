@@ -11,6 +11,7 @@
       ],
       "references": {
         "schemaKey": "lix_account",
+        "schemaVersion": "1",
         "properties": [
           "/id"
         ]

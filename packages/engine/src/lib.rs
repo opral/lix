@@ -4,6 +4,7 @@ pub(crate) mod cel;
 pub(crate) mod changelog;
 pub(crate) mod commit_graph;
 mod common;
+pub(crate) mod domain;
 pub mod engine;
 pub(crate) mod entity_identity;
 pub(crate) mod functions;
@@ -12,7 +13,7 @@ pub(crate) mod init;
 pub(crate) mod json_store;
 pub(crate) mod live_state;
 mod schema;
-pub(crate) mod schema_registry;
+pub(crate) mod schema_catalog;
 pub mod session;
 pub(crate) mod sql2;
 #[allow(dead_code, unused_imports)]

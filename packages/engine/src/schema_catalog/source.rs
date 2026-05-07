@@ -2,10 +2,12 @@ use std::collections::BTreeMap;
 
 use serde_json::Value as JsonValue;
 
+use crate::domain::{committed_row_is_exact_version_scoped, Domain};
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
-use crate::schema::{is_seed_schema_key, schema_key_from_definition};
-use crate::{LixError, NullableKeyFilter, GLOBAL_VERSION_ID};
+use crate::schema::schema_key_from_definition;
+use crate::schema_catalog::SchemaCatalogFact;
+use crate::{LixError, NullableKeyFilter};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
@@ -14,15 +16,19 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 /// SQL planning receives a schema snapshot from live state. System schemas are
 /// seeded as ordinary `lix_registered_schema` rows during initialization, so
 /// runtime schema visibility has one source of truth.
-pub(crate) struct SchemaRegistry;
+pub(crate) struct SchemaCatalogSource;
 
-impl SchemaRegistry {
+impl SchemaCatalogSource {
     pub(crate) fn new() -> Self {
         Self
     }
 
-    /// Loads schema definitions visible for SQL planning at `version_id`.
-    pub(crate) async fn visible_schemas<R>(
+    /// Loads schema definitions for SQL surface planning at `version_id`.
+    ///
+    /// SQL surfaces are a read-planning projection over the active untracked
+    /// schema catalog. Validation must use `schema_facts_for_domain` instead so
+    /// schema durability remains explicit.
+    pub(crate) async fn schema_jsons_for_sql_read_planning<R>(
         &self,
         live_state: &R,
         version_id: &str,
@@ -30,29 +36,47 @@ impl SchemaRegistry {
     where
         R: LiveStateReader + ?Sized,
     {
-        self.visible_schemas_for_domain(live_state, version_id, true)
-            .await
+        let facts = self
+            .schema_facts_for_domain(live_state, &Domain::schema_catalog(version_id, true))
+            .await?;
+        let mut schemas = BTreeMap::<String, JsonValue>::new();
+        for fact in facts {
+            let schema_key = fact.catalog_key().schema_key.clone();
+            if schemas
+                .insert(schema_key.clone(), fact.schema().clone())
+                .is_some()
+            {
+                return Err(LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    format!(
+                        "SQL surface schema '{}' is visible from more than one schema catalog fact",
+                        schema_key
+                    ),
+                )
+                .with_hint("SQL entity surfaces are named by schema_key. Keep exactly one visible schema per schema_key for SQL planning."));
+            }
+        }
+        Ok(schemas.into_values().collect())
     }
 
-    /// Loads schema definitions reachable from a row domain.
-    pub(crate) async fn visible_schemas_for_domain<R>(
+    /// Loads schema facts reachable from a row domain.
+    pub(crate) async fn schema_facts_for_domain<R>(
         &self,
         live_state: &R,
-        version_id: &str,
-        untracked: bool,
-    ) -> Result<Vec<JsonValue>, LixError>
+        domain: &Domain,
+    ) -> Result<Vec<SchemaCatalogFact>, LixError>
     where
         R: LiveStateReader + ?Sized,
     {
-        let mut schemas = BTreeMap::new();
-        for schema_untracked in [false, true] {
+        let mut facts = Vec::new();
+        for schema_domain in domain.schema_catalog_domains() {
             let rows = live_state
                 .scan_rows(&LiveStateScanRequest {
                     filter: LiveStateFilter {
                         schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
-                        version_ids: vec![version_id.to_string()],
+                        version_ids: vec![schema_domain.version_id().to_string()],
                         file_ids: vec![NullableKeyFilter::Null],
-                        untracked: Some(schema_untracked),
+                        untracked: Some(schema_domain.untracked()),
                         include_tombstones: false,
                         ..LiveStateFilter::default()
                     },
@@ -61,57 +85,25 @@ impl SchemaRegistry {
                 .await?;
             for row in rows
                 .into_iter()
-                .filter(|row| version_scoped_schema_row_is_visible(row, version_id))
+                .filter(|row| row_belongs_to_schema_catalog_domain(row, &schema_domain))
             {
                 let Some((key, schema)) = decode_registered_schema_row(&row)? else {
                     continue;
                 };
-                if !registered_schema_row_is_reachable_from_domain(&row, &key, untracked) {
-                    continue;
-                }
-                upsert_latest_schema(&mut schemas, key, schema);
+                facts.push(SchemaCatalogFact::new(schema_domain.clone(), key, schema));
             }
         }
-        Ok(schemas.into_values().map(|(_, schema)| schema).collect())
+        Ok(facts)
     }
 }
 
-fn registered_schema_row_is_reachable_from_domain(
-    row: &MaterializedLiveStateRow,
-    key: &crate::schema::SchemaKey,
-    untracked_domain: bool,
-) -> bool {
-    !row.untracked || untracked_domain || is_seed_schema_key(&key.schema_key)
-}
-
-fn version_scoped_schema_row_is_visible(
-    row: &MaterializedLiveStateRow,
-    requested_version_id: &str,
-) -> bool {
-    requested_version_id == GLOBAL_VERSION_ID || !row.global
-}
-
-fn upsert_latest_schema(
-    schemas: &mut BTreeMap<String, (crate::schema::SchemaKey, JsonValue)>,
-    key: crate::schema::SchemaKey,
-    schema: JsonValue,
-) {
-    let should_replace = schemas
-        .get(&key.schema_key)
-        .is_none_or(|(existing, _)| !schema_key_is_older(&key, existing));
-    if should_replace {
-        schemas.insert(key.schema_key.clone(), (key, schema));
-    }
-}
-
-fn schema_key_is_older(
-    candidate: &crate::schema::SchemaKey,
-    existing: &crate::schema::SchemaKey,
-) -> bool {
-    match (candidate.version_number(), existing.version_number()) {
-        (Some(candidate_version), Some(existing_version)) => candidate_version < existing_version,
-        _ => candidate.schema_version < existing.schema_version,
-    }
+fn row_belongs_to_schema_catalog_domain(row: &MaterializedLiveStateRow, domain: &Domain) -> bool {
+    row.schema_key == REGISTERED_SCHEMA_KEY
+        && row.file_id.is_none()
+        && row.snapshot_content.is_some()
+        && row.version_id == domain.version_id()
+        && row.untracked == domain.untracked()
+        && committed_row_is_exact_version_scoped(row, domain.version_id())
 }
 
 fn decode_registered_schema_row(
@@ -158,10 +150,10 @@ mod tests {
 
     #[tokio::test]
     async fn visible_schemas_are_loaded_from_registered_schema_rows() {
-        let registry = SchemaRegistry::new();
+        let source = SchemaCatalogSource::new();
 
-        let schemas = registry
-            .visible_schemas(
+        let schemas = source
+            .schema_jsons_for_sql_read_planning(
                 &RowsLiveStateReader::new(vec![
                     registered_schema_row("lix_registered_schema", "1"),
                     registered_schema_row("lix_key_value", "1"),
@@ -181,10 +173,10 @@ mod tests {
 
     #[tokio::test]
     async fn visible_schemas_include_registered_schema_rows() {
-        let registry = SchemaRegistry::new();
+        let source = SchemaCatalogSource::new();
 
-        let schemas = registry
-            .visible_schemas(
+        let schemas = source
+            .schema_jsons_for_sql_read_planning(
                 &RowsLiveStateReader::new(vec![registered_schema_row(
                     "engine_dynamic_schema",
                     "1",
@@ -200,20 +192,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_domain_sees_seed_schemas_but_not_user_untracked_schemas() {
-        let registry = SchemaRegistry::new();
-
-        let schemas = registry
-            .visible_schemas_for_domain(
+    async fn sql_read_planning_rejects_multiple_visible_schemas_for_same_surface() {
+        let source = SchemaCatalogSource::new();
+        let error = source
+            .schema_jsons_for_sql_read_planning(
                 &RowsLiveStateReader::new(vec![
-                    registered_schema_row("lix_key_value", "1"),
                     registered_schema_row("engine_dynamic_schema", "1"),
+                    registered_schema_row("engine_dynamic_schema", "2"),
                 ]),
                 "global",
-                false,
+            )
+            .await
+            .expect_err("SQL surfaces must not choose a schema version implicitly");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(error.message.contains("SQL surface schema"));
+    }
+
+    #[tokio::test]
+    async fn tracked_domain_sees_tracked_seed_schemas_but_not_user_untracked_schemas() {
+        let source = SchemaCatalogSource::new();
+        let mut seed_schema = registered_schema_row("lix_key_value", "1");
+        seed_schema.untracked = false;
+
+        let facts = source
+            .schema_facts_for_domain(
+                &RowsLiveStateReader::new(vec![
+                    seed_schema,
+                    registered_schema_row("engine_dynamic_schema", "1"),
+                ]),
+                &Domain::schema_catalog("global", false),
             )
             .await
             .expect("schema visibility should load");
+        let schemas = facts
+            .iter()
+            .map(SchemaCatalogFact::schema)
+            .collect::<Vec<_>>();
 
         assert!(schemas.iter().any(|schema| {
             schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("lix_key_value")
@@ -224,14 +239,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tracked_domain_does_not_see_untracked_seed_schemas() {
+        let source = SchemaCatalogSource::new();
+
+        let facts = source
+            .schema_facts_for_domain(
+                &RowsLiveStateReader::new(vec![registered_schema_row("lix_key_value", "1")]),
+                &Domain::schema_catalog("global", false),
+            )
+            .await
+            .expect("schema visibility should load");
+        let schemas = facts
+            .iter()
+            .map(SchemaCatalogFact::schema)
+            .collect::<Vec<_>>();
+
+        assert!(!schemas.iter().any(|schema| {
+            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("lix_key_value")
+        }));
+    }
+
+    #[tokio::test]
     async fn visible_schemas_ignore_projected_global_schema_rows_for_version_scope() {
-        let registry = SchemaRegistry::new();
+        let source = SchemaCatalogSource::new();
         let mut global_only = registered_schema_row("global_only_schema", "1");
         global_only.global = true;
         global_only.version_id = "main".to_string();
 
-        let schemas = registry
-            .visible_schemas(&RowsLiveStateReader::new(vec![global_only]), "main")
+        let schemas = source
+            .schema_jsons_for_sql_read_planning(
+                &RowsLiveStateReader::new(vec![global_only]),
+                "main",
+            )
             .await
             .expect("schema visibility should load");
 
@@ -239,11 +278,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn visible_schemas_are_empty_when_no_schema_rows_are_visible() {
-        let registry = SchemaRegistry::new();
+    async fn schema_facts_post_filter_non_catalog_rows_even_if_reader_returns_them() {
+        let source = SchemaCatalogSource::new();
+        let valid_schema = registered_schema_row("valid_schema", "1");
+        let mut file_scoped_schema = registered_schema_row("file_scoped_schema", "1");
+        file_scoped_schema.file_id = Some("file-a".to_string());
+        let mut tombstoned_schema = registered_schema_row("tombstoned_schema", "1");
+        tombstoned_schema.snapshot_content = None;
 
-        let schemas = registry
-            .visible_schemas(&RowsLiveStateReader::new(Vec::new()), "global")
+        let facts = source
+            .schema_facts_for_domain(
+                &RowsLiveStateReader::new(vec![
+                    valid_schema,
+                    file_scoped_schema,
+                    tombstoned_schema,
+                ]),
+                &Domain::schema_catalog("global", true),
+            )
+            .await
+            .expect("schema facts should load");
+        let schema_keys = facts
+            .iter()
+            .filter_map(|fact| fact.schema().get("x-lix-key").and_then(JsonValue::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(schema_keys, vec!["valid_schema"]);
+    }
+
+    #[tokio::test]
+    async fn visible_schemas_are_empty_when_no_schema_rows_are_visible() {
+        let source = SchemaCatalogSource::new();
+
+        let schemas = source
+            .schema_jsons_for_sql_read_planning(&RowsLiveStateReader::new(Vec::new()), "global")
             .await
             .expect("schema visibility should load");
 

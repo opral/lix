@@ -2,69 +2,66 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::Value as JsonValue;
 
+use crate::domain::Domain;
 use crate::live_state::{
     LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
 };
-use crate::schema_registry::SchemaRegistry;
-use crate::transaction::domain::Domain;
+use crate::schema_catalog::{
+    SchemaCatalog, SchemaCatalogFact, SchemaCatalogSource,
+};
 use crate::transaction::live_state_overlay::overlay_scan_rows;
-use crate::transaction::normalization::TransactionSchemaCatalog;
 use crate::transaction::staging::PreparedStateRowOverlay;
 use crate::LixError;
 
 pub(crate) struct TransactionSchemaResolver {
-    registry: Arc<SchemaRegistry>,
-    catalogs_by_domain: BTreeMap<Domain, TransactionSchemaCatalogEntry>,
+    source: Arc<SchemaCatalogSource>,
+    catalogs_by_domain: BTreeMap<Domain, SchemaCatalogEntry>,
 }
 
-enum TransactionSchemaCatalogEntry {
-    VisibleSchemas(Vec<JsonValue>),
-    Catalog(TransactionSchemaCatalog),
+enum SchemaCatalogEntry {
+    SchemaFacts(Vec<SchemaCatalogFact>),
+    Catalog(SchemaCatalog),
 }
 
 impl TransactionSchemaResolver {
-    pub(crate) fn new(registry: Arc<SchemaRegistry>) -> Self {
+    pub(crate) fn new(source: Arc<SchemaCatalogSource>) -> Self {
         Self {
-            registry,
+            source,
             catalogs_by_domain: BTreeMap::new(),
         }
     }
 
-    async fn load_catalog_for_version(
+    async fn load_catalog_for_domain(
         &mut self,
         live_state: &dyn LiveStateReader,
         staged: Option<&PreparedStateRowOverlay>,
-        version_id: &str,
-        untracked: bool,
+        domain: &Domain,
     ) -> Result<(), LixError> {
-        let domain = Domain::schema_catalog(version_id.to_string(), untracked);
+        let domain = domain.schema_catalog_domain();
         let needs_load = !self.catalogs_by_domain.contains_key(&domain);
         if needs_load {
-            let schemas = if let Some(staged) = staged {
+            let facts = if let Some(staged) = staged {
                 let reader = TransactionSchemaLiveStateReader {
                     base: live_state,
                     staged,
                 };
-                self.registry
-                    .visible_schemas_for_domain(&reader, version_id, untracked)
+                self.source
+                    .schema_facts_for_domain(&reader, &domain)
                     .await?
             } else {
-                self.registry
-                    .visible_schemas_for_domain(live_state, version_id, untracked)
+                self.source
+                    .schema_facts_for_domain(live_state, &domain)
                     .await?
             };
-            self.catalogs_by_domain.insert(
-                domain.clone(),
-                TransactionSchemaCatalogEntry::VisibleSchemas(schemas),
-            );
+            self.catalogs_by_domain
+                .insert(domain.clone(), SchemaCatalogEntry::SchemaFacts(facts));
         }
 
         let should_materialize = self
             .catalogs_by_domain
             .get(&domain)
-            .is_some_and(|entry| matches!(entry, TransactionSchemaCatalogEntry::VisibleSchemas(_)));
+            .is_some_and(|entry| matches!(entry, SchemaCatalogEntry::SchemaFacts(_)));
         if should_materialize {
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_transaction_schema_catalog_load();
@@ -72,12 +69,12 @@ impl TransactionSchemaResolver {
                 .catalogs_by_domain
                 .remove(&domain)
                 .expect("schema catalog entry should exist after load");
-            let TransactionSchemaCatalogEntry::VisibleSchemas(schemas) = entry else {
-                unreachable!("catalog entry was checked as raw visible schemas");
+            let SchemaCatalogEntry::SchemaFacts(facts) = entry else {
+                unreachable!("catalog entry was checked as schema facts");
             };
-            let catalog = TransactionSchemaCatalog::from_visible_schemas(&schemas)?;
+            let catalog = SchemaCatalog::from_schema_facts(&facts)?;
             self.catalogs_by_domain
-                .insert(domain, TransactionSchemaCatalogEntry::Catalog(catalog));
+                .insert(domain, SchemaCatalogEntry::Catalog(catalog));
         }
         Ok(())
     }
@@ -86,19 +83,18 @@ impl TransactionSchemaResolver {
         &mut self,
         live_state: &dyn LiveStateReader,
         staged: &PreparedStateRowOverlay,
-        version_id: &str,
-        untracked: bool,
-    ) -> Result<&mut TransactionSchemaCatalog, LixError> {
-        self.load_catalog_for_version(live_state, Some(staged), version_id, untracked)
+        domain: &Domain,
+    ) -> Result<&mut SchemaCatalog, LixError> {
+        self.load_catalog_for_domain(live_state, Some(staged), domain)
             .await?;
-        let domain = Domain::schema_catalog(version_id.to_string(), untracked);
+        let domain = domain.schema_catalog_domain();
         match self
             .catalogs_by_domain
             .get_mut(&domain)
             .expect("catalog cache should contain requested version")
         {
-            TransactionSchemaCatalogEntry::Catalog(catalog) => Ok(catalog),
-            TransactionSchemaCatalogEntry::VisibleSchemas(_) => {
+            SchemaCatalogEntry::Catalog(catalog) => Ok(catalog),
+            SchemaCatalogEntry::SchemaFacts(_) => {
                 unreachable!("schema catalog should be materialized before mutable access")
             }
         }
@@ -107,33 +103,27 @@ impl TransactionSchemaResolver {
     pub(crate) async fn catalog_for_validation(
         &mut self,
         live_state: &dyn LiveStateReader,
-        version_id: &str,
-        untracked: bool,
-    ) -> Result<&TransactionSchemaCatalog, LixError> {
-        self.load_catalog_for_version(live_state, None, version_id, untracked)
+        domain: &Domain,
+    ) -> Result<&SchemaCatalog, LixError> {
+        self.load_catalog_for_domain(live_state, None, domain)
             .await?;
-        let domain = Domain::schema_catalog(version_id.to_string(), untracked);
+        let domain = domain.schema_catalog_domain();
         match self
             .catalogs_by_domain
             .get(&domain)
             .expect("catalog cache should contain requested version")
         {
-            TransactionSchemaCatalogEntry::Catalog(catalog) => Ok(catalog),
-            TransactionSchemaCatalogEntry::VisibleSchemas(_) => {
+            SchemaCatalogEntry::Catalog(catalog) => Ok(catalog),
+            SchemaCatalogEntry::SchemaFacts(_) => {
                 unreachable!("schema catalog should be materialized before validation access")
             }
         }
     }
 
-    pub(crate) fn remember_visible_schemas(
-        &mut self,
-        version_id: impl Into<String>,
-        schemas: Vec<JsonValue>,
-    ) {
-        let version_id = version_id.into();
+    pub(crate) fn remember_schema_facts(&mut self, domain: &Domain, facts: Vec<SchemaCatalogFact>) {
         self.catalogs_by_domain.insert(
-            Domain::schema_catalog(version_id, true),
-            TransactionSchemaCatalogEntry::VisibleSchemas(schemas),
+            domain.schema_catalog_domain(),
+            SchemaCatalogEntry::SchemaFacts(facts),
         );
     }
 }
