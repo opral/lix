@@ -1,7 +1,6 @@
 import {
 	LixAccountSchema,
 	LixActiveAccountSchema,
-	LixActiveVersionSchema,
 	LixChangeAuthorSchema,
 	LixChangeSchema,
 	LixChangeSetElementSchema,
@@ -9,14 +8,14 @@ import {
 	LixCommitEdgeSchema,
 	LixCommitSchema,
 	LixDirectoryDescriptorSchema,
-	LixEntityLabelSchema,
 	LixFileDescriptorSchema,
 	LixKeyValueSchema,
+	LixLabelAssignmentSchema,
 	LixLabelSchema,
 	LixRegisteredSchemaSchema,
 	LixVersionDescriptorSchema,
 } from "@lix-js/sdk";
-import type { LixJsonValue } from "@lix-js/sdk";
+import type { JsonValue as LixJsonValue } from "@lix-js/sdk";
 import type { Generated } from "kysely";
 import type { FromSchema, JSONSchema } from "json-schema-to-ts";
 
@@ -31,6 +30,7 @@ type LixSchemaDefinition = JSONSchema & {
 };
 
 type LixJsonObject = { [key: string]: LixJsonValue };
+type LixEntityId = string[];
 
 export type LixGenerated<T> = T & {
 	readonly __lixGenerated?: true;
@@ -94,9 +94,9 @@ type ToKysely<T> = {
 };
 
 type EntityStateColumns = {
-	lixcol_entity_id: LixGenerated<string>;
+	lixcol_entity_id: LixGenerated<LixEntityId>;
 	lixcol_schema_key: LixGenerated<string>;
-	lixcol_file_id: LixGenerated<string>;
+	lixcol_file_id: LixGenerated<string | null>;
 	lixcol_plugin_key: LixGenerated<string>;
 	lixcol_inherited_from_version_id: LixGenerated<string | null>;
 	lixcol_created_at: LixGenerated<string>;
@@ -113,9 +113,9 @@ type EntityStateByVersionColumns = EntityStateColumns & {
 };
 
 type EntityStateHistoryColumns = {
-	lixcol_entity_id: LixGenerated<string>;
+	lixcol_entity_id: LixGenerated<LixEntityId>;
 	lixcol_schema_key: LixGenerated<string>;
-	lixcol_file_id: LixGenerated<string>;
+	lixcol_file_id: LixGenerated<string | null>;
 	lixcol_plugin_key: LixGenerated<string>;
 	lixcol_schema_version: LixGenerated<string>;
 	lixcol_change_id: LixGenerated<string>;
@@ -148,9 +148,9 @@ type EntityViews<
 };
 
 type StateByVersionView = {
-	entity_id: string;
+	entity_id: LixEntityId;
 	schema_key: string;
-	file_id: string;
+	file_id: string | null;
 	plugin_key: string;
 	snapshot_content: LixJsonValue;
 	schema_version: string;
@@ -168,9 +168,9 @@ type StateByVersionView = {
 type StateView = Omit<StateByVersionView, "version_id">;
 
 type StateWithTombstonesView = {
-	entity_id: string;
+	entity_id: LixEntityId;
 	schema_key: string;
-	file_id: string;
+	file_id: string | null;
 	plugin_key: string;
 	snapshot_content: LixJsonValue | null;
 	schema_version: string;
@@ -186,9 +186,9 @@ type StateWithTombstonesView = {
 };
 
 type StateHistoryView = {
-	entity_id: string;
+	entity_id: LixEntityId;
 	schema_key: string;
-	file_id: string;
+	file_id: string | null;
 	plugin_key: string;
 	snapshot_content: LixJsonValue;
 	metadata: LixJsonValue | null;
@@ -200,9 +200,9 @@ type StateHistoryView = {
 };
 
 type WorkingChangesView = {
-	entity_id: string;
+	entity_id: LixEntityId;
 	schema_key: string;
-	file_id: string;
+	file_id: string | null;
 	before_change_id: string | null;
 	after_change_id: string | null;
 	before_commit_id: string | null;
@@ -210,13 +210,16 @@ type WorkingChangesView = {
 	status: "added" | "modified" | "removed" | "unchanged";
 };
 
-type LixActiveVersion = FromLixSchemaDefinition<typeof LixActiveVersionSchema>;
+type LixActiveVersion = {
+	version_id: string;
+};
 type LixKeyValue = FromLixSchemaDefinition<typeof LixKeyValueSchema> & {
 	value: LixJsonValue;
 };
 
 type ChangeView = ToKysely<
 	FromLixSchemaDefinition<typeof LixChangeSchema> & {
+		entity_id: LixEntityId;
 		metadata: LixJsonValue | null;
 		snapshot_content: LixJsonValue | null;
 	}
@@ -266,10 +269,14 @@ export type LixDatabaseSchema = {
 	typeof LixKeyValueSchema,
 	"lix_key_value",
 	{ value: LixKeyValue["value"] }
-> &
+	> &
 	EntityViews<typeof LixAccountSchema, "lix_account"> &
 	EntityViews<typeof LixChangeSetSchema, "lix_change_set"> &
-	EntityViews<typeof LixChangeSetElementSchema, "lix_change_set_element"> &
+	EntityViews<
+		typeof LixChangeSetElementSchema,
+		"lix_change_set_element",
+		{ entity_id: LixEntityId }
+	> &
 	EntityViews<typeof LixChangeAuthorSchema, "lix_change_author"> &
 	EntityViews<
 		typeof LixFileDescriptorSchema,
@@ -283,7 +290,11 @@ export type LixDatabaseSchema = {
 		}
 	> &
 	EntityViews<typeof LixLabelSchema, "lix_label"> &
-	EntityViews<typeof LixEntityLabelSchema, "lix_entity_label"> &
+	EntityViews<
+		typeof LixLabelAssignmentSchema,
+		"lix_label_assignment",
+		{ target_entity_id: LixEntityId }
+	> &
 	EntityViews<
 		typeof LixRegisteredSchemaSchema,
 		"lix_registered_schema",

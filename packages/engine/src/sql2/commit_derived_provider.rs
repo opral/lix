@@ -367,7 +367,7 @@ async fn rows_for_surface(
                         rows.push(SurfaceRow::ChangeSetElement {
                             version_id: surface.by_version().then(|| version_id.clone()),
                             change_set_id: element.change_set_id,
-                            entity_id: element.change.entity_id.as_string()?,
+                            entity_id: element.change.entity_id.as_json_array_text()?,
                             change_id: element.change.id,
                             schema_key: element.change.schema_key,
                             file_id: element.change.file_id,
@@ -421,7 +421,7 @@ impl SurfaceColumn {
             Self::ParentId => Field::new("parent_id", DataType::Utf8, false),
             Self::ChildId => Field::new("child_id", DataType::Utf8, false),
             Self::ChangeId => Field::new("change_id", DataType::Utf8, false),
-            Self::EntityId => Field::new("entity_id", DataType::Utf8, false),
+            Self::EntityId => super::result_metadata::json_field("entity_id", false),
             Self::SchemaKey => Field::new("schema_key", DataType::Utf8, false),
             Self::FileId => Field::new("file_id", DataType::Utf8, true),
             Self::VersionId => Field::new("lixcol_version_id", DataType::Utf8, false),

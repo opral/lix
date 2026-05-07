@@ -1738,7 +1738,7 @@ async fn lix_file_record_batch(
         names.push(Some(file.name));
         hiddens.push(Some(file.hidden));
         data_values.push(data);
-        entity_ids.push(Some(file.live.entity_id.as_string()?));
+        entity_ids.push(Some(file.live.entity_id.as_json_array_text()?));
         schema_keys.push(Some(file.live.schema_key));
         file_ids.push(file.live.file_id);
         schema_versions.push(file.live.schema_version);
@@ -2267,7 +2267,7 @@ fn lix_file_schema() -> SchemaRef {
         Field::new("name", DataType::Utf8, false),
         Field::new("hidden", DataType::Boolean, true),
         Field::new("data", DataType::Binary, true),
-        Field::new("lixcol_entity_id", DataType::Utf8, false),
+        json_field("lixcol_entity_id", false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_schema_version", DataType::Utf8, false),
@@ -2465,8 +2465,7 @@ mod tests {
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
-                .expect("entity id should decode"),
+            entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
             schema_key: super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
             file_id: None,
             snapshot_content: Some(snapshot_content.to_string()),
@@ -2488,8 +2487,7 @@ mod tests {
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
-                .expect("entity id should decode"),
+            entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
             schema_key: super::FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
             file_id: None,
             snapshot_content: Some(snapshot_content.to_string()),

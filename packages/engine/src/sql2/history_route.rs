@@ -191,7 +191,7 @@ pub(crate) fn commit_graph_history_request(
         entity_ids: route
             .entity_ids
             .iter()
-            .map(|entity_id| EntityIdentity::single(entity_id))
+            .filter_map(|entity_id| EntityIdentity::from_json_array_text(entity_id).ok())
             .collect(),
         schema_keys,
         file_ids: route.file_ids.clone(),
@@ -411,16 +411,17 @@ fn parse_history_binary_filter(
     let right = &*binary_expr.right;
     match (column_name, &binary_expr.op, right) {
         ("start_commit_id", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _))
-        | ("entity_id", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _))
         | ("schema_key", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _))
         | ("file_id", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _)) => {
             Some(match column_name {
                 "start_commit_id" => HistoryFilterTerm::StartCommitIds(vec![value.clone()]),
-                "entity_id" => HistoryFilterTerm::EntityIds(vec![value.clone()]),
                 "schema_key" => HistoryFilterTerm::SchemaKeys(vec![value.clone()]),
                 "file_id" => HistoryFilterTerm::FileIds(vec![value.clone()]),
                 _ => unreachable!(),
             })
+        }
+        ("entity_id", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _)) => {
+            canonical_entity_id_value(value).map(|value| HistoryFilterTerm::EntityIds(vec![value]))
         }
         ("depth", Operator::Eq, depth_expr) => {
             scalar_i64_literal(depth_expr).map(HistoryFilterTerm::ExactDepth)
@@ -464,7 +465,7 @@ fn parse_history_in_list_filter(
 
     match column_name {
         "start_commit_id" => Some(HistoryFilterTerm::StartCommitIds(values)),
-        "entity_id" => Some(HistoryFilterTerm::EntityIds(values)),
+        "entity_id" => canonical_entity_id_values(values).map(HistoryFilterTerm::EntityIds),
         "schema_key" => Some(HistoryFilterTerm::SchemaKeys(values)),
         "file_id" => Some(HistoryFilterTerm::FileIds(values)),
         _ => None,
@@ -516,6 +517,20 @@ fn apply_conjunctive_values_filter(bucket: &mut Vec<String>, incoming_values: Ve
 
     bucket.retain(|existing| values.contains(existing));
     bucket.is_empty()
+}
+
+fn canonical_entity_id_values(values: Vec<String>) -> Option<Vec<String>> {
+    values
+        .into_iter()
+        .map(|value| canonical_entity_id_value(&value))
+        .collect()
+}
+
+fn canonical_entity_id_value(value: &str) -> Option<String> {
+    EntityIdentity::from_json_array_text(value)
+        .ok()?
+        .as_json_array_text()
+        .ok()
 }
 
 fn canonical_history_column_name(name: &str, column_style: HistoryColumnStyle) -> Option<&str> {

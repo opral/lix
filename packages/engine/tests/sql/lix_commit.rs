@@ -140,7 +140,7 @@ simulation_test!(
         .await;
         assert!(
             change_set_element_rows.contains(&vec![
-                Value::Text("commit-surface".to_string()),
+                Value::Json(json!(["commit-surface"])),
                 Value::Text("lix_key_value".to_string()),
                 Value::Boolean(true),
                 Value::Boolean(false),
@@ -154,7 +154,7 @@ simulation_test!(
                 "SELECT entity_id, schema_key, lixcol_version_id, lixcol_global, lixcol_untracked \
                  FROM lix_change_set_element_by_version \
                  WHERE change_set_id = '{change_set_id}' \
-                 AND entity_id = 'commit-surface' \
+                 AND entity_id = lix_json('[\"commit-surface\"]') \
                  AND schema_key = 'lix_key_value' \
                  ORDER BY lixcol_version_id"
             ),
@@ -164,14 +164,14 @@ simulation_test!(
             change_set_element_by_version_rows,
             vec![
                 vec![
-                    Value::Text("commit-surface".to_string()),
+                    Value::Json(json!(["commit-surface"])),
                     Value::Text("lix_key_value".to_string()),
                     Value::Text(sim.main_version_id().to_string()),
                     Value::Boolean(true),
                     Value::Boolean(false),
                 ],
                 vec![
-                    Value::Text("commit-surface".to_string()),
+                    Value::Json(json!(["commit-surface"])),
                     Value::Text("lix_key_value".to_string()),
                     Value::Text("global".to_string()),
                     Value::Boolean(true),
@@ -656,7 +656,7 @@ async fn change_set_elements_by_version(
         (
             text_value(&row[0]),
             text_value(&row[1]),
-            text_value(&row[2]),
+            entity_id_value(&row[2]),
             text_value(&row[3]),
             optional_text_value(&row[4]),
         )
@@ -669,6 +669,14 @@ fn optional_text_value(value: &Value) -> Option<String> {
         Value::Null => None,
         Value::Text(value) => Some(value.clone()),
         other => panic!("expected optional text value, got {other:?}"),
+    }
+}
+
+fn entity_id_value(value: &Value) -> String {
+    match value {
+        Value::Json(value) => value.to_string(),
+        Value::Text(value) => value.clone(),
+        other => panic!("expected entity_id JSON array, got {other:?}"),
     }
 }
 

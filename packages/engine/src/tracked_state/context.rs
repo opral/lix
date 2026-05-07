@@ -651,7 +651,10 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_id.as_string().expect("entity id"),
+            rows[0]
+                .entity_id
+                .as_single_string_owned()
+                .expect("entity id"),
             "entity-a"
         );
         assert_eq!(rows[0].file_id.as_deref(), Some("file-a.json"));
@@ -767,7 +770,10 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].entity_id.as_string().expect("entity id"),
+            rows[0]
+                .entity_id
+                .as_single_string_owned()
+                .expect("entity id"),
             "entity-live"
         );
     }
@@ -913,14 +919,26 @@ mod tests {
     fn merge_patch_ids(plan: &TrackedStateMergePlan) -> Vec<String> {
         plan.patches
             .iter()
-            .map(|entry| entry.identity().entity_id.as_string().expect("identity"))
+            .map(|entry| {
+                entry
+                    .identity()
+                    .entity_id
+                    .as_single_string_owned()
+                    .expect("identity")
+            })
             .collect()
     }
 
     fn merge_conflict_ids(plan: &TrackedStateMergePlan) -> Vec<String> {
         plan.conflicts
             .iter()
-            .map(|entry| entry.identity.entity_id.as_string().expect("identity"))
+            .map(|entry| {
+                entry
+                    .identity
+                    .entity_id
+                    .as_single_string_owned()
+                    .expect("identity")
+            })
             .collect()
     }
 

@@ -440,9 +440,10 @@ async fn load_file_history_rows(
         });
     }
     output.retain(|row| {
+        let entity_id = entity_id_json_array(&row.entity_id).ok();
         route.matches_surface_row(
             FILE_DESCRIPTOR_SCHEMA_KEY,
-            &row.entity_id,
+            entity_id.as_deref().unwrap_or(&row.entity_id),
             Some(&row.entity_id),
             row.event.depth,
         )
@@ -574,7 +575,7 @@ fn parse_file_history_descriptors(
         .map(|entry| {
             let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
                 return Ok(FileHistoryDescriptorRecord {
-                    id: entry.change.entity_id.as_string()?,
+                    id: entry.change.entity_id.as_single_string_owned()?,
                     directory_id: None,
                     name: None,
                     hidden: None,
@@ -640,7 +641,7 @@ fn parse_file_history_blobs(
                         entry
                             .change
                             .entity_id
-                            .as_string()
+                            .as_single_string_owned()
                             .expect("canonical change entity identity should project")
                     }),
                     blob_hash: None,
@@ -806,7 +807,11 @@ fn file_history_column_array(
                 .map(|row| row.data.as_deref())
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
-        HISTORY_COL_ENTITY_ID => string_array(rows.iter().map(|row| Some(row.entity_id.as_str()))),
+        HISTORY_COL_ENTITY_ID => Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| entity_id_json_array(&row.entity_id).map(Some))
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        )) as ArrayRef,
         HISTORY_COL_SCHEMA_KEY => {
             string_array(rows.iter().map(|_| Some(FILE_DESCRIPTOR_SCHEMA_KEY)))
         }
@@ -868,7 +873,7 @@ fn lix_file_history_schema() -> SchemaRef {
         Field::new("name", DataType::Utf8, true),
         Field::new("hidden", DataType::Boolean, true),
         Field::new("data", DataType::Binary, true),
-        Field::new(HISTORY_COL_ENTITY_ID, DataType::Utf8, false),
+        json_field(HISTORY_COL_ENTITY_ID, false),
         Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
         Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
         json_field(HISTORY_COL_SNAPSHOT_CONTENT, true),
@@ -895,6 +900,14 @@ fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
 
 fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
     super::error::datafusion_error_to_lix_error(error)
+}
+
+fn entity_id_json_array(entity_id: &str) -> Result<String, LixError> {
+    serde_json::to_string(&[entity_id]).map_err(|error| {
+        LixError::unknown(format!(
+            "failed to encode history entity id as JSON: {error}"
+        ))
+    })
 }
 
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {

@@ -354,7 +354,7 @@ where
             change.schema_key == COMMIT_SCHEMA_KEY
                 && change
                     .entity_id
-                    .as_string()
+                    .as_single_string_owned()
                     .is_ok_and(|entity_id| entity_id == commit_id)
         }) else {
             return Ok(None);
@@ -502,7 +502,7 @@ fn parse_commit_change(
     canonical_change: CanonicalChange,
     change: crate::changelog::MaterializedCanonicalChange,
 ) -> Result<CommitGraphCommit, LixError> {
-    let change_entity_id = change.entity_id.as_string()?;
+    let change_entity_id = change.entity_id.as_single_string_owned()?;
     if change.schema_key != COMMIT_SCHEMA_KEY {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -860,7 +860,7 @@ mod tests {
             elements[0]
                 .change
                 .entity_id
-                .as_string()
+                .as_single_string_owned()
                 .expect("entity id should project"),
             "entity-1"
         );

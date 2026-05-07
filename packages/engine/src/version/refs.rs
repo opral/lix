@@ -107,7 +107,7 @@ where
         let mut heads = rows
             .iter()
             .map(|row| {
-                let version_id = row.entity_id.as_string()?;
+                let version_id = row.entity_id.as_single_string_owned()?;
                 decode_version_head(&version_id, row)
             })
             .collect::<Result<Vec<_>, _>>()?

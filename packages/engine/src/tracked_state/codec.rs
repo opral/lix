@@ -1,6 +1,6 @@
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
-use crate::entity_identity::{EntityIdentity, EntityIdentityPart};
+use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
 use crate::tracked_state::tree_types::{
     TrackedStateKey, TrackedStateKeyRef, TrackedStateValue, TrackedStateValueRef,
@@ -15,8 +15,6 @@ const NODE_KIND_INTERNAL: u8 = 2;
 const WEIBULL_K: i32 = 4;
 const ENTITY_IDENTITY_END: u8 = 0;
 const ENTITY_IDENTITY_STRING: u8 = 1;
-const ENTITY_IDENTITY_BOOL: u8 = 2;
-const ENTITY_IDENTITY_NUMBER: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EncodedLeafEntry {
@@ -457,20 +455,8 @@ fn push_entity_identity(out: &mut Vec<u8>, identity: &EntityIdentity) {
         "tracked-state key entity identity must contain at least one part"
     );
     for part in &identity.parts {
-        match part {
-            EntityIdentityPart::String(value) => {
-                out.push(ENTITY_IDENTITY_STRING);
-                push_sized_bytes(out, value.as_bytes());
-            }
-            EntityIdentityPart::Bool(value) => {
-                out.push(ENTITY_IDENTITY_BOOL);
-                out.push(u8::from(*value));
-            }
-            EntityIdentityPart::Number(value) => {
-                out.push(ENTITY_IDENTITY_NUMBER);
-                push_sized_bytes(out, value.as_bytes());
-            }
-        }
+        out.push(ENTITY_IDENTITY_STRING);
+        push_sized_bytes(out, part.as_bytes());
     }
     out.push(ENTITY_IDENTITY_END);
 }
@@ -482,33 +468,11 @@ fn read_entity_identity(bytes: &[u8], cursor: &mut usize) -> Result<EntityIdenti
         match tag {
             ENTITY_IDENTITY_END => break,
             ENTITY_IDENTITY_STRING => {
-                parts.push(EntityIdentityPart::String(read_sized_string(
+                parts.push(read_sized_string(
                     bytes,
                     cursor,
                     "entity identity string part",
-                )?));
-            }
-            ENTITY_IDENTITY_BOOL => {
-                let value = match read_u8(bytes, cursor, "entity identity bool part")? {
-                    0 => false,
-                    1 => true,
-                    other => {
-                        return Err(LixError::new(
-                            "LIX_ERROR_UNKNOWN",
-                            format!(
-                            "tracked-state tree key has invalid entity identity bool byte {other}"
-                        ),
-                        ))
-                    }
-                };
-                parts.push(EntityIdentityPart::Bool(value));
-            }
-            ENTITY_IDENTITY_NUMBER => {
-                parts.push(EntityIdentityPart::Number(read_sized_string(
-                    bytes,
-                    cursor,
-                    "entity identity number part",
-                )?));
+                )?);
             }
             other => {
                 return Err(LixError::new(
@@ -665,15 +629,15 @@ mod tests {
     }
 
     #[test]
-    fn key_codec_encodes_composite_identity_as_typed_tuple_parts() {
+    fn key_codec_encodes_composite_identity_as_string_tuple_parts() {
         let key = TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
             entity_id: EntityIdentity {
                 parts: vec![
-                    EntityIdentityPart::String("namespace".to_string()),
-                    EntityIdentityPart::Bool(true),
-                    EntityIdentityPart::Number("42".to_string()),
+                    "namespace".to_string(),
+                    "true".to_string(),
+                    "42".to_string(),
                 ],
             },
         };
@@ -681,32 +645,26 @@ mod tests {
         let encoded = encode_key(&key);
 
         assert_eq!(decode_key(&encoded).expect("key should decode"), key);
-        assert!(
-            !encoded
-                .windows(b"pk:v1:".len())
-                .any(|window| window == b"pk:v1:"),
-            "tracked-state keys should not store the SQL entity_id projection"
-        );
     }
 
     #[test]
-    fn key_codec_distinguishes_typed_identity_parts() {
-        let string_true = encode_key(&TrackedStateKey {
+    fn key_codec_rejects_non_string_identity_part_tags() {
+        let mut encoded = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
             entity_id: EntityIdentity {
-                parts: vec![EntityIdentityPart::String("true".to_string())],
+                parts: vec!["true".to_string()],
             },
         });
-        let bool_true = encode_key(&TrackedStateKey {
-            schema_key: "schema".to_string(),
-            file_id: None,
-            entity_id: EntityIdentity {
-                parts: vec![EntityIdentityPart::Bool(true)],
-            },
-        });
+        let schema_key_len = "schema".len();
+        let file_scope_offset = 4 + schema_key_len;
+        let entity_tag_offset = file_scope_offset + 1;
+        encoded[entity_tag_offset] = 2;
 
-        assert_ne!(string_true, bool_true);
+        let error = decode_key(&encoded).expect_err("non-string identity tag should reject");
+        assert!(error
+            .to_string()
+            .contains("invalid entity identity part tag 2"));
     }
 
     #[test]
@@ -715,17 +673,14 @@ mod tests {
             schema_key: "schema".to_string(),
             file_id: None,
             entity_id: EntityIdentity {
-                parts: vec![EntityIdentityPart::String("a".to_string())],
+                parts: vec!["a".to_string()],
             },
         });
         let extended = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
             entity_id: EntityIdentity {
-                parts: vec![
-                    EntityIdentityPart::String("a".to_string()),
-                    EntityIdentityPart::String("b".to_string()),
-                ],
+                parts: vec!["a".to_string(), "b".to_string()],
             },
         });
 

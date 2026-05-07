@@ -169,7 +169,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO engine_history_conformance \
                  (lixcol_entity_id, id, value, lixcol_untracked) \
-                 VALUES ('history-conformance-entity', 'history-conformance-entity', 'one', false)",
+                 VALUES (lix_json('[\"history-conformance-entity\"]'), 'history-conformance-entity', 'one', false)",
                 &[],
             )
             .await
@@ -178,7 +178,7 @@ simulation_test!(
             .execute(
                 "UPDATE engine_history_conformance \
                  SET value = 'two' \
-                 WHERE lixcol_entity_id = 'history-conformance-entity'",
+                 WHERE lixcol_entity_id = lix_json('[\"history-conformance-entity\"]')",
                 &[],
             )
             .await
@@ -186,7 +186,7 @@ simulation_test!(
         session
             .execute(
                 "DELETE FROM engine_history_conformance \
-                 WHERE lixcol_entity_id = 'history-conformance-entity'",
+                 WHERE lixcol_entity_id = lix_json('[\"history-conformance-entity\"]')",
                 &[],
             )
             .await
@@ -197,7 +197,7 @@ simulation_test!(
             "SELECT id, value, lixcol_entity_id, lixcol_snapshot_content, lixcol_depth \
              FROM engine_history_conformance_history \
              WHERE lixcol_start_commit_id = lix_active_version_commit_id() \
-               AND lixcol_entity_id = 'history-conformance-entity' \
+               AND lixcol_entity_id = lix_json('[\"history-conformance-entity\"]') \
              ORDER BY lixcol_depth",
         )
         .await;
@@ -207,7 +207,7 @@ simulation_test!(
             vec![
                 Value::Null,
                 Value::Null,
-                Value::Text("history-conformance-entity".to_string()),
+                Value::Json(serde_json::json!(["history-conformance-entity"])),
                 Value::Null,
                 Value::Integer(0),
             ]
@@ -219,7 +219,7 @@ simulation_test!(
              FROM lix_state_history \
              WHERE start_commit_id = lix_active_version_commit_id() \
                AND schema_key = 'engine_history_conformance' \
-               AND entity_id = 'history-conformance-entity' \
+               AND entity_id = lix_json('[\"history-conformance-entity\"]') \
                AND snapshot_content IS NULL",
         )
         .await;
@@ -271,14 +271,14 @@ simulation_test!(
                 vec![
                     Value::Text("history-pk-backfill".to_string()),
                     Value::Null,
-                    Value::Text("history-pk-backfill".to_string()),
+                    Value::Json(serde_json::json!(["history-pk-backfill"])),
                     Value::Null,
                     Value::Integer(0),
                 ],
                 vec![
                     Value::Text("history-pk-backfill".to_string()),
                     lix_engine::Value::Json(serde_json::json!("one")),
-                    Value::Text("history-pk-backfill".to_string()),
+                    Value::Json(serde_json::json!(["history-pk-backfill"])),
                     lix_engine::Value::Json(serde_json::json!({
                         "key": "history-pk-backfill",
                         "value": "one"
@@ -306,7 +306,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_history_composite_pk\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/namespace\",\"/id\"],\"type\":\"object\",\"properties\":{\"namespace\":{\"type\":\"string\"},\"id\":{\"type\":\"integer\"},\"value\":{\"type\":\"string\"}},\"required\":[\"namespace\",\"id\",\"value\"],\"additionalProperties\":false}'),\
+                 lix_json('{\"x-lix-key\":\"engine_history_composite_pk\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/namespace\",\"/id\"],\"type\":\"object\",\"properties\":{\"namespace\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"namespace\",\"id\",\"value\"],\"additionalProperties\":false}'),\
                  false,\
                  true\
                  )",
@@ -319,7 +319,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO engine_history_composite_pk \
                  (namespace, id, value, lixcol_untracked) \
-                 VALUES ('messages', 7, 'one', false)",
+                 VALUES ('messages', '7', 'one', false)",
                 &[],
             )
             .await
@@ -327,7 +327,7 @@ simulation_test!(
         session
             .execute(
                 "DELETE FROM engine_history_composite_pk \
-                 WHERE namespace = 'messages' AND id = 7",
+                 WHERE namespace = 'messages' AND id = '7'",
                 &[],
             )
             .await
@@ -339,7 +339,7 @@ simulation_test!(
              FROM engine_history_composite_pk_history \
              WHERE lixcol_start_commit_id = lix_active_version_commit_id() \
                AND namespace = 'messages' \
-               AND id = 7 \
+               AND id = '7' \
              ORDER BY lixcol_depth",
         )
         .await;
@@ -349,18 +349,18 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("messages".to_string()),
-                    Value::Integer(7),
+                    Value::Text("7".to_string()),
                     Value::Null,
                     Value::Null,
                     Value::Integer(0),
                 ],
                 vec![
                     Value::Text("messages".to_string()),
-                    Value::Integer(7),
+                    Value::Text("7".to_string()),
                     Value::Text("one".to_string()),
                     lix_engine::Value::Json(serde_json::json!({
                         "namespace": "messages",
-                        "id": 7,
+                        "id": "7",
                         "value": "one"
                     })),
                     Value::Integer(1),
@@ -422,7 +422,7 @@ simulation_test!(
                 Value::Null,
                 Value::Null,
                 Value::Null,
-                Value::Text("history-conformance-file".to_string()),
+                Value::Json(serde_json::json!(["history-conformance-file"])),
                 Value::Text("history-conformance-file".to_string()),
                 Value::Null,
                 Value::Integer(0),
@@ -435,7 +435,7 @@ simulation_test!(
              FROM lix_state_history \
              WHERE start_commit_id = lix_active_version_commit_id() \
                AND schema_key = 'lix_file_descriptor' \
-               AND entity_id = 'history-conformance-file' \
+               AND entity_id = lix_json('[\"history-conformance-file\"]') \
                AND snapshot_content IS NULL",
         )
         .await;
@@ -496,7 +496,7 @@ simulation_test!(
                 Value::Null,
                 Value::Null,
                 Value::Null,
-                Value::Text("history-conformance-dir".to_string()),
+                Value::Json(serde_json::json!(["history-conformance-dir"])),
                 Value::Null,
                 Value::Integer(0),
             ]]
@@ -508,7 +508,7 @@ simulation_test!(
              FROM lix_state_history \
              WHERE start_commit_id = lix_active_version_commit_id() \
                AND schema_key = 'lix_directory_descriptor' \
-               AND entity_id = 'history-conformance-dir' \
+               AND entity_id = lix_json('[\"history-conformance-dir\"]') \
                AND snapshot_content IS NULL",
         )
         .await;

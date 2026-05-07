@@ -109,11 +109,11 @@ simulation_test!(
         let (engine, main, _draft) = create_draft_from_main(&sim).await;
 
         let error = main
-            .execute(
-                "DELETE FROM lix_state \
-                 WHERE schema_key = 'lix_version_descriptor' AND entity_id = 'draft-version'",
-                &[],
-            )
+		.execute(
+			"DELETE FROM lix_state \
+	             WHERE schema_key = 'lix_version_descriptor' AND entity_id = lix_json('[\"draft-version\"]')",
+			&[],
+		)
             .await
             .expect_err("descriptor delete through lix_state should fail");
         assert_version_pair_delete_restricted(&error);
@@ -168,11 +168,11 @@ simulation_test!(
         let (engine, main, _draft) = create_draft_from_main(&sim).await;
 
         let error = main
-            .execute(
-                "DELETE FROM lix_state \
-                 WHERE schema_key = 'lix_version_ref' AND entity_id = 'draft-version'",
-                &[],
-            )
+		.execute(
+			"DELETE FROM lix_state \
+	                 WHERE schema_key = 'lix_version_ref' AND entity_id = lix_json('[\"draft-version\"]')",
+			&[],
+		)
             .await
             .expect_err("ref delete through lix_state should fail");
         assert_version_pair_delete_restricted(&error);
@@ -901,10 +901,10 @@ simulation_test!(
         let equivalent_change_count = select_single_integer(
             &global,
             "SELECT count(*) \
-             FROM lix_change \
-             WHERE schema_key = 'lix_key_value' \
-               AND entity_id = 'merge-adopt-change' \
-               AND snapshot_content = lix_json('{\"key\":\"merge-adopt-change\",\"value\":\"source\"}')",
+	     FROM lix_change \
+	     WHERE schema_key = 'lix_key_value' \
+	       AND entity_id = lix_json('[\"merge-adopt-change\"]') \
+	       AND snapshot_content = lix_json('{\"key\":\"merge-adopt-change\",\"value\":\"source\"}')",
         )
         .await;
         assert_eq!(
@@ -915,10 +915,10 @@ simulation_test!(
         let history = main
             .execute(
                 "SELECT snapshot_content \
-                 FROM lix_state_history \
-                 WHERE start_commit_id = lix_active_version_commit_id() \
-                   AND entity_id = 'merge-adopt-change' \
-                 ORDER BY depth",
+	             FROM lix_state_history \
+	             WHERE start_commit_id = lix_active_version_commit_id() \
+	               AND entity_id = lix_json('[\"merge-adopt-change\"]') \
+	             ORDER BY depth",
                 &[],
             )
             .await
@@ -1599,7 +1599,7 @@ async fn count_version_refs(
         session,
         &format!(
             "SELECT COUNT(*) FROM lix_state \
-             WHERE schema_key = 'lix_version_ref' AND entity_id = '{version_id}'"
+	         WHERE schema_key = 'lix_version_ref' AND entity_id = lix_json('[\"{version_id}\"]')"
         ),
     )
     .await
@@ -1647,7 +1647,7 @@ fn assert_merge_conflict_error(error: &lix_engine::LixError) {
     assert!(
         conflict
             .get("entityId")
-            .and_then(JsonValue::as_str)
+            .and_then(JsonValue::as_array)
             .is_some(),
         "conflict should include entityId: {conflict:?}"
     );
@@ -1699,8 +1699,8 @@ async fn load_commit_snapshot(
         .execute(
             &format!(
                 "SELECT snapshot_content \
-                 FROM lix_state \
-                 WHERE schema_key = 'lix_commit' AND entity_id = '{commit_id}'"
+	             FROM lix_state \
+	             WHERE schema_key = 'lix_commit' AND entity_id = lix_json('[\"{commit_id}\"]')"
             ),
             &[],
         )

@@ -1,5 +1,6 @@
 use lix_engine::ExecuteResult;
 use lix_engine::Value;
+use serde_json::json;
 
 use super::assert_rows_eq;
 
@@ -18,7 +19,7 @@ simulation_test!(lix_state_latest_update_wins, |sim| async move {
             "INSERT INTO lix_state (\
              entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
              ) VALUES (\
-             'state-latest', 'lix_key_value', NULL, lix_json('{\"key\":\"state-latest\",\"value\":\"old\"}'), '1', false, false\
+             lix_json('[\"state-latest\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-latest\",\"value\":\"old\"}'), '1', false, false\
              )",
             &[],
         )
@@ -28,7 +29,7 @@ simulation_test!(lix_state_latest_update_wins, |sim| async move {
         .execute(
             "UPDATE lix_state \
              SET snapshot_content = lix_json('{\"key\":\"state-latest\",\"value\":\"new\"}') \
-             WHERE entity_id = 'state-latest' AND schema_key = 'lix_key_value'",
+             WHERE entity_id = lix_json('[\"state-latest\"]') AND schema_key = 'lix_key_value'",
             &[],
         )
         .await
@@ -38,7 +39,7 @@ simulation_test!(lix_state_latest_update_wins, |sim| async move {
         .execute(
             "SELECT snapshot_content \
              FROM lix_state \
-             WHERE entity_id = 'state-latest' AND schema_key = 'lix_key_value'",
+             WHERE entity_id = lix_json('[\"state-latest\"]') AND schema_key = 'lix_key_value'",
             &[],
         )
         .await
@@ -61,7 +62,7 @@ simulation_test!(lix_state_delete_hides_row, |sim| async move {
             "INSERT INTO lix_state (\
              entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
              ) VALUES (\
-             'state-delete', 'lix_key_value', NULL, lix_json('{\"key\":\"state-delete\",\"value\":\"delete-me\"}'), '1', false, false\
+             lix_json('[\"state-delete\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-delete\",\"value\":\"delete-me\"}'), '1', false, false\
              )",
             &[],
         )
@@ -70,7 +71,7 @@ simulation_test!(lix_state_delete_hides_row, |sim| async move {
     session
         .execute(
             "DELETE FROM lix_state \
-             WHERE entity_id = 'state-delete' AND schema_key = 'lix_key_value'",
+             WHERE entity_id = lix_json('[\"state-delete\"]') AND schema_key = 'lix_key_value'",
             &[],
         )
         .await
@@ -80,7 +81,7 @@ simulation_test!(lix_state_delete_hides_row, |sim| async move {
         .execute(
             "SELECT entity_id \
              FROM lix_state \
-             WHERE entity_id = 'state-delete' AND schema_key = 'lix_key_value'",
+             WHERE entity_id = lix_json('[\"state-delete\"]') AND schema_key = 'lix_key_value'",
             &[],
         )
         .await
@@ -106,7 +107,7 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
                  ) VALUES (\
-                 'state-global-overlay', 'lix_key_value', NULL, lix_json('{\"key\":\"state-global-overlay\",\"value\":\"global\"}'), '1', true, false\
+                 lix_json('[\"state-global-overlay\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-global-overlay\",\"value\":\"global\"}'), '1', true, false\
                  )",
                 &[],
             )
@@ -117,7 +118,7 @@ simulation_test!(
             .execute(
                 "SELECT entity_id, global, untracked \
                  FROM lix_state \
-                 WHERE entity_id = 'state-global-overlay' AND schema_key = 'lix_key_value'",
+                 WHERE entity_id = lix_json('[\"state-global-overlay\"]') AND schema_key = 'lix_key_value'",
                 &[],
             )
             .await
@@ -125,7 +126,7 @@ simulation_test!(
         assert_rows_eq(
             active_result,
             vec![vec![
-                Value::Text("state-global-overlay".to_string()),
+                Value::Json(json!(["state-global-overlay"])),
                 Value::Boolean(true),
                 Value::Boolean(false),
             ]],
@@ -136,7 +137,7 @@ simulation_test!(
                 &format!(
                     "SELECT entity_id, version_id, global, untracked \
                  FROM lix_state_by_version \
-                 WHERE entity_id = 'state-global-overlay' AND schema_key = 'lix_key_value' \
+                 WHERE entity_id = lix_json('[\"state-global-overlay\"]') AND schema_key = 'lix_key_value' \
                  AND version_id IN ('{}', 'global') \
                  ORDER BY version_id",
                     sim.main_version_id()
@@ -149,13 +150,13 @@ simulation_test!(
             by_version_result,
             vec![
                 vec![
-                    Value::Text("state-global-overlay".to_string()),
+                    Value::Json(json!(["state-global-overlay"])),
                     Value::Text(sim.main_version_id().to_string()),
                     Value::Boolean(true),
                     Value::Boolean(false),
                 ],
                 vec![
-                    Value::Text("state-global-overlay".to_string()),
+                    Value::Json(json!(["state-global-overlay"])),
                     Value::Text("global".to_string()),
                     Value::Boolean(true),
                     Value::Boolean(false),
@@ -182,7 +183,7 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
                  ) VALUES (\
-                 'state-global-tombstone-overlay', 'lix_key_value', NULL, lix_json('{\"key\":\"state-global-tombstone-overlay\",\"value\":\"global\"}'), '1', true, false\
+                 lix_json('[\"state-global-tombstone-overlay\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-global-tombstone-overlay\",\"value\":\"global\"}'), '1', true, false\
                  )",
                 &[],
             )
@@ -193,7 +194,7 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
                  ) VALUES (\
-                 'state-global-tombstone-overlay', 'lix_key_value', NULL, NULL, '1', false, false\
+                 lix_json('[\"state-global-tombstone-overlay\"]'), 'lix_key_value', NULL, NULL, '1', false, false\
                  )",
                 &[],
             )
@@ -204,7 +205,7 @@ simulation_test!(
             .execute(
                 "SELECT entity_id \
                  FROM lix_state \
-                 WHERE entity_id = 'state-global-tombstone-overlay' AND schema_key = 'lix_key_value'",
+                 WHERE entity_id = lix_json('[\"state-global-tombstone-overlay\"]') AND schema_key = 'lix_key_value'",
                 &[],
             )
             .await
@@ -216,7 +217,7 @@ simulation_test!(
                 &format!(
                     "SELECT entity_id, version_id, global, untracked \
                      FROM lix_state_by_version \
-                     WHERE entity_id = 'state-global-tombstone-overlay' AND schema_key = 'lix_key_value' \
+                     WHERE entity_id = lix_json('[\"state-global-tombstone-overlay\"]') AND schema_key = 'lix_key_value' \
                      AND version_id IN ('{}', 'global') \
                      ORDER BY version_id",
                     sim.main_version_id()
@@ -228,7 +229,7 @@ simulation_test!(
         assert_rows_eq(
             by_version_result,
             vec![vec![
-                Value::Text("state-global-tombstone-overlay".to_string()),
+                Value::Json(json!(["state-global-tombstone-overlay"])),
                 Value::Text("global".to_string()),
                 Value::Boolean(true),
                 Value::Boolean(false),

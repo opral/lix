@@ -128,7 +128,7 @@ fn diff_by_identity(
                 format!(
                     "tracked-state merge received duplicate diff entry for schema '{}' entity '{}'",
                     entry.identity.schema_key,
-                    entry.identity.entity_id.as_string()?
+                    entry.identity.entity_id.as_json_array_text()?
                 ),
             ));
         }
@@ -146,7 +146,7 @@ fn adopt_source_change_patch(
             format!(
                 "tracked-state merge cannot apply source removal for schema '{}' entity '{}' without a tombstone row",
                 entry.identity.schema_key,
-                entry.identity.entity_id.as_string()?
+                entry.identity.entity_id.as_json_array_text()?
             ),
         ));
     };
@@ -439,14 +439,26 @@ mod tests {
     fn patch_ids(plan: &TrackedStateMergePlan) -> Vec<String> {
         plan.patches
             .iter()
-            .map(|entry| entry.identity().entity_id.as_string().expect("identity"))
+            .map(|entry| {
+                entry
+                    .identity()
+                    .entity_id
+                    .as_single_string_owned()
+                    .expect("identity")
+            })
             .collect()
     }
 
     fn conflict_ids(plan: &TrackedStateMergePlan) -> Vec<String> {
         plan.conflicts
             .iter()
-            .map(|entry| entry.identity.entity_id.as_string().expect("identity"))
+            .map(|entry| {
+                entry
+                    .identity
+                    .entity_id
+                    .as_single_string_owned()
+                    .expect("identity")
+            })
             .collect()
     }
 
