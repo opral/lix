@@ -238,8 +238,7 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
 
   const isActive = (href: string, activePrefix?: string) => {
     const candidate = activePrefix ?? href;
-    const normalized =
-      candidate === "/" ? "/" : candidate.replace(/\/$/, "");
+    const normalized = candidate === "/" ? "/" : candidate.replace(/\/$/, "");
     if (normalized === "/") return pathname === "/";
     return pathname === normalized || pathname.startsWith(`${normalized}/`);
   };
@@ -388,7 +387,9 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
             </h1>
 
             <p className="text-gray-500 text-lg sm:text-xl max-w-4xl mx-auto mt-8">
-              Lix is a version control system that can be imported as a library. Use it to, for example, enable human-in-the-loop workflows for AI agents like diffs and reviews.
+              Lix is a version control system that can be imported as a library.
+              Use it to, for example, enable human-in-the-loop workflows for AI
+              agents like diffs and reviews.
             </p>
 
             {/* Trust signals */}
@@ -575,7 +576,8 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
                     Fits into your tech stack
                   </h3>
                   <p className="text-gray-600 text-base mt-2">
-                    Import Lix and get branching, diff, and rollback without changing your architecture.
+                    Import Lix and get branching, diff, and rollback without
+                    changing your architecture.
                   </p>
                 </div>
               </div>
@@ -615,7 +617,8 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
                     Tracks semantic changes
                   </h3>
                   <p className="text-gray-600 text-base mt-2">
-                    Lix stores semantic changes via plugins. Diffs, blame, and history are queryable via SQL.
+                    Lix stores semantic changes via plugins. Diffs, blame, and
+                    history are queryable via SQL.
                   </p>
                 </div>
               </div>
@@ -691,7 +694,8 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
                     Human in the loop for agents
                   </h3>
                   <p className="text-gray-600 text-base mt-2">
-                    Agents propose changes in isolated versions. Humans review, approve, and merge.
+                    Agents propose changes in isolated versions. Humans review,
+                    approve, and merge.
                   </p>
                 </div>
               </div>

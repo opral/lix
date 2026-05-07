@@ -22,7 +22,7 @@ const rfcMarkdownFiles = import.meta.glob<string>(
   {
     query: "?raw",
     import: "default",
-  }
+  },
 );
 
 const rfcRootPrefix = "../../../../../rfcs/";
@@ -53,17 +53,13 @@ async function getTitleForSlug(slug: string): Promise<string> {
  * Handles both relative paths (../001-slug/index.md) and absolute paths (/rfc/001-slug/index.md)
  */
 function rewriteRfcLinks(html: string): string {
-  return html
-    // Handle relative paths: ../001-slug/index.md or ./001-slug/index.md
-    .replace(
-      /href="\.\.?\/([\d]+-[^/]+)\/index\.md"/g,
-      'href="/rfc/$1"'
-    )
-    // Handle absolute paths that were resolved by assetBaseUrl: /rfc/001-slug/index.md
-    .replace(
-      /href="\/rfc\/([\d]+-[^/]+)\/index\.md"/g,
-      'href="/rfc/$1"'
-    );
+  return (
+    html
+      // Handle relative paths: ../001-slug/index.md or ./001-slug/index.md
+      .replace(/href="\.\.?\/([\d]+-[^/]+)\/index\.md"/g, 'href="/rfc/$1"')
+      // Handle absolute paths that were resolved by assetBaseUrl: /rfc/001-slug/index.md
+      .replace(/href="\/rfc\/([\d]+-[^/]+)\/index\.md"/g, 'href="/rfc/$1"')
+  );
 }
 
 async function loadRfc(slug: string) {
@@ -106,7 +102,9 @@ async function loadRfc(slug: string) {
     getMarkdownTitle({
       rawMarkdown,
       frontmatter: parsed.frontmatter,
-    }) ?? rendered.title ?? slug;
+    }) ??
+    rendered.title ??
+    slug;
   const description =
     getMarkdownDescription({
       rawMarkdown,

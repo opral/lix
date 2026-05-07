@@ -241,6 +241,49 @@
   margin: 8px 0 0;
 }
 
+.markdown-wc-body ul.contains-task-list {
+  padding-left: 0;
+  list-style: none;
+}
+
+.markdown-wc-body li.task-list-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.markdown-wc-body li.task-list-item + li.task-list-item {
+  margin-top: 8px;
+}
+
+.markdown-wc-body li.task-list-item > input[type="checkbox"] {
+  appearance: none;
+  display: inline-grid;
+  place-content: center;
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin: 5px 0 0;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 3px;
+  background: var(--vp-c-bg);
+  opacity: 1;
+}
+
+.markdown-wc-body li.task-list-item > input[type="checkbox"]:checked {
+  border-color: var(--vp-c-brand-1);
+  background: var(--vp-c-brand-1);
+}
+
+.markdown-wc-body li.task-list-item > input[type="checkbox"]:checked::before {
+  content: "";
+  width: 7px;
+  height: 4px;
+  border: solid white;
+  border-width: 0 0 2px 2px;
+  transform: translateY(-1px) rotate(-45deg);
+}
+
 /* Inline code */
 .markdown-wc-body :not(pre) > code {
   font-size: var(--vp-code-font-size);

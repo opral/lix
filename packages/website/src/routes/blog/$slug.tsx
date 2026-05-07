@@ -19,7 +19,7 @@ const blogMarkdownFiles = import.meta.glob<string>(
   {
     query: "?raw",
     import: "default",
-  }
+  },
 );
 const blogJsonFiles = import.meta.glob<string>("../../../../../blog/*.json", {
   query: "?raw",
@@ -77,7 +77,7 @@ async function loadBlogPost(slug: string) {
         getBlogTitle({ rawMarkdown: md, frontmatter: parsedMd.frontmatter }) ??
         item.slug;
       return { ...item, date, title };
-    })
+    }),
   );
 
   const sortedToc = [...postsWithDates].sort((a, b) => {

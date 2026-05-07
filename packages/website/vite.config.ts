@@ -7,6 +7,7 @@ import { githubStarsPlugin } from "./src/ssg/github-stars-plugin";
 import { viteStaticCopy } from "vite-plugin-static-copy";
 import path from "path";
 import fs from "fs";
+import type { ViteDevServer } from "vite";
 
 const mimeTypes: Record<string, string> = {
   ".svg": "image/svg+xml",
@@ -42,6 +43,47 @@ function blogAssetsPlugin(): Plugin {
   };
 }
 
+/**
+ * Keeps the docs route module graph in sync when root docs files are added or
+ * removed while the dev server is already running.
+ */
+function docsContentWatchPlugin(): Plugin {
+  const docsDir = path.resolve(__dirname, "../../docs");
+  const docsRouteFiles = [
+    path.resolve(__dirname, "src/routes/docs/$slugId.tsx"),
+    path.resolve(__dirname, "src/routes/docs/index.tsx"),
+  ];
+
+  const invalidateDocsRoutes = (server: ViteDevServer) => {
+    for (const routeFile of docsRouteFiles) {
+      const modules = server.moduleGraph.getModulesByFile(routeFile);
+      if (!modules) continue;
+      for (const module of modules) {
+        server.moduleGraph.invalidateModule(module);
+      }
+    }
+    server.ws.send({ type: "full-reload" });
+  };
+
+  const isDocsFile = (file: string) => {
+    const normalizedFile = path.normalize(file);
+    return normalizedFile.startsWith(docsDir + path.sep);
+  };
+
+  return {
+    name: "docs-content-watch",
+    configureServer(server) {
+      server.watcher.add(docsDir);
+      server.watcher.on("add", (file) => {
+        if (isDocsFile(file)) invalidateDocsRoutes(server);
+      });
+      server.watcher.on("unlink", (file) => {
+        if (isDocsFile(file)) invalidateDocsRoutes(server);
+      });
+    },
+  };
+}
+
 const config = defineConfig(({ mode, command }) => {
   const isTest = process.env.VITEST === "true" || mode === "test";
   const env = loadEnv(mode, process.cwd(), "");
@@ -59,6 +101,7 @@ const config = defineConfig(({ mode, command }) => {
     },
     plugins: [
       command === "serve" && blogAssetsPlugin(),
+      command === "serve" && docsContentWatchPlugin(),
       pluginReadmeSync(),
       githubStarsPlugin({
         token: githubToken,

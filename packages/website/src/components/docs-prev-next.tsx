@@ -37,10 +37,16 @@ export function DocsPrevNext({
     currentIndex < routes.length - 1 ? routes[currentIndex + 1] : null;
 
   const prev = prevRoute
-    ? { slug: prevRoute.slug, title: prevRoute.title ?? formatNavTitle(prevRoute.slug) }
+    ? {
+        slug: prevRoute.slug,
+        title: prevRoute.title ?? formatNavTitle(prevRoute.slug),
+      }
     : null;
   const next = nextRoute
-    ? { slug: nextRoute.slug, title: nextRoute.title ?? formatNavTitle(nextRoute.slug) }
+    ? {
+        slug: nextRoute.slug,
+        title: nextRoute.title ?? formatNavTitle(nextRoute.slug),
+      }
     : null;
 
   return (

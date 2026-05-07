@@ -6,7 +6,10 @@ export function resolveOgImageUrl(value: string, folderName: string): string {
   return new URL(value, base).toString();
 }
 
-export function resolveBlogAssetPath(value: string, folderName: string): string {
+export function resolveBlogAssetPath(
+  value: string,
+  folderName: string,
+): string {
   if (isAbsoluteUrl(value)) return value;
   if (value.startsWith("/")) return value;
   const normalized = value.replace(/^\.\//, "");

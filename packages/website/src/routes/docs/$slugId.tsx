@@ -11,6 +11,7 @@ import {
   buildDocMaps,
   buildTocMap,
   normalizeRelativePath,
+  resolveDocsMarkdownHref,
   type Toc,
   type TocItem,
 } from "../../lib/build-doc-map";
@@ -149,7 +150,9 @@ export function buildDocsPageHead(loaderData?: DocsLoaderData) {
   const ogImage = resolveOgImage(frontmatter);
   const ogMeta = extractOgMeta(frontmatter);
   const twitterMeta = extractTwitterMeta(frontmatter);
-  const pageTitle = title ? `${title} | Lix Documentation` : "Lix Documentation";
+  const pageTitle = title
+    ? `${title} | Lix Documentation`
+    : "Lix Documentation";
   const jsonLd = buildWebPageJsonLd({
     title: pageTitle,
     description,
@@ -235,14 +238,17 @@ export const Route = createFileRoute("/docs/$slugId")({
     const parsedMarkdown = await parse(doc.content, {
       externalLinks: true,
       assetBaseUrl: `/docs/${doc.slug}/`,
+      resolveHref: (href) =>
+        resolveDocsMarkdownHref(href, doc, docsByRelativePath),
     });
-    const pageToc = buildPageToc(parsedMarkdown.html);
+    const html = parsedMarkdown.html;
+    const pageToc = buildPageToc(html);
 
     return {
       doc,
       tocEntry,
       sidebarSections: buildSidebarSections(tableOfContents as Toc),
-      html: parsedMarkdown.html,
+      html,
       frontmatter: parsedMarkdown.frontmatter,
       pageToc,
     };
