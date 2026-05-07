@@ -1,17 +1,25 @@
 {
   "x-lix-key": "lix_label",
   "x-lix-version": "1",
+  "description": "Catalog of labels that can be assigned to arbitrary live Lix rows through lix_label_assignment.",
   "x-lix-primary-key": [
     "/id"
+  ],
+  "x-lix-unique": [
+    [
+      "/name"
+    ]
   ],
   "type": "object",
   "properties": {
     "id": {
       "type": "string",
-      "x-lix-default": "lix_uuid_v7()"
+      "x-lix-default": "lix_uuid_v7()",
+      "description": "Stable label identifier. Label assignments reference this value."
     },
     "name": {
-      "type": "string"
+      "type": "string",
+      "description": "Human-readable label name. Unique across labels."
     }
   },
   "required": [

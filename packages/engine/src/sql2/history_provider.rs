@@ -268,7 +268,7 @@ impl ExecutionPlan for LixStateHistoryScanExec {
 
 fn lix_state_history_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new("entity_id", DataType::Utf8, false),
+        json_field("entity_id", false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
         json_field("snapshot_content", true),
@@ -383,7 +383,7 @@ async fn load_state_history_rows(
         .into_iter()
         .map(|entry| -> Result<StateHistorySqlRow, LixError> {
             Ok(StateHistorySqlRow {
-                entity_id: entry.change.entity_id.as_string()?,
+                entity_id: entry.change.entity_id.as_json_array_text()?,
                 schema_key: entry.change.schema_key,
                 file_id: entry.change.file_id,
                 snapshot_content: entry.change.snapshot_content,

@@ -224,7 +224,7 @@ enum ChangeColumn {
 fn lix_change_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
-        Field::new("entity_id", DataType::Utf8, false),
+        json_field("entity_id", false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("schema_version", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
@@ -274,7 +274,7 @@ fn change_record_batch(
                     .map(|row| {
                         Some(
                             row.entity_id
-                                .as_string()
+                                .as_json_array_text()
                                 .expect("canonical change entity identity should project"),
                         )
                     })
@@ -312,7 +312,7 @@ fn change_schema(projection: &[ChangeColumn]) -> SchemaRef {
             .iter()
             .map(|column| match column {
                 ChangeColumn::Id => Field::new("id", DataType::Utf8, false),
-                ChangeColumn::EntityId => Field::new("entity_id", DataType::Utf8, false),
+                ChangeColumn::EntityId => json_field("entity_id", false),
                 ChangeColumn::SchemaKey => Field::new("schema_key", DataType::Utf8, false),
                 ChangeColumn::SchemaVersion => Field::new("schema_version", DataType::Utf8, false),
                 ChangeColumn::FileId => Field::new("file_id", DataType::Utf8, true),

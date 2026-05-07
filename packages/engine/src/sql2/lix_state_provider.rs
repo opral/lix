@@ -779,7 +779,7 @@ fn lix_state_update_write_rows_from_batch(
 
             Ok(TransactionWriteRow {
                 entity_id: Some(
-                    EntityIdentity::from_string(&required_string_value(
+                    EntityIdentity::from_json_array_text(&required_string_value(
                         batch,
                         row_index,
                         "entity_id",
@@ -911,7 +911,7 @@ fn lix_state_write_rows_from_batch(
 
             Ok(TransactionWriteRow {
                 entity_id: Some(
-                    EntityIdentity::from_string(&required_string_value(
+                    EntityIdentity::from_json_array_text(&required_string_value(
                         batch,
                         row_index,
                         "entity_id",
@@ -1160,7 +1160,7 @@ impl ExecutionPlan for LixStateScanExec {
 
 fn lix_state_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new("entity_id", DataType::Utf8, false),
+        json_field("entity_id", false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
         json_field("snapshot_content", true),
@@ -1177,7 +1177,7 @@ fn lix_state_schema() -> SchemaRef {
 
 fn lix_state_by_version_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new("entity_id", DataType::Utf8, false),
+        json_field("entity_id", false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
         json_field("snapshot_content", true),
@@ -1276,7 +1276,7 @@ fn lix_state_scan_request(
             .map(|values| {
                 values
                     .iter()
-                    .map(|value| EntityIdentity::single(value))
+                    .filter_map(|value| EntityIdentity::from_json_array_text(value).ok())
                     .collect()
             })
             .unwrap_or_default(),
@@ -1398,7 +1398,7 @@ fn parse_lix_state_in_list_filter(in_list: &InList) -> Option<LixStateFilterPred
     match column.name.as_str() {
         "schema_key" => Some(LixStateFilterPredicate::SchemaKeys(values)),
         "version_id" => Some(LixStateFilterPredicate::VersionIds(values)),
-        "entity_id" => Some(LixStateFilterPredicate::EntityIds(values)),
+        "entity_id" => canonical_entity_id_values(values).map(LixStateFilterPredicate::EntityIds),
         _ => None,
     }
 }
@@ -1428,10 +1428,25 @@ fn parse_lix_state_column_literal_filter(
         "version_id" => string_expr_literal(literal_expr)
             .map(|value| LixStateFilterPredicate::VersionIds(BTreeSet::from([value]))),
         "entity_id" => string_expr_literal(literal_expr)
+            .and_then(|value| canonical_entity_id_value(&value))
             .map(|value| LixStateFilterPredicate::EntityIds(BTreeSet::from([value]))),
         "file_id" => nullable_key_literal(literal_expr).map(LixStateFilterPredicate::FileId),
         _ => None,
     }
+}
+
+fn canonical_entity_id_values(values: BTreeSet<String>) -> Option<BTreeSet<String>> {
+    values
+        .into_iter()
+        .map(|value| canonical_entity_id_value(&value))
+        .collect()
+}
+
+fn canonical_entity_id_value(value: &str) -> Option<String> {
+    EntityIdentity::from_json_array_text(value)
+        .ok()?
+        .as_json_array_text()
+        .ok()
 }
 
 fn nullable_key_literal(expr: &Expr) -> Option<NullableKeyFilter<String>> {
@@ -1478,7 +1493,7 @@ fn lix_state_record_batch(
             Ok(match field.name().as_str() {
                 "entity_id" => Arc::new(StringArray::from(
                     rows.iter()
-                        .map(|row| row.entity_id.as_string().map(Some))
+                        .map(|row| row.entity_id.as_json_array_text().map(Some))
                         .collect::<std::result::Result<Vec<_>, LixError>>()?,
                 )) as ArrayRef,
                 "schema_key" => string_array(rows.iter().map(|row| Some(row.schema_key.as_str()))),
@@ -1878,7 +1893,7 @@ mod tests {
         RecordBatch::try_new(
             lix_state_schema(),
             vec![
-                string_column(vec![Some("entity-1")]),
+                string_column(vec![Some("[\"entity-1\"]")]),
                 string_column(vec![Some("lix_key_value")]),
                 string_column(vec![None]),
                 string_column(vec![Some("{\"key\":\"hello\",\"value\":\"world\"}")]),
@@ -1899,7 +1914,7 @@ mod tests {
         RecordBatch::try_new(
             lix_state_schema(),
             vec![
-                string_column(vec![Some("entity-1")]),
+                string_column(vec![Some("[\"entity-1\"]")]),
                 string_column(vec![Some("lix_key_value")]),
                 string_column(vec![None]),
                 string_column(vec![Some("{\"key\":\"hello\",\"value\":\"world\"}")]),
@@ -1918,7 +1933,7 @@ mod tests {
 
     fn live_row(entity_id: &str, metadata: Option<&str>) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: EntityIdentity::from_string(entity_id).expect("entity id should decode"),
+            entity_id: EntityIdentity::single(entity_id),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
             snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
@@ -2007,7 +2022,7 @@ mod tests {
             Box::new(Expr::BinaryExpr(BinaryExpr::new(
                 Box::new(col("entity_id")),
                 Operator::Eq,
-                Box::new(str_lit("entity-a")),
+                Box::new(str_lit("[\"entity-a\"]")),
             ))),
             Operator::And,
             Box::new(Expr::InList(InList::new(
@@ -2019,7 +2034,7 @@ mod tests {
 
         assert_eq!(
             route.entity_ids,
-            Some(BTreeSet::from(["entity-a".to_string()]))
+            Some(BTreeSet::from(["[\"entity-a\"]".to_string()]))
         );
         assert_eq!(
             route.version_ids,

@@ -6,7 +6,7 @@ use crate::LixError;
 const UNTRACKED_STATE_FILE_IDENTIFIER: &str = "LXUS";
 
 pub(crate) fn encode_row_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8>, LixError> {
-    let entity_id = row.entity_id.as_cow_str().map_err(|error| {
+    let entity_id = row.entity_id.as_json_array_text().map_err(|error| {
         LixError::unknown(format!(
             "failed to encode untracked-state entity identity: {error}"
         ))
@@ -64,7 +64,7 @@ pub(crate) fn decode_row(bytes: &[u8]) -> Result<UntrackedStateRow, LixError> {
     })?;
 
     let entity_id = required_str(row.entity_id(), "entity_id")?;
-    let entity_id = EntityIdentity::from_string(entity_id).map_err(|error| {
+    let entity_id = EntityIdentity::from_json_array_text(entity_id).map_err(|error| {
         LixError::unknown(format!(
             "failed to decode untracked-state entity identity: {error}"
         ))

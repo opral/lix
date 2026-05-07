@@ -49,11 +49,11 @@ simulation_test!(
             .map(|row| row.values().to_vec())
             .collect::<Vec<_>>();
         assert!(version_values.contains(&vec![
-            Value::Text("global".to_string()),
+            Value::Json(json!(["global"])),
             Value::Json(json!({"hidden": true, "id": "global", "name": "global"})),
         ]));
         assert!(version_values.contains(&vec![
-            Value::Text(sim.main_version_id().to_string()),
+            Value::Json(json!([sim.main_version_id()])),
             Value::Json(json!({"hidden": false, "id": sim.main_version_id(), "name": "main"})),
         ]));
 
@@ -81,12 +81,12 @@ simulation_test!(
             .map(|row| row.values().to_vec())
             .collect::<Vec<_>>();
         assert!(ref_values.contains(&vec![
-            Value::Text("global".to_string()),
+            Value::Json(json!(["global"])),
             Value::Json(json!({"commit_id": sim.initial_commit_id(), "id": "global"})),
             Value::Boolean(true),
         ]));
         assert!(ref_values.contains(&vec![
-            Value::Text(sim.main_version_id().to_string()),
+            Value::Json(json!([sim.main_version_id()])),
             Value::Json(json!({"commit_id": sim.initial_commit_id(), "id": sim.main_version_id()})),
             Value::Boolean(true),
         ]));
@@ -354,13 +354,13 @@ simulation_test!(
         );
         let write_result = second_session
 			.execute(
-				"INSERT INTO lix_state (\
-				 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
-				 ) VALUES (\
-				 'det-write', 'lix_key_value', NULL, lix_json('{\"key\":\"det-write\",\"value\":\"ok\"}'), '1', false, false\
-				 )",
-				&[],
-			)
+					"INSERT INTO lix_state (\
+					 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+					 ) VALUES (\
+					 lix_json('[\"det-write\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"det-write\",\"value\":\"ok\"}'), '1', false, false\
+					 )",
+					&[],
+				)
             .await
             .expect("deterministic write should succeed");
         assert_eq!(write_result, ExecuteResult::from_rows_affected(1));

@@ -27,7 +27,7 @@ simulation_test!(lix_change_queries_tracked_changes, |sim| async move {
         .execute(
             "SELECT entity_id, schema_key, snapshot_content \
              FROM lix_change \
-             WHERE entity_id = 'change-query'",
+             WHERE entity_id = lix_json('[\"change-query\"]')",
             &[],
         )
         .await
@@ -37,12 +37,105 @@ simulation_test!(lix_change_queries_tracked_changes, |sim| async move {
     assert_eq!(
         rows.rows()[0].values(),
         &[
-            Value::Text("change-query".to_string()),
+            Value::Json(json!(["change-query"])),
             Value::Text("lix_key_value".to_string()),
             Value::Json(json!({"key": "change-query", "value": "one"})),
         ]
     );
 });
+
+simulation_test!(
+    lix_change_entity_id_is_json_array_for_composite_primary_keys,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine_composite_message\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/key\",\"/locale\"],\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"locale\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"key\",\"locale\",\"text\"],\"additionalProperties\":false}'),\
+                 false,\
+                 true\
+                 )",
+                &[],
+            )
+            .await
+            .expect("composite schema insert should succeed");
+        session
+            .execute(
+                "INSERT INTO engine_composite_message (key, locale, text) \
+                 VALUES ('welcome.title', 'en', 'Welcome')",
+                &[],
+            )
+            .await
+            .expect("composite entity insert should succeed");
+
+        let result = session
+            .execute(
+                "SELECT entity_id, \
+                        lix_json_get_text(entity_id, 0) AS entity_key, \
+                        lix_json_get_text(entity_id, 1) AS entity_locale \
+                 FROM lix_change \
+                 WHERE schema_key = 'engine_composite_message' \
+                   AND entity_id = lix_json('[\"welcome.title\",\"en\"]')",
+                &[],
+            )
+            .await
+            .expect("lix_change should expose composite entity_id as JSON");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Json(json!(["welcome.title", "en"])),
+                Value::Text("welcome.title".to_string()),
+                Value::Text("en".to_string()),
+            ]
+        );
+    }
+);
+
+simulation_test!(
+    lix_change_rejects_non_string_primary_key_schemas,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine_numeric_message\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"number\"},\"text\":{\"type\":\"string\"}},\"required\":[\"id\",\"text\"],\"additionalProperties\":false}'),\
+                 false,\
+                 true\
+                 )",
+                &[],
+            )
+            .await
+            .expect_err("numeric primary-key schema should be rejected");
+
+        assert_eq!(error.code, lix_engine::LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            error
+                .message
+                .contains("x-lix-primary-key property \"/id\" must have type \"string\""),
+            "error should explain non-string primary-key schema: {error:?}"
+        );
+    }
+);
 
 simulation_test!(
     lix_change_sql_surface_matches_builtin_schema,

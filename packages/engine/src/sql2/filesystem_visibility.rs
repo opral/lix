@@ -365,8 +365,7 @@ mod tests {
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
-                .expect("entity id should decode"),
+            entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
             schema_key: schema_key.to_string(),
             file_id,
             snapshot_content: Some(snapshot_content.to_string()),
