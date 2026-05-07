@@ -878,7 +878,7 @@ fn duplicate_staged_present_row_error(
                 row.schema_version,
                 previous
                     .entity_id
-                    .as_string()
+                    .as_json_array_text()
                     .unwrap_or_else(|_| "<invalid entity_id>".to_string()),
                 row.version_id
             )
@@ -897,7 +897,7 @@ pub(crate) fn duplicate_insert_identity_message(
         return message;
     }
     let entity_id = entity_id
-        .as_string()
+        .as_json_array_text()
         .unwrap_or_else(|_| "<invalid entity_id>".to_string());
     match version_id {
         Some(version_id) => format!(
@@ -959,7 +959,7 @@ fn conflicting_adopted_identity_error(row: &PreparedStateRow) -> LixError {
             "transaction cannot stage a new row and an adopted projection for schema '{}' entity_id '{}' in version '{}'",
             row.schema_key,
             row.entity_id
-                .as_string()
+                .as_json_array_text()
                 .unwrap_or_else(|_| "<invalid entity_id>".to_string()),
             row.version_id
         ),
@@ -973,7 +973,7 @@ fn conflicting_adopted_projection_error(row: &PreparedAdoptedStateRow) -> LixErr
             "transaction cannot stage duplicate adopted projections for schema '{}' entity_id '{}' in version '{}'",
             row.schema_key,
             row.entity_id
-                .as_string()
+                .as_json_array_text()
                 .unwrap_or_else(|_| "<invalid entity_id>".to_string()),
             row.version_id
         ),

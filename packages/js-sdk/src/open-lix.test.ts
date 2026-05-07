@@ -303,7 +303,7 @@ test("merge conflicts expose structured details", async () => {
 		const details = error.details as {
 			conflicts?: Array<{
 				schemaKey?: string;
-				entityId?: string;
+				entityId?: string[];
 				target?: unknown;
 				source?: unknown;
 			}>;
@@ -311,7 +311,7 @@ test("merge conflicts expose structured details", async () => {
 		expect(details.conflicts).toHaveLength(1);
 		expect(details.conflicts?.[0]).toMatchObject({
 			schemaKey: "crm_task",
-			entityId: "conflict-task",
+			entityId: ["conflict-task"],
 		});
 		expect(details.conflicts?.[0]?.target).toBeDefined();
 		expect(details.conflicts?.[0]?.source).toBeDefined();

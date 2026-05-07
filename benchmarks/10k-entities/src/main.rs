@@ -744,17 +744,19 @@ fn build_direct_entity_write_sql_batches(
         "value": expected_json,
     });
     let root_snapshot_content = serde_json::to_string(&root_snapshot_content).map_err(serde_err)?;
+    let root_entity_id_json =
+        serde_json::to_string(&serde_json::json!([root_entity_id])).map_err(serde_err)?;
 
     let mut statements = vec![format!(
         "UPDATE lix_state \
          SET snapshot_content = '{}' \
-         WHERE entity_id = '{}' \
+         WHERE entity_id = lix_json('{}') \
            AND file_id = '{}' \
            AND schema_key = '{}' \
            AND plugin_key = '{}' \
            AND schema_version = '{}'",
         escape_sql_string(&root_snapshot_content),
-        escape_sql_string(root_entity_id),
+        escape_sql_string(&root_entity_id_json),
         escape_sql_string(file_id),
         PLUGIN_SCHEMA_KEY,
         PLUGIN_KEY,

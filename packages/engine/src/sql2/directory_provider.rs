@@ -1078,7 +1078,7 @@ impl From<&TransactionWriteRow> for StateRowDedupeKey {
                 .entity_id
                 .as_ref()
                 .expect("directory provider staged row should carry entity_id")
-                .as_string()
+                .as_single_string_owned()
                 .expect("directory provider staged row entity identity should project"),
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
@@ -1204,7 +1204,7 @@ fn attach_lix_directory_insert_origin(
         let Some(entity_id) = row
             .entity_id
             .as_ref()
-            .and_then(|entity_id| entity_id.as_string().ok())
+            .and_then(|entity_id| entity_id.as_single_string_owned().ok())
         else {
             continue;
         };
@@ -1372,7 +1372,7 @@ fn lix_directory_record_batch(
         parent_ids.push(directory.parent_id);
         names.push(Some(directory.name));
         hiddens.push(Some(directory.hidden));
-        entity_ids.push(Some(directory.live.entity_id.as_string()?));
+        entity_ids.push(Some(directory.live.entity_id.as_json_array_text()?));
         schema_keys.push(Some(directory.live.schema_key));
         file_ids.push(directory.live.file_id);
         schema_versions.push(directory.live.schema_version);
@@ -1793,7 +1793,7 @@ fn lix_directory_schema() -> SchemaRef {
         Field::new("parent_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
         Field::new("hidden", DataType::Boolean, true),
-        Field::new("lixcol_entity_id", DataType::Utf8, false),
+        json_field("lixcol_entity_id", false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_schema_version", DataType::Utf8, false),
@@ -1983,8 +1983,7 @@ mod tests {
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: crate::entity_identity::EntityIdentity::from_string(entity_id)
-                .expect("entity id should decode"),
+            entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
             schema_key: schema_key.to_string(),
             file_id: file_id.map(ToOwned::to_owned),
             snapshot_content: Some(snapshot_content.to_string()),
@@ -2299,7 +2298,7 @@ mod tests {
                         row.entity_id
                             .as_ref()
                             .expect("planned delete row should carry entity_id")
-                            .as_string()
+                            .as_single_string_owned()
                             .expect("planned delete row should project entity_id"),
                     )
                 })

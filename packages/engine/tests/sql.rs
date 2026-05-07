@@ -24,6 +24,8 @@ mod lix_file_history;
 mod lix_json;
 #[path = "sql/lix_key_value.rs"]
 mod lix_key_value;
+#[path = "sql/lix_label_assignment.rs"]
+mod lix_label_assignment;
 #[path = "sql/lix_registered_schema.rs"]
 mod lix_registered_schema;
 #[path = "sql/lix_state.rs"]

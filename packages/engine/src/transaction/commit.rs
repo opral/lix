@@ -253,7 +253,7 @@ async fn validate_new_canonical_changes(
         };
         let entity_id = existing
             .entity_id
-            .as_string()
+            .as_json_array_text()
             .unwrap_or_else(|_| "<invalid entity_id>".to_string());
         return Err(LixError::new(
             LixError::CODE_UNIQUE,
@@ -298,7 +298,7 @@ async fn validate_adopted_canonical_changes(
             Some(existing) => {
                 let entity_id = existing
                     .entity_id
-                    .as_string()
+                    .as_json_array_text()
                     .unwrap_or_else(|_| "<invalid entity_id>".to_string());
                 return Err(LixError::new(
                     LixError::CODE_UNIQUE,
@@ -1175,7 +1175,7 @@ mod tests {
         assert_eq!(
             commit_changes[0]
                 .entity_id
-                .as_string()
+                .as_single_string_owned()
                 .expect("commit entity id should project"),
             "test-uuid-1"
         );
@@ -1231,7 +1231,10 @@ mod tests {
         assert_eq!(rows.commit_rows.len(), 1);
         assert_eq!(rows.version_heads.len(), 1);
         let row = &rows.commit_rows[0];
-        assert_eq!(row.entity_id.as_string().as_deref(), Ok("test-uuid-1"));
+        assert_eq!(
+            row.entity_id.as_single_string_owned().as_deref(),
+            Ok("test-uuid-1")
+        );
         assert_eq!(row.change_id, "test-uuid-2");
         assert_eq!(row.created_at, "test-timestamp-1");
 

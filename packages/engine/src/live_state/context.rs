@@ -226,7 +226,7 @@ where
         let Some(commit) = self
             .commit_graph
             .reader(store)
-            .load_commit(&request.entity_id.as_string()?)
+            .load_commit(&request.entity_id.as_single_string_owned()?)
             .await?
         else {
             return Ok(None);
@@ -443,7 +443,7 @@ async fn all_version_ref_ids(
         })
         .await?;
     rows.into_iter()
-        .map(|row| row.entity_id.as_string())
+        .map(|row| row.entity_id.as_single_string_owned())
         .collect()
 }
 
@@ -1576,7 +1576,10 @@ mod tests {
             .expect("commit rows should scan");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].entity_id.as_string().as_deref(), Ok("commit-a"));
+        assert_eq!(
+            rows[0].entity_id.as_single_string_owned().as_deref(),
+            Ok("commit-a")
+        );
         assert_eq!(rows[0].schema_key, COMMIT_SCHEMA_KEY);
         assert_eq!(rows[0].version_id, "version-a");
         assert!(rows[0].global);
@@ -1605,7 +1608,10 @@ mod tests {
             .expect("commit row should load")
             .expect("commit row should exist");
 
-        assert_eq!(row.entity_id.as_string().as_deref(), Ok("commit-a"));
+        assert_eq!(
+            row.entity_id.as_single_string_owned().as_deref(),
+            Ok("commit-a")
+        );
         assert_eq!(row.version_id, "version-a");
         assert!(row.global);
         assert_eq!(row.change_id.as_deref(), Some("change-commit-a"));

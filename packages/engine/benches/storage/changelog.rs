@@ -163,6 +163,21 @@ pub(crate) fn bench(c: &mut Criterion, runtime: &Runtime, args: Args) {
             BatchSize::LargeInput,
         )
     });
+    group.bench_function("scan_change_set/10k", |b| {
+        b.iter_batched(
+            || prepare_read(runtime, args),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::changelog_scan_change_set_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("changelog/scan_change_set succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
     for rows in [1, 10, 100, 1_000] {
         let name = format!("append_changes/{rows}");
         group.bench_function(name, |b| {

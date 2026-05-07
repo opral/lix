@@ -155,7 +155,7 @@ fn encode_untracked_state_row_key_ref(identity: UntrackedStateIdentityRef<'_>) -
     push_component(&mut out, identity.schema_key);
     let entity_id = identity
         .entity_id
-        .as_cow_str()
+        .as_json_array_text()
         .expect("untracked-state identity should project");
     push_component(&mut out, &entity_id);
     match identity.file_id {

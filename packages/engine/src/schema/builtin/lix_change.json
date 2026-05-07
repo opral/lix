@@ -13,8 +13,12 @@
       "description": "Stable change identifier (UUIDv7). Referenced from `lix_commit.change_ids` and `lix_change_set_element.change_id`."
     },
     "entity_id": {
-      "type": "string",
-      "description": "The entity this change applies to, scoped by (`schema_key`, `file_id`)."
+      "type": "array",
+      "description": "Canonical JSON primary-key tuple for the entity this change applies to, scoped by (`schema_key`, `file_id`). Values are ordered according to the target schema's `x-lix-primary-key`.",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
     },
     "schema_key": {
       "type": "string",
