@@ -1,22 +1,23 @@
 import type { ExpressionBuilder, ExpressionWrapper, SqlBool } from "kysely";
 import type { LixDatabaseSchema } from "./schema.js";
 
+type LixEntityId = string[];
+
 type LixEntityCanonical = {
 	schema_key: string;
-	file_id: string;
-	entity_id: string;
+	file_id: string | null;
+	entity_id: LixEntityId;
 };
 
 type LixEntity = {
 	lixcol_schema_key: string;
-	lixcol_file_id: string;
-	lixcol_entity_id: string;
+	lixcol_file_id: string | null;
+	lixcol_entity_id: LixEntityId;
 };
 
 const CANONICAL_TABLES = [
 	"lix_state",
 	"lix_state_by_version",
-	"lix_entity_label",
 ] as const;
 
 export function ebEntity<
@@ -59,6 +60,41 @@ export function ebEntity<
 		};
 	};
 
+	const getColumnRefs = (entity?: LixEntity | LixEntityCanonical) => {
+		const { entityIdCol, schemaKeyCol, fileIdCol } = getColumnNames(entity);
+		return {
+			entityIdRef: entityType ? `${entityType}.${entityIdCol}` : entityIdCol,
+			schemaKeyRef: entityType ? `${entityType}.${schemaKeyCol}` : schemaKeyCol,
+			fileIdRef: entityType ? `${entityType}.${fileIdCol}` : fileIdCol,
+		};
+	};
+
+	const getTargetValues = (entity: LixEntity | LixEntityCanonical) => {
+		return {
+			targetEntityId:
+				"entity_id" in entity ? entity.entity_id : entity.lixcol_entity_id,
+			targetSchemaKey:
+				"schema_key" in entity ? entity.schema_key : entity.lixcol_schema_key,
+			targetFileId: "file_id" in entity ? entity.file_id : entity.lixcol_file_id,
+		};
+	};
+
+	const equalsExpression = (
+		eb: ExpressionBuilder<LixDatabaseSchema, TB>,
+		entity: LixEntity | LixEntityCanonical,
+	): ExpressionWrapper<LixDatabaseSchema, TB, SqlBool> => {
+		const { targetEntityId, targetSchemaKey, targetFileId } =
+			getTargetValues(entity);
+		const { entityIdRef, schemaKeyRef, fileIdRef } = getColumnRefs(entity);
+		return eb.and([
+			eb(eb.ref(entityIdRef as any), "=", targetEntityId),
+			eb(eb.ref(schemaKeyRef as any), "=", targetSchemaKey),
+			targetFileId === null
+				? eb(eb.ref(fileIdRef as any), "is", null)
+				: eb(eb.ref(fileIdRef as any), "=", targetFileId),
+		]);
+	};
+
 	return {
 		hasLabel(
 			label: { id: string; name?: string } | { name: string; id?: string },
@@ -66,15 +102,32 @@ export function ebEntity<
 			return (
 				eb: ExpressionBuilder<LixDatabaseSchema, TB>,
 			): ExpressionWrapper<LixDatabaseSchema, TB, SqlBool> => {
-				const { entityIdCol } = getColumnNames();
-				const columnRef = entityType
-					? `${entityType}.${entityIdCol}`
-					: entityIdCol;
-				return eb(eb.ref(columnRef as any), "in", (subquery: any) =>
-					subquery
-						.selectFrom("lix_entity_label")
-						.innerJoin("lix_label", "lix_label.id", "lix_entity_label.label_id")
-						.select("lix_entity_label.entity_id")
+				const { entityIdRef, schemaKeyRef, fileIdRef } = getColumnRefs();
+				const labelQuery = eb
+					.selectFrom("lix_label_assignment" as any)
+					.innerJoin(
+						"lix_label" as any,
+						"lix_label.id" as any,
+						"lix_label_assignment.label_id" as any,
+					) as any;
+				return eb.exists(
+					labelQuery
+						.select("lix_label_assignment.target_entity_id" as any)
+						.whereRef(
+							"lix_label_assignment.target_entity_id" as any,
+							"=",
+							entityIdRef as any,
+						)
+						.whereRef(
+							"lix_label_assignment.target_schema_key" as any,
+							"=",
+							schemaKeyRef as any,
+						)
+						.whereRef(
+							"lix_label_assignment.target_file_id" as any,
+							"is",
+							fileIdRef as any,
+						)
 						.$if("name" in label, (qb: any) =>
 							qb.where("lix_label.name", "=", label.name!),
 						)
@@ -88,27 +141,7 @@ export function ebEntity<
 			return (
 				eb: ExpressionBuilder<LixDatabaseSchema, TB>,
 			): ExpressionWrapper<LixDatabaseSchema, TB, SqlBool> => {
-				const targetEntityId =
-					"entity_id" in entity ? entity.entity_id : entity.lixcol_entity_id;
-				const targetSchemaKey =
-					"schema_key" in entity ? entity.schema_key : entity.lixcol_schema_key;
-				const targetFileId =
-					"file_id" in entity ? entity.file_id : entity.lixcol_file_id;
-
-				const { entityIdCol, schemaKeyCol, fileIdCol } = getColumnNames(entity);
-				const entityIdRef = entityType
-					? `${entityType}.${entityIdCol}`
-					: entityIdCol;
-				const schemaKeyRef = entityType
-					? `${entityType}.${schemaKeyCol}`
-					: schemaKeyCol;
-				const fileIdRef = entityType ? `${entityType}.${fileIdCol}` : fileIdCol;
-
-				return eb.and([
-					eb(eb.ref(entityIdRef as any), "=", targetEntityId),
-					eb(eb.ref(schemaKeyRef as any), "=", targetSchemaKey),
-					eb(eb.ref(fileIdRef as any), "=", targetFileId),
-				]);
+				return equalsExpression(eb, entity);
 			};
 		},
 		in(entities: Array<LixEntityCanonical | LixEntity>) {
@@ -119,16 +152,7 @@ export function ebEntity<
 					return eb.val(false);
 				}
 
-				const entityIds = entities.map((entity) =>
-					"entity_id" in entity ? entity.entity_id : entity.lixcol_entity_id,
-				);
-
-				const { entityIdCol } = getColumnNames(entities[0]);
-				const columnRef = entityType
-					? `${entityType}.${entityIdCol}`
-					: entityIdCol;
-
-				return eb(eb.ref(columnRef as any), "in", entityIds);
+				return eb.or(entities.map((entity) => equalsExpression(eb, entity)));
 			};
 		},
 	};

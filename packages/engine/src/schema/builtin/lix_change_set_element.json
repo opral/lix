@@ -49,8 +49,12 @@
       "description": "The canonical change introduced/adopted by the change_set's commit (references `lix_change.id`)."
     },
     "entity_id": {
-      "type": "string",
-      "description": "Denormalized from the referenced `lix_change` for fast entity-scoped queries and to anchor the unique constraint."
+      "type": "array",
+      "description": "Canonical JSON primary-key tuple denormalized from the referenced `lix_change` for fast entity-scoped queries and to anchor the unique constraint.",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
     },
     "schema_key": {
       "type": "string",

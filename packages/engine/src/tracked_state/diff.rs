@@ -445,7 +445,11 @@ mod tests {
             .iter()
             .map(|entry| {
                 (
-                    entry.identity.entity_id.as_string().expect("identity"),
+                    entry
+                        .identity
+                        .entity_id
+                        .as_single_string_owned()
+                        .expect("identity"),
                     entry.kind,
                 )
             })

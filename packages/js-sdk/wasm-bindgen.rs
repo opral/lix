@@ -210,7 +210,7 @@ export type MergeChangeStats = {
 export type MergeConflict = {
   kind: "sameEntityChanged";
   schemaKey: string;
-  entityId: string;
+  entityId: string[];
   fileId: string | null;
   target: MergeConflictSide;
   source: MergeConflictSide;
@@ -1183,7 +1183,7 @@ export type MergeConflictSide = {
         };
         set_string(&object, "kind", kind)?;
         set_string(&object, "schemaKey", &conflict.schema_key)?;
-        set_string(&object, "entityId", &conflict.entity_id)?;
+        set_json(&object, "entityId", &conflict.entity_id)?;
         set_optional_string(&object, "fileId", conflict.file_id.as_deref())?;
         Reflect::set(
             &object,
@@ -1287,6 +1287,19 @@ export type MergeConflictSide = {
 
     fn set_number(object: &Object, key: &str, value: f64) -> Result<(), LixError> {
         Reflect::set(object, &JsValue::from_str(key), &JsValue::from_f64(value))
+            .map(|_| ())
+            .map_err(|_| js_sdk_error(format!("could not set {key}")))
+    }
+
+    fn set_json(object: &Object, key: &str, value: &serde_json::Value) -> Result<(), LixError> {
+        let serializer = serde_wasm_bindgen::Serializer::json_compatible();
+        let value = value.serialize(&serializer).map_err(|error| {
+            LixError::new(
+                "LIX_ERROR_JS_SDK",
+                format!("could not serialize JSON value for {key}: {error}"),
+            )
+        })?;
+        Reflect::set(object, &JsValue::from_str(key), &value)
             .map(|_| ())
             .map_err(|_| js_sdk_error(format!("could not set {key}")))
     }

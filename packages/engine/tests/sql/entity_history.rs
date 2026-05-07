@@ -32,7 +32,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO engine_history_schema \
                  (lixcol_entity_id, id, count, active, meta, lixcol_untracked) \
-                 VALUES ('history-entity', 'history-entity', 1, true, lix_json('{\"source\":\"insert\"}'), false)",
+                 VALUES (lix_json('[\"history-entity\"]'), 'history-entity', 1, true, lix_json('{\"source\":\"insert\"}'), false)",
                 &[],
             )
             .await
@@ -47,7 +47,7 @@ simulation_test!(
             .execute(
                 "UPDATE engine_history_schema \
                  SET count = 2, active = false, meta = lix_json('{\"source\":\"update\"}') \
-                 WHERE lixcol_entity_id = 'history-entity'",
+                 WHERE lixcol_entity_id = lix_json('[\"history-entity\"]')",
                 &[],
             )
             .await
@@ -65,7 +65,7 @@ simulation_test!(
                     "SELECT id, count, active, meta, lixcol_entity_id, lixcol_observed_commit_id, lixcol_start_commit_id, lixcol_depth \
                      FROM engine_history_schema_history \
                      WHERE lixcol_start_commit_id = '{second_commit_id}' \
-                       AND lixcol_entity_id = 'history-entity' \
+                       AND lixcol_entity_id = lix_json('[\"history-entity\"]') \
                      ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -81,7 +81,7 @@ simulation_test!(
                     Value::Integer(2),
                     Value::Boolean(false),
                     Value::Json(json!({"source": "update"})),
-                    Value::Text("history-entity".to_string()),
+                    Value::Json(json!(["history-entity"])),
                     Value::Text(second_commit_id.clone()),
                     Value::Text(second_commit_id.clone()),
                     Value::Integer(0),
@@ -91,7 +91,7 @@ simulation_test!(
                     Value::Integer(1),
                     Value::Boolean(true),
                     Value::Json(json!({"source": "insert"})),
-                    Value::Text("history-entity".to_string()),
+                    Value::Json(json!(["history-entity"])),
                     Value::Text(first_commit_id),
                     Value::Text(second_commit_id),
                     Value::Integer(1),

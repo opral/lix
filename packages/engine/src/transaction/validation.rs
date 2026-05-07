@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value as JsonValue;
 
 use crate::common::{json_pointer_get, validate_row_metadata};
-use crate::entity_identity::{EntityIdentity, EntityIdentityError, EntityIdentityPart};
+use crate::entity_identity::{canonical_json_text, EntityIdentity, EntityIdentityError};
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateRowIdentity, LiveStateRowRequest,
     LiveStateScanRequest, MaterializedLiveStateRow,
@@ -15,7 +15,8 @@ use crate::schema::{
     validate_lix_schema_definition, SchemaKey,
 };
 use crate::transaction::normalization::{
-    ForeignKeyPlan, SchemaCatalogKey, TransactionSchemaCatalog, TransactionSchemaPlan,
+    ForeignKeyPlan, SchemaCatalogKey, StateForeignKeyPlan, TransactionSchemaCatalog,
+    TransactionSchemaPlan,
 };
 use crate::transaction::staging::duplicate_insert_identity_message;
 #[cfg(test)]
@@ -306,7 +307,7 @@ fn apply_staged_directory_parent_rows(
         {
             continue;
         }
-        let id = row.entity_id().as_string()?;
+        let id = row.entity_id().as_single_string_owned()?;
         let Some(snapshot) = row.snapshot_json() else {
             parents.remove(&id);
             continue;
@@ -703,11 +704,11 @@ fn filesystem_namespace_conflict_error(
     let parent = parent_id.as_deref().unwrap_or("<root>");
     let existing_id = existing
         .entity_id()
-        .as_string()
+        .as_single_string_owned()
         .unwrap_or_else(|_| "<non-string-entity-id>".to_string());
     let conflicting_id = conflicting
         .entity_id()
-        .as_string()
+        .as_single_string_owned()
         .unwrap_or_else(|_| "<non-string-entity-id>".to_string());
     LixError::new(
         LixError::CODE_UNIQUE,
@@ -895,10 +896,10 @@ fn version_ref_delete_restriction_error(
         format!(
             "cannot delete '{}' row '{}' in version '{}' because matching '{}' row '{}' would remain without a version ref",
             ref_identity.schema_key,
-            ref_identity.entity_id.as_string()?,
+            ref_identity.entity_id.as_single_string_owned()?,
             ref_identity.version_id,
             descriptor_identity.schema_key,
-            descriptor_identity.entity_id.as_string()?,
+            descriptor_identity.entity_id.as_single_string_owned()?,
         ),
     ))
 }
@@ -921,7 +922,7 @@ impl PendingFileDescriptorIndex {
             if row.schema_key() != FILE_DESCRIPTOR_SCHEMA_KEY || row.file_id().is_some() {
                 continue;
             }
-            if let Ok(file_id) = row.entity_id().as_string() {
+            if let Ok(file_id) = row.entity_id().as_single_string_owned() {
                 let state = if row.snapshot_json().is_some() {
                     PendingFileDescriptorState::Present
                 } else {
@@ -1010,13 +1011,13 @@ fn missing_file_owner_reference_error(
 ) -> Result<LixError, LixError> {
     Ok(LixError::new(
         LixError::CODE_FILE_NOT_FOUND,
-        format!(
-            "file ownership validation failed for schema '{}': entity '{}' references missing file_id '{}' in effective file scope for version '{}'",
-            row.schema_key(),
-            row.entity_id().as_string()?,
-            file_id,
-            row.version_id()
-        ),
+            format!(
+                "file ownership validation failed for schema '{}': entity '{}' references missing file_id '{}' in effective file scope for version '{}'",
+                row.schema_key(),
+                row.entity_id().as_json_array_text()?,
+                file_id,
+                row.version_id()
+            ),
     )
     .with_hint("Insert a row into lix_file with this id first, or use null for a global entity."))
 }
@@ -1136,8 +1137,8 @@ fn validate_primary_key_identity(
                 "primary-key constraint violation on schema '{}' version '{}': entity_id '{}' does not match derived primary key '{}'",
                 row.schema_key(),
                 row.schema_version(),
-                row.entity_id().as_string()?,
-                derived.as_string()?
+                row.entity_id().as_json_array_text()?,
+                derived.as_json_array_text()?
             ),
         ));
     }
@@ -1230,8 +1231,8 @@ impl PendingConstraintIndexes {
                             row.schema_key(),
                             format_pointer_group(&key.pointer_group),
                             key.value.display(),
-                            existing_entity_id.as_string()?,
-                            row.entity_id().as_string()?
+                            existing_entity_id.as_json_array_text()?,
+                            row.entity_id().as_json_array_text()?
                         ),
                     ));
                 }
@@ -1276,32 +1277,41 @@ impl PendingConstraintIndexes {
             ) else {
                 continue;
             };
-            let target = if foreign_key.referenced_schema_key == STATE_SURFACE_SCHEMA_KEY {
-                PendingForeignKeyReferenceTarget::StateSurfaceIdentity(
-                    state_surface_target_identity(row.version_id(), &foreign_key, snapshot)?,
-                )
-            } else {
-                let target_key = schema_catalog
-                    .schema_key_by_key(&foreign_key.referenced_schema_key)
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_SCHEMA_DEFINITION,
-                            format!(
-                                "foreign key on schema '{}' references missing schema '{}'",
-                                row.schema_key(),
-                                foreign_key.referenced_schema_key
-                            ),
-                        )
-                    })?;
-                PendingForeignKeyReferenceTarget::Key(PendingForeignKeyTargetKey {
-                    schema_key: target_key.schema_key,
-                    schema_version: target_key.schema_version,
+            let target_key = schema_catalog
+                .schema_key_by_key(&foreign_key.referenced_schema_key)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_DEFINITION,
+                        format!(
+                            "foreign key on schema '{}' references missing schema '{}'",
+                            row.schema_key(),
+                            foreign_key.referenced_schema_key
+                        ),
+                    )
+                })?;
+            let target = PendingForeignKeyReferenceTarget::Key(PendingForeignKeyTargetKey {
+                schema_key: target_key.schema_key,
+                schema_version: target_key.schema_version,
+                version_id: row.version_id().to_string(),
+                file_id: row.file_id().clone(),
+                pointer_group: foreign_key.referenced_properties.clone(),
+                value: local_value,
+            });
+            self.fk_references
+                .entry(target)
+                .or_default()
+                .push(LiveStateRowIdentity {
                     version_id: row.version_id().to_string(),
+                    schema_key: row.schema_key().to_string(),
+                    entity_id: row.entity_id().clone(),
                     file_id: row.file_id().clone(),
-                    pointer_group: foreign_key.referenced_properties.clone(),
-                    value: local_value,
-                })
-            };
+                });
+        }
+
+        for foreign_key in &schema_plan.state_foreign_keys {
+            let target = PendingForeignKeyReferenceTarget::StateSurfaceIdentity(
+                state_surface_target_identity(row.version_id(), foreign_key, snapshot)?,
+            );
             self.fk_references
                 .entry(target)
                 .or_default()
@@ -1490,9 +1500,9 @@ fn reject_pending_delete_references(
         format!(
             "cannot delete '{}' row '{}' in version '{}' because pending row '{}' references it{}",
             deleted_identity.schema_key,
-            deleted_identity.entity_id.as_string()?,
+            deleted_identity.entity_id.as_json_array_text()?,
             deleted_identity.version_id,
-            reference.entity_id.as_string()?,
+            reference.entity_id.as_json_array_text()?,
             pending_foreign_key_reference_target_description(target)?
         ),
     ))
@@ -1511,7 +1521,7 @@ fn pending_foreign_key_reference_target_description(
         PendingForeignKeyReferenceTarget::StateSurfaceIdentity(target) => Ok(format!(
             " through '{}:{}'",
             target.schema_key,
-            target.entity_id.as_string()?
+            target.entity_id.as_json_array_text()?
         )),
     }
 }
@@ -1524,16 +1534,7 @@ async fn validate_committed_delete_restrictions(
     for tombstone in &pending_constraints.tombstones {
         for source_plan in schema_catalog.plans() {
             for foreign_key in &source_plan.foreign_keys {
-                if foreign_key.referenced_schema_key == STATE_SURFACE_SCHEMA_KEY {
-                    validate_committed_state_surface_delete_restriction(
-                        input.live_state,
-                        pending_constraints,
-                        tombstone,
-                        &source_plan.key,
-                        foreign_key,
-                    )
-                    .await?;
-                } else if foreign_key.referenced_schema_key == tombstone.identity.schema_key {
+                if foreign_key.referenced_schema_key == tombstone.identity.schema_key {
                     validate_committed_normal_delete_restriction(
                         input.live_state,
                         pending_constraints,
@@ -1543,6 +1544,16 @@ async fn validate_committed_delete_restrictions(
                     )
                     .await?;
                 }
+            }
+            for foreign_key in &source_plan.state_foreign_keys {
+                validate_committed_state_surface_delete_restriction(
+                    input.live_state,
+                    pending_constraints,
+                    tombstone,
+                    &source_plan.key,
+                    foreign_key,
+                )
+                .await?;
             }
         }
     }
@@ -1608,14 +1619,13 @@ async fn validate_committed_state_surface_delete_restriction(
     pending_constraints: &PendingConstraintIndexes,
     tombstone: &PendingTombstone,
     source_key: &SchemaCatalogKey,
-    foreign_key: &ForeignKeyPlan,
+    foreign_key: &StateForeignKeyPlan,
 ) -> Result<(), LixError> {
     let rows = live_state
         .scan_rows(&LiveStateScanRequest {
             filter: LiveStateFilter {
                 schema_keys: vec![source_key.schema_key.clone()],
                 version_ids: vec![tombstone.identity.version_id.clone()],
-                file_ids: vec![nullable_filter_from_option(&tombstone.identity.file_id)],
                 include_tombstones: false,
                 ..Default::default()
             },
@@ -1628,7 +1638,6 @@ async fn validate_committed_state_surface_delete_restriction(
             continue;
         }
         if row.schema_version != source_key.schema_version
-            || row.file_id != tombstone.identity.file_id
             || pending_constraints.tombstones_identity(&row)
         {
             continue;
@@ -1643,7 +1652,7 @@ async fn validate_committed_state_surface_delete_restriction(
             return Err(committed_delete_restriction_error(
                 &tombstone.identity,
                 &row,
-                &foreign_key.local_properties,
+                &foreign_key.local_properties(),
             )?);
         }
     }
@@ -1692,9 +1701,9 @@ fn committed_delete_restriction_error(
         format!(
             "cannot delete '{}' row '{}' in version '{}' because committed row '{}' references it through {}",
             deleted_identity.schema_key,
-            deleted_identity.entity_id.as_string()?,
+            deleted_identity.entity_id.as_json_array_text()?,
             deleted_identity.version_id,
-            referencing_row.entity_id.as_string()?,
+            referencing_row.entity_id.as_json_array_text()?,
             format_pointer_group(local_properties)
         ),
     ))
@@ -1747,25 +1756,24 @@ fn validate_pending_foreign_keys(
             ) else {
                 continue;
             };
-            if foreign_key.referenced_schema_key == STATE_SURFACE_SCHEMA_KEY {
-                if let Some(check) = validate_pending_state_surface_foreign_key(
-                    *row,
-                    foreign_key,
-                    snapshot,
-                    pending_constraints,
-                )? {
-                    unresolved.push(check);
-                }
-            } else {
-                if let Some(check) = validate_pending_normal_foreign_key(
-                    schema_catalog,
-                    *row,
-                    foreign_key,
-                    local_value,
-                    pending_constraints,
-                )? {
-                    unresolved.push(check);
-                }
+            if let Some(check) = validate_pending_normal_foreign_key(
+                schema_catalog,
+                *row,
+                foreign_key,
+                local_value,
+                pending_constraints,
+            )? {
+                unresolved.push(check);
+            }
+        }
+        for foreign_key in &schema_plan.state_foreign_keys {
+            if let Some(check) = validate_pending_state_surface_foreign_key(
+                *row,
+                foreign_key,
+                snapshot,
+                pending_constraints,
+            )? {
+                unresolved.push(check);
             }
         }
     }
@@ -1817,10 +1825,11 @@ fn validate_pending_normal_foreign_key(
 
 fn validate_pending_state_surface_foreign_key(
     row: PreparedValidationRow<'_>,
-    foreign_key: &ForeignKeyPlan,
+    foreign_key: &StateForeignKeyPlan,
     snapshot: &JsonValue,
     pending_constraints: &PendingConstraintIndexes,
 ) -> Result<Option<UnresolvedForeignKeyCheck>, LixError> {
+    let local_properties = foreign_key.local_properties();
     let target_identity = state_surface_target_identity(row.version_id(), foreign_key, snapshot)?;
     if pending_constraints.tombstones_target_identity(&target_identity) {
         return Err(LixError::new(
@@ -1828,7 +1837,7 @@ fn validate_pending_state_surface_foreign_key(
             format!(
                 "foreign key on {}.{} references target deleted in this transaction",
                 row.schema_key(),
-                format_pointer_group(&foreign_key.local_properties)
+                format_pointer_group(&local_properties)
             ),
         ));
     }
@@ -1843,7 +1852,7 @@ fn validate_pending_state_surface_foreign_key(
             file_id: row.file_id().clone(),
         },
         source_schema_key: row.schema_key().to_string(),
-        source_pointer_group: foreign_key.local_properties.clone(),
+        source_pointer_group: local_properties,
         target: UnresolvedForeignKeyTarget::StateSurfaceIdentity(target_identity),
     }))
 }
@@ -1891,7 +1900,7 @@ fn reject_unresolved_foreign_keys(
         format!(
             "foreign key on schema '{}' row '{}' via {} has no matching target in version '{}'{}",
             check.source_schema_key,
-            check.source_identity.entity_id.as_string()?,
+            check.source_identity.entity_id.as_json_array_text()?,
             format_pointer_group(&check.source_pointer_group),
             check.source_identity.version_id,
             unresolved_foreign_key_target_description(&check.target)?
@@ -1912,7 +1921,7 @@ fn unresolved_foreign_key_target_description(
         UnresolvedForeignKeyTarget::StateSurfaceIdentity(target) => Ok(format!(
             " for target '{}:{}'",
             target.schema_key,
-            target.entity_id.as_string()?
+            target.entity_id.as_json_array_text()?
         )),
     }
 }
@@ -1998,22 +2007,19 @@ async fn committed_state_surface_foreign_key_target_exists(
 
 fn state_surface_target_identity(
     version_id: &str,
-    foreign_key: &ForeignKeyPlan,
+    foreign_key: &StateForeignKeyPlan,
     snapshot: &JsonValue,
 ) -> Result<LiveStateRowIdentity, LixError> {
     let entity_id =
-        state_surface_local_value_for_referenced_pointer(foreign_key, snapshot, "/entity_id")?;
+        state_surface_local_json_value(snapshot, &foreign_key.entity_id_property, "entity_id")?;
     let schema_key =
-        state_surface_local_value_for_referenced_pointer(foreign_key, snapshot, "/schema_key")?;
-    let file_id = state_surface_optional_local_value_for_referenced_pointer(
-        foreign_key,
-        snapshot,
-        "/file_id",
-    )?;
+        state_surface_local_value(snapshot, &foreign_key.schema_key_property, "schema_key")?;
+    let file_id =
+        state_surface_nullable_local_value(snapshot, &foreign_key.file_id_property, "file_id")?;
     Ok(LiveStateRowIdentity {
         version_id: version_id.to_string(),
         schema_key,
-        entity_id: EntityIdentity::from_string(&entity_id).map_err(|error| {
+        entity_id: EntityIdentity::from_json_array_value(entity_id).map_err(|error| {
             LixError::new(
                 LixError::CODE_FOREIGN_KEY,
                 format!("state-surface foreign key entity_id is invalid: {error}"),
@@ -2023,40 +2029,53 @@ fn state_surface_target_identity(
     })
 }
 
-fn state_surface_local_value_for_referenced_pointer(
-    foreign_key: &ForeignKeyPlan,
-    snapshot: &JsonValue,
-    referenced_pointer: &str,
-) -> Result<String, LixError> {
-    state_surface_optional_local_value_for_referenced_pointer(
-        foreign_key,
-        snapshot,
-        referenced_pointer,
-    )?
-    .ok_or_else(|| {
+fn state_surface_local_json_value<'a>(
+    snapshot: &'a JsonValue,
+    local_pointer: &[String],
+    state_address_part: &str,
+) -> Result<&'a JsonValue, LixError> {
+    state_surface_optional_local_json_value(snapshot, local_pointer)?.ok_or_else(|| {
         LixError::new(
             LixError::CODE_FOREIGN_KEY,
-            format!("state-surface foreign key target '{referenced_pointer}' is missing"),
+            format!(
+                "state-surface foreign key {state_address_part} at '{}' is missing",
+                format_json_pointer(local_pointer)
+            ),
         )
     })
 }
 
-fn state_surface_optional_local_value_for_referenced_pointer(
-    foreign_key: &ForeignKeyPlan,
+fn state_surface_local_value(
     snapshot: &JsonValue,
-    referenced_pointer: &str,
+    local_pointer: &[String],
+    state_address_part: &str,
+) -> Result<String, LixError> {
+    state_surface_nullable_local_value(snapshot, local_pointer, state_address_part)?.ok_or_else(
+        || {
+            LixError::new(
+                LixError::CODE_FOREIGN_KEY,
+                format!(
+                    "state-surface foreign key {state_address_part} at '{}' is missing",
+                    format_json_pointer(local_pointer)
+                ),
+            )
+        },
+    )
+}
+
+fn state_surface_nullable_local_value(
+    snapshot: &JsonValue,
+    local_pointer: &[String],
+    state_address_part: &str,
 ) -> Result<Option<String>, LixError> {
-    let referenced_pointer = parse_json_pointer(referenced_pointer)?;
-    let Some(index) = foreign_key
-        .referenced_properties
-        .iter()
-        .position(|pointer| pointer == &referenced_pointer)
-    else {
-        return Ok(None);
-    };
-    let local_pointer = &foreign_key.local_properties[index];
     let Some(value) = json_pointer_get(snapshot, local_pointer) else {
-        return Ok(None);
+        return Err(LixError::new(
+            LixError::CODE_FOREIGN_KEY,
+            format!(
+                "state-surface foreign key {state_address_part} at '{}' is missing",
+                format_json_pointer(local_pointer)
+            ),
+        ));
     };
     if value.is_null() {
         return Ok(None);
@@ -2068,11 +2087,24 @@ fn state_surface_optional_local_value_for_referenced_pointer(
             LixError::new(
                 LixError::CODE_FOREIGN_KEY,
                 format!(
-                    "state-surface foreign key value at '{}' must be a string",
+                    "state-surface foreign key {state_address_part} at '{}' must be a string or null",
                     format_json_pointer(local_pointer)
                 ),
             )
         })
+}
+
+fn state_surface_optional_local_json_value<'a>(
+    snapshot: &'a JsonValue,
+    local_pointer: &[String],
+) -> Result<Option<&'a JsonValue>, LixError> {
+    let Some(value) = json_pointer_get(snapshot, local_pointer) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(value))
 }
 
 async fn validate_committed_unique_constraints(
@@ -2129,8 +2161,8 @@ async fn validate_committed_unique_constraints(
                         key.schema_key,
                         format_pointer_group(&key.pointer_group),
                         key.value.display(),
-                        committed_row.entity_id.as_string()?,
-                        pending_entity_id.as_string()?
+                        committed_row.entity_id.as_json_array_text()?,
+                        pending_entity_id.as_json_array_text()?
                     ),
                 ));
             }
@@ -2184,11 +2216,7 @@ impl UniqueConstraintValue {
             identity
                 .parts
                 .iter()
-                .map(|part| match part {
-                    EntityIdentityPart::String(value) => format!("{value:?}"),
-                    EntityIdentityPart::Bool(value) => value.to_string(),
-                    EntityIdentityPart::Number(value) => value.clone(),
-                })
+                .map(|part| format!("{part:?}"))
                 .collect(),
         )
     }
@@ -2228,10 +2256,13 @@ fn stable_unique_value(value: &JsonValue) -> String {
         JsonValue::Number(value) => value.to_string(),
         JsonValue::Bool(value) => value.to_string(),
         JsonValue::Null => "null".to_string(),
-        JsonValue::Array(_) | JsonValue::Object(_) => value.to_string(),
+        JsonValue::Array(_) | JsonValue::Object(_) => {
+            canonical_json_text(value).unwrap_or_else(|_| value.to_string())
+        }
     }
 }
 
+#[cfg(test)]
 fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
     if pointer.is_empty() {
         return Ok(Vec::new());
@@ -2248,6 +2279,7 @@ fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
         .collect()
 }
 
+#[cfg(test)]
 fn unescape_json_pointer_segment(segment: &str) -> Result<String, LixError> {
     let mut output = String::new();
     let mut chars = segment.chars();
@@ -2310,17 +2342,9 @@ fn primary_key_identity_error(
             let pointer = format_json_pointer(&primary_key_paths[index]);
             format!("missing value at primary-key pointer '{pointer}'")
         }
-        EntityIdentityError::NullPrimaryKeyValue { index } => {
-            let pointer = format_json_pointer(&primary_key_paths[index]);
-            format!("null value at primary-key pointer '{pointer}'")
-        }
-        EntityIdentityError::EmptyPrimaryKeyValue { index } => {
-            let pointer = format_json_pointer(&primary_key_paths[index]);
-            format!("empty value at primary-key pointer '{pointer}'")
-        }
         EntityIdentityError::UnsupportedPrimaryKeyValue { index } => {
             let pointer = format_json_pointer(&primary_key_paths[index]);
-            format!("unsupported non-scalar value at primary-key pointer '{pointer}'")
+            format!("non-string value at primary-key pointer '{pointer}'")
         }
         EntityIdentityError::InvalidEncodedEntityIdentity => {
             "invalid encoded entity identity".to_string()
@@ -2355,13 +2379,19 @@ fn validate_foreign_key_definition(
         })?;
     }
 
+    if foreign_key.referenced_schema_key == STATE_SURFACE_SCHEMA_KEY {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            format!(
+                "foreign key on schema '{}' must not reference schemaKey 'lix_state'; use x-lix-state-foreign-keys with pointers ordered as [entity_id, schema_key, file_id]",
+                source_key.schema_key
+            ),
+        ));
+    }
+
     let target_plan = catalog.plan_by_schema_key(&foreign_key.referenced_schema_key);
     let target_schema = target_plan
         .map(|plan| plan.schema.as_ref())
-        .or_else(|| {
-            (foreign_key.referenced_schema_key == STATE_SURFACE_SCHEMA_KEY)
-                .then_some(state_surface_foreign_key_schema())
-        })
         .ok_or_else(|| {
             LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
@@ -2386,9 +2416,7 @@ fn validate_foreign_key_definition(
         })?;
     }
 
-    if foreign_key.referenced_schema_key == STATE_SURFACE_SCHEMA_KEY {
-        validate_state_surface_foreign_key_target(source_key, &foreign_key)?;
-    } else if !referenced_properties_are_keyed(
+    if !referenced_properties_are_keyed(
         target_plan.expect("non-state foreign key should have a target plan"),
         &foreign_key.referenced_properties,
     ) {
@@ -2406,30 +2434,23 @@ fn validate_foreign_key_definition(
     Ok(())
 }
 
-fn state_surface_foreign_key_schema() -> &'static JsonValue {
-    crate::schema::lix_state_surface_schema_definition()
-}
-
-fn validate_state_surface_foreign_key_target(
+fn validate_state_foreign_key_definition(
     source_key: &SchemaCatalogKey,
-    foreign_key: &ForeignKeyPlan,
+    source_schema: &JsonValue,
+    foreign_key: &StateForeignKeyPlan,
 ) -> Result<(), LixError> {
-    for required_pointer in ["/entity_id", "/schema_key"] {
-        let required_pointer = parse_json_pointer(required_pointer)?;
-        if !foreign_key
-            .referenced_properties
-            .iter()
-            .any(|pointer| pointer == &required_pointer)
-        {
-            return Err(LixError::new(
+    let local_properties = foreign_key.local_properties();
+    for pointer in &local_properties {
+        validate_schema_field_pointer(source_schema, pointer).map_err(|detail| {
+            LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
                 format!(
-                    "foreign key on schema '{}' references lix_state and must include '{}'",
+                    "state foreign key on schema '{}' references missing local property '{}': {detail}",
                     source_key.schema_key,
-                    format_json_pointer(&required_pointer)
+                    format_json_pointer(pointer)
                 ),
-            ));
-        }
+            )
+        })?;
     }
     Ok(())
 }
@@ -2475,6 +2496,9 @@ fn validate_foreign_key_definitions(catalog: &TransactionSchemaCatalog) -> Resul
     for plan in catalog.plans() {
         for foreign_key in &plan.foreign_keys {
             validate_foreign_key_definition(catalog, &plan.key, plan.schema.as_ref(), foreign_key)?;
+        }
+        for foreign_key in &plan.state_foreign_keys {
+            validate_state_foreign_key_definition(&plan.key, plan.schema.as_ref(), foreign_key)?;
         }
     }
     Ok(())
@@ -2647,8 +2671,8 @@ mod tests {
                         "duplicate pending registered schema '{}' version '{}' in transaction: rows '{}' and '{}'",
                         catalog_key.schema_key,
                         catalog_key.schema_version,
-                        existing_entity_id.as_string()?,
-                        row.entity_id().as_string()?
+                        existing_entity_id.as_json_array_text()?,
+                        row.entity_id().as_json_array_text()?
                     ),
                 ));
             }
@@ -3041,16 +3065,19 @@ mod tests {
         let input = validation_input(&staged_writes, &visible_schemas);
 
         let catalog = catalog_from_transaction_input(&input)
-            .expect("lix_state should validate as a state-surface FK target");
+            .expect("x-lix-state-foreign-keys should validate as a state-surface FK target");
 
         assert!(catalog.contains("state_surface_ref_schema", "1"));
     }
 
     #[test]
-    fn schema_catalog_rejects_state_surface_foreign_key_without_schema_key() {
-        let mut schema = state_surface_ref_schema();
-        schema["x-lix-foreign-keys"][0]["properties"] = json!(["/target_entity_id"]);
-        schema["x-lix-foreign-keys"][0]["references"]["properties"] = json!(["/entity_id"]);
+    fn schema_catalog_rejects_normal_foreign_key_to_lix_state() {
+        let mut schema = fk_child_schema();
+        schema["x-lix-foreign-keys"][0]["properties"] = json!(["/parent_id"]);
+        schema["x-lix-foreign-keys"][0]["references"] = json!({
+            "schemaKey": "lix_state",
+            "properties": ["/entity_id"]
+        });
         let staged_writes = PreparedWriteSet {
             state_rows: vec![pending_registered_schema_from_definition(schema)],
             adopted_rows: Vec::new(),
@@ -3060,9 +3087,34 @@ mod tests {
         let input = validation_input(&staged_writes, &visible_schemas);
 
         let error = catalog_from_transaction_input(&input)
-            .expect_err("lix_state FK target must include schema identity");
+            .expect_err("normal FK must not use fake lix_state schema key");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            error.message.contains("x-lix-state-foreign-keys"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn schema_catalog_rejects_state_surface_foreign_key_without_full_address_tuple() {
+        let mut schema = state_surface_ref_schema();
+        schema["x-lix-state-foreign-keys"][0] = json!(["/target_entity_id"]);
+        let staged_writes = PreparedWriteSet {
+            state_rows: vec![pending_registered_schema_from_definition(schema)],
+            adopted_rows: Vec::new(),
+            ..empty_staged_write_set()
+        };
+        let visible_schemas = vec![registered_schema()];
+
+        let error = catalog_from_transaction_parts_unchecked(&staged_writes, &visible_schemas)
+            .expect_err("state FK target must include entity_id, schema_key, and file_id");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            error.message.contains("[entity_id, schema_key, file_id]"),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -3811,7 +3863,36 @@ mod tests {
             &live_state,
         ))
         .await
-        .expect("lix_state FK should resolve against exact committed identity");
+        .expect("state FK should resolve against exact committed identity");
+    }
+
+    #[tokio::test]
+    async fn validation_allows_state_surface_fk_target_with_composite_entity_id() {
+        let visible_schemas = vec![composite_message_schema(), state_surface_ref_schema()];
+        let staged_writes = PreparedWriteSet {
+            state_rows: vec![state_surface_ref_row_with_target_entity_id(
+                "ref-1",
+                json!(["welcome.title", "en"]),
+                "composite_message_schema",
+                "file-a",
+            )],
+            ..empty_staged_write_set()
+        };
+        let live_state = StaticLiveStateReader {
+            rows: vec![MaterializedLiveStateRow::from(composite_message_row(
+                "welcome.title",
+                "en",
+                "version-a",
+            ))],
+        };
+
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+            &staged_writes,
+            &visible_schemas,
+            &live_state,
+        ))
+        .await
+        .expect("state FK should resolve composite JSON-array entity ids");
     }
 
     #[tokio::test]
@@ -4313,7 +4394,7 @@ mod tests {
             ]
         );
         let UnresolvedForeignKeyTarget::StateSurfaceIdentity(target) = &unresolved[0].target else {
-            panic!("lix_state FK should produce state-surface identity target");
+            panic!("state FK should produce state-surface identity target");
         };
         assert_eq!(target.version_id, "version-a");
         assert_eq!(target.schema_key, "fk_parent_schema");
@@ -4647,6 +4728,22 @@ mod tests {
         })
     }
 
+    fn composite_message_schema() -> JsonValue {
+        json!({
+            "x-lix-key": "composite_message_schema",
+            "x-lix-version": "1",
+            "x-lix-primary-key": ["/key", "/locale"],
+            "type": "object",
+            "properties": {
+                "key": { "type": "string" },
+                "locale": { "type": "string" },
+                "text": { "type": "string" }
+            },
+            "required": ["key", "locale", "text"],
+            "additionalProperties": false
+        })
+    }
+
     fn fk_child_schema() -> JsonValue {
         json!({
             "x-lix-key": "fk_child_schema",
@@ -4674,17 +4771,17 @@ mod tests {
             "x-lix-key": "state_surface_ref_schema",
             "x-lix-version": "1",
             "x-lix-primary-key": ["/id"],
-            "x-lix-foreign-keys": [{
-                "properties": ["/target_entity_id", "/target_schema_key", "/target_file_id"],
-                "references": {
-                    "schemaKey": "lix_state",
-                    "properties": ["/entity_id", "/schema_key", "/file_id"]
-                }
-            }],
+            "x-lix-state-foreign-keys": [
+                ["/target_entity_id", "/target_schema_key", "/target_file_id"]
+            ],
             "type": "object",
             "properties": {
                 "id": { "type": "string" },
-                "target_entity_id": { "type": "string" },
+                "target_entity_id": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1
+                },
                 "target_schema_key": { "type": "string" },
                 "target_file_id": { "type": ["string", "null"] }
             },
@@ -4759,9 +4856,41 @@ mod tests {
         row
     }
 
+    fn composite_message_row(key: &str, locale: &str, version_id: &str) -> PreparedStateRow {
+        let snapshot = json!({
+            "key": key,
+            "locale": locale,
+            "text": "Welcome",
+        });
+        let mut row = staged_row("composite_message_schema", "1", Some(snapshot.to_string()));
+        row.entity_id = EntityIdentity::from_primary_key_paths(
+            &snapshot,
+            &[vec!["key".to_string()], vec!["locale".to_string()]],
+        )
+        .expect("composite message identity should derive");
+        row.file_id = Some("file-a".to_string());
+        row.version_id = version_id.to_string();
+        row.global = false;
+        row
+    }
+
     fn state_surface_ref_row(
         entity_id: &str,
         target_entity_id: &str,
+        target_schema_key: &str,
+        target_file_id: &str,
+    ) -> PreparedStateRow {
+        state_surface_ref_row_with_target_entity_id(
+            entity_id,
+            json!([target_entity_id]),
+            target_schema_key,
+            target_file_id,
+        )
+    }
+
+    fn state_surface_ref_row_with_target_entity_id(
+        entity_id: &str,
+        target_entity_id: JsonValue,
         target_schema_key: &str,
         target_file_id: &str,
     ) -> PreparedStateRow {

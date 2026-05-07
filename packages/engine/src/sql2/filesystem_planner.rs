@@ -837,10 +837,7 @@ fn partial_state_row(
 ) -> TransactionWriteRow {
     let snapshot = snapshot.map(TransactionJson::from_value_unchecked);
     TransactionWriteRow {
-        entity_id: entity_id.map(|entity_id| {
-            EntityIdentity::from_string(&entity_id)
-                .expect("filesystem entity id should decode as entity identity")
-        }),
+        entity_id: entity_id.map(EntityIdentity::single),
         schema_key: schema_key.to_string(),
         file_id: context.file_id,
         snapshot,
@@ -1439,7 +1436,7 @@ mod tests {
                         row.entity_id
                             .as_ref()
                             .expect("planned recursive delete row should carry entity_id")
-                            .as_string()
+                            .as_single_string_owned()
                             .expect("planned recursive delete row should project entity_id"),
                     )
                 })
@@ -1500,7 +1497,7 @@ mod tests {
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: EntityIdentity::from_string(entity_id).expect("entity id should decode"),
+            entity_id: EntityIdentity::single(entity_id),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id: None,
             snapshot_content: Some(snapshot_content.to_string()),

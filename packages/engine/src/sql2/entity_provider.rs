@@ -977,7 +977,7 @@ fn entity_update_write_rows_from_batch(
             Ok(TransactionWriteRow {
                 entity_id: optional_string_value(batch, row_index, "lixcol_entity_id")?
                     .map(|entity_id| {
-                        EntityIdentity::from_string(&entity_id).map_err(|error| {
+                        EntityIdentity::from_json_array_text(&entity_id).map_err(|error| {
                             DataFusionError::Execution(format!(
                                 "UPDATE entity surface '{}' has invalid lixcol_entity_id: {error}",
                                 spec.schema_key
@@ -1216,7 +1216,7 @@ fn entity_lix_state_write_rows_from_batch_with_options(
                         spec.schema_key
                     ))
                 })?;
-                Some(EntityIdentity::from_string(&entity_id).map_err(|error| {
+                Some(EntityIdentity::from_json_array_text(&entity_id).map_err(|error| {
                     DataFusionError::Execution(format!(
                         "INSERT into entity surface '{}' has invalid lixcol_entity_id: {error}",
                         spec.schema_key
@@ -1225,7 +1225,7 @@ fn entity_lix_state_write_rows_from_batch_with_options(
             } else {
                 explicit_entity_id
                     .map(|entity_id| {
-                        EntityIdentity::from_string(&entity_id).map_err(|error| {
+                        EntityIdentity::from_json_array_text(&entity_id).map_err(|error| {
                             DataFusionError::Execution(format!(
                                 "INSERT into entity surface '{}' has invalid lixcol_entity_id: {error}",
                                 spec.schema_key
@@ -1685,7 +1685,7 @@ fn entity_system_column_array(
             rows.iter()
                 .map(|row| {
                     row.entity_id
-                        .as_string()
+                        .as_json_array_text()
                         .map(Some)
                         .map_err(lix_error_to_datafusion_error)
                 })
@@ -1815,7 +1815,7 @@ fn arrow_data_type_for_entity_column_type(column_type: EntityColumnType) -> Data
 pub(super) fn entity_system_fields(variant: EntityProviderVariant) -> Vec<Field> {
     if variant == EntityProviderVariant::History {
         return vec![
-            Field::new(HISTORY_COL_ENTITY_ID, DataType::Utf8, false),
+            json_field(HISTORY_COL_ENTITY_ID, false),
             Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
             Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
             json_field(HISTORY_COL_SNAPSHOT_CONTENT, true),
@@ -1830,7 +1830,7 @@ pub(super) fn entity_system_fields(variant: EntityProviderVariant) -> Vec<Field>
     }
 
     let mut fields = vec![
-        Field::new("lixcol_entity_id", DataType::Utf8, true),
+        json_field("lixcol_entity_id", true),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         json_field("lixcol_snapshot_content", true),
@@ -2262,7 +2262,7 @@ mod tests {
             Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
             string_column(vec![Some("{\"x\":1}")]),
             Arc::new(Float64Array::from(vec![4.5])) as ArrayRef,
-            string_column(vec![Some("entity-1")]),
+            string_column(vec![Some("[\"entity-1\"]")]),
             string_column(vec![Some("{\"source\":\"entity\"}")]),
             Arc::new(BooleanArray::from(vec![global])) as ArrayRef,
             Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
@@ -2289,7 +2289,7 @@ mod tests {
         ];
         if include_entity_id {
             fields.push(Field::new("lixcol_entity_id", DataType::Utf8, false));
-            columns.push(string_column(vec![Some("message-1")]));
+            columns.push(string_column(vec![Some("[\"message-1\"]")]));
         }
 
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
@@ -2486,7 +2486,7 @@ mod tests {
                 .downcast_ref::<datafusion::arrow::array::StringArray>()
                 .expect("entity id is string")
                 .value(0),
-            "entity-1"
+            "[\"entity-1\"]"
         );
         assert_eq!(
             batch

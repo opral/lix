@@ -3,7 +3,6 @@ use crate::changelog::{
     CanonicalChange, ChangelogContext, ChangelogScanRequest, MaterializedCanonicalChange,
 };
 use crate::entity_identity::EntityIdentity;
-use crate::entity_identity::EntityIdentityPart;
 use crate::json_store::context::JsonStoreContext;
 use crate::json_store::types::{JsonProjectionPath, JsonRef, NormalizedJson};
 use crate::live_state::LiveStateContext;
@@ -3755,13 +3754,9 @@ fn changelog_composite_entity_id_changes(
         .map(|(index, mut change)| {
             change.entity_id = EntityIdentity {
                 parts: vec![
-                    EntityIdentityPart::String(entity_id(
-                        "change-composite",
-                        index,
-                        config.key_pattern,
-                    )),
-                    EntityIdentityPart::Number(index.to_string()),
-                    EntityIdentityPart::Bool(index % 2 == 0),
+                    entity_id("change-composite", index, config.key_pattern),
+                    index.to_string(),
+                    (index % 2 == 0).to_string(),
                 ],
             };
             change
