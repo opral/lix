@@ -2162,8 +2162,7 @@ async fn committed_state_surface_foreign_key_target_exists(
                 &row.schema_key,
                 &row.schema_version,
                 &row.entity_id,
-            )
-            {
+            ) {
                 return Ok(true);
             }
         }

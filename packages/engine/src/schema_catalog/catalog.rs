@@ -92,11 +92,7 @@ impl SchemaCatalog {
         entries = candidate.entries.clone();
         let candidate = Self::from_entries(entries)?;
         *self = candidate;
-        Ok(self
-            .by_identity
-            .get(&identity)
-            .copied()
-            .unwrap_or(plan_id))
+        Ok(self.by_identity.get(&identity).copied().unwrap_or(plan_id))
     }
 
     fn from_entries(entries: Vec<SchemaCatalogEntry>) -> Result<Self, LixError> {

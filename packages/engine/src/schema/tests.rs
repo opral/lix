@@ -686,7 +686,8 @@ fn x_lix_state_foreign_keys_rejects_wrong_tuple_order_by_type() {
     let err =
         validate_lix_schema_definition(&schema).expect_err("wrong tuple order should be rejected");
     assert!(
-        err.message.contains("[entity_id, schema_key, schema_version, file_id]"),
+        err.message
+            .contains("[entity_id, schema_key, schema_version, file_id]"),
         "unexpected error: {err:?}"
     );
 }
