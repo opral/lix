@@ -186,6 +186,8 @@ pub(crate) struct LiveStateFilter {
     #[serde(default)]
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
     #[serde(default)]
+    pub(crate) untracked: Option<bool>,
+    #[serde(default)]
     pub(crate) constraints: Vec<ScanConstraint>,
     #[serde(default)]
     pub(crate) include_tombstones: bool,

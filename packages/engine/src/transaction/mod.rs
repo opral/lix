@@ -1,5 +1,6 @@
 mod commit;
 mod context;
+mod domain;
 mod live_state_overlay;
 mod normalization;
 mod prep;

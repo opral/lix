@@ -20,7 +20,7 @@ simulation_test!(
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_history_table_type\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
              false,\
-             true\
+             false\
              )",
             &[],
         )
@@ -78,7 +78,7 @@ simulation_test!(
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_history_contract_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"active\":{\"type\":\"boolean\"},\"meta\":{\"type\":\"object\"}},\"required\":[\"id\",\"count\",\"active\",\"meta\"],\"additionalProperties\":false}'),\
                  false,\
-                 true\
+                 false\
                  )",
                 &[],
             )
@@ -158,7 +158,7 @@ simulation_test!(
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_history_conformance\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false}'),\
                  false,\
-                 true\
+                 false\
                  )",
                 &[],
             )
@@ -308,7 +308,7 @@ simulation_test!(
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_history_composite_pk\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/namespace\",\"/id\"],\"type\":\"object\",\"properties\":{\"namespace\":{\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"namespace\",\"id\",\"value\"],\"additionalProperties\":false}'),\
                  false,\
-                 true\
+                 false\
                  )",
                 &[],
             )

@@ -4,7 +4,7 @@ use serde_json::Value as JsonValue;
 
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
-use crate::schema::schema_key_from_definition;
+use crate::schema::{is_seed_schema_key, schema_key_from_definition};
 use crate::{LixError, NullableKeyFilter, GLOBAL_VERSION_ID};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -30,29 +30,58 @@ impl SchemaRegistry {
     where
         R: LiveStateReader + ?Sized,
     {
+        self.visible_schemas_for_domain(live_state, version_id, true)
+            .await
+    }
+
+    /// Loads schema definitions reachable from a row domain.
+    pub(crate) async fn visible_schemas_for_domain<R>(
+        &self,
+        live_state: &R,
+        version_id: &str,
+        untracked: bool,
+    ) -> Result<Vec<JsonValue>, LixError>
+    where
+        R: LiveStateReader + ?Sized,
+    {
         let mut schemas = BTreeMap::new();
-        for row in live_state
-            .scan_rows(&LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
-                    version_ids: vec![version_id.to_string()],
-                    file_ids: vec![NullableKeyFilter::Null],
-                    include_tombstones: false,
-                    ..LiveStateFilter::default()
-                },
-                ..LiveStateScanRequest::default()
-            })
-            .await?
-            .into_iter()
-            .filter(|row| version_scoped_schema_row_is_visible(row, version_id))
-        {
-            let Some((key, schema)) = decode_registered_schema_row(&row)? else {
-                continue;
-            };
-            upsert_latest_schema(&mut schemas, key, schema);
+        for schema_untracked in [false, true] {
+            let rows = live_state
+                .scan_rows(&LiveStateScanRequest {
+                    filter: LiveStateFilter {
+                        schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
+                        version_ids: vec![version_id.to_string()],
+                        file_ids: vec![NullableKeyFilter::Null],
+                        untracked: Some(schema_untracked),
+                        include_tombstones: false,
+                        ..LiveStateFilter::default()
+                    },
+                    ..LiveStateScanRequest::default()
+                })
+                .await?;
+            for row in rows
+                .into_iter()
+                .filter(|row| version_scoped_schema_row_is_visible(row, version_id))
+            {
+                let Some((key, schema)) = decode_registered_schema_row(&row)? else {
+                    continue;
+                };
+                if !registered_schema_row_is_reachable_from_domain(&row, &key, untracked) {
+                    continue;
+                }
+                upsert_latest_schema(&mut schemas, key, schema);
+            }
         }
         Ok(schemas.into_values().map(|(_, schema)| schema).collect())
     }
+}
+
+fn registered_schema_row_is_reachable_from_domain(
+    row: &MaterializedLiveStateRow,
+    key: &crate::schema::SchemaKey,
+    untracked_domain: bool,
+) -> bool {
+    !row.untracked || untracked_domain || is_seed_schema_key(&key.schema_key)
 }
 
 fn version_scoped_schema_row_is_visible(
@@ -171,6 +200,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tracked_domain_sees_seed_schemas_but_not_user_untracked_schemas() {
+        let registry = SchemaRegistry::new();
+
+        let schemas = registry
+            .visible_schemas_for_domain(
+                &RowsLiveStateReader::new(vec![
+                    registered_schema_row("lix_key_value", "1"),
+                    registered_schema_row("engine_dynamic_schema", "1"),
+                ]),
+                "global",
+                false,
+            )
+            .await
+            .expect("schema visibility should load");
+
+        assert!(schemas.iter().any(|schema| {
+            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("lix_key_value")
+        }));
+        assert!(!schemas.iter().any(|schema| {
+            schema.get("x-lix-key").and_then(JsonValue::as_str) == Some("engine_dynamic_schema")
+        }));
+    }
+
+    #[tokio::test]
     async fn visible_schemas_ignore_projected_global_schema_rows_for_version_scope() {
         let registry = SchemaRegistry::new();
         let mut global_only = registered_schema_row("global_only_schema", "1");
@@ -223,6 +276,12 @@ mod tests {
                 .filter(|row| {
                     request.filter.version_ids.is_empty()
                         || request.filter.version_ids.contains(&row.version_id)
+                })
+                .filter(|row| {
+                    request
+                        .filter
+                        .untracked
+                        .is_none_or(|untracked| row.untracked == untracked)
                 })
                 .cloned()
                 .collect())

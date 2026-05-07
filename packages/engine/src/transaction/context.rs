@@ -249,21 +249,22 @@ impl Transaction {
         let row_count = rows.len();
         let staged = self.staged_writes.staging_overlay()?;
         let live_state = self.live_state.reader(self.storage_transaction.as_mut());
-        let mut rows_by_scope = BTreeMap::<String, Vec<(usize, TransactionWriteRow)>>::new();
+        let mut rows_by_scope =
+            BTreeMap::<(String, bool), Vec<(usize, TransactionWriteRow)>>::new();
         for (index, row) in rows.into_iter().enumerate() {
             rows_by_scope
-                .entry(row.schema_scope_version_id().to_string())
+                .entry((row.schema_scope_version_id().to_string(), row.untracked))
                 .or_default()
                 .push((index, row));
         }
 
         let mut prepared_rows = Vec::with_capacity(row_count);
         prepared_rows.resize_with(row_count, || None);
-        for (version_id, rows) in rows_by_scope {
+        for ((version_id, untracked), rows) in rows_by_scope {
             let functions = self.functions.clone();
             let catalog = self
                 .schema_resolver
-                .catalog_for_row_normalization(&live_state, &staged, &version_id)
+                .catalog_for_row_normalization(&live_state, &staged, &version_id, untracked)
                 .await?;
             let normalized_rows = rows
                 .into_iter()
@@ -295,7 +296,7 @@ impl Transaction {
         let staged = self.staged_writes.staging_overlay()?;
         let live_state = self.live_state.reader(self.storage_transaction.as_mut());
         let mut changes_by_scope =
-            BTreeMap::<String, Vec<(usize, TransactionAdoptedChange)>>::new();
+            BTreeMap::<(String, bool), Vec<(usize, TransactionAdoptedChange)>>::new();
         for (index, change) in changes.into_iter().enumerate() {
             let schema_scope_version_id = if change.version_id == GLOBAL_VERSION_ID {
                 GLOBAL_VERSION_ID
@@ -303,17 +304,17 @@ impl Transaction {
                 change.version_id.as_str()
             };
             changes_by_scope
-                .entry(schema_scope_version_id.to_string())
+                .entry((schema_scope_version_id.to_string(), false))
                 .or_default()
                 .push((index, change));
         }
 
         let mut prepared_rows = Vec::with_capacity(change_count);
         prepared_rows.resize_with(change_count, || None);
-        for (version_id, changes) in changes_by_scope {
+        for ((version_id, untracked), changes) in changes_by_scope {
             let catalog = self
                 .schema_resolver
-                .catalog_for_row_normalization(&live_state, &staged, &version_id)
+                .catalog_for_row_normalization(&live_state, &staged, &version_id, untracked)
                 .await?;
             let mut planned_changes = Vec::with_capacity(changes.len());
             for (index, change) in changes {
@@ -356,15 +357,14 @@ impl Transaction {
         prepared_writes: &PreparedWriteSet,
     ) -> Result<(), LixError> {
         let validation_index = prepared_writes.validation_index();
-        for version_id in validation_index.schema_scope_version_ids() {
+        for scope in validation_index.schema_scopes() {
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_transaction_validation_version();
-            let version_prepared_writes =
-                validation_index.validation_set_for_schema_scope(version_id);
+            let version_prepared_writes = validation_index.validation_set_for_schema_scope(scope);
             let live_state = self.live_state.reader(self.storage_transaction.as_mut());
             let schema_catalog = self
                 .schema_resolver
-                .catalog_for_validation(&live_state, version_id)
+                .catalog_for_validation(&live_state, &scope.version_id, scope.untracked)
                 .await?;
             validate_prepared_writes(TransactionValidationInput::new(
                 &version_prepared_writes,
