@@ -24,7 +24,7 @@ simulation_test!(
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_dummy_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false,\
-             true\
+             false\
              )",
             &[],
         )
@@ -101,6 +101,47 @@ simulation_test!(
 );
 
 simulation_test!(
+    untracked_registered_schema_does_not_authorize_tracked_state_write,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"engine_untracked_only_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                 false,\
+                 true\
+                 )",
+                &[],
+            )
+            .await
+            .expect("untracked schema registration should succeed");
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+                 ) VALUES (\
+                 lix_json('[\"tracked-1\"]'), 'engine_untracked_only_schema', NULL, lix_json('{\"id\":\"tracked-1\",\"name\":\"Tracked\"}'), '1', false, false\
+                 )",
+                &[],
+            )
+            .await
+            .expect_err("tracked rows must not validate against committed untracked schemas");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+    }
+);
+
+simulation_test!(
     lix_registered_schema_insert_rejects_system_schema_key,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -118,7 +159,7 @@ simulation_test!(
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"lix_change\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
                  false,\
-                 true\
+                 false\
                  )",
                 &[],
             )
@@ -151,7 +192,7 @@ simulation_test!(
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_future_schema\",\"x-lix-version\":\"2\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
                  false,\
-                 true\
+                 false\
                  )",
                 &[],
             )
@@ -184,7 +225,7 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_delete_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
                  false,\
-                 true\
+                 false\
                  )",
                 &[],
             )
@@ -253,7 +294,7 @@ simulation_test!(
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_bad_pointer_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
                  false,\
-                 true\
+                 false\
                  )",
                 &[],
             )
@@ -299,7 +340,7 @@ simulation_test!(
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_empty_property_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"kind\":{}},\"required\":[\"id\",\"kind\"],\"additionalProperties\":false}'),\
                  true,\
-                 true\
+                 false\
                  )",
                 &[],
             )
@@ -345,7 +386,7 @@ simulation_test!(
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_poison_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false,\
-             true\
+             false\
              )",
             &[],
         )
@@ -395,7 +436,7 @@ simulation_test!(
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_divergent_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false,\
-             true\
+             false\
              )",
             &[],
         )
@@ -416,7 +457,7 @@ simulation_test!(
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_divergent_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'),\
                  false,\
-                 true\
+                 false\
                  )",
                 &[],
             )
@@ -458,7 +499,7 @@ simulation_test!(
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_fk_parent_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
              false,\
-             true\
+             false\
              )",
             &[],
         )
@@ -470,7 +511,7 @@ simulation_test!(
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_fk_child_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_id\"],\"references\":{\"schemaKey\":\"engine_fk_parent_schema\",\"properties\":[\"/id\"]}}],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"parent_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"parent_id\"],\"additionalProperties\":false}'),\
              false,\
-             true\
+             false\
              )",
             &[],
         )
@@ -532,7 +573,7 @@ simulation_test!(
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_default_id_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"lix_uuid_v7()\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
                  false,\
-                 true\
+                 false\
                  )",
                 &[],
             )
@@ -587,7 +628,7 @@ simulation_test!(
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_nullable_default_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"status\":{\"type\":[\"string\",\"null\"],\"default\":\"computed\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
                  false,\
-                 true\
+                 false\
                  )",
                 &[],
             )
@@ -658,7 +699,7 @@ simulation_test!(entity_by_version_expands_global_rows, |sim| async move {
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_overlay_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              true,\
-             true\
+             false\
              )",
             &[],
         )
@@ -671,7 +712,7 @@ simulation_test!(entity_by_version_expands_global_rows, |sim| async move {
              VALUES (\
              lix_json('{\"x-lix-key\":\"engine_overlay_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
              false,\
-             true\
+             false\
              )",
             &[],
         )
@@ -737,7 +778,7 @@ simulation_test!(
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_global_poison_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
                  false,\
-                 true\
+                 false\
                  )",
                 &[],
             )
@@ -780,7 +821,7 @@ simulation_test!(
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_typed_entity_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"count\":{\"type\":\"number\"}},\"required\":[\"id\",\"name\",\"count\"],\"additionalProperties\":false}'),\
                  false,\
-                 true\
+                 false\
                  )",
                 &[],
             )
@@ -837,7 +878,7 @@ simulation_test!(
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_number_update_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"score\":{\"type\":\"number\"}},\"required\":[\"id\",\"score\"],\"additionalProperties\":false}'),\
                  false,\
-                 true\
+                 false\
                  )",
                 &[],
             )
@@ -895,7 +936,7 @@ simulation_test!(
                  VALUES (\
                  lix_json('{\"x-lix-key\":\"engine_optional_update_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"rank\":{\"type\":\"integer\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}'),\
                  false,\
-                 true\
+                 false\
                  )",
                 &[],
             )

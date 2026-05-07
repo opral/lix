@@ -302,16 +302,6 @@ pub(crate) struct PreparedStateRow {
     pub(crate) version_id: String,
 }
 
-impl PreparedStateRow {
-    pub(crate) fn schema_scope_version_id(&self) -> &str {
-        if self.global {
-            crate::GLOBAL_VERSION_ID
-        } else {
-            self.version_id.as_str()
-        }
-    }
-}
-
 /// Transaction-hydrated projection for an adopted canonical change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedAdoptedStateRow {
@@ -329,16 +319,6 @@ pub(crate) struct PreparedAdoptedStateRow {
     pub(crate) change_id: String,
     pub(crate) commit_id: String,
     pub(crate) version_id: String,
-}
-
-impl PreparedAdoptedStateRow {
-    pub(crate) fn schema_scope_version_id(&self) -> &str {
-        if self.global {
-            crate::GLOBAL_VERSION_ID
-        } else {
-            self.version_id.as_str()
-        }
-    }
 }
 
 impl From<PreparedStateRow> for MaterializedLiveStateRow {
