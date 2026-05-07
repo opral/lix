@@ -14,6 +14,8 @@ export type DocRecord = {
   relativePath: string;
 };
 
+export type DocsByRelativePath = Record<string, DocRecord>;
+
 /**
  * Converts file path entries in the table of contents into a quick lookup map.
  *
@@ -64,6 +66,97 @@ export function buildDocMaps(entries: Record<string, string>) {
       bySlug: {} as Record<string, DocRecord>,
     },
   );
+}
+
+/**
+ * Resolves portable markdown file links to clean docs routes.
+ *
+ * Markdown files stay portable with links like `./backend.md`, while the site
+ * renders them as `/docs/backend`.
+ *
+ * @example
+ * resolveDocsMarkdownHref("./backend.md", { slug: "persistence", content: "", relativePath: "./persistence.md" }, { "./backend.md": { slug: "backend", content: "", relativePath: "./backend.md" } })
+ */
+export function resolveDocsMarkdownHref(
+  href: string,
+  currentDoc: DocRecord,
+  docsByRelativePath: DocsByRelativePath,
+) {
+  if (
+    href.startsWith("#") ||
+    /^[a-z][a-z0-9+.-]*:/i.test(href) ||
+    !href.replace(/[?#].*$/, "").endsWith(".md")
+  ) {
+    return undefined;
+  }
+
+  const hashIndex = href.indexOf("#");
+  const hash = hashIndex === -1 ? "" : href.slice(hashIndex);
+  const withoutHash = hashIndex === -1 ? href : href.slice(0, hashIndex);
+  const queryIndex = withoutHash.indexOf("?");
+  const query = queryIndex === -1 ? "" : withoutHash.slice(queryIndex);
+  const pathOnly =
+    queryIndex === -1 ? withoutHash : withoutHash.slice(0, queryIndex);
+
+  const candidates = buildDocsLinkCandidates(pathOnly, currentDoc);
+
+  for (const candidate of candidates) {
+    const doc = docsByRelativePath[candidate];
+    if (doc) {
+      return `/docs/${doc.slug}${query}${hash}`;
+    }
+  }
+
+  return undefined;
+}
+
+function buildDocsLinkCandidates(pathOnly: string, currentDoc: DocRecord) {
+  const candidates = new Set<string>();
+  const currentSlugPrefix = `/docs/${currentDoc.slug}/`;
+
+  if (pathOnly.startsWith(currentSlugPrefix)) {
+    candidates.add(
+      resolveRelativeDocPath(
+        currentDoc.relativePath,
+        pathOnly.slice(currentSlugPrefix.length),
+      ),
+    );
+  }
+
+  if (pathOnly.startsWith("/docs/")) {
+    candidates.add(normalizeRelativePath(pathOnly));
+  } else {
+    candidates.add(resolveRelativeDocPath(currentDoc.relativePath, pathOnly));
+  }
+
+  const fileName = pathOnly.split("/").pop();
+  if (fileName?.endsWith(".md")) {
+    candidates.add(resolveRelativeDocPath(currentDoc.relativePath, fileName));
+  }
+
+  return [...candidates];
+}
+
+function resolveRelativeDocPath(currentRelativePath: string, hrefPath: string) {
+  const currentPath = currentRelativePath.replace(/^\.\//, "");
+  const currentDirectory = currentPath.includes("/")
+    ? currentPath.slice(0, currentPath.lastIndexOf("/"))
+    : ".";
+  const normalized = posixNormalize(`${currentDirectory}/${hrefPath}`);
+  return normalized.startsWith(".") ? normalized : `./${normalized}`;
+}
+
+function posixNormalize(value: string) {
+  const parts: string[] = [];
+  for (const part of value.replace(/\\/g, "/").split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  return parts.join("/");
 }
 
 /**

@@ -3,6 +3,7 @@ import {
   buildDocMaps,
   buildTocMap,
   normalizeRelativePath,
+  resolveDocsMarkdownHref,
   slugifyFileName,
   slugifyRelativePath,
 } from "./build-doc-map";
@@ -64,5 +65,51 @@ describe("path helpers", () => {
 
   test("slugifyFileName uses the filename without extension", () => {
     expect(slugifyFileName("./guide/hello-world.md")).toBe("hello-world");
+  });
+});
+
+describe("resolveDocsMarkdownHref", () => {
+  const currentDoc = {
+    slug: "persistence",
+    content: "",
+    relativePath: "./persistence.md",
+  };
+  const docsByRelativePath = {
+    "./backend.md": {
+      slug: "backend",
+      content: "",
+      relativePath: "./backend.md",
+    },
+    "./versions.md": {
+      slug: "versions",
+      content: "",
+      relativePath: "./versions.md",
+    },
+  };
+
+  test("resolves portable markdown links to clean docs routes", () => {
+    expect(
+      resolveDocsMarkdownHref("./backend.md", currentDoc, docsByRelativePath),
+    ).toBe("/docs/backend");
+  });
+
+  test("resolves page-url based markdown links to clean docs routes", () => {
+    expect(
+      resolveDocsMarkdownHref(
+        "/docs/persistence/backend.md",
+        currentDoc,
+        docsByRelativePath,
+      ),
+    ).toBe("/docs/backend");
+  });
+
+  test("preserves heading hashes", () => {
+    expect(
+      resolveDocsMarkdownHref(
+        "./versions.md#merge",
+        currentDoc,
+        docsByRelativePath,
+      ),
+    ).toBe("/docs/versions#merge");
   });
 });

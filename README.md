@@ -5,7 +5,7 @@
 <h3 align="center">Embeddable version control system</h3>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="97k weekly downloads on NPM"></a>
+  <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="weekly downloads on NPM"></a>
   <a href="https://discord.gg/gdMPPWy57R"><img src="https://img.shields.io/discord/897438559458430986?style=flat&logo=discord&labelColor=white" alt="Discord"></a>
   <a href="https://github.com/opral/lix"><img src="https://img.shields.io/github/stars/opral/lix?style=flat&logo=github&color=brightgreen" alt="GitHub Stars"></a>
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
@@ -17,11 +17,17 @@
 
 ---
 
-Lix is an **embeddable version control system** that can be imported as a library. Use lix, for example, to enable human-in-the-loop workflows for AI agents like diffs and reviews.
+Lix is an **embeddable version control system for files of any format** (DOCX, XLSX, CAD, PDF, JSON) with semantic, per-entity diffs. Branches, merge, and an immutable change history, exposed as SQL, all in-process.
 
-- **It's just a library** — Lix is a library you import. Get branching, diff, rollback in your existing stack
-- **Tracks semantic changes** — diffs, blame, and history are queryable via SQL
-- **Approval workflows for agents** — agents propose changes in isolated versions, humans review and merge
+Use it inside a contract editor, a feature-flag service, an artifact registry, an AI-agent platform, a versioned filesystem, or a domain-specific CLI.
+
+> Lix is to version control what DuckDB is to analytics: an embeddable engine with pluggable support for file formats.
+
+- **It's just a library.** `npm install`, import, run. No daemon, no protocol, no remote.
+- **Semantic per-entity diffs.** XLSX cells, DOCX clauses, CAD parts. Not line-by-line text.
+- **History is SQL.** Diffs, blame, and audit are direct queries against `lix_change`.
+
+The entity foundation ships today. A plugin API is on the [roadmap](#roadmap); once it lands, anyone can author a plugin that turns a file format (DOCX, XLSX, CAD, PDF, anything else) into entities.
 
 [How does Lix compare to Git? →](https://lix.dev/docs/comparison-to-git)
 
@@ -39,15 +45,39 @@ npm install @lix-js/sdk
 ```
 
 ```ts
-import { openLix, selectWorkingDiff } from "@lix-js/sdk";
+import { openLix } from "@lix-js/sdk";
 
-const lix = await openLix({
-  environment: new InMemorySQLite()
-});
+const lix = await openLix(); // in-memory by default; pass a backend for persistence
 
-await lix.db.insertInto("file").values({ path: "/hello.txt", data: ... }).execute();
+// Register a schema for a tracked entity
+await lix.execute(
+  "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+  [
+    JSON.stringify({
+      "x-lix-key": "task",
+      "x-lix-version": "1",
+      "x-lix-primary-key": ["/id"],
+      type: "object",
+      required: ["id", "title"],
+      properties: {
+        id: { type: "string" },
+        title: { type: "string" },
+      },
+      additionalProperties: false,
+    }),
+  ],
+);
 
-const diff = await selectWorkingDiff({ lix }).selectAll().execute();
+// Write rows like any SQL table
+await lix.execute(
+  "INSERT INTO task (id, title) VALUES ($1, $2)",
+  ["t1", "Ship v1"],
+);
+
+// Every change is journaled; query it with SQL
+const changes = await lix.execute(
+  "SELECT entity_id, schema_key, snapshot_content FROM lix_change",
+);
 ```
 
 ## Semantic change (delta) tracking
@@ -144,6 +174,18 @@ When a file is written, a plugin parses it and detects entity-level changes. The
 ```
 
 [Read more about Lix architecture →](https://lix.dev/docs/architecture)
+
+## Roadmap
+
+- [x] Core API (<v0.5)
+- [x] ACID transactions (v0.6)
+- [x] Branching, diffing, merging (v0.6)
+- [x] SQL API (v0.6)
+- [x] Stable physical storage layout (v0.6)
+- [ ] Plugin API for file formats (community-authored plugins for DOCX, XLSX, CAD, PDF, …)
+- [ ] Merge conflict semantics and resolution
+- [ ] Working changes & checkpointing
+- [ ] Real-time sync
 
 ## Learn More
 

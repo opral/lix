@@ -1,0 +1,124 @@
+---
+description: Lix journals every change. Query lix_change for global per-entity history, lix_state_history for what's reachable from a version, and <schema>_by_version for current per-version state.
+---
+
+# Change History
+
+Lix gives you three SQL surfaces for history. Pick the one that matches the question you're asking. For the full grid of state, version, and history surfaces see [SQL Surfaces](./surfaces.md).
+
+| Surface | What you ask it |
+| --- | --- |
+| `lix_change` | "What happened to this entity, ever?" Global, immutable journal of every write across every schema and version. |
+| `lix_state_history` | "What did this version see?" State walked back from a commit, with `depth` for time-travel. |
+| `<schema>_by_version` | "What's in this version right now?" Current rows in each version. Documented in [Versions & Merging](./versions.md). |
+
+Versions don't filter `lix_change` directly; `lix_change` is the raw write log, and versions are pointers in the commit graph. To scope history to a version, use `lix_state_history` with the version's `commit_id`.
+
+## `lix_change` columns
+
+| Column             | What it is                                                                                              |
+| ------------------ | ------------------------------------------------------------------------------------------------------- |
+| `id`               | Unique change id.                                                                                       |
+| `entity_id`        | Primary key of the changed row. For composite keys, an encoded form (`pk:v1:<base64-json>`).            |
+| `schema_key`       | Which schema (`x-lix-key`).                                                                             |
+| `schema_version`   | Schema contract version at the time of the change.                                                      |
+| `file_id`          | The file the change belongs to, or `null` for entity-only changes.                                      |
+| `metadata`         | JSON metadata attached to the change.                                                                   |
+| `snapshot_content` | JSON snapshot of the row after the change, or `null` for deletions (tombstones).                        |
+| `created_at`       | ISO timestamp.                                                                                          |
+
+Read JSON cells with `row.value("snapshot_content").asJson()` or `row.get("snapshot_content")`. Don't `JSON.parse` it as text, and handle `null` for tombstones.
+
+## `lix_state_history` columns
+
+| Column               | What it is                                                                              |
+| -------------------- | --------------------------------------------------------------------------------------- |
+| `entity_id`          | Primary key of the row.                                                                 |
+| `schema_key`         | Which schema.                                                                           |
+| `file_id`            | The file the row belongs to, or `null`.                                                 |
+| `snapshot_content`   | JSON snapshot at this depth.                                                            |
+| `metadata`           | JSON metadata.                                                                          |
+| `schema_version`     | Schema contract version.                                                                |
+| `change_id`          | The `lix_change.id` that produced this state.                                           |
+| `observed_commit_id` | The commit where this state was recorded.                                               |
+| `commit_created_at`  | When the commit was created.                                                            |
+| `start_commit_id`    | The commit the walk started from (typically the version's tip, `lix_version.commit_id`). |
+| `depth`              | `0` = current state at `start_commit_id`. Higher values walk back through history.       |
+
+## Recipes
+
+### Per-entity history (across all versions)
+
+```sql
+SELECT created_at, snapshot_content
+FROM lix_change
+WHERE schema_key = $1 AND entity_id = $2
+ORDER BY created_at;
+```
+
+### Latest activity for a schema
+
+```sql
+SELECT created_at, entity_id, snapshot_content
+FROM lix_change
+WHERE schema_key = $1
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+### What's in this version right now
+
+Use the schema's `_by_version` surface (see [Versions & Merging](./versions.md)):
+
+```sql
+SELECT entity_id, snapshot_content
+FROM acme_section_by_version
+WHERE lixcol_version_id = $1;
+```
+
+### What did this version see, walked back through history
+
+```sql
+SELECT entity_id, schema_key, snapshot_content, depth, observed_commit_id
+FROM lix_state_history
+WHERE start_commit_id = lix_active_version_commit_id()
+  AND depth >= 0
+ORDER BY depth, schema_key, entity_id;
+```
+
+`depth = 0` is the current state of that version. Higher depths walk back through earlier commits. Filter by `schema_key` or `entity_id` to narrow.
+
+### Diff one entity between two versions
+
+```sql
+SELECT v.id AS version_id, v.name, s.snapshot_content
+FROM acme_section_by_version s
+JOIN lix_version v ON v.id = s.lixcol_version_id
+WHERE s.id = $1
+  AND s.lixcol_version_id IN ($2, $3);
+```
+
+Compare the two `snapshot_content` JSON values field-by-field in your code to render a per-field diff.
+
+### Undo the last change to an entity
+
+```ts
+const prev = await lix.execute(
+  `SELECT snapshot_content
+     FROM lix_change
+    WHERE schema_key = $1 AND entity_id = $2
+      AND snapshot_content IS NOT NULL
+    ORDER BY created_at DESC
+    LIMIT 1 OFFSET 1`,
+  ["acme_section", "s1"],
+);
+
+const snapshot = prev.rows[0]?.value("snapshot_content").asJson();
+// then UPDATE acme_section with the snapshot fields
+```
+
+The `snapshot_content IS NOT NULL` filter skips tombstones (deletions).
+
+## Tombstones
+
+A deletion produces a `lix_change` row with `snapshot_content = null`. Branch on null when rendering or replaying history.

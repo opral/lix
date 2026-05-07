@@ -70,7 +70,7 @@ describe("SEO route smoke tests", () => {
       "Comparison to Git | Lix Documentation",
     );
     expect(findMetaContent(head.meta, "twitter:description")).toBe(
-      "See when to use Git, when to use Lix, and how semantic change tracking differs from snapshot-based source control.",
+      "Git versions text files line-by-line. Lix versions any file format (DOCX, XLSX, CAD, etc.) semantically per entity.",
     );
     expect(rendered.title).toBe("Comparison to Git");
     expect(rendered.body).not.toContain("<h1");
@@ -116,7 +116,9 @@ describe("SEO route smoke tests", () => {
       nextPost: null,
     });
 
-    expect(findLink(head.links, "canonical")).toBe(`https://lix.dev/blog/${slug}`);
+    expect(findLink(head.links, "canonical")).toBe(
+      `https://lix.dev/blog/${slug}`,
+    );
     expect(findMetaContent(head.meta, "og:title")).toBe(
       "Your Company should be a Repository for AI agents | Lix Blog",
     );
@@ -158,7 +160,9 @@ describe("SEO route smoke tests", () => {
       nextRfc: null,
     });
 
-    expect(findLink(head.links, "canonical")).toBe(`https://lix.dev/rfc/${slug}`);
+    expect(findLink(head.links, "canonical")).toBe(
+      `https://lix.dev/rfc/${slug}`,
+    );
     expect(findMetaContent(head.meta, "og:title")).toBe(
       "Preprocess writes to avoid vtable overhead | Lix RFCs",
     );

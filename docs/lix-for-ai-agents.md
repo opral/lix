@@ -1,96 +1,66 @@
+---
+description: Route agent writes through Lix to get isolated workspaces, previewable changes, and approve-or-discard review for every agent task.
+---
+
 # Lix for AI Agents
 
-AI agents can make large, fast, and useful changes. They can also make changes that need review.
+Agent review is one of Lix's headline use cases, but the same primitives ([Versions](./versions.md), [Change History](./history.md)) power any product where end users review proposed changes. If you're building knowledge-work tools, the patterns here apply to humans drafting changes too.
 
-Lix gives agentic applications a place to put those changes before they become the main state.
+Agents make fast, useful, and sometimes wrong changes. Lix gives each agent task its own isolated version of state so a human or a policy can review it before it lands.
 
-## The problem
-
-An agent might edit:
-
-- Files
-- Documents
-- Configuration
-- Structured records
-- Database-backed application state
-
-Without version control inside the app, those edits are hard to inspect. The user sees the result, but not the path that produced it.
-
-For agent workflows, that is not enough. Users need to review, compare, approve, reject, and recover.
-
-## The Lix model
-
-Route agent writes through Lix.
-
-Then each agent task can have its own isolated version of state:
+## The pattern
 
 1. Create a version for the agent task.
-2. Switch the agent into that version.
-3. Let the agent make changes.
-4. Preview what changed.
-5. Ask a human or policy to approve the result.
-6. Merge or discard the version.
+2. Switch the agent's writes into that version.
+3. Run the agent. All writes are isolated.
+4. Preview the merge: `changeStats` for the count, `conflicts` for collisions.
+5. Approve, request changes, or discard.
 
-The app stays in control of the workflow.
+```ts
+const main = await lix.activeVersionId();
+
+const task = await lix.createVersion({ name: "Agent task 123" });
+await lix.switchVersion({ versionId: task.id });
+
+// run the agent; every lix.execute is now isolated to `task`
+
+await lix.switchVersion({ versionId: main });
+
+const preview = await lix.mergeVersionPreview({ sourceVersionId: task.id });
+if (preview.conflicts.length === 0) {
+  await lix.mergeVersion({ sourceVersionId: task.id });
+}
+```
 
 ## Why versions matter for agents
 
-Versions let agents work without immediately changing the main state.
-
-That unlocks safer product experiences:
-
-- Run multiple agents in parallel.
-- Compare different proposed outcomes.
+- Run multiple agents in parallel without stepping on each other.
+- Compare proposed outcomes side by side.
 - Keep the main state stable while work is in progress.
-- Merge only the changes that pass review.
-- Discard a bad attempt without manual cleanup.
+- Discard a bad attempt with no manual cleanup.
 
-## What users should see
+## Showing the work
 
-Lix is infrastructure. Your product still decides the UI.
+The point of routing agent writes through Lix is that you can ask SQL what the agent did:
 
-A good agent review UI usually shows:
-
-- The task the agent was asked to complete.
-- The files or records that changed.
-- A human-readable diff.
-- Any validation or policy checks.
-- Buttons to approve, request changes, or discard.
-
-The important part is that the product can present agent work as a reviewable change, not as an invisible mutation.
-
-## Minimal flow
-
-```ts
-const mainVersionId = await lix.activeVersionId();
-
-const agentVersion = await lix.createVersion({
-  id: "agent-task-123",
-  name: "Agent task 123",
-});
-
-await lix.switchVersion({ versionId: agentVersion.id });
-
-// Run the agent here. Any writes routed through Lix are isolated.
-
-await lix.switchVersion({ versionId: mainVersionId });
-
-const preview = await lix.mergeVersionPreview({
-  sourceVersionId: agentVersion.id,
-});
-
-console.log(preview.changeStats);
+```sql
+SELECT entity_id, schema_key, snapshot_content, depth, observed_commit_id
+FROM lix_state_history
+WHERE start_commit_id = lix_active_version_commit_id()
+  AND depth >= 0
+ORDER BY depth, schema_key, entity_id;
 ```
 
-Once the user approves the change:
+This is the data your review UI renders. See [Change History](./history.md) for more recipes (per-entity history, who-changed-what, diffs between versions).
 
-```ts
-await lix.mergeVersion({
-  sourceVersionId: agentVersion.id,
-});
-```
+## Conflicts
+
+Merge is per-entity today: two versions editing different rows merge cleanly; two versions editing the same row produce a `sameEntityChanged` conflict. Wrap `mergeVersion()` and handle the conflict in your review flow.
+
+Don't reshape your schemas around this. Conflict semantics are an active roadmap item; design entities for how your code reads them, not around today's merge granularity. See [Versions & Merging](./versions.md#dont-shape-entities-around-merge).
 
 ## Next
 
-- Learn the basics in [Getting Started](/docs/getting-started)
-- Compare the mental model in [Comparison to Git](/docs/comparison-to-git)
+- [Getting Started](./getting-started.md): the basic loop.
+- [Versions & Merging](./versions.md): preview shape, conflicts, side-by-side reads.
+- [Change History](./history.md): the SQL surface for review and undo.

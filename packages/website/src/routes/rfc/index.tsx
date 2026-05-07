@@ -11,9 +11,9 @@ import {
 const rfcMarkdownFiles = import.meta.glob<string>(
   "../../../../../rfcs/**/index.md",
   {
-  query: "?raw",
-  import: "default",
-  }
+    query: "?raw",
+    import: "default",
+  },
 );
 
 const rfcRootPrefix = "../../../../../rfcs/";
@@ -49,7 +49,7 @@ async function loadRfcIndex(): Promise<{ rfcs: RfcEntry[] }> {
       const date = parsed.frontmatter?.date as string | undefined;
 
       return { slug, title, date };
-    })
+    }),
   );
 
   // Sort Z-A (descending by slug, so 002 comes before 001)
@@ -59,7 +59,8 @@ async function loadRfcIndex(): Promise<{ rfcs: RfcEntry[] }> {
 }
 
 export function buildRfcIndexHead() {
-  const title = "Lix RFCs | Design proposals, architecture decisions, and roadmap notes";
+  const title =
+    "Lix RFCs | Design proposals, architecture decisions, and roadmap notes";
   const description =
     "Read Lix RFCs covering architecture decisions, engine design, and upcoming changes before they land in the product.";
   const canonicalUrl = buildCanonicalUrl("/rfc");

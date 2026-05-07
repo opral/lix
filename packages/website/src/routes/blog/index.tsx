@@ -16,7 +16,7 @@ const blogMarkdownFiles = import.meta.glob<string>(
   {
     query: "?raw",
     import: "default",
-  }
+  },
 );
 const blogJsonFiles = import.meta.glob<string>("../../../../../blog/*.json", {
   query: "?raw",
@@ -88,7 +88,7 @@ async function loadBlogIndex() {
         ogImage,
         ogImageAlt,
       };
-    })
+    }),
   );
 
   posts.sort((a, b) => {
@@ -204,7 +204,8 @@ function BlogIndexPage() {
                       <img
                         src={post.ogImage}
                         alt={
-                          post.ogImageAlt ?? `${post.title ?? post.slug} cover image`
+                          post.ogImageAlt ??
+                          `${post.title ?? post.slug} cover image`
                         }
                         className="h-full w-full object-cover"
                       />
