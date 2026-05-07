@@ -12,6 +12,7 @@
       ],
       "references": {
         "schemaKey": "lix_change_set",
+        "schemaVersion": "1",
         "properties": [
           "/id"
         ]

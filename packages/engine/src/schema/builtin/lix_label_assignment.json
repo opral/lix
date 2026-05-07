@@ -1,7 +1,7 @@
 {
   "x-lix-key": "lix_label_assignment",
   "x-lix-version": "1",
-  "description": "Mapping table that assigns a label to any live Lix row addressed by (target_entity_id, target_schema_key, target_file_id). The state foreign-key tuple is ordered as [0] target_entity_id, [1] target_schema_key, [2] target_file_id.",
+  "description": "Mapping table that assigns a label to any live Lix row addressed by (target_entity_id, target_schema_key, target_schema_version, target_file_id). The state foreign-key tuple is ordered as [0] target_entity_id, [1] target_schema_key, [2] target_schema_version, [3] target_file_id.",
   "x-lix-primary-key": [
     "/id"
   ],
@@ -9,6 +9,7 @@
     [
       "/target_entity_id",
       "/target_schema_key",
+      "/target_schema_version",
       "/target_file_id",
       "/label_id"
     ]
@@ -17,6 +18,7 @@
     [
       "/target_entity_id",
       "/target_schema_key",
+      "/target_schema_version",
       "/target_file_id"
     ]
   ],
@@ -27,6 +29,7 @@
       ],
       "references": {
         "schemaKey": "lix_label",
+        "schemaVersion": "1",
         "properties": [
           "/id"
         ]
@@ -52,12 +55,16 @@
       "type": "string",
       "description": "Target row schema key. This is slot [1] in x-lix-state-foreign-keys."
     },
+    "target_schema_version": {
+      "type": "string",
+      "description": "Target row schema version. This is slot [2] in x-lix-state-foreign-keys."
+    },
     "target_file_id": {
       "type": [
         "string",
         "null"
       ],
-      "description": "Target row file scope. This is slot [2] in x-lix-state-foreign-keys; null targets global rows."
+      "description": "Target row file scope. This is slot [3] in x-lix-state-foreign-keys; null targets global rows."
     },
     "label_id": {
       "type": "string",
@@ -68,6 +75,7 @@
     "id",
     "target_entity_id",
     "target_schema_key",
+    "target_schema_version",
     "target_file_id",
     "label_id"
   ],

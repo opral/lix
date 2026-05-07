@@ -509,7 +509,7 @@ simulation_test!(
         main.execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"engine_fk_child_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_id\"],\"references\":{\"schemaKey\":\"engine_fk_parent_schema\",\"properties\":[\"/id\"]}}],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"parent_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"parent_id\"],\"additionalProperties\":false}'),\
+             lix_json('{\"x-lix-key\":\"engine_fk_child_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-foreign-keys\":[{\"properties\":[\"/parent_id\"],\"references\":{\"schemaKey\":\"engine_fk_parent_schema\",\"schemaVersion\":\"1\",\"properties\":[\"/id\"]}}],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"parent_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"parent_id\"],\"additionalProperties\":false}'),\
              false,\
              false\
              )",

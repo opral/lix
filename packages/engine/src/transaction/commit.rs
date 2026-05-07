@@ -693,8 +693,8 @@ mod tests {
     };
     use crate::changelog::ChangelogContext;
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
+    use crate::schema_catalog::SchemaPlanId;
     use crate::storage::StorageContext;
-    use crate::transaction::normalization::SchemaPlanId;
     use crate::transaction::types::PreparedRowFacts;
     use crate::untracked_state::{
         MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateRowRequest,

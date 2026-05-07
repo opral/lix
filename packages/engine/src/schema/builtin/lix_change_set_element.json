@@ -21,6 +21,7 @@
       ],
       "references": {
         "schemaKey": "lix_change_set",
+        "schemaVersion": "1",
         "properties": [
           "/id"
         ]
@@ -32,6 +33,7 @@
       ],
       "references": {
         "schemaKey": "lix_change",
+        "schemaVersion": "1",
         "properties": [
           "/id"
         ]

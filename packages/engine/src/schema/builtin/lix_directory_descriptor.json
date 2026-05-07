@@ -17,6 +17,7 @@
       ],
       "references": {
         "schemaKey": "lix_directory_descriptor",
+        "schemaVersion": "1",
         "properties": [
           "/id"
         ]

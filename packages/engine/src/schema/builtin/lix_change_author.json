@@ -12,6 +12,7 @@
       ],
       "references": {
         "schemaKey": "lix_change",
+        "schemaVersion": "1",
         "properties": [
           "/id"
         ]
@@ -23,6 +24,7 @@
       ],
       "references": {
         "schemaKey": "lix_account",
+        "schemaVersion": "1",
         "properties": [
           "/id"
         ]
