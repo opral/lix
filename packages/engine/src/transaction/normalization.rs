@@ -154,6 +154,7 @@ pub(crate) struct TransactionSchemaPlan {
     pub(crate) primary_key: Option<PointerGroup>,
     pub(crate) uniques: Vec<PointerGroup>,
     pub(crate) foreign_keys: Vec<ForeignKeyPlan>,
+    pub(crate) state_foreign_keys: Vec<StateForeignKeyPlan>,
 }
 
 impl TransactionSchemaPlan {
@@ -163,6 +164,7 @@ impl TransactionSchemaPlan {
         let primary_key = primary_key_paths(&schema)?;
         let uniques = pointer_groups(&schema, "x-lix-unique")?;
         let foreign_keys = foreign_key_plans(&schema)?;
+        let state_foreign_keys = state_foreign_key_plans(&schema)?;
         Ok(Self {
             key,
             schema: Arc::new(schema),
@@ -171,6 +173,7 @@ impl TransactionSchemaPlan {
             primary_key,
             uniques,
             foreign_keys,
+            state_foreign_keys,
         })
     }
 }
@@ -265,6 +268,26 @@ pub(crate) struct ForeignKeyPlan {
     pub(crate) local_properties: PointerGroup,
     pub(crate) referenced_schema_key: String,
     pub(crate) referenced_properties: PointerGroup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StateForeignKeyPlan {
+    /// Slot [0] in `x-lix-state-foreign-keys`: local pointer to the target entity_id.
+    pub(crate) entity_id_property: Vec<String>,
+    /// Slot [1] in `x-lix-state-foreign-keys`: local pointer to the target schema_key.
+    pub(crate) schema_key_property: Vec<String>,
+    /// Slot [2] in `x-lix-state-foreign-keys`: local pointer to the target file_id.
+    pub(crate) file_id_property: Vec<String>,
+}
+
+impl StateForeignKeyPlan {
+    pub(crate) fn local_properties(&self) -> PointerGroup {
+        vec![
+            self.entity_id_property.clone(),
+            self.schema_key_property.clone(),
+            self.file_id_property.clone(),
+        ]
+    }
 }
 
 /// Normalizes one incoming row into a row with final snapshot/entity identity.
@@ -472,7 +495,7 @@ fn resolve_entity_id(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
                     "entity_id '{}' does not match x-lix-primary-key derived entity_id '{}' for schema '{}' version '{}'",
-                    entity_id.as_string()?, derived.as_string()?, row.schema_key, row.schema_version
+                    entity_id.as_json_array_text()?, derived.as_json_array_text()?, row.schema_key, row.schema_version
                 ),
             ));
         }
@@ -607,6 +630,42 @@ fn foreign_key_plans(schema: &JsonValue) -> Result<Vec<ForeignKeyPlan>, LixError
         .collect()
 }
 
+fn state_foreign_key_plans(schema: &JsonValue) -> Result<Vec<StateForeignKeyPlan>, LixError> {
+    let Some(value) = schema.get("x-lix-state-foreign-keys") else {
+        return Ok(Vec::new());
+    };
+    let Some(foreign_keys) = value.as_array() else {
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            "schema x-lix-state-foreign-keys must be an array",
+        ));
+    };
+
+    foreign_keys
+        .iter()
+        .enumerate()
+        .map(|(index, foreign_key)| {
+            let local_properties = pointer_array(
+                Some(foreign_key),
+                &format!("x-lix-state-foreign-keys[{index}]"),
+            )?;
+            if local_properties.len() != 3 {
+                return Err(LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    format!(
+                        "x-lix-state-foreign-keys[{index}] must contain exactly three JSON Pointers ordered as [entity_id, schema_key, file_id]"
+                    ),
+                ));
+            }
+            Ok(StateForeignKeyPlan {
+                entity_id_property: local_properties[0].clone(),
+                schema_key_property: local_properties[1].clone(),
+                file_id_property: local_properties[2].clone(),
+            })
+        })
+        .collect()
+}
+
 fn pointer_array(value: Option<&JsonValue>, context: &str) -> Result<PointerGroup, LixError> {
     let Some(value) = value else {
         return Err(LixError::new(
@@ -687,17 +746,9 @@ fn entity_id_derivation_error(
             let pointer = format_json_pointer(&primary_key_paths[index]);
             format!("missing value at primary-key pointer '{pointer}'")
         }
-        EntityIdentityError::NullPrimaryKeyValue { index } => {
-            let pointer = format_json_pointer(&primary_key_paths[index]);
-            format!("null value at primary-key pointer '{pointer}'")
-        }
-        EntityIdentityError::EmptyPrimaryKeyValue { index } => {
-            let pointer = format_json_pointer(&primary_key_paths[index]);
-            format!("empty value at primary-key pointer '{pointer}'")
-        }
         EntityIdentityError::UnsupportedPrimaryKeyValue { index } => {
             let pointer = format_json_pointer(&primary_key_paths[index]);
-            format!("unsupported non-scalar value at primary-key pointer '{pointer}'")
+            format!("non-string value at primary-key pointer '{pointer}'")
         }
         EntityIdentityError::InvalidEncodedEntityIdentity => {
             "invalid encoded entity identity".to_string()
@@ -948,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn normalization_derives_opaque_entity_id_for_composite_primary_key() {
+    fn normalization_derives_json_array_entity_id_for_composite_primary_key() {
         let mut catalog = catalog_with(vec![composite_key_schema()]);
         let row = TransactionWriteRow {
             entity_id: None,
@@ -961,10 +1012,31 @@ mod tests {
         let row =
             normalize_transaction_write_row(row, &mut catalog, functions()).expect("normalize row");
         let entity_id = row.row.entity_id.expect("composite entity id");
-        let projected_entity_id = entity_id.as_string().expect("entity id should project");
+        let projected_entity_id = entity_id
+            .as_json_array_text()
+            .expect("entity id should project");
 
-        assert!(projected_entity_id.starts_with("pk:v1:"));
-        assert_ne!(projected_entity_id, "a~b~1");
+        assert_eq!(projected_entity_id, "[\"a~b\",\"1\"]");
+    }
+
+    #[test]
+    fn normalization_rejects_non_string_primary_key_values() {
+        let mut catalog = catalog_with(vec![composite_key_schema()]);
+        let row = TransactionWriteRow {
+            entity_id: None,
+            schema_key: "composite_key_schema".to_string(),
+            schema_version: "1".to_string(),
+            snapshot: Some(snapshot_json(r#"{"namespace":"a~b","key":1}"#)),
+            ..base_stage_row()
+        };
+
+        let error = normalize_transaction_write_row(row, &mut catalog, functions())
+            .expect_err("non-string primary key values should fail");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        assert!(error
+            .message
+            .contains("non-string value at primary-key pointer '/key'"));
     }
 
     #[test]

@@ -364,7 +364,7 @@ fn entity_history_column_value(
         return Ok(snapshot.get(column_name).cloned());
     }
 
-    let entity_id = row.change.entity_id.as_string().map_err(|error| {
+    let entity_id = row.change.entity_id.as_json_array_text().map_err(|error| {
         DataFusionError::Execution(format!(
             "sql2 entity history provider failed to project entity id: {error}"
         ))
@@ -388,7 +388,7 @@ fn entity_history_system_column_array(
                     Some(
                         row.change
                             .entity_id
-                            .as_string()
+                            .as_json_array_text()
                             .expect("canonical change entity identity should project"),
                     )
                 })

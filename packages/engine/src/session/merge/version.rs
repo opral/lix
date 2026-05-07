@@ -1,4 +1,4 @@
-use serde_json::json;
+use serde_json::{json, Value as JsonValue};
 
 use crate::transaction::types::TransactionWrite;
 use crate::version::VersionRefReader;
@@ -67,7 +67,7 @@ pub struct MergeVersionPreview {
 pub struct MergeConflict {
     pub kind: MergeConflictKind,
     pub schema_key: String,
-    pub entity_id: String,
+    pub entity_id: JsonValue,
     pub file_id: Option<String>,
     pub target: MergeConflictSide,
     pub source: MergeConflictSide,

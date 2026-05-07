@@ -2483,7 +2483,11 @@ mod tests {
             .expect("scan should succeed");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].0.entity_id.as_string().expect("identity"),
+            rows[0]
+                .0
+                .entity_id
+                .as_single_string_owned()
+                .expect("identity"),
             "visible"
         );
     }
@@ -2546,7 +2550,11 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0.schema_key, "schema-a");
         assert_eq!(
-            rows[0].0.entity_id.as_string().expect("identity"),
+            rows[0]
+                .0
+                .entity_id
+                .as_single_string_owned()
+                .expect("identity"),
             "entity-a"
         );
         assert_eq!(rows[0].0.file_id.as_deref(), Some("file-a"));

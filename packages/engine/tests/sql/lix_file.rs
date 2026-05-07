@@ -360,7 +360,7 @@ simulation_test!(
             .execute(
                 "SELECT entity_id, schema_key \
              FROM lix_state \
-             WHERE entity_id = 'file-readme' \
+             WHERE entity_id = lix_json('[\"file-readme\"]') \
              ORDER BY schema_key, entity_id",
                 &[],
             )
@@ -1298,7 +1298,7 @@ simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
         .execute(
             "SELECT entity_id, schema_key \
              FROM lix_state \
-             WHERE entity_id = 'file-readme' \
+             WHERE entity_id = lix_json('[\"file-readme\"]') \
              ORDER BY schema_key, entity_id",
             &[],
         )

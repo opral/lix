@@ -45,13 +45,13 @@ simulation_test!(
             .rows()
             .iter()
             .find_map(|row| match row.values() {
-                [Value::Text(entity_id), Value::Json(value)]
+                [Value::Json(entity_id), Value::Json(value)]
                     if value.get("x-lix-key").and_then(serde_json::Value::as_str)
                         == Some("engine_dummy_schema") =>
                 {
                     Some(entity_id)
                 }
-                [Value::Text(entity_id), Value::Text(value)] => {
+                [Value::Json(entity_id), Value::Text(value)] => {
                     let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
                     (value.get("x-lix-key").and_then(serde_json::Value::as_str)
                         == Some("engine_dummy_schema"))
@@ -60,15 +60,17 @@ simulation_test!(
                 _ => None,
             })
             .expect("registered schema row should be visible");
-        assert!(registered_schema_entity_id.starts_with("pk:v1:"));
-        assert_ne!(registered_schema_entity_id, "engine_dummy_schema~1");
+        assert_eq!(
+            registered_schema_entity_id,
+            &json!(["engine_dummy_schema", "1"])
+        );
 
         let insert_state_result = session
         .execute(
             "INSERT INTO lix_state (\
              entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
              ) VALUES (\
-             'dummy-1', 'engine_dummy_schema', NULL, lix_json('{\"id\":\"dummy-1\",\"name\":\"Dummy\"}'), '1', false, true\
+             lix_json('[\"dummy-1\"]'), 'engine_dummy_schema', NULL, lix_json('{\"id\":\"dummy-1\",\"name\":\"Dummy\"}'), '1', false, true\
              )",
             &[],
         )
@@ -80,7 +82,7 @@ simulation_test!(
             .execute(
                 "SELECT entity_id, schema_key, snapshot_content \
              FROM lix_state \
-             WHERE schema_key = 'engine_dummy_schema' AND entity_id = 'dummy-1'",
+             WHERE schema_key = 'engine_dummy_schema' AND entity_id = lix_json('[\"dummy-1\"]')",
                 &[],
             )
             .await
@@ -90,7 +92,7 @@ simulation_test!(
         assert_eq!(
             row_set.rows()[0].values(),
             &[
-                Value::Text("dummy-1".to_string()),
+                Value::Json(json!(["dummy-1"])),
                 Value::Text("engine_dummy_schema".to_string()),
                 Value::Json(json!({"id": "dummy-1", "name": "Dummy"})),
             ]
@@ -201,13 +203,13 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
         .rows()
         .iter()
         .find_map(|row| match row.values() {
-            [Value::Text(entity_id), Value::Json(value)]
+            [Value::Json(entity_id), Value::Json(value)]
                 if value.get("x-lix-key").and_then(serde_json::Value::as_str)
                     == Some("engine_delete_schema") =>
             {
                 Some(entity_id.clone())
             }
-            [Value::Text(entity_id), Value::Text(value)] => {
+            [Value::Json(entity_id), Value::Text(value)] => {
                 let value = serde_json::from_str::<serde_json::Value>(value).ok()?;
                 (value.get("x-lix-key").and_then(serde_json::Value::as_str)
                     == Some("engine_delete_schema"))
@@ -221,7 +223,7 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
         .execute(
             "DELETE FROM lix_registered_schema \
                  WHERE lixcol_entity_id = $1",
-            &[Value::Text(delete_schema_entity_id)],
+            &[Value::Json(delete_schema_entity_id)],
         )
         .await
         .expect_err("schema deletion is not supported yet");
@@ -558,10 +560,10 @@ simulation_test!(
         let row_set = result;
         assert_eq!(row_set.len(), 1);
         let values = row_set.rows()[0].values();
-        let [Value::Text(entity_id), Value::Text(id), Value::Text(name)] = values else {
+        let [Value::Json(entity_id), Value::Text(id), Value::Text(name)] = values else {
             panic!("expected generated id row, got {values:?}");
         };
-        assert_eq!(entity_id, id);
+        assert_eq!(entity_id, &json!([id]));
         assert!(!id.is_empty(), "defaulted id should be non-empty");
         assert_eq!(name, "Generated");
     }
@@ -690,7 +692,7 @@ simulation_test!(entity_by_version_expands_global_rows, |sim| async move {
         .execute(
             "SELECT id, name, lixcol_version_id, lixcol_global, lixcol_untracked \
                  FROM engine_overlay_schema_by_version \
-                 WHERE lixcol_entity_id = 'entity-global-overlay' \
+                 WHERE lixcol_entity_id = lix_json('[\"entity-global-overlay\"]') \
                  ORDER BY lixcol_version_id",
             &[],
         )
@@ -811,7 +813,7 @@ simulation_test!(
                 Value::Text("typed-entity-1".to_string()),
                 Value::Text("Typed Entity".to_string()),
                 Value::Real(7.0),
-                Value::Text("typed-entity-1".to_string()),
+                Value::Json(json!(["typed-entity-1"])),
             ]],
         );
     }

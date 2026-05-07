@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Lix Schema Definition",
-  "description": "A Lix schema is a JSON Schema draft 2020-12 document augmented with `x-lix-*` extensions that identify, version, and constrain an entity type. Every schema must declare `x-lix-key` (snake_case identifier, preferably prefixed with a plugin or domain namespace such as `library_book` to avoid collisions), `x-lix-version` (string-as-integer, e.g. `\"1\"`), and `additionalProperties: false`; add `x-lix-primary-key` (array of JSON Pointers) to make the schema writable — Lix will auto-materialize a public virtual table named after `x-lix-key` with an `INSERT/UPDATE/DELETE` surface. See the `examples` field for a minimal working schema.",
+  "description": "A Lix schema is a JSON Schema draft 2020-12 document augmented with `x-lix-*` extensions that identify, version, and constrain an entity type. Every schema must declare `x-lix-key` (snake_case identifier, preferably prefixed with a plugin or domain namespace such as `library_book` to avoid collisions), `x-lix-version` (string-as-integer, e.g. `\"1\"`), and `additionalProperties: false`; add `x-lix-primary-key` (array of JSON Pointers to string properties) to make the schema writable — Lix will auto-materialize a public virtual table named after `x-lix-key` with an `INSERT/UPDATE/DELETE` surface. See the `examples` field for a minimal working schema.",
   "examples": [
     {
       "x-lix-key": "library_book",
@@ -47,7 +47,7 @@
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
-          "description": "Primary-key fields as JSON Pointers (RFC 6901) into the entity, e.g. `[\"/id\"]` for a single-column key or `[\"/tenant_id\", \"/handle\"]` for a composite key. Note the leading slash; `\"id\"` without a slash is not a valid pointer.",
+          "description": "Primary-key fields as JSON Pointers (RFC 6901) into string-valued entity properties, e.g. `[\"/id\"]` for a single-column key or `[\"/tenant_id\", \"/handle\"]` for a composite key. Note the leading slash; `\"id\"` without a slash is not a valid pointer.",
           "items": {
             "type": "string",
             "format": "json-pointer",
@@ -101,6 +101,34 @@
                 }
               }
             }
+          }
+        },
+        "x-lix-state-foreign-keys": {
+          "type": "array",
+          "description": "Foreign keys from local fields to arbitrary live state rows. Each entry is exactly three required local JSON Pointers ordered as `[entity_id, schema_key, file_id]`: index 0 points to the local entity_id JSON array, index 1 points to the local schema_key string, and index 2 points to the local file_id string-or-null. Use explicit null for global file_id targets; omitted fields are invalid. The referenced state row is resolved in the same version.",
+          "items": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "uniqueItems": true,
+            "prefixItems": [
+              {
+                "type": "string",
+                "format": "json-pointer",
+                "description": "[0] Local JSON Pointer for the target entity_id. The value must be a non-empty JSON array of strings."
+              },
+              {
+                "type": "string",
+                "format": "json-pointer",
+                "description": "[1] Local JSON Pointer for the target schema_key. The value must be a string."
+              },
+              {
+                "type": "string",
+                "format": "json-pointer",
+                "description": "[2] Local JSON Pointer for the target file_id. The value must be a string or null."
+              }
+            ],
+            "items": false
           }
         },
         "x-lix-key": {

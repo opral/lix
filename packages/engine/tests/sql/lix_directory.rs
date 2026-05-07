@@ -557,13 +557,13 @@ simulation_test!(
             .expect("canonical directory insert should succeed");
 
         let nfc_collision = session
-            .execute(
-                "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
-                 ) VALUES ('dir-cafe-decomposed', 'lix_directory_descriptor', NULL, $1, '1', false, false)",
-                &[Value::Json(json!({
-                    "id": "dir-cafe-decomposed",
-                    "parent_id": null,
+			.execute(
+				"INSERT INTO lix_state (\
+	             entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+	             ) VALUES (lix_json('[\"dir-cafe-decomposed\"]'), 'lix_directory_descriptor', NULL, $1, '1', false, false)",
+				&[Value::Json(json!({
+					"id": "dir-cafe-decomposed",
+					"parent_id": null,
                     "name": "Cafe\u{301}",
                     "hidden": false,
                 }))],
@@ -573,13 +573,13 @@ simulation_test!(
         assert_eq!(nfc_collision.code, LixError::CODE_UNIQUE);
 
         let zero_width = session
-            .execute(
-                "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
-                 ) VALUES ('dir-zero-width', 'lix_directory_descriptor', NULL, $1, '1', false, false)",
-                &[Value::Json(json!({
-                    "id": "dir-zero-width",
-                    "parent_id": null,
+			.execute(
+				"INSERT INTO lix_state (\
+	             entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+	             ) VALUES (lix_json('[\"dir-zero-width\"]'), 'lix_directory_descriptor', NULL, $1, '1', false, false)",
+				&[Value::Json(json!({
+					"id": "dir-zero-width",
+					"parent_id": null,
                     "name": "zero\u{200D}width",
                     "hidden": false,
                 }))],
@@ -607,8 +607,8 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
                  ) VALUES \
-                 ('dir-a', 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-a\",\"parent_id\":\"dir-b\",\"name\":\"a\",\"hidden\":false}'), '1', false, false), \
-                 ('dir-b', 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-b\",\"parent_id\":\"dir-a\",\"name\":\"b\",\"hidden\":false}'), '1', false, false)",
+                 (lix_json('[\"dir-a\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-a\",\"parent_id\":\"dir-b\",\"name\":\"a\",\"hidden\":false}'), '1', false, false), \
+                 (lix_json('[\"dir-b\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-b\",\"parent_id\":\"dir-a\",\"name\":\"b\",\"hidden\":false}'), '1', false, false)",
                 &[],
             )
             .await
@@ -640,7 +640,7 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
                  ) VALUES \
-                 ('dir-foo', 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-foo\",\"parent_id\":null,\"name\":\"foo\",\"hidden\":false}'), '1', false, false)",
+                 (lix_json('[\"dir-foo\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-foo\",\"parent_id\":null,\"name\":\"foo\",\"hidden\":false}'), '1', false, false)",
                 &[],
             )
             .await
@@ -796,7 +796,7 @@ simulation_test!(
                 &format!(
                     "SELECT entity_id, schema_key \
                  FROM lix_state \
-                 WHERE entity_id IN ('{}', '{}', 'file-readme') \
+                 WHERE entity_id IN (lix_json('[\"{}\"]'), lix_json('[\"{}\"]'), lix_json('[\"file-readme\"]')) \
                  ORDER BY schema_key, entity_id",
                     directory_ids[0], directory_ids[1]
                 ),

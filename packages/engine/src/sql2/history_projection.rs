@@ -1,6 +1,6 @@
 use serde_json::Value as JsonValue;
 
-use crate::entity_identity::{EntityIdentity, EntityIdentityPart};
+use crate::entity_identity::EntityIdentity;
 use crate::LixError;
 
 /// Shared projection contract for typed history views.
@@ -44,7 +44,7 @@ fn primary_key_tombstone_value(
         return Ok(None);
     };
 
-    let identity = EntityIdentity::from_string(entity_id).map_err(|error| {
+    let identity = EntityIdentity::from_json_array_text(entity_id).map_err(|error| {
         LixError::unknown(format!(
             "failed to decode history tombstone entity identity: {error}"
         ))
@@ -52,29 +52,5 @@ fn primary_key_tombstone_value(
     Ok(identity
         .parts
         .get(part_index)
-        .map(entity_identity_part_json_value))
-}
-
-fn entity_identity_part_json_value(part: &EntityIdentityPart) -> JsonValue {
-    match part {
-        EntityIdentityPart::String(value) => JsonValue::String(value.clone()),
-        EntityIdentityPart::Bool(value) => JsonValue::Bool(*value),
-        EntityIdentityPart::Number(value) => value
-            .parse::<i64>()
-            .map(|value| JsonValue::Number(value.into()))
-            .or_else(|_| {
-                value
-                    .parse::<u64>()
-                    .map(|value| JsonValue::Number(value.into()))
-            })
-            .ok()
-            .or_else(|| {
-                value
-                    .parse::<f64>()
-                    .ok()
-                    .and_then(serde_json::Number::from_f64)
-                    .map(JsonValue::Number)
-            })
-            .unwrap_or_else(|| JsonValue::String(value.clone())),
-    }
+        .map(|part| JsonValue::String(part.clone())))
 }

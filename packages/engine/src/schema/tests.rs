@@ -192,6 +192,27 @@ fn validate_lix_schema_definition_rejects_missing_primary_key_properties() {
 }
 
 #[test]
+fn validate_lix_schema_definition_rejects_non_string_primary_key_properties() {
+    let schema = json!({
+        "x-lix-key": "numeric_pk",
+        "x-lix-version": "1",
+        "type": "object",
+        "properties": {
+            "id": { "type": "number" },
+            "value": { "type": "string" }
+        },
+        "required": ["id", "value"],
+        "x-lix-primary-key": ["/id"],
+        "additionalProperties": false
+    });
+
+    let err = validate_lix_schema_definition(&schema).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("x-lix-primary-key property \"/id\" must have type \"string\""));
+}
+
+#[test]
 fn validate_lix_schema_definition_rejects_missing_unique_constraint_properties() {
     let schema = json!({
         "x-lix-key": "missing_unique",
@@ -599,19 +620,15 @@ fn x_lix_foreign_keys_rejects_scope_field() {
 }
 
 #[test]
-fn x_lix_foreign_keys_with_composite_key() {
+fn x_lix_state_foreign_keys_with_ordered_state_address_tuple() {
     let schema = json!({
         "type": "object",
-        "x-lix-key": "entity_label",
+        "x-lix-key": "label_assignment",
         "x-lix-version": "1",
+        "x-lix-state-foreign-keys": [
+            ["/target_entity_id", "/target_schema_key", "/target_file_id"]
+        ],
         "x-lix-foreign-keys": [
-            {
-                "properties": ["/entity_id", "/schema_key", "/file_id"],
-                "references": {
-                    "schemaKey": "lix_state",
-                    "properties": ["/entity_id", "/schema_key", "/file_id"]
-                }
-            },
             {
                 "properties": ["/label_id"],
                 "references": {
@@ -621,12 +638,16 @@ fn x_lix_foreign_keys_with_composite_key() {
             }
         ],
         "properties": {
-            "entity_id": { "type": "string" },
-            "schema_key": { "type": "string" },
-            "file_id": { "type": "string" },
+            "target_entity_id": {
+                "type": "array",
+                "items": { "type": "string" },
+                "minItems": 1
+            },
+            "target_schema_key": { "type": "string" },
+            "target_file_id": { "type": ["string", "null"] },
             "label_id": { "type": "string" }
         },
-        "required": ["entity_id", "schema_key", "file_id", "label_id"],
+        "required": ["target_entity_id", "target_schema_key", "target_file_id", "label_id"],
         "additionalProperties": false
     });
 
@@ -634,30 +655,88 @@ fn x_lix_foreign_keys_with_composite_key() {
 }
 
 #[test]
-fn x_lix_foreign_keys_rejects_unaliased_lix_table_reference() {
+fn x_lix_state_foreign_keys_rejects_wrong_tuple_order_by_type() {
     let schema = json!({
         "type": "object",
-        "x-lix-key": "entity_label",
+        "x-lix-key": "bad_label_assignment",
+        "x-lix-version": "1",
+        "x-lix-state-foreign-keys": [
+            ["/target_schema_key", "/target_entity_id", "/target_file_id"]
+        ],
+        "properties": {
+            "target_entity_id": {
+                "type": "array",
+                "items": { "type": "string" },
+                "minItems": 1
+            },
+            "target_schema_key": { "type": "string" },
+            "target_file_id": { "type": ["string", "null"] }
+        },
+        "required": ["target_entity_id", "target_schema_key", "target_file_id"],
+        "additionalProperties": false
+    });
+
+    let err =
+        validate_lix_schema_definition(&schema).expect_err("wrong tuple order should be rejected");
+    assert!(
+        err.message.contains("[entity_id, schema_key, file_id]"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn x_lix_state_foreign_keys_requires_address_tuple_properties() {
+    let schema = json!({
+        "type": "object",
+        "x-lix-key": "optional_label_assignment",
+        "x-lix-version": "1",
+        "x-lix-state-foreign-keys": [
+            ["/target_entity_id", "/target_schema_key", "/target_file_id"]
+        ],
+        "properties": {
+            "target_entity_id": {
+                "type": "array",
+                "items": { "type": "string" },
+                "minItems": 1
+            },
+            "target_schema_key": { "type": "string" },
+            "target_file_id": { "type": ["string", "null"] }
+        },
+        "required": ["target_entity_id", "target_schema_key"],
+        "additionalProperties": false
+    });
+
+    let err = validate_lix_schema_definition(&schema)
+        .expect_err("state foreign key tuple fields should be required");
+    assert!(
+        err.message.contains("file_id") && err.message.contains("must be required"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn x_lix_foreign_keys_treat_schema_keys_literally() {
+    let schema = json!({
+        "type": "object",
+        "x-lix-key": "custom_label_assignment",
         "x-lix-version": "1",
         "x-lix-foreign-keys": [
             {
-                "properties": ["/entity_id", "/schema_key", "/file_id"],
+                "properties": ["/label_id"],
                 "references": {
-                    "schemaKey": "state",
-                    "properties": ["/entity_id", "/schema_key", "/file_id"]
+                    "schemaKey": "label",
+                    "properties": ["/id"]
                 }
             }
         ],
         "properties": {
-            "entity_id": { "type": "string" },
-            "schema_key": { "type": "string" },
-            "file_id": { "type": "string" }
+            "label_id": { "type": "string" }
         },
-        "required": ["entity_id", "schema_key", "file_id"],
+        "required": ["label_id"],
         "additionalProperties": false
     });
 
-    assert!(validate_lix_schema_definition(&schema).is_err());
+    assert!(validate_lix_schema_definition(&schema).is_ok());
 }
 
 #[test]
