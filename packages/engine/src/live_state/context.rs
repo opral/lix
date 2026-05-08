@@ -412,11 +412,12 @@ async fn scan_scope(
     untracked_state: &UntrackedStateContext,
     request: &LiveStateScanRequest,
 ) -> Result<LiveStateScanScope, LixError> {
+    let includes_commit_graph_projection = should_include_commit_graph_projection(request);
     if request.filter.version_ids.is_empty() {
         return Ok(LiveStateScanScope {
             storage_version_ids: all_version_ref_ids(store, untracked_state).await?,
             projection_version_ids: Vec::new(),
-            includes_commit_graph_projection: true,
+            includes_commit_graph_projection,
         });
     }
 
@@ -430,9 +431,22 @@ async fn scan_scope(
     let storage_version_ids = visibility::expanded_version_ids(&projection_version_ids);
     Ok(LiveStateScanScope {
         storage_version_ids,
-        includes_commit_graph_projection: !projection_version_ids.is_empty(),
+        includes_commit_graph_projection: includes_commit_graph_projection
+            && !projection_version_ids.is_empty(),
         projection_version_ids,
     })
+}
+
+fn should_include_commit_graph_projection(request: &LiveStateScanRequest) -> bool {
+    if request.filter.untracked == Some(true) {
+        return false;
+    }
+    request.filter.schema_keys.is_empty()
+        || request
+            .filter
+            .schema_keys
+            .iter()
+            .any(|schema_key| schema_key == COMMIT_SCHEMA_KEY)
 }
 
 async fn all_version_ref_ids(
@@ -1598,6 +1612,30 @@ mod tests {
         assert!(!rows[0].untracked);
         assert_eq!(rows[0].change_id.as_deref(), Some("change-commit-a"));
         assert_eq!(rows[0].commit_id.as_deref(), Some("commit-a"));
+    }
+
+    #[test]
+    fn commit_graph_projection_is_skipped_for_non_commit_schema_scans() {
+        assert!(!should_include_commit_graph_projection(
+            &LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec!["test_schema".to_string()],
+                    version_ids: vec!["version-a".to_string()],
+                    ..LiveStateFilter::default()
+                },
+                ..LiveStateScanRequest::default()
+            }
+        ));
+        assert!(should_include_commit_graph_projection(
+            &LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec![COMMIT_SCHEMA_KEY.to_string()],
+                    version_ids: vec!["version-a".to_string()],
+                    ..LiveStateFilter::default()
+                },
+                ..LiveStateScanRequest::default()
+            }
+        ));
     }
 
     #[tokio::test]
