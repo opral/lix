@@ -1,6 +1,6 @@
 use text_plugin::{
     document_schema_definition, document_schema_json, line_schema_definition, line_schema_json,
-    manifest_json, DOCUMENT_SCHEMA_KEY, LINE_SCHEMA_KEY, SCHEMA_VERSION,
+    manifest_json, DOCUMENT_SCHEMA_KEY, LINE_SCHEMA_KEY,
 };
 
 #[test]
@@ -12,13 +12,6 @@ fn line_schema_matches_constants() {
             .and_then(serde_json::Value::as_str)
             .expect("x-lix-key must be string"),
         LINE_SCHEMA_KEY
-    );
-    assert_eq!(
-        schema
-            .get("x-lix-version")
-            .and_then(serde_json::Value::as_str)
-            .expect("x-lix-version must be string"),
-        SCHEMA_VERSION
     );
 }
 
@@ -32,13 +25,6 @@ fn document_schema_matches_constants() {
             .expect("x-lix-key must be string"),
         DOCUMENT_SCHEMA_KEY
     );
-    assert_eq!(
-        schema
-            .get("x-lix-version")
-            .and_then(serde_json::Value::as_str)
-            .expect("x-lix-version must be string"),
-        SCHEMA_VERSION
-    );
 }
 
 #[test]
@@ -46,9 +32,7 @@ fn schema_json_accessors_return_expected_text() {
     let line = line_schema_json();
     let document = document_schema_json();
     assert!(line.contains("\"x-lix-key\": \"text_line\""));
-    assert!(line.contains("\"x-lix-version\": \"1\""));
     assert!(document.contains("\"x-lix-key\": \"text_document\""));
-    assert!(document.contains("\"x-lix-version\": \"1\""));
 }
 
 #[test]

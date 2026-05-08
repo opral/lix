@@ -1,6 +1,5 @@
 {
   "x-lix-key": "json_pointer",
-  "x-lix-version": "1",
   "x-lix-primary-key": [
     "/path"
   ],

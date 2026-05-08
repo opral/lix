@@ -185,7 +185,6 @@ pub(crate) enum DomainFileScope {
 pub(crate) struct DomainRowIdentity {
     domain: Domain,
     schema_key: String,
-    schema_version: String,
     entity_id: EntityIdentity,
 }
 
@@ -193,13 +192,11 @@ impl DomainRowIdentity {
     pub(crate) fn new(
         domain: Domain,
         schema_key: impl Into<String>,
-        schema_version: impl Into<String>,
         entity_id: EntityIdentity,
     ) -> Self {
         Self {
             domain,
             schema_key: schema_key.into(),
-            schema_version: schema_version.into(),
             entity_id,
         }
     }
@@ -208,7 +205,6 @@ impl DomainRowIdentity {
         Self::new(
             Domain::for_live_row(row),
             row.schema_key.clone(),
-            row.schema_version.clone(),
             row.entity_id.clone(),
         )
     }
@@ -216,10 +212,9 @@ impl DomainRowIdentity {
     pub(crate) fn in_domain(
         domain: Domain,
         schema_key: impl Into<String>,
-        schema_version: impl Into<String>,
         entity_id: EntityIdentity,
     ) -> Self {
-        Self::new(domain, schema_key, schema_version, entity_id)
+        Self::new(domain, schema_key, entity_id)
     }
 
     #[cfg(test)]
@@ -228,13 +223,11 @@ impl DomainRowIdentity {
         untracked: bool,
         file_id: Option<String>,
         schema_key: impl Into<String>,
-        schema_version: impl Into<String>,
         entity_id: EntityIdentity,
     ) -> Self {
         Self::new(
             Domain::exact_file(version_id, untracked, file_id),
             schema_key,
-            schema_version,
             entity_id,
         )
     }
@@ -243,7 +236,6 @@ impl DomainRowIdentity {
         Self {
             domain,
             schema_key: self.schema_key.clone(),
-            schema_version: self.schema_version.clone(),
             entity_id: self.entity_id.clone(),
         }
     }
@@ -260,10 +252,6 @@ impl DomainRowIdentity {
         self.schema_key.clone()
     }
 
-    pub(crate) fn schema_version(&self) -> &str {
-        &self.schema_version
-    }
-
     pub(crate) fn entity_id(&self) -> &EntityIdentity {
         &self.entity_id
     }
@@ -276,13 +264,9 @@ impl DomainRowIdentity {
         &self,
         domain: &Domain,
         schema_key: &str,
-        schema_version: &str,
         entity_id: &EntityIdentity,
     ) -> bool {
-        &self.domain == domain
-            && self.schema_key == schema_key
-            && self.schema_version == schema_version
-            && &self.entity_id == entity_id
+        &self.domain == domain && self.schema_key == schema_key && &self.entity_id == entity_id
     }
 
     pub(crate) fn reachable_target_identities(&self) -> Vec<Self> {
@@ -306,28 +290,21 @@ impl DomainRowIdentity {
 pub(crate) struct DomainSchemaIdentity {
     domain: Domain,
     schema_key: String,
-    schema_version: String,
 }
 
 impl DomainSchemaIdentity {
-    pub(crate) fn new(
-        domain: Domain,
-        schema_key: impl Into<String>,
-        schema_version: impl Into<String>,
-    ) -> Self {
+    pub(crate) fn new(domain: Domain, schema_key: impl Into<String>) -> Self {
         Self {
             domain: domain.schema_catalog_domain(),
             schema_key: schema_key.into(),
-            schema_version: schema_version.into(),
         }
     }
 
     pub(crate) fn fingerprint_component(&self) -> String {
         format!(
-            "{}|{}|{}",
+            "{}|{}",
             self.domain.fingerprint_component(),
-            self.schema_key,
-            self.schema_version
+            self.schema_key
         )
     }
 }

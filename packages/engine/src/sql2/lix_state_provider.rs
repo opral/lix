@@ -806,7 +806,6 @@ fn lix_state_update_write_rows_from_batch(
                     "lix_state",
                 )?,
                 origin: None,
-                schema_version: required_string_value(batch, row_index, "schema_version")?,
                 created_at: None,
                 updated_at: None,
                 global,
@@ -927,7 +926,6 @@ fn lix_state_write_rows_from_batch(
                 snapshot: optional_json_value(batch, row_index, "snapshot_content")?,
                 metadata: optional_metadata_value(batch, row_index, "metadata", "lix_state")?,
                 origin: None,
-                schema_version: required_string_value(batch, row_index, "schema_version")?,
                 created_at: optional_string_value(batch, row_index, "created_at")?,
                 updated_at: optional_string_value(batch, row_index, "updated_at")?,
                 global,
@@ -1165,7 +1163,6 @@ fn lix_state_schema() -> SchemaRef {
         Field::new("file_id", DataType::Utf8, true),
         json_field("snapshot_content", true),
         json_field("metadata", true),
-        Field::new("schema_version", DataType::Utf8, true),
         Field::new("created_at", DataType::Utf8, true),
         Field::new("updated_at", DataType::Utf8, true),
         Field::new("global", DataType::Boolean, true),
@@ -1182,7 +1179,6 @@ fn lix_state_by_version_schema() -> SchemaRef {
         Field::new("file_id", DataType::Utf8, true),
         json_field("snapshot_content", true),
         json_field("metadata", true),
-        Field::new("schema_version", DataType::Utf8, true),
         Field::new("created_at", DataType::Utf8, true),
         Field::new("updated_at", DataType::Utf8, true),
         Field::new("global", DataType::Boolean, true),
@@ -1506,9 +1502,6 @@ fn lix_state_record_batch(
                         .map(|row| row.metadata.as_ref().map(serialize_row_metadata))
                         .collect::<Vec<_>>(),
                 )),
-                "schema_version" => {
-                    string_array(rows.iter().map(|row| Some(row.schema_version.as_str())))
-                }
                 "created_at" => string_array(rows.iter().map(|row| Some(row.created_at.as_str()))),
                 "updated_at" => string_array(rows.iter().map(|row| Some(row.updated_at.as_str()))),
                 "global" => Arc::new(BooleanArray::from(
@@ -1898,7 +1891,6 @@ mod tests {
                 string_column(vec![None]),
                 string_column(vec![Some("{\"key\":\"hello\",\"value\":\"world\"}")]),
                 string_column(vec![Some("{\"source\":\"test\"}")]),
-                string_column(vec![Some("1")]),
                 string_column(vec![Some("2026-04-23T00:00:00Z")]),
                 string_column(vec![Some("2026-04-23T01:00:00Z")]),
                 Arc::new(BooleanArray::from(vec![global])) as ArrayRef,
@@ -1919,7 +1911,6 @@ mod tests {
                 string_column(vec![None]),
                 string_column(vec![Some("{\"key\":\"hello\",\"value\":\"world\"}")]),
                 string_column(vec![None]),
-                string_column(vec![Some("1")]),
                 string_column(vec![None]),
                 string_column(vec![None]),
                 Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
@@ -1938,7 +1929,6 @@ mod tests {
             file_id: None,
             snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
             metadata: metadata.map(str::to_string),
-            schema_version: "1".to_string(),
             version_id: "version-a".to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),
@@ -2000,7 +1990,7 @@ mod tests {
         ]);
 
         let request =
-            lix_state_scan_request(&schema, None, Some(&vec![0, 1, 12]), &route, Some(10));
+            lix_state_scan_request(&schema, None, Some(&vec![0, 1, 11]), &route, Some(10));
 
         assert_eq!(request.filter.schema_keys, vec!["profile".to_string()]);
         assert_eq!(request.filter.version_ids, vec!["v1".to_string()]);
@@ -2262,7 +2252,6 @@ mod tests {
                     json!({"source": "test"})
                 )),
                 origin: None,
-                schema_version: "1".to_string(),
                 created_at: Some("2026-04-23T00:00:00Z".to_string()),
                 updated_at: Some("2026-04-23T01:00:00Z".to_string()),
                 global: false,
@@ -2310,7 +2299,6 @@ mod tests {
                         json!({"source": "test"})
                     )),
                     origin: None,
-                    schema_version: "1".to_string(),
                     created_at: Some("2026-04-23T00:00:00Z".to_string()),
                     updated_at: Some("2026-04-23T01:00:00Z".to_string()),
                     global: false,
@@ -2419,7 +2407,6 @@ mod tests {
                         json!({"schema_key": "lix_key_value"})
                     )),
                     origin: None,
-                    schema_version: "1".to_string(),
                     created_at: None,
                     updated_at: None,
                     global: false,
@@ -2477,7 +2464,6 @@ mod tests {
                             json!({"source": "one"})
                         )),
                         origin: None,
-                        schema_version: "1".to_string(),
                         created_at: None,
                         updated_at: None,
                         global: false,
@@ -2495,7 +2481,6 @@ mod tests {
                             json!({"source": "two"})
                         )),
                         origin: None,
-                        schema_version: "1".to_string(),
                         created_at: None,
                         updated_at: None,
                         global: false,

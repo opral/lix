@@ -1,6 +1,6 @@
 use crate::common::{BlockSnapshotContent, DocumentSnapshotContent};
 use crate::exports::lix::plugin::api::{DetectStateContext, EntityChange, File, PluginError};
-use crate::schemas::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, ENTITY_SCHEMA_VERSION};
+use crate::schemas::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY};
 use crate::ROOT_ENTITY_ID;
 use markdown::mdast::{Node, Root};
 use markdown::{to_mdast, ParseOptions};
@@ -70,7 +70,6 @@ pub(crate) fn detect_changes(
             changes.push(EntityChange {
                 entity_id: id.clone(),
                 schema_key: before_block.schema_key.clone(),
-                schema_version: ENTITY_SCHEMA_VERSION.to_string(),
                 snapshot_content: None,
             });
         }
@@ -98,7 +97,6 @@ pub(crate) fn detect_changes(
         changes.push(EntityChange {
             entity_id: ROOT_ENTITY_ID.to_string(),
             schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
-            schema_version: ENTITY_SCHEMA_VERSION.to_string(),
             snapshot_content: Some(snapshot_content),
         });
     }
@@ -468,7 +466,6 @@ fn block_upsert_change(block: &ParsedBlock) -> Result<EntityChange, PluginError>
     Ok(EntityChange {
         entity_id: block.id.clone(),
         schema_key: block.schema_key.clone(),
-        schema_version: ENTITY_SCHEMA_VERSION.to_string(),
         snapshot_content: Some(snapshot_content),
     })
 }

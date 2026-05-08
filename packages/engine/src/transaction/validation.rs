@@ -2,6 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value as JsonValue;
 
+use crate::common::format_json_pointer;
+#[cfg(test)]
+use crate::common::parse_json_pointer;
 use crate::common::{json_pointer_get, validate_row_metadata};
 use crate::domain::{Domain, DomainFileScope, DomainRowIdentity};
 use crate::entity_identity::{canonical_json_text, EntityIdentity, EntityIdentityError};
@@ -10,11 +13,12 @@ use crate::live_state::LiveStateRowIdentity;
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
 };
-use crate::schema::{format_lix_schema_validation_errors, schema_from_registered_snapshot};
+use crate::schema::{
+    format_lix_schema_validation_errors, schema_from_registered_snapshot, validate_schema_amendment,
+};
 #[cfg(test)]
 use crate::schema::{
-    is_seed_schema_key, reject_unsupported_registered_schema_version, validate_lix_schema,
-    validate_lix_schema_definition, SchemaKey,
+    is_seed_schema_key, validate_lix_schema, validate_lix_schema_definition, SchemaKey,
 };
 use crate::schema_catalog::{
     ForeignKeyPlan, SchemaCatalog, SchemaCatalogKey, SchemaPlan, StateForeignKeyPlan,
@@ -110,7 +114,6 @@ async fn load_committed_constraint_row(
     live_state: &dyn LiveStateReader,
     domain: &Domain,
     schema_key: &str,
-    schema_version: &str,
     entity_id: EntityIdentity,
     include_tombstones: bool,
 ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
@@ -123,7 +126,6 @@ async fn load_committed_constraint_row(
     )
     .await?
     .into_iter()
-    .filter(|row| row.schema_version == schema_version)
     .next())
 }
 
@@ -133,7 +135,7 @@ async fn load_committed_constraint_row(
 /// frontend. It builds one transaction-visible schema catalog, validates pending
 /// schema registrations, checks exact schema existence, and validates each
 /// non-tombstone snapshot against the compiled JSON Schema for its
-/// `(schema_key, schema_version)`.
+/// `schema_key`.
 ///
 /// Cross-row constraints such as `x-lix-unique` and foreign keys should also
 /// live here so they can share transaction-local indexes and see the final
@@ -197,7 +199,6 @@ pub(crate) async fn validate_prepared_writes(
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct DirectoryDescriptorScope {
     domain: Domain,
-    schema_version: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -263,14 +264,18 @@ async fn validate_registered_schema_identity_is_canonical(
             .snapshot_json()
             .expect("pending registered schema row has snapshot_content");
         if &snapshot != pending_snapshot {
-            let (key, _) = schema_from_registered_snapshot(pending_snapshot)?;
-            return Err(LixError::new(
-                LixError::CODE_SCHEMA_DEFINITION,
-                format!(
-                    "schema '{}' version '{}' is already registered with a different definition; schema identity must be canonical",
-                    key.schema_key, key.schema_version
-                ),
-            ));
+            let (key, pending_schema) = schema_from_registered_snapshot(pending_snapshot)?;
+            let (_, committed_schema) = schema_from_registered_snapshot(&snapshot)?;
+            validate_schema_amendment(&committed_schema, &pending_schema).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    format!(
+                        "schema '{}' is already registered with a different definition; schema identity must be canonical",
+                        key.schema_key
+                    ),
+                )
+            })?;
+            continue;
         }
     }
 
@@ -326,7 +331,6 @@ fn staged_directory_descriptor_scopes(
         .filter(|row| row.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
         .map(|row| DirectoryDescriptorScope {
             domain: row.domain(),
-            schema_version: row.schema_version().to_string(),
         })
         .collect()
 }
@@ -352,8 +356,7 @@ async fn committed_directory_parent_map(
             let Some(snapshot_content) = row.snapshot_content.as_deref() else {
                 continue;
             };
-            let snapshot =
-                parse_directory_descriptor_snapshot(&row.schema_version, snapshot_content)?;
+            let snapshot = parse_directory_descriptor_snapshot(snapshot_content)?;
             parents.insert(snapshot.id, snapshot.parent_id);
         }
     }
@@ -362,12 +365,10 @@ async fn committed_directory_parent_map(
 
 fn committed_directory_row_is_in_domain(
     row: &MaterializedLiveStateRow,
-    scope: &DirectoryDescriptorScope,
+    _scope: &DirectoryDescriptorScope,
     domain: &Domain,
 ) -> bool {
-    row.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
-        && row.schema_version == scope.schema_version
-        && domain.contains(row)
+    row.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY && domain.contains(row)
 }
 
 fn apply_staged_directory_parent_rows(
@@ -378,7 +379,6 @@ fn apply_staged_directory_parent_rows(
     let reachable_domains = scope.domain.directory_parent_domains();
     for row in staged_rows {
         if row.schema_key() != DIRECTORY_DESCRIPTOR_SCHEMA_KEY
-            || row.schema_version() != scope.schema_version
             || !reachable_domains.contains(&row.domain())
         {
             continue;
@@ -388,78 +388,57 @@ fn apply_staged_directory_parent_rows(
             parents.remove(&id);
             continue;
         };
-        let snapshot = directory_descriptor_snapshot_from_value(row.schema_version(), snapshot)?;
+        let snapshot = directory_descriptor_snapshot_from_value(snapshot)?;
         parents.insert(snapshot.id, snapshot.parent_id);
     }
     Ok(())
 }
 
 fn parse_directory_descriptor_snapshot(
-    schema_version: &str,
     snapshot_content: &str,
 ) -> Result<DirectoryDescriptorSnapshot, LixError> {
     serde_json::from_str::<DirectoryDescriptorSnapshot>(snapshot_content).map_err(|error| {
         LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
-            format!(
-                "lix_directory_descriptor version '{schema_version}' snapshot_content is invalid JSON: {error}"
-            ),
+            format!("lix_directory_descriptor snapshot_content is invalid JSON: {error}"),
         )
     })
 }
 
 fn directory_descriptor_snapshot_from_value(
-    schema_version: &str,
     snapshot: &JsonValue,
 ) -> Result<DirectoryDescriptorSnapshot, LixError> {
     Ok(DirectoryDescriptorSnapshot {
-        id: required_snapshot_string(snapshot, "lix_directory_descriptor", schema_version, "id")?,
-        parent_id: optional_snapshot_string(
-            snapshot,
-            "lix_directory_descriptor",
-            schema_version,
-            "parent_id",
-        )?,
-        name: required_snapshot_string(
-            snapshot,
-            "lix_directory_descriptor",
-            schema_version,
-            "name",
-        )?,
+        id: required_snapshot_string(snapshot, "lix_directory_descriptor", "id")?,
+        parent_id: optional_snapshot_string(snapshot, "lix_directory_descriptor", "parent_id")?,
+        name: required_snapshot_string(snapshot, "lix_directory_descriptor", "name")?,
     })
 }
 
 fn file_descriptor_snapshot_from_value(
-    schema_version: &str,
     snapshot: &JsonValue,
 ) -> Result<FileDescriptorSnapshot, LixError> {
     Ok(FileDescriptorSnapshot {
-        directory_id: optional_snapshot_string(
-            snapshot,
-            "lix_file_descriptor",
-            schema_version,
-            "directory_id",
-        )?,
-        name: required_snapshot_string(snapshot, "lix_file_descriptor", schema_version, "name")?,
+        directory_id: optional_snapshot_string(snapshot, "lix_file_descriptor", "directory_id")?,
+        name: required_snapshot_string(snapshot, "lix_file_descriptor", "name")?,
     })
 }
 
 fn required_snapshot_string(
     snapshot: &JsonValue,
     schema_key: &str,
-    schema_version: &str,
     field: &str,
 ) -> Result<String, LixError> {
     let Some(value) = snapshot.get(field) else {
         return Err(LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
-            format!("{schema_key} version '{schema_version}' snapshot_content is missing field '{field}'"),
+            format!("{schema_key} snapshot_content is missing field '{field}'"),
         ));
     };
     value.as_str().map(str::to_string).ok_or_else(|| {
         LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
-            format!("{schema_key} version '{schema_version}' snapshot_content field '{field}' must be a string"),
+            format!("{schema_key} snapshot_content field '{field}' must be a string"),
         )
     })
 }
@@ -467,7 +446,6 @@ fn required_snapshot_string(
 fn optional_snapshot_string(
     snapshot: &JsonValue,
     schema_key: &str,
-    schema_version: &str,
     field: &str,
 ) -> Result<Option<String>, LixError> {
     let Some(value) = snapshot.get(field) else {
@@ -476,12 +454,15 @@ fn optional_snapshot_string(
     if value.is_null() {
         return Ok(None);
     }
-    value.as_str().map(|value| Some(value.to_string())).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_SCHEMA_VALIDATION,
-            format!("{schema_key} version '{schema_version}' snapshot_content field '{field}' must be a string or null"),
-        )
-    })
+    value
+        .as_str()
+        .map(|value| Some(value.to_string()))
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!("{schema_key} snapshot_content field '{field}' must be a string or null"),
+            )
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -636,11 +617,9 @@ fn filesystem_namespace_occupant_from_live_row(
     };
     let occupant = match row.schema_key.as_str() {
         DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-            directory_namespace_occupant(&row.schema_version, &row.entity_id, snapshot_content)?
+            directory_namespace_occupant(&row.entity_id, snapshot_content)?
         }
-        FILE_DESCRIPTOR_SCHEMA_KEY => {
-            file_namespace_occupant(&row.schema_version, &row.entity_id, snapshot_content)?
-        }
+        FILE_DESCRIPTOR_SCHEMA_KEY => file_namespace_occupant(&row.entity_id, snapshot_content)?,
         _ => return Ok(None),
     };
     Ok(Some((identity, occupant)))
@@ -652,11 +631,9 @@ fn filesystem_namespace_occupant_from_staged_row(
 ) -> Result<FilesystemNamespaceOccupant, LixError> {
     match row.schema_key() {
         DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-            directory_namespace_occupant_from_value(row.schema_version(), row.entity_id(), snapshot)
+            directory_namespace_occupant_from_value(row.entity_id(), snapshot)
         }
-        FILE_DESCRIPTOR_SCHEMA_KEY => {
-            file_namespace_occupant_from_value(row.schema_version(), row.entity_id(), snapshot)
-        }
+        FILE_DESCRIPTOR_SCHEMA_KEY => file_namespace_occupant_from_value(row.entity_id(), snapshot),
         _ => Err(LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
             format!(
@@ -668,11 +645,10 @@ fn filesystem_namespace_occupant_from_staged_row(
 }
 
 fn directory_namespace_occupant(
-    schema_version: &str,
     entity_id: &EntityIdentity,
     snapshot_content: &str,
 ) -> Result<FilesystemNamespaceOccupant, LixError> {
-    let snapshot = parse_directory_descriptor_snapshot(schema_version, snapshot_content)?;
+    let snapshot = parse_directory_descriptor_snapshot(snapshot_content)?;
     Ok(FilesystemNamespaceOccupant::Directory {
         entity_id: entity_id.clone(),
         parent_id: snapshot.parent_id,
@@ -681,11 +657,10 @@ fn directory_namespace_occupant(
 }
 
 fn directory_namespace_occupant_from_value(
-    schema_version: &str,
     entity_id: &EntityIdentity,
     snapshot: &JsonValue,
 ) -> Result<FilesystemNamespaceOccupant, LixError> {
-    let snapshot = directory_descriptor_snapshot_from_value(schema_version, snapshot)?;
+    let snapshot = directory_descriptor_snapshot_from_value(snapshot)?;
     Ok(FilesystemNamespaceOccupant::Directory {
         entity_id: entity_id.clone(),
         parent_id: snapshot.parent_id,
@@ -694,18 +669,16 @@ fn directory_namespace_occupant_from_value(
 }
 
 fn file_namespace_occupant(
-    schema_version: &str,
     entity_id: &EntityIdentity,
     snapshot_content: &str,
 ) -> Result<FilesystemNamespaceOccupant, LixError> {
-    let snapshot = serde_json::from_str::<FileDescriptorSnapshot>(snapshot_content).map_err(|error| {
-        LixError::new(
-            LixError::CODE_SCHEMA_VALIDATION,
-            format!(
-                "lix_file_descriptor version '{schema_version}' snapshot_content is invalid JSON: {error}"
-            ),
-        )
-    })?;
+    let snapshot =
+        serde_json::from_str::<FileDescriptorSnapshot>(snapshot_content).map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!("lix_file_descriptor snapshot_content is invalid JSON: {error}"),
+            )
+        })?;
     Ok(FilesystemNamespaceOccupant::File {
         entity_id: entity_id.clone(),
         directory_id: snapshot.directory_id,
@@ -714,11 +687,10 @@ fn file_namespace_occupant(
 }
 
 fn file_namespace_occupant_from_value(
-    schema_version: &str,
     entity_id: &EntityIdentity,
     snapshot: &JsonValue,
 ) -> Result<FilesystemNamespaceOccupant, LixError> {
-    let snapshot = file_descriptor_snapshot_from_value(schema_version, snapshot)?;
+    let snapshot = file_descriptor_snapshot_from_value(snapshot)?;
     Ok(FilesystemNamespaceOccupant::File {
         entity_id: entity_id.clone(),
         directory_id: snapshot.directory_id,
@@ -865,7 +837,6 @@ async fn validate_committed_insert_identities(
             input.live_state,
             pending_identity.domain(),
             pending_identity.schema_key(),
-            pending_identity.schema_version(),
             pending_identity.entity_id_owned(),
             false,
         )
@@ -882,7 +853,6 @@ async fn validate_committed_insert_identities(
             LixError::CODE_UNIQUE,
             duplicate_insert_identity_message(
                 identity.schema_key(),
-                &committed_row.schema_version,
                 identity.entity_id(),
                 None,
                 origin,
@@ -909,7 +879,6 @@ async fn validate_version_ref_delete_restrictions(
             let descriptor_identity = DomainRowIdentity::in_domain(
                 source_domain,
                 VERSION_DESCRIPTOR_SCHEMA_KEY,
-                "1",
                 tombstone.identity.entity_id_owned(),
             );
             if pending_constraints.tombstones_target_identity(&descriptor_identity) {
@@ -926,7 +895,6 @@ async fn validate_version_ref_delete_restrictions(
                 input.live_state,
                 descriptor_identity.domain(),
                 descriptor_identity.schema_key(),
-                descriptor_identity.schema_version(),
                 descriptor_identity.entity_id_owned(),
                 false,
             )
@@ -1003,7 +971,6 @@ impl PendingFileDescriptorIndex {
             .get(&DomainRowIdentity::in_domain(
                 domain.with_exact_file_scope(None),
                 FILE_DESCRIPTOR_SCHEMA_KEY,
-                "1",
                 EntityIdentity::single(file_id),
             ))
             .copied()
@@ -1055,7 +1022,6 @@ async fn committed_file_descriptor_exists_in_domain(
         live_state,
         &domain.with_exact_file_scope(None),
         FILE_DESCRIPTOR_SCHEMA_KEY,
-        "1",
         EntityIdentity::single(file_id),
         false,
     )
@@ -1093,12 +1059,6 @@ fn validate_staged_row_shape(row: PreparedValidationRow<'_>) -> Result<(), LixEr
             "engine transaction validation requires non-empty schema_key",
         ));
     }
-    if row.schema_version().is_empty() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "engine transaction validation requires non-empty schema_version",
-        ));
-    }
     if row.schema_key() == REGISTERED_SCHEMA_KEY && row.file_id().is_some() {
         return Err(LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
@@ -1115,11 +1075,7 @@ fn validate_staged_row_metadata(row: PreparedValidationRow<'_>) -> Result<(), Li
     };
     validate_row_metadata(
         metadata,
-        format!(
-            "metadata for schema '{}' version '{}'",
-            row.schema_key(),
-            row.schema_version()
-        ),
+        format!("metadata for schema '{}'", row.schema_key()),
     )?;
     Ok(())
 }
@@ -1151,7 +1107,6 @@ impl PendingSchemaDomains {
     fn validate_row_schema_domain(&self, row: PreparedValidationRow<'_>) -> Result<(), LixError> {
         let key = SchemaCatalogKey {
             schema_key: row.schema_key().to_string(),
-            schema_version: row.schema_version().to_string(),
         };
         let Some(domains) = self.domains_by_key.get(&key) else {
             return Ok(());
@@ -1163,9 +1118,8 @@ impl PendingSchemaDomains {
         Err(LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
             format!(
-                "schema '{}' version '{}' is pending in another validation domain",
-                row.schema_key(),
-                row.schema_version()
+                "schema '{}' is pending in another validation domain",
+                row.schema_key()
             ),
         ))
     }
@@ -1178,22 +1132,19 @@ fn schema_plan_for_row<'a>(
 ) -> Result<&'a SchemaPlan, LixError> {
     pending_schema_domains.validate_row_schema_domain(row)?;
     if let Some(plan) = schema_catalog.plan(row.schema_plan_id()) {
-        if plan.key.schema_key == row.schema_key()
-            && plan.key.schema_version == row.schema_version()
-        {
+        if plan.key.schema_key == row.schema_key() {
             return Ok(plan);
         }
     }
     #[cfg(test)]
-    if let Some((_, plan)) = schema_catalog.plan_for_key(row.schema_key(), row.schema_version()) {
+    if let Some((_, plan)) = schema_catalog.plan_for_key(row.schema_key()) {
         return Ok(plan);
     }
     Err(LixError::new(
         LixError::CODE_SCHEMA_DEFINITION,
         format!(
-            "schema plan for schema '{}' version '{}' is not visible to this transaction",
-            row.schema_key(),
-            row.schema_version()
+            "schema plan for schema '{}' is not visible to this transaction",
+            row.schema_key()
         ),
     ))
 }
@@ -1202,17 +1153,13 @@ fn validate_schema_matches_row(
     row: PreparedValidationRow<'_>,
     schema_plan: &SchemaPlan,
 ) -> Result<(), LixError> {
-    if schema_plan.key.schema_key != row.schema_key()
-        || schema_plan.key.schema_version != row.schema_version()
-    {
+    if schema_plan.key.schema_key != row.schema_key() {
         return Err(LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
             format!(
-                "schema plan mismatch: row targets schema '{}' version '{}' but plan is schema '{}' version '{}'",
+                "schema plan mismatch: row targets schema '{}' but plan is schema '{}'",
                 row.schema_key(),
-                row.schema_version(),
                 schema_plan.key.schema_key,
-                schema_plan.key.schema_version,
             ),
         ));
     }
@@ -1231,9 +1178,8 @@ fn validate_snapshot_content<'a>(
         return Err(LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
             format!(
-                "snapshot_content validation failed for schema '{}' version '{}': {details}",
-                row.schema_key(),
-                row.schema_version()
+                "snapshot_content validation failed for schema '{}': {details}",
+                row.schema_key()
             ),
         ));
     }
@@ -1254,9 +1200,8 @@ fn validate_primary_key_identity(
         return Err(LixError::new(
             LixError::CODE_UNIQUE,
             format!(
-                "primary-key constraint violation on schema '{}' version '{}': entity_id '{}' does not match derived primary key '{}'",
+                "primary-key constraint violation on schema '{}': entity_id '{}' does not match derived primary key '{}'",
                 row.schema_key(),
-                row.schema_version(),
                 row.entity_id().as_json_array_text()?,
                 derived.as_json_array_text()?
             ),
@@ -1278,7 +1223,6 @@ impl PendingConstraintIndexes {
     fn remember_tombstone(&mut self, row: PreparedValidationRow<'_>) {
         self.tombstones.push(PendingTombstone {
             identity: row.domain_row_identity(),
-            schema_version: row.schema_version().to_string(),
         });
     }
 
@@ -1324,7 +1268,6 @@ impl PendingConstraintIndexes {
             self.remember_fk_target(row, &unique_paths, snapshot);
             let key = PendingUniqueKey {
                 schema_key: row.schema_key().to_string(),
-                schema_version: row.schema_version().to_string(),
                 domain: row.domain(),
                 pointer_group: unique_paths.clone(),
                 value,
@@ -1363,7 +1306,6 @@ impl PendingConstraintIndexes {
         self.fk_targets
             .entry(PendingForeignKeyTargetKey {
                 schema_key: row.schema_key().to_string(),
-                schema_version: row.schema_version().to_string(),
                 domain: row.domain(),
                 pointer_group: pointer_group.to_vec(),
                 value,
@@ -1389,7 +1331,6 @@ impl PendingConstraintIndexes {
             };
             let target = PendingForeignKeyReferenceTarget::Key(PendingForeignKeyTargetKey {
                 schema_key: foreign_key.referenced_schema.schema_key.clone(),
-                schema_version: foreign_key.referenced_schema.schema_version.clone(),
                 domain: row.domain(),
                 pointer_group: foreign_key.referenced_properties.clone(),
                 value: local_value,
@@ -1447,7 +1388,6 @@ impl PendingConstraintIndexes {
                 target.identity.matches_parts(
                     &expected_domain,
                     identity.schema_key(),
-                    identity.schema_version(),
                     identity.entity_id(),
                 )
             })
@@ -1502,7 +1442,6 @@ impl PendingConstraintIndexes {
     fn has_fk_reference_to_key(
         &self,
         schema_key: &str,
-        schema_version: &str,
         version_id: &str,
         file_id: Option<&str>,
         pointer_group: &[&str],
@@ -1514,7 +1453,6 @@ impl PendingConstraintIndexes {
             .collect::<Result<Vec<_>, _>>()?;
         let key = PendingForeignKeyReferenceTarget::Key(PendingForeignKeyTargetKey {
             schema_key: schema_key.to_string(),
-            schema_version: schema_version.to_string(),
             domain: Domain::exact_file(version_id.to_string(), false, file_id.map(str::to_string)),
             pointer_group,
             value,
@@ -1534,7 +1472,6 @@ impl PendingConstraintIndexes {
     fn has_fk_target(
         &self,
         schema_key: &str,
-        schema_version: &str,
         version_id: &str,
         file_id: Option<&str>,
         pointer_group: &[&str],
@@ -1546,7 +1483,6 @@ impl PendingConstraintIndexes {
             .collect::<Result<Vec<_>, _>>()?;
         let key = PendingForeignKeyTargetKey {
             schema_key: schema_key.to_string(),
-            schema_version: schema_version.to_string(),
             domain: Domain::exact_file(version_id.to_string(), false, file_id.map(str::to_string)),
             pointer_group,
             value,
@@ -1558,7 +1494,6 @@ impl PendingConstraintIndexes {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingTombstone {
     identity: DomainRowIdentity,
-    schema_version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1579,7 +1514,6 @@ struct PendingForeignKeyReference {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PendingUniqueKey {
     schema_key: String,
-    schema_version: String,
     domain: Domain,
     pointer_group: Vec<Vec<String>>,
     value: UniqueConstraintValue,
@@ -1588,7 +1522,6 @@ struct PendingUniqueKey {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PendingForeignKeyTargetKey {
     schema_key: String,
-    schema_version: String,
     domain: Domain,
     pointer_group: Vec<Vec<String>>,
     value: UniqueConstraintValue,
@@ -1617,8 +1550,7 @@ fn validate_pending_delete_restrictions(
             pending_constraints.active_references_to_any(&identity_targets),
         )?;
 
-        let Some((_, schema_plan)) =
-            schema_catalog.plan_for_key(tombstone.identity.schema_key(), &tombstone.schema_version)
+        let Some((_, schema_plan)) = schema_catalog.plan_for_key(tombstone.identity.schema_key())
         else {
             continue;
         };
@@ -1631,7 +1563,6 @@ fn validate_pending_delete_restrictions(
                 .map(|domain| {
                     PendingForeignKeyReferenceTarget::Key(PendingForeignKeyTargetKey {
                         schema_key: tombstone.identity.schema_key_owned(),
-                        schema_version: tombstone.schema_version.clone(),
                         domain,
                         pointer_group: primary_key_paths.clone(),
                         value: UniqueConstraintValue::from_entity_identity(
@@ -1700,9 +1631,7 @@ async fn validate_committed_delete_restrictions(
     for tombstone in &pending_constraints.tombstones {
         for source_plan in schema_catalog.plans() {
             for foreign_key in &source_plan.foreign_keys {
-                if foreign_key.referenced_schema.schema_key == tombstone.identity.schema_key()
-                    && foreign_key.referenced_schema.schema_version == tombstone.schema_version
-                {
+                if foreign_key.referenced_schema.schema_key == tombstone.identity.schema_key() {
                     validate_committed_normal_delete_restriction(
                         input.live_state,
                         pending_constraints,
@@ -1798,9 +1727,7 @@ async fn validate_committed_normal_delete_restriction(
         .await?;
 
         for row in rows {
-            if row.schema_version != source_key.schema_version
-                || pending_constraints.tombstones_identity(&row)
-            {
+            if pending_constraints.tombstones_identity(&row) {
                 continue;
             }
             let Some(snapshot_content) = row.snapshot_content.as_deref() else {
@@ -1844,9 +1771,7 @@ async fn validate_committed_state_surface_delete_restriction(
         .await?;
 
         for row in rows {
-            if row.schema_version != source_key.schema_version
-                || pending_constraints.tombstones_identity(&row)
-            {
+            if pending_constraints.tombstones_identity(&row) {
                 continue;
             }
             let Some(snapshot_content) = row.snapshot_content.as_deref() else {
@@ -1879,7 +1804,6 @@ async fn committed_deleted_row_value(
         live_state,
         tombstone.identity.domain(),
         tombstone.identity.schema_key(),
-        tombstone.identity.schema_version(),
         tombstone.identity.entity_id_owned(),
         true,
     )
@@ -1887,9 +1811,6 @@ async fn committed_deleted_row_value(
     else {
         return Ok(None);
     };
-    if row.schema_version != tombstone.schema_version {
-        return Ok(None);
-    }
     let Some(snapshot_content) = row.snapshot_content.as_deref() else {
         return Ok(None);
     };
@@ -1926,8 +1847,8 @@ fn parse_committed_snapshot(
         LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
             format!(
-                "committed snapshot_content for schema '{}' version '{}' is invalid JSON: {error}",
-                row.schema_key, row.schema_version
+                "committed snapshot_content for schema '{}' is invalid JSON: {error}",
+                row.schema_key
             ),
         )
     })
@@ -1991,7 +1912,6 @@ fn validate_pending_normal_foreign_key(
 ) -> Result<Option<UnresolvedForeignKeyCheck>, LixError> {
     let key = PendingForeignKeyTargetKey {
         schema_key: foreign_key.referenced_schema.schema_key.clone(),
-        schema_version: foreign_key.referenced_schema.schema_version.clone(),
         domain: row.domain(),
         pointer_group: foreign_key.referenced_properties.clone(),
         value: local_value,
@@ -2114,21 +2034,22 @@ async fn committed_normal_foreign_key_target_exists(
             if pending_constraints.tombstones_identity(&row) {
                 continue;
             }
-            if row.schema_key != target.schema_key || row.schema_version != target.schema_version {
+            if row.schema_key != target.schema_key {
                 continue;
             }
             let Some(snapshot_content) = row.snapshot_content.as_deref() else {
                 continue;
             };
-            let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_SCHEMA_VALIDATION,
-                    format!(
-                        "committed snapshot_content for schema '{}' version '{}' is invalid JSON: {error}",
-                        row.schema_key, row.schema_version
-                    ),
-                )
-            })?;
+            let snapshot =
+                serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_VALIDATION,
+                        format!(
+                            "committed snapshot_content for schema '{}' is invalid JSON: {error}",
+                            row.schema_key
+                        ),
+                    )
+                })?;
             if UniqueConstraintValue::from_snapshot(&snapshot, &target.pointer_group).as_ref()
                 == Some(&target.value)
             {
@@ -2157,12 +2078,8 @@ async fn committed_state_surface_foreign_key_target_exists(
             if pending_constraints.tombstones_identity(&row) {
                 continue;
             }
-            if candidate.matches_parts(
-                &Domain::for_live_row(&row),
-                &row.schema_key,
-                &row.schema_version,
-                &row.entity_id,
-            ) {
+            if candidate.matches_parts(&Domain::for_live_row(&row), &row.schema_key, &row.entity_id)
+            {
                 return Ok(true);
             }
         }
@@ -2179,17 +2096,11 @@ fn state_surface_target_identity(
         state_surface_local_json_value(snapshot, &foreign_key.entity_id_property, "entity_id")?;
     let schema_key =
         state_surface_local_value(snapshot, &foreign_key.schema_key_property, "schema_key")?;
-    let schema_version = state_surface_local_value(
-        snapshot,
-        &foreign_key.schema_version_property,
-        "schema_version",
-    )?;
     let file_id =
         state_surface_nullable_local_value(snapshot, &foreign_key.file_id_property, "file_id")?;
     Ok(DomainRowIdentity::in_domain(
         source_domain.with_exact_file_scope(file_id),
         schema_key,
-        schema_version,
         EntityIdentity::from_json_array_value(entity_id).map_err(|error| {
             LixError::new(
                 LixError::CODE_FOREIGN_KEY,
@@ -2304,15 +2215,16 @@ async fn validate_committed_unique_constraints(
             let Some(snapshot_content) = committed_row.snapshot_content.as_deref() else {
                 continue;
             };
-            let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_SCHEMA_VALIDATION,
-                    format!(
-                        "committed snapshot_content for schema '{}' version '{}' is invalid JSON: {error}",
-                        committed_row.schema_key, committed_row.schema_version
-                    ),
-                )
-            })?;
+            let snapshot =
+                serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_VALIDATION,
+                        format!(
+                            "committed snapshot_content for schema '{}' is invalid JSON: {error}",
+                            committed_row.schema_key
+                        ),
+                    )
+                })?;
             let Some(committed_value) =
                 UniqueConstraintValue::from_snapshot(&snapshot, &key.pointer_group)
             else {
@@ -2343,9 +2255,7 @@ fn committed_row_is_in_exact_validation_scope(
     // LiveStateReader may return serving projections such as global rows
     // projected into a requested version. Constraint validation is root-local:
     // only rows authored in the exact version participate.
-    key.domain.contains(row)
-        && row.schema_key == key.schema_key
-        && row.schema_version == key.schema_version
+    key.domain.contains(row) && row.schema_key == key.schema_key
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2413,46 +2323,6 @@ fn stable_unique_value(value: &JsonValue) -> String {
     }
 }
 
-#[cfg(test)]
-fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
-    if pointer.is_empty() {
-        return Ok(Vec::new());
-    }
-    if !pointer.starts_with('/') {
-        return Err(LixError::new(
-            LixError::CODE_SCHEMA_DEFINITION,
-            format!("invalid JSON pointer '{pointer}'"),
-        ));
-    }
-    pointer[1..]
-        .split('/')
-        .map(unescape_json_pointer_segment)
-        .collect()
-}
-
-#[cfg(test)]
-fn unescape_json_pointer_segment(segment: &str) -> Result<String, LixError> {
-    let mut output = String::new();
-    let mut chars = segment.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '~' {
-            match chars.next() {
-                Some('0') => output.push('~'),
-                Some('1') => output.push('/'),
-                _ => {
-                    return Err(LixError::new(
-                        LixError::CODE_SCHEMA_DEFINITION,
-                        "invalid JSON pointer escape",
-                    ));
-                }
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-    Ok(output)
-}
-
 fn format_pointer_group(group: &[Vec<String>]) -> String {
     let pointers = group
         .iter()
@@ -2463,20 +2333,6 @@ fn format_pointer_group(group: &[Vec<String>]) -> String {
     } else {
         format!("({})", pointers.join(", "))
     }
-}
-
-fn format_json_pointer(pointer: &[String]) -> String {
-    if pointer.is_empty() {
-        return String::new();
-    }
-    format!(
-        "/{}",
-        pointer
-            .iter()
-            .map(|segment| segment.replace('~', "~0").replace('/', "~1"))
-            .collect::<Vec<_>>()
-            .join("/")
-    )
 }
 
 fn primary_key_identity_error(
@@ -2504,9 +2360,8 @@ fn primary_key_identity_error(
     LixError::new(
         LixError::CODE_UNIQUE,
         format!(
-            "primary-key constraint violation on schema '{}' version '{}': {reason}",
-            row.schema_key(),
-            row.schema_version()
+            "primary-key constraint violation on schema '{}': {reason}",
+            row.schema_key()
         ),
     )
 }
@@ -2534,7 +2389,7 @@ fn validate_foreign_key_definition(
         return Err(LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
             format!(
-                "foreign key on schema '{}' must not reference schemaKey 'lix_state'; use x-lix-state-foreign-keys with pointers ordered as [entity_id, schema_key, schema_version, file_id]",
+                "foreign key on schema '{}' must not reference schemaKey 'lix_state'; use x-lix-state-foreign-keys with pointers ordered as [entity_id, schema_key, file_id]",
                 source_key.schema_key
             ),
         ));
@@ -2546,28 +2401,22 @@ fn validate_foreign_key_definition(
             LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
                 format!(
-                "foreign key on schema '{}' references missing bound schema plan '{}' version '{}'",
-                source_key.schema_key,
-                foreign_key.referenced_schema.schema_key,
-                foreign_key.referenced_schema.schema_version
-            ),
+                    "foreign key on schema '{}' references missing bound schema plan '{}'",
+                    source_key.schema_key, foreign_key.referenced_schema.schema_key,
+                ),
             )
         })?;
     let target_schema = target_plan.schema.as_ref();
     if target_plan.key != foreign_key.referenced_schema {
-        return Err(
-            LixError::new(
-                LixError::CODE_SCHEMA_DEFINITION,
-                format!(
-                    "foreign key on schema '{}' is bound to schema '{}' version '{}' but declares schema '{}' version '{}'",
-                    source_key.schema_key,
-                    target_plan.key.schema_key,
-                    target_plan.key.schema_version,
-                    foreign_key.referenced_schema.schema_key,
-                    foreign_key.referenced_schema.schema_version
-                ),
+        return Err(LixError::new(
+            LixError::CODE_SCHEMA_DEFINITION,
+            format!(
+                "foreign key on schema '{}' is bound to schema '{}' but declares schema '{}'",
+                source_key.schema_key,
+                target_plan.key.schema_key,
+                foreign_key.referenced_schema.schema_key,
             ),
-        );
+        ));
     }
 
     for pointer in &foreign_key.referenced_properties {
@@ -2694,7 +2543,6 @@ fn validate_pending_registered_schema(
     // `lix_registered_schema` schema, and the inner definition must be a valid
     // Lix schema before it can extend the transaction-visible catalog.
     let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
-    reject_unsupported_registered_schema_version(&key)?;
     reject_seed_schema_registration(&key)?;
     validate_lix_schema_definition(&schema)?;
     validate_lix_schema(registered_schema_definition, &snapshot)?;
@@ -2760,7 +2608,7 @@ mod tests {
                 .expect("test schema plan catalog should build"),
         ));
         catalog
-            .plan_for_key(&key.schema_key, &key.schema_version)
+            .plan_for_key(&key.schema_key)
             .expect("test schema key should resolve")
             .1
     }
@@ -2840,9 +2688,8 @@ mod tests {
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
                     format!(
-                        "duplicate pending registered schema '{}' version '{}' in transaction: rows '{}' and '{}'",
+                        "duplicate pending registered schema '{}' in transaction: rows '{}' and '{}'",
                         catalog_key.schema_key,
-                        catalog_key.schema_version,
                         existing_entity_id.as_json_array_text()?,
                         row.entity_id().as_json_array_text()?
                     ),
@@ -2863,7 +2710,7 @@ mod tests {
             .filter(|row| row.schema_key() == REGISTERED_SCHEMA_KEY)
         {
             let registered_schema_definition = catalog
-                .schema(REGISTERED_SCHEMA_KEY, "1")
+                .schema(REGISTERED_SCHEMA_KEY)
                 .cloned()
                 .ok_or_else(|| {
                     LixError::new(
@@ -3038,7 +2885,6 @@ mod tests {
     fn schema_catalog_indexes_visible_schemas_by_key_and_version() {
         let visible_schemas = vec![json!({
             "x-lix-key": "visible_schema",
-            "x-lix-version": "1",
             "type": "object",
         })];
         let staged_writes = empty_staged_write_set();
@@ -3047,7 +2893,7 @@ mod tests {
         let catalog = catalog_from_transaction_input(&input).expect("schema catalog should build");
 
         assert_eq!(catalog.len(), 1);
-        assert!(catalog.contains("visible_schema", "1"));
+        assert!(catalog.contains("visible_schema"));
     }
 
     #[test]
@@ -3056,12 +2902,11 @@ mod tests {
             registered_schema(),
             json!({
                 "x-lix-key": "visible_schema",
-                "x-lix-version": "1",
                 "type": "object",
             }),
         ];
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![pending_registered_schema_row("pending_schema", "1")],
+            state_rows: vec![pending_registered_schema_row("pending_schema")],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
@@ -3070,8 +2915,8 @@ mod tests {
         let catalog = catalog_from_transaction_input(&input).expect("schema catalog should build");
 
         assert_eq!(catalog.len(), 3);
-        assert!(catalog.contains("visible_schema", "1"));
-        assert!(catalog.contains("pending_schema", "1"));
+        assert!(catalog.contains("visible_schema"));
+        assert!(catalog.contains("pending_schema"));
     }
 
     #[test]
@@ -3080,7 +2925,6 @@ mod tests {
             registered_schema(),
             json!({
                 "x-lix-key": "same_schema",
-                "x-lix-version": "1",
                 "type": "object",
                 "properties": {
                     "old": { "type": "string" }
@@ -3088,7 +2932,7 @@ mod tests {
             }),
         ];
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![pending_registered_schema_row("same_schema", "1")],
+            state_rows: vec![pending_registered_schema_row("same_schema")],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
@@ -3102,7 +2946,7 @@ mod tests {
 
     #[test]
     fn pending_registered_schema_requires_snapshot_content() {
-        let mut row = pending_registered_schema_row("missing_snapshot", "1");
+        let mut row = pending_registered_schema_row("missing_snapshot");
         row.snapshot = None;
 
         let error = validate_pending_registered_schema(
@@ -3124,7 +2968,7 @@ mod tests {
 
     #[test]
     fn pending_registered_schema_uses_builtin_schema_for_outer_value_shape() {
-        let mut row = pending_registered_schema_row("missing_value", "1");
+        let mut row = pending_registered_schema_row("missing_value");
         row.snapshot = Some(test_stage_json(&json!({}).to_string()));
 
         let error = validate_pending_registered_schema(
@@ -3138,12 +2982,12 @@ mod tests {
 
     #[test]
     fn pending_registered_schema_rejects_malformed_nested_lix_schema_definition() {
-        let mut row = pending_registered_schema_row("bad_schema_version", "v1");
+        let mut row = pending_registered_schema_row("bad_schema_definition");
         row.snapshot = Some(test_stage_json(
             &json!({
                 "value": {
-                    "x-lix-key": "bad_schema_version",
-                    "x-lix-version": "v1",
+                    "x-lix-key": "bad_schema_definition",
+                    "x-lix-primary-key": ["id"],
                     "type": "object",
                     "properties": {
                         "id": { "type": "string" }
@@ -3166,13 +3010,10 @@ mod tests {
 
     #[test]
     fn schema_catalog_rejects_duplicate_pending_registered_schema_identity() {
-        let mut duplicate = pending_registered_schema_row("duplicate_schema", "1");
-        duplicate.entity_id = registered_schema_entity_id("duplicate_schema_duplicate", "1");
+        let mut duplicate = pending_registered_schema_row("duplicate_schema");
+        duplicate.entity_id = registered_schema_entity_id("duplicate_schema_duplicate");
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![
-                pending_registered_schema_row("duplicate_schema", "1"),
-                duplicate,
-            ],
+            state_rows: vec![pending_registered_schema_row("duplicate_schema"), duplicate],
             ..empty_staged_write_set()
         };
         let visible_schemas = vec![registered_schema()];
@@ -3198,8 +3039,8 @@ mod tests {
         let catalog = catalog_from_transaction_input(&input)
             .expect("pending parent schema should satisfy pending child foreign key");
 
-        assert!(catalog.contains("fk_parent_schema", "1"));
-        assert!(catalog.contains("fk_child_schema", "1"));
+        assert!(catalog.contains("fk_parent_schema"));
+        assert!(catalog.contains("fk_child_schema"));
     }
 
     #[test]
@@ -3290,7 +3131,7 @@ mod tests {
         let catalog = catalog_from_transaction_input(&input)
             .expect("x-lix-state-foreign-keys should validate as a state-surface FK target");
 
-        assert!(catalog.contains("state_surface_ref_schema", "1"));
+        assert!(catalog.contains("state_surface_ref_schema"));
     }
 
     #[test]
@@ -3299,7 +3140,6 @@ mod tests {
         schema["x-lix-foreign-keys"][0]["properties"] = json!(["/parent_id"]);
         schema["x-lix-foreign-keys"][0]["references"] = json!({
             "schemaKey": "lix_state",
-            "schemaVersion": "1",
             "properties": ["/entity_id"]
         });
         let staged_writes = PreparedWriteSet {
@@ -3335,9 +3175,7 @@ mod tests {
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
         assert!(
-            error
-                .message
-                .contains("[entity_id, schema_key, schema_version, file_id]"),
+            error.message.contains("[entity_id, schema_key, file_id]"),
             "unexpected error: {error:?}"
         );
     }
@@ -3346,11 +3184,7 @@ mod tests {
     async fn validation_rejects_unknown_schema_key() {
         let visible_schemas = vec![key_value_schema()];
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![staged_row(
-                "unknown_schema",
-                "1",
-                Some(json!({}).to_string()),
-            )],
+            state_rows: vec![staged_row("unknown_schema", Some(json!({}).to_string()))],
             ..empty_staged_write_set()
         };
 
@@ -3362,29 +3196,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_rejects_unknown_schema_version() {
-        let visible_schemas = vec![key_value_schema()];
-        let staged_writes = PreparedWriteSet {
-            state_rows: vec![staged_row(
-                "lix_key_value",
-                "2",
-                Some(json!({ "key": "k", "value": "v" }).to_string()),
-            )],
-            ..empty_staged_write_set()
-        };
-
-        let error = validate_prepared_writes(validation_input(&staged_writes, &visible_schemas))
-            .await
-            .expect_err("unknown schema_version should fail");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-    }
-
-    #[tokio::test]
     async fn validation_checks_schema_existence_for_tombstones() {
         let visible_schemas = vec![key_value_schema()];
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![staged_row("unknown_schema", "1", None)],
+            state_rows: vec![staged_row("unknown_schema", None)],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
@@ -3401,10 +3216,9 @@ mod tests {
         let visible_schemas = vec![key_value_schema(), registered_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
-                pending_registered_schema_row("pending_schema", "1"),
+                pending_registered_schema_row("pending_schema"),
                 staged_row(
                     "pending_schema",
-                    "1",
                     Some(json!({ "id": "entity-1" }).to_string()),
                 ),
             ],
@@ -3419,11 +3233,10 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_tracked_row_using_pending_untracked_schema_definition() {
         let visible_schemas = vec![registered_schema()];
-        let mut untracked_schema = pending_registered_schema_row("untracked_only_schema", "1");
+        let mut untracked_schema = pending_registered_schema_row("untracked_only_schema");
         mark_prepared_row_untracked(&mut untracked_schema);
         let mut tracked_row = staged_row(
             "untracked_only_schema",
-            "1",
             Some(json!({ "id": "row-1" }).to_string()),
         );
         tracked_row.entity_id = EntityIdentity::single("row-1");
@@ -3446,7 +3259,6 @@ mod tests {
         let staged_writes = PreparedWriteSet {
             state_rows: vec![staged_row(
                 "lix_key_value",
-                "1",
                 Some(json!({ "key": "k" }).to_string()),
             )],
             ..empty_staged_write_set()
@@ -3471,7 +3283,7 @@ mod tests {
     async fn validation_skips_snapshot_validation_for_tombstones() {
         let visible_schemas = vec![key_value_schema()];
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![staged_row("lix_key_value", "1", None)],
+            state_rows: vec![staged_row("lix_key_value", None)],
             adopted_rows: Vec::new(),
             ..empty_staged_write_set()
         };
@@ -4901,7 +4713,7 @@ mod tests {
         let input = validation_input(&staged_writes, &visible_schemas);
         let catalog = catalog_from_transaction_input(&input).expect("schema catalog should build");
         let plan = catalog
-            .plan_for_key("lix_key_value", "1")
+            .plan_for_key("lix_key_value")
             .expect("lix_key_value plan should exist");
 
         assert!(plan
@@ -4934,7 +4746,6 @@ mod tests {
         assert!(indexes
             .has_fk_target(
                 "fk_parent_schema",
-                "1",
                 "version-a",
                 Some("file-a"),
                 &["/id"],
@@ -4944,7 +4755,6 @@ mod tests {
         assert!(!indexes
             .has_fk_target(
                 "fk_parent_schema",
-                "1",
                 "version-b",
                 Some("file-a"),
                 &["/id"],
@@ -4976,7 +4786,6 @@ mod tests {
         assert!(indexes
             .has_fk_target(
                 "unique_schema",
-                "1",
                 "version-a",
                 Some("file-a"),
                 &["/slug"],
@@ -5012,7 +4821,6 @@ mod tests {
         assert!(indexes
             .has_fk_reference_to_key(
                 "fk_parent_schema",
-                "1",
                 "version-a",
                 Some("file-a"),
                 &["/id"],
@@ -5022,7 +4830,6 @@ mod tests {
         assert!(!indexes
             .has_fk_reference_to_key(
                 "fk_parent_schema",
-                "1",
                 "version-b",
                 Some("file-a"),
                 &["/id"],
@@ -5061,7 +4868,6 @@ mod tests {
                 false,
                 Some("file-a".to_string()),
                 "fk_parent_schema",
-                "1",
                 EntityIdentity::single("target-1"),
             ))
         );
@@ -5137,7 +4943,6 @@ mod tests {
                 false,
                 Some("file-a".to_string()),
                 "fk_child_schema",
-                "1",
                 EntityIdentity::single("child-1"),
             )
         );
@@ -5150,7 +4955,6 @@ mod tests {
             panic!("normal FK should produce key target");
         };
         assert_eq!(target.schema_key, "fk_parent_schema");
-        assert_eq!(target.schema_version, "1");
         assert_eq!(target.domain.version_id(), "version-a");
         assert_eq!(
             target.domain.file_scope(),
@@ -5302,7 +5106,6 @@ mod tests {
                 false,
                 Some("file-a".to_string()),
                 "state_surface_ref_schema",
-                "1",
                 EntityIdentity::single("ref-1"),
             )
         );
@@ -5312,7 +5115,6 @@ mod tests {
             vec![
                 vec!["target_entity_id".to_string()],
                 vec!["target_schema_key".to_string()],
-                vec!["target_schema_version".to_string()],
                 vec!["target_file_id".to_string()],
             ]
         );
@@ -5321,7 +5123,6 @@ mod tests {
         };
         assert_eq!(target.domain().version_id(), "version-a");
         assert_eq!(target.schema_key(), "fk_parent_schema");
-        assert_eq!(target.schema_version(), "1");
         assert_eq!(target.entity_id(), &EntityIdentity::single("target-1"));
         assert_eq!(
             target.domain().file_scope(),
@@ -5479,53 +5280,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn committed_state_surface_fk_rejects_wrong_target_schema_version() {
-        let indexes = PendingConstraintIndexes::default();
-        let row = state_surface_ref_row("ref-1", "target-1", "fk_parent_schema", "file-a");
-        let snapshot = serde_json::from_str::<JsonValue>(
-            row.snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.normalized.as_ref())
-                .expect("fixture should have snapshot"),
-        )
-        .expect("fixture JSON should parse");
-        let visible_schemas = vec![state_surface_ref_schema()];
-        let staged_writes = empty_staged_write_set();
-        let unresolved = validate_pending_foreign_keys(
-            &indexes,
-            &[(
-                PreparedValidationRow::State(&row),
-                test_plan_from_schema(state_surface_ref_schema()),
-                &snapshot,
-            )],
-        )
-        .expect("pending FK validation should collect unresolved check");
-        let mut wrong_version_target = fk_parent_row("target-1", "version-a");
-        wrong_version_target.schema_version = "2".to_string();
-        let live_state = StaticLiveStateReader {
-            rows: vec![MaterializedLiveStateRow::from(wrong_version_target)],
-        };
-
-        let still_unresolved = validate_committed_foreign_keys(
-            &TransactionValidationInput::from_visible_schemas_for_tests(
-                &staged_writes,
-                &visible_schemas,
-                &live_state,
-            ),
-            &indexes,
-            &unresolved,
-        )
-        .await
-        .expect("committed FK lookup should reject wrong target schema version");
-
-        assert_eq!(
-            still_unresolved.len(),
-            1,
-            "state-surface FK target identity includes schema_version"
-        );
-    }
-
     fn empty_staged_write_set() -> PreparedWriteSet {
         PreparedWriteSet {
             state_rows: Vec::new(),
@@ -5580,10 +5334,9 @@ mod tests {
         ]
     }
 
-    fn pending_registered_schema_row(schema_key: &str, schema_version: &str) -> PreparedStateRow {
+    fn pending_registered_schema_row(schema_key: &str) -> PreparedStateRow {
         pending_registered_schema_from_definition(json!({
             "x-lix-key": schema_key,
-            "x-lix-version": schema_version,
             "type": "object",
             "properties": {
                 "id": { "type": "string" }
@@ -5598,13 +5351,12 @@ mod tests {
         PreparedStateRow {
             schema_plan_id: crate::schema_catalog::SchemaPlanId::for_test(0),
             facts: crate::transaction::types::PreparedRowFacts::default(),
-            entity_id: registered_schema_entity_id(&key.schema_key, &key.schema_version),
+            entity_id: registered_schema_entity_id(&key.schema_key),
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
             file_id: None,
             snapshot: Some(test_stage_json(&json!({ "value": schema }).to_string())),
             metadata: None,
             origin: None,
-            schema_version: "1".to_string(),
             created_at: "2026-04-29T00:00:00.000Z".to_string(),
             updated_at: "2026-04-29T00:00:00.000Z".to_string(),
             global: true,
@@ -5615,21 +5367,14 @@ mod tests {
         }
     }
 
-    fn registered_schema_entity_id(
-        schema_key: &str,
-        schema_version: &str,
-    ) -> crate::entity_identity::EntityIdentity {
+    fn registered_schema_entity_id(schema_key: &str) -> crate::entity_identity::EntityIdentity {
         crate::entity_identity::EntityIdentity::from_primary_key_paths(
             &serde_json::json!({
                 "value": {
                     "x-lix-key": schema_key,
-                    "x-lix-version": schema_version,
                 }
             }),
-            &[
-                vec!["value".to_string(), "x-lix-key".to_string()],
-                vec!["value".to_string(), "x-lix-version".to_string()],
-            ],
+            &[vec!["value".to_string(), "x-lix-key".to_string()]],
         )
         .expect("registered schema identity should derive")
     }
@@ -5661,7 +5406,6 @@ mod tests {
     fn unique_schema() -> JsonValue {
         json!({
             "x-lix-key": "unique_schema",
-            "x-lix-version": "1",
             "x-lix-primary-key": ["/id"],
             "x-lix-unique": [["/slug"]],
             "type": "object",
@@ -5678,7 +5422,6 @@ mod tests {
     fn nullable_unique_schema() -> JsonValue {
         json!({
             "x-lix-key": "nullable_unique_schema",
-            "x-lix-version": "1",
             "x-lix-primary-key": ["/id"],
             "x-lix-unique": [["/scope", "/name"]],
             "type": "object",
@@ -5695,7 +5438,6 @@ mod tests {
     fn fk_parent_schema() -> JsonValue {
         json!({
             "x-lix-key": "fk_parent_schema",
-            "x-lix-version": "1",
             "x-lix-primary-key": ["/id"],
             "type": "object",
             "properties": {
@@ -5709,7 +5451,6 @@ mod tests {
     fn composite_message_schema() -> JsonValue {
         json!({
             "x-lix-key": "composite_message_schema",
-            "x-lix-version": "1",
             "x-lix-primary-key": ["/key", "/locale"],
             "type": "object",
             "properties": {
@@ -5725,13 +5466,11 @@ mod tests {
     fn fk_child_schema() -> JsonValue {
         json!({
             "x-lix-key": "fk_child_schema",
-            "x-lix-version": "1",
             "x-lix-primary-key": ["/id"],
             "x-lix-foreign-keys": [{
                 "properties": ["/parent_id"],
                 "references": {
                     "schemaKey": "fk_parent_schema",
-                    "schemaVersion": "1",
                     "properties": ["/id"]
                 }
             }],
@@ -5748,10 +5487,9 @@ mod tests {
     fn state_surface_ref_schema() -> JsonValue {
         json!({
             "x-lix-key": "state_surface_ref_schema",
-            "x-lix-version": "1",
             "x-lix-primary-key": ["/id"],
             "x-lix-state-foreign-keys": [
-                ["/target_entity_id", "/target_schema_key", "/target_schema_version", "/target_file_id"]
+                ["/target_entity_id", "/target_schema_key", "/target_file_id"]
             ],
             "type": "object",
             "properties": {
@@ -5762,10 +5500,9 @@ mod tests {
                     "minItems": 1
                 },
                 "target_schema_key": { "type": "string" },
-                "target_schema_version": { "type": "string" },
                 "target_file_id": { "type": ["string", "null"] }
             },
-            "required": ["id", "target_entity_id", "target_schema_key", "target_schema_version", "target_file_id"],
+            "required": ["id", "target_entity_id", "target_schema_key", "target_file_id"],
             "additionalProperties": false
         })
     }
@@ -5773,7 +5510,6 @@ mod tests {
     fn unique_row(entity_id: &str, slug: &str, title: &str) -> PreparedStateRow {
         let mut row = staged_row(
             "unique_schema",
-            "1",
             Some(
                 json!({
                     "id": entity_id,
@@ -5793,7 +5529,6 @@ mod tests {
     fn nullable_unique_row(entity_id: &str, scope: Option<&str>, name: &str) -> PreparedStateRow {
         let mut row = staged_row(
             "nullable_unique_schema",
-            "1",
             Some(
                 json!({
                     "id": entity_id,
@@ -5813,7 +5548,6 @@ mod tests {
     fn fk_parent_row(entity_id: &str, version_id: &str) -> PreparedStateRow {
         let mut row = staged_row(
             "fk_parent_schema",
-            "1",
             Some(json!({ "id": entity_id }).to_string()),
         );
         row.entity_id = crate::entity_identity::EntityIdentity::single(entity_id);
@@ -5826,7 +5560,6 @@ mod tests {
     fn fk_child_row(entity_id: &str, parent_id: &str, version_id: &str) -> PreparedStateRow {
         let mut row = staged_row(
             "fk_child_schema",
-            "1",
             Some(json!({ "id": entity_id, "parent_id": parent_id }).to_string()),
         );
         row.entity_id = crate::entity_identity::EntityIdentity::single(entity_id);
@@ -5842,7 +5575,7 @@ mod tests {
             "locale": locale,
             "text": "Welcome",
         });
-        let mut row = staged_row("composite_message_schema", "1", Some(snapshot.to_string()));
+        let mut row = staged_row("composite_message_schema", Some(snapshot.to_string()));
         row.entity_id = EntityIdentity::from_primary_key_paths(
             &snapshot,
             &[vec!["key".to_string()], vec!["locale".to_string()]],
@@ -5876,13 +5609,11 @@ mod tests {
     ) -> PreparedStateRow {
         let mut row = staged_row(
             "state_surface_ref_schema",
-            "1",
             Some(
                 json!({
                     "id": entity_id,
                     "target_entity_id": target_entity_id,
                     "target_schema_key": target_schema_key,
-                    "target_schema_version": "1",
                     "target_file_id": target_file_id,
                 })
                 .to_string(),
@@ -5910,7 +5641,6 @@ mod tests {
     fn staged_file_descriptor_row(file_id: &str, version_id: &str) -> PreparedStateRow {
         let mut row = staged_row(
             FILE_DESCRIPTOR_SCHEMA_KEY,
-            "1",
             Some(
                 json!({
                     "id": file_id,
@@ -5940,7 +5670,6 @@ mod tests {
     ) -> PreparedStateRow {
         let mut row = staged_row(
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-            "1",
             Some(
                 json!({
                     "id": directory_id,
@@ -5966,7 +5695,6 @@ mod tests {
             file_id: row.file_id,
             snapshot_content: row.snapshot.as_ref().map(|snapshot| snapshot.materialize()),
             metadata: row.metadata.as_ref().map(|metadata| metadata.materialize()),
-            schema_version: row.schema_version,
             created_at: row.created_at,
             updated_at: row.updated_at,
             global: row.global,
@@ -5985,11 +5713,7 @@ mod tests {
         MaterializedLiveStateRow::from(nullable_unique_row(entity_id, scope, name))
     }
 
-    fn staged_row(
-        schema_key: &str,
-        schema_version: &str,
-        snapshot_content: Option<String>,
-    ) -> PreparedStateRow {
+    fn staged_row(schema_key: &str, snapshot_content: Option<String>) -> PreparedStateRow {
         PreparedStateRow {
             schema_plan_id: crate::schema_catalog::SchemaPlanId::for_test(0),
             facts: crate::transaction::types::PreparedRowFacts::default(),
@@ -5999,7 +5723,6 @@ mod tests {
             snapshot: snapshot_content.as_deref().map(test_stage_json),
             metadata: None,
             origin: None,
-            schema_version: schema_version.to_string(),
             created_at: "2026-04-29T00:00:00.000Z".to_string(),
             updated_at: "2026-04-29T00:00:00.000Z".to_string(),
             global: true,

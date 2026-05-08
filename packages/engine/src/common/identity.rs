@@ -113,7 +113,6 @@ canonical_identity_type!(EntityId, "entity_id");
 canonical_identity_type!(FileId, "file_id");
 canonical_identity_type!(VersionId, "version_id");
 canonical_identity_type!(CanonicalSchemaKey, "schema_key");
-canonical_identity_type!(CanonicalSchemaVersion, "schema_version");
 canonical_identity_type!(CanonicalPluginKey, "plugin_key");
 
 pub(crate) fn json_pointer_get<'a>(

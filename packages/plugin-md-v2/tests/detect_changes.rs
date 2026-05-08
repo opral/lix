@@ -6,7 +6,7 @@ use common::{
 };
 use plugin_md_v2::{
     detect_changes, detect_changes_with_state_context, PluginDetectStateContext, BLOCK_SCHEMA_KEY,
-    DOCUMENT_SCHEMA_KEY, SCHEMA_VERSION,
+    DOCUMENT_SCHEMA_KEY,
 };
 use std::collections::BTreeSet;
 
@@ -107,7 +107,6 @@ fn state_context_from_rows(rows: &[plugin_md_v2::PluginEntityChange]) -> PluginD
                 .map(|row| plugin_md_v2::PluginActiveStateRow {
                     entity_id: row.entity_id.clone(),
                     schema_key: Some(row.schema_key.clone()),
-                    schema_version: Some(row.schema_version.clone()),
                     snapshot_content: row.snapshot_content.clone(),
                     file_id: None,
                     plugin_key: None,
@@ -172,7 +171,6 @@ fn emits_document_and_block_rows_for_new_file() {
 
     for row in block_rows {
         assert_eq!(row.schema_key, BLOCK_SCHEMA_KEY);
-        assert_eq!(row.schema_version, SCHEMA_VERSION);
         assert!(row.snapshot_content.is_some());
     }
 }

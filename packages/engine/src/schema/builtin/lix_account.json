@@ -1,6 +1,5 @@
 {
   "x-lix-key": "lix_account",
-  "x-lix-version": "1",
   "x-lix-primary-key": [
     "/id"
   ],

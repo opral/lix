@@ -27,7 +27,6 @@ where
         file_id: row.file_id,
         snapshot_content,
         metadata,
-        schema_version: row.schema_version,
         created_at: row.created_at,
         updated_at: row.updated_at,
         global: row.global,

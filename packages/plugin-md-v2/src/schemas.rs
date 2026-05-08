@@ -3,7 +3,6 @@ use std::sync::OnceLock;
 
 pub const DOCUMENT_SCHEMA_KEY: &str = "markdown_v2_document";
 pub const BLOCK_SCHEMA_KEY: &str = "markdown_v2_block";
-pub const ENTITY_SCHEMA_VERSION: &str = "1";
 
 const DOCUMENT_SCHEMA_JSON: &str = include_str!("../schema/markdown_document.json");
 const BLOCK_SCHEMA_JSON: &str = include_str!("../schema/markdown_block.json");

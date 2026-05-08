@@ -15,7 +15,6 @@ wit_bindgen::generate!({
 
 pub const LINE_SCHEMA_KEY: &str = "text_line";
 pub const DOCUMENT_SCHEMA_KEY: &str = "text_document";
-pub const SCHEMA_VERSION: &str = "1";
 pub const DOCUMENT_ENTITY_ID: &str = "__document__";
 const MANIFEST_JSON: &str = include_str!("../manifest.json");
 const LINE_SCHEMA_JSON: &str = include_str!("../schema/text_line.json");
@@ -118,7 +117,6 @@ impl Guest for TextLinesPlugin {
                     changes.push(EntityChange {
                         entity_id: line.entity_id.clone(),
                         schema_key: LINE_SCHEMA_KEY.to_string(),
-                        schema_version: SCHEMA_VERSION.to_string(),
                         snapshot_content: None,
                     });
                 }
@@ -132,7 +130,6 @@ impl Guest for TextLinesPlugin {
             changes.push(EntityChange {
                 entity_id: line.entity_id.clone(),
                 schema_key: LINE_SCHEMA_KEY.to_string(),
-                schema_version: SCHEMA_VERSION.to_string(),
                 snapshot_content: Some(serialize_line_snapshot(line)?),
             });
         }
@@ -147,7 +144,6 @@ impl Guest for TextLinesPlugin {
             changes.push(EntityChange {
                 entity_id: DOCUMENT_ENTITY_ID.to_string(),
                 schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
-                schema_version: SCHEMA_VERSION.to_string(),
                 snapshot_content: Some(snapshot),
             });
         }
@@ -171,7 +167,6 @@ impl Guest for TextLinesPlugin {
 
         for change in changes {
             if change.schema_key == LINE_SCHEMA_KEY {
-                validate_schema_version(&change.schema_version, LINE_SCHEMA_KEY)?;
                 if !seen_line_change_ids.insert(change.entity_id.clone()) {
                     return Err(PluginError::InvalidInput(
                         "duplicate text_line snapshot in apply_changes input".to_string(),
@@ -198,7 +193,6 @@ impl Guest for TextLinesPlugin {
             }
 
             if change.schema_key == DOCUMENT_SCHEMA_KEY {
-                validate_schema_version(&change.schema_version, DOCUMENT_SCHEMA_KEY)?;
                 if change.entity_id != DOCUMENT_ENTITY_ID {
                     return Err(PluginError::InvalidInput(format!(
                         "document snapshot entity_id must be '{DOCUMENT_ENTITY_ID}', got '{}'",
@@ -254,15 +248,6 @@ impl Guest for TextLinesPlugin {
 
         Ok(output)
     }
-}
-
-fn validate_schema_version(value: &str, schema_key: &str) -> Result<(), PluginError> {
-    if value == SCHEMA_VERSION {
-        return Ok(());
-    }
-    Err(PluginError::InvalidInput(format!(
-        "unsupported schema_version '{value}' for schema_key '{schema_key}', expected '{SCHEMA_VERSION}'"
-    )))
 }
 
 fn parse_document_snapshot(raw: &str) -> Result<DocumentSnapshotOwned, PluginError> {

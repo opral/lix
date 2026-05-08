@@ -3,10 +3,11 @@ use std::{collections::BTreeMap, sync::Arc};
 use jsonschema::JSONSchema;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use crate::common::{format_json_pointer, parse_json_pointer};
 use crate::domain::{Domain, DomainSchemaIdentity};
 use crate::entity_identity::canonical_json_text;
 use crate::functions::FunctionProviderHandle;
-use crate::schema::{compile_lix_schema, SchemaKey};
+use crate::schema::{compile_lix_schema, validate_schema_amendment, SchemaKey};
 use crate::LixError;
 
 #[derive(Default)]
@@ -47,7 +48,6 @@ impl SchemaCatalog {
             let identity = DomainSchemaIdentity::new(
                 Domain::schema_catalog(crate::GLOBAL_VERSION_ID, true),
                 catalog_key.schema_key.clone(),
-                catalog_key.schema_version.clone(),
             );
             catalog.remember_schema_identity(identity, catalog_key, schema.clone())?;
         }
@@ -72,8 +72,8 @@ impl SchemaCatalog {
         &self.fingerprint
     }
 
-    pub(crate) fn schema(&self, schema_key: &str, schema_version: &str) -> Option<&JsonValue> {
-        self.plan_for_key(schema_key, schema_version)
+    pub(crate) fn schema(&self, schema_key: &str) -> Option<&JsonValue> {
+        self.plan_for_key(schema_key)
             .map(|(_, plan)| plan.schema.as_ref())
     }
 
@@ -84,8 +84,7 @@ impl SchemaCatalog {
         schema: JsonValue,
     ) -> Result<SchemaPlanId, LixError> {
         let key = SchemaCatalogKey::from_schema_key(key);
-        let identity =
-            DomainSchemaIdentity::new(domain, key.schema_key.clone(), key.schema_version.clone());
+        let identity = DomainSchemaIdentity::new(domain, key.schema_key.clone());
         let mut entries = self.entries.clone();
         let mut candidate = Self::from_entries(entries.clone())?;
         let plan_id = candidate.remember_schema_identity(identity.clone(), key, schema)?;
@@ -115,12 +114,14 @@ impl SchemaCatalog {
             if existing_entry.key == key && existing_entry.schema == schema {
                 return Ok(existing);
             }
+            if existing_entry.key == key {
+                validate_schema_amendment(&existing_entry.schema, &schema)?;
+                self.entries[existing.index()].schema = schema;
+                return Ok(existing);
+            }
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
-                format!(
-                    "schema '{}' version '{}' is already registered with a different definition in the same schema domain",
-                    key.schema_key, key.schema_version
-                ),
+                format!("schema '{}' is already registered with a different definition in the same schema domain", key.schema_key),
             ));
         }
         if let Some(existing) = self.by_key.get(&key).copied() {
@@ -130,12 +131,9 @@ impl SchemaCatalog {
             }
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
-                format!(
-                    "schema '{}' version '{}' is visible from more than one schema domain",
-                    existing_entry.key.schema_key, existing_entry.key.schema_version
-                ),
+                format!("schema '{}' is visible from more than one schema domain", existing_entry.key.schema_key),
             )
-            .with_hint("Schema references store schema_key and schema_version, but not the schema domain. Remove the duplicate tracked/untracked schema registration or use a distinct schema version."));
+            .with_hint("Schema references store schema_key, but not the schema domain. Remove the duplicate tracked/untracked schema registration or use a distinct schema key."));
         }
 
         let plan_id = SchemaPlanId(self.entries.len() as u32);
@@ -179,7 +177,6 @@ impl SchemaCatalog {
         for entry in entries {
             hash_fingerprint_part(&mut hasher, &entry.identity.fingerprint_component());
             hash_fingerprint_part(&mut hasher, &entry.key.schema_key);
-            hash_fingerprint_part(&mut hasher, &entry.key.schema_version);
             let canonical_schema = canonical_json_text(&entry.schema).map_err(|error| {
                 LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
@@ -194,8 +191,8 @@ impl SchemaCatalog {
     }
 
     #[cfg(test)]
-    pub(crate) fn contains(&self, schema_key: &str, schema_version: &str) -> bool {
-        self.plan_for_key(schema_key, schema_version).is_some()
+    pub(crate) fn contains(&self, schema_key: &str) -> bool {
+        self.plan_for_key(schema_key).is_some()
     }
 
     #[cfg(test)]
@@ -211,14 +208,9 @@ impl SchemaCatalog {
         self.plans.get(plan_id.index())
     }
 
-    pub(crate) fn plan_for_key(
-        &self,
-        schema_key: &str,
-        schema_version: &str,
-    ) -> Option<(SchemaPlanId, &SchemaPlan)> {
+    pub(crate) fn plan_for_key(&self, schema_key: &str) -> Option<(SchemaPlanId, &SchemaPlan)> {
         let key = SchemaCatalogKey {
             schema_key: schema_key.to_string(),
-            schema_version: schema_version.to_string(),
         };
         let plan_id = *self.by_key.get(&key)?;
         let plan = self.plan(plan_id)?;
@@ -343,7 +335,6 @@ impl DefaultPlan {
         snapshot: &mut JsonMap<String, JsonValue>,
         functions: FunctionProviderHandle,
         schema_key: &str,
-        schema_version: &str,
     ) -> Result<bool, LixError> {
         let mut changed = false;
         let mut cel_context = None::<JsonMap<String, JsonValue>>;
@@ -360,8 +351,8 @@ impl DefaultPlan {
                         .map_err(|err| LixError {
                             code: "LIX_ERROR_UNKNOWN".to_string(),
                             message: format!(
-                                "failed to evaluate x-lix-default for '{}.{}' ({}): {}",
-                                schema_key, property.field_name, schema_version, err.message
+                                "failed to evaluate x-lix-default for '{}.{}': {}",
+                                schema_key, property.field_name, err.message
                             ),
                             hint: None,
                             details: None,
@@ -396,9 +387,7 @@ pub(crate) struct StateForeignKeyPlan {
     pub(crate) entity_id_property: Vec<String>,
     /// Slot [1] in `x-lix-state-foreign-keys`: local pointer to the target schema_key.
     pub(crate) schema_key_property: Vec<String>,
-    /// Slot [2] in `x-lix-state-foreign-keys`: local pointer to the target schema_version.
-    pub(crate) schema_version_property: Vec<String>,
-    /// Slot [3] in `x-lix-state-foreign-keys`: local pointer to the target file_id.
+    /// Slot [2] in `x-lix-state-foreign-keys`: local pointer to the target file_id.
     pub(crate) file_id_property: Vec<String>,
 }
 
@@ -407,7 +396,6 @@ impl StateForeignKeyPlan {
         vec![
             self.entity_id_property.clone(),
             self.schema_key_property.clone(),
-            self.schema_version_property.clone(),
             self.file_id_property.clone(),
         ]
     }
@@ -416,14 +404,12 @@ impl StateForeignKeyPlan {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SchemaCatalogKey {
     pub(crate) schema_key: String,
-    pub(crate) schema_version: String,
 }
 
 impl SchemaCatalogKey {
     pub(crate) fn from_schema_key(key: SchemaKey) -> Self {
         Self {
             schema_key: key.schema_key,
-            schema_version: key.schema_version,
         }
     }
 }
@@ -438,11 +424,7 @@ pub(crate) struct SchemaCatalogFact {
 impl SchemaCatalogFact {
     pub(crate) fn new(domain: Domain, key: SchemaKey, schema: JsonValue) -> Self {
         let catalog_key = SchemaCatalogKey::from_schema_key(key);
-        let identity = DomainSchemaIdentity::new(
-            domain,
-            catalog_key.schema_key.clone(),
-            catalog_key.schema_version.clone(),
-        );
+        let identity = DomainSchemaIdentity::new(domain, catalog_key.schema_key.clone());
         Self {
             identity,
             catalog_key,
@@ -561,18 +543,6 @@ fn foreign_key_plans(schema: &JsonValue) -> Result<Vec<UnboundForeignKeyPlan>, L
                     )
                 })?
                 .to_string();
-            let referenced_schema_version = references
-                .get("schemaVersion")
-                .and_then(JsonValue::as_str)
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_SCHEMA_DEFINITION,
-                        format!(
-                            "x-lix-foreign-keys[{index}].references.schemaVersion must be a string"
-                        ),
-                    )
-                })?
-                .to_string();
             let local_properties = pointer_array(
                 object.get("properties"),
                 &format!("x-lix-foreign-keys[{index}].properties"),
@@ -593,7 +563,6 @@ fn foreign_key_plans(schema: &JsonValue) -> Result<Vec<UnboundForeignKeyPlan>, L
                 local_properties,
                 referenced_schema: SchemaCatalogKey {
                     schema_key: referenced_schema_key,
-                    schema_version: referenced_schema_version,
                 },
                 referenced_properties,
             })
@@ -615,7 +584,7 @@ fn bind_foreign_key_plans(
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
                     format!(
-                        "foreign key on schema '{}' must not reference schemaKey 'lix_state'; use x-lix-state-foreign-keys with pointers ordered as [entity_id, schema_key, schema_version, file_id]",
+                        "foreign key on schema '{}' must not reference schemaKey 'lix_state'; use x-lix-state-foreign-keys with pointers ordered as [entity_id, schema_key, file_id]",
                         source_key.schema_key
                     ),
                 ));
@@ -626,10 +595,9 @@ fn bind_foreign_key_plans(
                     LixError::new(
                         LixError::CODE_SCHEMA_DEFINITION,
                         format!(
-                            "foreign key on schema '{}' references missing schema '{}' version '{}'",
+                            "foreign key on schema '{}' references missing schema '{}'",
                             source_key.schema_key,
                             foreign_key.referenced_schema.schema_key,
-                            foreign_key.referenced_schema.schema_version
                         ),
                     )
                 })?;
@@ -639,15 +607,14 @@ fn bind_foreign_key_plans(
                     .copied()
                     .ok_or_else(|| {
                         LixError::new(
-                            LixError::CODE_SCHEMA_DEFINITION,
-                            format!(
-                                "foreign key on schema '{}' references missing schema '{}' version '{}'",
+                        LixError::CODE_SCHEMA_DEFINITION,
+                        format!(
+                                "foreign key on schema '{}' references missing schema '{}'",
                                 source_key.schema_key,
                                 foreign_key.referenced_schema.schema_key,
-                                foreign_key.referenced_schema.schema_version
                             ),
-                        )
-                    })?;
+                    )
+                })?;
 
             for (local_pointer, referenced_pointer) in foreign_key
                 .local_properties
@@ -833,19 +800,18 @@ fn state_foreign_key_plans(schema: &JsonValue) -> Result<Vec<StateForeignKeyPlan
                 Some(foreign_key),
                 &format!("x-lix-state-foreign-keys[{index}]"),
             )?;
-            if local_properties.len() != 4 {
+            if local_properties.len() != 3 {
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
                     format!(
-                        "x-lix-state-foreign-keys[{index}] must contain exactly four JSON Pointers ordered as [entity_id, schema_key, schema_version, file_id]"
+                        "x-lix-state-foreign-keys[{index}] must contain exactly three JSON Pointers ordered as [entity_id, schema_key, file_id]"
                     ),
                 ));
             }
             Ok(StateForeignKeyPlan {
                 entity_id_property: local_properties[0].clone(),
                 schema_key_property: local_properties[1].clone(),
-                schema_version_property: local_properties[2].clone(),
-                file_id_property: local_properties[3].clone(),
+                file_id_property: local_properties[2].clone(),
             })
         })
         .collect()
@@ -879,64 +845,12 @@ fn pointer_array(value: Option<&JsonValue>, context: &str) -> Result<PointerGrou
         .collect()
 }
 
-fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
-    if pointer.is_empty() {
-        return Ok(Vec::new());
-    }
-    if !pointer.starts_with('/') {
-        return Err(LixError::new(
-            LixError::CODE_SCHEMA_DEFINITION,
-            format!("invalid JSON pointer '{pointer}'"),
-        ));
-    }
-    pointer[1..]
-        .split('/')
-        .map(decode_json_pointer_segment)
-        .collect()
-}
-
-fn format_json_pointer(segments: &[String]) -> String {
-    if segments.is_empty() {
-        return String::new();
-    }
-    format!(
-        "/{}",
-        segments
-            .iter()
-            .map(|segment| segment.replace('~', "~0").replace('/', "~1"))
-            .collect::<Vec<_>>()
-            .join("/")
-    )
-}
-
 fn format_pointer_group(paths: &[Vec<String>]) -> String {
     paths
         .iter()
         .map(|path| format_json_pointer(path))
         .collect::<Vec<_>>()
         .join(",")
-}
-
-fn decode_json_pointer_segment(segment: &str) -> Result<String, LixError> {
-    let mut out = String::new();
-    let mut chars = segment.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '~' {
-            match chars.next() {
-                Some('0') => out.push('~'),
-                Some('1') => out.push('/'),
-                _ => {
-                    return Err(LixError::new(
-                        LixError::CODE_SCHEMA_DEFINITION,
-                        "invalid JSON pointer escape",
-                    ))
-                }
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -946,66 +860,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_rejects_same_schema_version_from_multiple_domains() {
+    fn catalog_rejects_same_schema_key_from_multiple_domains() {
         let tracked = SchemaCatalogFact::new(
             Domain::schema_catalog("main", false),
-            SchemaKey::new("example_schema", "1"),
-            schema_json("example_schema", "1"),
+            SchemaKey::new("example_schema"),
+            schema_json("example_schema"),
         );
         let untracked = SchemaCatalogFact::new(
             Domain::schema_catalog("main", true),
-            SchemaKey::new("example_schema", "1"),
-            schema_json("example_schema", "1"),
+            SchemaKey::new("example_schema"),
+            schema_json("example_schema"),
         );
 
         let error = SchemaCatalog::from_schema_facts(&[tracked, untracked])
-            .expect_err("same schema key/version in two reachable domains is ambiguous");
+            .expect_err("same schema key in two reachable domains is ambiguous");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
         assert!(error.message.contains("more than one schema domain"));
     }
 
     #[test]
-    fn catalog_allows_same_schema_key_with_distinct_versions() {
-        let catalog = SchemaCatalog::from_schema_facts(&[
-            SchemaCatalogFact::new(
-                Domain::schema_catalog("main", false),
-                SchemaKey::new("target_schema", "1"),
-                schema_json("target_schema", "1"),
-            ),
-            SchemaCatalogFact::new(
-                Domain::schema_catalog("main", false),
-                SchemaKey::new("target_schema", "2"),
-                schema_json("target_schema", "2"),
-            ),
-        ])
-        .expect("distinct schema versions are catalog facts");
-
-        assert!(catalog.contains("target_schema", "1"));
-        assert!(catalog.contains("target_schema", "2"));
-    }
-
-    #[test]
     fn insert_schema_for_domain_is_atomic_when_binding_fails() {
         let mut catalog = SchemaCatalog::from_schema_facts(&[SchemaCatalogFact::new(
             Domain::schema_catalog("main", false),
-            SchemaKey::new("base_schema", "1"),
-            schema_json("base_schema", "1"),
+            SchemaKey::new("base_schema"),
+            schema_json("base_schema"),
         )])
         .expect("base catalog should bind");
 
         let error = catalog
             .insert_schema_for_domain(
                 Domain::schema_catalog("main", false),
-                SchemaKey::new("bad_child_schema", "1"),
-                child_schema_json("bad_child_schema", "1", "missing_parent_schema", "1"),
+                SchemaKey::new("bad_child_schema"),
+                child_schema_json("bad_child_schema", "missing_parent_schema"),
             )
             .expect_err("schema with missing FK target should fail");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(catalog.contains("base_schema", "1"));
+        assert!(catalog.contains("base_schema"));
         assert!(
-            !catalog.contains("bad_child_schema", "1"),
+            !catalog.contains("bad_child_schema"),
             "failed catalog insert must not publish a partially bound schema"
         );
     }
@@ -1014,13 +908,13 @@ mod tests {
     fn catalog_fingerprint_is_independent_of_fact_order() {
         let parent = SchemaCatalogFact::new(
             Domain::schema_catalog("main", false),
-            SchemaKey::new("parent_schema", "1"),
-            schema_json("parent_schema", "1"),
+            SchemaKey::new("parent_schema"),
+            schema_json("parent_schema"),
         );
         let child = SchemaCatalogFact::new(
             Domain::schema_catalog("main", false),
-            SchemaKey::new("child_schema", "1"),
-            child_schema_json("child_schema", "1", "parent_schema", "1"),
+            SchemaKey::new("child_schema"),
+            child_schema_json("child_schema", "parent_schema"),
         );
 
         let parent_first = SchemaCatalog::from_schema_facts(&[parent.clone(), child.clone()])
@@ -1031,10 +925,9 @@ mod tests {
         assert_eq!(parent_first.fingerprint(), child_first.fingerprint());
     }
 
-    fn schema_json(schema_key: &str, schema_version: &str) -> JsonValue {
+    fn schema_json(schema_key: &str) -> JsonValue {
         json!({
             "x-lix-key": schema_key,
-            "x-lix-version": schema_version,
             "x-lix-primary-key": ["/id"],
             "type": "object",
             "properties": {
@@ -1045,21 +938,14 @@ mod tests {
         })
     }
 
-    fn child_schema_json(
-        schema_key: &str,
-        schema_version: &str,
-        parent_schema_key: &str,
-        parent_schema_version: &str,
-    ) -> JsonValue {
+    fn child_schema_json(schema_key: &str, parent_schema_key: &str) -> JsonValue {
         json!({
             "x-lix-key": schema_key,
-            "x-lix-version": schema_version,
             "x-lix-primary-key": ["/id"],
             "x-lix-foreign-keys": [{
                 "properties": ["/parent_id"],
                 "references": {
                     "schemaKey": parent_schema_key,
-                    "schemaVersion": parent_schema_version,
                     "properties": ["/id"]
                 }
             }],

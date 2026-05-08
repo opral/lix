@@ -4,6 +4,7 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
+use crate::common::parse_json_pointer;
 use crate::LixError;
 
 static LIX_SCHEMA_DEFINITION: OnceLock<JsonValue> = OnceLock::new();
@@ -11,9 +12,6 @@ static LIX_SCHEMA_VALIDATOR: OnceLock<Result<JSONSchema, LixError>> = OnceLock::
 
 pub fn lix_schema_definition() -> &'static JsonValue {
     LIX_SCHEMA_DEFINITION.get_or_init(|| {
-        // NOTE: x-lix-version is intentionally constrained to a monotonic integer (as a string).
-        // This keeps translation rules open while avoiding a future breaking change when versioning
-        // semantics become concrete.
         let raw = include_str!("definition.json");
         serde_json::from_str(raw).expect("definition.json must be valid JSON")
     })
@@ -215,11 +213,11 @@ fn detect_state_foreign_key_tuple_shape(schema: &JsonValue) -> Option<LixError> 
         let Some(local_pointers) = foreign_key.as_array() else {
             continue;
         };
-        if local_pointers.len() != 4 {
+        if local_pointers.len() != 3 {
             return Some(LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
                 format!(
-                    "Invalid Lix schema definition: x-lix-state-foreign-keys[{index}] must contain exactly four JSON Pointers ordered as [entity_id, schema_key, schema_version, file_id]; [0] entity_id, [1] schema_key, [2] schema_version, [3] file_id."
+                    "Invalid Lix schema definition: x-lix-state-foreign-keys[{index}] must contain exactly three JSON Pointers ordered as [entity_id, schema_key, file_id]; [0] entity_id, [1] schema_key, [2] file_id."
                 ),
             ));
         }
@@ -288,50 +286,6 @@ fn is_json_pointer(value: &str) -> bool {
 
 fn is_cel_expression(value: &str) -> bool {
     Program::compile(value).is_ok()
-}
-
-fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
-    if pointer.is_empty() {
-        return Ok(Vec::new());
-    }
-    if !pointer.starts_with('/') {
-        return Err(LixError {
-            code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
-            message: "Invalid JSON pointer".to_string(),
-            hint: None,
-            details: None,
-        });
-    }
-
-    let mut segments = Vec::new();
-    for raw in pointer[1..].split('/') {
-        segments.push(unescape_pointer_segment(raw)?);
-    }
-    Ok(segments)
-}
-
-fn unescape_pointer_segment(segment: &str) -> Result<String, LixError> {
-    let mut out = String::new();
-    let mut chars = segment.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '~' {
-            match chars.next() {
-                Some('0') => out.push('~'),
-                Some('1') => out.push('/'),
-                _ => {
-                    return Err(LixError {
-                        code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
-                        message: "Invalid JSON pointer".to_string(),
-                        hint: None,
-                        details: None,
-                    })
-                }
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    Ok(out)
 }
 
 fn assert_primary_key_pointers(schema: &JsonValue) -> Result<(), LixError> {
@@ -416,14 +370,13 @@ fn assert_state_foreign_key_pointers(schema: &JsonValue) -> Result<(), LixError>
         let Some(local_pointers) = foreign_key.as_array() else {
             continue;
         };
-        if local_pointers.len() != 4 {
+        if local_pointers.len() != 3 {
             continue;
         }
 
         let roles = [
             ("entity_id", "a non-empty JSON array of strings"),
             ("schema_key", "a string"),
-            ("schema_version", "a string"),
             ("file_id", "a string or null"),
         ];
         for (slot, (role, expected)) in roles.iter().enumerate() {
@@ -446,7 +399,7 @@ fn assert_state_foreign_key_pointers(schema: &JsonValue) -> Result<(), LixError>
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
                     format!(
-                        "Invalid Lix schema definition: x-lix-state-foreign-keys[{index}][{slot}] ({role}) property \"{pointer}\" must be required. Tuple order is [entity_id, schema_key, schema_version, file_id]."
+                        "Invalid Lix schema definition: x-lix-state-foreign-keys[{index}][{slot}] ({role}) property \"{pointer}\" must be required. Tuple order is [entity_id, schema_key, file_id]."
                     ),
                 ));
             }
@@ -454,7 +407,6 @@ fn assert_state_foreign_key_pointers(schema: &JsonValue) -> Result<(), LixError>
             let valid = match *role {
                 "entity_id" => schema_property_is_string_array(property_schema),
                 "schema_key" => schema_property_is_string_only(property_schema),
-                "schema_version" => schema_property_is_string_only(property_schema),
                 "file_id" => schema_property_is_string_or_null(property_schema),
                 _ => unreachable!("state foreign key roles are exhaustive"),
             };
@@ -462,7 +414,7 @@ fn assert_state_foreign_key_pointers(schema: &JsonValue) -> Result<(), LixError>
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
                     format!(
-                        "Invalid Lix schema definition: x-lix-state-foreign-keys[{index}][{slot}] ({role}) property \"{pointer}\" must be {expected}. Tuple order is [entity_id, schema_key, schema_version, file_id]."
+                        "Invalid Lix schema definition: x-lix-state-foreign-keys[{index}][{slot}] ({role}) property \"{pointer}\" must be {expected}. Tuple order is [entity_id, schema_key, file_id]."
                     ),
                 ));
             }
@@ -485,7 +437,6 @@ fn assert_known_x_lix_top_level_fields(schema: &JsonValue) -> Result<(), LixErro
         let known = matches!(
             key.as_str(),
             "x-lix-key"
-                | "x-lix-version"
                 | "x-lix-primary-key"
                 | "x-lix-unique"
                 | "x-lix-foreign-keys"
@@ -615,7 +566,6 @@ mod pointer_slash_detection_tests {
         let mut obj = json!({
             "type": "object",
             "x-lix-key": "book",
-            "x-lix-version": "1",
             "properties": {
                 "id": { "type": "string" },
                 "author_id": { "type": "string" },
@@ -690,7 +640,6 @@ mod pointer_slash_detection_tests {
                 "properties": ["author_id"],
                 "references": {
                     "schemaKey": "author",
-                    "schemaVersion": "1",
                     "properties": ["/id"],
                 }
             }]
@@ -712,7 +661,6 @@ mod pointer_slash_detection_tests {
                 "properties": ["/author_id"],
                 "references": {
                     "schemaKey": "author",
-                    "schemaVersion": "1",
                     "properties": ["id"],
                 }
             }]
@@ -735,7 +683,6 @@ mod pointer_slash_detection_tests {
                 "properties": ["/author_id"],
                 "references": {
                     "schemaKey": "author",
-                    "schemaVersion": "1",
                     "properties": ["/id"],
                 }
             }]

@@ -1692,7 +1692,6 @@ async fn lix_file_record_batch(
     let mut entity_ids = Vec::new();
     let mut schema_keys = Vec::new();
     let mut file_ids = Vec::new();
-    let mut schema_versions = Vec::new();
     let mut globals = Vec::new();
     let mut change_ids = Vec::new();
     let mut created_ats = Vec::new();
@@ -1741,7 +1740,6 @@ async fn lix_file_record_batch(
         entity_ids.push(Some(file.live.entity_id.as_json_array_text()?));
         schema_keys.push(Some(file.live.schema_key));
         file_ids.push(file.live.file_id);
-        schema_versions.push(file.live.schema_version);
         globals.push(Some(file.live.global));
         change_ids.push(file.live.change_id);
         created_ats.push(file.live.created_at);
@@ -1769,7 +1767,6 @@ async fn lix_file_record_batch(
             "lixcol_entity_id" => Arc::new(StringArray::from(entity_ids.clone())),
             "lixcol_schema_key" => Arc::new(StringArray::from(schema_keys.clone())),
             "lixcol_file_id" => Arc::new(StringArray::from(file_ids.clone())),
-            "lixcol_schema_version" => Arc::new(StringArray::from(schema_versions.clone())),
             "lixcol_global" => Arc::new(BooleanArray::from(globals.clone())),
             "lixcol_change_id" => Arc::new(StringArray::from(change_ids.clone())),
             "lixcol_created_at" => Arc::new(StringArray::from(created_ats.clone())),
@@ -2270,7 +2267,6 @@ fn lix_file_schema() -> SchemaRef {
         json_field("lixcol_entity_id", false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
-        Field::new("lixcol_schema_version", DataType::Utf8, false),
         Field::new("lixcol_global", DataType::Boolean, true),
         Field::new("lixcol_change_id", DataType::Utf8, true),
         Field::new("lixcol_created_at", DataType::Utf8, true),
@@ -2470,7 +2466,6 @@ mod tests {
             file_id: None,
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
-            schema_version: "1".to_string(),
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),
@@ -2492,7 +2487,6 @@ mod tests {
             file_id: None,
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
-            schema_version: "1".to_string(),
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),
@@ -2673,7 +2667,6 @@ mod tests {
         );
         assert_eq!(rows[0].schema_key, "lix_file_descriptor");
         assert_eq!(rows[0].version_id, "version-b");
-        assert_eq!(rows[0].schema_version.as_str(), "1");
         assert_eq!(
             rows[0].metadata.as_ref(),
             Some(&TransactionJson::from_value_for_test(

@@ -75,7 +75,6 @@ impl ByFileIndex {
         encode_tracked_value_ref(TrackedStateValueRef {
             snapshot_ref: None,
             metadata_ref: None,
-            schema_version: value.schema_version,
             created_at: value.created_at,
             updated_at: value.updated_at,
             change_id: value.change_id,

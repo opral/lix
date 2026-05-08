@@ -9,7 +9,6 @@ pub(crate) fn apply_schema_defaults<P>(
     evaluator: &CelEvaluator,
     functions: P,
     schema_key: &str,
-    schema_version: &str,
 ) -> Result<bool, LixError>
 where
     P: CelFunctionProvider,
@@ -21,7 +20,6 @@ where
         evaluator,
         functions,
         schema_key,
-        schema_version,
     )
 }
 
@@ -30,7 +28,6 @@ pub(crate) fn apply_schema_defaults_with_shared_runtime<P>(
     schema: &JsonValue,
     functions: P,
     schema_key: &str,
-    schema_version: &str,
 ) -> Result<bool, LixError>
 where
     P: CelFunctionProvider,
@@ -41,7 +38,6 @@ where
         crate::cel::shared_runtime(),
         functions,
         schema_key,
-        schema_version,
     )
 }
 
@@ -52,7 +48,6 @@ pub(crate) fn apply_schema_defaults_with_context<P>(
     evaluator: &CelEvaluator,
     functions: P,
     schema_key: &str,
-    schema_version: &str,
 ) -> Result<bool, LixError>
 where
     P: CelFunctionProvider,
@@ -78,8 +73,8 @@ where
                 .map_err(|err| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     message: format!(
-                        "failed to evaluate x-lix-default for '{}.{}' ({}): {}",
-                        schema_key, field_name, schema_version, err.message
+                        "failed to evaluate x-lix-default for '{}.{}': {}",
+                        schema_key, field_name, err.message
                     ),
                     hint: None,
                     details: None,

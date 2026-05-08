@@ -17,7 +17,6 @@ where
         id: change.id,
         entity_id: change.entity_id,
         schema_key: change.schema_key,
-        schema_version: change.schema_version,
         file_id: change.file_id,
         snapshot_content,
         metadata,

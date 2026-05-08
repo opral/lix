@@ -155,8 +155,8 @@ mod tests {
         let schemas = source
             .schema_jsons_for_sql_read_planning(
                 &RowsLiveStateReader::new(vec![
-                    registered_schema_row("lix_registered_schema", "1"),
-                    registered_schema_row("lix_key_value", "1"),
+                    registered_schema_row("lix_registered_schema"),
+                    registered_schema_row("lix_key_value"),
                 ]),
                 "global",
             )
@@ -177,10 +177,7 @@ mod tests {
 
         let schemas = source
             .schema_jsons_for_sql_read_planning(
-                &RowsLiveStateReader::new(vec![registered_schema_row(
-                    "engine_dynamic_schema",
-                    "1",
-                )]),
+                &RowsLiveStateReader::new(vec![registered_schema_row("engine_dynamic_schema")]),
                 "global",
             )
             .await
@@ -197,13 +194,13 @@ mod tests {
         let error = source
             .schema_jsons_for_sql_read_planning(
                 &RowsLiveStateReader::new(vec![
-                    registered_schema_row("engine_dynamic_schema", "1"),
-                    registered_schema_row("engine_dynamic_schema", "2"),
+                    registered_schema_row("engine_dynamic_schema"),
+                    registered_schema_row("engine_dynamic_schema"),
                 ]),
                 "global",
             )
             .await
-            .expect_err("SQL surfaces must not choose a schema version implicitly");
+            .expect_err("SQL surfaces must not choose a schema identity implicitly");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
         assert!(error.message.contains("SQL surface schema"));
@@ -212,14 +209,14 @@ mod tests {
     #[tokio::test]
     async fn tracked_domain_sees_tracked_seed_schemas_but_not_user_untracked_schemas() {
         let source = SchemaCatalogSource::new();
-        let mut seed_schema = registered_schema_row("lix_key_value", "1");
+        let mut seed_schema = registered_schema_row("lix_key_value");
         seed_schema.untracked = false;
 
         let facts = source
             .schema_facts_for_domain(
                 &RowsLiveStateReader::new(vec![
                     seed_schema,
-                    registered_schema_row("engine_dynamic_schema", "1"),
+                    registered_schema_row("engine_dynamic_schema"),
                 ]),
                 &Domain::schema_catalog("global", false),
             )
@@ -244,7 +241,7 @@ mod tests {
 
         let facts = source
             .schema_facts_for_domain(
-                &RowsLiveStateReader::new(vec![registered_schema_row("lix_key_value", "1")]),
+                &RowsLiveStateReader::new(vec![registered_schema_row("lix_key_value")]),
                 &Domain::schema_catalog("global", false),
             )
             .await
@@ -262,7 +259,7 @@ mod tests {
     #[tokio::test]
     async fn visible_schemas_ignore_projected_global_schema_rows_for_version_scope() {
         let source = SchemaCatalogSource::new();
-        let mut global_only = registered_schema_row("global_only_schema", "1");
+        let mut global_only = registered_schema_row("global_only_schema");
         global_only.global = true;
         global_only.version_id = "main".to_string();
 
@@ -280,10 +277,10 @@ mod tests {
     #[tokio::test]
     async fn schema_facts_post_filter_non_catalog_rows_even_if_reader_returns_them() {
         let source = SchemaCatalogSource::new();
-        let valid_schema = registered_schema_row("valid_schema", "1");
-        let mut file_scoped_schema = registered_schema_row("file_scoped_schema", "1");
+        let valid_schema = registered_schema_row("valid_schema");
+        let mut file_scoped_schema = registered_schema_row("file_scoped_schema");
         file_scoped_schema.file_id = Some("file-a".to_string());
-        let mut tombstoned_schema = registered_schema_row("tombstoned_schema", "1");
+        let mut tombstoned_schema = registered_schema_row("tombstoned_schema");
         tombstoned_schema.snapshot_content = None;
 
         let facts = source
@@ -370,12 +367,11 @@ mod tests {
         }
     }
 
-    fn registered_schema_row(schema_key: &str, schema_version: &str) -> MaterializedLiveStateRow {
+    fn registered_schema_row(schema_key: &str) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_id: registered_schema_entity_id(schema_key, schema_version),
+            entity_id: registered_schema_entity_id(schema_key),
             file_id: None,
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
-            schema_version: "1".to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
             metadata: None,
             change_id: Some("change-registered-schema".to_string()),
@@ -388,7 +384,6 @@ mod tests {
                 json!({
                     "value": {
                         "x-lix-key": schema_key,
-                        "x-lix-version": schema_version,
                         "type": "object",
                         "properties": {
                             "id": { "type": "string" }
@@ -402,21 +397,14 @@ mod tests {
         }
     }
 
-    fn registered_schema_entity_id(
-        schema_key: &str,
-        schema_version: &str,
-    ) -> crate::entity_identity::EntityIdentity {
+    fn registered_schema_entity_id(schema_key: &str) -> crate::entity_identity::EntityIdentity {
         crate::entity_identity::EntityIdentity::from_primary_key_paths(
             &json!({
                 "value": {
                     "x-lix-key": schema_key,
-                    "x-lix-version": schema_version,
                 }
             }),
-            &[
-                vec!["value".to_string(), "x-lix-key".to_string()],
-                vec!["value".to_string(), "x-lix-version".to_string()],
-            ],
+            &[vec!["value".to_string(), "x-lix-key".to_string()]],
         )
         .expect("registered schema identity should derive")
     }

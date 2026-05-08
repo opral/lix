@@ -1,6 +1,5 @@
 {
   "x-lix-key": "text_line",
-  "x-lix-version": "1",
   "x-lix-override-lixcols": {
     "lixcol_plugin_key": "'text_plugin'"
   },

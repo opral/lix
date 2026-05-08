@@ -1,6 +1,5 @@
 {
   "x-lix-key": "lix_change_author",
-  "x-lix-version": "1",
   "x-lix-primary-key": [
     "/change_id",
     "/account_id"
@@ -12,7 +11,6 @@
       ],
       "references": {
         "schemaKey": "lix_change",
-        "schemaVersion": "1",
         "properties": [
           "/id"
         ]
@@ -24,7 +22,6 @@
       ],
       "references": {
         "schemaKey": "lix_account",
-        "schemaVersion": "1",
         "properties": [
           "/id"
         ]
