@@ -8,7 +8,7 @@ use crate::untracked_state::{
 };
 use crate::{LixError, NullableKeyFilter};
 
-const UNTRACKED_STATE_ROW_NAMESPACE: &str = "untracked_state.row";
+pub(super) const UNTRACKED_STATE_ROW_NAMESPACE: &str = "untracked_state.row";
 
 pub(crate) async fn scan_rows(
     store: &mut impl StorageReader,
@@ -61,6 +61,65 @@ pub(crate) async fn load_row(
     )
     .await
     .map(Some)
+}
+
+pub(super) async fn existing_identities<'a>(
+    store: &mut (impl StorageReader + ?Sized),
+    identities: impl IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
+) -> Result<Vec<UntrackedStateIdentity>, LixError> {
+    let mut candidates = identities
+        .into_iter()
+        .map(|identity| {
+            let owned = UntrackedStateIdentity {
+                version_id: identity.version_id.to_string(),
+                schema_key: identity.schema_key.to_string(),
+                entity_id: identity.entity_id.clone(),
+                file_id: identity.file_id.map(str::to_string),
+            };
+            let key = encode_untracked_state_row_key_ref(owned.as_ref());
+            (key, owned)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|(left, _), (right, _)| left.cmp(right));
+    candidates.dedup_by(|(left, _), (right, _)| left == right);
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys = candidates
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+
+    let result = store
+        .exists_many(KvGetRequest {
+            groups: vec![KvGetGroup {
+                namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
+                keys,
+            }],
+        })
+        .await?;
+    let group = result.groups.into_iter().next().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "untracked identity existence probe returned no result group",
+        )
+    })?;
+    if group.exists.len() != candidates.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "untracked identity existence probe returned {} results for {} requested keys",
+                group.exists.len(),
+                candidates.len()
+            ),
+        ));
+    }
+
+    Ok(candidates
+        .into_iter()
+        .zip(group.exists)
+        .filter_map(|((_, identity), exists)| exists.then_some(identity))
+        .collect())
 }
 
 pub(crate) fn stage_rows<'a, I>(writes: &mut StorageWriteSet, rows: I) -> Result<(), LixError>
@@ -149,7 +208,9 @@ fn encode_untracked_state_row_key(identity: &UntrackedStateIdentity) -> Vec<u8> 
     encode_untracked_state_row_key_ref(identity.as_ref())
 }
 
-fn encode_untracked_state_row_key_ref(identity: UntrackedStateIdentityRef<'_>) -> Vec<u8> {
+pub(super) fn encode_untracked_state_row_key_ref(
+    identity: UntrackedStateIdentityRef<'_>,
+) -> Vec<u8> {
     let mut out = Vec::new();
     push_component(&mut out, identity.version_id);
     push_component(&mut out, identity.schema_key);
@@ -298,7 +359,6 @@ mod tests {
             entity_id: row.entity_id.clone(),
             file_id: row.file_id.clone(),
         };
-
         let mut transaction = storage
             .begin_write_transaction()
             .await

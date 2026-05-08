@@ -11,7 +11,9 @@ use crate::transaction::staging::PreparedWriteSet;
 use crate::transaction::types::{
     PreparedAdoptedStateRow, PreparedStateRow, StageJson, StagedCommitMembers, TransactionJson,
 };
-use crate::untracked_state::{UntrackedStateIdentityRef, UntrackedStateRowRef};
+use crate::untracked_state::{
+    UntrackedStateContext, UntrackedStateIdentity, UntrackedStateIdentityRef, UntrackedStateRowRef,
+};
 use crate::version::{VersionContext, VersionRefReader};
 use crate::LixError;
 use std::collections::{BTreeMap, BTreeSet};
@@ -110,16 +112,8 @@ pub(crate) async fn commit_prepared_writes(
     // changelog append. Tracked rows become prolly mutations under their owning
     // commit root; untracked rows remain in the separate local overlay store.
     {
-        let mut writer = live_state.writer(&mut *transaction);
-        writer.stage_untracked_rows(
-            &mut writes,
-            row_index
-                .untracked_row_indices
-                .iter()
-                .map(|&row_index| untracked_row_ref_from_state_row(&state_rows[row_index])),
-        )?;
-        writer.stage_delete_untracked_rows(
-            &mut writes,
+        let untracked_overlay_delete_identities = existing_untracked_overlay_delete_identities(
+            transaction,
             row_index
                 .changelog_row_indices
                 .iter()
@@ -129,7 +123,23 @@ pub(crate) async fn commit_prepared_writes(
                         .iter()
                         .map(untracked_identity_ref_from_adopted_row),
                 ),
-        );
+        )
+        .await?;
+        let mut writer = live_state.writer(&mut *transaction);
+        writer.stage_untracked_rows(
+            &mut writes,
+            row_index
+                .untracked_row_indices
+                .iter()
+                .map(|&row_index| untracked_row_ref_from_state_row(&state_rows[row_index])),
+        )?;
+        UntrackedStateContext::new()
+            .writer(&mut writes)
+            .stage_delete_rows(
+                untracked_overlay_delete_identities
+                    .iter()
+                    .map(UntrackedStateIdentity::as_ref),
+            );
         stage_tracked_roots(
             &mut writer,
             &mut writes,
@@ -155,6 +165,16 @@ pub(crate) async fn commit_prepared_writes(
     json_writer.flush_into(&mut writes);
     writes.apply(transaction).await?;
     Ok(())
+}
+
+async fn existing_untracked_overlay_delete_identities<'a>(
+    transaction: &mut (impl StorageReader + ?Sized),
+    identities: impl IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
+) -> Result<Vec<UntrackedStateIdentity>, LixError> {
+    UntrackedStateContext::new()
+        .reader(transaction)
+        .existing_identities(identities)
+        .await
 }
 
 struct PreparedRowIndex {

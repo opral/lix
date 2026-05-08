@@ -1,7 +1,7 @@
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::untracked_state::{
-    MaterializedUntrackedStateRow, UntrackedStateIdentityRef, UntrackedStateRowRef,
-    UntrackedStateRowRequest, UntrackedStateScanRequest,
+    MaterializedUntrackedStateRow, UntrackedStateIdentity, UntrackedStateIdentityRef,
+    UntrackedStateRowRef, UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
 use crate::LixError;
 
@@ -58,6 +58,16 @@ where
         request: &UntrackedStateRowRequest,
     ) -> Result<Option<MaterializedUntrackedStateRow>, LixError> {
         crate::untracked_state::storage::load_row(&mut self.store, request).await
+    }
+
+    pub(crate) async fn existing_identities<'a, I>(
+        &mut self,
+        identities: I,
+    ) -> Result<Vec<UntrackedStateIdentity>, LixError>
+    where
+        I: IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
+    {
+        crate::untracked_state::storage::existing_identities(&mut self.store, identities).await
     }
 }
 
