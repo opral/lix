@@ -764,7 +764,6 @@ mod tests {
             id: change_id.to_string(),
             entity_id: crate::entity_identity::EntityIdentity::single(commit_id),
             schema_key: "lix_commit".to_string(),
-            schema_version: "1".to_string(),
             file_id: None,
             snapshot_content: Some(
                 serde_json::to_string(&json!({

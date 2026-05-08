@@ -226,7 +226,6 @@ async fn register_crm_task_schema(lix: &lix_rs_sdk::Lix) {
     let schema = r#"{
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "x-lix-key": "crm_task",
-        "x-lix-version": "1",
         "x-lix-primary-key": ["/id"],
         "type": "object",
         "required": ["id", "title", "done", "meta"],
@@ -297,7 +296,6 @@ async fn register_poison_task_schema(lix: &lix_rs_sdk::Lix) {
     let schema = r#"{
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "x-lix-key": "poison_task",
-        "x-lix-version": "1",
         "x-lix-primary-key": ["/id"],
         "type": "object",
         "required": ["id", "title", "meta"],

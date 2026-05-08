@@ -17,11 +17,8 @@ use super::filesystem_visibility::VisibleFilesystem;
 use crate::transaction::types::{TransactionFileData, TransactionJson, TransactionWriteRow};
 
 pub(crate) const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
-pub(crate) const FILE_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
 pub(crate) const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
-pub(crate) const DIRECTORY_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
 pub(crate) const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
-pub(crate) const BLOB_REF_SCHEMA_VERSION: &str = "1";
 
 /// Planned filesystem write output after SQL surface columns have been lowered
 /// into state rows and optional file payload writes.
@@ -445,7 +442,6 @@ pub(crate) fn directory_descriptor_write_row(
     partial_state_row(
         input.id,
         DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-        DIRECTORY_DESCRIPTOR_SCHEMA_VERSION.to_string(),
         Some(JsonValue::Object(snapshot)),
         input.context,
     )
@@ -472,7 +468,6 @@ pub(crate) fn file_descriptor_write_row(input: FileDescriptorWriteIntent) -> Tra
     partial_state_row(
         input.id,
         FILE_DESCRIPTOR_SCHEMA_KEY,
-        FILE_DESCRIPTOR_SCHEMA_VERSION.to_string(),
         Some(JsonValue::Object(snapshot)),
         input.context,
     )
@@ -497,7 +492,6 @@ pub(crate) fn blob_ref_row(input: BlobRefRowInput) -> Result<TransactionWriteRow
     Ok(state_row(
         input.file_id.clone(),
         BLOB_REF_SCHEMA_KEY,
-        BLOB_REF_SCHEMA_VERSION.to_string(),
         Some(snapshot),
         FilesystemRowContext {
             file_id: Some(input.file_id),
@@ -618,7 +612,6 @@ pub(crate) fn plan_file_delete(input: FileDeleteInput) -> FilesystemDeletePlan {
     let mut rows = vec![tombstone_row(
         input.file_id.clone(),
         FILE_DESCRIPTOR_SCHEMA_KEY,
-        FILE_DESCRIPTOR_SCHEMA_VERSION.to_string(),
         FilesystemRowContext {
             file_id: None,
             ..input.context.clone()
@@ -629,7 +622,6 @@ pub(crate) fn plan_file_delete(input: FileDeleteInput) -> FilesystemDeletePlan {
         rows.push(tombstone_row(
             input.file_id.clone(),
             BLOB_REF_SCHEMA_KEY,
-            BLOB_REF_SCHEMA_VERSION.to_string(),
             FilesystemRowContext {
                 file_id: Some(input.file_id),
                 metadata: None,
@@ -646,7 +638,6 @@ pub(crate) fn plan_directory_delete(input: DirectoryDeleteInput) -> FilesystemDe
         rows: vec![tombstone_row(
             input.directory_id,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-            DIRECTORY_DESCRIPTOR_SCHEMA_VERSION.to_string(),
             FilesystemRowContext {
                 file_id: None,
                 ..input.context
@@ -815,23 +806,15 @@ fn directory_parent_cycle_error(directory_id: &str) -> LixError {
 fn state_row(
     entity_id: String,
     schema_key: &str,
-    schema_version: String,
     snapshot: Option<JsonValue>,
     context: FilesystemRowContext,
 ) -> TransactionWriteRow {
-    partial_state_row(
-        Some(entity_id),
-        schema_key,
-        schema_version,
-        snapshot,
-        context,
-    )
+    partial_state_row(Some(entity_id), schema_key, snapshot, context)
 }
 
 fn partial_state_row(
     entity_id: Option<String>,
     schema_key: &str,
-    schema_version: String,
     snapshot: Option<JsonValue>,
     context: FilesystemRowContext,
 ) -> TransactionWriteRow {
@@ -843,7 +826,6 @@ fn partial_state_row(
         snapshot,
         metadata: context.metadata,
         origin: None,
-        schema_version,
         created_at: None,
         updated_at: None,
         global: context.global,
@@ -857,10 +839,9 @@ fn partial_state_row(
 fn tombstone_row(
     entity_id: String,
     schema_key: &str,
-    schema_version: String,
     context: FilesystemRowContext,
 ) -> TransactionWriteRow {
-    state_row(entity_id, schema_key, schema_version, None, context)
+    state_row(entity_id, schema_key, None, context)
 }
 
 fn collect_recursive_directory_delete(
@@ -941,7 +922,6 @@ mod tests {
             Some(&crate::entity_identity::EntityIdentity::single("dir-docs"))
         );
         assert_eq!(row.schema_key, "lix_directory_descriptor");
-        assert_eq!(row.schema_version.as_str(), "1");
         assert_eq!(row.version_id, "version-a");
         let snapshot: JsonValue = row.snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["id"], "dir-docs");
@@ -967,7 +947,6 @@ mod tests {
             ))
         );
         assert_eq!(row.schema_key, "lix_file_descriptor");
-        assert_eq!(row.schema_version.as_str(), "1");
         let snapshot: JsonValue = row.snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["directory_id"], "dir-docs");
         assert_eq!(snapshot["name"], "readme.md");
@@ -990,7 +969,6 @@ mod tests {
         );
         assert_eq!(row.file_id.as_deref(), Some("file-readme"));
         assert_eq!(row.schema_key, "lix_binary_blob_ref");
-        assert_eq!(row.schema_version.as_str(), "1");
         let snapshot: JsonValue = row.snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["id"], "file-readme");
         assert_eq!(snapshot["size_bytes"], 5);
@@ -1328,7 +1306,6 @@ mod tests {
         );
         assert_eq!(descriptor.file_id, None);
         assert_eq!(descriptor.snapshot, None);
-        assert_eq!(descriptor.schema_version.as_str(), "1");
 
         let blob_ref = plan
             .rows
@@ -1343,7 +1320,6 @@ mod tests {
         );
         assert_eq!(blob_ref.file_id.as_deref(), Some("file-readme"));
         assert_eq!(blob_ref.snapshot, None);
-        assert_eq!(blob_ref.schema_version.as_str(), "1");
     }
 
     #[test]
@@ -1376,7 +1352,6 @@ mod tests {
         assert_eq!(plan.rows[0].schema_key, "lix_directory_descriptor");
         assert_eq!(plan.rows[0].file_id, None);
         assert_eq!(plan.rows[0].snapshot, None);
-        assert_eq!(plan.rows[0].schema_version.as_str(), "1");
     }
 
     #[test]
@@ -1502,7 +1477,6 @@ mod tests {
             file_id: None,
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
-            schema_version: "1".to_string(),
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),

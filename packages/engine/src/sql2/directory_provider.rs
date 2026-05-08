@@ -34,6 +34,7 @@ use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::filesystem_predicates::{
     canonicalize_filesystem_path_filters, FilesystemPathKind,
 };
+use crate::sql2::predicate_typecheck::validate_json_predicate_filters;
 use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids,
     resolve_write_version_scope, VersionBinding,
@@ -244,6 +245,7 @@ impl TableProvider for LixDirectoryProvider {
         .map_err(lix_error_to_datafusion_error)?;
         let filters = canonicalize_filesystem_path_filters(filters, FilesystemPathKind::Directory)?;
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, _state.execution_props()))
@@ -294,6 +296,7 @@ impl TableProvider for LixDirectoryProvider {
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
         let filters =
             canonicalize_filesystem_path_filters(&filters, FilesystemPathKind::Directory)?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
@@ -341,6 +344,7 @@ impl TableProvider for LixDirectoryProvider {
             .collect::<Result<Vec<_>>>()?;
         let filters =
             canonicalize_filesystem_path_filters(&filters, FilesystemPathKind::Directory)?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
@@ -1352,7 +1356,6 @@ fn lix_directory_record_batch(
     let mut entity_ids = Vec::new();
     let mut schema_keys = Vec::new();
     let mut file_ids = Vec::new();
-    let mut schema_versions = Vec::new();
     let mut globals = Vec::new();
     let mut change_ids = Vec::new();
     let mut created_ats = Vec::new();
@@ -1375,7 +1378,6 @@ fn lix_directory_record_batch(
         entity_ids.push(Some(directory.live.entity_id.as_json_array_text()?));
         schema_keys.push(Some(directory.live.schema_key));
         file_ids.push(directory.live.file_id);
-        schema_versions.push(directory.live.schema_version);
         globals.push(Some(directory.live.global));
         change_ids.push(directory.live.change_id);
         created_ats.push(directory.live.created_at);
@@ -1397,7 +1399,6 @@ fn lix_directory_record_batch(
             "lixcol_entity_id" => Arc::new(StringArray::from(entity_ids.clone())),
             "lixcol_schema_key" => Arc::new(StringArray::from(schema_keys.clone())),
             "lixcol_file_id" => Arc::new(StringArray::from(file_ids.clone())),
-            "lixcol_schema_version" => Arc::new(StringArray::from(schema_versions.clone())),
             "lixcol_global" => Arc::new(BooleanArray::from(globals.clone())),
             "lixcol_change_id" => Arc::new(StringArray::from(change_ids.clone())),
             "lixcol_created_at" => Arc::new(StringArray::from(created_ats.clone())),
@@ -1796,7 +1797,6 @@ fn lix_directory_schema() -> SchemaRef {
         json_field("lixcol_entity_id", false),
         Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
-        Field::new("lixcol_schema_version", DataType::Utf8, false),
         Field::new("lixcol_global", DataType::Boolean, true),
         Field::new("lixcol_change_id", DataType::Utf8, true),
         Field::new("lixcol_created_at", DataType::Utf8, true),
@@ -1988,7 +1988,6 @@ mod tests {
             file_id: file_id.map(ToOwned::to_owned),
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: Some(json!({"source": "test"}).to_string()),
-            schema_version: "1".to_string(),
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),
@@ -2201,7 +2200,6 @@ mod tests {
                     json!({"source": "directory"})
                 )),
                 origin: Some(lix_directory_insert_origin("lix_directory", "dir-docs")),
-                schema_version: "1".to_string(),
                 created_at: None,
                 updated_at: None,
                 global: false,
@@ -2379,7 +2377,6 @@ mod tests {
                         "lix_directory_by_version",
                         "dir-docs"
                     )),
-                    schema_version: "1".to_string(),
                     created_at: None,
                     updated_at: None,
                     global: false,

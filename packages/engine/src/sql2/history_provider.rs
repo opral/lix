@@ -273,7 +273,6 @@ fn lix_state_history_schema() -> SchemaRef {
         Field::new("file_id", DataType::Utf8, true),
         json_field("snapshot_content", true),
         json_field("metadata", true),
-        Field::new("schema_version", DataType::Utf8, false),
         Field::new("change_id", DataType::Utf8, false),
         Field::new("observed_commit_id", DataType::Utf8, false),
         Field::new("commit_created_at", DataType::Utf8, false),
@@ -304,7 +303,6 @@ struct StateHistorySqlRow {
     file_id: Option<String>,
     snapshot_content: Option<String>,
     metadata: Option<String>,
-    schema_version: String,
     change_id: String,
     observed_commit_id: String,
     commit_created_at: String,
@@ -332,9 +330,6 @@ fn state_history_record_batch(
                         .map(|row| row.metadata.as_ref().map(serialize_row_metadata))
                         .collect::<Vec<_>>(),
                 )),
-                "schema_version" => {
-                    string_array(rows.iter().map(|row| Some(row.schema_version.as_str())))
-                }
                 "change_id" => string_array(rows.iter().map(|row| Some(row.change_id.as_str()))),
                 "observed_commit_id" => {
                     string_array(rows.iter().map(|row| Some(row.observed_commit_id.as_str())))
@@ -388,7 +383,6 @@ async fn load_state_history_rows(
                 file_id: entry.change.file_id,
                 snapshot_content: entry.change.snapshot_content,
                 metadata: entry.change.metadata,
-                schema_version: entry.change.schema_version,
                 change_id: entry.change.id,
                 observed_commit_id: entry.observed_commit_id,
                 commit_created_at: entry.commit_created_at,

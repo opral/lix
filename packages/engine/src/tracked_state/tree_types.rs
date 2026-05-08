@@ -63,7 +63,6 @@ pub(crate) struct TrackedStateKeyRef<'a> {
 pub(crate) struct TrackedStateValue {
     pub(crate) snapshot_ref: Option<JsonRef>,
     pub(crate) metadata_ref: Option<JsonRef>,
-    pub(crate) schema_version: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) change_id: String,
@@ -84,7 +83,6 @@ impl TrackedStateValue {
             file_id: key.file_id,
             snapshot_content,
             metadata,
-            schema_version: self.schema_version,
             created_at: self.created_at,
             updated_at: self.updated_at,
             change_id: self.change_id,
@@ -98,7 +96,6 @@ impl TrackedStateValue {
 pub(crate) struct TrackedStateValueRef<'a> {
     pub(crate) snapshot_ref: Option<&'a JsonRef>,
     pub(crate) metadata_ref: Option<&'a JsonRef>,
-    pub(crate) schema_version: &'a str,
     pub(crate) created_at: &'a str,
     pub(crate) updated_at: &'a str,
     pub(crate) change_id: &'a str,
@@ -124,7 +121,6 @@ impl TrackedStateRow {
             value: TrackedStateValueRef {
                 snapshot_ref: self.snapshot_ref.as_ref(),
                 metadata_ref: self.metadata_ref.as_ref(),
-                schema_version: &self.schema_version,
                 created_at: &self.created_at,
                 updated_at: &self.updated_at,
                 change_id: &self.change_id,

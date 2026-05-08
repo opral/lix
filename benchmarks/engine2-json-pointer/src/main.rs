@@ -225,9 +225,9 @@ async fn ensure_benchmark_file_descriptor(lix: &Lix) -> BenchResult<()> {
     });
     let sql = format!(
         "INSERT INTO lix_state (\
-         entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+         entity_id, schema_key, file_id, snapshot_content, global, untracked\
          ) VALUES (\
-         'bench.json', 'lix_file_descriptor', NULL, lix_json('{}'), '1', false, false\
+         'bench.json', 'lix_file_descriptor', NULL, lix_json('{}'), false, false\
          )",
         sql_string(&snapshot.to_string())
     );
@@ -250,7 +250,7 @@ fn build_insert_batches(row_count: usize, chunk_size: usize) -> BenchResult<Vec<
         let end = (next + chunk_size).min(row_count);
         let mut sql = String::from(
             "INSERT INTO lix_state (\
-             entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+             entity_id, schema_key, file_id, snapshot_content, global, untracked\
              ) VALUES ",
         );
         for index in next..end {
@@ -266,7 +266,7 @@ fn build_insert_batches(row_count: usize, chunk_size: usize) -> BenchResult<Vec<
                 }
             });
             sql.push_str(&format!(
-                "('{}','json_pointer','bench.json',lix_json('{}'),'1',false,false)",
+                "('{}','json_pointer','bench.json',lix_json('{}'),false,false)",
                 sql_string(&pointer),
                 sql_string(&snapshot.to_string())
             ));

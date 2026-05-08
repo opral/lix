@@ -1,6 +1,6 @@
 use crate::common::{BlockSnapshotContent, DocumentSnapshotContent};
 use crate::exports::lix::plugin::api::{EntityChange, File, PluginError};
-use crate::schemas::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, ENTITY_SCHEMA_VERSION};
+use crate::schemas::{BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY};
 use crate::ROOT_ENTITY_ID;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,13 +15,6 @@ pub(crate) fn apply_changes(
     for change in changes {
         if change.schema_key != DOCUMENT_SCHEMA_KEY && change.schema_key != BLOCK_SCHEMA_KEY {
             continue;
-        }
-
-        if change.schema_version != ENTITY_SCHEMA_VERSION {
-            return Err(PluginError::InvalidInput(format!(
-                "unsupported schema_version '{}' for schema_key '{}', expected '{}'",
-                change.schema_version, change.schema_key, ENTITY_SCHEMA_VERSION
-            )));
         }
 
         if change.schema_key == DOCUMENT_SCHEMA_KEY {

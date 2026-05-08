@@ -62,7 +62,6 @@
                 "enum": [
                   "entity_id",
                   "schema_key",
-                  "schema_version",
                   "snapshot_content",
                   "file_id",
                   "plugin_key",

@@ -60,9 +60,9 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_composite_message\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/key\",\"/locale\"],\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"locale\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"key\",\"locale\",\"text\"],\"additionalProperties\":false}'),\
+                 lix_json('{\"x-lix-key\":\"engine_composite_message\",\"x-lix-primary-key\":[\"/key\",\"/locale\"],\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"locale\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},\"required\":[\"key\",\"locale\",\"text\"],\"additionalProperties\":false}'),\
                  false,\
-                 true\
+                 false\
                  )",
                 &[],
             )
@@ -118,9 +118,9 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"engine_numeric_message\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"number\"},\"text\":{\"type\":\"string\"}},\"required\":[\"id\",\"text\"],\"additionalProperties\":false}'),\
+                 lix_json('{\"x-lix-key\":\"engine_numeric_message\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"number\"},\"text\":{\"type\":\"string\"}},\"required\":[\"id\",\"text\"],\"additionalProperties\":false}'),\
                  false,\
-                 true\
+                 false\
                  )",
                 &[],
             )

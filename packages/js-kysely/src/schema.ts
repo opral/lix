@@ -117,7 +117,6 @@ type EntityStateHistoryColumns = {
 	lixcol_schema_key: LixGenerated<string>;
 	lixcol_file_id: LixGenerated<string | null>;
 	lixcol_plugin_key: LixGenerated<string>;
-	lixcol_schema_version: LixGenerated<string>;
 	lixcol_change_id: LixGenerated<string>;
 	lixcol_commit_id: LixGenerated<string>;
 	lixcol_root_commit_id: LixGenerated<string>;
@@ -153,7 +152,6 @@ type StateByVersionView = {
 	file_id: string | null;
 	plugin_key: string;
 	snapshot_content: LixJsonValue;
-	schema_version: string;
 	version_id: string;
 	created_at: Generated<string>;
 	updated_at: Generated<string>;
@@ -173,7 +171,6 @@ type StateWithTombstonesView = {
 	file_id: string | null;
 	plugin_key: string;
 	snapshot_content: LixJsonValue | null;
-	schema_version: string;
 	version_id: string;
 	created_at: Generated<string>;
 	updated_at: Generated<string>;
@@ -192,7 +189,6 @@ type StateHistoryView = {
 	plugin_key: string;
 	snapshot_content: LixJsonValue;
 	metadata: LixJsonValue | null;
-	schema_version: string;
 	change_id: string;
 	commit_id: string;
 	root_commit_id: string;
