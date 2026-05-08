@@ -32,6 +32,7 @@ use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
 use crate::sql2::dml::{InsertExec, InsertSink};
+use crate::sql2::predicate_typecheck::validate_json_predicate_filters;
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids,
@@ -404,6 +405,7 @@ impl TableProvider for EntityProvider {
         };
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
@@ -456,6 +458,7 @@ impl TableProvider for EntityProvider {
         };
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_assignments = assignments
             .iter()
             .map(|(column_name, expr)| {

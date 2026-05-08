@@ -40,6 +40,31 @@ fn validate_lix_schema_definition_rejects_unprojectable_entity_properties() {
 }
 
 #[test]
+fn validate_lix_schema_definition_rejects_reserved_lix_property_prefixes() {
+    for property_name in ["lixcol_entity_id", "lix_internal", "lixfoo"] {
+        let schema = json!({
+            "x-lix-key": "test_entity",
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                property_name: { "type": "string" }
+            },
+            "required": ["id", property_name],
+            "additionalProperties": false
+        });
+
+        let err = validate_lix_schema_definition(&schema)
+            .expect_err("reserved property names should be rejected");
+        assert!(
+            err.to_string().contains(&format!(
+                "property '/{property_name}' uses reserved prefix 'lix'"
+            )),
+            "error should identify the reserved property name: {err:?}"
+        );
+    }
+}
+
+#[test]
 fn validate_lix_schema_definition_throws_for_invalid_schema() {
     let invalid_schema = json!({
         "type": "object",
