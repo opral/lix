@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -14,7 +14,8 @@ use datafusion::common::{not_impl_err, DFSchema, DataFusionError, Result, Scalar
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::expr::InList;
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_expr::{create_physical_expr, EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -299,13 +300,14 @@ impl TableProvider for EntityProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
+        let analyzer = EntityPrimaryKeyFilterAnalyzer::new(&self.spec);
         Ok(filters
             .iter()
             .map(|filter| {
-                if explicit_version_ids_from_dml_filters(&[(*filter).clone()]).is_empty() {
-                    TableProviderFilterPushDown::Unsupported
+                if ExactVersionIdFilterAnalyzer.supports(filter) || analyzer.supports(filter) {
+                    TableProviderFilterPushDown::Exact
                 } else {
-                    TableProviderFilterPushDown::Inexact
+                    TableProviderFilterPushDown::Unsupported
                 }
             })
             .collect())
@@ -341,6 +343,8 @@ impl TableProvider for EntityProvider {
         )
         .await
         .map_err(lix_error_to_datafusion_error)?;
+        apply_exact_version_id_filter(&mut request, exact_version_ids_from_filters(filters)?);
+        apply_exact_entity_id_filters(&mut request, &self.spec, filters)?;
 
         Ok(Arc::new(EntityScanExec::new(
             Arc::clone(&self.spec),
@@ -416,14 +420,16 @@ impl TableProvider for EntityProvider {
             None,
         );
         if matches!(version_binding, VersionBinding::Explicit) {
-            request.filter.version_ids = explicit_version_ids_from_dml_filters(&filters);
-            if request.filter.version_ids.is_empty() {
+            let exact_version_ids = exact_version_ids_from_filters(&filters)?;
+            if exact_version_ids.is_none() {
                 return Err(DataFusionError::Plan(format!(
                     "DELETE FROM {}_by_version requires an explicit lixcol_version_id predicate",
                     self.spec.schema_key
                 )));
             }
+            apply_exact_version_id_filter(&mut request, exact_version_ids);
         }
+        apply_exact_entity_id_filters(&mut request, &self.spec, &filters)?;
 
         Ok(Arc::new(EntityDeleteExec::new(
             Arc::clone(&self.spec),
@@ -472,11 +478,12 @@ impl TableProvider for EntityProvider {
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
             .collect::<Result<Vec<_>>>()?;
-        let request = entity_live_state_scan_request(
+        let mut request = entity_live_state_scan_request(
             &self.spec.schema_key,
             version_binding.active_version_id(),
             None,
         );
+        apply_exact_entity_id_filters(&mut request, &self.spec, &filters)?;
 
         Ok(Arc::new(EntityUpdateExec::new(
             Arc::clone(&self.spec),
@@ -487,6 +494,413 @@ impl TableProvider for EntityProvider {
             physical_assignments,
             physical_filters,
         )))
+    }
+}
+
+fn entity_ids_from_primary_key_filters(
+    spec: &EntitySurfaceSpec,
+    filters: &[Expr],
+) -> Result<Option<Vec<EntityIdentity>>> {
+    let analyzer = EntityPrimaryKeyFilterAnalyzer::new(spec);
+    let mut entity_ids: Option<BTreeSet<EntityIdentity>> = None;
+    for filter in filters {
+        let Some(filter_ids) = analyzer.analyze(filter)? else {
+            continue;
+        };
+        entity_ids = Some(match entity_ids {
+            Some(existing_ids) => existing_ids.intersection(&filter_ids).cloned().collect(),
+            None => filter_ids,
+        });
+    }
+
+    Ok(entity_ids.map(|ids| ids.into_iter().collect()))
+}
+
+fn apply_exact_entity_id_filters(
+    request: &mut LiveStateScanRequest,
+    spec: &EntitySurfaceSpec,
+    filters: &[Expr],
+) -> Result<()> {
+    if let Some(entity_ids) = entity_ids_from_primary_key_filters(spec, filters)? {
+        if entity_ids.is_empty() {
+            request.limit = Some(0);
+        }
+        request.filter.entity_ids = entity_ids;
+    }
+    Ok(())
+}
+
+fn exact_version_ids_from_filters(filters: &[Expr]) -> Result<Option<Vec<String>>> {
+    let analyzer = ExactVersionIdFilterAnalyzer;
+    let mut version_ids: Option<BTreeSet<String>> = None;
+    for filter in filters {
+        let Some(filter_ids) = analyzer.analyze(filter)? else {
+            continue;
+        };
+        version_ids = Some(match version_ids {
+            Some(existing_ids) => existing_ids.intersection(&filter_ids).cloned().collect(),
+            None => filter_ids,
+        });
+    }
+    Ok(version_ids.map(|ids| ids.into_iter().collect()))
+}
+
+fn apply_exact_version_id_filter(
+    request: &mut LiveStateScanRequest,
+    version_ids: Option<Vec<String>>,
+) {
+    if let Some(version_ids) = version_ids {
+        if version_ids.is_empty() {
+            request.limit = Some(0);
+        }
+        request.filter.version_ids = version_ids;
+    }
+}
+
+struct EntityPrimaryKeyFilterAnalyzer<'a> {
+    primary_key_columns: Vec<&'a str>,
+}
+
+struct ExactVersionIdFilterAnalyzer;
+
+impl ExactVersionIdFilterAnalyzer {
+    fn supports(&self, expr: &Expr) -> bool {
+        self.analyze(expr)
+            .is_ok_and(|constraint| constraint.is_some())
+    }
+
+    fn analyze(&self, expr: &Expr) -> Result<Option<BTreeSet<String>>> {
+        match expr {
+            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
+                let Some(left) = self.analyze(&binary_expr.left)? else {
+                    return Ok(None);
+                };
+                let Some(right) = self.analyze(&binary_expr.right)? else {
+                    return Ok(None);
+                };
+                Ok(Some(left.intersection(&right).cloned().collect()))
+            }
+            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
+                let Some(mut left) = self.analyze(&binary_expr.left)? else {
+                    return Ok(None);
+                };
+                let Some(right) = self.analyze(&binary_expr.right)? else {
+                    return Ok(None);
+                };
+                left.extend(right);
+                Ok(Some(left))
+            }
+            Expr::BinaryExpr(binary_expr) => {
+                Ok(version_id_from_binary_filter(binary_expr).map(|value| BTreeSet::from([value])))
+            }
+            Expr::InList(in_list) => {
+                Ok(version_ids_from_in_list_filter(in_list)
+                    .map(|values| values.into_iter().collect()))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+fn version_id_from_binary_filter(binary_expr: &BinaryExpr) -> Option<String> {
+    if binary_expr.op != Operator::Eq {
+        return None;
+    }
+
+    version_id_from_column_literal_filter(&binary_expr.left, &binary_expr.right)
+        .or_else(|| version_id_from_column_literal_filter(&binary_expr.right, &binary_expr.left))
+}
+
+fn version_ids_from_in_list_filter(in_list: &InList) -> Option<Vec<String>> {
+    if in_list.negated {
+        return None;
+    }
+    let Expr::Column(column) = in_list.expr.as_ref() else {
+        return None;
+    };
+    if column.name != "lixcol_version_id" {
+        return None;
+    }
+
+    let values = in_list
+        .list
+        .iter()
+        .map(string_expr_literal)
+        .collect::<Option<Vec<_>>>()?;
+    if values.is_empty() {
+        return None;
+    }
+    Some(values)
+}
+
+fn version_id_from_column_literal_filter(
+    column_expr: &Expr,
+    literal_expr: &Expr,
+) -> Option<String> {
+    let Expr::Column(column) = column_expr else {
+        return None;
+    };
+    if column.name != "lixcol_version_id" {
+        return None;
+    }
+    string_expr_literal(literal_expr)
+}
+
+impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
+    fn new(spec: &'a EntitySurfaceSpec) -> Self {
+        Self {
+            primary_key_columns: string_primary_key_columns(spec),
+        }
+    }
+
+    fn supports(&self, expr: &Expr) -> bool {
+        self.analyze(expr)
+            .is_ok_and(|constraint| constraint.is_some())
+    }
+
+    fn analyze(&self, expr: &Expr) -> Result<Option<BTreeSet<EntityIdentity>>> {
+        if self.primary_key_columns.is_empty() {
+            return Ok(None);
+        };
+        let Some(constraint) = self.analyze_constraint(expr)? else {
+            return Ok(None);
+        };
+        Ok(constraint.into_entity_ids(&self.primary_key_columns))
+    }
+
+    fn analyze_constraint(&self, expr: &Expr) -> Result<Option<EntityIdentityConstraint>> {
+        match expr {
+            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
+                let Some(left) = self.analyze_constraint(&binary_expr.left)? else {
+                    return Ok(None);
+                };
+                let Some(right) = self.analyze_constraint(&binary_expr.right)? else {
+                    return Ok(None);
+                };
+                Ok(Some(left.intersect(right, &self.primary_key_columns)))
+            }
+            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
+                let Some(left) = self.analyze_constraint(&binary_expr.left)? else {
+                    return Ok(None);
+                };
+                let Some(right) = self.analyze_constraint(&binary_expr.right)? else {
+                    return Ok(None);
+                };
+                let Some(left_ids) = left.into_entity_ids(&self.primary_key_columns) else {
+                    return Ok(None);
+                };
+                let Some(mut right_ids) = right.into_entity_ids(&self.primary_key_columns) else {
+                    return Ok(None);
+                };
+                right_ids.extend(left_ids);
+                Ok(Some(EntityIdentityConstraint::Full(right_ids)))
+            }
+            Expr::BinaryExpr(binary_expr) => Ok(entity_identity_constraint_from_binary_filter(
+                binary_expr,
+                &self.primary_key_columns,
+            )),
+            Expr::InList(in_list) => Ok(entity_identity_constraint_from_in_list_filter(
+                in_list,
+                &self.primary_key_columns,
+            )),
+            _ => Ok(None),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EntityIdentityConstraint {
+    Full(BTreeSet<EntityIdentity>),
+    Parts(BTreeMap<String, BTreeSet<String>>),
+}
+
+impl EntityIdentityConstraint {
+    fn intersect(self, other: Self, primary_key_columns: &[&str]) -> Self {
+        match (self, other) {
+            (Self::Full(left), Self::Full(right)) => {
+                Self::Full(left.intersection(&right).cloned().collect())
+            }
+            (Self::Full(ids), Self::Parts(parts)) | (Self::Parts(parts), Self::Full(ids)) => {
+                Self::Full(
+                    ids.into_iter()
+                        .filter(|identity| {
+                            identity_matches_parts(identity, primary_key_columns, &parts)
+                        })
+                        .collect(),
+                )
+            }
+            (Self::Parts(mut left), Self::Parts(right)) => {
+                for (column, right_values) in right {
+                    left.entry(column)
+                        .and_modify(|left_values| {
+                            *left_values =
+                                left_values.intersection(&right_values).cloned().collect();
+                        })
+                        .or_insert(right_values);
+                }
+                Self::Parts(left)
+            }
+        }
+    }
+
+    fn into_entity_ids(self, primary_key_columns: &[&str]) -> Option<BTreeSet<EntityIdentity>> {
+        match self {
+            Self::Full(ids) => Some(ids),
+            Self::Parts(parts) => entity_ids_from_primary_key_parts(primary_key_columns, parts),
+        }
+    }
+}
+
+fn string_primary_key_columns(spec: &EntitySurfaceSpec) -> Vec<&str> {
+    spec.primary_key_paths
+        .iter()
+        .map(|path| {
+            let [column_name] = path.as_slice() else {
+                return None;
+            };
+            let column = spec.visible_column(column_name)?;
+            (column.column_type == EntityColumnType::String).then_some(column.name.as_str())
+        })
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
+}
+
+fn entity_identity_constraint_from_binary_filter(
+    binary_expr: &BinaryExpr,
+    primary_key_columns: &[&str],
+) -> Option<EntityIdentityConstraint> {
+    if binary_expr.op != Operator::Eq {
+        return None;
+    }
+    entity_identity_constraint_from_column_literal_filter(
+        &binary_expr.left,
+        &binary_expr.right,
+        primary_key_columns,
+    )
+    .or_else(|| {
+        entity_identity_constraint_from_column_literal_filter(
+            &binary_expr.right,
+            &binary_expr.left,
+            primary_key_columns,
+        )
+    })
+}
+
+fn entity_identity_constraint_from_in_list_filter(
+    in_list: &InList,
+    primary_key_columns: &[&str],
+) -> Option<EntityIdentityConstraint> {
+    if in_list.negated {
+        return None;
+    }
+    let Expr::Column(column) = in_list.expr.as_ref() else {
+        return None;
+    };
+    let values = in_list
+        .list
+        .iter()
+        .map(string_expr_literal)
+        .collect::<Option<Vec<_>>>()?;
+    if values.is_empty() {
+        return None;
+    }
+    match column.name.as_str() {
+        "lixcol_entity_id" => values
+            .into_iter()
+            .map(|value| EntityIdentity::from_json_array_text(&value).ok())
+            .collect::<Option<BTreeSet<_>>>()
+            .map(EntityIdentityConstraint::Full),
+        column_name if primary_key_columns.contains(&column_name) => {
+            Some(EntityIdentityConstraint::Parts(BTreeMap::from([(
+                column_name.to_string(),
+                values.into_iter().collect(),
+            )])))
+        }
+        _ => None,
+    }
+}
+
+fn entity_identity_constraint_from_column_literal_filter(
+    column_expr: &Expr,
+    literal_expr: &Expr,
+    primary_key_columns: &[&str],
+) -> Option<EntityIdentityConstraint> {
+    let Expr::Column(column) = column_expr else {
+        return None;
+    };
+    let value = string_expr_literal(literal_expr)?;
+    match column.name.as_str() {
+        "lixcol_entity_id" => EntityIdentity::from_json_array_text(&value)
+            .ok()
+            .map(|identity| EntityIdentityConstraint::Full(BTreeSet::from([identity]))),
+        column_name if primary_key_columns.contains(&column_name) => {
+            Some(EntityIdentityConstraint::Parts(BTreeMap::from([(
+                column_name.to_string(),
+                BTreeSet::from([value]),
+            )])))
+        }
+        _ => None,
+    }
+}
+
+fn entity_ids_from_primary_key_parts(
+    primary_key_columns: &[&str],
+    parts: BTreeMap<String, BTreeSet<String>>,
+) -> Option<BTreeSet<EntityIdentity>> {
+    if primary_key_columns
+        .iter()
+        .any(|column| !parts.contains_key(*column))
+    {
+        return None;
+    }
+
+    let mut identities = BTreeSet::from([Vec::<String>::new()]);
+    for column in primary_key_columns {
+        let values = parts.get(*column)?;
+        identities = identities
+            .into_iter()
+            .flat_map(|prefix| {
+                values.iter().map(move |value| {
+                    let mut parts = prefix.clone();
+                    parts.push(value.clone());
+                    parts
+                })
+            })
+            .collect();
+    }
+    Some(
+        identities
+            .into_iter()
+            .map(|parts| EntityIdentity { parts })
+            .collect(),
+    )
+}
+
+fn identity_matches_parts(
+    identity: &EntityIdentity,
+    primary_key_columns: &[&str],
+    parts: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    let identity_parts = identity.parts.as_slice();
+    primary_key_columns
+        .iter()
+        .zip(identity_parts.iter())
+        .all(|(column, value)| {
+            parts
+                .get(*column)
+                .is_none_or(|values| values.contains(value))
+        })
+}
+
+fn string_expr_literal(expr: &Expr) -> Option<String> {
+    let Expr::Literal(literal, _) = expr else {
+        return None;
+    };
+    match literal {
+        ScalarValue::Utf8(Some(value))
+        | ScalarValue::Utf8View(Some(value))
+        | ScalarValue::LargeUtf8(Some(value)) => Some(value.clone()),
+        _ => None,
     }
 }
 
@@ -617,12 +1031,7 @@ impl DisplayAs for EntityDeleteExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(
-                    f,
-                    "EntityDeleteExec(schema_key={}, filters={})",
-                    self.spec.schema_key,
-                    self.filters.len()
-                )
+                write!(f, "EntityDeleteExec(schema_key={})", self.spec.schema_key)
             }
             DisplayFormatType::TreeRender => write!(f, "EntityDeleteExec"),
         }
@@ -782,10 +1191,9 @@ impl DisplayAs for EntityUpdateExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "EntityUpdateExec(schema_key={}, assignments={}, filters={})",
+                    "EntityUpdateExec(schema_key={}, assignments={})",
                     self.spec.schema_key,
-                    self.assignments.len(),
-                    self.filters.len()
+                    self.assignments.len()
                 )
             }
             DisplayFormatType::TreeRender => write!(f, "EntityUpdateExec"),
@@ -2026,7 +2434,10 @@ mod tests {
     use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::common::{Column, ScalarValue};
     use datafusion::execution::TaskContext;
+    use datafusion::logical_expr::expr::InList;
+    use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
     use serde_json::json;
 
     use super::{
@@ -2212,6 +2623,22 @@ mod tests {
 
     fn string_column(values: Vec<Option<&str>>) -> ArrayRef {
         Arc::new(StringArray::from(values)) as ArrayRef
+    }
+
+    fn string_literal(value: &str) -> Expr {
+        Expr::Literal(ScalarValue::Utf8(Some(value.to_string())), None)
+    }
+
+    fn column(name: &str) -> Expr {
+        Expr::Column(Column::from_name(name))
+    }
+
+    fn eq_filter(column_name: &str, value: &str) -> Expr {
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(column(column_name)),
+            Operator::Eq,
+            Box::new(string_literal(value)),
+        ))
     }
 
     fn entity_insert_batch(include_version: bool, global: bool) -> RecordBatch {
@@ -2486,6 +2913,80 @@ mod tests {
         );
 
         assert!(provider.schema.field_with_name("lixcol_version_id").is_ok());
+    }
+
+    #[test]
+    fn primary_key_filters_route_entity_ids_for_string_primary_key() {
+        let spec = entity_insert_spec_with_primary_key();
+        let filters = vec![
+            eq_filter("id", "entity-a"),
+            Expr::InList(InList::new(
+                Box::new(column("id")),
+                vec![string_literal("entity-b"), string_literal("entity-a")],
+                false,
+            )),
+        ];
+
+        let entity_ids = super::entity_ids_from_primary_key_filters(&spec, &filters)
+            .expect("primary-key filters should analyze")
+            .expect("primary-key filters should produce a constraint");
+
+        assert_eq!(
+            entity_ids,
+            vec![crate::entity_identity::EntityIdentity::single("entity-a")]
+        );
+    }
+
+    #[test]
+    fn primary_key_filter_analyzer_models_boolean_predicates() {
+        let spec = entity_insert_spec_with_primary_key();
+        let analyzer = super::EntityPrimaryKeyFilterAnalyzer::new(&spec);
+        let disjunction = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(eq_filter("id", "entity-a")),
+            Operator::Or,
+            Box::new(eq_filter("id", "entity-b")),
+        ));
+        let contradiction = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(eq_filter("id", "entity-a")),
+            Operator::And,
+            Box::new(eq_filter("id", "entity-b")),
+        ));
+
+        let disjunction_ids = analyzer
+            .analyze(&disjunction)
+            .expect("OR should analyze")
+            .expect("OR should produce an entity-id set");
+        let contradiction_ids = analyzer
+            .analyze(&contradiction)
+            .expect("AND should analyze")
+            .expect("AND should produce an entity-id set");
+
+        assert_eq!(
+            disjunction_ids.into_iter().collect::<Vec<_>>(),
+            vec![
+                crate::entity_identity::EntityIdentity::single("entity-a"),
+                crate::entity_identity::EntityIdentity::single("entity-b"),
+            ]
+        );
+        assert!(contradiction_ids.is_empty());
+    }
+
+    #[test]
+    fn primary_key_filters_ignore_non_key_and_negated_predicates() {
+        let spec = entity_insert_spec_with_primary_key();
+        let filters = vec![
+            eq_filter("body", "hello"),
+            Expr::InList(InList::new(
+                Box::new(column("id")),
+                vec![string_literal("entity-a")],
+                true,
+            )),
+        ];
+
+        assert!(super::entity_ids_from_primary_key_filters(&spec, &filters)
+            .expect("ignored filters should analyze")
+            .unwrap_or_default()
+            .is_empty());
     }
 
     #[test]
