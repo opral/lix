@@ -425,6 +425,9 @@ fn sqlite_scan_entries(
 }
 
 fn sqlite_fetch_limit(limit: usize) -> Result<i64, LixError> {
+    if limit == usize::MAX {
+        return Ok(i64::MAX);
+    }
     let fetch_limit = limit.checked_add(1).ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
