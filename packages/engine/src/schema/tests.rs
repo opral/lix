@@ -202,6 +202,27 @@ fn validate_lix_schema_definition_rejects_non_string_primary_key_properties() {
 }
 
 #[test]
+fn validate_lix_schema_definition_rejects_optional_primary_key_properties() {
+    let schema = json!({
+        "x-lix-key": "optional_pk",
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "value": { "type": "string" }
+        },
+        "required": ["value"],
+        "x-lix-primary-key": ["/id"],
+        "additionalProperties": false
+    });
+
+    let err = validate_lix_schema_definition(&schema)
+        .expect_err("primary-key property should be required");
+    assert!(err
+        .to_string()
+        .contains("x-lix-primary-key property \"/id\" must be required"));
+}
+
+#[test]
 fn validate_lix_schema_definition_rejects_missing_unique_constraint_properties() {
     let schema = json!({
         "x-lix-key": "missing_unique",

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Lix Schema Definition",
-  "description": "A Lix schema is a JSON Schema draft 2020-12 document augmented with `x-lix-*` extensions that identify and constrain an entity type. Every schema must declare `x-lix-key` (snake_case identifier, preferably prefixed with a plugin or domain namespace such as `library_book` to avoid collisions) and `additionalProperties: false`; add `x-lix-primary-key` (array of JSON Pointers to string properties) to make the schema writable. Lix will auto-materialize a public virtual table named after `x-lix-key` with an `INSERT/UPDATE/DELETE` surface. See the `examples` field for a minimal working schema.",
+  "description": "A Lix schema is a JSON Schema draft 2020-12 document augmented with `x-lix-*` extensions that identify and constrain an entity type. Every schema must declare `x-lix-key` (snake_case identifier, preferably prefixed with a plugin or domain namespace such as `library_book` to avoid collisions) and `additionalProperties: false`; add `x-lix-primary-key` (array of JSON Pointers to required string properties) to make the schema writable. Lix will auto-materialize a public virtual table named after `x-lix-key` with an `INSERT/UPDATE/DELETE` surface. See the `examples` field for a minimal working schema.",
   "examples": [
     {
       "x-lix-key": "library_book",
@@ -58,7 +58,7 @@
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
-          "description": "Primary-key fields as JSON Pointers (RFC 6901) into string-valued entity properties, e.g. `[\"/id\"]` for a single-column key or `[\"/tenant_id\", \"/handle\"]` for a composite key. Note the leading slash; `\"id\"` without a slash is not a valid pointer.",
+          "description": "Primary-key fields as JSON Pointers (RFC 6901) into required string-valued entity properties, e.g. `[\"/id\"]` for a single-column key or `[\"/tenant_id\", \"/handle\"]` for a composite key. Note the leading slash; `\"id\"` without a slash is not a valid pointer.",
           "items": {
             "type": "string",
             "format": "json-pointer",
