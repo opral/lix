@@ -250,8 +250,7 @@ async fn register_poison_task_schema(session: &lix_engine::SessionContext) {
     let schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "x-lix-key": "poison_task",
-        "x-lix-version": "1",
-        "x-lix-primary-key": ["/id"],
+                "x-lix-primary-key": ["/id"],
         "type": "object",
         "required": ["id", "title", "meta"],
         "properties": {
@@ -355,9 +354,9 @@ simulation_test!(
         let write_result = second_session
 			.execute(
 					"INSERT INTO lix_state (\
-					 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+					 entity_id, schema_key, file_id, snapshot_content, global, untracked\
 					 ) VALUES (\
-					 lix_json('[\"det-write\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"det-write\",\"value\":\"ok\"}'), '1', false, false\
+					 lix_json('[\"det-write\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"det-write\",\"value\":\"ok\"}'), false, false\
 					 )",
 					&[],
 				)

@@ -4,6 +4,7 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
+use crate::common::parse_json_pointer;
 use crate::LixError;
 
 static LIX_SCHEMA_DEFINITION: OnceLock<JsonValue> = OnceLock::new();
@@ -11,9 +12,6 @@ static LIX_SCHEMA_VALIDATOR: OnceLock<Result<JSONSchema, LixError>> = OnceLock::
 
 pub fn lix_schema_definition() -> &'static JsonValue {
     LIX_SCHEMA_DEFINITION.get_or_init(|| {
-        // NOTE: x-lix-version is intentionally constrained to a monotonic integer (as a string).
-        // This keeps translation rules open while avoiding a future breaking change when versioning
-        // semantics become concrete.
         let raw = include_str!("definition.json");
         serde_json::from_str(raw).expect("definition.json must be valid JSON")
     })
@@ -46,7 +44,33 @@ pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError
     assert_unique_pointers(schema)?;
     assert_state_foreign_key_pointers(schema)?;
     assert_known_x_lix_top_level_fields(schema)?;
+    assert_entity_properties_do_not_use_reserved_lix_prefix(schema)?;
     assert_entity_properties_have_projectable_types(schema)?;
+
+    Ok(())
+}
+
+fn assert_entity_properties_do_not_use_reserved_lix_prefix(
+    schema: &JsonValue,
+) -> Result<(), LixError> {
+    let Some(schema_key) = schema.get("x-lix-key").and_then(JsonValue::as_str) else {
+        return Ok(());
+    };
+    let Some(properties) = schema.get("properties").and_then(JsonValue::as_object) else {
+        return Ok(());
+    };
+
+    for property_name in properties.keys() {
+        if property_name.starts_with("lix") {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                format!(
+                    "Invalid Lix schema definition: schema '{schema_key}' property '/{property_name}' uses reserved prefix 'lix'."
+                ),
+            )
+            .with_hint("Property names starting with 'lix' are reserved for Lix system fields."));
+        }
+    }
 
     Ok(())
 }
@@ -60,9 +84,6 @@ fn assert_entity_properties_have_projectable_types(schema: &JsonValue) -> Result
     };
 
     for (property_name, property_schema) in properties {
-        if property_name.starts_with("lixcol_") {
-            continue;
-        }
         if !schema_property_has_sql_projection_type(property_schema) {
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
@@ -290,50 +311,6 @@ fn is_cel_expression(value: &str) -> bool {
     Program::compile(value).is_ok()
 }
 
-fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
-    if pointer.is_empty() {
-        return Ok(Vec::new());
-    }
-    if !pointer.starts_with('/') {
-        return Err(LixError {
-            code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
-            message: "Invalid JSON pointer".to_string(),
-            hint: None,
-            details: None,
-        });
-    }
-
-    let mut segments = Vec::new();
-    for raw in pointer[1..].split('/') {
-        segments.push(unescape_pointer_segment(raw)?);
-    }
-    Ok(segments)
-}
-
-fn unescape_pointer_segment(segment: &str) -> Result<String, LixError> {
-    let mut out = String::new();
-    let mut chars = segment.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '~' {
-            match chars.next() {
-                Some('0') => out.push('~'),
-                Some('1') => out.push('/'),
-                _ => {
-                    return Err(LixError {
-                        code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
-                        message: "Invalid JSON pointer".to_string(),
-                        hint: None,
-                        details: None,
-                    })
-                }
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    Ok(out)
-}
-
 fn assert_primary_key_pointers(schema: &JsonValue) -> Result<(), LixError> {
     let Some(primary_key) = schema
         .get("x-lix-primary-key")
@@ -364,6 +341,14 @@ fn assert_primary_key_pointers(schema: &JsonValue) -> Result<(), LixError> {
                 LixError::CODE_SCHEMA_DEFINITION,
                 format!(
                     "Invalid Lix schema definition: x-lix-primary-key property \"{pointer}\" must have type \"string\"."
+                ),
+            ));
+        }
+        if !schema_pointer_is_required(schema, &segments) {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                format!(
+                    "Invalid Lix schema definition: x-lix-primary-key property \"{pointer}\" must be required."
                 ),
             ));
         }
@@ -483,7 +468,6 @@ fn assert_known_x_lix_top_level_fields(schema: &JsonValue) -> Result<(), LixErro
         let known = matches!(
             key.as_str(),
             "x-lix-key"
-                | "x-lix-version"
                 | "x-lix-primary-key"
                 | "x-lix-unique"
                 | "x-lix-foreign-keys"
@@ -613,7 +597,6 @@ mod pointer_slash_detection_tests {
         let mut obj = json!({
             "type": "object",
             "x-lix-key": "book",
-            "x-lix-version": "1",
             "properties": {
                 "id": { "type": "string" },
                 "author_id": { "type": "string" },

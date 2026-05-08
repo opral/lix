@@ -33,7 +33,7 @@ use super::history_route::{
     HistoryColumnStyle, HistoryEntry, HistoryRoute, HistoryViewDescriptor, HISTORY_COL_CHANGE_ID,
     HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_ID, HISTORY_COL_FILE_ID,
     HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_SCHEMA_KEY,
-    HISTORY_COL_SCHEMA_VERSION, HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
+    HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
 };
 use super::result_metadata::json_field;
 use super::SqlChangelogQuerySource;
@@ -816,10 +816,6 @@ fn file_history_column_array(
             string_array(rows.iter().map(|_| Some(FILE_DESCRIPTOR_SCHEMA_KEY)))
         }
         HISTORY_COL_FILE_ID => string_array(rows.iter().map(|row| Some(row.entity_id.as_str()))),
-        HISTORY_COL_SCHEMA_VERSION => string_array(
-            rows.iter()
-                .map(|row| Some(row.descriptor_change.schema_version.as_str())),
-        ),
         HISTORY_COL_CHANGE_ID => {
             string_array(rows.iter().map(|row| Some(row.event.change.id.as_str())))
         }
@@ -877,7 +873,6 @@ fn lix_file_history_schema() -> SchemaRef {
         Field::new(HISTORY_COL_SCHEMA_KEY, DataType::Utf8, false),
         Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
         json_field(HISTORY_COL_SNAPSHOT_CONTENT, true),
-        Field::new(HISTORY_COL_SCHEMA_VERSION, DataType::Utf8, false),
         Field::new(HISTORY_COL_CHANGE_ID, DataType::Utf8, false),
         json_field(HISTORY_COL_METADATA, true),
         Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),

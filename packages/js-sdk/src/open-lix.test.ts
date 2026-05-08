@@ -538,7 +538,6 @@ async function registerCrmTaskSchema(lix: Lix) {
 	const schema = {
 		$schema: "https://json-schema.org/draft/2020-12/schema",
 		"x-lix-key": "crm_task",
-		"x-lix-version": "1",
 		"x-lix-primary-key": ["/id"],
 		type: "object",
 		required: ["id", "title", "done", "meta"],

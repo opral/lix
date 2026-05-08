@@ -22,7 +22,6 @@ pub(crate) fn encode_row_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8>, L
     let metadata_ref = row
         .metadata_ref
         .map(|value| builder.create_vector(value.as_hash_bytes()));
-    let schema_version = builder.create_string(row.schema_version);
     let created_at = builder.create_string(row.created_at);
     let updated_at = builder.create_string(row.updated_at);
     let version_id = builder.create_string(row.version_id);
@@ -35,7 +34,6 @@ pub(crate) fn encode_row_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8>, L
             file_id,
             snapshot_ref,
             metadata_ref,
-            schema_version,
             created_at,
             updated_at,
             global: row.global,
@@ -76,7 +74,6 @@ pub(crate) fn decode_row(bytes: &[u8]) -> Result<UntrackedStateRow, LixError> {
         file_id: row.file_id().map(ToString::to_string),
         snapshot_ref: optional_json_ref(row.snapshot_ref(), "snapshot_ref")?,
         metadata_ref: optional_json_ref(row.metadata_ref(), "metadata_ref")?,
-        schema_version: required_str(row.schema_version(), "schema_version")?.to_string(),
         created_at: required_str(row.created_at(), "created_at")?.to_string(),
         updated_at: required_str(row.updated_at(), "updated_at")?.to_string(),
         global: row.global(),
@@ -135,11 +132,10 @@ mod flatbuffer {
         const VT_FILE_ID: flatbuffers::VOffsetT = 8;
         const VT_SNAPSHOT_REF: flatbuffers::VOffsetT = 10;
         const VT_METADATA_REF: flatbuffers::VOffsetT = 12;
-        const VT_SCHEMA_VERSION: flatbuffers::VOffsetT = 14;
-        const VT_CREATED_AT: flatbuffers::VOffsetT = 16;
-        const VT_UPDATED_AT: flatbuffers::VOffsetT = 18;
-        const VT_GLOBAL: flatbuffers::VOffsetT = 20;
-        const VT_VERSION_ID: flatbuffers::VOffsetT = 22;
+        const VT_CREATED_AT: flatbuffers::VOffsetT = 14;
+        const VT_UPDATED_AT: flatbuffers::VOffsetT = 16;
+        const VT_GLOBAL: flatbuffers::VOffsetT = 18;
+        const VT_VERSION_ID: flatbuffers::VOffsetT = 20;
 
         #[inline]
         pub(super) fn entity_id(&self) -> Option<&'a str> {
@@ -187,15 +183,6 @@ mod flatbuffer {
             }
         }
 
-        #[inline]
-        pub(super) fn schema_version(&self) -> Option<&'a str> {
-            unsafe {
-                self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_SCHEMA_VERSION, None)
-            }
-        }
-
-        #[inline]
         pub(super) fn created_at(&self) -> Option<&'a str> {
             unsafe {
                 self.table
@@ -259,11 +246,6 @@ mod flatbuffer {
                     false,
                 )?
                 .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "schema_version",
-                    Self::VT_SCHEMA_VERSION,
-                    true,
-                )?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
                     "created_at",
                     Self::VT_CREATED_AT,
                     true,
@@ -290,7 +272,6 @@ mod flatbuffer {
         pub(super) file_id: Option<flatbuffers::WIPOffset<&'a str>>,
         pub(super) snapshot_ref: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
         pub(super) metadata_ref: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
-        pub(super) schema_version: flatbuffers::WIPOffset<&'a str>,
         pub(super) created_at: flatbuffers::WIPOffset<&'a str>,
         pub(super) updated_at: flatbuffers::WIPOffset<&'a str>,
         pub(super) global: bool,
@@ -314,10 +295,6 @@ mod flatbuffer {
         builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
             UntrackedStateRow::VT_CREATED_AT,
             args.created_at,
-        );
-        builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-            UntrackedStateRow::VT_SCHEMA_VERSION,
-            args.schema_version,
         );
         if let Some(metadata_ref) = args.metadata_ref {
             builder.push_slot_always::<flatbuffers::WIPOffset<_>>(

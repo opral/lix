@@ -12,7 +12,7 @@ use crate::entity_identity::EntityIdentity;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
-use crate::schema_registry::SchemaRegistry;
+use crate::schema_catalog::SchemaCatalogSource;
 use crate::sql2::{ChangelogQuerySource, SqlChangelogQuerySource, SqlExecutionContext};
 use crate::storage::{
     ScopedStorageReader, StorageContext, StorageReadScope, StorageReadTransaction, StorageReader,
@@ -50,7 +50,7 @@ pub struct SessionContext {
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) changelog: Arc<ChangelogContext>,
     pub(super) version_ctx: Arc<VersionContext>,
-    pub(super) schema_registry: Arc<SchemaRegistry>,
+    pub(super) schema_catalog_source: Arc<SchemaCatalogSource>,
     closed: Arc<AtomicBool>,
 }
 
@@ -62,7 +62,7 @@ impl SessionContext {
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
         version_ctx: Arc<VersionContext>,
-        schema_registry: Arc<SchemaRegistry>,
+        schema_catalog_source: Arc<SchemaCatalogSource>,
     ) -> Result<Self, LixError> {
         let session = Self::new(
             SessionMode::Workspace,
@@ -72,7 +72,7 @@ impl SessionContext {
             binary_cas,
             changelog,
             version_ctx,
-            schema_registry,
+            schema_catalog_source,
         );
         session.active_version_id().await?;
         Ok(session)
@@ -86,7 +86,7 @@ impl SessionContext {
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
         version_ctx: Arc<VersionContext>,
-        schema_registry: Arc<SchemaRegistry>,
+        schema_catalog_source: Arc<SchemaCatalogSource>,
     ) -> Result<Self, LixError> {
         Ok(Self::new(
             SessionMode::Pinned {
@@ -98,7 +98,7 @@ impl SessionContext {
             binary_cas,
             changelog,
             version_ctx,
-            schema_registry,
+            schema_catalog_source,
         ))
     }
 
@@ -110,7 +110,7 @@ impl SessionContext {
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
         version_ctx: Arc<VersionContext>,
-        schema_registry: Arc<SchemaRegistry>,
+        schema_catalog_source: Arc<SchemaCatalogSource>,
     ) -> Self {
         Self::new_with_closed(
             mode,
@@ -120,7 +120,7 @@ impl SessionContext {
             binary_cas,
             changelog,
             version_ctx,
-            schema_registry,
+            schema_catalog_source,
             Arc::new(AtomicBool::new(false)),
         )
     }
@@ -133,7 +133,7 @@ impl SessionContext {
         binary_cas: Arc<BinaryCasContext>,
         changelog: Arc<ChangelogContext>,
         version_ctx: Arc<VersionContext>,
-        schema_registry: Arc<SchemaRegistry>,
+        schema_catalog_source: Arc<SchemaCatalogSource>,
         closed: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -144,7 +144,7 @@ impl SessionContext {
             binary_cas,
             changelog,
             version_ctx,
-            schema_registry,
+            schema_catalog_source,
             closed,
         }
     }
@@ -287,7 +287,7 @@ impl SessionContext {
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.changelog),
             Arc::clone(&self.version_ctx),
-            Arc::clone(&self.schema_registry),
+            Arc::clone(&self.schema_catalog_source),
         )
         .await?;
         let mut transaction = opened.transaction;

@@ -17,7 +17,6 @@ pub(crate) struct MaterializedLiveStateRow {
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
-    pub(crate) schema_version: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) global: bool,
@@ -57,7 +56,6 @@ impl From<MaterializedLiveStateRow> for MaterializedCanonicalChange {
                 .expect("tracked live-state rows must carry change_id"),
             entity_id: row.entity_id,
             schema_key: row.schema_key,
-            schema_version: row.schema_version,
             file_id: row.file_id,
             snapshot_content: row.snapshot_content,
             metadata: row.metadata,
@@ -74,7 +72,6 @@ impl From<MaterializedUntrackedStateRow> for MaterializedLiveStateRow {
             file_id: row.file_id,
             snapshot_content: row.snapshot_content,
             metadata: row.metadata,
-            schema_version: row.schema_version,
             created_at: row.created_at,
             updated_at: row.updated_at,
             global: row.global,
@@ -115,7 +112,6 @@ impl TryFrom<&MaterializedLiveStateRow> for MaterializedTrackedStateRow {
             file_id: row.file_id.clone(),
             snapshot_content: row.snapshot_content.clone(),
             metadata: row.metadata.clone(),
-            schema_version: row.schema_version.clone(),
             created_at: row.created_at.clone(),
             updated_at: row.updated_at.clone(),
             change_id,
@@ -132,7 +128,6 @@ impl From<&MaterializedLiveStateRow> for MaterializedUntrackedStateRow {
             file_id: row.file_id.clone(),
             snapshot_content: row.snapshot_content.clone(),
             metadata: row.metadata.clone(),
-            schema_version: row.schema_version.clone(),
             created_at: row.created_at.clone(),
             updated_at: row.updated_at.clone(),
             global: row.global,
@@ -146,7 +141,6 @@ impl From<&MaterializedLiveStateRow> for MaterializedUntrackedStateRow {
 pub(crate) enum ScanField {
     EntityId,
     FileId,
-    SchemaVersion,
 }
 
 /// Inclusive or exclusive range bound.
@@ -185,6 +179,8 @@ pub(crate) struct LiveStateFilter {
     pub(crate) version_ids: Vec<String>,
     #[serde(default)]
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
+    #[serde(default)]
+    pub(crate) untracked: Option<bool>,
     #[serde(default)]
     pub(crate) constraints: Vec<ScanConstraint>,
     #[serde(default)]

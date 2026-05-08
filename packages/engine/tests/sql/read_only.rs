@@ -64,9 +64,9 @@ simulation_test!(
         assert_read_only_error(
             session
                 .execute(
-                    "INSERT INTO lix_state (entity_id, schema_key, snapshot_content, schema_version) \
+                    "INSERT INTO lix_state (entity_id, schema_key, snapshot_content) \
                      VALUES (lix_json('[\"orphan-descriptor\"]'), 'lix_version_descriptor', \
-                       lix_json('{\"id\":\"orphan-descriptor\",\"name\":\"Orphan\",\"hidden\":false}'), '1')",
+                       lix_json('{\"id\":\"orphan-descriptor\",\"name\":\"Orphan\",\"hidden\":false}'))",
                     &[],
                 )
                 .await
@@ -235,9 +235,9 @@ simulation_test!(
         assert_read_only_error(
             session
                 .execute(
-                    "INSERT INTO lix_state (entity_id, schema_key, snapshot_content, schema_version, global) \
+                    "INSERT INTO lix_state (entity_id, schema_key, snapshot_content, global) \
                      VALUES (lix_json('[\"fake-change\"]'), 'lix_change', \
-                       lix_json('{\"id\":\"fake-change\",\"entity_id\":\"x\",\"schema_key\":\"lix_key_value\",\"schema_version\":\"1\"}'), '1', true)",
+                       lix_json('{\"id\":\"fake-change\",\"entity_id\":\"x\",\"schema_key\":\"lix_key_value\"}'), true)",
                     &[],
                 )
                 .await
@@ -303,7 +303,7 @@ simulation_test!(read_only_typed_history_views_reject_dml, |sim| async move {
         .execute(
             "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
              VALUES (\
-             lix_json('{\"x-lix-key\":\"read_only_history_entity\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
+             lix_json('{\"x-lix-key\":\"read_only_history_entity\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'),\
              false,\
              true\
              )",

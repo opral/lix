@@ -405,10 +405,6 @@ fn entity_history_system_column_array(
                 .map(|row| row.change.metadata.as_ref().map(serialize_row_metadata))
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
-        "schema_version" => string_array(
-            rows.iter()
-                .map(|row| Some(row.change.schema_version.as_str())),
-        ),
         "change_id" => string_array(rows.iter().map(|row| Some(row.change.id.as_str()))),
         "observed_commit_id" => {
             string_array(rows.iter().map(|row| Some(row.observed_commit_id.as_str())))

@@ -44,6 +44,7 @@ use crate::sql2::{
 };
 use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 
+use super::predicate_typecheck::validate_json_predicate_filters;
 use super::result_metadata::json_field;
 
 pub(crate) async fn register_lix_state_providers(
@@ -266,6 +267,7 @@ impl TableProvider for LixStateProvider {
         let write_ctx = self.write_access.require_write("DELETE FROM lix_state")?;
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
@@ -300,6 +302,7 @@ impl TableProvider for LixStateProvider {
         validate_lix_state_update_assignments(&self.schema, &assignments)?;
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_assignments = assignments
             .iter()
             .map(|(column_name, expr)| {
@@ -806,7 +809,6 @@ fn lix_state_update_write_rows_from_batch(
                     "lix_state",
                 )?,
                 origin: None,
-                schema_version: required_string_value(batch, row_index, "schema_version")?,
                 created_at: None,
                 updated_at: None,
                 global,
@@ -927,7 +929,6 @@ fn lix_state_write_rows_from_batch(
                 snapshot: optional_json_value(batch, row_index, "snapshot_content")?,
                 metadata: optional_metadata_value(batch, row_index, "metadata", "lix_state")?,
                 origin: None,
-                schema_version: required_string_value(batch, row_index, "schema_version")?,
                 created_at: optional_string_value(batch, row_index, "created_at")?,
                 updated_at: optional_string_value(batch, row_index, "updated_at")?,
                 global,
@@ -1165,7 +1166,6 @@ fn lix_state_schema() -> SchemaRef {
         Field::new("file_id", DataType::Utf8, true),
         json_field("snapshot_content", true),
         json_field("metadata", true),
-        Field::new("schema_version", DataType::Utf8, true),
         Field::new("created_at", DataType::Utf8, true),
         Field::new("updated_at", DataType::Utf8, true),
         Field::new("global", DataType::Boolean, true),
@@ -1182,7 +1182,6 @@ fn lix_state_by_version_schema() -> SchemaRef {
         Field::new("file_id", DataType::Utf8, true),
         json_field("snapshot_content", true),
         json_field("metadata", true),
-        Field::new("schema_version", DataType::Utf8, true),
         Field::new("created_at", DataType::Utf8, true),
         Field::new("updated_at", DataType::Utf8, true),
         Field::new("global", DataType::Boolean, true),
@@ -1506,9 +1505,6 @@ fn lix_state_record_batch(
                         .map(|row| row.metadata.as_ref().map(serialize_row_metadata))
                         .collect::<Vec<_>>(),
                 )),
-                "schema_version" => {
-                    string_array(rows.iter().map(|row| Some(row.schema_version.as_str())))
-                }
                 "created_at" => string_array(rows.iter().map(|row| Some(row.created_at.as_str()))),
                 "updated_at" => string_array(rows.iter().map(|row| Some(row.updated_at.as_str()))),
                 "global" => Arc::new(BooleanArray::from(
@@ -1885,6 +1881,18 @@ mod tests {
         Expr::Literal(ScalarValue::Utf8(Some(value.to_string())), None)
     }
 
+    fn json_lit(value: &str) -> Expr {
+        Expr::Literal(
+            ScalarValue::Utf8(Some(value.to_string())),
+            Some(datafusion::common::metadata::FieldMetadata::new(
+                std::collections::BTreeMap::from([(
+                    crate::sql2::result_metadata::LIX_VALUE_TYPE_METADATA_KEY.to_string(),
+                    crate::sql2::result_metadata::LIX_VALUE_TYPE_JSON.to_string(),
+                )]),
+            )),
+        )
+    }
+
     fn string_column(values: Vec<Option<&str>>) -> ArrayRef {
         Arc::new(StringArray::from(values)) as ArrayRef
     }
@@ -1898,7 +1906,6 @@ mod tests {
                 string_column(vec![None]),
                 string_column(vec![Some("{\"key\":\"hello\",\"value\":\"world\"}")]),
                 string_column(vec![Some("{\"source\":\"test\"}")]),
-                string_column(vec![Some("1")]),
                 string_column(vec![Some("2026-04-23T00:00:00Z")]),
                 string_column(vec![Some("2026-04-23T01:00:00Z")]),
                 Arc::new(BooleanArray::from(vec![global])) as ArrayRef,
@@ -1919,7 +1926,6 @@ mod tests {
                 string_column(vec![None]),
                 string_column(vec![Some("{\"key\":\"hello\",\"value\":\"world\"}")]),
                 string_column(vec![None]),
-                string_column(vec![Some("1")]),
                 string_column(vec![None]),
                 string_column(vec![None]),
                 Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
@@ -1938,7 +1944,6 @@ mod tests {
             file_id: None,
             snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
             metadata: metadata.map(str::to_string),
-            schema_version: "1".to_string(),
             version_id: "version-a".to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),
@@ -2000,7 +2005,7 @@ mod tests {
         ]);
 
         let request =
-            lix_state_scan_request(&schema, None, Some(&vec![0, 1, 12]), &route, Some(10));
+            lix_state_scan_request(&schema, None, Some(&vec![0, 1, 11]), &route, Some(10));
 
         assert_eq!(request.filter.schema_keys, vec!["profile".to_string()]);
         assert_eq!(request.filter.version_ids, vec!["v1".to_string()]);
@@ -2262,7 +2267,6 @@ mod tests {
                     json!({"source": "test"})
                 )),
                 origin: None,
-                schema_version: "1".to_string(),
                 created_at: Some("2026-04-23T00:00:00Z".to_string()),
                 updated_at: Some("2026-04-23T01:00:00Z".to_string()),
                 global: false,
@@ -2310,7 +2314,6 @@ mod tests {
                         json!({"source": "test"})
                     )),
                     origin: None,
-                    schema_version: "1".to_string(),
                     created_at: Some("2026-04-23T00:00:00Z".to_string()),
                     updated_at: Some("2026-04-23T01:00:00Z".to_string()),
                     global: false,
@@ -2385,7 +2388,7 @@ mod tests {
                 vec![Expr::BinaryExpr(BinaryExpr::new(
                     Box::new(col("metadata")),
                     Operator::Eq,
-                    Box::new(str_lit("{\"source\":\"match\"}")),
+                    Box::new(json_lit("{\"source\":\"match\"}")),
                 ))],
             )
             .await
@@ -2419,7 +2422,6 @@ mod tests {
                         json!({"schema_key": "lix_key_value"})
                     )),
                     origin: None,
-                    schema_version: "1".to_string(),
                     created_at: None,
                     updated_at: None,
                     global: false,
@@ -2477,7 +2479,6 @@ mod tests {
                             json!({"source": "one"})
                         )),
                         origin: None,
-                        schema_version: "1".to_string(),
                         created_at: None,
                         updated_at: None,
                         global: false,
@@ -2495,7 +2496,6 @@ mod tests {
                             json!({"source": "two"})
                         )),
                         origin: None,
-                        schema_version: "1".to_string(),
                         created_at: None,
                         updated_at: None,
                         global: false,

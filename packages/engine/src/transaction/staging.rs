@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
+use crate::domain::{Domain, DomainRowIdentity};
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionProvider, FunctionProviderHandle};
 use crate::json_store::{JsonStoreContext, JsonStoreWriter};
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
-use crate::live_state::{LiveStateRowIdentity, LiveStateScanRequest, MaterializedLiveStateRow};
-use crate::transaction::normalization::SchemaPlanId;
+use crate::live_state::{LiveStateScanRequest, MaterializedLiveStateRow};
+use crate::schema_catalog::SchemaPlanId;
 #[cfg(test)]
 use crate::transaction::types::{stage_json_from_value, TransactionJson};
 use crate::transaction::types::{
@@ -29,7 +30,7 @@ pub(crate) struct TransactionWriteBuffer {
     rows: Mutex<Vec<Option<PreparedStateRow>>>,
     adopted_rows: Mutex<Vec<Option<PreparedAdoptedStateRow>>>,
     by_identity: Mutex<HashMap<PreparedStateRowIdentity, RowSlot>>,
-    insert_identities: Mutex<BTreeMap<LiveStateRowIdentity, Option<TransactionWriteOrigin>>>,
+    insert_identities: Mutex<BTreeMap<PreparedStateRowIdentity, Option<TransactionWriteOrigin>>>,
     commit_members_by_version: Mutex<BTreeMap<String, StagedCommitMembers>>,
     extra_commit_parents_by_version: Mutex<BTreeMap<String, Vec<String>>>,
     file_data_writes: Mutex<Vec<TransactionFileData>>,
@@ -46,7 +47,8 @@ pub(crate) enum RowSlot {
 pub(crate) struct PreparedWriteSet {
     pub(crate) state_rows: Vec<PreparedStateRow>,
     pub(crate) adopted_rows: Vec<PreparedAdoptedStateRow>,
-    pub(crate) insert_identities: BTreeMap<LiveStateRowIdentity, Option<TransactionWriteOrigin>>,
+    pub(crate) insert_identities:
+        BTreeMap<PreparedStateRowIdentity, Option<TransactionWriteOrigin>>,
     pub(crate) commit_members_by_version: BTreeMap<String, StagedCommitMembers>,
     pub(crate) extra_commit_parents_by_version: BTreeMap<String, Vec<String>>,
     pub(crate) file_data_writes: Vec<TransactionFileData>,
@@ -55,13 +57,22 @@ pub(crate) struct PreparedWriteSet {
 
 pub(crate) struct PreparedWriteValidationSet<'a> {
     rows: Vec<PreparedValidationRow<'a>>,
-    insert_identities: Vec<(&'a LiveStateRowIdentity, Option<&'a TransactionWriteOrigin>)>,
+    constraint_rows: Vec<PreparedValidationRow<'a>>,
+    insert_identities: Vec<(
+        &'a PreparedStateRowIdentity,
+        Option<&'a TransactionWriteOrigin>,
+    )>,
 }
 
 pub(crate) struct PreparedWriteValidationIndex<'a> {
-    rows_by_schema_scope: BTreeMap<String, Vec<PreparedValidationRow<'a>>>,
-    insert_identities_by_schema_scope:
-        BTreeMap<String, Vec<(&'a LiveStateRowIdentity, Option<&'a TransactionWriteOrigin>)>>,
+    rows_by_schema_scope: BTreeMap<Domain, Vec<PreparedValidationRow<'a>>>,
+    insert_identities_by_schema_scope: BTreeMap<
+        Domain,
+        Vec<(
+            &'a PreparedStateRowIdentity,
+            Option<&'a TransactionWriteOrigin>,
+        )>,
+    >,
 }
 
 #[derive(Clone, Copy)]
@@ -139,13 +150,6 @@ impl<'a> PreparedValidationRow<'a> {
         }
     }
 
-    pub(crate) fn schema_version(&self) -> &str {
-        match self {
-            Self::State(row) => &row.schema_version,
-            Self::Adopted(row) => &row.schema_version,
-        }
-    }
-
     pub(crate) fn untracked(&self) -> bool {
         match self {
             Self::State(row) => row.untracked,
@@ -159,26 +163,54 @@ impl<'a> PreparedValidationRow<'a> {
             Self::Adopted(row) => &row.version_id,
         }
     }
+
+    pub(crate) fn domain(&self) -> Domain {
+        Domain::exact_file(
+            self.version_id().to_string(),
+            self.untracked(),
+            self.file_id().clone(),
+        )
+    }
+
+    pub(crate) fn domain_row_identity(&self) -> DomainRowIdentity {
+        DomainRowIdentity::in_domain(
+            self.domain(),
+            self.schema_key().to_string(),
+            self.entity_id().clone(),
+        )
+    }
 }
 
 impl<'a> PreparedWriteValidationIndex<'a> {
-    pub(crate) fn schema_scope_version_ids(&self) -> impl Iterator<Item = &str> {
-        self.rows_by_schema_scope.keys().map(String::as_str)
+    pub(crate) fn schema_scopes(&self) -> impl Iterator<Item = &Domain> {
+        self.rows_by_schema_scope.keys()
     }
 
     pub(crate) fn validation_set_for_schema_scope(
         &self,
-        schema_scope_version_id: &str,
+        schema_scope: &Domain,
     ) -> PreparedWriteValidationSet<'a> {
+        let constraint_rows = self
+            .rows_by_schema_scope
+            .iter()
+            .flat_map(|(target_scope, rows)| {
+                rows.iter().copied().filter(move |row| {
+                    schema_scope.validation_scope_contains_constraint_domain(target_scope)
+                        || (row.snapshot_json().is_none()
+                            && target_scope.tombstone_domain_affects_validation_scope(schema_scope))
+                })
+            })
+            .collect();
         PreparedWriteValidationSet {
             rows: self
                 .rows_by_schema_scope
-                .get(schema_scope_version_id)
+                .get(schema_scope)
                 .cloned()
                 .unwrap_or_default(),
+            constraint_rows,
             insert_identities: self
                 .insert_identities_by_schema_scope
-                .get(schema_scope_version_id)
+                .get(schema_scope)
                 .cloned()
                 .unwrap_or_default(),
         }
@@ -190,9 +222,13 @@ impl<'a> PreparedWriteValidationSet<'a> {
         self.rows.iter().copied()
     }
 
+    pub(crate) fn constraint_rows(&self) -> impl Iterator<Item = PreparedValidationRow<'a>> + '_ {
+        self.constraint_rows.iter().copied()
+    }
+
     pub(crate) fn insert_identities(
         &self,
-    ) -> impl Iterator<Item = (&LiveStateRowIdentity, Option<&TransactionWriteOrigin>)> {
+    ) -> impl Iterator<Item = (&PreparedStateRowIdentity, Option<&TransactionWriteOrigin>)> {
         self.insert_identities
             .iter()
             .map(|(identity, origin)| (*identity, *origin))
@@ -209,26 +245,29 @@ impl PreparedWriteSet {
     }
 
     pub(crate) fn validation_index(&self) -> PreparedWriteValidationIndex<'_> {
-        let mut rows_by_schema_scope = BTreeMap::<String, Vec<PreparedValidationRow<'_>>>::new();
+        let mut rows_by_schema_scope = BTreeMap::<Domain, Vec<PreparedValidationRow<'_>>>::new();
         for row in &self.state_rows {
+            let row = PreparedValidationRow::State(row);
             rows_by_schema_scope
-                .entry(row.schema_scope_version_id().to_string())
+                .entry(row.domain().schema_catalog_domain())
                 .or_default()
-                .push(PreparedValidationRow::State(row));
+                .push(row);
         }
         for row in &self.adopted_rows {
+            let row = PreparedValidationRow::Adopted(row);
             rows_by_schema_scope
-                .entry(row.schema_scope_version_id().to_string())
+                .entry(row.domain().schema_catalog_domain())
                 .or_default()
-                .push(PreparedValidationRow::Adopted(row));
+                .push(row);
         }
 
-        let mut insert_identities_by_schema_scope =
-            BTreeMap::<String, Vec<(&LiveStateRowIdentity, Option<&TransactionWriteOrigin>)>>::new(
-            );
+        let mut insert_identities_by_schema_scope = BTreeMap::<
+            Domain,
+            Vec<(&PreparedStateRowIdentity, Option<&TransactionWriteOrigin>)>,
+        >::new();
         for (identity, origin) in &self.insert_identities {
             insert_identities_by_schema_scope
-                .entry(staged_identity_schema_scope(identity).to_string())
+                .entry(identity.domain().schema_catalog_domain())
                 .or_default()
                 .push((identity, origin.as_ref()));
         }
@@ -241,24 +280,17 @@ impl PreparedWriteSet {
 
     #[cfg(test)]
     pub(crate) fn validation_set_for_tests(&self) -> PreparedWriteValidationSet<'_> {
-        let rows = self.validation_rows().collect();
+        let rows: Vec<_> = self.validation_rows().collect();
         let insert_identities = self
             .insert_identities
             .iter()
             .map(|(identity, origin)| (identity, origin.as_ref()))
             .collect();
         PreparedWriteValidationSet {
+            constraint_rows: rows.clone(),
             rows,
             insert_identities,
         }
-    }
-}
-
-fn staged_identity_schema_scope(identity: &LiveStateRowIdentity) -> &str {
-    if identity.version_id == GLOBAL_VERSION_ID {
-        GLOBAL_VERSION_ID
-    } else {
-        identity.version_id.as_str()
     }
 }
 
@@ -507,20 +539,12 @@ impl TransactionWriteBuffer {
         for mut row in rows {
             let identity = PreparedStateRowIdentity::from(&row);
             if mode == Some(TransactionWriteMode::Insert)
-                && (by_identity_guard.contains_key(&identity)
-                    || by_identity_guard.contains_key(&identity.opposite_untracked()))
+                && by_identity_guard.contains_key(&identity)
             {
                 return Err(duplicate_insert_identity_error(&row));
             }
             if matches!(by_identity_guard.get(&identity), Some(RowSlot::Adopted(_))) {
                 return Err(conflicting_adopted_identity_error(&row));
-            }
-            if let Some(RowSlot::State(index)) =
-                by_identity_guard.remove(&identity.opposite_untracked())
-            {
-                if let Some(previous) = guard.get_mut(index).and_then(Option::take) {
-                    remove_row_from_commit_members(&mut commit_members_guard, &previous);
-                }
             }
             let existing_slot = by_identity_guard.remove(&identity);
             if let Some(RowSlot::State(index)) = existing_slot {
@@ -531,10 +555,7 @@ impl TransactionWriteBuffer {
             add_row_to_commit_members(&mut commit_members_guard, &mut row, &mut functions);
             let identity = PreparedStateRowIdentity::from(&row);
             if mode == Some(TransactionWriteMode::Insert) {
-                insert_identities_guard.insert(
-                    live_state_identity_from_staged_row(&row),
-                    row.origin.clone(),
-                );
+                insert_identities_guard.insert(identity.clone(), row.origin.clone());
             }
             let slot = match existing_slot {
                 Some(RowSlot::State(index)) => {
@@ -788,14 +809,20 @@ impl PreparedStateRowIdentity {
         })
     }
 
-    fn opposite_untracked(&self) -> Self {
-        Self {
-            untracked: !self.untracked,
-            schema_key: self.schema_key.clone(),
-            entity_id: self.entity_id.clone(),
-            file_id: self.file_id.clone(),
-            version_id: self.version_id.clone(),
-        }
+    pub(crate) fn schema_key(&self) -> &str {
+        &self.schema_key
+    }
+
+    pub(crate) fn entity_id(&self) -> &crate::entity_identity::EntityIdentity {
+        &self.entity_id
+    }
+
+    pub(crate) fn domain(&self) -> Domain {
+        Domain::exact_file(
+            self.version_id.clone(),
+            self.untracked,
+            self.file_id.clone(),
+        )
     }
 }
 
@@ -873,9 +900,8 @@ fn duplicate_staged_present_row_error(
     let message = logical_primary_key_violation_message(row.origin.as_ref())
         .unwrap_or_else(|| {
             format!(
-                "primary-key constraint violation on schema '{}' version '{}': duplicate staged rows for entity_id '{}' in version '{}'",
+                "primary-key constraint violation on schema '{}': duplicate staged rows for entity_id '{}' in version '{}'",
                 row.schema_key,
-                row.schema_version,
                 previous
                     .entity_id
                     .as_json_array_text()
@@ -888,7 +914,6 @@ fn duplicate_staged_present_row_error(
 
 pub(crate) fn duplicate_insert_identity_message(
     schema_key: &str,
-    schema_version: &str,
     entity_id: &crate::entity_identity::EntityIdentity,
     version_id: Option<&str>,
     origin: Option<&TransactionWriteOrigin>,
@@ -901,10 +926,10 @@ pub(crate) fn duplicate_insert_identity_message(
         .unwrap_or_else(|_| "<invalid entity_id>".to_string());
     match version_id {
         Some(version_id) => format!(
-            "primary-key constraint violation on schema '{schema_key}' version '{schema_version}': INSERT would duplicate entity_id '{entity_id}' in version '{version_id}'"
+            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate entity_id '{entity_id}' in version '{version_id}'"
         ),
         None => format!(
-            "primary-key constraint violation on schema '{schema_key}' version '{schema_version}': INSERT would duplicate entity_id '{entity_id}'"
+            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate entity_id '{entity_id}'"
         ),
     }
 }
@@ -912,7 +937,6 @@ pub(crate) fn duplicate_insert_identity_message(
 fn duplicate_insert_identity_error(row: &PreparedStateRow) -> LixError {
     let message = duplicate_insert_identity_message(
         &row.schema_key,
-        &row.schema_version,
         &row.entity_id,
         Some(&row.version_id),
         row.origin.as_ref(),
@@ -978,15 +1002,6 @@ fn conflicting_adopted_projection_error(row: &PreparedAdoptedStateRow) -> LixErr
             row.version_id
         ),
     )
-}
-
-fn live_state_identity_from_staged_row(row: &PreparedStateRow) -> LiveStateRowIdentity {
-    LiveStateRowIdentity {
-        version_id: row.version_id.clone(),
-        schema_key: row.schema_key.clone(),
-        entity_id: row.entity_id.clone(),
-        file_id: row.file_id.clone(),
-    }
 }
 
 fn add_row_to_commit_members(
@@ -1071,6 +1086,9 @@ fn adopted_row_identity_matches_scan(
     {
         return false;
     }
+    if request.filter.untracked == Some(true) {
+        return false;
+    }
     nullable_key_matches_filters(&row.file_id, &request.filter.file_ids)
 }
 
@@ -1089,6 +1107,13 @@ fn staged_row_identity_matches_scan(
     }
     if !request.filter.version_ids.is_empty()
         && !request.filter.version_ids.contains(&row.version_id)
+    {
+        return false;
+    }
+    if request
+        .filter
+        .untracked
+        .is_some_and(|untracked| row.untracked != untracked)
     {
         return false;
     }
@@ -1395,7 +1420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn staged_writes_untracked_overwrite_removes_tracked_commit_member() {
+    async fn staged_writes_keep_tracked_and_untracked_domains_separate() {
         let staged_writes = test_staged_writes();
 
         staged_writes
@@ -1412,12 +1437,23 @@ mod tests {
             .expect("untracked overwrite should stage");
 
         let drained = staged_writes.drain().expect("drain should succeed");
-        assert_eq!(drained.state_rows.len(), 1);
+        assert_eq!(drained.state_rows.len(), 2);
+        assert!(drained
+            .state_rows
+            .iter()
+            .any(|row| { row.change_id.as_deref() == Some("change-tracked") && !row.untracked }));
+        assert!(drained
+            .state_rows
+            .iter()
+            .any(|row| { row.change_id.as_deref() == Some("change-untracked") && row.untracked }));
+        let members = drained
+            .commit_members_by_version
+            .get("global")
+            .expect("tracked commit member should remain in tracked domain");
         assert_eq!(
-            drained.state_rows[0].change_id.as_deref(),
-            Some("change-untracked")
+            members.change_ids.iter().cloned().collect::<Vec<_>>(),
+            vec!["change-tracked".to_string()]
         );
-        assert!(drained.commit_members_by_version.is_empty());
     }
 
     #[tokio::test]
@@ -1439,6 +1475,32 @@ mod tests {
             error.message.contains("primary-key constraint violation"),
             "error should explain the duplicate primary key: {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn staged_writes_insert_keeps_tracked_and_untracked_rows_as_distinct_identities() {
+        let staged_writes = test_staged_writes();
+
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Insert,
+                rows: vec![
+                    state_row("shared-domain-key", "tracked").with_tracked(),
+                    state_row("shared-domain-key", "untracked"),
+                ],
+            })
+            .expect("tracked and untracked rows are distinct domain identities");
+
+        let drained = staged_writes.drain().expect("drain should succeed");
+        assert_eq!(drained.state_rows.len(), 2);
+        assert!(drained.state_rows.iter().any(|row| {
+            row.entity_id == crate::entity_identity::EntityIdentity::single("shared-domain-key")
+                && !row.untracked
+        }));
+        assert!(drained.state_rows.iter().any(|row| {
+            row.entity_id == crate::entity_identity::EntityIdentity::single("shared-domain-key")
+                && row.untracked
+        }));
     }
 
     #[tokio::test]
@@ -1492,9 +1554,7 @@ mod tests {
         staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
-                rows: vec![
-                    state_row("shared-entity", "other-schema-version").with_schema_version("2")
-                ],
+                rows: vec![state_row("shared-entity", "base")],
             })
             .expect("initial same-identity row should stage");
         staged_writes
@@ -1526,7 +1586,17 @@ mod tests {
             })
             .expect("overlay scan should succeed");
 
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.entity_id
+                    == crate::entity_identity::EntityIdentity::single("shared-entity")
+                    && row.version_id == "global"
+                    && row.schema_key == "lix_key_value"
+                    && row.file_id.is_none())
+                .count(),
+            2
+        );
         assert!(rows.iter().any(|row| {
             row.snapshot_content.as_deref()
                 == Some("{\"key\":\"shared-entity\",\"value\":\"tracked\"}")
@@ -1623,7 +1693,6 @@ mod tests {
             snapshot: Some(snapshot),
             metadata: None,
             origin: None,
-            schema_version: "1".to_string(),
             created_at: "test-created-at".to_string(),
             updated_at: "test-updated-at".to_string(),
             global: true,
@@ -1665,7 +1734,6 @@ mod tests {
 
     trait StateRowTestExt {
         fn with_schema(self, schema_key: &str) -> Self;
-        fn with_schema_version(self, schema_version: &str) -> Self;
         fn with_file_id(self, file_id: &str) -> Self;
         fn with_tracked(self) -> Self;
         fn with_version(self, version_id: &str) -> Self;
@@ -1675,11 +1743,6 @@ mod tests {
     impl StateRowTestExt for PreparedStateRow {
         fn with_schema(mut self, schema_key: &str) -> Self {
             self.schema_key = schema_key.to_string();
-            self
-        }
-
-        fn with_schema_version(mut self, schema_version: &str) -> Self {
-            self.schema_version = schema_version.to_string();
             self
         }
 
