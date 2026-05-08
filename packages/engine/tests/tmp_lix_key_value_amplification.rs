@@ -70,7 +70,10 @@ impl AmplificationCounts {
                     .deletes_by_namespace
                     .entry(namespace.clone())
                     .or_default() += 1;
-                *self.bytes_by_namespace.entry(namespace.clone()).or_default() += key.len();
+                *self
+                    .bytes_by_namespace
+                    .entry(namespace.clone())
+                    .or_default() += key.len();
             }
         }
     }
@@ -96,10 +99,7 @@ impl AmplificationCounts {
     }
 
     fn puts_in(&self, namespace: &str) -> usize {
-        self.puts_by_namespace
-            .get(namespace)
-            .copied()
-            .unwrap_or(0)
+        self.puts_by_namespace.get(namespace).copied().unwrap_or(0)
     }
 
     fn deletes_in(&self, namespace: &str) -> usize {
@@ -110,10 +110,7 @@ impl AmplificationCounts {
     }
 
     fn bytes_in(&self, namespace: &str) -> usize {
-        self.bytes_by_namespace
-            .get(namespace)
-            .copied()
-            .unwrap_or(0)
+        self.bytes_by_namespace.get(namespace).copied().unwrap_or(0)
     }
 }
 
@@ -125,8 +122,7 @@ struct CountingBackend {
 
 impl CountingBackend {
     fn reset_counts(&self) {
-        *self.counts.lock().expect("amplification counts lock") =
-            AmplificationCounts::default();
+        *self.counts.lock().expect("amplification counts lock") = AmplificationCounts::default();
     }
 
     fn counts(&self) -> AmplificationCounts {
@@ -308,7 +304,8 @@ fn storage_totals_for(
         totals.added_namespace_key_value_bytes += item.added_namespace_key_value_bytes;
         totals.updated_before_namespace_key_value_bytes +=
             item.updated_before_namespace_key_value_bytes;
-        totals.updated_after_namespace_key_value_bytes += item.updated_after_namespace_key_value_bytes;
+        totals.updated_after_namespace_key_value_bytes +=
+            item.updated_after_namespace_key_value_bytes;
         totals.removed_namespace_key_value_bytes += item.removed_namespace_key_value_bytes;
     }
     totals
@@ -648,11 +645,7 @@ fn update_key_value_sql(rows: usize) -> String {
 
 fn insert_lix_file_descriptor_sql(rows: usize) -> String {
     let values = (0..rows)
-        .map(|index| {
-            format!(
-                "('amplification-file-{index:08}', NULL, 'file-{index:08}.bin')"
-            )
-        })
+        .map(|index| format!("('amplification-file-{index:08}', NULL, 'file-{index:08}.bin')"))
         .collect::<Vec<_>>()
         .join(", ");
     format!("INSERT INTO lix_file (id, directory_id, name) VALUES {values}")
@@ -758,10 +751,7 @@ async fn run_lix_file_branch_insert(file_bytes: usize) -> AmplificationRun {
     finish_measurement(&backend, before)
 }
 
-async fn run_lix_file_branch_update_data(
-    base_rows: usize,
-    file_bytes: usize,
-) -> AmplificationRun {
+async fn run_lix_file_branch_update_data(base_rows: usize, file_bytes: usize) -> AmplificationRun {
     let (backend, engine, main_version_id) = setup_counting_engine().await;
     let main = open_main_session(&engine, &main_version_id).await;
     main.execute(&insert_lix_file_descriptor_sql(base_rows), &[])
@@ -900,13 +890,21 @@ fn print_amplification_row(rows: usize, value_bytes: usize, run: &AmplificationR
         println!(
             "AMPLIFICATION_NAMESPACE rows={rows} namespace={} puts={} deletes={} bytes={}",
             namespace,
-            counts.puts_by_namespace.get(namespace).copied().unwrap_or(0),
+            counts
+                .puts_by_namespace
+                .get(namespace)
+                .copied()
+                .unwrap_or(0),
             counts
                 .deletes_by_namespace
                 .get(namespace)
                 .copied()
                 .unwrap_or(0),
-            counts.bytes_by_namespace.get(namespace).copied().unwrap_or(0),
+            counts
+                .bytes_by_namespace
+                .get(namespace)
+                .copied()
+                .unwrap_or(0),
         );
     }
 }
@@ -914,11 +912,9 @@ fn print_amplification_row(rows: usize, value_bytes: usize, run: &AmplificationR
 fn print_category_rows(rows: usize, value_bytes: usize, run: &AmplificationRun) {
     let counts = &run.counts;
     let storage = &run.storage;
-    let canonical_changelog_row_namespaces = [
-        "changelog.change",
-        "changelog.change_pack",
-    ];
-    let canonical_commit_pack_namespaces = ["commit_record", "change_record_pack", "change_ref_pack"];
+    let canonical_changelog_row_namespaces = ["changelog.change", "changelog.change_pack"];
+    let canonical_commit_pack_namespaces =
+        ["commit_record", "change_record_pack", "change_ref_pack"];
     let canonical_storage_namespaces = [
         "changelog.change",
         "changelog.change_pack",
@@ -968,8 +964,7 @@ fn print_category_rows(rows: usize, value_bytes: usize, run: &AmplificationRun) 
         .map(|namespace| counts.bytes_in(namespace))
         .sum();
     let logical_value_bytes = rows.saturating_mul(value_bytes);
-    let scan_calls =
-        counts.scan_keys_calls + counts.scan_values_calls + counts.scan_entries_calls;
+    let scan_calls = counts.scan_keys_calls + counts.scan_values_calls + counts.scan_entries_calls;
     let scan_rows = counts.scan_keys_rows + counts.scan_values_rows + counts.scan_entries_rows;
     let changelog_encoded_objects = counts.puts_in("changelog.change")
         + counts.puts_in("commit_record")
@@ -1213,7 +1208,13 @@ async fn lix_file_branching_amplification_canaries() {
     let file_bytes = 1024;
 
     let branch_insert = run_lix_file_branch_insert(file_bytes).await;
-    print_amplification_case("file_branch_then_insert_1k_data", 0, 1, file_bytes, &branch_insert);
+    print_amplification_case(
+        "file_branch_then_insert_1k_data",
+        0,
+        1,
+        file_bytes,
+        &branch_insert,
+    );
 
     let update_data = run_lix_file_branch_update_data(1_000, file_bytes).await;
     print_amplification_case(
