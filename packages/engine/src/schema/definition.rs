@@ -321,6 +321,14 @@ fn assert_primary_key_pointers(schema: &JsonValue) -> Result<(), LixError> {
                 ),
             ));
         }
+        if !schema_pointer_is_required(schema, &segments) {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                format!(
+                    "Invalid Lix schema definition: x-lix-primary-key property \"{pointer}\" must be required."
+                ),
+            ));
+        }
     }
 
     Ok(())
