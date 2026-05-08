@@ -14,7 +14,8 @@ use datafusion::common::{not_impl_err, DFSchema, DataFusionError, Result, Scalar
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::expr::InList;
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_expr::{create_physical_expr, EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -26,6 +27,7 @@ use futures_util::{stream, TryStreamExt};
 use serde::Deserialize;
 
 use crate::binary_cas::{BlobDataReader, BlobHash};
+use crate::entity_identity::EntityIdentity;
 use crate::functions::FunctionProviderHandle;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
@@ -227,9 +229,19 @@ impl TableProvider for LixFileProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
+        let analyzer = LixFileIdFilterAnalyzer;
         Ok(filters
             .iter()
-            .map(|_| TableProviderFilterPushDown::Exact)
+            .map(|filter| {
+                if ExactStringColumnFilterAnalyzer::new("lixcol_version_id").supports(filter)
+                    || analyzer.supports(filter)
+                    || contains_column(filter, "path")
+                {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
             .collect())
     }
 
@@ -262,6 +274,7 @@ impl TableProvider for LixFileProvider {
         .await
         .map_err(lix_error_to_datafusion_error)?;
         let filters = canonicalize_filesystem_path_filters(filters, FilesystemPathKind::File)?;
+        let target_file_ids = file_id_constraint_from_filters(&filters)?;
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
@@ -275,6 +288,7 @@ impl TableProvider for LixFileProvider {
             projected_schema,
             projection.cloned(),
             request,
+            target_file_ids,
             physical_filters,
             limit,
         )))
@@ -321,6 +335,7 @@ impl TableProvider for LixFileProvider {
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
             .collect::<Result<Vec<_>>>()?;
+        let target_file_ids = file_id_constraint_from_filters(&filters)?;
         let mut request = lix_file_scan_request(self.version_binding.active_version_id(), None);
         if matches!(self.version_binding, VersionBinding::Explicit) {
             request.filter.version_ids = explicit_version_ids_from_dml_filters(&filters);
@@ -338,6 +353,7 @@ impl TableProvider for LixFileProvider {
             Arc::clone(&self.schema),
             self.version_binding.clone(),
             request,
+            target_file_ids,
             physical_filters,
         )))
     }
@@ -363,6 +379,7 @@ impl TableProvider for LixFileProvider {
             })
             .collect::<Result<Vec<_>>>()?;
         let filters = canonicalize_filesystem_path_filters(&filters, FilesystemPathKind::File)?;
+        let target_file_ids = file_id_constraint_from_filters(&filters)?;
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
             .iter()
@@ -377,6 +394,7 @@ impl TableProvider for LixFileProvider {
             self.version_binding.clone(),
             self.functions.clone(),
             request,
+            target_file_ids,
             physical_assignments,
             physical_filters,
         )))
@@ -513,6 +531,7 @@ struct LixFileDeleteExec {
     table_schema: SchemaRef,
     version_binding: VersionBinding,
     request: LiveStateScanRequest,
+    target_file_ids: FileIdConstraint,
     filters: Vec<Arc<dyn PhysicalExpr>>,
     result_schema: SchemaRef,
     properties: Arc<PlanProperties>,
@@ -531,6 +550,7 @@ impl LixFileDeleteExec {
         table_schema: SchemaRef,
         version_binding: VersionBinding,
         request: LiveStateScanRequest,
+        target_file_ids: FileIdConstraint,
         filters: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Self {
         let result_schema = dml_count_schema();
@@ -546,6 +566,7 @@ impl LixFileDeleteExec {
             table_schema,
             version_binding,
             request,
+            target_file_ids,
             filters,
             result_schema,
             properties: Arc::new(properties),
@@ -609,15 +630,19 @@ impl ExecutionPlan for LixFileDeleteExec {
         let table_schema = Arc::clone(&self.table_schema);
         let version_binding = self.version_binding.clone();
         let request = self.request.clone();
+        let target_file_ids = self.target_file_ids.clone();
         let filters = self.filters.clone();
         let result_schema = Arc::clone(&self.result_schema);
         let stream_schema = Arc::clone(&result_schema);
 
         let stream = stream::once(async move {
-            let rows = write_ctx
-                .scan_live_state(&request)
-                .await
-                .map_err(lix_error_to_datafusion_error)?;
+            let rows = scan_lix_file_live_rows(
+                Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+                &request,
+                &target_file_ids,
+            )
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
             let blob_ref_file_ids =
                 blob_ref_file_ids_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
             let source_batch = lix_file_record_batch(&table_schema, &blob_reader, rows)
@@ -662,6 +687,7 @@ struct LixFileUpdateExec {
     version_binding: VersionBinding,
     functions: FunctionProviderHandle,
     request: LiveStateScanRequest,
+    target_file_ids: FileIdConstraint,
     assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
     filters: Vec<Arc<dyn PhysicalExpr>>,
     result_schema: SchemaRef,
@@ -682,6 +708,7 @@ impl LixFileUpdateExec {
         version_binding: VersionBinding,
         functions: FunctionProviderHandle,
         request: LiveStateScanRequest,
+        target_file_ids: FileIdConstraint,
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Self {
@@ -699,6 +726,7 @@ impl LixFileUpdateExec {
             version_binding,
             functions,
             request,
+            target_file_ids,
             assignments,
             filters,
             result_schema,
@@ -769,16 +797,20 @@ impl ExecutionPlan for LixFileUpdateExec {
         let version_binding = self.version_binding.clone();
         let functions = self.functions.clone();
         let request = self.request.clone();
+        let target_file_ids = self.target_file_ids.clone();
         let assignments = self.assignments.clone();
         let filters = self.filters.clone();
         let result_schema = Arc::clone(&self.result_schema);
         let stream_schema = Arc::clone(&result_schema);
 
         let stream = stream::once(async move {
-            let rows = write_ctx
-                .scan_live_state(&request)
-                .await
-                .map_err(lix_error_to_datafusion_error)?;
+            let rows = scan_lix_file_live_rows(
+                Arc::new(WriteContextLiveStateReader::new(write_ctx.clone())),
+                &request,
+                &target_file_ids,
+            )
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
             let source_batch = lix_file_record_batch(&table_schema, &blob_reader, rows)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
@@ -846,6 +878,7 @@ struct LixFileScanExec {
     output_schema: SchemaRef,
     projection: Option<Vec<usize>>,
     request: LiveStateScanRequest,
+    target_file_ids: FileIdConstraint,
     filters: Vec<Arc<dyn PhysicalExpr>>,
     limit: Option<usize>,
     properties: Arc<PlanProperties>,
@@ -865,6 +898,7 @@ impl LixFileScanExec {
         output_schema: SchemaRef,
         projection: Option<Vec<usize>>,
         request: LiveStateScanRequest,
+        target_file_ids: FileIdConstraint,
         filters: Vec<Arc<dyn PhysicalExpr>>,
         limit: Option<usize>,
     ) -> Self {
@@ -881,6 +915,7 @@ impl LixFileScanExec {
             output_schema,
             projection,
             request,
+            target_file_ids,
             filters,
             limit,
             properties: Arc::new(properties),
@@ -942,15 +977,18 @@ impl ExecutionPlan for LixFileScanExec {
         let live_state = Arc::clone(&self.live_state);
         let blob_reader = Arc::clone(&self.blob_reader);
         let request = self.request.clone();
+        let target_file_ids = self.target_file_ids.clone();
         let filters = self.filters.clone();
         let limit = self.limit;
         let output_schema = Arc::clone(&self.output_schema);
         let batch_schema = Arc::clone(&self.batch_schema);
         let projection = self.projection.clone();
         let fut = async move {
-            let rows = live_state.scan_rows(&request).await.map_err(|error| {
-                DataFusionError::Execution(format!("sql2 lix_file scan failed: {error}"))
-            })?;
+            let rows = scan_lix_file_live_rows(live_state, &request, &target_file_ids)
+                .await
+                .map_err(|error| {
+                    DataFusionError::Execution(format!("sql2 lix_file scan failed: {error}"))
+                })?;
             let batch = lix_file_record_batch(&batch_schema, &blob_reader, rows)
                 .await
                 .map_err(|error| {
@@ -1920,6 +1958,232 @@ fn lix_file_scan_request(
     }
 }
 
+async fn scan_lix_file_live_rows(
+    live_state: Arc<dyn LiveStateReader>,
+    request: &LiveStateScanRequest,
+    target_file_ids: &FileIdConstraint,
+) -> std::result::Result<Vec<MaterializedLiveStateRow>, LixError> {
+    let target_file_ids = match target_file_ids {
+        FileIdConstraint::All => return live_state.scan_rows(request).await,
+        FileIdConstraint::None => return Ok(Vec::new()),
+        FileIdConstraint::Ids(target_file_ids) => target_file_ids,
+    };
+
+    let mut file_request = request.clone();
+    file_request.filter.schema_keys = vec![
+        FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+        BLOB_REF_SCHEMA_KEY.to_string(),
+    ];
+    file_request.filter.entity_ids = target_file_ids
+        .iter()
+        .map(|file_id| EntityIdentity::single(file_id.clone()))
+        .collect();
+
+    let mut rows = live_state.scan_rows(&file_request).await?;
+
+    let mut directory_request = request.clone();
+    directory_request.filter.schema_keys = vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()];
+    directory_request.filter.entity_ids.clear();
+    directory_request.limit = None;
+    rows.extend(live_state.scan_rows(&directory_request).await?);
+
+    Ok(rows)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileIdConstraint {
+    All,
+    None,
+    Ids(BTreeSet<String>),
+}
+
+impl FileIdConstraint {
+    fn from_ids(ids: Vec<String>) -> Self {
+        let ids = ids.into_iter().collect::<BTreeSet<_>>();
+        if ids.is_empty() {
+            Self::None
+        } else {
+            Self::Ids(ids)
+        }
+    }
+
+    fn intersect(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::None, _) | (_, Self::None) => Self::None,
+            (Self::All, constraint) | (constraint, Self::All) => constraint,
+            (Self::Ids(left), Self::Ids(right)) => {
+                let ids = left.intersection(&right).cloned().collect::<BTreeSet<_>>();
+                if ids.is_empty() {
+                    Self::None
+                } else {
+                    Self::Ids(ids)
+                }
+            }
+        }
+    }
+
+    fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::All, _) | (_, Self::All) => Self::All,
+            (Self::None, constraint) | (constraint, Self::None) => constraint,
+            (Self::Ids(mut left), Self::Ids(right)) => {
+                left.extend(right);
+                Self::Ids(left)
+            }
+        }
+    }
+}
+
+fn file_id_constraint_from_filters(filters: &[Expr]) -> Result<FileIdConstraint> {
+    let analyzer = LixFileIdFilterAnalyzer;
+    let mut constraint = FileIdConstraint::All;
+    for filter in filters {
+        if let Some(filter_constraint) = analyzer.analyze(filter)? {
+            constraint = constraint.intersect(filter_constraint);
+        }
+    }
+    Ok(constraint)
+}
+
+struct LixFileIdFilterAnalyzer;
+
+impl LixFileIdFilterAnalyzer {
+    fn supports(&self, expr: &Expr) -> bool {
+        self.analyze(expr)
+            .is_ok_and(|constraint| constraint.is_some())
+    }
+
+    fn analyze(&self, expr: &Expr) -> Result<Option<FileIdConstraint>> {
+        ExactStringColumnFilterAnalyzer::new("id").analyze(expr)
+    }
+}
+
+struct ExactStringColumnFilterAnalyzer {
+    column_name: &'static str,
+}
+
+impl ExactStringColumnFilterAnalyzer {
+    fn new(column_name: &'static str) -> Self {
+        Self { column_name }
+    }
+
+    fn supports(&self, expr: &Expr) -> bool {
+        self.analyze(expr)
+            .is_ok_and(|constraint| constraint.is_some())
+    }
+
+    fn analyze(&self, expr: &Expr) -> Result<Option<FileIdConstraint>> {
+        match expr {
+            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
+                let Some(left) = self.analyze(&binary_expr.left)? else {
+                    return Ok(None);
+                };
+                let Some(right) = self.analyze(&binary_expr.right)? else {
+                    return Ok(None);
+                };
+                Ok(Some(left.intersect(right)))
+            }
+            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
+                let Some(left) = self.analyze(&binary_expr.left)? else {
+                    return Ok(None);
+                };
+                let Some(right) = self.analyze(&binary_expr.right)? else {
+                    return Ok(None);
+                };
+                Ok(Some(left.union(right)))
+            }
+            Expr::BinaryExpr(binary_expr) => Ok(self
+                .value_from_binary_filter(binary_expr)
+                .map(|value| FileIdConstraint::Ids(BTreeSet::from([value])))),
+            Expr::InList(in_list) => Ok(self
+                .values_from_in_list_filter(in_list)
+                .map(FileIdConstraint::from_ids)),
+            _ => Ok(None),
+        }
+    }
+
+    fn value_from_binary_filter(&self, binary_expr: &BinaryExpr) -> Option<String> {
+        if binary_expr.op != Operator::Eq {
+            return None;
+        }
+        self.value_from_column_literal_filter(&binary_expr.left, &binary_expr.right)
+            .or_else(|| {
+                self.value_from_column_literal_filter(&binary_expr.right, &binary_expr.left)
+            })
+    }
+
+    fn values_from_in_list_filter(&self, in_list: &InList) -> Option<Vec<String>> {
+        if in_list.negated {
+            return None;
+        }
+        let Expr::Column(column) = in_list.expr.as_ref() else {
+            return None;
+        };
+        if column.name != self.column_name {
+            return None;
+        }
+        let values = in_list
+            .list
+            .iter()
+            .map(string_expr_literal)
+            .collect::<Option<Vec<_>>>()?;
+        Some(values)
+    }
+
+    fn value_from_column_literal_filter(
+        &self,
+        column_expr: &Expr,
+        literal_expr: &Expr,
+    ) -> Option<String> {
+        let Expr::Column(column) = column_expr else {
+            return None;
+        };
+        if column.name != self.column_name {
+            return None;
+        }
+        string_expr_literal(literal_expr)
+    }
+}
+
+fn string_expr_literal(expr: &Expr) -> Option<String> {
+    let Expr::Literal(literal, _) = expr else {
+        return None;
+    };
+    match literal {
+        ScalarValue::Utf8(Some(value))
+        | ScalarValue::Utf8View(Some(value))
+        | ScalarValue::LargeUtf8(Some(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn contains_column(expr: &Expr, column_name: &str) -> bool {
+    match expr {
+        Expr::Column(column) => column.name == column_name,
+        Expr::BinaryExpr(binary_expr) => {
+            contains_column(&binary_expr.left, column_name)
+                || contains_column(&binary_expr.right, column_name)
+        }
+        Expr::InList(in_list) => {
+            contains_column(&in_list.expr, column_name)
+                || in_list
+                    .list
+                    .iter()
+                    .any(|expr| contains_column(expr, column_name))
+        }
+        Expr::Between(between) => {
+            contains_column(&between.expr, column_name)
+                || contains_column(&between.low, column_name)
+                || contains_column(&between.high, column_name)
+        }
+        Expr::Not(expr) | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
+            contains_column(expr, column_name)
+        }
+        Expr::Negative(expr) => contains_column(expr, column_name),
+        _ => false,
+    }
+}
+
 fn validate_lix_file_update_assignments(
     schema: &SchemaRef,
     assignments: &[(String, Expr)],
@@ -2308,8 +2572,11 @@ mod tests {
     use datafusion::arrow::array::{ArrayRef, BinaryArray, BooleanArray, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::common::{Column, ScalarValue};
     use datafusion::execution::TaskContext;
+    use datafusion::logical_expr::expr::InList;
     use datafusion::logical_expr::lit;
+    use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
     use serde_json::Value as JsonValue;
 
     use crate::binary_cas::BlobDataReader;
@@ -2341,6 +2608,120 @@ mod tests {
         SharedFunctionProvider::new(
             Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>
         )
+    }
+
+    fn string_literal(value: &str) -> Expr {
+        Expr::Literal(ScalarValue::Utf8(Some(value.to_string())), None)
+    }
+
+    fn column(name: &str) -> Expr {
+        Expr::Column(Column::from_name(name))
+    }
+
+    fn eq_filter(column_name: &str, value: &str) -> Expr {
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(column(column_name)),
+            Operator::Eq,
+            Box::new(string_literal(value)),
+        ))
+    }
+
+    #[test]
+    fn file_id_filters_support_string_id_predicates() {
+        let analyzer = super::LixFileIdFilterAnalyzer;
+        let constraint = analyzer
+            .analyze(&Expr::InList(InList::new(
+                Box::new(column("id")),
+                vec![string_literal("file-b"), string_literal("file-a")],
+                false,
+            )))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            constraint,
+            super::FileIdConstraint::Ids(BTreeSet::from([
+                "file-a".to_string(),
+                "file-b".to_string()
+            ]))
+        );
+        assert!(analyzer.supports(&eq_filter("id", "file-a")));
+        assert!(analyzer.supports(&Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(string_literal("file-a")),
+            Operator::Eq,
+            Box::new(column("id")),
+        ))));
+    }
+
+    #[test]
+    fn file_id_filters_intersect_and_union_boolean_predicates() {
+        let analyzer = super::LixFileIdFilterAnalyzer;
+        let left = Expr::InList(InList::new(
+            Box::new(column("id")),
+            vec![string_literal("file-a"), string_literal("file-b")],
+            false,
+        ));
+        let right = Expr::InList(InList::new(
+            Box::new(column("id")),
+            vec![string_literal("file-b"), string_literal("file-c")],
+            false,
+        ));
+
+        let and_constraint = analyzer
+            .analyze(&Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(left.clone()),
+                Operator::And,
+                Box::new(right.clone()),
+            )))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            and_constraint,
+            super::FileIdConstraint::Ids(BTreeSet::from(["file-b".to_string()]))
+        );
+
+        let or_constraint = analyzer
+            .analyze(&Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(left),
+                Operator::Or,
+                Box::new(right),
+            )))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            or_constraint,
+            super::FileIdConstraint::Ids(BTreeSet::from([
+                "file-a".to_string(),
+                "file-b".to_string(),
+                "file-c".to_string()
+            ]))
+        );
+    }
+
+    #[test]
+    fn file_id_filters_detect_contradictions() {
+        let filters = vec![Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(eq_filter("id", "file-a")),
+            Operator::And,
+            Box::new(eq_filter("id", "file-b")),
+        ))];
+
+        assert_eq!(
+            super::file_id_constraint_from_filters(&filters).unwrap(),
+            super::FileIdConstraint::None
+        );
+    }
+
+    #[test]
+    fn file_id_filters_ignore_non_id_and_negated_predicates() {
+        let analyzer = super::LixFileIdFilterAnalyzer;
+
+        assert!(!analyzer.supports(&eq_filter("name", "readme.md")));
+        assert!(!analyzer.supports(&Expr::InList(InList::new(
+            Box::new(column("id")),
+            vec![string_literal("file-a")],
+            true,
+        ))));
     }
 
     fn lix_file_update_stage_from_batch_for_test(
