@@ -44,6 +44,7 @@ use crate::sql2::{
 };
 use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
 
+use super::predicate_typecheck::validate_json_predicate_filters;
 use super::result_metadata::json_field;
 
 pub(crate) async fn register_lix_state_providers(
@@ -266,6 +267,7 @@ impl TableProvider for LixStateProvider {
         let write_ctx = self.write_access.require_write("DELETE FROM lix_state")?;
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
@@ -300,6 +302,7 @@ impl TableProvider for LixStateProvider {
         validate_lix_state_update_assignments(&self.schema, &assignments)?;
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_assignments = assignments
             .iter()
             .map(|(column_name, expr)| {
@@ -1878,6 +1881,18 @@ mod tests {
         Expr::Literal(ScalarValue::Utf8(Some(value.to_string())), None)
     }
 
+    fn json_lit(value: &str) -> Expr {
+        Expr::Literal(
+            ScalarValue::Utf8(Some(value.to_string())),
+            Some(datafusion::common::metadata::FieldMetadata::new(
+                std::collections::BTreeMap::from([(
+                    crate::sql2::result_metadata::LIX_VALUE_TYPE_METADATA_KEY.to_string(),
+                    crate::sql2::result_metadata::LIX_VALUE_TYPE_JSON.to_string(),
+                )]),
+            )),
+        )
+    }
+
     fn string_column(values: Vec<Option<&str>>) -> ArrayRef {
         Arc::new(StringArray::from(values)) as ArrayRef
     }
@@ -2373,7 +2388,7 @@ mod tests {
                 vec![Expr::BinaryExpr(BinaryExpr::new(
                     Box::new(col("metadata")),
                     Operator::Eq,
-                    Box::new(str_lit("{\"source\":\"match\"}")),
+                    Box::new(json_lit("{\"source\":\"match\"}")),
                 ))],
             )
             .await

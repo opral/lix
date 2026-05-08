@@ -1,15 +1,17 @@
 use datafusion::arrow::datatypes::Field;
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::common::ScalarValue;
+use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
+use datafusion::common::{ParamValues, ScalarValue};
 use datafusion::logical_expr::{Expr, LogicalPlan, WriteOp};
 use datafusion::prelude::SessionContext;
 use serde_json::{json, Value as JsonValue};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::schema::schema_key_from_definition;
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
-use super::result_metadata::field_is_json;
+use super::predicate_typecheck::validate_json_predicate_expr_with_dfschema;
+use super::result_metadata::{field_is_json, LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY};
 use super::session::{build_read_session, build_write_session};
 use super::write_normalization::{
     is_binary_type, lix_file_data_type_lix_error, logical_expr_is_binary_or_null,
@@ -65,6 +67,7 @@ pub(crate) async fn create_logical_plan(
         .await
         .map_err(datafusion_error_to_lix_error)?;
     validate_supported_logical_plan(&plan)?;
+    validate_json_predicates_in_logical_plan(&plan)?;
     let kind = classify_logical_plan(&plan);
     let notices = history_filter_notices(&plan);
 
@@ -91,6 +94,7 @@ pub(crate) async fn create_write_logical_plan(
         .await
         .map_err(datafusion_error_to_lix_error)?;
     validate_supported_logical_plan(&plan)?;
+    validate_json_predicates_in_logical_plan(&plan)?;
     let strict_binary_params = validate_strict_lix_file_data_writes(&plan)?;
     let kind = classify_logical_plan(&plan);
 
@@ -101,6 +105,26 @@ pub(crate) async fn create_write_logical_plan(
         notices: Vec::new(),
         strict_binary_params,
     })
+}
+
+fn validate_json_predicates_in_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
+    match plan {
+        LogicalPlan::Filter(filter) => {
+            validate_json_predicate_expr_with_dfschema(filter.input.schema(), &filter.predicate)?;
+        }
+        LogicalPlan::TableScan(scan) => {
+            for filter in &scan.filters {
+                validate_json_predicate_expr_with_dfschema(scan.projected_schema.as_ref(), filter)?;
+            }
+        }
+        _ => {}
+    }
+
+    for input in plan.inputs() {
+        validate_json_predicates_in_logical_plan(input)?;
+    }
+
+    Ok(())
 }
 
 fn validate_strict_lix_file_data_writes(plan: &LogicalPlan) -> Result<BTreeSet<usize>, LixError> {
@@ -224,12 +248,9 @@ pub(crate) async fn execute_logical_plan(
         .map_err(datafusion_error_to_lix_error)?;
     if !params.is_empty() {
         dataframe = dataframe
-            .with_param_values(
-                params
-                    .iter()
-                    .map(scalar_value_from_lix_value)
-                    .collect::<Vec<_>>(),
-            )
+            .with_param_values(ParamValues::List(
+                params.iter().map(scalar_value_from_lix_value).collect(),
+            ))
             .map_err(datafusion_error_to_lix_error)?;
     }
 
@@ -419,16 +440,26 @@ fn validate_supported_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
     Ok(())
 }
 
-fn scalar_value_from_lix_value(value: &Value) -> ScalarValue {
+fn scalar_value_from_lix_value(value: &Value) -> ScalarAndMetadata {
     match value {
-        Value::Null => ScalarValue::Null,
-        Value::Boolean(value) => ScalarValue::Boolean(Some(*value)),
-        Value::Integer(value) => ScalarValue::Int64(Some(*value)),
-        Value::Real(value) => ScalarValue::Float64(Some(*value)),
-        Value::Text(value) => ScalarValue::Utf8(Some(value.clone())),
-        Value::Json(value) => ScalarValue::Utf8(Some(value.to_string())),
-        Value::Blob(value) => ScalarValue::Binary(Some(value.clone())),
+        Value::Null => ScalarValue::Null.into(),
+        Value::Boolean(value) => ScalarValue::Boolean(Some(*value)).into(),
+        Value::Integer(value) => ScalarValue::Int64(Some(*value)).into(),
+        Value::Real(value) => ScalarValue::Float64(Some(*value)).into(),
+        Value::Text(value) => ScalarValue::Utf8(Some(value.clone())).into(),
+        Value::Json(value) => ScalarAndMetadata::new(
+            ScalarValue::Utf8(Some(value.to_string())),
+            Some(json_field_metadata()),
+        ),
+        Value::Blob(value) => ScalarValue::Binary(Some(value.clone())).into(),
     }
+}
+
+fn json_field_metadata() -> FieldMetadata {
+    FieldMetadata::new(BTreeMap::from([(
+        LIX_VALUE_TYPE_METADATA_KEY.to_string(),
+        LIX_VALUE_TYPE_JSON.to_string(),
+    )]))
 }
 
 fn datafusion_error_to_lix_error(error: datafusion::error::DataFusionError) -> LixError {
@@ -2750,7 +2781,7 @@ mod tests {
             "UPDATE lix_state \
              SET snapshot_content = '{\"key\":\"hello\",\"value\":\"updated\"}', \
                  metadata = '{\"schema_key\":\"lix_key_value\"}' \
-             WHERE metadata = '{\"source\":\"match\"}'",
+             WHERE metadata = lix_json('{\"source\":\"match\"}')",
             &[],
         )
         .await

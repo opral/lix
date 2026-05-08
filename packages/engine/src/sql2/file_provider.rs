@@ -35,6 +35,7 @@ use crate::sql2::dml::{InsertExec, InsertSink};
 use crate::sql2::filesystem_predicates::{
     canonicalize_filesystem_path_filters, FilesystemPathKind,
 };
+use crate::sql2::predicate_typecheck::validate_json_predicate_filters;
 use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids,
     resolve_write_version_scope, VersionBinding,
@@ -262,6 +263,7 @@ impl TableProvider for LixFileProvider {
         .map_err(lix_error_to_datafusion_error)?;
         let filters = canonicalize_filesystem_path_filters(filters, FilesystemPathKind::File)?;
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, _state.execution_props()))
@@ -314,6 +316,7 @@ impl TableProvider for LixFileProvider {
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
         let filters = canonicalize_filesystem_path_filters(&filters, FilesystemPathKind::File)?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
@@ -360,6 +363,7 @@ impl TableProvider for LixFileProvider {
             })
             .collect::<Result<Vec<_>>>()?;
         let filters = canonicalize_filesystem_path_filters(&filters, FilesystemPathKind::File)?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))

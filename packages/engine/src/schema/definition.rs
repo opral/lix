@@ -44,7 +44,33 @@ pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError
     assert_unique_pointers(schema)?;
     assert_state_foreign_key_pointers(schema)?;
     assert_known_x_lix_top_level_fields(schema)?;
+    assert_entity_properties_do_not_use_reserved_lix_prefix(schema)?;
     assert_entity_properties_have_projectable_types(schema)?;
+
+    Ok(())
+}
+
+fn assert_entity_properties_do_not_use_reserved_lix_prefix(
+    schema: &JsonValue,
+) -> Result<(), LixError> {
+    let Some(schema_key) = schema.get("x-lix-key").and_then(JsonValue::as_str) else {
+        return Ok(());
+    };
+    let Some(properties) = schema.get("properties").and_then(JsonValue::as_object) else {
+        return Ok(());
+    };
+
+    for property_name in properties.keys() {
+        if property_name.starts_with("lix") {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                format!(
+                    "Invalid Lix schema definition: schema '{schema_key}' property '/{property_name}' uses reserved prefix 'lix'."
+                ),
+            )
+            .with_hint("Property names starting with 'lix' are reserved for Lix system fields."));
+        }
+    }
 
     Ok(())
 }
@@ -58,9 +84,6 @@ fn assert_entity_properties_have_projectable_types(schema: &JsonValue) -> Result
     };
 
     for (property_name, property_schema) in properties {
-        if property_name.starts_with("lixcol_") {
-            continue;
-        }
         if !schema_property_has_sql_projection_type(property_schema) {
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
