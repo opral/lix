@@ -477,7 +477,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    registered_schema_insert_rejects_divergent_same_key_version_shape,
+    registered_schema_identity_is_scoped_per_version,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let main = sim.wrap_session(
@@ -503,10 +503,33 @@ simulation_test!(
              false,\
              false\
              )",
-            &[],
-        )
-        .await
-        .expect("main schema should be registered");
+                &[],
+            )
+            .await
+            .expect("main schema should be registered");
+
+        let main_schema = json!({
+            "x-lix-key": "engine_divergent_schema",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "name": { "type": "string" }
+            },
+            "required": ["id", "name"],
+            "additionalProperties": false
+        });
+        let target_schema = json!({
+            "x-lix-key": "engine_divergent_schema",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "title": { "type": "string" }
+            },
+            "required": ["id", "title"],
+            "additionalProperties": false
+        });
 
         let target = sim.wrap_session(
             engine
@@ -516,7 +539,7 @@ simulation_test!(
             &engine,
         );
 
-        let error = target
+        target
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
@@ -527,15 +550,147 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect_err("same schema key/version must have one canonical shape");
+            .expect("same schema key may have independent version-local definitions");
 
-        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(
-            error
-                .message
-                .contains("already registered with a different definition"),
-            "unexpected error: {error:?}"
+        let main_result = main
+            .execute(
+                "SELECT value \
+                 FROM lix_registered_schema \
+                 WHERE lixcol_entity_id = lix_json('[\"engine_divergent_schema\"]')",
+                &[],
+            )
+            .await
+            .expect("main schema read should succeed");
+        assert_rows_eq(main_result, vec![vec![Value::Json(main_schema)]]);
+
+        let target_result = target
+            .execute(
+                "SELECT value \
+                 FROM lix_registered_schema \
+                 WHERE lixcol_entity_id = lix_json('[\"engine_divergent_schema\"]')",
+                &[],
+            )
+            .await
+            .expect("target schema read should succeed");
+        assert_rows_eq(target_result, vec![vec![Value::Json(target_schema)]]);
+    }
+);
+
+simulation_test!(
+    independent_schema_amendments_on_two_versions_are_allowed,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(
+            engine
+                .open_session(sim.main_version_id())
+                .await
+                .expect("main session should open"),
+            &engine,
         );
+
+        let base_schema = json!({
+            "x-lix-key": "engine_branch_schema_amendment",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "title": { "type": "string" }
+            },
+            "required": ["id", "title"],
+            "additionalProperties": false
+        });
+        let main_schema = json!({
+            "x-lix-key": "engine_branch_schema_amendment",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "title": { "type": "string" },
+                "main_note": { "type": "string" }
+            },
+            "required": ["id", "title"],
+            "additionalProperties": false
+        });
+        let draft_schema = json!({
+            "x-lix-key": "engine_branch_schema_amendment",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "title": { "type": "string" },
+                "draft_note": { "type": "string" }
+            },
+            "required": ["id", "title"],
+            "additionalProperties": false
+        });
+
+        main.execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES ($1, false, false)",
+            &[Value::Json(base_schema)],
+        )
+        .await
+        .expect("base schema should be registered");
+
+        main.create_version(CreateVersionOptions {
+            id: Some("schema-amendment-draft".to_string()),
+            name: "Schema Amendment Draft".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("draft version should be created from base schema");
+
+        let draft = sim.wrap_session(
+            engine
+                .open_session("schema-amendment-draft")
+                .await
+                .expect("draft session should open"),
+            &engine,
+        );
+
+        let main_update = main
+            .execute(
+                "UPDATE lix_registered_schema \
+                 SET value = $1 \
+                 WHERE lixcol_entity_id = lix_json('[\"engine_branch_schema_amendment\"]')",
+                &[Value::Json(main_schema.clone())],
+            )
+            .await
+            .expect("main additive schema amendment should succeed");
+        assert_eq!(main_update, ExecuteResult::from_rows_affected(1));
+
+        let draft_update = draft
+            .execute(
+                "UPDATE lix_registered_schema \
+                 SET value = $1 \
+                 WHERE lixcol_entity_id = lix_json('[\"engine_branch_schema_amendment\"]')",
+                &[Value::Json(draft_schema.clone())],
+            )
+            .await
+            .expect("draft additive schema amendment should succeed");
+        assert_eq!(draft_update, ExecuteResult::from_rows_affected(1));
+
+        let main_result = main
+            .execute(
+                "SELECT value \
+                 FROM lix_registered_schema \
+                 WHERE lixcol_entity_id = lix_json('[\"engine_branch_schema_amendment\"]')",
+                &[],
+            )
+            .await
+            .expect("main amended schema read should succeed");
+        assert_rows_eq(main_result, vec![vec![Value::Json(main_schema)]]);
+
+        let draft_result = draft
+            .execute(
+                "SELECT value \
+                 FROM lix_registered_schema \
+                 WHERE lixcol_entity_id = lix_json('[\"engine_branch_schema_amendment\"]')",
+                &[],
+            )
+            .await
+            .expect("draft amended schema read should succeed");
+        assert_rows_eq(draft_result, vec![vec![Value::Json(draft_schema)]]);
     }
 );
 
