@@ -214,7 +214,6 @@ enum ChangeColumn {
     Id,
     EntityId,
     SchemaKey,
-    SchemaVersion,
     FileId,
     Metadata,
     CreatedAt,
@@ -226,7 +225,6 @@ fn lix_change_schema() -> SchemaRef {
         Field::new("id", DataType::Utf8, false),
         json_field("entity_id", false),
         Field::new("schema_key", DataType::Utf8, false),
-        Field::new("schema_version", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
         json_field("metadata", true),
         Field::new("created_at", DataType::Utf8, false),
@@ -239,7 +237,6 @@ fn change_projection_for_scan(projection: Option<&Vec<usize>>) -> Vec<ChangeColu
         ChangeColumn::Id,
         ChangeColumn::EntityId,
         ChangeColumn::SchemaKey,
-        ChangeColumn::SchemaVersion,
         ChangeColumn::FileId,
         ChangeColumn::Metadata,
         ChangeColumn::CreatedAt,
@@ -283,9 +280,6 @@ fn change_record_batch(
             ChangeColumn::SchemaKey => {
                 string_array(changes.iter().map(|row| Some(row.schema_key.as_str())))
             }
-            ChangeColumn::SchemaVersion => {
-                string_array(changes.iter().map(|row| Some(row.schema_version.as_str())))
-            }
             ChangeColumn::FileId => string_array(changes.iter().map(|row| row.file_id.as_deref())),
             ChangeColumn::Metadata => Arc::new(StringArray::from(
                 changes
@@ -314,7 +308,6 @@ fn change_schema(projection: &[ChangeColumn]) -> SchemaRef {
                 ChangeColumn::Id => Field::new("id", DataType::Utf8, false),
                 ChangeColumn::EntityId => json_field("entity_id", false),
                 ChangeColumn::SchemaKey => Field::new("schema_key", DataType::Utf8, false),
-                ChangeColumn::SchemaVersion => Field::new("schema_version", DataType::Utf8, false),
                 ChangeColumn::FileId => Field::new("file_id", DataType::Utf8, true),
                 ChangeColumn::Metadata => json_field("metadata", true),
                 ChangeColumn::CreatedAt => Field::new("created_at", DataType::Utf8, false),

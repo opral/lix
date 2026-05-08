@@ -1,6 +1,5 @@
 {
   "x-lix-key": "lix_version_descriptor",
-  "x-lix-version": "1",
   "description": "User-facing version metadata (name and visibility) for a branch-like version. The stable identity of a version; the matching `lix_version_ref` carries the moving head pointer. The catalog's `lix_version` surface joins this descriptor with its ref to present a single user-visible version row.",
   "x-lix-primary-key": [
     "/id"

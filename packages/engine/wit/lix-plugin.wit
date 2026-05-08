@@ -22,7 +22,6 @@ interface api {
   record entity-change {
     entity-id: string,
     schema-key: string,
-    schema-version: string,
     /// Deterministically encoded JSON text.
     snapshot-content: option<canonical-json>,
   }
@@ -34,7 +33,6 @@ interface api {
   record active-state-row {
     entity-id: string,
     schema-key: option<string>,
-    schema-version: option<string>,
     /// Deterministically encoded JSON text.
     snapshot-content: option<canonical-json>,
     file-id: option<string>,

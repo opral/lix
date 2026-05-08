@@ -16,7 +16,6 @@ pub(crate) fn encode_change_ref(change: CanonicalChangeRef<'_>) -> Result<Vec<u8
     let id = builder.create_string(change.id);
     let entity_id = builder.create_string(&entity_id);
     let schema_key = builder.create_string(change.schema_key);
-    let schema_version = builder.create_string(change.schema_version);
     let file_id = change.file_id.map(|value| builder.create_string(value));
     let snapshot_ref = change
         .snapshot_ref
@@ -32,7 +31,6 @@ pub(crate) fn encode_change_ref(change: CanonicalChangeRef<'_>) -> Result<Vec<u8
             id,
             entity_id,
             schema_key,
-            schema_version,
             file_id,
             snapshot_ref,
             metadata_ref,
@@ -71,7 +69,6 @@ pub(crate) fn decode_change(bytes: &[u8]) -> Result<CanonicalChange, LixError> {
         id: required_str(change.id(), "id")?.to_string(),
         entity_id,
         schema_key: required_str(change.schema_key(), "schema_key")?.to_string(),
-        schema_version: required_str(change.schema_version(), "schema_version")?.to_string(),
         file_id: change.file_id().map(ToString::to_string),
         snapshot_ref: optional_json_ref(change.snapshot_ref(), "snapshot_ref")?,
         metadata_ref: optional_json_ref(change.metadata_ref(), "metadata_ref")?,
@@ -126,11 +123,10 @@ mod flatbuffer {
         const VT_ID: flatbuffers::VOffsetT = 4;
         const VT_ENTITY_ID: flatbuffers::VOffsetT = 6;
         const VT_SCHEMA_KEY: flatbuffers::VOffsetT = 8;
-        const VT_SCHEMA_VERSION: flatbuffers::VOffsetT = 10;
-        const VT_FILE_ID: flatbuffers::VOffsetT = 12;
-        const VT_SNAPSHOT_REF: flatbuffers::VOffsetT = 14;
-        const VT_METADATA_REF: flatbuffers::VOffsetT = 16;
-        const VT_CREATED_AT: flatbuffers::VOffsetT = 18;
+        const VT_FILE_ID: flatbuffers::VOffsetT = 10;
+        const VT_SNAPSHOT_REF: flatbuffers::VOffsetT = 12;
+        const VT_METADATA_REF: flatbuffers::VOffsetT = 14;
+        const VT_CREATED_AT: flatbuffers::VOffsetT = 16;
 
         #[inline]
         pub(super) fn id(&self) -> Option<&'a str> {
@@ -156,15 +152,6 @@ mod flatbuffer {
             }
         }
 
-        #[inline]
-        pub(super) fn schema_version(&self) -> Option<&'a str> {
-            unsafe {
-                self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_SCHEMA_VERSION, None)
-            }
-        }
-
-        #[inline]
         pub(super) fn file_id(&self) -> Option<&'a str> {
             unsafe {
                 self.table
@@ -223,11 +210,6 @@ mod flatbuffer {
                     true,
                 )?
                 .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "schema_version",
-                    Self::VT_SCHEMA_VERSION,
-                    true,
-                )?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
                     "file_id",
                     Self::VT_FILE_ID,
                     false,
@@ -256,7 +238,6 @@ mod flatbuffer {
         pub(super) id: flatbuffers::WIPOffset<&'a str>,
         pub(super) entity_id: flatbuffers::WIPOffset<&'a str>,
         pub(super) schema_key: flatbuffers::WIPOffset<&'a str>,
-        pub(super) schema_version: flatbuffers::WIPOffset<&'a str>,
         pub(super) file_id: Option<flatbuffers::WIPOffset<&'a str>>,
         pub(super) snapshot_ref: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
         pub(super) metadata_ref: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
@@ -290,10 +271,6 @@ mod flatbuffer {
                 file_id,
             );
         }
-        builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-            CanonicalChange::VT_SCHEMA_VERSION,
-            args.schema_version,
-        );
         builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
             CanonicalChange::VT_SCHEMA_KEY,
             args.schema_key,

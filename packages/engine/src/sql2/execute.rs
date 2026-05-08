@@ -791,7 +791,6 @@ mod tests {
     struct CapturedStageRow {
         entity_id: String,
         schema_key: String,
-        schema_version: String,
         version_id: String,
         file_id: Option<String>,
         snapshot_content: Option<String>,
@@ -810,7 +809,6 @@ mod tests {
                     .as_json_array_text()
                     .expect("captured staged row should project entity_id"),
                 schema_key: row.schema_key,
-                schema_version: row.schema_version,
                 version_id: row.version_id,
                 file_id: row.file_id,
                 global: row.global,
@@ -1105,7 +1103,6 @@ mod tests {
             file_id: None,
             snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
             metadata: metadata.map(str::to_string),
-            schema_version: "1".to_string(),
             version_id: "version-a".to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),
@@ -1123,7 +1120,6 @@ mod tests {
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
             metadata: Some(json!({ "source": entity_id }).to_string()),
-            schema_version: "1".to_string(),
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),
@@ -1155,7 +1151,6 @@ mod tests {
                 .to_string(),
             ),
             metadata: Some(json!({ "source": entity_id }).to_string()),
-            schema_version: "1".to_string(),
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),
@@ -1187,7 +1182,6 @@ mod tests {
                 .to_string(),
             ),
             metadata: Some(json!({ "source": entity_id }).to_string()),
-            schema_version: "1".to_string(),
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),
@@ -1334,7 +1328,7 @@ mod tests {
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"}},\"required\":[\"value\",\"count\"],\"additionalProperties\":false}'),\
+                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"}},\"required\":[\"value\",\"count\"],\"additionalProperties\":false}'),\
                  false,\
                  false\
                  )",
@@ -1838,9 +1832,9 @@ mod tests {
         let result = execute_write_sql(
 			&mut ctx,
 			"INSERT INTO lix_state (\
-	         entity_id, schema_key, file_id, snapshot_content, metadata, schema_version, global, untracked\
+	         entity_id, schema_key, file_id, snapshot_content, metadata, global, untracked\
 	         ) VALUES (\
-	         lix_json('[\"entity-1\"]'), 'lix_key_value', NULL, '{\"key\":\"hello\",\"value\":\"world\"}', '{\"source\":\"sql\"}', '1', false, false\
+	         lix_json('[\"entity-1\"]'), 'lix_key_value', NULL, '{\"key\":\"hello\",\"value\":\"world\"}', '{\"source\":\"sql\"}', false, false\
 	         )",
 			&[],
 		)
@@ -1858,7 +1852,6 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_id, "[\"entity-1\"]");
-        assert_eq!(rows[0].schema_version, "1");
         assert_eq!(rows[0].version_id, "version-a");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
@@ -1885,9 +1878,9 @@ mod tests {
         let result = execute_write_sql(
 			&mut ctx,
 			"INSERT INTO lix_state (\
-	         entity_id, schema_key, file_id, snapshot_content, metadata, schema_version\
+	         entity_id, schema_key, file_id, snapshot_content, metadata\
 	         ) VALUES (\
-	         lix_json('[\"entity-defaults\"]'), 'lix_key_value', NULL, '{\"key\":\"hello\",\"value\":\"defaults\"}', NULL, '1'\
+	         lix_json('[\"entity-defaults\"]'), 'lix_key_value', NULL, '{\"key\":\"hello\",\"value\":\"defaults\"}', NULL\
 	         )",
 			&[],
 		)
@@ -1924,9 +1917,9 @@ mod tests {
         };
 
         let result = execute_write_sql(
-			&mut ctx,
-			"INSERT INTO lix_state (\
-	         entity_id, schema_key, file_id, snapshot_content, metadata, schema_version, global, untracked\
+            &mut ctx,
+            "INSERT INTO lix_state (\
+	         entity_id, schema_key, file_id, snapshot_content, metadata, global, untracked\
 	         ) \
 	         SELECT \
 	         lix_json('[\"entity-from-select\"]') AS entity_id, \
@@ -1934,7 +1927,6 @@ mod tests {
 	         NULL AS file_id, \
              '{\"key\":\"hello\",\"value\":\"from-select\"}' AS snapshot_content, \
              '{\"source\":\"select\"}' AS metadata, \
-             '1' AS schema_version, \
              false AS global, \
              false AS untracked",
             &[],
@@ -1953,7 +1945,6 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_key_value");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_id, "[\"entity-from-select\"]");
-        assert_eq!(rows[0].schema_version, "1");
         assert_eq!(rows[0].version_id, "version-a");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
@@ -1974,7 +1965,6 @@ mod tests {
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
-                "x-lix-version": "1",
                 "type": "object",
                 "properties": {
                     "value": { "type": "string" }
@@ -2003,7 +1993,6 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "test_state_schema");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_id, "[\"entity-c\"]");
-        assert_eq!(rows[0].schema_version, "1");
         assert_eq!(rows[0].version_id, "version-b");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
@@ -2025,7 +2014,6 @@ mod tests {
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
-                "x-lix-version": "1",
                 "type": "object",
                 "properties": {
                     "value": { "type": "string" }
@@ -2096,7 +2084,6 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_id, "[\"dir-docs\"]");
-        assert_eq!(rows[0].schema_version, "1");
         assert_eq!(rows[0].version_id, "version-b");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
@@ -2311,7 +2298,6 @@ mod tests {
         let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].entity_id, "[\"file-readme\"]");
-        assert_eq!(rows[0].schema_version, "1");
         assert_eq!(rows[0].version_id, "version-b");
         assert!(!rows[0].global);
         assert!(!rows[0].untracked);
@@ -2653,7 +2639,6 @@ mod tests {
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
-                "x-lix-version": "1",
                 "type": "object",
                 "properties": {
                     "value": { "type": "string" }
@@ -2710,7 +2695,6 @@ mod tests {
             staged_writes: Arc::clone(&staged_writes),
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
-                "x-lix-version": "1",
                 "type": "object",
                 "properties": {
                     "value": { "type": "string" }
@@ -2923,7 +2907,6 @@ mod tests {
         let session_b = engine.open_session("version-b").await?;
         let schema_definition = json!({
             "x-lix-key": "test_state_schema",
-            "x-lix-version": "1",
             "type": "object",
             "properties": {
                 "value": { "type": "string" }
@@ -2935,7 +2918,7 @@ mod tests {
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}'),\
+                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}'),\
                  false,\
                  false\
                  )",
@@ -2946,7 +2929,7 @@ mod tests {
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}'),\
+                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}'),\
                  false,\
                  false\
                  )",
@@ -2954,31 +2937,31 @@ mod tests {
             )
             .await?;
         session_a
-		.execute(
-			"INSERT INTO lix_state (\
-	         entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+            .execute(
+                "INSERT INTO lix_state (\
+	         entity_id, schema_key, file_id, snapshot_content, global, untracked\
 	         ) VALUES (\
-	         lix_json('[\"entity-a\"]'), 'test_state_schema', NULL, '{\"value\":\"A\"}', '1', false, false\
+	         lix_json('[\"entity-a\"]'), 'test_state_schema', NULL, '{\"value\":\"A\"}', false, false\
 	         )",
-			&[],
-		)
+                &[],
+            )
             .await?;
         session_b
-		.execute(
-			"INSERT INTO lix_state (\
-	         entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+            .execute(
+                "INSERT INTO lix_state (\
+	         entity_id, schema_key, file_id, snapshot_content, global, untracked\
 	         ) VALUES (\
-	         lix_json('[\"entity-b\"]'), 'test_state_schema', NULL, '{\"value\":\"B\"}', '1', false, false\
+	         lix_json('[\"entity-b\"]'), 'test_state_schema', NULL, '{\"value\":\"B\"}', false, false\
 	         )",
-			&[],
-		)
+                &[],
+            )
             .await?;
         session_a
 		.execute(
 			"INSERT INTO lix_state (\
-	         entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+	         entity_id, schema_key, file_id, snapshot_content, global, untracked\
 	         ) VALUES (\
-	         lix_json('[\"dir-docs\"]'), 'lix_directory_descriptor', NULL, '{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}', '1', false, false\
+	         lix_json('[\"dir-docs\"]'), 'lix_directory_descriptor', NULL, '{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}', false, false\
 	         )",
 			&[],
 		)

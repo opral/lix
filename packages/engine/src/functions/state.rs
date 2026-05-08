@@ -16,7 +16,6 @@ pub(crate) const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
 pub(crate) const DETERMINISTIC_SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
-const KEY_VALUE_SCHEMA_VERSION: &str = "1";
 
 /// Loads deterministic-mode settings from visible live state.
 ///
@@ -171,7 +170,6 @@ fn deterministic_key_value_row(
         file_id: None,
         snapshot_ref: Some(snapshot_ref),
         metadata_ref: None,
-        schema_version: KEY_VALUE_SCHEMA_VERSION.to_string(),
         created_at: timestamp.to_string(),
         updated_at: timestamp.to_string(),
         global: true,

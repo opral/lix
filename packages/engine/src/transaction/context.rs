@@ -375,14 +375,12 @@ impl Transaction {
             let mut planned_changes = Vec::with_capacity(changes.len());
             for (index, change) in changes {
                 let row = &change.projected_row;
-                let Some((schema_plan_id, _)) =
-                    catalog.plan_for_key(&row.schema_key, &row.schema_version)
-                else {
+                let Some((schema_plan_id, _)) = catalog.plan_for_key(&row.schema_key) else {
                     return Err(LixError::new(
                         LixError::CODE_SCHEMA_DEFINITION,
                         format!(
-                            "schema '{}' version '{}' is not visible to this transaction",
-                            row.schema_key, row.schema_version
+                            "schema '{}' is not visible to this transaction",
+                            row.schema_key
                         ),
                     ));
                 };
@@ -595,7 +593,6 @@ fn prepare_state_row(
         snapshot,
         metadata,
         origin: row.origin,
-        schema_version: row.schema_version,
         created_at: row.created_at.unwrap_or_else(|| updated_at.clone()),
         updated_at,
         global: row.global,
@@ -663,7 +660,6 @@ fn prepare_adopted_state_row(
         file_id: row.file_id,
         snapshot,
         metadata,
-        schema_version: row.schema_version,
         created_at: row.created_at,
         updated_at: row.updated_at,
         global: change.version_id == GLOBAL_VERSION_ID,
@@ -1196,7 +1192,7 @@ mod tests {
         assert!(
             error
                 .message
-                .contains("schema 'missing_schema' version '1' is not visible"),
+                .contains("schema 'missing_schema' is not visible"),
             "error should explain missing schema visibility: {error:?}"
         );
     }
@@ -1256,35 +1252,6 @@ mod tests {
         assert!(
             error.message.contains("version_id='global', global=false"),
             "error should explain invalid storage scope: {error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn stage_rows_rejects_unknown_schema_version_without_sql() {
-        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
-        let (
-            _live_state,
-            _binary_cas,
-            _changelog,
-            _version_ref,
-            _runtime_functions,
-            mut transaction,
-        ) = open_test_transaction(&backend).await;
-
-        let mut row = key_value_stage_row("unknown-version", "value", false);
-        row.schema_version = "999".to_string();
-
-        let error = transaction
-            .stage_rows(vec![row])
-            .await
-            .expect_err("unknown schema version should be rejected while staging");
-
-        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
-        assert!(
-            error
-                .message
-                .contains("schema 'lix_key_value' version '999' is not visible"),
-            "error should explain missing schema version visibility: {error:?}"
         );
     }
 
@@ -1366,7 +1333,14 @@ mod tests {
         row.schema_key = "lix_registered_schema".to_string();
         row.snapshot = Some(TransactionJson::from_value_for_test(json!({
             "value": {
-                "x-lix-key": "malformed_registered_schema"
+                "x-lix-key": "malformed_registered_schema",
+                "x-lix-primary-key": ["id"],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" }
+                },
+                "required": ["id"],
+                "additionalProperties": false
             }
         })));
         row.entity_id = None;
@@ -1376,10 +1350,9 @@ mod tests {
             .await
             .expect_err("malformed registered schema should be rejected while staging");
 
-        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
         assert!(
-            error.message.contains("x-lix-version")
-                || error.message.contains("primary-key pointer"),
+            error.message.contains("x-lix-primary-key"),
             "error should explain malformed registered schema: {error:?}"
         );
     }
@@ -1467,14 +1440,10 @@ mod tests {
                     .expect("seed schema key should derive");
                 let snapshot_content = json!({ "value": schema }).to_string();
                 crate::tracked_state::TrackedStateRow {
-                    entity_id: crate::schema::registered_schema_entity_id(
-                        &key.schema_key,
-                        &key.schema_version,
-                    )
-                    .expect("registered schema identity should derive"),
+                    entity_id: crate::schema::registered_schema_entity_id(&key.schema_key)
+                        .expect("registered schema identity should derive"),
                     schema_key: "lix_registered_schema".to_string(),
                     file_id: None,
-                    schema_version: "1".to_string(),
                     snapshot_ref: Some(
                         json_writer
                             .prepare_json(crate::json_store::NormalizedJson::from_arc_unchecked(
@@ -1485,7 +1454,7 @@ mod tests {
                     metadata_ref: None,
                     created_at: "1970-01-01T00:00:00.000Z".to_string(),
                     updated_at: "1970-01-01T00:00:00.000Z".to_string(),
-                    change_id: format!("schema-fixture-{}-{}", key.schema_key, key.schema_version),
+                    change_id: format!("schema-fixture-{}", key.schema_key),
                     commit_id: SCHEMA_FIXTURE_COMMIT_ID.to_string(),
                 }
             })
@@ -1585,7 +1554,6 @@ mod tests {
             }))),
             metadata: None,
             origin: None,
-            schema_version: "1".to_string(),
             created_at: None,
             updated_at: None,
             global: true,

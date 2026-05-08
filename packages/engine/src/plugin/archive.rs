@@ -71,15 +71,12 @@ pub(crate) fn parse_plugin_archive_for_install(
             })?;
         validate_lix_schema_definition(&schema_json)?;
         let schema_key = schema_key_from_definition(&schema_json)?;
-        if !seen_schema_keys.insert((
-            schema_key.schema_key.clone(),
-            schema_key.schema_version.clone(),
-        )) {
+        if !seen_schema_keys.insert(schema_key.schema_key.clone()) {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 message: format!(
-                    "Plugin archive declares duplicate schema '{}~{}'",
-                    schema_key.schema_key, schema_key.schema_version
+                    "Plugin archive declares duplicate schema '{}'",
+                    schema_key.schema_key
                 ),
                 hint: None,
             details: None,

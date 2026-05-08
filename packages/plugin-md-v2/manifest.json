@@ -12,7 +12,6 @@
       "columns": [
         "entity_id",
         "schema_key",
-        "schema_version",
         "snapshot_content"
       ]
     }

@@ -43,9 +43,7 @@ pub use backend::{
 };
 pub use common::LixError;
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};
-pub use common::{
-    CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
-};
+pub use common::{CanonicalPluginKey, CanonicalSchemaKey, EntityId, FileId, VersionId};
 pub use common::{LixNotice, NullableKeyFilter, SqlQueryResult, Value, WriteReceipt};
 pub use common::{WireQueryResult, WireValue};
 pub use engine::Engine;

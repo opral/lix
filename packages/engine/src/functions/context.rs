@@ -309,7 +309,6 @@ mod tests {
                     .expect("snapshot should stage"),
             ),
             metadata_ref: None,
-            schema_version: "1".to_string(),
             created_at: "1970-01-01T00:00:00.000Z".to_string(),
             updated_at: "1970-01-01T00:00:00.000Z".to_string(),
             global: true,

@@ -2,13 +2,14 @@ use std::sync::Arc;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use crate::common::format_json_pointer;
 use crate::common::normalize_path_segment;
 use crate::domain::Domain;
 use crate::entity_identity::{EntityIdentity, EntityIdentityError};
 use crate::functions::FunctionProviderHandle;
 use crate::schema::{
-    is_seed_schema_key, reject_unsupported_registered_schema_version,
-    schema_from_registered_snapshot, validate_lix_schema, validate_lix_schema_definition,
+    is_seed_schema_key, schema_from_registered_snapshot, validate_lix_schema,
+    validate_lix_schema_definition,
 };
 use crate::schema_catalog::{SchemaCatalog, SchemaPlan, SchemaPlanId};
 use crate::transaction::types::{PreparedRowFacts, TransactionJson, TransactionWriteRow};
@@ -44,14 +45,12 @@ pub(crate) fn normalize_transaction_write_row(
 ) -> Result<NormalizedTransactionWriteRow, LixError> {
     validate_transaction_write_row_schema_identity(&row)?;
 
-    let Some((schema_plan_id, schema_plan)) =
-        schema_catalog.plan_for_key(&row.schema_key, &row.schema_version)
-    else {
+    let Some((schema_plan_id, schema_plan)) = schema_catalog.plan_for_key(&row.schema_key) else {
         return Err(LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
             format!(
-                "schema '{}' version '{}' is not visible to this transaction",
-                row.schema_key, row.schema_version
+                "schema '{}' is not visible to this transaction",
+                row.schema_key
             ),
         ));
     };
@@ -74,8 +73,8 @@ pub(crate) fn normalize_transaction_write_row(
         return Err(LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
             format!(
-                "tombstone for schema '{}' version '{}' requires entity_id",
-                row.schema_key, row.schema_version
+                "tombstone for schema '{}' requires entity_id",
+                row.schema_key
             ),
         ));
     } else {
@@ -116,12 +115,6 @@ fn validate_transaction_write_row_schema_identity(
             "engine transaction staging requires non-empty schema_key",
         ));
     }
-    if row.schema_version.is_empty() {
-        return Err(LixError::new(
-            LixError::CODE_UNKNOWN,
-            "engine transaction staging requires non-empty schema_version",
-        ));
-    }
     Ok(())
 }
 
@@ -139,8 +132,8 @@ fn snapshot_object_from_transaction_json(
         _ => Err(LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
             format!(
-                "snapshot_content for schema '{}' version '{}' must be a JSON object",
-                row.schema_key, row.schema_version
+                "snapshot_content for schema '{}' must be a JSON object",
+                row.schema_key
             ),
         )),
     }
@@ -154,7 +147,7 @@ fn apply_defaults(
 ) -> Result<bool, LixError> {
     schema_plan
         .defaults
-        .apply(snapshot, functions, &row.schema_key, &row.schema_version)
+        .apply(snapshot, functions, &row.schema_key)
 }
 
 fn normalize_filesystem_descriptor_snapshot(
@@ -210,8 +203,8 @@ fn optional_string_field<'a>(
         LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
             format!(
-                "snapshot_content for schema '{}' version '{}' field '{}' must be a string",
-                row.schema_key, row.schema_version, field
+                "snapshot_content for schema '{}' field '{}' must be a string",
+                row.schema_key, field
             ),
         )
     })
@@ -227,8 +220,8 @@ fn resolve_entity_id(
             LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
-                    "write for schema '{}' version '{}' requires entity_id because the schema has no x-lix-primary-key",
-                    row.schema_key, row.schema_version
+                    "write for schema '{}' requires entity_id because the schema has no x-lix-primary-key",
+                    row.schema_key
                 ),
             )
         });
@@ -240,8 +233,8 @@ fn resolve_entity_id(
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
-                    "entity_id '{}' does not match x-lix-primary-key derived entity_id '{}' for schema '{}' version '{}'",
-                    entity_id.as_json_array_text()?, derived.as_json_array_text()?, row.schema_key, row.schema_version
+                    "entity_id '{}' does not match x-lix-primary-key derived entity_id '{}' for schema '{}'",
+                    entity_id.as_json_array_text()?, derived.as_json_array_text()?, row.schema_key
                 ),
             ));
         }
@@ -274,23 +267,9 @@ fn entity_id_derivation_error(
     LixError::new(
         LixError::CODE_SCHEMA_VALIDATION,
         format!(
-            "failed to derive entity_id for schema '{}' version '{}': {detail}",
-            row.schema_key, row.schema_version
+            "failed to derive entity_id for schema '{}': {detail}",
+            row.schema_key
         ),
-    )
-}
-
-fn format_json_pointer(segments: &[String]) -> String {
-    if segments.is_empty() {
-        return String::new();
-    }
-    format!(
-        "/{}",
-        segments
-            .iter()
-            .map(|segment| segment.replace('~', "~0").replace('/', "~1"))
-            .collect::<Vec<_>>()
-            .join("/")
     )
 }
 
@@ -305,14 +284,12 @@ pub(crate) fn remember_pending_registered_schema(
             "lix_registered_schema rows cannot be deleted yet; schema deletion is not supported",
         ));
     };
-    if let Some(schema) = snapshot.get("value").and_then(JsonValue::as_object) {
-        if schema.contains_key("x-lix-version") {
-            validate_lix_schema_definition(&JsonValue::Object(schema.clone()))?;
-        }
+    if let Some(schema) = snapshot.get("value") {
+        validate_lix_schema_definition(schema)?;
     }
     {
         let registered_schema_definition = schema_catalog
-            .schema(REGISTERED_SCHEMA_KEY, "1")
+            .schema(REGISTERED_SCHEMA_KEY)
             .ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
@@ -322,7 +299,6 @@ pub(crate) fn remember_pending_registered_schema(
         validate_lix_schema(registered_schema_definition, &snapshot)?;
     }
     let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
-    reject_unsupported_registered_schema_version(&key)?;
     if is_seed_schema_key(&key.schema_key) {
         return Err(LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
@@ -351,7 +327,6 @@ mod tests {
         let row = TransactionWriteRow {
             entity_id: None,
             schema_key: "normalization_schema".to_string(),
-            schema_version: "1".to_string(),
             snapshot: Some(snapshot_json(
                 r#"{"id":"entity-from-snapshot","value":"hello"}"#,
             )),
@@ -375,7 +350,6 @@ mod tests {
         let row = TransactionWriteRow {
             entity_id: None,
             schema_key: "normalization_schema".to_string(),
-            schema_version: "1".to_string(),
             snapshot: Some(snapshot_json(r#"{}"#)),
             ..base_stage_row()
         };
@@ -400,7 +374,6 @@ mod tests {
         let row = TransactionWriteRow {
             entity_id: None,
             schema_key: "cel_field_default_schema".to_string(),
-            schema_version: "1".to_string(),
             snapshot: Some(snapshot_json(r#"{"id":"entity-1","name":"Sample"}"#)),
             ..base_stage_row()
         };
@@ -418,7 +391,6 @@ mod tests {
         let row = TransactionWriteRow {
             entity_id: None,
             schema_key: "overridden_default_schema".to_string(),
-            schema_version: "1".to_string(),
             snapshot: Some(snapshot_json(r#"{"id":"entity-1"}"#)),
             ..base_stage_row()
         };
@@ -436,7 +408,6 @@ mod tests {
         let row = TransactionWriteRow {
             entity_id: None,
             schema_key: "nullable_default_schema".to_string(),
-            schema_version: "1".to_string(),
             snapshot: Some(snapshot_json(r#"{"id":"entity-1","status":null}"#)),
             ..base_stage_row()
         };
@@ -454,7 +425,6 @@ mod tests {
         let row = TransactionWriteRow {
             entity_id: None,
             schema_key: "timestamp_default_schema".to_string(),
-            schema_version: "1".to_string(),
             snapshot: Some(snapshot_json(r#"{"id":"entity-1"}"#)),
             ..base_stage_row()
         };
@@ -472,7 +442,6 @@ mod tests {
         let row = TransactionWriteRow {
             entity_id: None,
             schema_key: "unknown_cel_default_schema".to_string(),
-            schema_version: "1".to_string(),
             snapshot: Some(snapshot_json(r#"{"id":"entity-1"}"#)),
             ..base_stage_row()
         };
@@ -490,7 +459,6 @@ mod tests {
         let row = TransactionWriteRow {
             entity_id: Some(crate::entity_identity::EntityIdentity::single("wrong-id")),
             schema_key: "normalization_schema".to_string(),
-            schema_version: "1".to_string(),
             snapshot: Some(snapshot_json(r#"{"id":"right-id","value":"hello"}"#)),
             ..base_stage_row()
         };
@@ -509,7 +477,6 @@ mod tests {
         let row = TransactionWriteRow {
             entity_id: None,
             schema_key: "composite_key_schema".to_string(),
-            schema_version: "1".to_string(),
             snapshot: Some(snapshot_json(r#"{"namespace":"a~b","key":"1"}"#)),
             ..base_stage_row()
         };
@@ -530,7 +497,6 @@ mod tests {
         let row = TransactionWriteRow {
             entity_id: None,
             schema_key: "composite_key_schema".to_string(),
-            schema_version: "1".to_string(),
             snapshot: Some(snapshot_json(r#"{"namespace":"a~b","key":1}"#)),
             ..base_stage_row()
         };
@@ -559,7 +525,6 @@ mod tests {
         let row = TransactionWriteRow {
             entity_id: Some(derived.clone()),
             schema_key: "composite_key_schema".to_string(),
-            schema_version: "1".to_string(),
             snapshot: Some(transaction_json(snapshot.clone())),
             ..base_stage_row()
         };
@@ -578,7 +543,6 @@ mod tests {
         let registered = TransactionWriteRow {
             entity_id: None,
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
-            schema_version: "1".to_string(),
             snapshot: Some(transaction_json(json!({
                 "value": dynamic_schema_definition(),
             }))),
@@ -591,7 +555,6 @@ mod tests {
         let dynamic = TransactionWriteRow {
             entity_id: None,
             schema_key: "dynamic_schema".to_string(),
-            schema_version: "1".to_string(),
             snapshot: Some(snapshot_json(r#"{"id":"dynamic-1"}"#)),
             ..base_stage_row()
         };
@@ -773,7 +736,6 @@ mod tests {
             snapshot: Some(snapshot_json(r#"{"id":"entity-1","value":"hello"}"#)),
             metadata: None,
             origin: None,
-            schema_version: "1".to_string(),
             created_at: None,
             updated_at: None,
             global: true,
@@ -787,7 +749,6 @@ mod tests {
     fn schema_with_default_id() -> JsonValue {
         json!({
             "x-lix-key": "normalization_schema",
-            "x-lix-version": "1",
             "x-lix-primary-key": ["/id"],
             "type": "object",
             "properties": {
@@ -802,7 +763,6 @@ mod tests {
     fn schema_with_cel_field_default() -> JsonValue {
         json!({
             "x-lix-key": "cel_field_default_schema",
-            "x-lix-version": "1",
             "x-lix-primary-key": ["/id"],
             "type": "object",
             "properties": {
@@ -818,7 +778,6 @@ mod tests {
     fn schema_with_overridden_default() -> JsonValue {
         json!({
             "x-lix-key": "overridden_default_schema",
-            "x-lix-version": "1",
             "x-lix-primary-key": ["/id"],
             "type": "object",
             "properties": {
@@ -837,7 +796,6 @@ mod tests {
     fn schema_with_nullable_default() -> JsonValue {
         json!({
             "x-lix-key": "nullable_default_schema",
-            "x-lix-version": "1",
             "x-lix-primary-key": ["/id"],
             "type": "object",
             "properties": {
@@ -855,7 +813,6 @@ mod tests {
     fn schema_with_timestamp_default() -> JsonValue {
         json!({
             "x-lix-key": "timestamp_default_schema",
-            "x-lix-version": "1",
             "x-lix-primary-key": ["/id"],
             "type": "object",
             "properties": {
@@ -870,7 +827,6 @@ mod tests {
     fn schema_with_unknown_cel_default() -> JsonValue {
         json!({
             "x-lix-key": "unknown_cel_default_schema",
-            "x-lix-version": "1",
             "x-lix-primary-key": ["/id"],
             "type": "object",
             "properties": {
@@ -885,7 +841,6 @@ mod tests {
     fn composite_key_schema() -> JsonValue {
         json!({
             "x-lix-key": "composite_key_schema",
-            "x-lix-version": "1",
             "x-lix-primary-key": ["/namespace", "/key"],
             "type": "object",
             "properties": {
@@ -900,7 +855,6 @@ mod tests {
     fn dynamic_schema_definition() -> JsonValue {
         json!({
             "x-lix-key": "dynamic_schema",
-            "x-lix-version": "1",
             "x-lix-primary-key": ["/id"],
             "type": "object",
             "properties": {

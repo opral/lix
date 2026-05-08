@@ -1,19 +1,30 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Lix Schema Definition",
-  "description": "A Lix schema is a JSON Schema draft 2020-12 document augmented with `x-lix-*` extensions that identify, version, and constrain an entity type. Every schema must declare `x-lix-key` (snake_case identifier, preferably prefixed with a plugin or domain namespace such as `library_book` to avoid collisions), `x-lix-version` (string-as-integer, e.g. `\"1\"`), and `additionalProperties: false`; add `x-lix-primary-key` (array of JSON Pointers to string properties) to make the schema writable — Lix will auto-materialize a public virtual table named after `x-lix-key` with an `INSERT/UPDATE/DELETE` surface. See the `examples` field for a minimal working schema.",
+  "description": "A Lix schema is a JSON Schema draft 2020-12 document augmented with `x-lix-*` extensions that identify and constrain an entity type. Every schema must declare `x-lix-key` (snake_case identifier, preferably prefixed with a plugin or domain namespace such as `library_book` to avoid collisions) and `additionalProperties: false`; add `x-lix-primary-key` (array of JSON Pointers to string properties) to make the schema writable. Lix will auto-materialize a public virtual table named after `x-lix-key` with an `INSERT/UPDATE/DELETE` surface. See the `examples` field for a minimal working schema.",
   "examples": [
     {
       "x-lix-key": "library_book",
-      "x-lix-version": "1",
       "type": "object",
-      "x-lix-primary-key": ["/id"],
+      "x-lix-primary-key": [
+        "/id"
+      ],
       "properties": {
-        "id": { "type": "string", "x-lix-default": "lix_uuid_v7()" },
-        "title": { "type": "string" },
-        "author": { "type": "string" }
+        "id": {
+          "type": "string",
+          "x-lix-default": "lix_uuid_v7()"
+        },
+        "title": {
+          "type": "string"
+        },
+        "author": {
+          "type": "string"
+        }
       },
-      "required": ["id", "title"],
+      "required": [
+        "id",
+        "title"
+      ],
       "additionalProperties": false
     }
   ],
@@ -79,7 +90,6 @@
                 "type": "object",
                 "required": [
                   "schemaKey",
-                  "schemaVersion",
                   "properties"
                 ],
                 "additionalProperties": false,
@@ -87,10 +97,6 @@
                   "schemaKey": {
                     "type": "string",
                     "description": "The x-lix-key of the referenced schema"
-                  },
-                  "schemaVersion": {
-                    "type": "string",
-                    "description": "The x-lix-version of the referenced schema"
                   },
                   "properties": {
                     "type": "array",
@@ -110,11 +116,11 @@
         },
         "x-lix-state-foreign-keys": {
           "type": "array",
-          "description": "Foreign keys from local fields to arbitrary live state rows. Each entry is exactly four required local JSON Pointers ordered as `[entity_id, schema_key, schema_version, file_id]`: index 0 points to the local entity_id JSON array, index 1 points to the local schema_key string, index 2 points to the local schema_version string, and index 3 points to the local file_id string-or-null. Use explicit null for global file_id targets; omitted fields are invalid. The referenced state row is resolved in the same version.",
+          "description": "Foreign keys from local fields to arbitrary live state rows. Each entry is exactly three required local JSON Pointers ordered as `[entity_id, schema_key, file_id]`: index 0 points to the local entity_id JSON array, index 1 points to the local schema_key string, and index 2 points to the local file_id string-or-null. Use explicit null for global file_id targets; omitted fields are invalid. The referenced state row is resolved in the same version.",
           "items": {
             "type": "array",
-            "minItems": 4,
-            "maxItems": 4,
+            "minItems": 3,
+            "maxItems": 3,
             "uniqueItems": true,
             "prefixItems": [
               {
@@ -130,12 +136,7 @@
               {
                 "type": "string",
                 "format": "json-pointer",
-                "description": "[2] Local JSON Pointer for the target schema_version. The value must be a string."
-              },
-              {
-                "type": "string",
-                "format": "json-pointer",
-                "description": "[3] Local JSON Pointer for the target file_id. The value must be a string or null."
+                "description": "[2] Local JSON Pointer for the target file_id. The value must be a string or null."
               }
             ],
             "items": false
@@ -148,14 +149,6 @@
           "examples": [
             "library_book",
             "csv_plugin_cell"
-          ]
-        },
-        "x-lix-version": {
-          "type": "string",
-          "pattern": "^[1-9]\\d*$",
-          "description": "Schema version identifier. Deliberately constrained to a monotonic integer (as a string) without leading zeros to keep translation rules open while avoiding future breaking changes.",
-          "examples": [
-            "1"
           ]
         },
         "properties": {
@@ -187,7 +180,6 @@
       },
       "required": [
         "x-lix-key",
-        "x-lix-version",
         "additionalProperties"
       ]
     }

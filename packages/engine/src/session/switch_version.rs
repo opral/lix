@@ -10,7 +10,6 @@ use crate::GLOBAL_VERSION_ID;
 use super::context::{SessionContext, SessionMode, WORKSPACE_VERSION_KEY};
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
-const KEY_VALUE_SCHEMA_VERSION: &str = "1";
 
 /// Options for switching a session to another version.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +99,6 @@ fn workspace_version_stage_row(version_id: &str) -> Result<TransactionWriteRow, 
         }))),
         metadata: None,
         origin: None,
-        schema_version: KEY_VALUE_SCHEMA_VERSION.to_string(),
         created_at: None,
         updated_at: None,
         global: true,

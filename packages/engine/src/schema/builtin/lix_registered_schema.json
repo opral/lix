@@ -1,9 +1,7 @@
 {
   "x-lix-key": "lix_registered_schema",
-  "x-lix-version": "1",
   "x-lix-primary-key": [
-    "/value/x-lix-key",
-    "/value/x-lix-version"
+    "/value/x-lix-key"
   ],
   "type": "object",
   "properties": {
@@ -12,14 +10,10 @@
       "properties": {
         "x-lix-key": {
           "type": "string"
-        },
-        "x-lix-version": {
-          "type": "string"
         }
       },
       "required": [
-        "x-lix-key",
-        "x-lix-version"
+        "x-lix-key"
       ],
       "additionalProperties": true
     }

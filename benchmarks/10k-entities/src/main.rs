@@ -22,7 +22,6 @@ const DIRECT_ENTITY_WRITE_CHUNK_SIZE: usize = 250;
 
 const PLUGIN_KEY: &str = "json";
 const PLUGIN_SCHEMA_KEY: &str = "json_pointer";
-const PLUGIN_SCHEMA_VERSION: &str = "1";
 const PLUGIN_ARCHIVE_MANIFEST_JSON: &str = r#"{
   "key": "json",
   "runtime": "wasm-component-v1",
@@ -168,7 +167,6 @@ struct SharedSetupReport {
     expected_state_rows_after_commit: u64,
     plugin_key: &'static str,
     schema_key: &'static str,
-    schema_version: &'static str,
     plugin_wasm_path: String,
     sqlite_mode: &'static str,
 }
@@ -327,7 +325,6 @@ async fn run(args: Args) -> BenchResult<()> {
             expected_state_rows_after_commit,
             plugin_key: PLUGIN_KEY,
             schema_key: PLUGIN_SCHEMA_KEY,
-            schema_version: PLUGIN_SCHEMA_VERSION,
             plugin_wasm_path: plugin_wasm_path.display().to_string(),
             sqlite_mode: "fresh file-backed SQLite database per run",
         },
@@ -753,14 +750,12 @@ fn build_direct_entity_write_sql_batches(
          WHERE entity_id = lix_json('{}') \
            AND file_id = '{}' \
            AND schema_key = '{}' \
-           AND plugin_key = '{}' \
-           AND schema_version = '{}'",
+           AND plugin_key = '{}'",
         escape_sql_string(&root_snapshot_content),
         escape_sql_string(&root_entity_id_json),
         escape_sql_string(file_id),
         PLUGIN_SCHEMA_KEY,
         PLUGIN_KEY,
-        PLUGIN_SCHEMA_VERSION,
     )];
 
     let entries = object
@@ -773,12 +768,11 @@ fn build_direct_entity_write_sql_batches(
             });
             let snapshot_content = serde_json::to_string(&snapshot_content).map_err(serde_err)?;
             Ok(format!(
-                "('{}', '{}', '{}', '{}', '{}', '{}')",
+                "('{}', '{}', '{}', '{}', '{}')",
                 escape_sql_string(&entity_id),
                 escape_sql_string(file_id),
                 PLUGIN_SCHEMA_KEY,
                 PLUGIN_KEY,
-                PLUGIN_SCHEMA_VERSION,
                 escape_sql_string(&snapshot_content),
             ))
         })
@@ -786,7 +780,7 @@ fn build_direct_entity_write_sql_batches(
 
     for chunk in entries.chunks(chunk_size) {
         statements.push(format!(
-            "INSERT INTO lix_state (entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content) VALUES {}",
+            "INSERT INTO lix_state (entity_id, file_id, schema_key, plugin_key, snapshot_content) VALUES {}",
             chunk.join(", ")
         ));
     }

@@ -124,7 +124,6 @@ pub(crate) fn tracked_state_row_from_materialized(
                 prepare_json_ref(json_writer, &serialized)
             })
             .transpose()?,
-        schema_version: row.schema_version.clone(),
         created_at: row.created_at.clone(),
         updated_at: row.updated_at.clone(),
         change_id: row.change_id.clone(),
@@ -156,7 +155,6 @@ pub(crate) fn untracked_state_row_from_materialized(
                 prepare_json_ref(json_writer, &serialized)
             })
             .transpose()?,
-        schema_version: row.schema_version.clone(),
         created_at: row.created_at.clone(),
         updated_at: row.updated_at.clone(),
         global: row.global,
@@ -175,7 +173,6 @@ pub(crate) fn canonical_change_from_materialized(
         id: change.id.clone(),
         entity_id: change.entity_id.clone(),
         schema_key: change.schema_key.clone(),
-        schema_version: change.schema_version.clone(),
         file_id: change.file_id.clone(),
         snapshot_ref: change
             .snapshot_content

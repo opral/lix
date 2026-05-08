@@ -150,13 +150,6 @@ impl<'a> PreparedValidationRow<'a> {
         }
     }
 
-    pub(crate) fn schema_version(&self) -> &str {
-        match self {
-            Self::State(row) => &row.schema_version,
-            Self::Adopted(row) => &row.schema_version,
-        }
-    }
-
     pub(crate) fn untracked(&self) -> bool {
         match self {
             Self::State(row) => row.untracked,
@@ -183,7 +176,6 @@ impl<'a> PreparedValidationRow<'a> {
         DomainRowIdentity::in_domain(
             self.domain(),
             self.schema_key().to_string(),
-            self.schema_version().to_string(),
             self.entity_id().clone(),
         )
     }
@@ -784,7 +776,6 @@ pub(crate) enum StagedExactRow {
 pub(crate) struct PreparedStateRowIdentity {
     untracked: bool,
     schema_key: String,
-    schema_version: String,
     entity_id: crate::entity_identity::EntityIdentity,
     file_id: Option<String>,
     version_id: String,
@@ -795,7 +786,6 @@ impl PreparedStateRowIdentity {
         Self {
             untracked: row.untracked,
             schema_key: row.schema_key.clone(),
-            schema_version: row.schema_version.clone(),
             entity_id: row.entity_id.clone(),
             file_id: row.file_id.clone(),
             version_id: row.version_id.clone(),
@@ -813,7 +803,6 @@ impl PreparedStateRowIdentity {
         Some(Self {
             untracked,
             schema_key: request.schema_key.clone(),
-            schema_version: "1".to_string(),
             entity_id: request.entity_id.clone(),
             file_id,
             version_id: request.version_id.clone(),
@@ -822,10 +811,6 @@ impl PreparedStateRowIdentity {
 
     pub(crate) fn schema_key(&self) -> &str {
         &self.schema_key
-    }
-
-    pub(crate) fn schema_version(&self) -> &str {
-        &self.schema_version
     }
 
     pub(crate) fn entity_id(&self) -> &crate::entity_identity::EntityIdentity {
@@ -852,7 +837,6 @@ impl From<&PreparedAdoptedStateRow> for PreparedStateRowIdentity {
         Self {
             untracked: false,
             schema_key: row.schema_key.clone(),
-            schema_version: row.schema_version.clone(),
             entity_id: row.entity_id.clone(),
             file_id: row.file_id.clone(),
             version_id: row.version_id.clone(),
@@ -865,7 +849,6 @@ impl From<&MaterializedLiveStateRow> for PreparedStateRowIdentity {
         Self {
             untracked: row.untracked,
             schema_key: row.schema_key.clone(),
-            schema_version: row.schema_version.clone(),
             entity_id: row.entity_id.clone(),
             file_id: row.file_id.clone(),
             version_id: row.version_id.clone(),
@@ -917,9 +900,8 @@ fn duplicate_staged_present_row_error(
     let message = logical_primary_key_violation_message(row.origin.as_ref())
         .unwrap_or_else(|| {
             format!(
-                "primary-key constraint violation on schema '{}' version '{}': duplicate staged rows for entity_id '{}' in version '{}'",
+                "primary-key constraint violation on schema '{}': duplicate staged rows for entity_id '{}' in version '{}'",
                 row.schema_key,
-                row.schema_version,
                 previous
                     .entity_id
                     .as_json_array_text()
@@ -932,7 +914,6 @@ fn duplicate_staged_present_row_error(
 
 pub(crate) fn duplicate_insert_identity_message(
     schema_key: &str,
-    schema_version: &str,
     entity_id: &crate::entity_identity::EntityIdentity,
     version_id: Option<&str>,
     origin: Option<&TransactionWriteOrigin>,
@@ -945,10 +926,10 @@ pub(crate) fn duplicate_insert_identity_message(
         .unwrap_or_else(|_| "<invalid entity_id>".to_string());
     match version_id {
         Some(version_id) => format!(
-            "primary-key constraint violation on schema '{schema_key}' version '{schema_version}': INSERT would duplicate entity_id '{entity_id}' in version '{version_id}'"
+            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate entity_id '{entity_id}' in version '{version_id}'"
         ),
         None => format!(
-            "primary-key constraint violation on schema '{schema_key}' version '{schema_version}': INSERT would duplicate entity_id '{entity_id}'"
+            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate entity_id '{entity_id}'"
         ),
     }
 }
@@ -956,7 +937,6 @@ pub(crate) fn duplicate_insert_identity_message(
 fn duplicate_insert_identity_error(row: &PreparedStateRow) -> LixError {
     let message = duplicate_insert_identity_message(
         &row.schema_key,
-        &row.schema_version,
         &row.entity_id,
         Some(&row.version_id),
         row.origin.as_ref(),
@@ -1574,9 +1554,7 @@ mod tests {
         staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
-                rows: vec![
-                    state_row("shared-entity", "other-schema-version").with_schema_version("2")
-                ],
+                rows: vec![state_row("shared-entity", "base")],
             })
             .expect("initial same-identity row should stage");
         staged_writes
@@ -1608,7 +1586,7 @@ mod tests {
             })
             .expect("overlay scan should succeed");
 
-        assert_eq!(rows.len(), 6);
+        assert_eq!(rows.len(), 5);
         assert_eq!(
             rows.iter()
                 .filter(|row| row.entity_id
@@ -1617,7 +1595,7 @@ mod tests {
                     && row.schema_key == "lix_key_value"
                     && row.file_id.is_none())
                 .count(),
-            3
+            2
         );
         assert!(rows.iter().any(|row| {
             row.snapshot_content.as_deref()
@@ -1715,7 +1693,6 @@ mod tests {
             snapshot: Some(snapshot),
             metadata: None,
             origin: None,
-            schema_version: "1".to_string(),
             created_at: "test-created-at".to_string(),
             updated_at: "test-updated-at".to_string(),
             global: true,
@@ -1757,7 +1734,6 @@ mod tests {
 
     trait StateRowTestExt {
         fn with_schema(self, schema_key: &str) -> Self;
-        fn with_schema_version(self, schema_version: &str) -> Self;
         fn with_file_id(self, file_id: &str) -> Self;
         fn with_tracked(self) -> Self;
         fn with_version(self, version_id: &str) -> Self;
@@ -1767,11 +1743,6 @@ mod tests {
     impl StateRowTestExt for PreparedStateRow {
         fn with_schema(mut self, schema_key: &str) -> Self {
             self.schema_key = schema_key.to_string();
-            self
-        }
-
-        fn with_schema_version(mut self, schema_version: &str) -> Self {
-            self.schema_version = schema_version.to_string();
             self
         }
 

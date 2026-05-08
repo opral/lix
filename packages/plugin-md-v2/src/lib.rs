@@ -13,7 +13,6 @@ pub mod schemas;
 pub const ROOT_ENTITY_ID: &str = "root";
 pub const DOCUMENT_SCHEMA_KEY: &str = schemas::DOCUMENT_SCHEMA_KEY;
 pub const BLOCK_SCHEMA_KEY: &str = schemas::BLOCK_SCHEMA_KEY;
-pub const SCHEMA_VERSION: &str = schemas::ENTITY_SCHEMA_VERSION;
 
 pub use crate::exports::lix::plugin::api::{
     ActiveStateRow as PluginActiveStateRow, DetectStateContext as PluginDetectStateContext,
@@ -78,7 +77,6 @@ fn project_state_context_from_before(
                 .map(|row| PluginActiveStateRow {
                     entity_id: row.entity_id,
                     schema_key: Some(row.schema_key),
-                    schema_version: Some(row.schema_version),
                     snapshot_content: row.snapshot_content,
                     file_id: None,
                     plugin_key: None,

@@ -1,7 +1,7 @@
 mod common;
 
 use common::{file_from_json, parse_snapshot_value_from_change};
-use plugin_json_v2::{detect_changes, SCHEMA_KEY, SCHEMA_VERSION};
+use plugin_json_v2::{detect_changes, SCHEMA_KEY};
 use serde_json::Value;
 
 #[test]
@@ -28,7 +28,6 @@ fn detects_root_insert() {
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].entity_id, "/City");
     assert_eq!(changes[0].schema_key, SCHEMA_KEY);
-    assert_eq!(changes[0].schema_version, SCHEMA_VERSION);
     assert_eq!(
         parse_snapshot_value_from_change(&changes[0]),
         Value::String("New York".to_string())
