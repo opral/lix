@@ -32,7 +32,7 @@ use crate::transaction::staging::{
 #[cfg(test)]
 use crate::transaction::types::PreparedStateRow;
 use crate::version::{VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_REF_SCHEMA_KEY};
-use crate::{LixError, NullableKeyFilter};
+use crate::LixError;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -240,26 +240,22 @@ async fn validate_registered_schema_identity_is_canonical(
         return Ok(());
     }
 
-    let committed_rows = scan_committed_registered_schema_identities(
-        input.live_state,
-        pending_schema_rows
-            .iter()
-            .map(|row| row.entity_id().clone())
-            .collect(),
-    )
-    .await?;
-
-    for row in committed_rows {
+    for pending_row in pending_schema_rows {
+        let Some(row) = load_committed_constraint_row(
+            input.live_state,
+            &pending_row.domain().with_exact_file_scope(None),
+            REGISTERED_SCHEMA_KEY,
+            pending_row.entity_id().clone(),
+            false,
+        )
+        .await?
+        else {
+            continue;
+        };
         let Some(snapshot_content) = row.snapshot_content.as_deref() else {
             continue;
         };
         let snapshot = parse_registered_schema_snapshot(snapshot_content)?;
-        let Some(pending_row) = pending_schema_rows
-            .iter()
-            .find(|pending_row| pending_row.entity_id() == &row.entity_id)
-        else {
-            continue;
-        };
         let pending_snapshot = pending_row
             .snapshot_json()
             .expect("pending registered schema row has snapshot_content");
@@ -280,38 +276,6 @@ async fn validate_registered_schema_identity_is_canonical(
     }
 
     Ok(())
-}
-
-async fn scan_committed_registered_schema_identities(
-    live_state: &dyn LiveStateReader,
-    entity_ids: Vec<EntityIdentity>,
-) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-    let mut rows = Vec::new();
-    for untracked in [false, true] {
-        rows.extend(
-            live_state
-                .scan_rows(&LiveStateScanRequest {
-                    filter: LiveStateFilter {
-                        schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
-                        entity_ids: entity_ids.clone(),
-                        file_ids: vec![NullableKeyFilter::Null],
-                        untracked: Some(untracked),
-                        include_tombstones: false,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                })
-                .await?,
-        );
-    }
-    Ok(rows
-        .into_iter()
-        .filter(|row| {
-            row.schema_key == REGISTERED_SCHEMA_KEY
-                && row.file_id.is_none()
-                && row.snapshot_content.is_some()
-        })
-        .collect())
 }
 
 fn parse_registered_schema_snapshot(snapshot_content: &str) -> Result<JsonValue, LixError> {
