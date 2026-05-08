@@ -1,6 +1,5 @@
 {
   "x-lix-key": "lix_version_ref",
-  "x-lix-version": "1",
   "description": "Version head pointer. Records which commit a version should currently resolve to in the local runtime. Intentionally not part of canonical commit membership: refs may be reset client-side after sync without introducing content conflicts. Each `lix_version_descriptor.id` has exactly one `lix_version_ref` row.",
   "x-lix-primary-key": [
     "/id"

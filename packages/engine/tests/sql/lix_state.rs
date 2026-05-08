@@ -17,9 +17,9 @@ simulation_test!(lix_state_latest_update_wins, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_state (\
-             entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+             entity_id, schema_key, file_id, snapshot_content, global, untracked\
              ) VALUES (\
-             lix_json('[\"state-latest\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-latest\",\"value\":\"old\"}'), '1', false, false\
+             lix_json('[\"state-latest\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-latest\",\"value\":\"old\"}'), false, false\
              )",
             &[],
         )
@@ -60,9 +60,9 @@ simulation_test!(lix_state_delete_hides_row, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_state (\
-             entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+             entity_id, schema_key, file_id, snapshot_content, global, untracked\
              ) VALUES (\
-             lix_json('[\"state-delete\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-delete\",\"value\":\"delete-me\"}'), '1', false, false\
+             lix_json('[\"state-delete\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-delete\",\"value\":\"delete-me\"}'), false, false\
              )",
             &[],
         )
@@ -105,9 +105,9 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES (\
-                 lix_json('[\"state-global-overlay\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-global-overlay\",\"value\":\"global\"}'), '1', true, false\
+                 lix_json('[\"state-global-overlay\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-global-overlay\",\"value\":\"global\"}'), true, false\
                  )",
                 &[],
             )
@@ -181,9 +181,9 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES (\
-                 lix_json('[\"state-global-tombstone-overlay\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-global-tombstone-overlay\",\"value\":\"global\"}'), '1', true, false\
+                 lix_json('[\"state-global-tombstone-overlay\"]'), 'lix_key_value', NULL, lix_json('{\"key\":\"state-global-tombstone-overlay\",\"value\":\"global\"}'), true, false\
                  )",
                 &[],
             )
@@ -192,9 +192,9 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES (\
-                 lix_json('[\"state-global-tombstone-overlay\"]'), 'lix_key_value', NULL, NULL, '1', false, false\
+                 lix_json('[\"state-global-tombstone-overlay\"]'), 'lix_key_value', NULL, NULL, false, false\
                  )",
                 &[],
             )

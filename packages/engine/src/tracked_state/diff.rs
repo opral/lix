@@ -138,9 +138,7 @@ fn tracked_row_payload_eq(
     left: &MaterializedTrackedStateRow,
     right: &MaterializedTrackedStateRow,
 ) -> bool {
-    left.snapshot_content == right.snapshot_content
-        && left.metadata == right.metadata
-        && left.schema_version == right.schema_version
+    left.snapshot_content == right.snapshot_content && left.metadata == right.metadata
 }
 
 impl TrackedStateDiffIdentity {
@@ -501,7 +499,6 @@ mod tests {
             file_id: file_id.map(str::to_string),
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
             metadata: None,
-            schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             change_id: change_id.to_string(),

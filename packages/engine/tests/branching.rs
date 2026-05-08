@@ -947,7 +947,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value) \
                  VALUES (\
-                 lix_json('{\"x-lix-key\":\"merge_task_item\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}')\
+                 lix_json('{\"x-lix-key\":\"merge_task_item\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"}},\"required\":[\"id\",\"title\"],\"additionalProperties\":false}')\
                  )",
                 &[],
             )

@@ -7,7 +7,7 @@ use crate::entity_identity::EntityIdentity;
 use crate::json_store::context::JsonStoreContext;
 use crate::json_store::types::{JsonProjectionPath, JsonRef, NormalizedJson};
 use crate::live_state::LiveStateContext;
-use crate::schema_registry::SchemaRegistry;
+use crate::schema_catalog::SchemaCatalogSource;
 use crate::session::SessionMode;
 use crate::storage::{
     KvGetGroup, KvGetRequest, KvScanRange, KvScanRequest, KvWriteBatch, StorageContext,
@@ -168,7 +168,7 @@ pub struct TransactionBenchFixture {
     binary_cas: Arc<BinaryCasContext>,
     changelog: Arc<ChangelogContext>,
     version_ctx: Arc<VersionContext>,
-    schema_registry: Arc<SchemaRegistry>,
+    schema_catalog_source: Arc<SchemaCatalogSource>,
     rows: Vec<TransactionWriteRow>,
 }
 
@@ -188,7 +188,6 @@ static JSON_STORE_UNIQUE_REFS: OnceLock<Mutex<HashSet<[u8; 32]>>> = OnceLock::ne
 const STORAGE_API_NAMESPACE: &str = "bench.storage_api";
 const STORAGE_API_ALT_NAMESPACE: &str = "bench.storage_api.alt";
 const TRANSACTION_BENCH_SCHEMA_KEY: &str = "bench_transaction_entity";
-const TRANSACTION_BENCH_SCHEMA_VERSION: &str = "1";
 
 pub fn reset_transaction_bench_counters() {
     TRANSACTION_ROWS_STAGED.store(0, Ordering::Relaxed);
@@ -406,7 +405,7 @@ pub async fn transaction_commit_prepared(
         Arc::clone(&fixture.binary_cas),
         Arc::clone(&fixture.changelog),
         Arc::clone(&fixture.version_ctx),
-        Arc::clone(&fixture.schema_registry),
+        Arc::clone(&fixture.schema_catalog_source),
     )
     .await?;
     let mut transaction = opened.transaction;
@@ -442,7 +441,7 @@ pub async fn transaction_open_empty_prepared(
         Arc::clone(&fixture.binary_cas),
         Arc::clone(&fixture.changelog),
         Arc::clone(&fixture.version_ctx),
-        Arc::clone(&fixture.schema_registry),
+        Arc::clone(&fixture.schema_catalog_source),
     )
     .await?;
     let elapsed = started_at.elapsed();
@@ -467,7 +466,7 @@ pub async fn transaction_stage_only_prepared(
         Arc::clone(&fixture.binary_cas),
         Arc::clone(&fixture.changelog),
         Arc::clone(&fixture.version_ctx),
-        Arc::clone(&fixture.schema_registry),
+        Arc::clone(&fixture.schema_catalog_source),
     )
     .await?;
     let mut transaction = opened.transaction;
@@ -502,7 +501,7 @@ pub async fn prepare_transaction_commit_only(
         Arc::clone(&fixture.binary_cas),
         Arc::clone(&fixture.changelog),
         Arc::clone(&fixture.version_ctx),
-        Arc::clone(&fixture.schema_registry),
+        Arc::clone(&fixture.schema_catalog_source),
     )
     .await?;
     let mut transaction = opened.transaction;
@@ -576,7 +575,7 @@ async fn prepare_transaction_fixture(
     ));
     let binary_cas = Arc::new(BinaryCasContext::new());
     let version_ctx = Arc::new(VersionContext::new(untracked_state));
-    let schema_registry = Arc::new(SchemaRegistry::new());
+    let schema_catalog_source = Arc::new(SchemaCatalogSource::new());
     seed_transaction_visible_schema_rows(storage.clone(), live_state.as_ref()).await?;
     Ok(TransactionBenchFixture {
         storage,
@@ -585,7 +584,7 @@ async fn prepare_transaction_fixture(
         binary_cas,
         changelog,
         version_ctx,
-        schema_registry,
+        schema_catalog_source,
         rows,
     })
 }
@@ -605,15 +604,11 @@ async fn seed_transaction_visible_schema_rows(
                 .expect("seed schema key should derive");
             let snapshot_content = serde_json::json!({ "value": schema }).to_string();
             Ok(crate::untracked_state::UntrackedStateRow {
-                entity_id: crate::schema::registered_schema_entity_id(
-                    &key.schema_key,
-                    &key.schema_version,
-                )
-                .expect("registered schema identity should derive"),
+                entity_id: crate::schema::registered_schema_entity_id(&key.schema_key)
+                    .expect("registered schema identity should derive"),
                 schema_key: "lix_registered_schema".to_string(),
                 file_id: None,
                 version_id: crate::GLOBAL_VERSION_ID.to_string(),
-                schema_version: "1".to_string(),
                 snapshot_ref: Some(prepare_json_ref(
                     &mut json_writer,
                     snapshot_content.as_bytes(),
@@ -638,7 +633,6 @@ async fn seed_transaction_visible_schema_rows(
 fn transaction_entity_schema_definition() -> serde_json::Value {
     serde_json::json!({
         "x-lix-key": TRANSACTION_BENCH_SCHEMA_KEY,
-        "x-lix-version": TRANSACTION_BENCH_SCHEMA_VERSION,
         "type": "object",
         "properties": {
             "value": {
@@ -691,7 +685,6 @@ fn transaction_entity_rows(config: TransactionEntityRows) -> Vec<TransactionWrit
                 )),
                 metadata: transaction_metadata(config.metadata_pattern, metadata_index),
                 origin: None,
-                schema_version: TRANSACTION_BENCH_SCHEMA_VERSION.to_string(),
                 created_at: None,
                 updated_at: None,
                 global: true,
@@ -707,7 +700,6 @@ fn transaction_entity_rows(config: TransactionEntityRows) -> Vec<TransactionWrit
 fn transaction_registered_schema_row() -> TransactionWriteRow {
     let schema = serde_json::json!({
         "x-lix-key": "bench_transaction_schema",
-        "x-lix-version": "1",
         "x-lix-primary-key": ["/id"],
         "type": "object",
         "properties": {
@@ -721,7 +713,7 @@ fn transaction_registered_schema_row() -> TransactionWriteRow {
         crate::schema::schema_key_from_definition(&schema).expect("seed schema key should derive");
     TransactionWriteRow {
         entity_id: Some(
-            crate::schema::registered_schema_entity_id(&key.schema_key, &key.schema_version)
+            crate::schema::registered_schema_entity_id(&key.schema_key)
                 .expect("registered schema identity should derive"),
         ),
         schema_key: "lix_registered_schema".to_string(),
@@ -731,7 +723,6 @@ fn transaction_registered_schema_row() -> TransactionWriteRow {
         )),
         metadata: None,
         origin: None,
-        schema_version: "1".to_string(),
         created_at: None,
         updated_at: None,
         global: true,
@@ -3657,7 +3648,6 @@ fn tracked_rows(config: StorageBenchConfig, commit_id: &str) -> Vec<Materialized
             file_id: Some("bench.json".to_string()),
             snapshot_content: Some(snapshot_content(index, config.state_payload_bytes)),
             metadata: None,
-            schema_version: "1".to_string(),
             created_at: timestamp(index),
             updated_at: timestamp(index),
             change_id: format!("tracked-change-{index}"),
@@ -3684,7 +3674,6 @@ fn tracked_rows_file_selective(
             ),
             snapshot_content: Some(snapshot_content(index, config.state_payload_bytes)),
             metadata: None,
-            schema_version: "1".to_string(),
             created_at: timestamp(index),
             updated_at: timestamp(index),
             change_id: format!("tracked-change-{index}"),
@@ -3701,7 +3690,6 @@ fn untracked_rows(config: StorageBenchConfig) -> Vec<MaterializedUntrackedStateR
             file_id: Some("bench.json".to_string()),
             snapshot_content: Some(snapshot_content(index, config.state_payload_bytes)),
             metadata: None,
-            schema_version: "1".to_string(),
             created_at: timestamp(index),
             updated_at: timestamp(index),
             global: false,
@@ -3727,7 +3715,6 @@ fn changelog_materialized_changes(config: StorageBenchConfig) -> Vec<Materialize
                 config.key_pattern,
             )),
             schema_key: "bench_changelog_entity".to_string(),
-            schema_version: "1".to_string(),
             file_id: Some("bench.json".to_string()),
             snapshot_content: Some(snapshot_content(index, config.state_payload_bytes)),
             metadata: None,
@@ -3756,7 +3743,6 @@ fn commit_graph_materialized_commit_change(
         id: format!("bench-commit-change-{commit_id}"),
         entity_id: EntityIdentity::single(commit_id.to_string()),
         schema_key: "lix_commit".to_string(),
-        schema_version: "1".to_string(),
         file_id: None,
         snapshot_content: Some(snapshot_content),
         metadata: None,
@@ -3778,7 +3764,6 @@ fn canonical_changelog_bench_change(change: MaterializedCanonicalChange) -> Cano
         id: change.id,
         entity_id: change.entity_id,
         schema_key: change.schema_key,
-        schema_version: change.schema_version,
         file_id: change.file_id,
         snapshot_ref,
         metadata_ref,
@@ -3989,7 +3974,6 @@ fn tracked_state_header_columns() -> Vec<String> {
     [
         "entity_id",
         "schema_key",
-        "schema_version",
         "file_id",
         "metadata",
         "created_at",
@@ -4006,7 +3990,6 @@ fn untracked_state_header_columns() -> Vec<String> {
     [
         "entity_id",
         "schema_key",
-        "schema_version",
         "file_id",
         "metadata",
         "created_at",

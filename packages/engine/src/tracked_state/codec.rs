@@ -174,7 +174,6 @@ pub(crate) fn encode_value(value: &TrackedStateValue) -> Vec<u8> {
     encode_value_ref(TrackedStateValueRef {
         snapshot_ref: value.snapshot_ref.as_ref(),
         metadata_ref: value.metadata_ref.as_ref(),
-        schema_version: &value.schema_version,
         created_at: &value.created_at,
         updated_at: &value.updated_at,
         change_id: &value.change_id,
@@ -188,7 +187,6 @@ pub(crate) fn encode_value_ref(value: TrackedStateValueRef<'_>) -> Vec<u8> {
     out.push(VALUE_VERSION);
     push_optional_json_ref(&mut out, value.snapshot_ref);
     push_optional_json_ref(&mut out, value.metadata_ref);
-    push_sized_bytes(&mut out, value.schema_version.as_bytes());
     push_sized_bytes(&mut out, value.created_at.as_bytes());
     push_sized_bytes(&mut out, value.updated_at.as_bytes());
     push_sized_bytes(&mut out, value.change_id.as_bytes());
@@ -201,7 +199,6 @@ pub(crate) fn encode_value_ref(value: TrackedStateValueRef<'_>) -> Vec<u8> {
 pub(crate) fn encoded_value_len(value: &TrackedStateValue) -> usize {
     1 + optional_json_ref_len(value.snapshot_ref.as_ref())
         + optional_json_ref_len(value.metadata_ref.as_ref())
-        + sized_bytes_len(value.schema_version.as_bytes())
         + sized_bytes_len(value.created_at.as_bytes())
         + sized_bytes_len(value.updated_at.as_bytes())
         + sized_bytes_len(value.change_id.as_bytes())
@@ -220,7 +217,6 @@ pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateValue, LixError> 
     }
     let snapshot_ref = read_optional_json_ref(bytes, &mut cursor, "snapshot_ref")?;
     let metadata_ref = read_optional_json_ref(bytes, &mut cursor, "metadata_ref")?;
-    let schema_version = read_sized_string(bytes, &mut cursor, "schema_version")?;
     let created_at = read_sized_string(bytes, &mut cursor, "created_at")?;
     let updated_at = read_sized_string(bytes, &mut cursor, "updated_at")?;
     let change_id = read_sized_string(bytes, &mut cursor, "change_id")?;
@@ -244,7 +240,6 @@ pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateValue, LixError> 
     Ok(TrackedStateValue {
         snapshot_ref,
         metadata_ref,
-        schema_version,
         created_at,
         updated_at,
         change_id,
@@ -692,7 +687,6 @@ mod tests {
         let value = TrackedStateValue {
             snapshot_ref: None,
             metadata_ref: Some(JsonRef::from_hash_bytes([1; 32])),
-            schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
             change_id: "change".to_string(),
@@ -709,7 +703,6 @@ mod tests {
         let value = TrackedStateValue {
             snapshot_ref: Some(JsonRef::from_hash_bytes([2; 32])),
             metadata_ref: None,
-            schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
             change_id: "change".to_string(),
@@ -727,7 +720,6 @@ mod tests {
             TrackedStateValue {
                 snapshot_ref: None,
                 metadata_ref: None,
-                schema_version: "1".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
                 change_id: "change".to_string(),
@@ -737,7 +729,6 @@ mod tests {
             TrackedStateValue {
                 snapshot_ref: Some(JsonRef::from_hash_bytes([3; 32])),
                 metadata_ref: Some(JsonRef::from_hash_bytes([4; 32])),
-                schema_version: "1".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
                 change_id: "change".to_string(),
@@ -747,7 +738,6 @@ mod tests {
             TrackedStateValue {
                 snapshot_ref: Some(JsonRef::from_hash_bytes([5; 32])),
                 metadata_ref: None,
-                schema_version: "1".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
                 change_id: "change".to_string(),

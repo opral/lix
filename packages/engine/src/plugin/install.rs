@@ -37,11 +37,8 @@ use crate::{LixError, Value};
 
 use crate::transaction::WriteCommand;
 const REGISTERED_SCHEMA_STORAGE_SCHEMA_KEY: &str = "lix_registered_schema";
-const REGISTERED_SCHEMA_STORAGE_SCHEMA_VERSION: &str = "1";
 const FILESYSTEM_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
-const FILESYSTEM_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
 const FILESYSTEM_BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
-const FILESYSTEM_BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 
 #[derive(Clone)]
 pub(crate) struct PluginInstallWriteContext {
@@ -170,7 +167,6 @@ fn prepare_registered_schema_write_statement_from_schemas(
         .map(|row| PublicChange {
             entity_id: row.entity_id.clone(),
             schema_key: REGISTERED_SCHEMA_STORAGE_SCHEMA_KEY.to_string(),
-            schema_version: Some(REGISTERED_SCHEMA_STORAGE_SCHEMA_VERSION.to_string()),
             file_id: None,
             plugin_key: None,
             snapshot_content: Some(row.snapshot.to_string()),
@@ -290,10 +286,6 @@ fn registered_schema_planned_row(
     values.insert("file_id".to_string(), Value::Null);
     values.insert("plugin_key".to_string(), Value::Null);
     values.insert(
-        "schema_version".to_string(),
-        Value::Text(REGISTERED_SCHEMA_STORAGE_SCHEMA_VERSION.to_string()),
-    );
-    values.insert(
         "snapshot_content".to_string(),
         Value::Json(row.snapshot.clone()),
     );
@@ -331,10 +323,6 @@ fn plugin_archive_file_descriptor_row(
     );
     values.insert("file_id".to_string(), Value::Null);
     values.insert("plugin_key".to_string(), Value::Null);
-    values.insert(
-        "schema_version".to_string(),
-        Value::Text(FILESYSTEM_DESCRIPTOR_SCHEMA_VERSION.to_string()),
-    );
     values.insert(
         "snapshot_content".to_string(),
         Value::Text(snapshot_content),
@@ -381,10 +369,6 @@ fn plugin_archive_binary_blob_ref_row(
     );
     values.insert("file_id".to_string(), Value::Text(archive_id.to_string()));
     values.insert("plugin_key".to_string(), Value::Null);
-    values.insert(
-        "schema_version".to_string(),
-        Value::Text(FILESYSTEM_BINARY_BLOB_REF_SCHEMA_VERSION.to_string()),
-    );
     values.insert(
         "snapshot_content".to_string(),
         Value::Text(snapshot_content),
@@ -506,7 +490,6 @@ fn planned_row_to_public_change(row: &PlannedStateRow) -> Result<PublicChange, L
     Ok(PublicChange {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
-        schema_version: planned_row_text_value(row, "schema_version"),
         file_id: planned_row_text_value(row, "file_id"),
         plugin_key: planned_row_text_value(row, "plugin_key"),
         snapshot_content: if row.tombstone {
@@ -569,7 +552,6 @@ fn summarize_change(change: &PublicChange) -> JsonValue {
     json!({
         "entity_id": change.entity_id,
         "schema_key": change.schema_key,
-        "schema_version": change.schema_version,
         "file_id": change.file_id,
         "plugin_key": change.plugin_key,
         "version_id": change.version_id,

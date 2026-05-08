@@ -156,11 +156,11 @@ simulation_test!(
             session
                 .execute(
                     "INSERT INTO lix_state (\
-                     entity_id, schema_key, file_id, snapshot_content, metadata, schema_version\
+                     entity_id, schema_key, file_id, snapshot_content, metadata\
                      ) VALUES (\
                      lix_json('[\"metadata-state-insert\"]'), 'lix_key_value', NULL, \
                      lix_json('{\"key\":\"metadata-state-insert\",\"value\":\"value\"}'), \
-                     '{bad', '1'\
+                     '{bad'\
                      )",
                     &[],
                 )
@@ -171,10 +171,10 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, schema_version\
+                 entity_id, schema_key, file_id, snapshot_content\
                  ) VALUES (\
                  lix_json('[\"metadata-state-update\"]'), 'lix_key_value', NULL, \
-                 lix_json('{\"key\":\"metadata-state-update\",\"value\":\"value\"}'), '1'\
+                 lix_json('{\"key\":\"metadata-state-update\",\"value\":\"value\"}')\
                  )",
                 &[],
             )

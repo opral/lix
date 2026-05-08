@@ -4,7 +4,7 @@ use common::{
     assert_invalid_input, block_change, decode_utf8, document_change, empty_file,
     file_from_markdown,
 };
-use plugin_md_v2::{apply_changes, BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY, SCHEMA_VERSION};
+use plugin_md_v2::{apply_changes, BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY};
 
 #[test]
 fn materializes_markdown_from_document_order_and_blocks() {
@@ -26,7 +26,6 @@ fn document_tombstone_results_in_empty_file() {
     let changes = vec![plugin_md_v2::PluginEntityChange {
         entity_id: plugin_md_v2::ROOT_ENTITY_ID.to_string(),
         schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
-        schema_version: SCHEMA_VERSION.to_string(),
         snapshot_content: None,
     }];
 
@@ -76,34 +75,10 @@ fn rejects_unknown_document_entity_id() {
     let changes = vec![plugin_md_v2::PluginEntityChange {
         entity_id: "other".to_string(),
         schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
-        schema_version: SCHEMA_VERSION.to_string(),
         snapshot_content: Some(
             serde_json::json!({
                 "id": "other",
                 "order": ["b1"],
-            })
-            .to_string(),
-        ),
-    }];
-
-    let error = apply_changes(file, changes).expect_err("apply_changes should fail");
-
-    assert_invalid_input(error);
-}
-
-#[test]
-fn rejects_schema_version_mismatch() {
-    let file = empty_file("f1", "/notes.md");
-    let changes = vec![plugin_md_v2::PluginEntityChange {
-        entity_id: "b1".to_string(),
-        schema_key: BLOCK_SCHEMA_KEY.to_string(),
-        schema_version: "2".to_string(),
-        snapshot_content: Some(
-            serde_json::json!({
-                "id": "b1",
-                "type": "paragraph",
-                "node": {},
-                "markdown": "x",
             })
             .to_string(),
         ),
@@ -120,7 +95,6 @@ fn rejects_invalid_block_snapshot_json() {
     let changes = vec![plugin_md_v2::PluginEntityChange {
         entity_id: "b1".to_string(),
         schema_key: BLOCK_SCHEMA_KEY.to_string(),
-        schema_version: SCHEMA_VERSION.to_string(),
         snapshot_content: Some("{".to_string()),
     }];
 
@@ -135,7 +109,6 @@ fn rejects_invalid_document_snapshot_json() {
     let changes = vec![plugin_md_v2::PluginEntityChange {
         entity_id: plugin_md_v2::ROOT_ENTITY_ID.to_string(),
         schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
-        schema_version: SCHEMA_VERSION.to_string(),
         snapshot_content: Some("{".to_string()),
     }];
 
@@ -150,7 +123,6 @@ fn rejects_block_snapshot_id_mismatch_with_entity_id() {
     let changes = vec![plugin_md_v2::PluginEntityChange {
         entity_id: "b1".to_string(),
         schema_key: BLOCK_SCHEMA_KEY.to_string(),
-        schema_version: SCHEMA_VERSION.to_string(),
         snapshot_content: Some(
             serde_json::json!({
                 "id": "b2",
@@ -173,7 +145,6 @@ fn rejects_document_snapshot_id_mismatch_with_root() {
     let changes = vec![plugin_md_v2::PluginEntityChange {
         entity_id: plugin_md_v2::ROOT_ENTITY_ID.to_string(),
         schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
-        schema_version: SCHEMA_VERSION.to_string(),
         snapshot_content: Some(
             serde_json::json!({
                 "id": "other",
@@ -195,13 +166,11 @@ fn ignores_unknown_schema_rows() {
         plugin_md_v2::PluginEntityChange {
             entity_id: "unknown1".to_string(),
             schema_key: "other_schema".to_string(),
-            schema_version: SCHEMA_VERSION.to_string(),
             snapshot_content: Some("{\"x\":1}".to_string()),
         },
         plugin_md_v2::PluginEntityChange {
             entity_id: "unknown2".to_string(),
             schema_key: "other_schema".to_string(),
-            schema_version: "999".to_string(),
             snapshot_content: None,
         },
     ];
@@ -275,7 +244,6 @@ fn tombstoned_block_is_not_rendered_even_if_order_mentions_it() {
         plugin_md_v2::PluginEntityChange {
             entity_id: "b2".to_string(),
             schema_key: BLOCK_SCHEMA_KEY.to_string(),
-            schema_version: SCHEMA_VERSION.to_string(),
             snapshot_content: None,
         },
     ];

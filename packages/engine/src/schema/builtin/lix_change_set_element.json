@@ -1,6 +1,5 @@
 {
   "x-lix-key": "lix_change_set_element",
-  "x-lix-version": "1",
   "description": "Derived relational index mapping a change_set to the canonical changes introduced by its commit relative to the commit's first parent. Rebuildable from `lix_commit.change_ids` plus the referenced `lix_change` rows; the unique constraint enforces at most one change per (entity, schema, file) tuple within a single change_set.",
   "x-lix-primary-key": [
     "/change_set_id",

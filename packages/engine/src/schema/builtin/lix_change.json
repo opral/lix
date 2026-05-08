@@ -1,6 +1,5 @@
 {
   "x-lix-key": "lix_change",
-  "x-lix-version": "1",
   "description": "Canonical immutable change fact. This surface represents the authoritative stream of journaled change facts. Commit lineage and non-commit scope are modeled separately around these facts.",
   "x-lix-primary-key": [
     "/id"
@@ -23,10 +22,6 @@
     "schema_key": {
       "type": "string",
       "description": "Schema identifier of the entity (e.g. `lix_file_descriptor`, `lix_commit`, or a user-registered key)."
-    },
-    "schema_version": {
-      "type": "string",
-      "description": "Schema version the snapshot_content was written against (matches `x-lix-version` on the schema at write time)."
     },
     "file_id": {
       "type": [
@@ -58,7 +53,6 @@
     "id",
     "entity_id",
     "schema_key",
-    "schema_version",
     "file_id",
     "created_at"
   ],

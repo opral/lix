@@ -388,7 +388,6 @@ fn canonical_change_matches_ref(
     change.id == expected.id
         && &change.entity_id == expected.entity_id
         && change.schema_key == expected.schema_key
-        && change.schema_version == expected.schema_version
         && change.file_id.as_deref() == expected.file_id
         && change.snapshot_ref.as_ref() == expected.snapshot_ref
         && change.metadata_ref.as_ref() == expected.metadata_ref
@@ -409,7 +408,6 @@ fn canonical_change_ref_from_state_row(
         id: change_id,
         entity_id: &row.entity_id,
         schema_key: &row.schema_key,
-        schema_version: &row.schema_version,
         file_id: row.file_id.as_deref(),
         snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
         metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
@@ -422,7 +420,6 @@ fn canonical_change_ref_from_adopted_row(row: &PreparedAdoptedStateRow) -> Canon
         id: &row.change_id,
         entity_id: &row.entity_id,
         schema_key: &row.schema_key,
-        schema_version: &row.schema_version,
         file_id: row.file_id.as_deref(),
         snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
         metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
@@ -435,7 +432,6 @@ fn canonical_change_ref_from_commit_row(row: &FinalizedCommitRow) -> CanonicalCh
         id: &row.change_id,
         entity_id: &row.entity_id,
         schema_key: COMMIT_SCHEMA_KEY,
-        schema_version: "1",
         file_id: None,
         snapshot_ref: Some(&row.snapshot.json_ref),
         metadata_ref: None,
@@ -450,7 +446,6 @@ fn untracked_row_ref_from_state_row(row: &PreparedStateRow) -> UntrackedStateRow
         file_id: row.file_id.as_deref(),
         snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
         metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
-        schema_version: &row.schema_version,
         created_at: &row.created_at,
         updated_at: &row.updated_at,
         global: row.global,
@@ -508,7 +503,6 @@ fn tracked_state_row_ref_from_state_row(
             value: TrackedStateValueRef {
                 snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
                 metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
-                schema_version: &row.schema_version,
                 created_at: &row.created_at,
                 updated_at: &row.updated_at,
                 change_id,
@@ -534,7 +528,6 @@ fn tracked_state_row_ref_from_adopted_row(
             value: TrackedStateValueRef {
                 snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
                 metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
-                schema_version: &row.schema_version,
                 created_at: &row.created_at,
                 updated_at: &row.updated_at,
                 change_id: &row.change_id,
@@ -693,8 +686,8 @@ mod tests {
     };
     use crate::changelog::ChangelogContext;
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
+    use crate::schema_catalog::SchemaPlanId;
     use crate::storage::StorageContext;
-    use crate::transaction::normalization::SchemaPlanId;
     use crate::transaction::types::PreparedRowFacts;
     use crate::untracked_state::{
         MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateRowRequest,
@@ -980,7 +973,6 @@ mod tests {
                     file_id: None,
                     snapshot_ref: Some(mode_snapshot_ref),
                     metadata_ref: None,
-                    schema_version: "1".to_string(),
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                     updated_at: "2026-01-01T00:00:00Z".to_string(),
                     global: true,
@@ -1415,7 +1407,6 @@ mod tests {
             ),
             metadata: None,
             origin: None,
-            schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             global: version_id == GLOBAL_VERSION_ID,

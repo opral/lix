@@ -72,7 +72,6 @@ fn tracked_row_from_entity(entity: CommitGraphEntity) -> TrackedStateRow {
         file_id: change.file_id,
         snapshot_ref: change.snapshot_ref,
         metadata_ref: change.metadata_ref,
-        schema_version: change.schema_version,
         created_at,
         updated_at,
         change_id: change.id,
@@ -113,7 +112,6 @@ mod tests {
         assert_eq!(row.file_id.as_deref(), Some("file-1"));
         assert!(row.snapshot_ref.is_some());
         assert!(row.metadata_ref.is_some());
-        assert_eq!(row.schema_version, "1");
         assert_eq!(row.change_id, "change-1");
         assert_eq!(row.commit_id, "commit-1");
     }
@@ -513,7 +511,6 @@ mod tests {
                 id: change_id.to_string(),
                 entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
                 schema_key: "test_schema".to_string(),
-                schema_version: "1".to_string(),
                 file_id: Some("file-1".to_string()),
                 snapshot_ref: snapshot_content.map(|content| {
                     crate::json_store::JsonRef::from_hash(blake3::hash(content.as_bytes()))
@@ -542,7 +539,6 @@ mod tests {
                 id: materialized.id,
                 entity_id: materialized.entity_id,
                 schema_key: materialized.schema_key,
-                schema_version: materialized.schema_version,
                 file_id: materialized.file_id,
                 snapshot_ref: None,
                 metadata_ref: None,
@@ -739,7 +735,6 @@ mod tests {
             id: change_id.to_string(),
             entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
             schema_key: schema_key.to_string(),
-            schema_version: "1".to_string(),
             file_id: None,
             snapshot_content: snapshot_content.map(str::to_string),
             metadata: None,
@@ -757,7 +752,6 @@ mod tests {
             id: change_id.to_string(),
             entity_id: crate::entity_identity::EntityIdentity::single(commit_id),
             schema_key: "lix_commit".to_string(),
-            schema_version: "1".to_string(),
             file_id: None,
             snapshot_content: Some(
                 serde_json::to_string(&json!({
@@ -780,7 +774,6 @@ mod tests {
             file_id: None,
             snapshot_content: Some("{}".to_string()),
             metadata: None,
-            schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             change_id: format!("change-{entity_id}"),

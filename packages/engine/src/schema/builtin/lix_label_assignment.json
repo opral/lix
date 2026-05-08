@@ -1,6 +1,5 @@
 {
   "x-lix-key": "lix_label_assignment",
-  "x-lix-version": "1",
   "description": "Mapping table that assigns a label to any live Lix row addressed by (target_entity_id, target_schema_key, target_file_id). The state foreign-key tuple is ordered as [0] target_entity_id, [1] target_schema_key, [2] target_file_id.",
   "x-lix-primary-key": [
     "/id"
