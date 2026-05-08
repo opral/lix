@@ -192,7 +192,6 @@ mod tests {
             id: id.to_string(),
             entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
             schema_key: "test_schema".to_string(),
-            schema_version: "1".to_string(),
             file_id: None,
             snapshot_content: Some("{\"value\":1}".to_string()),
             metadata: None,

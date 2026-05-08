@@ -39,7 +39,6 @@ struct WireDetectStateContext {
 struct WireActiveStateRow {
     entity_id: String,
     schema_key: Option<String>,
-    schema_version: Option<String>,
     snapshot_content: Option<CanonicalJson>,
     file_id: Option<String>,
     plugin_key: Option<String>,
@@ -54,7 +53,6 @@ struct WireActiveStateRow {
 struct WirePluginEntityChange {
     entity_id: String,
     schema_key: String,
-    schema_version: String,
     snapshot_content: Option<CanonicalJson>,
 }
 
@@ -68,7 +66,6 @@ struct WireApplyChangesRequest {
 struct WirePluginEntityChangeOutput {
     entity_id: String,
     schema_key: String,
-    schema_version: String,
     snapshot_content: Option<CanonicalJson>,
 }
 
@@ -320,7 +317,6 @@ fn wire_change_to_binding(
     plugin_bindings::exports::lix::plugin::api::EntityChange {
         entity_id: change.entity_id,
         schema_key: change.schema_key,
-        schema_version: change.schema_version,
         snapshot_content: change.snapshot_content.map(Into::into),
     }
 }
@@ -343,7 +339,6 @@ fn wire_active_state_row_to_binding(
     plugin_bindings::exports::lix::plugin::api::ActiveStateRow {
         entity_id: row.entity_id,
         schema_key: row.schema_key,
-        schema_version: row.schema_version,
         snapshot_content: row.snapshot_content.map(Into::into),
         file_id: row.file_id,
         plugin_key: row.plugin_key,
@@ -361,7 +356,6 @@ fn binding_change_to_wire(
     Ok(WirePluginEntityChangeOutput {
         entity_id: change.entity_id,
         schema_key: change.schema_key,
-        schema_version: change.schema_version,
         snapshot_content: change
             .snapshot_content
             .map(CanonicalJson::from_text)

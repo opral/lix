@@ -559,8 +559,8 @@ simulation_test!(
         let nfc_collision = session
 			.execute(
 				"INSERT INTO lix_state (\
-	             entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
-	             ) VALUES (lix_json('[\"dir-cafe-decomposed\"]'), 'lix_directory_descriptor', NULL, $1, '1', false, false)",
+	             entity_id, schema_key, file_id, snapshot_content, global, untracked\
+	             ) VALUES (lix_json('[\"dir-cafe-decomposed\"]'), 'lix_directory_descriptor', NULL, $1, false, false)",
 				&[Value::Json(json!({
 					"id": "dir-cafe-decomposed",
 					"parent_id": null,
@@ -575,8 +575,8 @@ simulation_test!(
         let zero_width = session
 			.execute(
 				"INSERT INTO lix_state (\
-	             entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
-	             ) VALUES (lix_json('[\"dir-zero-width\"]'), 'lix_directory_descriptor', NULL, $1, '1', false, false)",
+	             entity_id, schema_key, file_id, snapshot_content, global, untracked\
+	             ) VALUES (lix_json('[\"dir-zero-width\"]'), 'lix_directory_descriptor', NULL, $1, false, false)",
 				&[Value::Json(json!({
 					"id": "dir-zero-width",
 					"parent_id": null,
@@ -605,10 +605,10 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES \
-                 (lix_json('[\"dir-a\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-a\",\"parent_id\":\"dir-b\",\"name\":\"a\",\"hidden\":false}'), '1', false, false), \
-                 (lix_json('[\"dir-b\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-b\",\"parent_id\":\"dir-a\",\"name\":\"b\",\"hidden\":false}'), '1', false, false)",
+                 (lix_json('[\"dir-a\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-a\",\"parent_id\":\"dir-b\",\"name\":\"a\",\"hidden\":false}'), false, false), \
+                 (lix_json('[\"dir-b\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-b\",\"parent_id\":\"dir-a\",\"name\":\"b\",\"hidden\":false}'), false, false)",
                 &[],
             )
             .await
@@ -638,9 +638,9 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_state (\
-                 entity_id, schema_key, file_id, snapshot_content, schema_version, global, untracked\
+                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES \
-                 (lix_json('[\"dir-foo\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-foo\",\"parent_id\":null,\"name\":\"foo\",\"hidden\":false}'), '1', false, false)",
+                 (lix_json('[\"dir-foo\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-foo\",\"parent_id\":null,\"name\":\"foo\",\"hidden\":false}'), false, false)",
                 &[],
             )
             .await

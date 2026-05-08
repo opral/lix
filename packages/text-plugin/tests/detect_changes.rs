@@ -1,9 +1,7 @@
 mod common;
 
 use common::{file_from_bytes, parse_document_snapshot};
-use text_plugin::{
-    detect_changes, DOCUMENT_ENTITY_ID, DOCUMENT_SCHEMA_KEY, LINE_SCHEMA_KEY, SCHEMA_VERSION,
-};
+use text_plugin::{detect_changes, DOCUMENT_ENTITY_ID, DOCUMENT_SCHEMA_KEY, LINE_SCHEMA_KEY};
 
 #[test]
 fn creation_returns_full_projection() {
@@ -16,9 +14,6 @@ fn creation_returns_full_projection() {
         .filter(|change| change.schema_key == LINE_SCHEMA_KEY)
         .collect::<Vec<_>>();
     assert_eq!(line_changes.len(), 2);
-    assert!(line_changes
-        .iter()
-        .all(|change| change.schema_version == SCHEMA_VERSION));
     assert!(line_changes
         .iter()
         .all(|change| change.snapshot_content.is_some()));

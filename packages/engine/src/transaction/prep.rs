@@ -1,7 +1,7 @@
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::{JsonStoreWriter, NormalizedJson};
 use crate::untracked_state::UntrackedStateRow;
-use crate::version::{VERSION_REF_SCHEMA_KEY, VERSION_REF_SCHEMA_VERSION};
+use crate::version::VERSION_REF_SCHEMA_KEY;
 use crate::{LixError, GLOBAL_VERSION_ID};
 
 pub(crate) fn prepare_version_ref_row(
@@ -25,7 +25,6 @@ pub(crate) fn prepare_version_ref_row(
         file_id: None,
         snapshot_ref: Some(snapshot_ref),
         metadata_ref: None,
-        schema_version: VERSION_REF_SCHEMA_VERSION.to_string(),
         created_at: timestamp.to_string(),
         updated_at: timestamp.to_string(),
         global: true,

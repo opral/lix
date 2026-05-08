@@ -1,6 +1,5 @@
 {
   "x-lix-key": "lix_label",
-  "x-lix-version": "1",
   "description": "Catalog of labels that can be assigned to arbitrary live Lix rows through lix_label_assignment.",
   "x-lix-primary-key": [
     "/id"

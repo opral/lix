@@ -9,7 +9,6 @@ wit_bindgen::generate!({
 });
 
 pub const SCHEMA_KEY: &str = "json_pointer";
-pub const SCHEMA_VERSION: &str = "1";
 const MAX_ARRAY_INDEX: usize = 100_000;
 const JSON_POINTER_SCHEMA_JSON: &str = include_str!("../schema/json_pointer.json");
 
@@ -112,12 +111,6 @@ impl Guest for JsonPlugin {
         for change in changes {
             if change.schema_key != SCHEMA_KEY {
                 continue;
-            }
-            if change.schema_version != SCHEMA_VERSION {
-                return Err(PluginError::InvalidInput(format!(
-                    "unsupported schema_version '{}' for schema_key '{}', expected '{}'",
-                    change.schema_version, SCHEMA_KEY, SCHEMA_VERSION
-                )));
             }
 
             let pointer = change.entity_id;
@@ -521,7 +514,6 @@ fn push_deletion(changes: &mut Vec<EntityChange>, pointer: String) {
     changes.push(EntityChange {
         entity_id: pointer,
         schema_key: SCHEMA_KEY.to_string(),
-        schema_version: SCHEMA_VERSION.to_string(),
         snapshot_content: None,
     });
 }
@@ -544,7 +536,6 @@ fn push_upsert(
     changes.push(EntityChange {
         entity_id: pointer,
         schema_key: SCHEMA_KEY.to_string(),
-        schema_version: SCHEMA_VERSION.to_string(),
         snapshot_content: Some(snapshot_content),
     });
 

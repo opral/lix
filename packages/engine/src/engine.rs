@@ -7,7 +7,7 @@ use crate::entity_identity::EntityIdentity;
 use crate::init::InitReceipt;
 use crate::live_state::LiveStateContext;
 use crate::live_state::LiveStateRowRequest;
-use crate::schema_registry::SchemaRegistry;
+use crate::schema_catalog::SchemaCatalogSource;
 use crate::session::SessionContext;
 use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::TrackedStateContext;
@@ -24,7 +24,7 @@ pub struct Engine {
     version_ctx: Arc<VersionContext>,
     binary_cas: Arc<BinaryCasContext>,
     changelog: Arc<ChangelogContext>,
-    schema_registry: Arc<SchemaRegistry>,
+    schema_catalog_source: Arc<SchemaCatalogSource>,
 }
 
 impl Engine {
@@ -78,7 +78,7 @@ impl Engine {
             tracked_state,
             live_state,
             version_ctx,
-            schema_registry: Arc::new(SchemaRegistry::new()),
+            schema_catalog_source: Arc::new(SchemaCatalogSource::new()),
         })
     }
 
@@ -125,7 +125,7 @@ impl Engine {
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.changelog),
             Arc::clone(&self.version_ctx),
-            Arc::clone(&self.schema_registry),
+            Arc::clone(&self.schema_catalog_source),
         )
         .await
     }
@@ -138,7 +138,7 @@ impl Engine {
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.changelog),
             Arc::clone(&self.version_ctx),
-            Arc::clone(&self.schema_registry),
+            Arc::clone(&self.schema_catalog_source),
         )
         .await
     }

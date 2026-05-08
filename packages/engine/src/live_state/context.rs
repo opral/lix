@@ -93,26 +93,29 @@ where
         let mut store = self.store.lock().await;
         let scope = scan_scope(&mut *store, &self.untracked_state, request).await?;
         let mut tracked_rows = Vec::new();
-        for version_id in &scope.storage_version_ids {
-            let Some(commit_id) =
-                load_version_ref_commit_id(&mut *store, &self.untracked_state, version_id).await?
-            else {
-                continue;
-            };
-            let tracked_request = tracked_scan_request_from_live(request);
-            let source = tracked_source_from_version_id(version_id);
-            let store: &mut dyn StorageReader = &mut *store;
-            tracked_rows.extend(
-                self.tracked_state
-                    .reader(store)
-                    .scan_rows_at_commit(&commit_id, &tracked_request)
-                    .await?
-                    .into_iter()
-                    .map(|row| project_tracked_row(row, version_id, source)),
-            );
+        if request.filter.untracked != Some(true) {
+            for version_id in &scope.storage_version_ids {
+                let Some(commit_id) =
+                    load_version_ref_commit_id(&mut *store, &self.untracked_state, version_id)
+                        .await?
+                else {
+                    continue;
+                };
+                let tracked_request = tracked_scan_request_from_live(request);
+                let source = tracked_source_from_version_id(version_id);
+                let store: &mut dyn StorageReader = &mut *store;
+                tracked_rows.extend(
+                    self.tracked_state
+                        .reader(store)
+                        .scan_rows_at_commit(&commit_id, &tracked_request)
+                        .await?
+                        .into_iter()
+                        .map(|row| project_tracked_row(row, version_id, source)),
+                );
+            }
         }
 
-        let untracked_rows = {
+        let untracked_rows = if request.filter.untracked != Some(false) {
             let store: &mut dyn StorageReader = &mut *store;
             self.untracked_state
                 .reader(store)
@@ -121,10 +124,12 @@ where
                     &scope.storage_version_ids,
                 ))
                 .await?
-        }
-        .into_iter()
-        .map(MaterializedLiveStateRow::from)
-        .collect::<Vec<_>>();
+                .into_iter()
+                .map(MaterializedLiveStateRow::from)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
 
         let mut commit_rows = if scope.includes_commit_graph_projection {
             let store: &mut dyn StorageReader = &mut *store;
@@ -140,8 +145,11 @@ where
         };
         commit_rows.retain(|row| live_state_row_matches_filter(row, &request.filter));
 
-        let mut rows =
-            crate::live_state::overlay::overlay_untracked_rows(tracked_rows, untracked_rows);
+        let mut rows = if request.filter.untracked.is_some() {
+            tracked_rows.into_iter().chain(untracked_rows).collect()
+        } else {
+            crate::live_state::overlay::overlay_untracked_rows(tracked_rows, untracked_rows)
+        };
         rows.extend(commit_rows);
         rows = visibility::resolve_scan_rows(
             rows,
@@ -502,7 +510,6 @@ fn live_state_row_from_commit(commit: CommitGraphCommit) -> MaterializedLiveStat
         file_id: change.file_id,
         snapshot_content: change.snapshot_content,
         metadata: change.metadata,
-        schema_version: change.schema_version,
         created_at: change.created_at.clone(),
         updated_at: change.created_at,
         global: true,
@@ -538,7 +545,6 @@ fn project_tracked_row(
         file_id: row.file_id,
         snapshot_content: row.snapshot_content,
         metadata: row.metadata,
-        schema_version: row.schema_version,
         created_at: row.created_at,
         updated_at: row.updated_at,
         global: source == TrackedRowSource::Global,
@@ -550,6 +556,12 @@ fn project_tracked_row(
 }
 
 fn live_state_row_matches_filter(row: &MaterializedLiveStateRow, filter: &LiveStateFilter) -> bool {
+    if filter
+        .untracked
+        .is_some_and(|untracked| row.untracked != untracked)
+    {
+        return false;
+    }
     if !filter.schema_keys.is_empty() && !filter.schema_keys.contains(&row.schema_key) {
         return false;
     }
@@ -1976,7 +1988,6 @@ mod tests {
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
             metadata: None,
-            schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             global: version_id == "global",
@@ -2009,7 +2020,6 @@ mod tests {
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
             metadata: None,
-            schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             global: version_id == "global",
@@ -2030,7 +2040,6 @@ mod tests {
                 .expect("version ref should serialize"),
             ),
             metadata: None,
-            schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             global: true,
@@ -2102,7 +2111,6 @@ mod tests {
                 serde_json::to_string(&snapshot).expect("commit snapshot should serialize"),
             ),
             metadata: None,
-            schema_version: "1".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             global: true,
@@ -2123,7 +2131,6 @@ mod tests {
             id: format!("change-{commit_id}"),
             entity_id: crate::entity_identity::EntityIdentity::single(commit_id),
             schema_key: COMMIT_SCHEMA_KEY.to_string(),
-            schema_version: "1".to_string(),
             file_id: None,
             snapshot_content: Some(
                 serde_json::to_string(&json!({

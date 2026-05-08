@@ -1,6 +1,5 @@
 {
   "x-lix-key": "lix_change_author",
-  "x-lix-version": "1",
   "x-lix-primary-key": [
     "/change_id",
     "/account_id"

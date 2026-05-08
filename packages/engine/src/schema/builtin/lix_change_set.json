@@ -1,6 +1,5 @@
 {
   "x-lix-key": "lix_change_set",
-  "x-lix-version": "1",
   "x-lix-primary-key": [
     "/id"
   ],

@@ -13,7 +13,6 @@ fn to_state_context(rows: &[PluginEntityChange]) -> PluginDetectStateContext {
                 .map(|row| PluginActiveStateRow {
                     entity_id: row.entity_id.clone(),
                     schema_key: Some(row.schema_key.clone()),
-                    schema_version: Some(row.schema_version.clone()),
                     snapshot_content: row.snapshot_content.clone(),
                     file_id: None,
                     plugin_key: None,

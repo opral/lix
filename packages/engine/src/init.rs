@@ -11,23 +11,17 @@ use crate::schema::{
 use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::TrackedStateRow;
 use crate::untracked_state::UntrackedStateRow;
-use crate::version::{
-    VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_DESCRIPTOR_SCHEMA_VERSION, VERSION_REF_SCHEMA_KEY,
-    VERSION_REF_SCHEMA_VERSION,
-};
+use crate::version::{VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_REF_SCHEMA_KEY};
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 use serde_json::json;
 use std::sync::Arc;
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
-const KEY_VALUE_SCHEMA_VERSION: &str = "1";
 const LIX_ID_KEY: &str = "lix_id";
 const WORKSPACE_VERSION_KEY: &str = "lix_workspace_version_id";
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
-const COMMIT_SCHEMA_VERSION: &str = "1";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
-const REGISTERED_SCHEMA_VERSION: &str = "1";
 
 /// Pure seed plan for initializing an engine repository.
 ///
@@ -45,7 +39,6 @@ struct InitSeedChange {
     id: String,
     entity_id: EntityIdentity,
     schema_key: String,
-    schema_version: String,
     snapshot_content: String,
     created_at: String,
 }
@@ -54,7 +47,6 @@ struct InitSeedChange {
 struct InitSeedLiveRow {
     entity_id: EntityIdentity,
     schema_key: String,
-    schema_version: String,
     snapshot_content: String,
     created_at: String,
     updated_at: String,
@@ -87,9 +79,8 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         let key = schema_key_from_definition(schema)?;
         registered_schema_changes.push(canonical_change(
             functions.call_uuid_v7(),
-            registered_schema_entity_id(&key.schema_key, &key.schema_version)?,
+            registered_schema_entity_id(&key.schema_key)?,
             REGISTERED_SCHEMA_KEY,
-            REGISTERED_SCHEMA_VERSION,
             registered_schema_snapshot(schema)?,
             &timestamp,
         ));
@@ -99,7 +90,6 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         GLOBAL_VERSION_ID.to_string(),
         EntityIdentity::single(GLOBAL_VERSION_ID),
         VERSION_DESCRIPTOR_SCHEMA_KEY,
-        VERSION_DESCRIPTOR_SCHEMA_VERSION,
         version_descriptor_snapshot(GLOBAL_VERSION_ID, "global", true)?,
         &timestamp,
     );
@@ -107,7 +97,6 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         functions.call_uuid_v7(),
         EntityIdentity::single(&main_version_id),
         VERSION_DESCRIPTOR_SCHEMA_KEY,
-        VERSION_DESCRIPTOR_SCHEMA_VERSION,
         version_descriptor_snapshot(&main_version_id, "main", false)?,
         &timestamp,
     );
@@ -115,7 +104,6 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         functions.call_uuid_v7(),
         EntityIdentity::single(LIX_ID_KEY),
         KEY_VALUE_SCHEMA_KEY,
-        KEY_VALUE_SCHEMA_VERSION,
         key_value_snapshot(LIX_ID_KEY, &lix_id)?,
         &timestamp,
     );
@@ -134,7 +122,6 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         functions.call_uuid_v7(),
         EntityIdentity::single(&initial_commit_id),
         COMMIT_SCHEMA_KEY,
-        COMMIT_SCHEMA_VERSION,
         commit_snapshot(
             &initial_commit_id,
             &initial_change_set_id,
@@ -145,21 +132,18 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     let global_version_ref_row = untracked_row(
         EntityIdentity::single(GLOBAL_VERSION_ID),
         VERSION_REF_SCHEMA_KEY,
-        VERSION_REF_SCHEMA_VERSION,
         version_ref_snapshot(GLOBAL_VERSION_ID, &initial_commit_id)?,
         &timestamp,
     );
     let main_version_ref_row = untracked_row(
         EntityIdentity::single(&main_version_id),
         VERSION_REF_SCHEMA_KEY,
-        VERSION_REF_SCHEMA_VERSION,
         version_ref_snapshot(&main_version_id, &initial_commit_id)?,
         &timestamp,
     );
     let workspace_version_row = untracked_row(
         EntityIdentity::single(WORKSPACE_VERSION_KEY),
         KEY_VALUE_SCHEMA_KEY,
-        KEY_VALUE_SCHEMA_VERSION,
         key_value_snapshot(WORKSPACE_VERSION_KEY, &main_version_id)?,
         &timestamp,
     );
@@ -272,7 +256,6 @@ fn tracked_row_from_initial_change(
             Arc::from(change.snapshot_content.as_str()),
         ))?),
         metadata_ref: None,
-        schema_version: change.schema_version.clone(),
         created_at: change.created_at.clone(),
         updated_at: change.created_at.clone(),
         change_id: change.id.clone(),
@@ -288,7 +271,6 @@ fn seed_change_to_canonical_change(
         id: change.id.clone(),
         entity_id: change.entity_id.clone(),
         schema_key: change.schema_key.clone(),
-        schema_version: change.schema_version.clone(),
         file_id: None,
         snapshot_ref: Some(json_writer.prepare_json(NormalizedJson::from_arc_unchecked(
             Arc::from(change.snapshot_content.as_str()),
@@ -310,7 +292,6 @@ fn untracked_state_row_from_seed(
             Arc::from(row.snapshot_content.as_str()),
         ))?),
         metadata_ref: None,
-        schema_version: row.schema_version.clone(),
         created_at: row.created_at.clone(),
         updated_at: row.updated_at.clone(),
         global: row.global,
@@ -321,7 +302,6 @@ fn untracked_state_row_from_seed(
 fn untracked_row(
     entity_id: EntityIdentity,
     schema_key: &str,
-    schema_version: &str,
     snapshot_content: String,
     timestamp: &str,
 ) -> InitSeedLiveRow {
@@ -329,7 +309,6 @@ fn untracked_row(
         entity_id,
         schema_key: schema_key.to_string(),
         snapshot_content,
-        schema_version: schema_version.to_string(),
         created_at: timestamp.to_string(),
         updated_at: timestamp.to_string(),
         global: true,
@@ -341,7 +320,6 @@ fn canonical_change(
     id: String,
     entity_id: EntityIdentity,
     schema_key: &str,
-    schema_version: &str,
     snapshot_content: String,
     created_at: &str,
 ) -> InitSeedChange {
@@ -349,7 +327,6 @@ fn canonical_change(
         id,
         entity_id,
         schema_key: schema_key.to_string(),
-        schema_version: schema_version.to_string(),
         snapshot_content,
         created_at: created_at.to_string(),
     }

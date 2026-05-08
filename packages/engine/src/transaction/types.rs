@@ -3,8 +3,8 @@ use std::{collections::BTreeSet, fmt, ops::Deref, sync::Arc};
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::{JsonRef, JsonStoreWriter, NormalizedJson};
 use crate::live_state::MaterializedLiveStateRow;
+use crate::schema_catalog::SchemaPlanId;
 use crate::tracked_state::MaterializedTrackedStateRow;
-use crate::transaction::normalization::SchemaPlanId;
 use crate::untracked_state::MaterializedUntrackedStateRow;
 use crate::LixError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -126,7 +126,6 @@ pub(crate) struct TransactionWriteRow {
     pub(crate) snapshot: Option<TransactionJson>,
     pub(crate) metadata: Option<TransactionJson>,
     pub(crate) origin: Option<TransactionWriteOrigin>,
-    pub(crate) schema_version: String,
     pub(crate) created_at: Option<String>,
     pub(crate) updated_at: Option<String>,
     pub(crate) global: bool,
@@ -292,7 +291,6 @@ pub(crate) struct PreparedStateRow {
     pub(crate) snapshot: Option<StageJson>,
     pub(crate) metadata: Option<StageJson>,
     pub(crate) origin: Option<TransactionWriteOrigin>,
-    pub(crate) schema_version: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) global: bool,
@@ -300,16 +298,6 @@ pub(crate) struct PreparedStateRow {
     pub(crate) commit_id: Option<String>,
     pub(crate) untracked: bool,
     pub(crate) version_id: String,
-}
-
-impl PreparedStateRow {
-    pub(crate) fn schema_scope_version_id(&self) -> &str {
-        if self.global {
-            crate::GLOBAL_VERSION_ID
-        } else {
-            self.version_id.as_str()
-        }
-    }
 }
 
 /// Transaction-hydrated projection for an adopted canonical change.
@@ -322,23 +310,12 @@ pub(crate) struct PreparedAdoptedStateRow {
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot: Option<StageJson>,
     pub(crate) metadata: Option<StageJson>,
-    pub(crate) schema_version: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) global: bool,
     pub(crate) change_id: String,
     pub(crate) commit_id: String,
     pub(crate) version_id: String,
-}
-
-impl PreparedAdoptedStateRow {
-    pub(crate) fn schema_scope_version_id(&self) -> &str {
-        if self.global {
-            crate::GLOBAL_VERSION_ID
-        } else {
-            self.version_id.as_str()
-        }
-    }
 }
 
 impl From<PreparedStateRow> for MaterializedLiveStateRow {
@@ -349,7 +326,6 @@ impl From<PreparedStateRow> for MaterializedLiveStateRow {
             file_id: row.file_id,
             snapshot_content: row.snapshot.map(|snapshot| snapshot.materialize()),
             metadata: row.metadata.map(|metadata| metadata.materialize()),
-            schema_version: row.schema_version,
             created_at: row.created_at,
             updated_at: row.updated_at,
             global: row.global,
@@ -369,7 +345,6 @@ impl From<&PreparedStateRow> for MaterializedLiveStateRow {
             file_id: row.file_id.clone(),
             snapshot_content: row.snapshot.as_ref().map(StageJson::materialize),
             metadata: row.metadata.as_ref().map(StageJson::materialize),
-            schema_version: row.schema_version.clone(),
             created_at: row.created_at.clone(),
             updated_at: row.updated_at.clone(),
             global: row.global,
@@ -389,7 +364,6 @@ impl From<PreparedAdoptedStateRow> for MaterializedLiveStateRow {
             file_id: row.file_id,
             snapshot_content: row.snapshot.map(|snapshot| snapshot.materialize()),
             metadata: row.metadata.map(|metadata| metadata.materialize()),
-            schema_version: row.schema_version,
             created_at: row.created_at,
             updated_at: row.updated_at,
             global: row.global,
@@ -409,7 +383,6 @@ impl From<&PreparedAdoptedStateRow> for MaterializedLiveStateRow {
             file_id: row.file_id.clone(),
             snapshot_content: row.snapshot.as_ref().map(StageJson::materialize),
             metadata: row.metadata.as_ref().map(StageJson::materialize),
-            schema_version: row.schema_version.clone(),
             created_at: row.created_at.clone(),
             updated_at: row.updated_at.clone(),
             global: row.global,
@@ -429,7 +402,6 @@ impl From<PreparedStateRow> for MaterializedUntrackedStateRow {
             file_id: row.file_id,
             snapshot_content: row.snapshot.map(|snapshot| snapshot.materialize()),
             metadata: row.metadata.map(|metadata| metadata.materialize()),
-            schema_version: row.schema_version,
             created_at: row.created_at,
             updated_at: row.updated_at,
             global: row.global,

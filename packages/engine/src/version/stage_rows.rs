@@ -5,9 +5,7 @@ use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::GLOBAL_VERSION_ID;
 
 pub(crate) const VERSION_DESCRIPTOR_SCHEMA_KEY: &str = "lix_version_descriptor";
-pub(crate) const VERSION_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
 pub(crate) const VERSION_REF_SCHEMA_KEY: &str = "lix_version_ref";
-pub(crate) const VERSION_REF_SCHEMA_VERSION: &str = "1";
 
 pub(crate) fn version_descriptor_stage_row(
     version_id: &str,
@@ -25,7 +23,6 @@ pub(crate) fn version_descriptor_stage_row(
         }))),
         metadata: None,
         origin: None,
-        schema_version: VERSION_DESCRIPTOR_SCHEMA_VERSION.to_string(),
         created_at: None,
         updated_at: None,
         global: true,
@@ -47,7 +44,6 @@ pub(crate) fn version_ref_stage_row(version_id: &str, commit_id: &str) -> Transa
         }))),
         metadata: None,
         origin: None,
-        schema_version: VERSION_REF_SCHEMA_VERSION.to_string(),
         created_at: None,
         updated_at: None,
         global: true,

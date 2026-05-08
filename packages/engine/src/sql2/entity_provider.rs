@@ -32,6 +32,7 @@ use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
 };
 use crate::sql2::dml::{InsertExec, InsertSink};
+use crate::sql2::predicate_typecheck::validate_json_predicate_filters;
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::version_scope::{
     explicit_version_ids_from_dml_filters, resolve_provider_version_ids,
@@ -48,8 +49,7 @@ use super::entity_history_provider::EntityHistoryProvider;
 use super::history_route::{
     HISTORY_COL_CHANGE_ID, HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_ID,
     HISTORY_COL_FILE_ID, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
-    HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SCHEMA_VERSION, HISTORY_COL_SNAPSHOT_CONTENT,
-    HISTORY_COL_START_COMMIT_ID,
+    HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
 };
 use super::result_metadata::{json_field, mark_json_field};
 use crate::sql2::{
@@ -177,7 +177,6 @@ pub(super) struct EntitySurfaceColumn {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct EntitySurfaceSpec {
     pub(super) schema_key: String,
-    schema_version: Option<String>,
     pub(super) primary_key_paths: Vec<Vec<String>>,
     pub(super) columns: Vec<EntitySurfaceColumn>,
 }
@@ -406,6 +405,7 @@ impl TableProvider for EntityProvider {
         };
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
@@ -458,6 +458,7 @@ impl TableProvider for EntityProvider {
         };
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_assignments = assignments
             .iter()
             .map(|(column_name, expr)| {
@@ -965,15 +966,6 @@ fn entity_update_write_rows_from_batch(
                 &spec.schema_key,
             )?;
 
-            let schema_version = optional_string_value(batch, row_index, "lixcol_schema_version")?
-                .or_else(|| spec.schema_version.clone())
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "UPDATE entity surface '{}' requires lixcol_schema_version",
-                        spec.schema_key
-                    ))
-                })?;
-
             Ok(TransactionWriteRow {
                 entity_id: optional_string_value(batch, row_index, "lixcol_entity_id")?
                     .map(|entity_id| {
@@ -1007,7 +999,6 @@ fn entity_update_write_rows_from_batch(
                     &spec.schema_key,
                 )?,
                 origin: None,
-                schema_version,
                 created_at: None,
                 updated_at: None,
                 global: scope.global,
@@ -1198,14 +1189,6 @@ fn entity_lix_state_write_rows_from_batch_with_options(
                 reject_present_entity_insert_field(batch, row_index, "lixcol_commit_id")?;
             }
 
-            let schema_version = optional_string_value(batch, row_index, "lixcol_schema_version")?
-                .or_else(|| spec.schema_version.clone())
-                .ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "INSERT into entity surface '{}' requires lixcol_schema_version",
-                        spec.schema_key
-                    ))
-                })?;
             let snapshot_content =
                 entity_snapshot_content_from_batch(spec, batch, insert_column_intents, row_index)?;
             let explicit_entity_id = optional_string_value(batch, row_index, "lixcol_entity_id")?;
@@ -1251,7 +1234,6 @@ fn entity_lix_state_write_rows_from_batch_with_options(
                     &spec.schema_key,
                 )?,
                 origin: None,
-                schema_version: schema_version,
                 created_at: None,
                 updated_at: None,
                 global: scope.global,
@@ -1699,7 +1681,6 @@ fn entity_system_column_array(
                 .map(|row| row.metadata.as_ref().map(serialize_row_metadata))
                 .collect::<Vec<_>>(),
         )) as ArrayRef,
-        "schema_version" => string_array(rows.iter().map(|row| Some(row.schema_version.as_str()))),
         "created_at" => string_array(rows.iter().map(|row| Some(row.created_at.as_str()))),
         "updated_at" => string_array(rows.iter().map(|row| Some(row.updated_at.as_str()))),
         "global" => Arc::new(BooleanArray::from(
@@ -1820,7 +1801,6 @@ pub(super) fn entity_system_fields(variant: EntityProviderVariant) -> Vec<Field>
             Field::new(HISTORY_COL_FILE_ID, DataType::Utf8, true),
             json_field(HISTORY_COL_SNAPSHOT_CONTENT, true),
             json_field(HISTORY_COL_METADATA, true),
-            Field::new(HISTORY_COL_SCHEMA_VERSION, DataType::Utf8, false),
             Field::new(HISTORY_COL_CHANGE_ID, DataType::Utf8, false),
             Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
             Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
@@ -1835,7 +1815,6 @@ pub(super) fn entity_system_fields(variant: EntityProviderVariant) -> Vec<Field>
         Field::new("lixcol_file_id", DataType::Utf8, true),
         json_field("lixcol_snapshot_content", true),
         json_field("lixcol_metadata", true),
-        Field::new("lixcol_schema_version", DataType::Utf8, true),
         Field::new("lixcol_created_at", DataType::Utf8, true),
         Field::new("lixcol_updated_at", DataType::Utf8, true),
         Field::new("lixcol_global", DataType::Boolean, true),
@@ -1868,11 +1847,6 @@ fn derive_entity_surface_spec_from_schema(
                 "schema is missing string x-lix-key".to_string(),
             )
         })?;
-
-    let schema_version = schema
-        .get("x-lix-version")
-        .and_then(JsonValue::as_str)
-        .map(ToOwned::to_owned);
 
     let properties = schema
         .get("properties")
@@ -1909,7 +1883,6 @@ fn derive_entity_surface_spec_from_schema(
 
     Ok(EntitySurfaceSpec {
         schema_key: schema_key.to_string(),
-        schema_version,
         primary_key_paths,
         columns,
     })
@@ -2194,7 +2167,6 @@ mod tests {
                     .to_string(),
             ),
             metadata: Some(json!({"source": "test"}).to_string()),
-            schema_version: "1".to_string(),
             version_id: "version-a".to_string(),
             change_id: Some("change-a".to_string()),
             commit_id: Some("commit-a".to_string()),
@@ -2209,7 +2181,6 @@ mod tests {
         Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
                 "x-lix-key": "project_message",
-                "x-lix-version": "1",
                 "type": "object",
                 "properties": {
                     "body": { "type": "string" },
@@ -2227,7 +2198,6 @@ mod tests {
         Arc::new(
             derive_entity_surface_spec_from_schema(&json!({
                 "x-lix-key": "project_message",
-                "x-lix-version": "1",
                 "x-lix-primary-key": ["/id"],
                 "type": "object",
                 "properties": {
@@ -2306,7 +2276,6 @@ mod tests {
     fn derives_entity_surface_spec_from_schema_definition() {
         let spec = derive_entity_surface_spec_from_schema(&json!({
             "x-lix-key": "project_message",
-            "x-lix-version": "1",
             "type": "object",
             "properties": {
                 "body": { "type": "string" },
@@ -2318,7 +2287,6 @@ mod tests {
         .expect("schema should derive entity surface spec");
 
         assert_eq!(spec.schema_key, "project_message");
-        assert_eq!(spec.schema_version.as_deref(), Some("1"));
         assert_eq!(
             spec.visible_column_names().collect::<Vec<_>>(),
             vec!["body", "meta", "rating"]
@@ -2343,7 +2311,6 @@ mod tests {
     fn entity_surface_spec_rejects_properties_without_projection_type() {
         let error = derive_entity_surface_spec_from_schema(&json!({
             "x-lix-key": "project_message",
-            "x-lix-version": "1",
             "x-lix-primary-key": ["/id"],
             "type": "object",
             "properties": {
@@ -2538,7 +2505,6 @@ mod tests {
             Some(&crate::entity_identity::EntityIdentity::single("entity-1"))
         );
         assert_eq!(rows[0].schema_key, "project_message");
-        assert_eq!(rows[0].schema_version.as_str(), "1");
         assert_eq!(rows[0].version_id, "version-a");
         assert_eq!(
             rows[0].metadata.as_ref(),
@@ -2701,7 +2667,6 @@ mod tests {
                         json!({"source": "entity"})
                     )),
                     origin: None,
-                    schema_version: "1".to_string(),
                     created_at: None,
                     updated_at: None,
                     global: false,

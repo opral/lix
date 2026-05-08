@@ -45,7 +45,7 @@ Do not use this skill for raw SQLite access, private engine/wasm internals, SDK 
 
 1. Install `@lix-js/sdk` and `better-sqlite3`.
 2. Open with `createBetterSqlite3Backend({ path })`; do not open `.lix` with raw SQLite.
-3. Register a schema with `x-lix-key`, `x-lix-version`, `x-lix-primary-key`, and `additionalProperties: false`.
+3. Register a schema with `x-lix-key`, `x-lix-primary-key`, and `additionalProperties: false`.
 4. Write rows through the generated table named by `x-lix-key`.
 5. Use `<schema>_by_version` plus `lixcol_version_id` for side-by-side version reads/writes.
 6. Query `lix_change` for audit/history instead of hand-rolling audit tables.
@@ -135,7 +135,6 @@ await lix.execute(
     JSON.stringify({
       $schema: "https://json-schema.org/draft/2020-12/schema",
       "x-lix-key": "acme_note",
-      "x-lix-version": "1",
       "x-lix-primary-key": ["/id"],
       type: "object",
       required: ["id", "title", "done"],
@@ -218,7 +217,7 @@ await lix.execute(
 Schema basics:
 
 - `x-lix-key` becomes the generated SQL table name.
-- `x-lix-version` versions your schema contract.
+- Compatible schema amendments are keyed by `x-lix-key`.
 - `x-lix-primary-key` tells Lix how to derive entity identity.
 - Primary-key entries are JSON Pointers with a leading slash, such as `["/id"]` or `["/owner/email"]`.
 - Use `additionalProperties: false` so accidental fields fail fast.
@@ -230,7 +229,6 @@ Uniqueness is not inferred from ordinary JSON Schema fields. If a non-primary-ke
 ```ts
 const companyDomainSchema = {
   "x-lix-key": "crm_company_domain",
-  "x-lix-version": "1",
   "x-lix-primary-key": ["/id"],
   "x-lix-unique": [["/domain"]],
   type: "object",
@@ -390,7 +388,7 @@ Columns consumers usually need:
 
 `lix_change` is an immutable SQL table of changes across registered schemas and versions. Use it for audit logs, blame, history, activity feeds, and undo-style UI.
 
-Important columns include `id`, `entity_id`, `schema_key`, `schema_version`, `snapshot_content`, `created_at`, and `lixcol_*` metadata.
+Important columns include `id`, `entity_id`, `schema_key`, `snapshot_content`, `created_at`, and `lixcol_*` metadata.
 
 ```ts
 // Audit log for one entity, oldest to newest.

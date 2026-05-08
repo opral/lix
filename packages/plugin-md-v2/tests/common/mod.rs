@@ -2,7 +2,7 @@
 
 use plugin_md_v2::{
     PluginApiError, PluginEntityChange, PluginFile, BLOCK_SCHEMA_KEY, DOCUMENT_SCHEMA_KEY,
-    ROOT_ENTITY_ID, SCHEMA_VERSION,
+    ROOT_ENTITY_ID,
 };
 use std::collections::BTreeMap;
 
@@ -106,7 +106,6 @@ pub fn document_change(order: Vec<String>) -> PluginEntityChange {
     PluginEntityChange {
         entity_id: ROOT_ENTITY_ID.to_string(),
         schema_key: DOCUMENT_SCHEMA_KEY.to_string(),
-        schema_version: SCHEMA_VERSION.to_string(),
         snapshot_content: Some(
             serde_json::json!({
                 "id": ROOT_ENTITY_ID,
@@ -121,7 +120,6 @@ pub fn block_change(id: &str, node_type: &str, markdown: &str) -> PluginEntityCh
     PluginEntityChange {
         entity_id: id.to_string(),
         schema_key: BLOCK_SCHEMA_KEY.to_string(),
-        schema_version: SCHEMA_VERSION.to_string(),
         snapshot_content: Some(
             serde_json::json!({
                 "id": id,

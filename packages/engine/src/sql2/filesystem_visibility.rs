@@ -370,7 +370,6 @@ mod tests {
             file_id,
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
-            schema_version: "1".to_string(),
             version_id: "version-a".to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),

@@ -1,6 +1,5 @@
 {
   "x-lix-key": "lix_commit_edge",
-  "x-lix-version": "1",
   "x-lix-primary-key": [
     "/parent_id",
     "/child_id"
