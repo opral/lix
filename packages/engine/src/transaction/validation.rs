@@ -1484,6 +1484,23 @@ struct PendingUniqueKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PendingUniqueConstraintScope {
+    schema_key: String,
+    domain: Domain,
+    pointer_group: Vec<Vec<String>>,
+}
+
+impl From<&PendingUniqueKey> for PendingUniqueConstraintScope {
+    fn from(key: &PendingUniqueKey) -> Self {
+        Self {
+            schema_key: key.schema_key.clone(),
+            domain: key.domain.clone(),
+            pointer_group: key.pointer_group.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PendingForeignKeyTargetKey {
     schema_key: String,
     domain: Domain,
@@ -2156,21 +2173,31 @@ async fn validate_committed_unique_constraints(
     input: &TransactionValidationInput<'_>,
     pending_constraints: &PendingConstraintIndexes,
 ) -> Result<(), LixError> {
+    let mut pending_by_scope = BTreeMap::<
+        PendingUniqueConstraintScope,
+        BTreeMap<UniqueConstraintValue, Vec<&EntityIdentity>>,
+    >::new();
     for (key, pending_entity_id) in &pending_constraints.unique_values {
+        pending_by_scope
+            .entry(PendingUniqueConstraintScope::from(key))
+            .or_default()
+            .entry(key.value.clone())
+            .or_default()
+            .push(pending_entity_id);
+    }
+
+    for (scope, pending_values) in pending_by_scope {
         let committed_rows = scan_committed_constraint_rows(
             input.live_state,
-            &key.domain,
-            vec![key.schema_key.clone()],
+            &scope.domain,
+            vec![scope.schema_key.clone()],
             Vec::new(),
             false,
         )
         .await?;
 
         for committed_row in committed_rows {
-            if !committed_row_is_in_exact_validation_scope(&committed_row, key) {
-                continue;
-            }
-            if committed_row.entity_id == *pending_entity_id {
+            if !committed_row_is_in_exact_unique_scope(&committed_row, &scope) {
                 continue;
             }
             if pending_constraints.tombstones_identity(&committed_row) {
@@ -2190,18 +2217,24 @@ async fn validate_committed_unique_constraints(
                     )
                 })?;
             let Some(committed_value) =
-                UniqueConstraintValue::from_snapshot(&snapshot, &key.pointer_group)
+                UniqueConstraintValue::from_snapshot(&snapshot, &scope.pointer_group)
             else {
                 continue;
             };
-            if committed_value == key.value {
+            let Some(pending_entity_ids) = pending_values.get(&committed_value) else {
+                continue;
+            };
+            for pending_entity_id in pending_entity_ids {
+                if committed_row.entity_id == **pending_entity_id {
+                    continue;
+                }
                 return Err(LixError::new(
                     LixError::CODE_UNIQUE,
                     format!(
                         "unique constraint violation on {}.{} for value {}: committed row '{}' conflicts with staged row '{}'",
-                        key.schema_key,
-                        format_pointer_group(&key.pointer_group),
-                        key.value.display(),
+                        scope.schema_key,
+                        format_pointer_group(&scope.pointer_group),
+                        committed_value.display(),
                         committed_row.entity_id.as_json_array_text()?,
                         pending_entity_id.as_json_array_text()?
                     ),
@@ -2212,14 +2245,14 @@ async fn validate_committed_unique_constraints(
     Ok(())
 }
 
-fn committed_row_is_in_exact_validation_scope(
+fn committed_row_is_in_exact_unique_scope(
     row: &MaterializedLiveStateRow,
-    key: &PendingUniqueKey,
+    scope: &PendingUniqueConstraintScope,
 ) -> bool {
     // LiveStateReader may return serving projections such as global rows
     // projected into a requested version. Constraint validation is root-local:
     // only rows authored in the exact version participate.
-    key.domain.contains(row) && row.schema_key == key.schema_key
+    scope.domain.contains(row) && row.schema_key == scope.schema_key
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2529,6 +2562,8 @@ fn reject_seed_schema_registration(key: &SchemaKey) -> Result<(), LixError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use async_trait::async_trait;
     use serde_json::json;
 
@@ -2842,6 +2877,40 @@ mod tests {
                 .iter()
                 .find(|row| live_state_row_matches_load(row, request))
                 .cloned())
+        }
+    }
+
+    struct CountingStaticLiveStateReader {
+        rows: Vec<MaterializedLiveStateRow>,
+        scan_count: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LiveStateReader for CountingStaticLiveStateReader {
+        async fn scan_rows(
+            &self,
+            request: &LiveStateScanRequest,
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+            self.scan_count.fetch_add(1, Ordering::Relaxed);
+            Ok(self
+                .rows
+                .iter()
+                .cloned()
+                .chain(test_file_descriptor_rows())
+                .filter(|row| live_state_row_matches_scan(row, request))
+                .collect())
+        }
+
+        async fn load_row(
+            &self,
+            request: &LiveStateRowRequest,
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
+            Ok(self
+                .rows
+                .iter()
+                .cloned()
+                .chain(test_file_descriptor_rows())
+                .find(|row| live_state_row_matches_load(row, request)))
         }
     }
 
@@ -3932,6 +4001,38 @@ mod tests {
         ))
         .await
         .expect("same identity should update committed unique owner");
+    }
+
+    #[tokio::test]
+    async fn validation_batches_committed_unique_scans_by_constraint_group() {
+        let visible_schemas = vec![unique_schema()];
+        let mut staged_one = unique_row("post-3", "new-slug-3", "third");
+        staged_one.file_id = None;
+        let mut staged_two = unique_row("post-4", "new-slug-4", "fourth");
+        staged_two.file_id = None;
+        let mut committed_one = committed_unique_row("post-1", "hello-world", "first");
+        committed_one.file_id = None;
+        let mut committed_two = committed_unique_row("post-2", "second-slug", "second");
+        committed_two.file_id = None;
+        let staged_writes = PreparedWriteSet {
+            state_rows: vec![staged_one, staged_two],
+            adopted_rows: Vec::new(),
+            ..empty_staged_write_set()
+        };
+        let live_state = CountingStaticLiveStateReader {
+            rows: vec![committed_one, committed_two],
+            scan_count: AtomicUsize::new(0),
+        };
+
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+            &staged_writes,
+            &visible_schemas,
+            &live_state,
+        ))
+        .await
+        .expect("distinct pending unique values should not conflict");
+
+        assert_eq!(live_state.scan_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
