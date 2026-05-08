@@ -13,8 +13,8 @@ use crate::tracked_state::{
     TrackedStateRowRequest, TrackedStateScanRequest,
 };
 use crate::untracked_state::{
-    UntrackedStateContext, UntrackedStateIdentityRef, UntrackedStateRowRef,
-    UntrackedStateRowRequest, UntrackedStateScanRequest,
+    UntrackedStateContext, UntrackedStateRowRef, UntrackedStateRowRequest,
+    UntrackedStateScanRequest,
 };
 use crate::version::VERSION_REF_SCHEMA_KEY;
 use crate::LixError;
@@ -285,16 +285,6 @@ where
         rows: impl IntoIterator<Item = UntrackedStateRowRef<'a>>,
     ) -> Result<(), LixError> {
         self.untracked_state.writer(writes).stage_rows(rows)
-    }
-
-    pub(crate) fn stage_delete_untracked_rows<'a>(
-        &mut self,
-        writes: &mut StorageWriteSet,
-        identities: impl IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
-    ) {
-        self.untracked_state
-            .writer(writes)
-            .stage_delete_rows(identities);
     }
 
     pub(crate) async fn stage_tracked_root<'a>(
