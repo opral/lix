@@ -1,6 +1,6 @@
 {
   "x-lix-key": "lix_change",
-  "description": "Canonical immutable change fact. This surface represents the authoritative stream of journaled change facts. Commit lineage and non-commit scope are modeled separately around these facts.",
+  "description": "A change records one edit to a Lix entity, including what changed, when it changed, and which entity was affected.",
   "x-lix-primary-key": [
     "/id"
   ],
@@ -9,7 +9,7 @@
     "id": {
       "type": "string",
       "x-lix-default": "lix_uuid_v7()",
-      "description": "Stable change identifier (UUIDv7). Referenced from `lix_commit.change_ids` and `lix_change_set_element.change_id`."
+      "description": "Stable identifier for this change."
     },
     "entity_id": {
       "type": "array",
@@ -39,6 +39,9 @@
     },
     "created_at": {
       "type": "string",
+      "examples": [
+        "2026-05-08T17:42:31.123Z"
+      ],
       "description": "ISO-8601 timestamp at which the change was recorded (set via `lix_timestamp()` at write time)."
     },
     "snapshot_content": {

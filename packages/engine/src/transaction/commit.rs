@@ -244,7 +244,6 @@ async fn stage_commit_store_commits(
         let commit = CommitDraftBorrowed {
             id: &commit_row.commit_id,
             change_id: &commit_row.change_id,
-            change_set_id: &commit_row.change_set_id,
             parent_ids: &commit_row.parent_commit_ids,
             author_account_ids: &[],
             created_at: &commit_row.created_at,
@@ -471,7 +470,6 @@ struct FinalizedCommitRows {
 
 struct FinalizedCommitRow {
     commit_id: String,
-    change_set_id: String,
     parent_commit_ids: Vec<String>,
     created_at: String,
     change_id: String,
@@ -505,7 +503,6 @@ async fn finalize_commit_rows(
 
         let commit_id = members.commit_id;
         let commit_change_id = members.commit_change_id;
-        let change_set_id = members.change_set_id;
         let timestamp = members.created_at;
         let _change_ids = members.change_ids;
         let parent_commit_ids = version_ctx
@@ -525,7 +522,6 @@ async fn finalize_commit_rows(
 
         commit_rows.push(FinalizedCommitRow {
             commit_id: commit_id.clone(),
-            change_set_id,
             parent_commit_ids: parent_commit_ids.clone(),
             created_at: timestamp.clone(),
             change_id: commit_change_id,
@@ -642,7 +638,6 @@ mod tests {
             .expect("commit-store commit should load")
             .expect("commit-store commit should exist");
         assert_eq!(commit.change_id, "test-uuid-2");
-        assert_eq!(commit.change_set_id, "test-uuid-3");
         assert_eq!(commit.change_pack_count, 1);
         assert_eq!(commit.membership_pack_count, 0);
         let index_entries = commit_reader
@@ -1110,7 +1105,6 @@ mod tests {
         assert_eq!(rows.version_heads.len(), 1);
         let row = &rows.commit_rows[0];
         assert_eq!(row.commit_id, "test-uuid-1");
-        assert_eq!(row.change_set_id, "test-uuid-3");
         assert_eq!(row.change_id, "test-uuid-2");
         assert_eq!(row.created_at, "test-timestamp-1");
         assert_eq!(row.parent_commit_ids, vec!["initial-commit"]);
@@ -1205,7 +1199,6 @@ mod tests {
         let mut members = StagedCommitMembers::new(
             "test-uuid-1".to_string(),
             "test-uuid-2".to_string(),
-            "test-uuid-3".to_string(),
             "test-timestamp-1".to_string(),
         );
         for change_id in change_ids {

@@ -2,7 +2,6 @@
 #[path = "support/mod.rs"]
 mod support;
 use lix_engine::Value;
-use serde_json::Value as JsonValue;
 
 simulation_test!(
     version_ref_advances_after_tracked_commit,
@@ -97,10 +96,9 @@ simulation_test!(
             "tracked write should advance exactly the touched version ref"
         );
 
-        let commit_snapshot = load_commit_snapshot(&global_session, &main_head_after).await;
         assert_eq!(
-            commit_snapshot.get("id").and_then(JsonValue::as_str),
-            Some(main_head_after.as_str()),
+            commit_ids(&global_session, &main_head_after).await,
+            vec![main_head_after.clone()],
             "the touched-version commit should still be globally visible through lix_state"
         );
     }
@@ -153,38 +151,57 @@ simulation_test!(
 
         assert_ne!(second_head, first_head);
 
-        let commit_snapshot = load_commit_snapshot(&global_session, &second_head).await;
-        let parent_commit_ids = commit_snapshot
-            .get("parent_commit_ids")
-            .and_then(JsonValue::as_array)
-            .expect("commit snapshot should contain parent_commit_ids");
         assert_eq!(
-            parent_commit_ids,
-            &vec![JsonValue::String(first_head)],
+            commit_parent_ids(&global_session, &second_head).await,
+            vec![first_head],
             "second commit should parent to the previous version head"
         );
     }
 );
 
-async fn load_commit_snapshot(
+async fn commit_parent_ids(
     session: &crate::support::simulation_test::engine::SimSession,
     commit_id: &str,
-) -> JsonValue {
+) -> Vec<String> {
     let result = session
         .execute(
             &format!(
-                "SELECT snapshot_content \
-	             FROM lix_state \
-	             WHERE schema_key = 'lix_commit' AND entity_id = lix_json('[\"{commit_id}\"]')"
+                "SELECT parent_id \
+                 FROM lix_commit_edge \
+                 WHERE child_id = '{commit_id}' \
+                 ORDER BY parent_id"
             ),
             &[],
         )
         .await
-        .expect("commit row should read");
-    let rows = result;
-    assert_eq!(rows.len(), 1);
-    let Value::Json(snapshot_content) = &rows.rows()[0].values()[0] else {
-        panic!("commit snapshot should be JSON");
-    };
-    snapshot_content.clone()
+        .expect("commit edge rows should read");
+    result
+        .rows()
+        .iter()
+        .map(|row| match &row.values()[0] {
+            Value::Text(parent_id) => parent_id.clone(),
+            value => panic!("expected parent_id string, got {value:?}"),
+        })
+        .collect()
+}
+
+async fn commit_ids(
+    session: &crate::support::simulation_test::engine::SimSession,
+    commit_id: &str,
+) -> Vec<String> {
+    let result = session
+        .execute(
+            &format!("SELECT id FROM lix_commit WHERE id = '{commit_id}'"),
+            &[],
+        )
+        .await
+        .expect("commit rows should read");
+    result
+        .rows()
+        .iter()
+        .map(|row| match &row.values()[0] {
+            Value::Text(commit_id) => commit_id.clone(),
+            value => panic!("expected commit id string, got {value:?}"),
+        })
+        .collect()
 }

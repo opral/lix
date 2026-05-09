@@ -438,7 +438,6 @@ impl TransactionWriteBuffer {
             StagedCommitMembers::new(
                 functions.uuid_v7(),
                 functions.uuid_v7(),
-                functions.uuid_v7(),
                 functions.timestamp(),
             )
         });
@@ -1022,7 +1021,6 @@ fn add_row_to_commit_members(
             StagedCommitMembers::new(
                 functions.uuid_v7(),
                 functions.uuid_v7(),
-                functions.uuid_v7(),
                 functions.timestamp(),
             )
         });
@@ -1039,7 +1037,6 @@ fn add_adopted_row_to_commit_members(
         .entry(row.version_id.clone())
         .or_insert_with(|| {
             StagedCommitMembers::new(
-                functions.uuid_v7(),
                 functions.uuid_v7(),
                 functions.uuid_v7(),
                 functions.timestamp(),
@@ -1621,7 +1618,6 @@ mod tests {
             .expect("global commit members should exist");
         assert_eq!(members.commit_id, "test-uuid-1");
         assert_eq!(members.commit_change_id, "test-uuid-2");
-        assert_eq!(members.change_set_id, "test-uuid-3");
         assert_eq!(members.created_at, "test-timestamp-1");
     }
 

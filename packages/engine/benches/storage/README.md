@@ -67,7 +67,6 @@ storage/changelog/load_change_miss/10k
 storage/changelog/scan_all/10k
 storage/changelog/scan_limit_100/10k
 storage/changelog/scan_change_set/10k
-commit_graph/change_set_elements/10k
 commit_graph/change_history_from_commit/10k
 storage/binary_cas/write_blobs_1k/10k
 storage/binary_cas/read_blob_hit_1k/10k

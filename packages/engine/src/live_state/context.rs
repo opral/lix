@@ -21,8 +21,6 @@ use crate::NullableKeyFilter;
 use crate::GLOBAL_VERSION_ID;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
-const CHANGE_SET_SCHEMA_KEY: &str = "lix_change_set";
-const CHANGE_SET_ELEMENT_SCHEMA_KEY: &str = "lix_change_set_element";
 const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 
 /// Serving facade for visible live-state reads.
@@ -274,10 +272,6 @@ async fn scan_commit_derived_rows(
     let mut graph = commit_graph.reader(store);
     let commits = graph.all_commits().await?;
     let include_commit = schema_filter_allows(&request.filter.schema_keys, COMMIT_SCHEMA_KEY);
-    let include_change_set =
-        schema_filter_allows(&request.filter.schema_keys, CHANGE_SET_SCHEMA_KEY);
-    let include_change_set_element =
-        schema_filter_allows(&request.filter.schema_keys, CHANGE_SET_ELEMENT_SCHEMA_KEY);
     let include_commit_edge =
         schema_filter_allows(&request.filter.schema_keys, COMMIT_EDGE_SCHEMA_KEY);
 
@@ -288,19 +282,9 @@ async fn scan_commit_derived_rows(
                 rows.push(commit_row(commit, version_id)?);
             }
         }
-        if include_change_set {
-            for change_set in graph.change_sets(&commits) {
-                rows.push(change_set_row(&change_set, version_id)?);
-            }
-        }
         if include_commit_edge {
             for edge in graph.commit_edges(&commits) {
                 rows.push(commit_edge_row(&edge, version_id)?);
-            }
-        }
-        if include_change_set_element {
-            for element in graph.change_set_elements(&commits).await? {
-                rows.push(change_set_element_row(&element, version_id)?);
             }
         }
     }
@@ -332,13 +316,7 @@ fn is_commit_derived_only_request(request: &LiveStateScanRequest) -> bool {
 }
 
 fn is_commit_derived_schema(schema_key: &str) -> bool {
-    matches!(
-        schema_key,
-        COMMIT_SCHEMA_KEY
-            | CHANGE_SET_SCHEMA_KEY
-            | CHANGE_SET_ELEMENT_SCHEMA_KEY
-            | COMMIT_EDGE_SCHEMA_KEY
-    )
+    matches!(schema_key, COMMIT_SCHEMA_KEY | COMMIT_EDGE_SCHEMA_KEY)
 }
 
 fn schema_filter_allows(schema_keys: &[String], schema_key: &str) -> bool {
@@ -358,10 +336,6 @@ fn commit_row(
 ) -> Result<MaterializedLiveStateRow, LixError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "id": commit.commit_id,
-        "change_set_id": commit.change_set_id,
-        "change_ids": commit.change_ids,
-        "author_account_ids": commit.author_account_ids,
-        "parent_commit_ids": commit.parent_commit_ids,
     }))
     .map_err(|error| {
         LixError::new(
@@ -386,34 +360,6 @@ fn commit_row(
     })
 }
 
-fn change_set_row(
-    change_set: &crate::commit_graph::CommitGraphChangeSet,
-    version_id: &str,
-) -> Result<MaterializedLiveStateRow, LixError> {
-    let snapshot_content = serde_json::to_string(&serde_json::json!({ "id": change_set.id }))
-        .map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("failed to encode derived lix_change_set snapshot: {error}"),
-            )
-        })?;
-    Ok(MaterializedLiveStateRow {
-        entity_id: EntityIdentity::single(change_set.id.clone()),
-        schema_key: CHANGE_SET_SCHEMA_KEY.to_string(),
-        file_id: None,
-        snapshot_content: Some(snapshot_content),
-        metadata: None,
-        deleted: false,
-        created_at: "1970-01-01T00:00:00.000Z".to_string(),
-        updated_at: "1970-01-01T00:00:00.000Z".to_string(),
-        global: true,
-        change_id: None,
-        commit_id: Some(change_set.commit_id.clone()),
-        untracked: false,
-        version_id: version_id.to_string(),
-    })
-}
-
 fn commit_edge_row(
     edge: &crate::commit_graph::CommitGraphEdge,
     version_id: &str,
@@ -421,6 +367,7 @@ fn commit_edge_row(
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "parent_id": edge.parent_commit_id,
         "child_id": edge.child_commit_id,
+        "parent_order": edge.parent_order,
     }))
     .map_err(|error| {
         LixError::new(
@@ -442,43 +389,6 @@ fn commit_edge_row(
         global: true,
         change_id: None,
         commit_id: Some(edge.child_commit_id.clone()),
-        untracked: false,
-        version_id: version_id.to_string(),
-    })
-}
-
-fn change_set_element_row(
-    element: &crate::commit_graph::CommitGraphChangeSetElement,
-    version_id: &str,
-) -> Result<MaterializedLiveStateRow, LixError> {
-    let entity_id_value = element.change.entity_id.as_json_array_value()?;
-    let snapshot_content = serde_json::to_string(&serde_json::json!({
-        "change_set_id": element.change_set_id,
-        "change_id": element.change.id,
-        "entity_id": entity_id_value,
-        "schema_key": element.change.schema_key,
-        "file_id": element.change.file_id,
-    }))
-    .map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to encode derived lix_change_set_element snapshot: {error}"),
-        )
-    })?;
-    Ok(MaterializedLiveStateRow {
-        entity_id: EntityIdentity {
-            parts: vec![element.change_set_id.clone(), element.change.id.clone()],
-        },
-        schema_key: CHANGE_SET_ELEMENT_SCHEMA_KEY.to_string(),
-        file_id: None,
-        snapshot_content: Some(snapshot_content),
-        metadata: None,
-        deleted: false,
-        created_at: element.change.created_at.clone(),
-        updated_at: element.change.created_at.clone(),
-        global: true,
-        change_id: Some(element.change.id.clone()),
-        commit_id: None,
         untracked: false,
         version_id: version_id.to_string(),
     })
@@ -833,18 +743,17 @@ mod tests {
     fn parent_commit_id_from_test_commit_row(
         row: &MaterializedLiveStateRow,
     ) -> Result<Option<String>, LixError> {
-        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+        let Some(metadata) = row.metadata.as_deref() else {
             return Ok(None);
         };
-        let snapshot =
-            serde_json::from_str::<serde_json::Value>(snapshot_content).map_err(|error| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("test commit row has invalid snapshot: {error}"),
-                )
-            })?;
-        Ok(snapshot
-            .get("parent_commit_ids")
+        let metadata = serde_json::from_str::<serde_json::Value>(metadata).map_err(|error| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("test commit row has invalid metadata: {error}"),
+            )
+        })?;
+        Ok(metadata
+            .get("test_parents")
             .and_then(serde_json::Value::as_array)
             .and_then(|parents| parents.first())
             .and_then(serde_json::Value::as_str)
@@ -1978,17 +1887,19 @@ mod tests {
 
     fn commit_live_state_row_with_parents(
         commit_id: &str,
-        parent_commit_ids: &[&str],
+        parent_ids: &[&str],
     ) -> MaterializedLiveStateRow {
-        commit_live_state_row_with_snapshot(
+        let mut row = commit_live_state_row_with_snapshot(
             commit_id,
             json!({
                 "id": commit_id,
-                "change_set_id": format!("change-set-{commit_id}"),
-                "change_ids": ["change-version"],
-                "parent_commit_ids": parent_commit_ids,
             }),
-        )
+        );
+        row.metadata = Some(
+            serde_json::to_string(&json!({ "test_parents": parent_ids }))
+                .expect("test metadata should serialize"),
+        );
+        row
     }
 
     fn commit_live_state_row_with_snapshot(

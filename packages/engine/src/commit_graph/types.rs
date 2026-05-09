@@ -14,7 +14,6 @@ pub(crate) struct CommitGraphCommit {
     pub(crate) canonical_change: Change,
     pub(crate) change: Change,
     pub(crate) commit_id: String,
-    pub(crate) change_set_id: String,
     pub(crate) change_ids: Vec<String>,
     pub(crate) author_account_ids: Vec<String>,
     pub(crate) parent_commit_ids: Vec<String>,
@@ -32,20 +31,7 @@ pub(crate) struct ReachableCommitGraphCommit {
 pub(crate) struct CommitGraphEdge {
     pub(crate) parent_commit_id: String,
     pub(crate) child_commit_id: String,
-}
-
-/// Derived change-set row for a commit.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CommitGraphChangeSet {
-    pub(crate) id: String,
-    pub(crate) commit_id: String,
-}
-
-/// Derived membership row for a commit's introduced/adopted change set.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CommitGraphChangeSetElement {
-    pub(crate) change_set_id: String,
-    pub(crate) change: Change,
+    pub(crate) parent_order: u32,
 }
 
 /// Filter for canonical change history from a chosen traversal start commit.
@@ -114,13 +100,6 @@ pub(crate) trait CommitGraphReader: Send + Sync {
     ) -> Result<CommitGraphCommit, LixError>;
 
     fn commit_edges(&self, commits: &[CommitGraphCommit]) -> Vec<CommitGraphEdge>;
-
-    fn change_sets(&self, commits: &[CommitGraphCommit]) -> Vec<CommitGraphChangeSet>;
-
-    async fn change_set_elements(
-        &mut self,
-        commits: &[CommitGraphCommit],
-    ) -> Result<Vec<CommitGraphChangeSetElement>, LixError>;
 
     async fn change_history_from_commit(
         &mut self,

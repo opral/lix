@@ -6,21 +6,6 @@ use tokio::runtime::Runtime;
 
 pub(crate) fn bench(c: &mut Criterion, runtime: &Runtime, args: Args) {
     let mut group = c.benchmark_group("commit_graph");
-    group.bench_function("change_set_elements/10k", |b| {
-        b.iter_batched(
-            || prepare_read(runtime, args),
-            |(backend, fixture)| {
-                black_box(
-                    runtime
-                        .block_on(storage_bench::commit_graph_change_set_elements_prepared(
-                            &backend, &fixture,
-                        ))
-                        .expect("commit_graph/change_set_elements succeeds"),
-                )
-            },
-            BatchSize::LargeInput,
-        )
-    });
     group.bench_function("change_history_from_commit/10k", |b| {
         b.iter_batched(
             || prepare_read(runtime, args),

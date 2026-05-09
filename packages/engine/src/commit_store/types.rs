@@ -7,7 +7,6 @@ use crate::json_store::JsonRef;
 pub(crate) struct Commit {
     pub(crate) id: String,
     pub(crate) change_id: String,
-    pub(crate) change_set_id: String,
     pub(crate) parent_ids: Vec<String>,
     pub(crate) author_account_ids: Vec<String>,
     pub(crate) created_at: String,
@@ -20,7 +19,6 @@ impl Commit {
         StoredCommitBorrowed {
             id: &self.id,
             change_id: &self.change_id,
-            change_set_id: &self.change_set_id,
             parent_ids: &self.parent_ids,
             author_account_ids: &self.author_account_ids,
             created_at: &self.created_at,
@@ -35,7 +33,6 @@ impl Commit {
 pub(crate) struct StoredCommitBorrowed<'a> {
     pub(crate) id: &'a str,
     pub(crate) change_id: &'a str,
-    pub(crate) change_set_id: &'a str,
     pub(crate) parent_ids: &'a [String],
     pub(crate) author_account_ids: &'a [String],
     pub(crate) created_at: &'a str,
@@ -48,7 +45,6 @@ pub(crate) struct StoredCommitBorrowed<'a> {
 pub(crate) struct CommitDraftBorrowed<'a> {
     pub(crate) id: &'a str,
     pub(crate) change_id: &'a str,
-    pub(crate) change_set_id: &'a str,
     pub(crate) parent_ids: &'a [String],
     pub(crate) author_account_ids: &'a [String],
     pub(crate) created_at: &'a str,
