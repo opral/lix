@@ -1,7 +1,7 @@
 use crate::binary_cas::{BinaryCasContext, BlobHash, BlobWrite};
 use crate::commit_graph::CommitGraphChangeHistoryRequest;
 use crate::commit_store::{
-    Change, ChangeScanRequest, CommitDraftBorrowed, CommitStoreContext, MaterializedChange,
+    Change, ChangeScanRequest, CommitDraftRef, CommitStoreContext, MaterializedChange,
 };
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::context::JsonStoreContext;
@@ -2349,7 +2349,7 @@ pub async fn prepare_changelog_codec(
     let changes = changelog_changes(config);
     let encoded_changes = changes
         .iter()
-        .map(|change| crate::commit_store::codec::encode_change_borrowed(change.as_ref()))
+        .map(|change| crate::commit_store::codec::encode_change_ref(change.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ChangelogCodecFixture {
         changes,
@@ -2417,7 +2417,7 @@ pub async fn changelog_encode_only_prepared(
     let mut verified_rows = 0;
     let mut encoded_bytes = 0;
     for change in &fixture.changes {
-        encoded_bytes += crate::commit_store::codec::encode_change_borrowed(change.as_ref())?.len();
+        encoded_bytes += crate::commit_store::codec::encode_change_ref(change.as_ref())?.len();
         verified_rows += 1;
     }
     Ok(report(
@@ -3568,7 +3568,7 @@ async fn append_changelog_changes(
             let mut writer = context.writer(&mut transaction_ref, &mut writes);
             writer
                 .stage_commit_draft(
-                    CommitDraftBorrowed {
+                    CommitDraftRef {
                         id: "bench-changelog-commit-0",
                         change_id: "bench-changelog-header-change-0",
                         parent_ids: &parent_ids,

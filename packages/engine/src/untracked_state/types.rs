@@ -35,7 +35,7 @@ impl UntrackedStateRow {
     }
 }
 
-/// Borrowed untracked-state write row.
+/// Zero-copy view of untracked-state write row.
 ///
 /// Untracked state owns this storage-facing write shape. Callers adapt into it
 /// without making untracked_state depend on transaction or live-state types.

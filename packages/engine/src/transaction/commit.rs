@@ -1,5 +1,5 @@
 use crate::binary_cas::BinaryCasContext;
-use crate::commit_store::{ChangeBorrowed, CommitDraftBorrowed, CommitStoreContext};
+use crate::commit_store::{ChangeRef, CommitDraftRef, CommitStoreContext};
 use crate::functions::FunctionContext;
 #[cfg(test)]
 use crate::json_store::{JsonStoreContext, JsonStoreWriter, NormalizedJson};
@@ -234,14 +234,14 @@ async fn stage_commit_store_commits(
             .unwrap_or_default();
         let mut authored_changes = Vec::with_capacity(state_row_indices.len());
         for &row_index in state_row_indices {
-            authored_changes.push(change_borrowed_from_state_row(&state_rows[row_index])?);
+            authored_changes.push(change_ref_from_state_row(&state_rows[row_index])?);
         }
         let mut adopted_changes = Vec::with_capacity(adopted_row_indices.len());
         for &row_index in adopted_row_indices {
-            adopted_changes.push(change_borrowed_from_adopted_row(&adopted_rows[row_index]));
+            adopted_changes.push(change_ref_from_adopted_row(&adopted_rows[row_index]));
         }
 
-        let commit = CommitDraftBorrowed {
+        let commit = CommitDraftRef {
             id: &commit_row.commit_id,
             change_id: &commit_row.change_id,
             parent_ids: &commit_row.parent_commit_ids,
@@ -257,7 +257,7 @@ async fn stage_commit_store_commits(
     Ok(())
 }
 
-fn change_borrowed_from_state_row(row: &PreparedStateRow) -> Result<ChangeBorrowed<'_>, LixError> {
+fn change_ref_from_state_row(row: &PreparedStateRow) -> Result<ChangeRef<'_>, LixError> {
     let Some(change_id) = row.change_id.as_deref() else {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -265,7 +265,7 @@ fn change_borrowed_from_state_row(row: &PreparedStateRow) -> Result<ChangeBorrow
         ));
     };
 
-    Ok(ChangeBorrowed {
+    Ok(ChangeRef {
         id: change_id,
         entity_id: &row.entity_id,
         schema_key: &row.schema_key,
@@ -276,8 +276,8 @@ fn change_borrowed_from_state_row(row: &PreparedStateRow) -> Result<ChangeBorrow
     })
 }
 
-fn change_borrowed_from_adopted_row(row: &PreparedAdoptedStateRow) -> ChangeBorrowed<'_> {
-    ChangeBorrowed {
+fn change_ref_from_adopted_row(row: &PreparedAdoptedStateRow) -> ChangeRef<'_> {
+    ChangeRef {
         id: &row.change_id,
         entity_id: &row.entity_id,
         schema_key: &row.schema_key,

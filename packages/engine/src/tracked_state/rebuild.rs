@@ -91,7 +91,7 @@ mod tests {
 
     use crate::backend::testing::UnitTestBackend;
     use crate::commit_graph::CommitGraphContext;
-    use crate::commit_store::{Change, ChangeBorrowed, CommitDraftBorrowed, CommitStoreContext};
+    use crate::commit_store::{Change, ChangeRef, CommitDraftRef, CommitStoreContext};
     use crate::json_store::JsonStoreContext;
     use crate::storage::{StorageContext, StorageWriteSet};
     use crate::tracked_state::{
@@ -634,7 +634,7 @@ mod tests {
                 .expect("commit fixture should have id")
                 .to_string();
             let author_account_ids = Vec::new();
-            let commit = CommitDraftBorrowed {
+            let commit = CommitDraftRef {
                 id: &commit_id,
                 change_id: &change.change.id,
                 parent_ids: &change.parent_commit_ids,
@@ -648,9 +648,9 @@ mod tests {
                     .get(change_id.as_str())
                     .expect("commit fixture member change should exist");
                 if authored_change_ids.insert(change_id) {
-                    authored_changes.push(change_borrowed_from_canonical(change.as_ref()));
+                    authored_changes.push(change_ref_from_canonical(change.as_ref()));
                 } else {
-                    adopted_changes.push(change_borrowed_from_canonical(change.as_ref()));
+                    adopted_changes.push(change_ref_from_canonical(change.as_ref()));
                 }
             }
             commit_store
@@ -666,8 +666,8 @@ mod tests {
         tx.commit().await.expect("transaction should commit");
     }
 
-    fn change_borrowed_from_canonical<'a>(change: ChangeBorrowed<'a>) -> ChangeBorrowed<'a> {
-        ChangeBorrowed {
+    fn change_ref_from_canonical<'a>(change: ChangeRef<'a>) -> ChangeRef<'a> {
+        ChangeRef {
             id: change.id,
             entity_id: change.entity_id,
             schema_key: change.schema_key,

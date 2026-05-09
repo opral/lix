@@ -46,7 +46,7 @@ pub(crate) struct TrackedStateKey {
     pub(crate) entity_id: EntityIdentity,
 }
 
-/// Borrowed primary tracked-state key.
+/// Zero-copy view of primary tracked-state key.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TrackedStateKeyRef<'a> {
     pub(crate) schema_key: &'a str,
@@ -92,7 +92,7 @@ impl TrackedStateValue {
     }
 }
 
-/// Borrowed tracked-state value.
+/// Zero-copy view of tracked-state value.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TrackedStateValueRef<'a> {
     pub(crate) snapshot_ref: Option<&'a JsonRef>,
@@ -104,7 +104,7 @@ pub(crate) struct TrackedStateValueRef<'a> {
     pub(crate) deleted: bool,
 }
 
-/// Borrowed tracked-state write row.
+/// Zero-copy view of tracked-state write row.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TrackedStateRowRef<'a> {
     pub(crate) key: TrackedStateKeyRef<'a>,

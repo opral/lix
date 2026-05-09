@@ -224,7 +224,7 @@ mod tests {
 
     use crate::backend::testing::UnitTestBackend;
     use crate::commit_graph::CommitGraphContext;
-    use crate::commit_store::{Change, CommitDraftBorrowed, CommitStoreContext};
+    use crate::commit_store::{Change, CommitDraftRef, CommitStoreContext};
     use crate::storage::{StorageContext, StorageWriteSet};
     use crate::LixError;
 
@@ -713,7 +713,7 @@ mod tests {
                 .expect("commit fixture should have single id")
                 .to_string();
             let author_account_ids = Vec::new();
-            let commit = CommitDraftBorrowed {
+            let commit = CommitDraftRef {
                 id: &commit_id,
                 change_id: &change.change.id,
                 parent_ids: &change.parent_commit_ids,

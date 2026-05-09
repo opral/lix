@@ -15,8 +15,8 @@ pub(crate) struct Commit {
 }
 
 impl Commit {
-    pub(crate) fn as_borrowed(&self) -> StoredCommitBorrowed<'_> {
-        StoredCommitBorrowed {
+    pub(crate) fn as_ref(&self) -> StoredCommitRef<'_> {
+        StoredCommitRef {
             id: &self.id,
             change_id: &self.change_id,
             parent_ids: &self.parent_ids,
@@ -28,9 +28,9 @@ impl Commit {
     }
 }
 
-/// Borrowed write-boundary view of stored [`Commit`] bytes.
+/// Zero-copy view of stored [`Commit`] bytes.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct StoredCommitBorrowed<'a> {
+pub(crate) struct StoredCommitRef<'a> {
     pub(crate) id: &'a str,
     pub(crate) change_id: &'a str,
     pub(crate) parent_ids: &'a [String],
@@ -40,9 +40,9 @@ pub(crate) struct StoredCommitBorrowed<'a> {
     pub(crate) membership_pack_count: u32,
 }
 
-/// Borrowed logical commit supplied by commit producers before physical packing.
+/// Zero-copy view of a logical commit supplied before physical packing.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CommitDraftBorrowed<'a> {
+pub(crate) struct CommitDraftRef<'a> {
     pub(crate) id: &'a str,
     pub(crate) change_id: &'a str,
     pub(crate) parent_ids: &'a [String],
@@ -75,8 +75,8 @@ pub(crate) struct MaterializedChange {
 }
 
 impl Change {
-    pub(crate) fn as_borrowed(&self) -> ChangeBorrowed<'_> {
-        ChangeBorrowed {
+    pub(crate) fn as_ref(&self) -> ChangeRef<'_> {
+        ChangeRef {
             id: &self.id,
             entity_id: &self.entity_id,
             schema_key: &self.schema_key,
@@ -86,16 +86,11 @@ impl Change {
             created_at: &self.created_at,
         }
     }
-
-    #[cfg(any(test, feature = "storage-benches"))]
-    pub(crate) fn as_ref(&self) -> ChangeBorrowed<'_> {
-        self.as_borrowed()
-    }
 }
 
-/// Borrowed write-boundary view of [`Change`].
+/// Zero-copy view of [`Change`].
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ChangeBorrowed<'a> {
+pub(crate) struct ChangeRef<'a> {
     pub(crate) id: &'a str,
     pub(crate) entity_id: &'a EntityIdentity,
     pub(crate) schema_key: &'a str,
@@ -129,7 +124,7 @@ impl ChangePack {
     }
 }
 
-/// Borrowed read view for a decoded [`ChangePack`].
+/// Zero-copy view for a decoded [`ChangePack`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ChangePackView<'a> {
     pub(crate) commit_id: &'a str,
@@ -147,8 +142,8 @@ pub(crate) struct ChangeLocator {
 }
 
 impl ChangeLocator {
-    pub(crate) fn as_borrowed(&self) -> ChangeLocatorBorrowed<'_> {
-        ChangeLocatorBorrowed {
+    pub(crate) fn as_ref(&self) -> ChangeLocatorRef<'_> {
+        ChangeLocatorRef {
             source_commit_id: &self.source_commit_id,
             source_pack_id: self.source_pack_id,
             source_ordinal: self.source_ordinal,
@@ -157,9 +152,9 @@ impl ChangeLocator {
     }
 }
 
-/// Borrowed write-boundary view of [`ChangeLocator`].
+/// Zero-copy view of [`ChangeLocator`].
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ChangeLocatorBorrowed<'a> {
+pub(crate) struct ChangeLocatorRef<'a> {
     pub(crate) source_commit_id: &'a str,
     pub(crate) source_pack_id: u32,
     pub(crate) source_ordinal: u32,
@@ -196,7 +191,7 @@ impl MembershipPack {
     }
 }
 
-/// Borrowed read view for a decoded [`MembershipPack`].
+/// Zero-copy view for a decoded [`MembershipPack`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MembershipPackView<'a> {
     pub(crate) commit_id: &'a str,

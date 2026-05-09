@@ -251,7 +251,7 @@ fn value_type_error(expected: &str, actual: &Value) -> LixError {
     )
 }
 
-/// Borrowed row view with access to the result-set column names.
+/// Zero-copy row view with access to the result-set column names.
 ///
 /// This is the ergonomic path for callers that want `row.get("column")`
 /// without storing column metadata on every owned row.

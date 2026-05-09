@@ -1,6 +1,6 @@
 use crate::commit_store::{
-    Change, ChangeBorrowed, ChangeIndexEntry, ChangeLocator, ChangeScanRequest, Commit,
-    CommitDraftBorrowed, StagedCommitStoreCommit,
+    Change, ChangeIndexEntry, ChangeLocator, ChangeRef, ChangeScanRequest, Commit, CommitDraftRef,
+    StagedCommitStoreCommit,
 };
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::LixError;
@@ -195,9 +195,9 @@ pub(crate) struct CommitStoreWriter<'a, S: ?Sized> {
 }
 
 struct PendingCommitDraft<'a> {
-    commit: CommitDraftBorrowed<'a>,
-    authored_changes: Vec<ChangeBorrowed<'a>>,
-    adopted_changes: Vec<ChangeBorrowed<'a>>,
+    commit: CommitDraftRef<'a>,
+    authored_changes: Vec<ChangeRef<'a>>,
+    adopted_changes: Vec<ChangeRef<'a>>,
 }
 
 impl<S> CommitStoreWriter<'_, S>
@@ -211,9 +211,9 @@ where
     /// locators, and physical namespace writes.
     pub(crate) async fn stage_commit_draft<'a>(
         &mut self,
-        commit: CommitDraftBorrowed<'a>,
-        authored_changes: Vec<ChangeBorrowed<'a>>,
-        adopted_changes: Vec<ChangeBorrowed<'a>>,
+        commit: CommitDraftRef<'a>,
+        authored_changes: Vec<ChangeRef<'a>>,
+        adopted_changes: Vec<ChangeRef<'a>>,
     ) -> Result<StagedCommitStoreCommit, LixError> {
         let mut staged = self
             .stage_commit_drafts([(commit, authored_changes, adopted_changes)])
@@ -229,13 +229,7 @@ where
     /// Validates and stages multiple commit drafts as one commit-store batch.
     pub(crate) async fn stage_commit_drafts<'a>(
         &mut self,
-        commits: impl IntoIterator<
-            Item = (
-                CommitDraftBorrowed<'a>,
-                Vec<ChangeBorrowed<'a>>,
-                Vec<ChangeBorrowed<'a>>,
-            ),
-        >,
+        commits: impl IntoIterator<Item = (CommitDraftRef<'a>, Vec<ChangeRef<'a>>, Vec<ChangeRef<'a>>)>,
     ) -> Result<Vec<StagedCommitStoreCommit>, LixError> {
         let commits = commits
             .into_iter()
@@ -504,7 +498,7 @@ async fn validate_adopted_changes_present<'a>(
         match existing {
             Some(ChangeIndexEntry::PackedChange { locator }) => {
                 let existing_change = load_packed_change(&reader, &locator, expected.id).await?;
-                if !change_matches_borrowed(&existing_change, expected) {
+                if !change_matches_ref(&existing_change, expected) {
                     let entity_id = existing_change
                         .entity_id
                         .as_json_array_text()
@@ -591,7 +585,7 @@ where
     Ok(change)
 }
 
-fn change_matches_borrowed(change: &Change, expected: ChangeBorrowed<'_>) -> bool {
+fn change_matches_ref(change: &Change, expected: ChangeRef<'_>) -> bool {
     change.id == expected.id
         && &change.entity_id == expected.entity_id
         && change.schema_key == expected.schema_key
@@ -617,7 +611,7 @@ mod tests {
 
     use crate::backend::testing::UnitTestBackend;
     use crate::commit_store::{
-        ChangeIndexEntry, ChangeLocator, CommitDraftBorrowed, CommitStoreContext,
+        ChangeIndexEntry, ChangeLocator, CommitDraftRef, CommitStoreContext,
     };
     use crate::entity_identity::EntityIdentity;
     use crate::json_store::JsonRef;
@@ -642,14 +636,14 @@ mod tests {
         CommitStoreContext::new()
             .writer(transaction.as_mut(), &mut writes)
             .stage_commit_draft(
-                CommitDraftBorrowed {
+                CommitDraftRef {
                     id: &commit_id,
                     change_id: &commit_change_id,
                     parent_ids: &parent_ids,
                     author_account_ids: &author_account_ids,
                     created_at: "2026-01-01T00:00:00Z",
                 },
-                vec![authored_change.as_borrowed()],
+                vec![authored_change.as_ref()],
                 Vec::new(),
             )
             .await
@@ -727,7 +721,7 @@ mod tests {
             storage.clone(),
             "source-commit",
             "source-commit-change",
-            vec![authored_change.as_borrowed()],
+            vec![authored_change.as_ref()],
             Vec::new(),
         )
         .await;
@@ -736,7 +730,7 @@ mod tests {
             "adopting-commit",
             "adopting-commit-change",
             Vec::new(),
-            vec![authored_change.as_borrowed()],
+            vec![authored_change.as_ref()],
         )
         .await;
 
@@ -770,8 +764,8 @@ mod tests {
         storage: StorageContext,
         commit_id: &str,
         commit_change_id: &str,
-        authored_changes: Vec<ChangeBorrowed<'_>>,
-        adopted_changes: Vec<ChangeBorrowed<'_>>,
+        authored_changes: Vec<ChangeRef<'_>>,
+        adopted_changes: Vec<ChangeRef<'_>>,
     ) {
         let mut transaction = storage
             .begin_write_transaction()
@@ -784,7 +778,7 @@ mod tests {
         CommitStoreContext::new()
             .writer(transaction.as_mut(), &mut writes)
             .stage_commit_draft(
-                CommitDraftBorrowed {
+                CommitDraftRef {
                     id: commit_id,
                     change_id: commit_change_id,
                     parent_ids: &parent_ids,
