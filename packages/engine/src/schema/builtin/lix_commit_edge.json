@@ -1,45 +1,53 @@
 {
   "x-lix-key": "lix_commit_edge",
-  "x-lix-primary-key": [
-    "/parent_id",
-    "/child_id"
+  "description": "Direct parent relationship between two commits. Merge commits have one row per parent. The first parent is useful for showing mainline history or comparing a merge commit against the commit that was checked out before the merge.",
+  "examples": [
+    {
+      "parent_id": "commit-main",
+      "child_id": "commit-merge",
+      "parent_order": 0
+    },
+    {
+      "parent_id": "commit-feature",
+      "child_id": "commit-merge",
+      "parent_order": 1
+    }
   ],
+  "x-lix-primary-key": ["/child_id", "/parent_order"],
+  "x-lix-unique": [["/parent_id", "/child_id"]],
   "x-lix-foreign-keys": [
     {
-      "properties": [
-        "/parent_id"
-      ],
+      "properties": ["/parent_id"],
       "references": {
         "schemaKey": "lix_commit",
-        "properties": [
-          "/id"
-        ]
+        "properties": ["/id"]
       }
     },
     {
-      "properties": [
-        "/child_id"
-      ],
+      "properties": ["/child_id"],
       "references": {
         "schemaKey": "lix_commit",
-        "properties": [
-          "/id"
-        ]
+        "properties": ["/id"]
       }
     }
   ],
   "type": "object",
   "properties": {
     "parent_id": {
-      "type": "string"
+      "type": "string",
+      "description": "Identifier of the parent commit."
     },
     "child_id": {
-      "type": "string"
+      "type": "string",
+      "description": "Identifier of the child commit."
+    },
+    "parent_order": {
+      "type": "integer",
+      "minimum": 0,
+      "examples": [0, 1],
+      "description": "Zero-based position of this parent in the child commit's ordered parent list. The first parent has order 0; additional merge parents have order 1, 2, and so on."
     }
   },
-  "required": [
-    "parent_id",
-    "child_id"
-  ],
+  "required": ["parent_id", "child_id", "parent_order"],
   "additionalProperties": false
 }

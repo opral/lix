@@ -126,17 +126,15 @@ where
                         .flatten()
                         .map(commit_header_change)
                 }
-                Some(ChangeIndexEntry::PackedChange { locator }) => {
-                    Some(
-                        load_change_by_locator_cached(
-                            &mut *store,
-                            &mut packs_by_locator,
-                            &locator,
-                            change_id,
-                        )
-                        .await?,
+                Some(ChangeIndexEntry::PackedChange { locator }) => Some(
+                    load_change_by_locator_cached(
+                        &mut *store,
+                        &mut packs_by_locator,
+                        &locator,
+                        change_id,
                     )
-                }
+                    .await?,
+                ),
                 None => None,
             });
         }
@@ -639,7 +637,6 @@ mod tests {
         let author_account_ids = vec!["author-1".to_string()];
         let commit_id = "commit-1".to_string();
         let commit_change_id = "commit-change-1".to_string();
-        let change_set_id = "change-set-1".to_string();
         let authored_change = test_change("change-1");
 
         CommitStoreContext::new()
@@ -648,7 +645,6 @@ mod tests {
                 CommitDraftBorrowed {
                     id: &commit_id,
                     change_id: &commit_change_id,
-                    change_set_id: &change_set_id,
                     parent_ids: &parent_ids,
                     author_account_ids: &author_account_ids,
                     created_at: "2026-01-01T00:00:00Z",
@@ -731,7 +727,6 @@ mod tests {
             storage.clone(),
             "source-commit",
             "source-commit-change",
-            "source-change-set",
             vec![authored_change.as_borrowed()],
             Vec::new(),
         )
@@ -740,7 +735,6 @@ mod tests {
             storage.clone(),
             "adopting-commit",
             "adopting-commit-change",
-            "adopting-change-set",
             Vec::new(),
             vec![authored_change.as_borrowed()],
         )
@@ -776,7 +770,6 @@ mod tests {
         storage: StorageContext,
         commit_id: &str,
         commit_change_id: &str,
-        change_set_id: &str,
         authored_changes: Vec<ChangeBorrowed<'_>>,
         adopted_changes: Vec<ChangeBorrowed<'_>>,
     ) {
@@ -794,7 +787,6 @@ mod tests {
                 CommitDraftBorrowed {
                     id: commit_id,
                     change_id: commit_change_id,
-                    change_set_id,
                     parent_ids: &parent_ids,
                     author_account_ids: &author_account_ids,
                     created_at: "2026-01-01T00:00:00Z",

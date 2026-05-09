@@ -2,9 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::commit_graph::walker::{best_common_ancestors, walk_reachable_commits};
 use crate::commit_graph::{
-    CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphChangeSet,
-    CommitGraphChangeSetElement, CommitGraphCommit, CommitGraphEdge, CommitGraphEntity,
-    CommitGraphReader, ReachableCommitGraphCommit,
+    CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
+    CommitGraphEdge, CommitGraphEntity, CommitGraphReader, ReachableCommitGraphCommit,
 };
 use crate::commit_store::{Change, Commit, CommitStoreContext, CommitStoreReader};
 use crate::entity_identity::EntityIdentity;
@@ -151,46 +150,15 @@ where
         commits
             .iter()
             .flat_map(|commit| {
-                commit
-                    .parent_commit_ids
-                    .iter()
-                    .map(|parent_commit_id| CommitGraphEdge {
+                commit.parent_commit_ids.iter().enumerate().map(
+                    |(parent_order, parent_commit_id)| CommitGraphEdge {
                         parent_commit_id: parent_commit_id.clone(),
                         child_commit_id: commit.commit_id.clone(),
-                    })
+                        parent_order: parent_order as u32,
+                    },
+                )
             })
             .collect()
-    }
-
-    /// Derives one change-set row for each parsed commit.
-    pub(crate) fn change_sets(&self, commits: &[CommitGraphCommit]) -> Vec<CommitGraphChangeSet> {
-        commits
-            .iter()
-            .map(|commit| CommitGraphChangeSet {
-                id: commit.change_set_id.clone(),
-                commit_id: commit.commit_id.clone(),
-            })
-            .collect()
-    }
-
-    /// Loads the canonical changes introduced/adopted by each commit's change set.
-    pub(crate) async fn change_set_elements(
-        &mut self,
-        commits: &[CommitGraphCommit],
-    ) -> Result<Vec<CommitGraphChangeSetElement>, LixError> {
-        let mut elements = Vec::new();
-        for commit in commits {
-            for change_id in &commit.change_ids {
-                let change = self
-                    .load_member_change(change_id, &commit.commit_id)
-                    .await?;
-                elements.push(CommitGraphChangeSetElement {
-                    change_set_id: commit.change_set_id.clone(),
-                    change,
-                });
-            }
-        }
-        Ok(elements)
     }
 
     /// Returns canonical changes reachable from `start_commit_id`.
@@ -299,28 +267,6 @@ where
             .collect())
     }
 
-    async fn load_member_change(
-        &mut self,
-        change_id: &str,
-        source_commit_id: &str,
-    ) -> Result<Change, LixError> {
-        let change_ids = vec![change_id.to_string()];
-        Ok(self
-            .load_canonical_changes(&change_ids)
-            .await?
-            .into_iter()
-            .next()
-            .flatten()
-            .ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "commit_graph commit '{source_commit_id}' references missing change '{change_id}'"
-                    ),
-                )
-            })?)
-    }
-
     async fn graph_commit_from_store_commit(
         &mut self,
         commit: Commit,
@@ -413,17 +359,6 @@ where
         CommitGraphStoreReader::commit_edges(self, commits)
     }
 
-    fn change_sets(&self, commits: &[CommitGraphCommit]) -> Vec<CommitGraphChangeSet> {
-        CommitGraphStoreReader::change_sets(self, commits)
-    }
-
-    async fn change_set_elements(
-        &mut self,
-        commits: &[CommitGraphCommit],
-    ) -> Result<Vec<CommitGraphChangeSetElement>, LixError> {
-        CommitGraphStoreReader::change_set_elements(self, commits).await
-    }
-
     async fn change_history_from_commit(
         &mut self,
         start_commit_id: &str,
@@ -514,7 +449,6 @@ fn commit_graph_commit_from_store_commit(
         canonical_change: change.clone(),
         change,
         commit_id: commit.id,
-        change_set_id: commit.change_set_id,
         change_ids,
         author_account_ids: commit.author_account_ids,
         parent_commit_ids: commit.parent_ids,
@@ -588,7 +522,6 @@ mod tests {
             .expect("commit should exist");
 
         assert_eq!(commit.commit_id, "commit-1");
-        assert_eq!(commit.change_set_id, "change-set-1");
         assert_eq!(commit.change_ids, vec!["change-1", "change-2"]);
         assert_eq!(commit.parent_commit_ids, vec!["parent-1"]);
         assert_eq!(commit.change.id, "commit-1-change");
@@ -698,63 +631,14 @@ mod tests {
                 .iter()
                 .map(|edge| (
                     edge.parent_commit_id.as_str(),
-                    edge.child_commit_id.as_str()
+                    edge.child_commit_id.as_str(),
+                    edge.parent_order,
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                ("commit-left", "commit-head"),
-                ("commit-right", "commit-head")
+                ("commit-left", "commit-head", 0),
+                ("commit-right", "commit-head", 1)
             ]
-        );
-    }
-
-    #[tokio::test]
-    async fn change_sets_are_derived_from_commits() {
-        let graph = CommitGraphContext::new();
-        let reader = graph.reader(StorageContext::new(Arc::new(UnitTestBackend::new())));
-        let commits = vec![parsed_commit("commit-1", &[], &[])];
-
-        let change_sets = reader.change_sets(&commits);
-
-        assert_eq!(change_sets.len(), 1);
-        assert_eq!(change_sets[0].id, "change-set-1");
-        assert_eq!(change_sets[0].commit_id, "commit-1");
-    }
-
-    #[tokio::test]
-    async fn change_set_elements_load_member_changes() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
-        append_changes(
-            storage.clone(),
-            &[
-                entity_change("change-1", "entity-1", "example", "{}"),
-                commit_change("commit-1-change", "commit-1", &["change-1"], &[]),
-            ],
-        )
-        .await;
-
-        let graph = CommitGraphContext::new();
-        let mut reader = graph.reader(storage);
-        let commits = reader
-            .all_commits()
-            .await
-            .expect("commit scan should succeed");
-        let elements = reader
-            .change_set_elements(&commits)
-            .await
-            .expect("change-set elements should load");
-
-        assert_eq!(elements.len(), 1);
-        assert_eq!(elements[0].change_set_id, "change-set-1");
-        assert_eq!(elements[0].change.id, "change-1");
-        assert_eq!(
-            elements[0]
-                .change
-                .entity_id
-                .as_single_string_owned()
-                .expect("entity id should project"),
-            "entity-1"
         );
     }
 
@@ -1309,7 +1193,6 @@ mod tests {
         commit_change_ids: Vec<String>,
         parent_commit_ids: Vec<String>,
         author_account_ids: Vec<String>,
-        change_set_id: String,
     }
 
     impl TestChange {
@@ -1332,7 +1215,6 @@ mod tests {
                 commit_change_ids: change_ids.iter().map(|id| id.to_string()).collect(),
                 parent_commit_ids: parent_commit_ids.iter().map(|id| id.to_string()).collect(),
                 author_account_ids: Vec::new(),
-                change_set_id: "change-set-1".to_string(),
             }
         }
 
@@ -1359,7 +1241,6 @@ mod tests {
                 commit_change_ids: Vec::new(),
                 parent_commit_ids: Vec::new(),
                 author_account_ids: Vec::new(),
-                change_set_id: String::new(),
             }
         }
 
@@ -1395,7 +1276,6 @@ mod tests {
                     .as_single_string()
                     .expect("commit fixture should use single entity id")
                     .to_string(),
-                change_set_id: change.change_set_id.clone(),
                 change_ids: change.commit_change_ids.clone(),
                 author_account_ids: change.author_account_ids.clone(),
                 parent_commit_ids: change.parent_commit_ids.clone(),
@@ -1405,7 +1285,6 @@ mod tests {
             let commit_draft = CommitDraftBorrowed {
                 id: &commit.commit_id,
                 change_id: &commit.canonical_change.id,
-                change_set_id: &commit.change_set_id,
                 parent_ids: &parent_commit_ids,
                 author_account_ids: &author_account_ids,
                 created_at: &commit.canonical_change.created_at,
@@ -1495,7 +1374,6 @@ mod tests {
             canonical_change: fixture.change.clone(),
             change: fixture.change,
             commit_id: commit_id.to_string(),
-            change_set_id: "change-set-1".to_string(),
             change_ids: change_ids
                 .iter()
                 .map(|change_id| change_id.to_string())

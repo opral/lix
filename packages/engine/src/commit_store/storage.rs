@@ -23,7 +23,6 @@ pub(crate) fn stage_commit(
     let stored_commit = StoredCommitBorrowed {
         id: commit.id,
         change_id: commit.change_id,
-        change_set_id: commit.change_set_id,
         parent_ids: commit.parent_ids,
         author_account_ids: commit.author_account_ids,
         created_at: commit.created_at,
@@ -184,7 +183,10 @@ pub(crate) async fn load_change_index_entries(
             let Some(changes) = load_change_pack(store, &commit.id, pack_id).await? else {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    format!("commit-store missing change pack ({}, {pack_id})", commit.id),
+                    format!(
+                        "commit-store missing change pack ({}, {pack_id})",
+                        commit.id
+                    ),
                 ));
             };
             for (source_ordinal, change) in changes.iter().enumerate() {
@@ -315,7 +317,6 @@ mod tests {
             CommitDraftBorrowed {
                 id: &commit.id,
                 change_id: &commit.change_id,
-                change_set_id: &commit.change_set_id,
                 parent_ids: &commit.parent_ids,
                 author_account_ids: &commit.author_account_ids,
                 created_at: &commit.created_at,
@@ -390,7 +391,6 @@ mod tests {
         Commit {
             id: "commit-1".to_string(),
             change_id: "commit-change-1".to_string(),
-            change_set_id: "change-set-1".to_string(),
             parent_ids: vec!["parent-1".to_string()],
             author_account_ids: Vec::new(),
             created_at: "2026-01-01T00:00:00Z".to_string(),

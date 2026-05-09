@@ -1402,7 +1402,6 @@ pub struct ChangelogCodecFixture {
 }
 
 pub struct CommitGraphReadFixture {
-    commits: Vec<crate::commit_graph::CommitGraphCommit>,
     head_commit_id: String,
     rows: usize,
 }
@@ -2593,24 +2592,10 @@ pub async fn prepare_commit_graph_read(
     ));
     append_changelog_changes(backend, &changelog, &changes).await?;
 
-    let graph = crate::commit_graph::CommitGraphContext::new();
-    let mut reader = graph.reader(StorageContext::new(Arc::clone(backend)));
-    let commits = reader.all_commits().await?;
     Ok(CommitGraphReadFixture {
-        commits,
         head_commit_id,
         rows: config.rows,
     })
-}
-
-pub async fn commit_graph_change_set_elements_prepared(
-    backend: &Arc<dyn Backend + Send + Sync>,
-    fixture: &CommitGraphReadFixture,
-) -> Result<StorageBenchReport, LixError> {
-    let graph = crate::commit_graph::CommitGraphContext::new();
-    let mut reader = graph.reader(StorageContext::new(Arc::clone(backend)));
-    let verified_rows = reader.change_set_elements(&fixture.commits).await?.len();
-    Ok(report(fixture.rows, verified_rows, Duration::ZERO))
 }
 
 pub async fn commit_graph_change_history_from_commit_prepared(
@@ -3586,7 +3571,6 @@ async fn append_changelog_changes(
                     CommitDraftBorrowed {
                         id: "bench-changelog-commit-0",
                         change_id: "bench-changelog-header-change-0",
-                        change_set_id: "bench-changelog-change-set-0",
                         parent_ids: &parent_ids,
                         author_account_ids: &author_account_ids,
                         created_at: "2024-01-01T00:00:00.000Z",
@@ -3731,15 +3715,8 @@ fn changelog_materialized_changes(config: StorageBenchConfig) -> Vec<Materialize
 }
 
 fn commit_graph_materialized_commit_change(commit_id: &str, rows: usize) -> MaterializedChange {
-    let change_ids = (0..rows)
-        .map(|index| format!("bench-change-{index}"))
-        .collect::<Vec<_>>();
     let snapshot_content = serde_json::json!({
         "id": commit_id,
-        "change_set_id": "bench-change-set",
-        "change_ids": change_ids,
-        "author_account_ids": ["bench-author"],
-        "parent_commit_ids": []
     })
     .to_string();
 

@@ -1,6 +1,7 @@
 #[macro_use]
 #[path = "support/mod.rs"]
 mod support;
+
 use lix_engine::Value;
 use lix_engine::{
     CreateVersionOptions, Engine, LixError, MergeChangeStats, MergeVersionOptions,
@@ -723,10 +724,9 @@ simulation_test!(
                 .expect("global session should open"),
             &engine,
         );
-        let source_snapshot = load_commit_snapshot(&global, &source_head).await;
         assert_eq!(
-            json_string_array(&source_snapshot, "parent_commit_ids"),
-            vec![target_head_before],
+            commit_parent_edges(&global, &source_head).await,
+            vec![(target_head_before, 0)],
             "fast-forward should not create a two-parent merge commit"
         );
     }
@@ -815,23 +815,10 @@ simulation_test!(
                 .expect("global session should open"),
             &engine,
         );
-        let commit_snapshot = load_commit_snapshot(&global, &target_head_after).await;
-        let parent_commit_ids = commit_snapshot
-            .get("parent_commit_ids")
-            .and_then(JsonValue::as_array)
-            .expect("merge commit should declare parent_commit_ids")
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .expect("parent commit id should be text")
-                    .to_string()
-            })
-            .collect::<Vec<_>>();
         assert_eq!(
-            parent_commit_ids,
-            vec![target_head_before, source_head],
-            "merge commit should parent first to the old target head, then to the source head"
+            commit_parent_edges(&global, &target_head_after).await,
+            vec![(target_head_before, 0), (source_head, 1)],
+            "merge commit should preserve target as first parent and source as second parent"
         );
     }
 );
@@ -854,27 +841,16 @@ simulation_test!(
             .await
             .expect("draft write should succeed");
 
-        let source_head = engine
-            .load_version_head_commit_id("draft-version")
-            .await
-            .expect("draft head should load")
-            .expect("draft head should exist");
-        let source_change_id = select_single_text(
-            &draft,
-            "SELECT lixcol_change_id FROM lix_key_value WHERE key = 'merge-adopt-change'",
-        )
-        .await;
-
         let receipt = main
             .merge_version(MergeVersionOptions {
                 source_version_id: "draft-version".to_string(),
             })
             .await
             .expect("merge should apply source change");
-        let merge_commit_id = receipt
-            .created_merge_commit_id
-            .as_deref()
-            .expect("non-empty merge should create a merge commit");
+        assert!(
+            receipt.created_merge_commit_id.is_some(),
+            "non-empty merge should create a merge commit"
+        );
 
         let global = sim.wrap_session(
             engine
@@ -883,21 +859,6 @@ simulation_test!(
                 .expect("global session should open"),
             &engine,
         );
-        let merge_snapshot = load_commit_snapshot(&global, merge_commit_id).await;
-        let merge_change_ids = json_string_array(&merge_snapshot, "change_ids");
-        assert_eq!(
-            merge_change_ids,
-            vec![source_change_id.clone()],
-            "merge commit should adopt the source change id, not mint an equivalent copy"
-        );
-
-        let source_snapshot = load_commit_snapshot(&global, &source_head).await;
-        assert_eq!(
-            json_string_array(&source_snapshot, "change_ids"),
-            vec![source_change_id.clone()],
-            "source commit should remain the original owner of the canonical source change"
-        );
-
         let equivalent_change_count = select_single_integer(
             &global,
             "SELECT count(*) \
@@ -1661,21 +1622,6 @@ fn assert_merge_conflict_error(error: &lix_engine::LixError) {
     );
 }
 
-async fn select_single_text(
-    session: &crate::support::simulation_test::engine::SimSession,
-    sql: &str,
-) -> String {
-    let result = session
-        .execute(sql, &[])
-        .await
-        .expect("query should succeed");
-    assert_eq!(result.len(), 1, "expected exactly one row for query: {sql}");
-    let Value::Text(value) = &result.rows()[0].values()[0] else {
-        panic!("expected text value for query: {sql}");
-    };
-    value.clone()
-}
-
 async fn select_single_integer(
     session: &crate::support::simulation_test::engine::SimSession,
     sql: &str,
@@ -1691,27 +1637,35 @@ async fn select_single_integer(
     value
 }
 
-async fn load_commit_snapshot(
+async fn commit_parent_edges(
     session: &crate::support::simulation_test::engine::SimSession,
     commit_id: &str,
-) -> JsonValue {
+) -> Vec<(String, i64)> {
     let result = session
         .execute(
             &format!(
-                "SELECT snapshot_content \
-	             FROM lix_state \
-	             WHERE schema_key = 'lix_commit' AND entity_id = lix_json('[\"{commit_id}\"]')"
+                "SELECT parent_id, parent_order \
+                 FROM lix_commit_edge \
+                 WHERE child_id = '{commit_id}' \
+                 ORDER BY parent_order"
             ),
             &[],
         )
         .await
-        .expect("commit row should read");
-    let rows = result;
-    assert_eq!(rows.len(), 1);
-    let Value::Json(snapshot_content) = &rows.rows()[0].values()[0] else {
-        panic!("commit snapshot should be JSON");
-    };
-    snapshot_content.clone()
+        .expect("commit edges should read");
+    result
+        .rows()
+        .iter()
+        .map(|row| {
+            let Value::Text(value) = &row.values()[0] else {
+                panic!("parent_id should be text");
+            };
+            let Value::Integer(parent_order) = row.values()[1] else {
+                panic!("parent_order should be integer");
+            };
+            (value.clone(), parent_order)
+        })
+        .collect()
 }
 
 async fn assert_empty_merge_commit(
@@ -1742,30 +1696,15 @@ async fn assert_empty_merge_commit(
             .expect("global session should open"),
         engine,
     );
-    let commit_snapshot = load_commit_snapshot(&global, merge_commit_id).await;
     assert_eq!(
-        json_string_array(&commit_snapshot, "change_ids"),
-        Vec::<String>::new(),
-        "empty merge commit should not claim state changes"
-    );
-    assert_eq!(
-        json_string_array(&commit_snapshot, "parent_commit_ids"),
-        vec![target_head_before.to_string(), source_head.to_string()],
+        commit_parent_edges(&global, merge_commit_id)
+            .await
+            .into_iter()
+            .map(|(parent_id, _)| parent_id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [target_head_before.to_string(), source_head.to_string()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
         "empty merge commit should preserve target/source ancestry"
     );
-}
-
-fn json_string_array(snapshot: &JsonValue, key: &str) -> Vec<String> {
-    snapshot
-        .get(key)
-        .and_then(JsonValue::as_array)
-        .unwrap_or_else(|| panic!("snapshot field '{key}' should be an array"))
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .unwrap_or_else(|| panic!("snapshot field '{key}' should contain strings"))
-                .to_string()
-        })
-        .collect()
 }

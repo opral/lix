@@ -2398,10 +2398,7 @@ fn schema_exposed_as_entity_surface(schema_key: &str) -> bool {
 }
 
 fn schema_exposed_as_entity_history_surface(schema_key: &str) -> bool {
-    !matches!(
-        schema_key,
-        "lix_commit" | "lix_commit_edge" | "lix_change_set" | "lix_change_set_element"
-    )
+    !matches!(schema_key, "lix_commit" | "lix_commit_edge")
 }
 
 fn entity_column_type_from_schema(schema: &JsonValue) -> Option<EntityColumnType> {

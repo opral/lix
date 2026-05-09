@@ -542,7 +542,6 @@ mod tests {
         snapshot_content: Option<String>,
         commit_change_ids: Vec<String>,
         parent_commit_ids: Vec<String>,
-        change_set_id: String,
     }
 
     impl TestChange {
@@ -565,7 +564,6 @@ mod tests {
                 snapshot_content: None,
                 commit_change_ids: change_ids.iter().map(|id| id.to_string()).collect(),
                 parent_commit_ids: parent_commit_ids.iter().map(|id| id.to_string()).collect(),
-                change_set_id: format!("change-set-{commit_id}"),
             }
         }
 
@@ -589,7 +587,6 @@ mod tests {
                 snapshot_content: snapshot_content.map(str::to_string),
                 commit_change_ids: Vec::new(),
                 parent_commit_ids: Vec::new(),
-                change_set_id: String::new(),
             }
         }
 
@@ -640,7 +637,6 @@ mod tests {
             let commit = CommitDraftBorrowed {
                 id: &commit_id,
                 change_id: &change.change.id,
-                change_set_id: &change.change_set_id,
                 parent_ids: &change.parent_commit_ids,
                 author_account_ids: &author_account_ids,
                 created_at: &change.change.created_at,

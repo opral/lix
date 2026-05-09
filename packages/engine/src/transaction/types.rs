@@ -427,23 +427,16 @@ impl From<PreparedStateRow> for MaterializedUntrackedStateRow {
 pub(crate) struct StagedCommitMembers {
     pub(crate) commit_id: String,
     pub(crate) commit_change_id: String,
-    pub(crate) change_set_id: String,
     pub(crate) created_at: String,
     pub(crate) change_ids: BTreeSet<String>,
     pub(crate) allow_empty: bool,
 }
 
 impl StagedCommitMembers {
-    pub(crate) fn new(
-        commit_id: String,
-        commit_change_id: String,
-        change_set_id: String,
-        created_at: String,
-    ) -> Self {
+    pub(crate) fn new(commit_id: String, commit_change_id: String, created_at: String) -> Self {
         Self {
             commit_id,
             commit_change_id,
-            change_set_id,
             created_at,
             change_ids: BTreeSet::new(),
             allow_empty: false,

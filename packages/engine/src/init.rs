@@ -38,7 +38,6 @@ pub(crate) struct InitSeedPlan {
 struct InitSeedCommit {
     id: String,
     change_id: String,
-    change_set_id: String,
     parent_ids: Vec<String>,
     author_account_ids: Vec<String>,
     created_at: String,
@@ -81,7 +80,6 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     let main_version_id = functions.call_uuid_v7();
     let lix_id = functions.call_uuid_v7();
     let initial_commit_id = functions.call_uuid_v7();
-    let initial_change_set_id = functions.call_uuid_v7();
     let timestamp = functions.call_timestamp();
 
     let mut registered_schema_changes = Vec::new();
@@ -121,7 +119,6 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     let initial_commit = InitSeedCommit {
         id: initial_commit_id.clone(),
         change_id: functions.call_uuid_v7(),
-        change_set_id: initial_change_set_id,
         parent_ids: Vec::new(),
         author_account_ids: Vec::new(),
         created_at: timestamp.clone(),
@@ -201,7 +198,6 @@ pub(crate) async fn initialize(
         let commit = CommitDraftBorrowed {
             id: &plan.commit.id,
             change_id: &plan.commit.change_id,
-            change_set_id: &plan.commit.change_set_id,
             parent_ids: &plan.commit.parent_ids,
             author_account_ids: &plan.commit.author_account_ids,
             created_at: &plan.commit.created_at,
@@ -432,7 +428,7 @@ mod tests {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
 
         assert_eq!(plan.commit.id, plan.receipt.initial_commit_id);
-        assert_eq!(plan.commit.change_set_id, "test-uuid-4");
+        assert_eq!(plan.commit.change_id, "test-uuid-21");
         assert!(plan.commit.parent_ids.is_empty());
         assert!(plan.commit.author_account_ids.is_empty());
         assert_eq!(plan.commit.created_at, "test-timestamp-1");

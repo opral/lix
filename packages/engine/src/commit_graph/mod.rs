@@ -6,7 +6,6 @@ mod walker;
 pub(crate) use context::{CommitGraphContext, CommitGraphStoreReader};
 #[allow(unused_imports)]
 pub(crate) use types::{
-    CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphChangeSet,
-    CommitGraphChangeSetElement, CommitGraphCommit, CommitGraphEdge, CommitGraphEntity,
-    CommitGraphReader, ReachableCommitGraphCommit,
+    CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
+    CommitGraphEdge, CommitGraphEntity, CommitGraphReader, ReachableCommitGraphCommit,
 };

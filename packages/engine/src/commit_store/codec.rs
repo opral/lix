@@ -17,7 +17,6 @@ pub(crate) fn encode_commit_borrowed(
     bytes.extend_from_slice(COMMIT_MAGIC);
     write_str(&mut bytes, commit.id)?;
     write_str(&mut bytes, commit.change_id)?;
-    write_str(&mut bytes, commit.change_set_id)?;
     write_strs(&mut bytes, commit.parent_ids.iter().map(String::as_str))?;
     write_strs(
         &mut bytes,
@@ -34,7 +33,6 @@ pub(crate) fn decode_commit(bytes: &[u8]) -> Result<Commit, LixError> {
     cursor.expect_magic(COMMIT_MAGIC, "commit")?;
     let id = cursor.read_string("id")?;
     let change_id = cursor.read_string("change_id")?;
-    let change_set_id = cursor.read_string("change_set_id")?;
     let parent_ids = cursor.read_strings("parent_ids")?;
     let author_account_ids = cursor.read_strings("author_account_ids")?;
     let created_at = cursor.read_string("created_at")?;
@@ -44,7 +42,6 @@ pub(crate) fn decode_commit(bytes: &[u8]) -> Result<Commit, LixError> {
     Ok(Commit {
         id,
         change_id,
-        change_set_id,
         parent_ids,
         author_account_ids,
         created_at,
@@ -592,7 +589,6 @@ mod tests {
         let commit = Commit {
             id: "commit-1".to_string(),
             change_id: "commit-change-1".to_string(),
-            change_set_id: "change-set-1".to_string(),
             parent_ids: vec!["parent-1".to_string(), "parent-2".to_string()],
             author_account_ids: vec!["author-1".to_string()],
             created_at: "2026-01-01T00:00:00Z".to_string(),

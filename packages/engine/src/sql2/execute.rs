@@ -692,9 +692,8 @@ mod tests {
     };
     use crate::binary_cas::BlobDataReader;
     use crate::commit_graph::{
-        CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphChangeSet,
-        CommitGraphChangeSetElement, CommitGraphCommit, CommitGraphEdge, CommitGraphReader,
-        ReachableCommitGraphCommit,
+        CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
+        CommitGraphEdge, CommitGraphReader, ReachableCommitGraphCommit,
     };
     use crate::commit_store::CommitStoreContext;
     use crate::functions::{
@@ -1028,17 +1027,6 @@ mod tests {
 
         fn commit_edges(&self, _commits: &[CommitGraphCommit]) -> Vec<CommitGraphEdge> {
             Vec::new()
-        }
-
-        fn change_sets(&self, _commits: &[CommitGraphCommit]) -> Vec<CommitGraphChangeSet> {
-            Vec::new()
-        }
-
-        async fn change_set_elements(
-            &mut self,
-            _commits: &[CommitGraphCommit],
-        ) -> Result<Vec<CommitGraphChangeSetElement>, LixError> {
-            Ok(Vec::new())
         }
 
         async fn change_history_from_commit(
