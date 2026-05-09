@@ -1,4 +1,4 @@
-use crate::commit_store::{Change, CommitDraftBorrowed, CommitStoreContext};
+use crate::commit_store::{Change, CommitDraftRef, CommitStoreContext};
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{
     FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
@@ -195,7 +195,7 @@ pub(crate) async fn initialize(
         .collect::<Result<Vec<_>, _>>()?;
 
     {
-        let commit = CommitDraftBorrowed {
+        let commit = CommitDraftRef {
             id: &plan.commit.id,
             change_id: &plan.commit.change_id,
             parent_ids: &plan.commit.parent_ids,
@@ -206,7 +206,7 @@ pub(crate) async fn initialize(
         writer
             .stage_commit_draft(
                 commit,
-                authored_changes.iter().map(Change::as_borrowed).collect(),
+                authored_changes.iter().map(Change::as_ref).collect(),
                 Vec::new(),
             )
             .await?;

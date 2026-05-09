@@ -494,7 +494,7 @@ mod tests {
     use crate::backend::testing::UnitTestBackend;
     use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphContext};
     use crate::commit_store::{
-        Change, ChangeBorrowed, ChangeLocator, CommitDraftBorrowed, CommitStoreContext,
+        Change, ChangeLocator, ChangeRef, CommitDraftRef, CommitStoreContext,
     };
     use crate::storage::{StorageContext, StorageWriteSet};
 
@@ -1282,7 +1282,7 @@ mod tests {
             };
             let parent_commit_ids = commit.parent_commit_ids.clone();
             let author_account_ids = commit.author_account_ids.clone();
-            let commit_draft = CommitDraftBorrowed {
+            let commit_draft = CommitDraftRef {
                 id: &commit.commit_id,
                 change_id: &commit.canonical_change.id,
                 parent_ids: &parent_commit_ids,
@@ -1296,9 +1296,9 @@ mod tests {
             for change_id in &commit.change_ids {
                 if let Some(change) = changes_by_id.get(change_id.as_str()) {
                     if authored_change_ids.insert(change_id.clone()) {
-                        authored_changes.push(change_borrowed_from_canonical(change.as_ref()));
+                        authored_changes.push(change_ref_from_canonical(change.as_ref()));
                     } else {
-                        adopted_changes.push(change_borrowed_from_canonical(change.as_ref()));
+                        adopted_changes.push(change_ref_from_canonical(change.as_ref()));
                     }
                 } else {
                     corrupt_missing_members.push(change_id.clone());
@@ -1336,10 +1336,8 @@ mod tests {
         tx.commit().await.expect("commit should succeed");
     }
 
-    fn change_borrowed_from_canonical<'a>(
-        change: crate::commit_store::ChangeBorrowed<'a>,
-    ) -> ChangeBorrowed<'a> {
-        ChangeBorrowed {
+    fn change_ref_from_canonical<'a>(change: crate::commit_store::ChangeRef<'a>) -> ChangeRef<'a> {
+        ChangeRef {
             id: change.id,
             entity_id: change.entity_id,
             schema_key: change.schema_key,

@@ -26,7 +26,7 @@ pub(crate) struct MaterializedLiveStateRow {
     pub(crate) version_id: String,
 }
 
-/// Borrowed tracked write row plus live-state routing metadata.
+/// Zero-copy view of tracked write row plus live-state routing metadata.
 ///
 /// The tracked-state owner only sees `row`; live-state uses `global` and
 /// `version_id` to enforce that one tracked root contains exactly one storage

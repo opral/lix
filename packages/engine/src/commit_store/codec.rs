@@ -1,5 +1,5 @@
 use crate::commit_store::{
-    Change, ChangeBorrowed, ChangeLocator, ChangeLocatorBorrowed, Commit, StoredCommitBorrowed,
+    Change, ChangeLocator, ChangeLocatorRef, ChangeRef, Commit, StoredCommitRef,
 };
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
@@ -10,9 +10,7 @@ const COMMIT_MAGIC: &[u8; 5] = b"LXCM1";
 const CHANGE_PACK_MAGIC: &[u8; 5] = b"LXCP1";
 const MEMBERSHIP_PACK_MAGIC: &[u8; 5] = b"LXMP1";
 
-pub(crate) fn encode_commit_borrowed(
-    commit: StoredCommitBorrowed<'_>,
-) -> Result<Vec<u8>, LixError> {
+pub(crate) fn encode_commit_ref(commit: StoredCommitRef<'_>) -> Result<Vec<u8>, LixError> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(COMMIT_MAGIC);
     write_str(&mut bytes, commit.id)?;
@@ -50,7 +48,7 @@ pub(crate) fn decode_commit(bytes: &[u8]) -> Result<Commit, LixError> {
     })
 }
 
-pub(crate) fn encode_change_borrowed(change: ChangeBorrowed<'_>) -> Result<Vec<u8>, LixError> {
+pub(crate) fn encode_change_ref(change: ChangeRef<'_>) -> Result<Vec<u8>, LixError> {
     let entity_id = change.entity_id.as_json_array_text().map_err(|error| {
         LixError::unknown(format!(
             "failed to encode commit-store change entity identity: {error}"
@@ -124,7 +122,7 @@ pub(crate) fn decode_change(bytes: &[u8]) -> Result<Change, LixError> {
 pub(crate) fn encode_change_pack<'a>(
     commit_id: &str,
     pack_id: u32,
-    changes: impl IntoIterator<Item = ChangeBorrowed<'a>>,
+    changes: impl IntoIterator<Item = ChangeRef<'a>>,
 ) -> Result<Vec<u8>, LixError> {
     let changes = changes.into_iter().collect::<Vec<_>>();
     let mut bytes = Vec::new();
@@ -133,7 +131,7 @@ pub(crate) fn encode_change_pack<'a>(
     bytes.extend_from_slice(&pack_id.to_le_bytes());
     write_len(&mut bytes, changes.len(), "change pack changes")?;
     for change in changes {
-        write_bytes(&mut bytes, &encode_change_borrowed(change)?)?;
+        write_bytes(&mut bytes, &encode_change_ref(change)?)?;
     }
     Ok(bytes)
 }
@@ -155,7 +153,7 @@ pub(crate) fn decode_change_pack(bytes: &[u8]) -> Result<(String, u32, Vec<Chang
 pub(crate) fn encode_membership_pack<'a>(
     commit_id: &str,
     pack_id: u32,
-    members: impl IntoIterator<Item = ChangeLocatorBorrowed<'a>>,
+    members: impl IntoIterator<Item = ChangeLocatorRef<'a>>,
 ) -> Result<Vec<u8>, LixError> {
     let members = members.into_iter().collect::<Vec<_>>();
     let mut bytes = Vec::new();
@@ -185,7 +183,7 @@ pub(crate) fn decode_membership_pack(
     Ok((commit_id, pack_id, members))
 }
 
-fn encode_locator(bytes: &mut Vec<u8>, locator: ChangeLocatorBorrowed<'_>) -> Result<(), LixError> {
+fn encode_locator(bytes: &mut Vec<u8>, locator: ChangeLocatorRef<'_>) -> Result<(), LixError> {
     write_str(bytes, locator.source_commit_id)?;
     bytes.extend_from_slice(&locator.source_pack_id.to_le_bytes());
     bytes.extend_from_slice(&locator.source_ordinal.to_le_bytes());
@@ -596,7 +594,7 @@ mod tests {
             membership_pack_count: 1,
         };
 
-        let encoded = encode_commit_borrowed(commit.as_borrowed()).expect("commit should encode");
+        let encoded = encode_commit_ref(commit.as_ref()).expect("commit should encode");
         let decoded = decode_commit(&encoded).expect("commit should decode");
 
         assert_eq!(decoded, commit);
@@ -614,7 +612,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
         };
 
-        let encoded = encode_change_borrowed(change.as_borrowed()).expect("change should encode");
+        let encoded = encode_change_ref(change.as_ref()).expect("change should encode");
         let decoded = decode_change(&encoded).expect("change should decode");
 
         assert_eq!(decoded, change);

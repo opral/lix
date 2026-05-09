@@ -1837,7 +1837,7 @@ struct LeafChunkAccumulator {
 }
 
 #[derive(Debug, Default)]
-struct BorrowedLeafChunkAccumulator<'a> {
+struct LeafChunkRefAccumulator<'a> {
     entries: Vec<EncodedLeafEntryRef<'a>>,
     key_bytes: usize,
     value_bytes: usize,
@@ -1851,7 +1851,7 @@ struct InternalChunkAccumulator {
 }
 
 #[derive(Debug, Default)]
-struct BorrowedInternalChunkAccumulator<'a> {
+struct InternalChunkRefAccumulator<'a> {
     children: Vec<ChildSummaryRef<'a>>,
     first_key_bytes: usize,
     last_key_bytes: usize,
@@ -1909,13 +1909,13 @@ fn chunk_leaf_entries(
 fn chunk_leaf_entry_refs<'a>(
     entries: impl IntoIterator<Item = EncodedLeafEntryRef<'a>>,
     options: &TrackedStateTreeOptions,
-) -> Vec<BorrowedLeafChunkAccumulator<'a>> {
+) -> Vec<LeafChunkRefAccumulator<'a>> {
     let mut iter = entries.into_iter().peekable();
     if iter.peek().is_none() {
-        return vec![BorrowedLeafChunkAccumulator::default()];
+        return vec![LeafChunkRefAccumulator::default()];
     }
     let mut groups = Vec::new();
-    let mut current = BorrowedLeafChunkAccumulator::default();
+    let mut current = LeafChunkRefAccumulator::default();
     for entry in iter {
         let item_size = entry.key.len() + entry.value.len();
         let projected_size = estimate_leaf_chunk_size(
@@ -2010,9 +2010,9 @@ fn chunk_internal_entry_refs<'a>(
     children: impl IntoIterator<Item = ChildSummaryRef<'a>>,
     options: &TrackedStateTreeOptions,
     level: usize,
-) -> Vec<BorrowedInternalChunkAccumulator<'a>> {
+) -> Vec<InternalChunkRefAccumulator<'a>> {
     let mut groups = Vec::new();
-    let mut current = BorrowedInternalChunkAccumulator::default();
+    let mut current = InternalChunkRefAccumulator::default();
     for child in children {
         let item_size = child.first_key.len()
             + child.last_key.len()

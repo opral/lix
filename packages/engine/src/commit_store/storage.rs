@@ -1,6 +1,6 @@
 use crate::commit_store::{
-    Change, ChangeBorrowed, ChangeIndexEntry, ChangeLocator, Commit, CommitDraftBorrowed,
-    StagedCommitStoreCommit, StoredCommitBorrowed,
+    Change, ChangeIndexEntry, ChangeLocator, ChangeRef, Commit, CommitDraftRef,
+    StagedCommitStoreCommit, StoredCommitRef,
 };
 use crate::storage::{
     KvGetGroup, KvGetRequest, KvScanRange, KvScanRequest, StorageReader, StorageWriteSet,
@@ -16,11 +16,11 @@ const SINGLE_PACK_ID: u32 = 0;
 
 pub(crate) fn stage_commit(
     writes: &mut StorageWriteSet,
-    commit: CommitDraftBorrowed<'_>,
-    authored_changes: Vec<ChangeBorrowed<'_>>,
+    commit: CommitDraftRef<'_>,
+    authored_changes: Vec<ChangeRef<'_>>,
     adopted_changes: Vec<ChangeLocator>,
 ) -> Result<StagedCommitStoreCommit, LixError> {
-    let stored_commit = StoredCommitBorrowed {
+    let stored_commit = StoredCommitRef {
         id: commit.id,
         change_id: commit.change_id,
         parent_ids: commit.parent_ids,
@@ -33,7 +33,7 @@ pub(crate) fn stage_commit(
     writes.put(
         COMMIT_NAMESPACE,
         commit_key(commit.id),
-        crate::commit_store::codec::encode_commit_borrowed(stored_commit)?,
+        crate::commit_store::codec::encode_commit_ref(stored_commit)?,
     );
 
     let mut authored_locators = Vec::with_capacity(authored_changes.len());
@@ -69,7 +69,7 @@ pub(crate) fn stage_commit(
             crate::commit_store::codec::encode_membership_pack(
                 commit.id,
                 SINGLE_PACK_ID,
-                adopted_changes.iter().map(ChangeLocator::as_borrowed),
+                adopted_changes.iter().map(ChangeLocator::as_ref),
             )?,
         );
     }
@@ -288,7 +288,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::backend::testing::UnitTestBackend;
-    use crate::commit_store::CommitDraftBorrowed;
+    use crate::commit_store::CommitDraftRef;
     use crate::entity_identity::EntityIdentity;
     use crate::json_store::JsonRef;
     use crate::storage::{StorageContext, StorageWriteTransaction};
@@ -314,14 +314,14 @@ mod tests {
 
         let staged = stage_commit(
             &mut writes,
-            CommitDraftBorrowed {
+            CommitDraftRef {
                 id: &commit.id,
                 change_id: &commit.change_id,
                 parent_ids: &commit.parent_ids,
                 author_account_ids: &commit.author_account_ids,
                 created_at: &commit.created_at,
             },
-            vec![change.as_borrowed()],
+            vec![change.as_ref()],
             vec![adopted.clone()],
         )
         .expect("commit should stage");
