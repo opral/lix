@@ -1,5 +1,5 @@
 use crate::entity_identity::EntityIdentity;
-use crate::tracked_state::tree_types::TrackedStateTreeScanRequest;
+use crate::tracked_state::types::TrackedStateTreeScanRequest;
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateFilter, TrackedStateStoreReader,
 };
@@ -183,8 +183,7 @@ mod tests {
 
     use super::*;
     use crate::backend::testing::UnitTestBackend;
-    use crate::json_store::JsonStoreContext;
-    use crate::storage::{StorageContext, StorageWriteSet, StorageWriteTransaction};
+    use crate::storage::{StorageContext, StorageWriteTransaction};
     use crate::tracked_state::TrackedStateContext;
     use crate::NullableKeyFilter;
 
@@ -415,27 +414,14 @@ mod tests {
         parent_commit_id: Option<&str>,
         rows: &[MaterializedTrackedStateRow],
     ) -> Result<(), LixError> {
-        let mut writes = StorageWriteSet::new();
-        {
-            let mut json_writer = JsonStoreContext::new().writer();
-            let canonical_rows = crate::test_support::tracked_state_rows_from_materialized(
-                &mut writes,
-                &mut json_writer,
-                rows,
-            )?;
-            tracked_state
-                .writer()
-                .stage_root(
-                    tx,
-                    &mut writes,
-                    commit_id,
-                    parent_commit_id,
-                    canonical_rows.iter().map(|row| row.as_ref()),
-                )
-                .await?;
-        }
-        writes.apply(tx).await?;
-        Ok(())
+        crate::test_support::stage_tracked_root_from_materialized(
+            tx,
+            tracked_state,
+            commit_id,
+            parent_commit_id,
+            rows,
+        )
+        .await
     }
 
     fn kinds(diff: &TrackedStateDiff) -> Vec<(String, TrackedStateDiffKind)> {

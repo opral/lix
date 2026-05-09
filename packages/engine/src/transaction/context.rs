@@ -1004,18 +1004,20 @@ mod tests {
 
         let tracked_row = crate::tracked_state::TrackedStateContext::new()
             .reader(storage.clone())
-            .load_row_at_commit(
+            .load_rows_at_commit(
                 &head_commit_id,
-                &TrackedStateRowRequest {
+                &[TrackedStateRowRequest {
                     schema_key: "lix_key_value".to_string(),
                     entity_id: crate::entity_identity::EntityIdentity::single(
                         "tracked-programmatic",
                     ),
                     file_id: NullableKeyFilter::Null,
-                },
+                }],
             )
             .await
             .expect("tracked state should load")
+            .pop()
+            .flatten()
             .expect("tracked row should be present in tracked state");
         assert_eq!(tracked_row.commit_id, head_commit_id);
         assert_eq!(
@@ -1120,7 +1122,10 @@ mod tests {
             .await
             .expect("changelog should scan after failed commit");
         assert!(
-            changes.is_empty(),
+            changes.iter().all(
+                |change| change.entity_id.as_single_string_owned().as_deref()
+                    != Ok("invalid-programmatic")
+            ),
             "validation failure must happen before changelog persistence"
         );
         let head = version_ctx
@@ -1164,6 +1169,7 @@ mod tests {
             &live_state,
             &changelog,
             &version_ref,
+            "invalid-metadata",
         )
         .await;
     }
@@ -1313,6 +1319,7 @@ mod tests {
             &live_state,
             &changelog,
             &version_ref,
+            "schema-mismatch",
         )
         .await;
     }
@@ -1440,19 +1447,14 @@ mod tests {
                 let key = crate::schema::schema_key_from_definition(schema)
                     .expect("seed schema key should derive");
                 let snapshot_content = json!({ "value": schema }).to_string();
-                crate::tracked_state::TrackedStateRow {
+                crate::tracked_state::MaterializedTrackedStateRow {
                     entity_id: crate::schema::registered_schema_entity_id(&key.schema_key)
                         .expect("registered schema identity should derive"),
                     schema_key: "lix_registered_schema".to_string(),
                     file_id: None,
-                    snapshot_ref: Some(
-                        json_writer
-                            .prepare_json(crate::json_store::NormalizedJson::from_arc_unchecked(
-                                Arc::from(snapshot_content.as_str()),
-                            ))
-                            .expect("schema snapshot should stage"),
-                    ),
-                    metadata_ref: None,
+                    snapshot_content: Some(snapshot_content),
+                    metadata: None,
+                    deleted: false,
                     created_at: "1970-01-01T00:00:00.000Z".to_string(),
                     updated_at: "1970-01-01T00:00:00.000Z".to_string(),
                     change_id: format!("schema-fixture-{}", key.schema_key),
@@ -1472,17 +1474,15 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("schema fixture transaction should open");
-        crate::tracked_state::TrackedStateContext::new()
-            .writer()
-            .stage_root(
-                storage_transaction.as_mut(),
-                &mut writes,
-                SCHEMA_FIXTURE_COMMIT_ID,
-                None,
-                rows.iter().map(|row| row.as_ref()),
-            )
-            .await
-            .expect("schema fixture rows should stage");
+        crate::test_support::stage_tracked_root_from_materialized(
+            storage_transaction.as_mut(),
+            &crate::tracked_state::TrackedStateContext::new(),
+            SCHEMA_FIXTURE_COMMIT_ID,
+            None,
+            &rows,
+        )
+        .await
+        .expect("schema fixture rows should stage");
         crate::untracked_state::UntrackedStateContext::new()
             .writer(&mut writes)
             .stage_rows([version_ref_row.as_ref()])
@@ -1502,6 +1502,7 @@ mod tests {
         live_state: &LiveStateContext,
         changelog: &CommitStoreContext,
         version_ctx: &VersionContext,
+        rejected_entity_id: &str,
     ) {
         let changes = changelog
             .reader(storage.clone())
@@ -1509,7 +1510,10 @@ mod tests {
             .await
             .expect("changelog should scan after failed commit");
         assert!(
-            changes.is_empty(),
+            changes.iter().all(
+                |change| change.entity_id.as_single_string_owned().as_deref()
+                    != Ok(rejected_entity_id)
+            ),
             "validation failure must happen before changelog persistence"
         );
         let head = version_ctx
@@ -1527,7 +1531,7 @@ mod tests {
             .load_row(&crate::live_state::LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: crate::entity_identity::EntityIdentity::single("schema-mismatch"),
+                entity_id: crate::entity_identity::EntityIdentity::single(rejected_entity_id),
                 file_id: NullableKeyFilter::Null,
             })
             .await

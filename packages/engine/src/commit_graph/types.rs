@@ -107,18 +107,3 @@ pub(crate) trait CommitGraphReader: Send + Sync {
         request: &CommitGraphChangeHistoryRequest,
     ) -> Result<Vec<CommitGraphChangeHistoryEntry>, LixError>;
 }
-
-/// Canonical entity selected by resolving the commit graph at a commit head.
-///
-/// The changelog fact remains unchanged. The graph reader adds the commit that
-/// made the fact visible at this head plus its distance from the requested
-/// head, so tracked_state can materialize serving rows without knowing graph
-/// traversal rules.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CommitGraphEntity {
-    pub(crate) change: Change,
-    pub(crate) source_commit_id: String,
-    pub(crate) depth: u32,
-    pub(crate) created_at: String,
-    pub(crate) updated_at: String,
-}

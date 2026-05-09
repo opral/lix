@@ -1,29 +1,208 @@
-use crate::json_store::{JsonRef, JsonStoreReader};
+use crate::commit_store::CommitStoreContext;
+use crate::entity_identity::EntityIdentity;
+use crate::json_store::JsonRef;
+use crate::json_store::JsonStoreContext;
 use crate::storage::StorageReader;
-use crate::tracked_state::tree_types::{TrackedStateKey, TrackedStateValue};
+use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey};
 use crate::tracked_state::MaterializedTrackedStateRow;
-use crate::{parse_row_metadata, LixError};
+use crate::LixError;
+use std::collections::BTreeMap;
 
-pub(crate) async fn materialize_value<S>(
-    json_reader: &mut JsonStoreReader<S>,
-    key: TrackedStateKey,
-    value: TrackedStateValue,
+/// Materializes tracked-state index entries from commit_store packs.
+///
+/// The durable tracked_state value carries only a commit_store locator plus a
+/// projection-local `updated_at` cache. Snapshot refs, metadata refs,
+/// tombstone state, change id, and source commit id are hydrated at this read
+/// boundary from grouped commit_store pack loads.
+pub(crate) async fn materialize_index_entries<S>(
+    store: &mut S,
+    commit_store: &CommitStoreContext,
+    entries: Vec<(TrackedStateKey, TrackedStateIndexValue)>,
     projection: &TrackedMaterializationProjection,
-) -> Result<MaterializedTrackedStateRow, LixError>
+) -> Result<Vec<MaterializedTrackedStateRow>, LixError>
 where
     S: StorageReader,
 {
-    let snapshot_content = if projection.snapshot_content {
-        load_optional_json(json_reader, value.snapshot_ref.as_ref(), "snapshot_ref").await?
-    } else {
-        None
+    let mut packs = BTreeMap::new();
+    for (_, value) in &entries {
+        let key = (
+            value.change_locator.source_commit_id.clone(),
+            value.change_locator.source_pack_id,
+        );
+        if packs.contains_key(&key) {
+            continue;
+        }
+        let Some(changes) = commit_store
+            .reader(&mut *store)
+            .load_change_pack(&key.0, key.1)
+            .await?
+        else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state locator references missing change pack ({}, {})",
+                    key.0, key.1
+                ),
+            ));
+        };
+        packs.insert(key, changes);
+    }
+
+    let mut row_plans = Vec::with_capacity(entries.len());
+    let mut json_refs = Vec::new();
+    for (key, value) in entries {
+        let pack_key = (
+            value.change_locator.source_commit_id.clone(),
+            value.change_locator.source_pack_id,
+        );
+        let changes = packs.get(&pack_key).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state materialization lost a loaded commit_store pack",
+            )
+        })?;
+        let change = changes
+            .get(
+                usize::try_from(value.change_locator.source_ordinal).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state locator ordinal does not fit usize",
+                    )
+                })?,
+            )
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked_state locator for '{}' points past pack ({}, {})",
+                        value.change_locator.change_id,
+                        value.change_locator.source_commit_id,
+                        value.change_locator.source_pack_id
+                    ),
+                )
+            })?;
+        if change.id != value.change_locator.change_id {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state locator expected '{}' but found '{}'",
+                    value.change_locator.change_id, change.id
+                ),
+            ));
+        }
+
+        let snapshot_ref_index = projected_json_ref_index(
+            projection.snapshot_content,
+            change.snapshot_ref,
+            &mut json_refs,
+        );
+        let metadata_ref_index =
+            projected_json_ref_index(projection.metadata, change.metadata_ref, &mut json_refs);
+        row_plans.push(MaterializedTrackedStateRowPlan {
+            entity_id: key.entity_id,
+            schema_key: key.schema_key,
+            file_id: key.file_id,
+            deleted: change.snapshot_ref.is_none(),
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            change_id: change.id.clone(),
+            commit_id: value.change_locator.source_commit_id,
+            snapshot_ref_index,
+            metadata_ref_index,
+        });
+    }
+
+    let json_store = JsonStoreContext::new();
+    let json_values = json_store.load_bytes_many(store, &json_refs).await?;
+    row_plans
+        .into_iter()
+        .map(|plan| materialize_row_plan(plan, &json_refs, &json_values))
+        .collect()
+}
+
+struct MaterializedTrackedStateRowPlan {
+    entity_id: EntityIdentity,
+    schema_key: String,
+    file_id: Option<String>,
+    deleted: bool,
+    created_at: String,
+    updated_at: String,
+    change_id: String,
+    commit_id: String,
+    snapshot_ref_index: Option<usize>,
+    metadata_ref_index: Option<usize>,
+}
+
+fn projected_json_ref_index(
+    include: bool,
+    json_ref: Option<JsonRef>,
+    json_refs: &mut Vec<JsonRef>,
+) -> Option<usize> {
+    if !include {
+        return None;
+    }
+    let index = json_refs.len();
+    json_refs.push(json_ref?);
+    Some(index)
+}
+
+fn materialize_row_plan(
+    plan: MaterializedTrackedStateRowPlan,
+    json_refs: &[JsonRef],
+    json_values: &[Option<Vec<u8>>],
+) -> Result<MaterializedTrackedStateRow, LixError> {
+    Ok(MaterializedTrackedStateRow {
+        entity_id: plan.entity_id,
+        schema_key: plan.schema_key,
+        file_id: plan.file_id,
+        snapshot_content: materialized_json_string(
+            plan.snapshot_ref_index,
+            json_refs,
+            json_values,
+        )?,
+        metadata: materialized_json_string(plan.metadata_ref_index, json_refs, json_values)?,
+        deleted: plan.deleted,
+        created_at: plan.created_at,
+        updated_at: plan.updated_at,
+        change_id: plan.change_id,
+        commit_id: plan.commit_id,
+    })
+}
+
+fn materialized_json_string(
+    index: Option<usize>,
+    json_refs: &[JsonRef],
+    json_values: &[Option<Vec<u8>>],
+) -> Result<Option<String>, LixError> {
+    let Some(index) = index else {
+        return Ok(None);
     };
-    let metadata = if projection.metadata {
-        load_optional_metadata(json_reader, value.metadata_ref.as_ref()).await?
-    } else {
-        None
-    };
-    Ok(value.into_materialized_row(key, snapshot_content, metadata))
+    let json_ref = json_refs.get(index).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state materialization lost JSON ref index",
+        )
+    })?;
+    let bytes = json_values
+        .get(index)
+        .and_then(Option::as_deref)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state materialization missing JSON payload '{}'",
+                    json_ref.to_hex()
+                ),
+            )
+        })?;
+    std::str::from_utf8(bytes)
+        .map(|json| Some(json.to_string()))
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("tracked_state materialized JSON payload is not UTF-8: {error}"),
+            )
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,48 +228,4 @@ impl TrackedMaterializationProjection {
             metadata: columns.iter().any(|column| column == "metadata"),
         }
     }
-}
-
-async fn load_optional_metadata<S>(
-    json_reader: &mut JsonStoreReader<S>,
-    json_ref: Option<&JsonRef>,
-) -> Result<Option<String>, LixError>
-where
-    S: StorageReader,
-{
-    let Some(json) = load_optional_json(json_reader, json_ref, "metadata_ref").await? else {
-        return Ok(None);
-    };
-    parse_row_metadata(&json, "tracked_state metadata_ref").map(Some)
-}
-
-async fn load_optional_json<S>(
-    json_reader: &mut JsonStoreReader<S>,
-    json_ref: Option<&JsonRef>,
-    field: &str,
-) -> Result<Option<String>, LixError>
-where
-    S: StorageReader,
-{
-    let Some(json_ref) = json_ref else {
-        return Ok(None);
-    };
-    let bytes = json_reader.load_bytes(json_ref).await?.ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "tracked_state {field} '{}' is missing from json_store",
-                json_ref.to_hex()
-            ),
-        )
-    })?;
-    String::from_utf8(bytes).map(Some).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "tracked_state {field} '{}' is not valid UTF-8 JSON bytes: {error}",
-                json_ref.to_hex()
-            ),
-        )
-    })
 }

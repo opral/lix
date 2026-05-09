@@ -4,6 +4,7 @@ use crate::json_store::types::JsonRef;
 use crate::storage::{KvGetGroup, KvGetRequest, StorageReader};
 use crate::LixError;
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 pub(crate) const JSON_NAMESPACE: &str = "json_store.json";
 const STORED_JSON_MAGIC: &[u8] = b"lix-json:v1";
@@ -100,6 +101,76 @@ pub(crate) async fn load_json_bytes(
     decode_json_payload(store, json_ref, stored_payload)
         .await
         .map(Some)
+}
+
+pub(crate) async fn load_json_bytes_many(
+    store: &mut impl StorageReader,
+    json_refs: &[JsonRef],
+) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+    if json_refs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut unique_keys = Vec::new();
+    let mut unique_refs = Vec::new();
+    let mut key_indexes = BTreeMap::<Vec<u8>, usize>::new();
+    let mut requested_indexes = Vec::with_capacity(json_refs.len());
+    for json_ref in json_refs {
+        let key = json_ref.as_hash_bytes().to_vec();
+        let index = match key_indexes.get(&key) {
+            Some(index) => *index,
+            None => {
+                let index = unique_keys.len();
+                key_indexes.insert(key.clone(), index);
+                unique_keys.push(key);
+                unique_refs.push(*json_ref);
+                index
+            }
+        };
+        requested_indexes.push(index);
+    }
+
+    let result = store
+        .get_values(KvGetRequest {
+            groups: vec![KvGetGroup {
+                namespace: JSON_NAMESPACE.to_string(),
+                keys: unique_keys,
+            }],
+        })
+        .await?;
+    let group = result.groups.into_iter().next().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "json_store batch load returned no result group",
+        )
+    })?;
+    if group.len() != unique_refs.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "json_store batch load returned {} values for {} requested refs",
+                group.len(),
+                unique_refs.len()
+            ),
+        ));
+    }
+
+    let mut unique_values = Vec::with_capacity(unique_refs.len());
+    for (index, stored_bytes) in group.values_iter().enumerate() {
+        let Some(stored_bytes) = stored_bytes else {
+            unique_values.push(None);
+            continue;
+        };
+        let stored_payload = decode_stored_json_payload(stored_bytes)?;
+        unique_values.push(Some(
+            decode_json_payload(store, &unique_refs[index], stored_payload).await?,
+        ));
+    }
+
+    Ok(requested_indexes
+        .into_iter()
+        .map(|index| unique_values[index].clone())
+        .collect())
 }
 
 fn encode_stored_json_payload(encoded_json: &EncodedJson<'_>) -> Vec<u8> {
@@ -231,6 +302,54 @@ mod tests {
                 .await
                 .expect("json should load"),
             Some(json.as_bytes().to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn json_batch_load_roundtrips_in_request_order() {
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let first = encode_json("{\"value\":\"first\"}").expect("first json should encode");
+        let second = encode_json("{\"value\":\"second\"}").expect("second json should encode");
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            JSON_NAMESPACE,
+            first.json_ref.as_hash_bytes().to_vec(),
+            encode_stored_json_payload(&first),
+        );
+        writes.put(
+            JSON_NAMESPACE,
+            second.json_ref.as_hash_bytes().to_vec(),
+            encode_stored_json_payload(&second),
+        );
+        writes
+            .apply(&mut transaction.as_mut())
+            .await
+            .expect("json should store");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let mut store = storage.clone();
+        let values = load_json_bytes_many(
+            &mut store,
+            &[second.json_ref, first.json_ref, second.json_ref],
+        )
+        .await
+        .expect("json batch should load");
+
+        assert_eq!(
+            values,
+            vec![
+                Some(second.data.as_ref().to_vec()),
+                Some(first.data.as_ref().to_vec()),
+                Some(second.data.as_ref().to_vec()),
+            ]
         );
     }
 }

@@ -165,27 +165,19 @@ impl Engine {
                     "target",
                 )
             })?;
-        let commit_graph = CommitGraphContext::new();
         let storage = self.storage();
-        let mut read_transaction = storage.begin_read_transaction().await?;
         let mut transaction = storage.begin_write_transaction().await?;
         let mut writes = StorageWriteSet::new();
         let rebuild_result = self
             .tracked_state
-            .rebuild_state_at_commit(
-                &commit_graph,
-                read_transaction.as_mut(),
+            .rebuild_at_commit(
                 transaction.as_mut(),
                 &mut writes,
+                self.commit_store.as_ref(),
                 &head_commit_id,
             )
             .await;
         if let Err(error) = rebuild_result {
-            let _ = read_transaction.rollback().await;
-            let _ = transaction.rollback().await;
-            return Err(error);
-        }
-        if let Err(error) = read_transaction.rollback().await {
             let _ = transaction.rollback().await;
             return Err(error);
         }

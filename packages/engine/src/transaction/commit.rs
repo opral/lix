@@ -1,13 +1,10 @@
 use crate::binary_cas::BinaryCasContext;
-use crate::commit_store::{ChangeRef, CommitDraftRef, CommitStoreContext};
+use crate::commit_store::{ChangeRef, CommitDraftRef, CommitStoreContext, StagedCommitStoreCommit};
 use crate::functions::FunctionContext;
 #[cfg(test)]
 use crate::json_store::{JsonStoreContext, JsonStoreWriter, NormalizedJson};
-use crate::live_state::LiveStateTrackedRowRef;
 use crate::storage::{StorageReader, StorageWriteSet, StorageWriteTransaction};
-use crate::tracked_state::{
-    TrackedStateContext, TrackedStateKeyRef, TrackedStateRowRef, TrackedStateValueRef,
-};
+use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
 use crate::transaction::prepare_version_ref_row;
 use crate::transaction::staging::PreparedWriteSet;
 use crate::transaction::types::{PreparedAdoptedStateRow, PreparedStateRow, StagedCommitMembers};
@@ -17,8 +14,6 @@ use crate::untracked_state::{
 use crate::version::{VersionContext, VersionRefReader};
 use crate::LixError;
 use std::collections::BTreeMap;
-
-const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 
 type RowIndex = usize;
 type AdoptedRowIndex = usize;
@@ -78,7 +73,7 @@ pub(crate) async fn commit_prepared_writes(
         return Ok(());
     }
 
-    stage_commit_store_commits(
+    let staged_commits = stage_commit_store_commits(
         commit_store,
         transaction,
         &mut writes,
@@ -130,6 +125,7 @@ pub(crate) async fn commit_prepared_writes(
             &adopted_rows,
             adopted_index.tracked_row_indices_by_commit,
             tracked_roots,
+            staged_commits,
         )
         .await?;
     }
@@ -221,8 +217,9 @@ async fn stage_commit_store_commits(
     adopted_rows: &[PreparedAdoptedStateRow],
     adopted_row_indices_by_commit: &BTreeMap<String, Vec<AdoptedRowIndex>>,
     commit_rows: &[FinalizedCommitRow],
-) -> Result<(), LixError> {
+) -> Result<BTreeMap<String, StagedCommitStoreCommit>, LixError> {
     let mut commits = Vec::with_capacity(commit_rows.len());
+    let mut commit_ids = Vec::with_capacity(commit_rows.len());
     for commit_row in commit_rows {
         let state_row_indices = tracked_row_indices_by_commit
             .get(&commit_row.commit_id)
@@ -248,13 +245,24 @@ async fn stage_commit_store_commits(
             author_account_ids: &[],
             created_at: &commit_row.created_at,
         };
+        commit_ids.push(commit_row.commit_id.clone());
         commits.push((commit, authored_changes, adopted_changes));
     }
-    commit_store
+    let staged = commit_store
         .writer(transaction, writes)
         .stage_commit_drafts(commits)
         .await?;
-    Ok(())
+    if staged.len() != commit_ids.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "commit-store staged {} commits for {} finalized commit rows",
+                staged.len(),
+                commit_ids.len()
+            ),
+        ));
+    }
+    Ok(commit_ids.into_iter().zip(staged).collect())
 }
 
 fn change_ref_from_state_row(row: &PreparedStateRow) -> Result<ChangeRef<'_>, LixError> {
@@ -272,7 +280,7 @@ fn change_ref_from_state_row(row: &PreparedStateRow) -> Result<ChangeRef<'_>, Li
         file_id: row.file_id.as_deref(),
         snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
         metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
-        created_at: &row.created_at,
+        created_at: &row.updated_at,
     })
 }
 
@@ -284,7 +292,7 @@ fn change_ref_from_adopted_row(row: &PreparedAdoptedStateRow) -> ChangeRef<'_> {
         file_id: row.file_id.as_deref(),
         snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
         metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
-        created_at: &row.created_at,
+        created_at: &row.updated_at,
     }
 }
 
@@ -296,34 +304,105 @@ async fn stage_tracked_roots(
     adopted_rows: &[PreparedAdoptedStateRow],
     mut adopted_row_indices_by_commit: BTreeMap<String, Vec<AdoptedRowIndex>>,
     tracked_roots: Vec<PendingTrackedRoot>,
+    mut staged_commits: BTreeMap<String, StagedCommitStoreCommit>,
 ) -> Result<(), LixError> {
-    let mut writer = TrackedStateContext::new().writer();
+    let tracked_state = TrackedStateContext::new();
+    let mut writer = tracked_state.writer(transaction, writes);
     for root in tracked_roots {
+        let staged = staged_commits.remove(&root.commit_id).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked-state root for commit '{}' has no staged commit-store locators",
+                    root.commit_id
+                ),
+            )
+        })?;
         let state_row_indices = tracked_row_indices_by_commit
             .remove(&root.commit_id)
             .unwrap_or_default();
         let adopted_row_indices = adopted_row_indices_by_commit
             .remove(&root.commit_id)
             .unwrap_or_default();
-        let mut root_rows = Vec::with_capacity(state_row_indices.len() + adopted_row_indices.len());
-        for row_index in state_row_indices {
-            if let Some(row) = tracked_state_row_ref_from_state_row(&state_rows[row_index])? {
-                root_rows.push(row);
-            }
-        }
-        for row_index in adopted_row_indices {
-            root_rows.push(tracked_state_row_ref_from_adopted_row(
-                &adopted_rows[row_index],
+        if state_row_indices.len() != staged.authored_locators.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "commit '{}' has {} tracked authored rows but {} commit-store authored locators",
+                    root.commit_id,
+                    state_row_indices.len(),
+                    staged.authored_locators.len()
+                ),
             ));
         }
+        if adopted_row_indices.len() != staged.adopted_locators.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "commit '{}' has {} tracked adopted rows but {} commit-store adopted locators",
+                    root.commit_id,
+                    adopted_row_indices.len(),
+                    staged.adopted_locators.len()
+                ),
+            ));
+        }
+        let authored_changes = state_row_indices
+            .iter()
+            .map(|&row_index| change_ref_from_state_row(&state_rows[row_index]))
+            .collect::<Result<Vec<_>, _>>()?;
+        let adopted_changes = adopted_row_indices
+            .iter()
+            .map(|&row_index| change_ref_from_adopted_row(&adopted_rows[row_index]))
+            .collect::<Vec<_>>();
+        let authored_updated_at = state_row_indices
+            .iter()
+            .map(|&row_index| state_rows[row_index].updated_at.as_str())
+            .collect::<Vec<_>>();
+        let authored_created_at = state_row_indices
+            .iter()
+            .map(|&row_index| state_rows[row_index].created_at.as_str())
+            .collect::<Vec<_>>();
+        let adopted_updated_at = adopted_row_indices
+            .iter()
+            .map(|&row_index| adopted_rows[row_index].updated_at.as_str())
+            .collect::<Vec<_>>();
+        let adopted_created_at = adopted_row_indices
+            .iter()
+            .map(|&row_index| adopted_rows[row_index].created_at.as_str())
+            .collect::<Vec<_>>();
+        let mut deltas = Vec::with_capacity(authored_changes.len() + adopted_changes.len());
+        deltas.extend(
+            authored_changes
+                .iter()
+                .zip(&staged.authored_locators)
+                .zip(authored_created_at)
+                .zip(authored_updated_at)
+                .map(
+                    |(((change, locator), created_at), updated_at)| TrackedStateDeltaRef {
+                        change: *change,
+                        locator: locator.as_ref(),
+                        created_at,
+                        updated_at,
+                    },
+                ),
+        );
+        deltas.extend(
+            adopted_changes
+                .iter()
+                .zip(&staged.adopted_locators)
+                .zip(adopted_created_at)
+                .zip(adopted_updated_at)
+                .map(
+                    |(((change, locator), created_at), updated_at)| TrackedStateDeltaRef {
+                        change: *change,
+                        locator: locator.as_ref(),
+                        created_at,
+                        updated_at,
+                    },
+                ),
+        );
         writer
-            .stage_root(
-                transaction,
-                writes,
-                &root.commit_id,
-                root.parent_commit_id.as_deref(),
-                root_rows.into_iter().map(|row| row.row),
-            )
+            .stage_delta(&root.commit_id, root.parent_commit_id.as_deref(), deltas)
             .await?;
     }
     if !tracked_row_indices_by_commit.is_empty() || !adopted_row_indices_by_commit.is_empty() {
@@ -338,6 +417,16 @@ async fn stage_tracked_roots(
             LixError::CODE_INTERNAL_ERROR,
             format!(
                 "tracked live_state rows have no finalized root metadata for commit ids: {}",
+                commit_ids.join(", ")
+            ),
+        ));
+    }
+    if !staged_commits.is_empty() {
+        let commit_ids = staged_commits.keys().cloned().collect::<Vec<_>>();
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "commit-store staged commits without tracked root metadata: {}",
                 commit_ids.join(", ")
             ),
         ));
@@ -376,71 +465,6 @@ fn untracked_identity_ref_from_adopted_row(
         schema_key: &row.schema_key,
         entity_id: &row.entity_id,
         file_id: row.file_id.as_deref(),
-    }
-}
-
-fn tracked_state_row_ref_from_state_row(
-    row: &PreparedStateRow,
-) -> Result<Option<LiveStateTrackedRowRef<'_>>, LixError> {
-    if row.schema_key == COMMIT_SCHEMA_KEY {
-        return Ok(None);
-    }
-    let Some(change_id) = row.change_id.as_deref() else {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked staged row is missing change_id before tracked_state write",
-        ));
-    };
-    let Some(commit_id) = row.commit_id.as_deref() else {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked staged row is missing commit_id before tracked_state write",
-        ));
-    };
-    Ok(Some(LiveStateTrackedRowRef {
-        global: row.global,
-        version_id: &row.version_id,
-        row: TrackedStateRowRef {
-            key: TrackedStateKeyRef {
-                schema_key: &row.schema_key,
-                file_id: row.file_id.as_deref(),
-                entity_id: &row.entity_id,
-            },
-            value: TrackedStateValueRef {
-                snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
-                metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
-                created_at: &row.created_at,
-                updated_at: &row.updated_at,
-                change_id,
-                commit_id,
-                deleted: row.snapshot.is_none(),
-            },
-        },
-    }))
-}
-
-fn tracked_state_row_ref_from_adopted_row(
-    row: &PreparedAdoptedStateRow,
-) -> LiveStateTrackedRowRef<'_> {
-    LiveStateTrackedRowRef {
-        global: row.global,
-        version_id: &row.version_id,
-        row: TrackedStateRowRef {
-            key: TrackedStateKeyRef {
-                schema_key: &row.schema_key,
-                file_id: row.file_id.as_deref(),
-                entity_id: &row.entity_id,
-            },
-            value: TrackedStateValueRef {
-                snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
-                metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
-                created_at: &row.created_at,
-                updated_at: &row.updated_at,
-                change_id: &row.change_id,
-                commit_id: &row.commit_id,
-                deleted: row.snapshot.is_none(),
-            },
-        },
     }
 }
 

@@ -4,12 +4,11 @@ use crate::functions::{
     FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
 };
 use crate::json_store::{JsonStoreContext, NormalizedJson};
-use crate::live_state::LiveStateTrackedRowRef;
 use crate::schema::{
     registered_schema_entity_id, schema_key_from_definition, seed_schema_definitions,
 };
 use crate::storage::{StorageContext, StorageWriteSet};
-use crate::tracked_state::{TrackedStateContext, TrackedStateRow};
+use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
 use crate::untracked_state::{UntrackedStateContext, UntrackedStateRow};
 use crate::version::{VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_REF_SCHEMA_KEY};
 use crate::LixError;
@@ -194,7 +193,7 @@ pub(crate) async fn initialize(
         .map(|change| seed_change_to_commit_store_change(&mut json_writer, change))
         .collect::<Result<Vec<_>, _>>()?;
 
-    {
+    let staged_commit = {
         let commit = CommitDraftRef {
             id: &plan.commit.id,
             change_id: &plan.commit.change_id,
@@ -209,13 +208,9 @@ pub(crate) async fn initialize(
                 authored_changes.iter().map(Change::as_ref).collect(),
                 Vec::new(),
             )
-            .await?;
-    }
+            .await?
+    };
 
-    let tracked_rows = authored_changes
-        .iter()
-        .map(|change| tracked_row_from_initial_change(change, &receipt.initial_commit_id))
-        .collect::<Result<Vec<_>, _>>()?;
     let untracked_rows = plan
         .untracked_rows
         .iter()
@@ -226,24 +221,19 @@ pub(crate) async fn initialize(
         untracked_state
             .writer(&mut writes)
             .stage_rows(untracked_rows.iter().map(|row| row.as_ref()))?;
-        let tracked_root_rows = tracked_rows
+        let deltas = authored_changes
             .iter()
-            .map(|row| LiveStateTrackedRowRef {
-                row: row.as_ref(),
-                global: true,
-                version_id: GLOBAL_VERSION_ID,
+            .zip(&staged_commit.authored_locators)
+            .map(|(change, locator)| TrackedStateDeltaRef {
+                change: change.as_ref(),
+                locator: locator.as_ref(),
+                created_at: &change.created_at,
+                updated_at: &change.created_at,
             })
             .collect::<Vec<_>>();
-        validate_initial_tracked_root(&tracked_root_rows, &receipt.initial_commit_id)?;
-        tracked_state
-            .writer()
-            .stage_root(
-                transaction.as_mut(),
-                &mut writes,
-                &receipt.initial_commit_id,
-                None,
-                tracked_root_rows.into_iter().map(|row| row.row),
-            )
+        let mut writer = tracked_state.writer(transaction.as_mut(), &mut writes);
+        writer
+            .stage_delta(&receipt.initial_commit_id, None, deltas)
             .await?;
     }
 
@@ -251,47 +241,6 @@ pub(crate) async fn initialize(
     writes.apply(&mut transaction.as_mut()).await?;
     transaction.commit().await?;
     Ok(receipt)
-}
-
-fn validate_initial_tracked_root(
-    rows: &[LiveStateTrackedRowRef<'_>],
-    commit_id: &str,
-) -> Result<(), LixError> {
-    for row in rows {
-        if !row.global || row.version_id != GLOBAL_VERSION_ID {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "initial tracked root must contain only global bootstrap rows",
-            ));
-        }
-        if row.row.value.commit_id != commit_id {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "initial tracked root for commit '{commit_id}' cannot include row from commit '{}'",
-                    row.row.value.commit_id
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn tracked_row_from_initial_change(
-    change: &Change,
-    initial_commit_id: &str,
-) -> Result<TrackedStateRow, LixError> {
-    Ok(TrackedStateRow {
-        entity_id: change.entity_id.clone(),
-        schema_key: change.schema_key.clone(),
-        file_id: None,
-        snapshot_ref: change.snapshot_ref.clone(),
-        metadata_ref: None,
-        created_at: change.created_at.clone(),
-        updated_at: change.created_at.clone(),
-        change_id: change.id.clone(),
-        commit_id: initial_commit_id.to_string(),
-    })
 }
 
 fn seed_change_to_commit_store_change(

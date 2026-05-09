@@ -1,5 +1,5 @@
 use crate::entity_identity::EntityIdentity;
-use crate::tracked_state::{MaterializedTrackedStateRow, TrackedStateRowRef};
+use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::untracked_state::{
     MaterializedUntrackedStateRow, UntrackedStateFilter, UntrackedStateRowRequest,
 };
@@ -24,18 +24,6 @@ pub(crate) struct MaterializedLiveStateRow {
     pub(crate) commit_id: Option<String>,
     pub(crate) untracked: bool,
     pub(crate) version_id: String,
-}
-
-/// Zero-copy view of tracked write row plus live-state routing metadata.
-///
-/// The tracked-state owner only sees `row`; live-state uses `global` and
-/// `version_id` to enforce that one tracked root contains exactly one storage
-/// scope before delegating to tracked_state.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct LiveStateTrackedRowRef<'a> {
-    pub(crate) row: TrackedStateRowRef<'a>,
-    pub(crate) global: bool,
-    pub(crate) version_id: &'a str,
 }
 
 impl From<MaterializedUntrackedStateRow> for MaterializedLiveStateRow {

@@ -30,6 +30,14 @@ impl JsonStoreContext {
     ) -> Result<Option<Vec<u8>>, LixError> {
         store::load_json_bytes(store, json_ref).await
     }
+
+    pub(crate) async fn load_bytes_many(
+        &self,
+        store: &mut impl StorageReader,
+        json_refs: &[JsonRef],
+    ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+        store::load_json_bytes_many(store, json_refs).await
+    }
 }
 
 pub(crate) struct JsonStoreReader<S> {
@@ -56,6 +64,13 @@ where
         json_ref: &JsonRef,
     ) -> Result<Option<Vec<u8>>, LixError> {
         store::load_json_bytes(&mut self.store, json_ref).await
+    }
+
+    pub(crate) async fn load_bytes_many(
+        &mut self,
+        json_refs: &[JsonRef],
+    ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+        store::load_json_bytes_many(&mut self.store, json_refs).await
     }
 
     pub(crate) async fn load_json_value(
