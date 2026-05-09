@@ -109,15 +109,33 @@ where
             crate::commit_store::storage::load_change_index_entries(&mut *store, change_ids)
                 .await?;
         let mut changes = Vec::with_capacity(entries.len());
+        let mut commits_by_id = BTreeMap::new();
+        let mut packs_by_locator = BTreeMap::new();
         for (change_id, entry) in change_ids.iter().zip(entries) {
             changes.push(match entry {
                 Some(ChangeIndexEntry::CommitHeader { commit_id, .. }) => {
-                    crate::commit_store::storage::load_commit(&mut *store, &commit_id)
-                        .await?
+                    if !commits_by_id.contains_key(&commit_id) {
+                        let commit =
+                            crate::commit_store::storage::load_commit(&mut *store, &commit_id)
+                                .await?;
+                        commits_by_id.insert(commit_id.clone(), commit);
+                    }
+                    commits_by_id
+                        .get(&commit_id)
+                        .cloned()
+                        .flatten()
                         .map(commit_header_change)
                 }
                 Some(ChangeIndexEntry::PackedChange { locator }) => {
-                    Some(load_change_by_locator(&mut *store, &locator, change_id).await?)
+                    Some(
+                        load_change_by_locator_cached(
+                            &mut *store,
+                            &mut packs_by_locator,
+                            &locator,
+                            change_id,
+                        )
+                        .await?,
+                    )
                 }
                 None => None,
             });
@@ -317,6 +335,63 @@ async fn load_change_by_locator(
             locator.source_pack_id,
         ));
     };
+    let change = changes
+        .get(usize::try_from(locator.source_ordinal).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "commit-store change locator ordinal does not fit usize",
+            )
+        })?)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "commit-store change locator for '{}' points past pack '{}' in commit '{}'",
+                    expected_change_id, locator.source_pack_id, locator.source_commit_id
+                ),
+            )
+        })?;
+    if change.id != expected_change_id || change.id != locator.change_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "commit-store change locator expected '{}' but found '{}'",
+                expected_change_id, change.id
+            ),
+        ));
+    }
+    Ok(change.clone())
+}
+
+async fn load_change_by_locator_cached(
+    store: &mut (impl StorageReader + ?Sized),
+    packs_by_locator: &mut BTreeMap<(String, u32), Vec<Change>>,
+    locator: &ChangeLocator,
+    expected_change_id: &str,
+) -> Result<Change, LixError> {
+    let key = (locator.source_commit_id.clone(), locator.source_pack_id);
+    if !packs_by_locator.contains_key(&key) {
+        let Some(changes) = crate::commit_store::storage::load_change_pack(
+            store,
+            &locator.source_commit_id,
+            locator.source_pack_id,
+        )
+        .await?
+        else {
+            return Err(missing_pack_error(
+                "change",
+                &locator.source_commit_id,
+                locator.source_pack_id,
+            ));
+        };
+        packs_by_locator.insert(key.clone(), changes);
+    }
+    let changes = packs_by_locator.get(&key).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "commit-store change pack cache lost a loaded pack",
+        )
+    })?;
     let change = changes
         .get(usize::try_from(locator.source_ordinal).map_err(|_| {
             LixError::new(

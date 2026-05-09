@@ -1,16 +1,16 @@
 use crate::commit_store::{
-    Change, ChangeBorrowed, ChangeIndexEntry, ChangeIndexEntryBorrowed, ChangeLocator, Commit,
-    CommitDraftBorrowed, StagedCommitStoreCommit, StoredCommitBorrowed,
+    Change, ChangeBorrowed, ChangeIndexEntry, ChangeLocator, Commit, CommitDraftBorrowed,
+    StagedCommitStoreCommit, StoredCommitBorrowed,
 };
 use crate::storage::{
     KvGetGroup, KvGetRequest, KvScanRange, KvScanRequest, StorageReader, StorageWriteSet,
 };
 use crate::LixError;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const COMMIT_NAMESPACE: &str = "commit_store.commit";
 pub(crate) const CHANGE_PACK_NAMESPACE: &str = "commit_store.change_pack";
 pub(crate) const MEMBERSHIP_PACK_NAMESPACE: &str = "commit_store.membership_pack";
-pub(crate) const CHANGE_INDEX_NAMESPACE: &str = "commit_store.change_index";
 
 const SINGLE_PACK_ID: u32 = 0;
 
@@ -73,22 +73,6 @@ pub(crate) fn stage_commit(
                 adopted_changes.iter().map(ChangeLocator::as_borrowed),
             )?,
         );
-    }
-
-    stage_change_index_entry(
-        writes,
-        ChangeIndexEntryBorrowed::CommitHeader {
-            commit_id: commit.id,
-            change_id: commit.change_id,
-        },
-    )?;
-    for locator in &authored_locators {
-        stage_change_index_entry(
-            writes,
-            ChangeIndexEntryBorrowed::PackedChange {
-                locator: locator.as_borrowed(),
-            },
-        )?;
     }
 
     Ok(StagedCommitStoreCommit {
@@ -178,45 +162,68 @@ pub(crate) async fn load_change_index_entries(
     if change_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let result = store
-        .get_values(KvGetRequest {
-            groups: vec![KvGetGroup {
-                namespace: CHANGE_INDEX_NAMESPACE.to_string(),
-                keys: change_ids
-                    .iter()
-                    .map(|change_id| change_index_key(change_id))
-                    .collect(),
-            }],
-        })
-        .await?;
-    let group = result.groups.into_iter().next().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "commit-store change index batch load returned no result group",
-        )
-    })?;
-    if group.len() != change_ids.len() {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "commit-store change index batch load returned {} values for {} requested change ids",
-                group.len(),
-                change_ids.len()
-            ),
-        ));
+
+    let mut unresolved = change_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let mut entries_by_change_id = BTreeMap::new();
+    let commits = scan_commits(store).await?;
+    for commit in commits {
+        if unresolved.remove(&commit.change_id) {
+            entries_by_change_id.insert(
+                commit.change_id.clone(),
+                ChangeIndexEntry::CommitHeader {
+                    commit_id: commit.id.clone(),
+                    change_id: commit.change_id.clone(),
+                },
+            );
+        }
+        if unresolved.is_empty() {
+            break;
+        }
+
+        for pack_id in 0..commit.change_pack_count {
+            let Some(changes) = load_change_pack(store, &commit.id, pack_id).await? else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("commit-store missing change pack ({}, {pack_id})", commit.id),
+                ));
+            };
+            for (source_ordinal, change) in changes.iter().enumerate() {
+                if !unresolved.remove(&change.id) {
+                    continue;
+                }
+                entries_by_change_id.insert(
+                    change.id.clone(),
+                    ChangeIndexEntry::PackedChange {
+                        locator: ChangeLocator {
+                            source_commit_id: commit.id.clone(),
+                            source_pack_id: pack_id,
+                            source_ordinal: u32::try_from(source_ordinal).map_err(|_| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    "commit-store change pack ordinal exceeds u32",
+                                )
+                            })?,
+                            change_id: change.id.clone(),
+                        },
+                    },
+                );
+                if unresolved.is_empty() {
+                    break;
+                }
+            }
+            if unresolved.is_empty() {
+                break;
+            }
+        }
+        if unresolved.is_empty() {
+            break;
+        }
     }
 
-    let mut entries = Vec::with_capacity(group.len());
-    for index in 0..group.len() {
-        let entry = match group.value(index).flatten() {
-            Some(bytes) => Some(crate::commit_store::codec::decode_change_index_entry(
-                bytes,
-            )?),
-            None => None,
-        };
-        entries.push(entry);
-    }
-    Ok(entries)
+    Ok(change_ids
+        .iter()
+        .map(|change_id| entries_by_change_id.get(change_id).cloned())
+        .collect())
 }
 
 async fn get_one(
@@ -236,18 +243,6 @@ async fn get_one(
         .into_iter()
         .next()
         .and_then(|group| group.single_value_owned()))
-}
-
-fn stage_change_index_entry(
-    writes: &mut StorageWriteSet,
-    entry: ChangeIndexEntryBorrowed<'_>,
-) -> Result<(), LixError> {
-    writes.put(
-        CHANGE_INDEX_NAMESPACE,
-        change_index_key(entry.change_id()),
-        crate::commit_store::codec::encode_change_index_entry(entry)?,
-    );
-    Ok(())
 }
 
 fn ensure_pack_identity(
@@ -272,10 +267,6 @@ fn commit_key(commit_id: &str) -> Vec<u8> {
     commit_id.as_bytes().to_vec()
 }
 
-fn change_index_key(change_id: &str) -> Vec<u8> {
-    change_id.as_bytes().to_vec()
-}
-
 fn pack_key(commit_id: &str, pack_id: u32) -> Result<Vec<u8>, LixError> {
     let commit_id_len = u32::try_from(commit_id.len()).map_err(|_| {
         LixError::new(
@@ -288,19 +279,6 @@ fn pack_key(commit_id: &str, pack_id: u32) -> Result<Vec<u8>, LixError> {
     key.extend_from_slice(commit_id.as_bytes());
     key.extend_from_slice(&pack_id.to_be_bytes());
     Ok(key)
-}
-
-trait ChangeIndexEntryBorrowedExt {
-    fn change_id(&self) -> &str;
-}
-
-impl ChangeIndexEntryBorrowedExt for ChangeIndexEntryBorrowed<'_> {
-    fn change_id(&self) -> &str {
-        match self {
-            ChangeIndexEntryBorrowed::CommitHeader { change_id, .. } => change_id,
-            ChangeIndexEntryBorrowed::PackedChange { locator } => locator.change_id,
-        }
-    }
 }
 
 #[cfg(test)]

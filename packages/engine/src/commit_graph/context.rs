@@ -6,9 +6,7 @@ use crate::commit_graph::{
     CommitGraphChangeSetElement, CommitGraphCommit, CommitGraphEdge, CommitGraphEntity,
     CommitGraphReader, ReachableCommitGraphCommit,
 };
-use crate::commit_store::{
-    Change, ChangeIndexEntry, ChangeLocator, Commit, CommitStoreContext, CommitStoreReader,
-};
+use crate::commit_store::{Change, Commit, CommitStoreContext, CommitStoreReader};
 use crate::entity_identity::EntityIdentity;
 use crate::storage::StorageReader;
 use crate::storage::{ScopedStorageReader, StorageReadScope};
@@ -360,68 +358,15 @@ where
         &self,
         change_ids: &[String],
     ) -> Result<Vec<Option<Change>>, LixError> {
-        let entries = self
-            .commit_store_reader
-            .load_change_index_entries(change_ids)
-            .await?;
-        let mut changes = Vec::with_capacity(entries.len());
-        for (change_id, entry) in change_ids.iter().zip(entries) {
-            changes.push(match entry {
-                Some(ChangeIndexEntry::CommitHeader { commit_id, .. }) => self
-                    .commit_store_reader
-                    .load_commit(&commit_id)
-                    .await?
-                    .map(commit_header_canonical_change),
-                Some(ChangeIndexEntry::PackedChange { locator }) => {
-                    Some(self.load_change_by_locator(&locator, change_id).await?)
-                }
-                None => None,
-            });
-        }
-        Ok(changes)
-    }
-
-    async fn load_change_by_locator(
-        &self,
-        locator: &ChangeLocator,
-        expected_change_id: &str,
-    ) -> Result<Change, LixError> {
-        let Some(changes) = self
-            .commit_store_reader
-            .load_change_pack(&locator.source_commit_id, locator.source_pack_id)
-            .await?
-        else {
-            return Err(missing_pack_error(
-                "change",
-                &locator.source_commit_id,
-                locator.source_pack_id,
-            ));
-        };
-        let change = changes
-            .get(usize::try_from(locator.source_ordinal).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "commit-store change locator ordinal does not fit usize",
-                )
-            })?)
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "commit-store change locator for '{expected_change_id}' is out of bounds"
-                    ),
-                )
-            })?;
-        if change.id != expected_change_id || locator.change_id != expected_change_id {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "commit-store change locator expected '{expected_change_id}' but found '{}'",
-                    change.id
-                ),
-            ));
-        }
-        Ok(canonical_change_from_store_change(change.clone()))
+        self.commit_store_reader
+            .load_changes(change_ids)
+            .await
+            .map(|changes| {
+                changes
+                    .into_iter()
+                    .map(|change| change.map(canonical_change_from_store_change))
+                    .collect()
+            })
     }
 }
 
