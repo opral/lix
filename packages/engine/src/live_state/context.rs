@@ -668,6 +668,35 @@ mod tests {
             .expect("untracked rows should apply");
     }
 
+    async fn write_empty_commits_to_store(
+        store: &mut (impl StorageWriteTransaction + ?Sized),
+        commit_ids: &[&str],
+    ) {
+        let mut writes = StorageWriteSet::new();
+        for commit_id in commit_ids {
+            let commit_change_id = format!("{commit_id}:commit");
+            CommitStoreContext::new()
+                .writer(&mut *store, &mut writes)
+                .stage_commit_draft(
+                    CommitDraftRef {
+                        id: commit_id,
+                        change_id: &commit_change_id,
+                        parent_ids: &[],
+                        author_account_ids: &[],
+                        created_at: "1970-01-01T00:00:00.000Z",
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+                .expect("empty commit should stage");
+        }
+        writes
+            .apply(store)
+            .await
+            .expect("empty commits should apply");
+    }
+
     async fn stage_materialized_live_rows(
         store: &mut (impl StorageReader + ?Sized),
         writes: &mut StorageWriteSet,
@@ -1040,6 +1069,7 @@ mod tests {
             ],
         )
         .await;
+        write_empty_commits_to_store(transaction.as_mut(), &["commit-version-a"]).await;
         transaction.commit().await.expect("commit should persist");
 
         let loaded = load_selected_tab_at(&live_state, storage.clone(), "version-a")
@@ -1102,6 +1132,7 @@ mod tests {
             ],
         )
         .await;
+        write_empty_commits_to_store(transaction.as_mut(), &["commit-main"]).await;
         transaction.commit().await.expect("commit should persist");
 
         let loaded = load_selected_tab_at(&live_state, storage.clone(), "main")
@@ -1406,6 +1437,7 @@ mod tests {
             ],
         )
         .await;
+        write_empty_commits_to_store(transaction.as_mut(), &["commit-version-a"]).await;
         transaction.commit().await.expect("commit should persist");
 
         let rows = scan_selected_tab_at(&live_state, storage.clone(), "version-a", false)

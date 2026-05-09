@@ -3,14 +3,16 @@ mod codec;
 mod context;
 mod diff;
 mod materialization;
+mod materializer;
 mod merge;
-pub(crate) mod rebuild;
 mod storage;
 mod tree;
 mod types;
 
 #[allow(unused_imports)]
-pub(crate) use context::{TrackedStateContext, TrackedStateStoreReader, TrackedStateWriter};
+pub(crate) use context::{
+    TrackedStateContext, TrackedStateMaterializer, TrackedStateStoreReader, TrackedStateWriter,
+};
 #[allow(unused_imports)]
 pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,

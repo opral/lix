@@ -2,13 +2,16 @@ use std::collections::HashMap;
 
 use crate::storage::{KvGetGroup, KvGetRequest, StorageReader, StorageWriteSet};
 use crate::tracked_state::codec::PendingChunkWrite;
-use crate::tracked_state::types::{TrackedStateRootId, TRACKED_STATE_HASH_BYTES};
+use crate::tracked_state::types::{
+    TrackedStateDeltaEntry, TrackedStateRootId, TRACKED_STATE_HASH_BYTES,
+};
 use crate::LixError;
 
 pub(crate) const TRACKED_STATE_CHUNK_NAMESPACE: &'static str = "tracked_state.tree.chunk";
 pub(crate) const TRACKED_STATE_ROOT_NAMESPACE: &'static str = "tracked_state.tree.root";
 pub(crate) const TRACKED_STATE_BY_FILE_ROOT_NAMESPACE: &'static str =
     "tracked_state.tree.root.by_file";
+pub(crate) const TRACKED_STATE_DELTA_PACK_NAMESPACE: &'static str = "tracked_state.delta_pack";
 
 async fn get_one(
     store: &mut (impl StorageReader + ?Sized),
@@ -83,6 +86,35 @@ pub(crate) fn stage_by_file_root(
         commit_id.as_bytes().to_vec(),
         root_id.as_bytes().to_vec(),
     );
+}
+
+pub(crate) async fn load_delta_pack(
+    store: &mut (impl StorageReader + ?Sized),
+    commit_id: &str,
+) -> Result<Option<Vec<TrackedStateDeltaEntry>>, LixError> {
+    let Some(bytes) = get_one(
+        store,
+        TRACKED_STATE_DELTA_PACK_NAMESPACE,
+        commit_id.as_bytes().to_vec(),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    crate::tracked_state::codec::decode_delta_pack(&bytes).map(Some)
+}
+
+pub(crate) fn stage_delta_pack(
+    writes: &mut StorageWriteSet,
+    commit_id: &str,
+    entries: &[TrackedStateDeltaEntry],
+) -> Result<(), LixError> {
+    writes.put(
+        TRACKED_STATE_DELTA_PACK_NAMESPACE,
+        commit_id.as_bytes().to_vec(),
+        crate::tracked_state::codec::encode_delta_pack(entries)?,
+    );
+    Ok(())
 }
 
 pub(crate) async fn read_chunk(

@@ -145,12 +145,12 @@ impl Engine {
         .await
     }
 
-    /// Rebuilds the tracked serving projection for one version from changelog.
+    /// Materializes the tracked serving projection root for one version from commit_store.
     ///
     /// This is intentionally an engine-level operation: callers should not need
     /// to know which KV namespaces back changelog, commit graph, or tracked
     /// state. The current version head is read from the live-state facade so
-    /// rebuild uses the same moving-ref visibility as normal execution.
+    /// materialization uses the same moving-ref visibility as normal execution.
     pub async fn rebuild_tracked_state_for_version(
         &self,
         version_id: &str,
@@ -168,16 +168,16 @@ impl Engine {
         let storage = self.storage();
         let mut transaction = storage.begin_write_transaction().await?;
         let mut writes = StorageWriteSet::new();
-        let rebuild_result = self
+        let materialize_result = self
             .tracked_state
-            .rebuild_at_commit(
+            .materializer(
                 transaction.as_mut(),
                 &mut writes,
                 self.commit_store.as_ref(),
-                &head_commit_id,
             )
+            .materialize_root_at(&head_commit_id)
             .await;
-        if let Err(error) = rebuild_result {
+        if let Err(error) = materialize_result {
             let _ = transaction.rollback().await;
             return Err(error);
         }

@@ -3,13 +3,14 @@ use xxhash_rust::xxh3::xxh3_64_with_seed;
 use crate::commit_store::ChangeLocator;
 use crate::entity_identity::EntityIdentity;
 use crate::tracked_state::types::{
-    TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
-    TRACKED_STATE_HASH_BYTES,
+    TrackedStateDeltaEntry, TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey,
+    TrackedStateKeyRef, TRACKED_STATE_HASH_BYTES,
 };
 use crate::LixError;
 
 const NODE_VERSION: u8 = 1;
 const VALUE_VERSION: u8 = 4;
+const DELTA_PACK_VERSION: u8 = 1;
 const NODE_KIND_LEAF: u8 = 1;
 const NODE_KIND_INTERNAL: u8 = 2;
 const WEIBULL_K: i32 = 4;
@@ -243,6 +244,63 @@ pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateIndexValue, LixEr
         created_at,
         updated_at,
     })
+}
+
+pub(crate) fn encode_delta_pack(entries: &[TrackedStateDeltaEntry]) -> Result<Vec<u8>, LixError> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"LXTD");
+    out.push(DELTA_PACK_VERSION);
+    push_u32(&mut out, entries.len());
+    for entry in entries {
+        push_sized_bytes(&mut out, &encode_key(&entry.key));
+        push_sized_bytes(
+            &mut out,
+            &encode_value_ref(TrackedStateIndexValueRef {
+                change_locator: entry.value.change_locator.as_ref(),
+                created_at: &entry.value.created_at,
+                updated_at: &entry.value.updated_at,
+            }),
+        );
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_delta_pack(bytes: &[u8]) -> Result<Vec<TrackedStateDeltaEntry>, LixError> {
+    let mut cursor = 0usize;
+    let magic = bytes.get(0..4).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state delta pack is truncated before magic",
+        )
+    })?;
+    if magic != b"LXTD" {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state delta pack has invalid magic",
+        ));
+    }
+    cursor += 4;
+    let version = read_u8(bytes, &mut cursor, "delta pack version")?;
+    if version != DELTA_PACK_VERSION {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("unsupported tracked-state delta pack version {version}"),
+        ));
+    }
+    let count = read_u32(bytes, &mut cursor, "delta pack entry count")?;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let key = decode_key(&read_sized_bytes(bytes, &mut cursor, "delta key")?)?;
+        let value = decode_value(&read_sized_bytes(bytes, &mut cursor, "delta value")?)?;
+        entries.push(TrackedStateDeltaEntry { key, value });
+    }
+    if cursor != bytes.len() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state delta pack decode found trailing bytes",
+        ));
+    }
+    Ok(entries)
 }
 
 #[cfg(test)]

@@ -1,26 +1,27 @@
 use crate::commit_store::{Change, ChangeLocator, Commit, CommitStoreContext};
-use crate::storage::{StorageReader, StorageWriteSet};
-use crate::tracked_state::context::TrackedStateWriteReport;
+use crate::storage::StorageReader;
+use crate::tracked_state::context::{TrackedStateMaterializer, TrackedStateWriteReport};
 use crate::tracked_state::types::TrackedStateKey;
-use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
+use crate::tracked_state::TrackedStateDeltaRef;
 use crate::LixError;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Owned rebuild delta used only by offline projection hydration.
+/// Owned materialization delta used only by explicit projection-root hydration.
 ///
 /// Normal transaction commits already have borrowed `ChangeRef` and
-/// `ChangeLocatorRef` values available while staging commit_store. Rebuilds
-/// load those facts back from storage, so they own the decoded data internally
-/// and immediately pass a borrowed view into the same tracked-state writer.
+/// `ChangeLocatorRef` values available while staging commit_store.
+/// Materialization loads those facts back from storage, so it owns the decoded
+/// data internally and immediately passes a borrowed view into the same
+/// tracked-state root writer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RebuildDelta {
+pub(crate) struct MaterializationDelta {
     pub(crate) change: Change,
     pub(crate) locator: ChangeLocator,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
 }
 
-impl RebuildDelta {
+impl MaterializationDelta {
     pub(crate) fn as_ref(&self) -> TrackedStateDeltaRef<'_> {
         TrackedStateDeltaRef {
             change: self.change.as_ref(),
@@ -32,10 +33,10 @@ impl RebuildDelta {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RebuildInput {
+pub(crate) struct MaterializationInput {
     pub(crate) commit_id: String,
     pub(crate) parent_commit_id: Option<String>,
-    pub(crate) deltas: Vec<RebuildDelta>,
+    pub(crate) deltas: Vec<MaterializationDelta>,
 }
 
 struct LocatedChange {
@@ -43,30 +44,30 @@ struct LocatedChange {
     change: Change,
 }
 
-/// Explicit offline projection rebuild over commit_store.
+/// Explicit projection-root materialization over commit_store.
 ///
 /// Normal transaction commits must use `TrackedStateWriter::stage_delta` with
-/// already prepared commit_store refs. This rebuild path exists for repair and
-/// projection hydration only.
-pub(crate) async fn rebuild_at_commit<S>(
-    tracked_state: &TrackedStateContext,
-    store: &mut S,
-    writes: &mut StorageWriteSet,
-    commit_store: &CommitStoreContext,
+/// already prepared commit_store refs. This path exists for deliberate
+/// materialization only.
+pub(crate) async fn materialize_root_at<S>(
+    materializer: &mut TrackedStateMaterializer<'_, S>,
     commit_id: &str,
 ) -> Result<TrackedStateWriteReport, LixError>
 where
     S: StorageReader + ?Sized,
 {
-    let input = build_rebuild_input(store, commit_store, commit_id).await?;
+    let input =
+        build_materialization_input(materializer.store, materializer.commit_store, commit_id)
+            .await?;
     let delta_refs = input
         .deltas
         .iter()
-        .map(RebuildDelta::as_ref)
+        .map(MaterializationDelta::as_ref)
         .collect::<Vec<_>>();
-    tracked_state
-        .writer(store, writes)
-        .stage_delta(
+    materializer
+        .tracked_state
+        .writer(materializer.store, materializer.writes)
+        .stage_projection_root(
             &input.commit_id,
             input.parent_commit_id.as_deref(),
             delta_refs,
@@ -74,11 +75,11 @@ where
         .await
 }
 
-async fn build_rebuild_input<S>(
+async fn build_materialization_input<S>(
     store: &mut S,
     commit_store: &CommitStoreContext,
     commit_id: &str,
-) -> Result<RebuildInput, LixError>
+) -> Result<MaterializationInput, LixError>
 where
     S: StorageReader + ?Sized,
 {
@@ -88,9 +89,9 @@ where
         located_changes
             .append(&mut load_commit_located_changes(store, commit_store, &commit).await?);
     }
-    let deltas = project_rebuild_deltas(located_changes);
+    let deltas = project_materialization_deltas(located_changes);
 
-    Ok(RebuildInput {
+    Ok(MaterializationInput {
         commit_id: commit_id.to_string(),
         parent_commit_id: None,
         deltas,
@@ -112,7 +113,9 @@ where
         if !seen.insert(current_id.clone()) {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!("tracked_state rebuild found first-parent cycle at commit '{current_id}'"),
+                format!(
+                    "tracked_state materialization found first-parent cycle at commit '{current_id}'"
+                ),
             ));
         }
         let commit = commit_store
@@ -147,7 +150,7 @@ where
                 source_ordinal: u32::try_from(source_ordinal).map_err(|_| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
-                        "tracked_state rebuild change pack ordinal exceeds u32",
+                        "tracked_state materialization change pack ordinal exceeds u32",
                     )
                 })?,
                 change_id: change.id.clone(),
@@ -174,8 +177,10 @@ where
     Ok(located_changes)
 }
 
-fn project_rebuild_deltas(changes: impl IntoIterator<Item = LocatedChange>) -> Vec<RebuildDelta> {
-    let mut projected = BTreeMap::<TrackedStateKey, RebuildDelta>::new();
+fn project_materialization_deltas(
+    changes: impl IntoIterator<Item = LocatedChange>,
+) -> Vec<MaterializationDelta> {
+    let mut projected = BTreeMap::<TrackedStateKey, MaterializationDelta>::new();
     for LocatedChange { locator, change } in changes {
         let key = TrackedStateKey {
             schema_key: change.schema_key.clone(),
@@ -189,7 +194,7 @@ fn project_rebuild_deltas(changes: impl IntoIterator<Item = LocatedChange>) -> V
         let updated_at = change.created_at.clone();
         projected.insert(
             key,
-            RebuildDelta {
+            MaterializationDelta {
                 change,
                 locator,
                 created_at,
@@ -235,7 +240,7 @@ fn change_from_loaded_packs(
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
-                "tracked_state rebuild lost loaded change pack ({}, {})",
+                "tracked_state materialization lost loaded change pack ({}, {})",
                 locator.source_commit_id, locator.source_pack_id
             ),
         )
@@ -244,14 +249,14 @@ fn change_from_loaded_packs(
         .get(usize::try_from(locator.source_ordinal).map_err(|_| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "tracked_state rebuild locator ordinal does not fit usize",
+                "tracked_state materialization locator ordinal does not fit usize",
             )
         })?)
         .ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
-                    "tracked_state rebuild locator for '{}' points past pack ({}, {})",
+                    "tracked_state materialization locator for '{}' points past pack ({}, {})",
                     locator.change_id, locator.source_commit_id, locator.source_pack_id
                 ),
             )
@@ -260,7 +265,7 @@ fn change_from_loaded_packs(
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
-                "tracked_state rebuild locator expected '{}' but found '{}'",
+                "tracked_state materialization locator expected '{}' but found '{}'",
                 locator.change_id, change.id
             ),
         ));
@@ -271,14 +276,14 @@ fn change_from_loaded_packs(
 fn missing_pack_error(label: &str, commit_id: &str, pack_id: u32) -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
-        format!("tracked_state rebuild missing {label} pack ({commit_id}, {pack_id})"),
+        format!("tracked_state materialization missing {label} pack ({commit_id}, {pack_id})"),
     )
 }
 
 fn missing_commit_error(commit_id: &str) -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
-        format!("tracked_state rebuild missing commit '{commit_id}'"),
+        format!("tracked_state materialization missing commit '{commit_id}'"),
     )
 }
 
@@ -289,8 +294,8 @@ mod tests {
     use crate::entity_identity::EntityIdentity;
 
     #[test]
-    fn rebuild_delta_ref_borrows_owned_rebuild_facts() {
-        let delta = RebuildDelta {
+    fn materialization_delta_ref_borrows_owned_facts() {
+        let delta = MaterializationDelta {
             change: Change {
                 id: "change-1".to_string(),
                 entity_id: EntityIdentity::single("entity-1"),
@@ -360,8 +365,8 @@ mod tests {
     }
 
     #[test]
-    fn project_rebuild_deltas_keeps_first_seen_created_at_and_latest_updated_at() {
-        let deltas = project_rebuild_deltas(vec![
+    fn project_materialization_deltas_keeps_first_seen_created_at_and_latest_updated_at() {
+        let deltas = project_materialization_deltas(vec![
             located_change(
                 "commit-1",
                 0,
@@ -387,8 +392,8 @@ mod tests {
     }
 
     #[test]
-    fn project_rebuild_deltas_uses_adopted_change_time_not_target_commit_time() {
-        let deltas = project_rebuild_deltas(vec![located_change(
+    fn project_materialization_deltas_uses_adopted_change_time_not_target_commit_time() {
+        let deltas = project_materialization_deltas(vec![located_change(
             "source-commit",
             0,
             "adopted-change",
@@ -402,8 +407,8 @@ mod tests {
     }
 
     #[test]
-    fn project_rebuild_deltas_tracks_entities_independently() {
-        let deltas = project_rebuild_deltas(vec![
+    fn project_materialization_deltas_tracks_entities_independently() {
+        let deltas = project_materialization_deltas(vec![
             located_change(
                 "commit-1",
                 0,

@@ -4,8 +4,7 @@ use crate::{parse_row_metadata, LixError};
 pub(crate) fn materialize_row(
     row: UntrackedStateRow,
     projection: &UntrackedMaterializationProjection,
-) -> Result<MaterializedUntrackedStateRow, LixError>
-{
+) -> Result<MaterializedUntrackedStateRow, LixError> {
     let deleted = row.snapshot_content.is_none();
     let snapshot_content = if projection.snapshot_content {
         row.snapshot_content

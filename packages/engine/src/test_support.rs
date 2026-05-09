@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use crate::commit_store::{Change, CommitDraftRef, CommitStoreContext};
-use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef};
+use crate::json_store::{
+    JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef,
+};
 use crate::storage::StorageContext;
 use crate::storage::StorageWriteSet;
 use crate::storage::StorageWriteTransaction;
