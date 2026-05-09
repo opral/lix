@@ -109,14 +109,14 @@ async fn rebuild_tracked_state_rolls_back_read_and_write_transactions_on_failure
         .await
         .expect("initialized backend should create an engine");
 
-    backend.fail_scan_namespace("changelog.change");
+    backend.fail_read_namespace("commit_store.commit");
     let before = backend.stats();
     let error = engine
         .rebuild_tracked_state_for_version(&receipt.main_version_id)
         .await
-        .expect_err("forced changelog scan failure should fail rebuild");
+        .expect_err("forced commit-store read failure should fail rebuild");
     assert!(
-        error.message.contains("forced scan failure"),
+        error.message.contains("forced read failure"),
         "unexpected error: {error:?}"
     );
 
@@ -137,7 +137,7 @@ async fn rebuild_tracked_state_rolls_back_read_and_write_transactions_on_failure
 struct RecordingBackend {
     data: Arc<Mutex<KvMap>>,
     stats: Arc<TransactionStats>,
-    fail_scan_namespace: Arc<Mutex<Option<String>>>,
+    fail_read_namespace: Arc<Mutex<Option<String>>>,
 }
 
 impl RecordingBackend {
@@ -149,9 +149,9 @@ impl RecordingBackend {
         self.stats.snapshot()
     }
 
-    fn fail_scan_namespace(&self, namespace: &str) {
+    fn fail_read_namespace(&self, namespace: &str) {
         *self
-            .fail_scan_namespace
+            .fail_read_namespace
             .lock()
             .expect("fail namespace lock should not poison") = Some(namespace.to_string());
     }
@@ -167,7 +167,7 @@ impl Backend for RecordingBackend {
             data: Arc::clone(&self.data),
             pending: BTreeMap::new(),
             stats: Arc::clone(&self.stats),
-            fail_scan_namespace: Arc::clone(&self.fail_scan_namespace),
+            fail_read_namespace: Arc::clone(&self.fail_read_namespace),
             mode: RecordingTransactionMode::Read,
         }))
     }
@@ -180,7 +180,7 @@ impl Backend for RecordingBackend {
             data: Arc::clone(&self.data),
             pending: BTreeMap::new(),
             stats: Arc::clone(&self.stats),
-            fail_scan_namespace: Arc::clone(&self.fail_scan_namespace),
+            fail_read_namespace: Arc::clone(&self.fail_read_namespace),
             mode: RecordingTransactionMode::Write,
         }))
     }
@@ -190,7 +190,7 @@ struct RecordingTransaction {
     data: Arc<Mutex<KvMap>>,
     pending: BTreeMap<KvKey, Option<Vec<u8>>>,
     stats: Arc<TransactionStats>,
-    fail_scan_namespace: Arc<Mutex<Option<String>>>,
+    fail_read_namespace: Arc<Mutex<Option<String>>>,
     mode: RecordingTransactionMode,
 }
 
@@ -206,6 +206,7 @@ impl BackendReadTransaction for RecordingTransaction {
         &mut self,
         request: BackendKvGetRequest,
     ) -> Result<BackendKvValueBatch, LixError> {
+        self.fail_if_get_namespace_matches(&request)?;
         let data = self.data.lock().expect("recording backend lock poisoned");
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
@@ -240,6 +241,7 @@ impl BackendReadTransaction for RecordingTransaction {
         &mut self,
         request: BackendKvGetRequest,
     ) -> Result<BackendKvExistsBatch, LixError> {
+        self.fail_if_get_namespace_matches(&request)?;
         let data = self.data.lock().expect("recording backend lock poisoned");
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
@@ -357,20 +359,31 @@ impl BackendWriteTransaction for RecordingTransaction {
 }
 
 impl RecordingTransaction {
+    fn fail_if_get_namespace_matches(&self, request: &BackendKvGetRequest) -> Result<(), LixError> {
+        for group in &request.groups {
+            self.fail_if_namespace_matches(&group.namespace)?;
+        }
+        Ok(())
+    }
+
     fn fail_if_scan_namespace_matches(
         &self,
         request: &BackendKvScanRequest,
     ) -> Result<(), LixError> {
+        self.fail_if_namespace_matches(&request.namespace)
+    }
+
+    fn fail_if_namespace_matches(&self, namespace: &str) -> Result<(), LixError> {
         if self
-            .fail_scan_namespace
+            .fail_read_namespace
             .lock()
             .expect("fail namespace lock should not poison")
             .as_deref()
-            == Some(request.namespace.as_str())
+            == Some(namespace)
         {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                format!("forced scan failure for namespace {}", request.namespace),
+                format!("forced read failure for namespace {namespace}"),
             ));
         }
         Ok(())

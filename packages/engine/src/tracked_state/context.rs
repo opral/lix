@@ -994,6 +994,7 @@ mod tests {
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
             metadata: None,
+            deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             change_id: change_id.to_string(),

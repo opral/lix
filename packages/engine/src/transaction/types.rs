@@ -320,12 +320,14 @@ pub(crate) struct PreparedAdoptedStateRow {
 
 impl From<PreparedStateRow> for MaterializedLiveStateRow {
     fn from(row: PreparedStateRow) -> Self {
+        let deleted = row.snapshot.is_none();
         MaterializedLiveStateRow {
             entity_id: row.entity_id,
             schema_key: row.schema_key,
             file_id: row.file_id,
             snapshot_content: row.snapshot.map(|snapshot| snapshot.materialize()),
             metadata: row.metadata.map(|metadata| metadata.materialize()),
+            deleted,
             created_at: row.created_at,
             updated_at: row.updated_at,
             global: row.global,
@@ -345,6 +347,7 @@ impl From<&PreparedStateRow> for MaterializedLiveStateRow {
             file_id: row.file_id.clone(),
             snapshot_content: row.snapshot.as_ref().map(StageJson::materialize),
             metadata: row.metadata.as_ref().map(StageJson::materialize),
+            deleted: row.snapshot.is_none(),
             created_at: row.created_at.clone(),
             updated_at: row.updated_at.clone(),
             global: row.global,
@@ -358,12 +361,14 @@ impl From<&PreparedStateRow> for MaterializedLiveStateRow {
 
 impl From<PreparedAdoptedStateRow> for MaterializedLiveStateRow {
     fn from(row: PreparedAdoptedStateRow) -> Self {
+        let deleted = row.snapshot.is_none();
         MaterializedLiveStateRow {
             entity_id: row.entity_id,
             schema_key: row.schema_key,
             file_id: row.file_id,
             snapshot_content: row.snapshot.map(|snapshot| snapshot.materialize()),
             metadata: row.metadata.map(|metadata| metadata.materialize()),
+            deleted,
             created_at: row.created_at,
             updated_at: row.updated_at,
             global: row.global,
@@ -383,6 +388,7 @@ impl From<&PreparedAdoptedStateRow> for MaterializedLiveStateRow {
             file_id: row.file_id.clone(),
             snapshot_content: row.snapshot.as_ref().map(StageJson::materialize),
             metadata: row.metadata.as_ref().map(StageJson::materialize),
+            deleted: row.snapshot.is_none(),
             created_at: row.created_at.clone(),
             updated_at: row.updated_at.clone(),
             global: row.global,
@@ -396,12 +402,14 @@ impl From<&PreparedAdoptedStateRow> for MaterializedLiveStateRow {
 
 impl From<PreparedStateRow> for MaterializedUntrackedStateRow {
     fn from(row: PreparedStateRow) -> Self {
+        let deleted = row.snapshot.is_none();
         MaterializedUntrackedStateRow {
             entity_id: row.entity_id,
             schema_key: row.schema_key,
             file_id: row.file_id,
             snapshot_content: row.snapshot.map(|snapshot| snapshot.materialize()),
             metadata: row.metadata.map(|metadata| metadata.materialize()),
+            deleted,
             created_at: row.created_at,
             updated_at: row.updated_at,
             global: row.global,

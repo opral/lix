@@ -1,6 +1,5 @@
 mod change_provider;
 mod classify;
-mod commit_derived_provider;
 mod context;
 mod directory_history_provider;
 mod directory_provider;
@@ -33,7 +32,7 @@ pub(crate) use classify::{
     classify_statement, dml_target_table_names, validate_supported_statement_ast, SqlStatementKind,
 };
 pub(crate) use context::{
-    ChangelogQuerySource, SqlChangelogQuerySource, SqlExecutionContext, SqlJsonReader,
+    CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext, SqlJsonReader,
     SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextLiveStateReader,
     WriteContextVersionRefReader,
 };

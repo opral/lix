@@ -224,8 +224,11 @@ impl TableProvider for LixDirectoryProvider {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let projected_schema = projected_schema(&self.schema, projection)?;
         let scan_limit = if filters.is_empty() { limit } else { None };
-        let mut request =
-            lix_directory_scan_request(self.version_binding.active_version_id(), scan_limit);
+        let mut request = lix_directory_scan_request(
+            self.version_binding.active_version_id(),
+            Some(projected_schema.as_ref()),
+            scan_limit,
+        );
         if self.write_access.is_write() && matches!(self.version_binding, VersionBinding::Explicit)
         {
             request.filter.version_ids = explicit_version_ids_from_dml_filters(filters);
@@ -302,7 +305,7 @@ impl TableProvider for LixDirectoryProvider {
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
             .collect::<Result<Vec<_>>>()?;
         let mut request =
-            lix_directory_scan_request(self.version_binding.active_version_id(), None);
+            lix_directory_scan_request(self.version_binding.active_version_id(), None, None);
         if matches!(self.version_binding, VersionBinding::Explicit) {
             request.filter.version_ids = explicit_version_ids_from_dml_filters(&filters);
             if request.filter.version_ids.is_empty() {
@@ -349,7 +352,8 @@ impl TableProvider for LixDirectoryProvider {
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
             .collect::<Result<Vec<_>>>()?;
-        let request = lix_directory_scan_request(self.version_binding.active_version_id(), None);
+        let request =
+            lix_directory_scan_request(self.version_binding.active_version_id(), None, None);
 
         Ok(Arc::new(LixDirectoryUpdateExec::new(
             write_ctx.clone(),
@@ -1517,6 +1521,7 @@ fn projected_schema(base_schema: &SchemaRef, projection: Option<&Vec<usize>>) ->
 
 fn lix_directory_scan_request(
     version_binding: Option<&str>,
+    projected_schema: Option<&Schema>,
     limit: Option<usize>,
 ) -> LiveStateScanRequest {
     LiveStateScanRequest {
@@ -1527,9 +1532,31 @@ fn lix_directory_scan_request(
                 .unwrap_or_default(),
             ..LiveStateFilter::default()
         },
-        projection: LiveStateProjection::default(),
+        projection: lix_directory_live_state_projection(projected_schema),
         limit,
     }
+}
+
+fn lix_directory_live_state_projection(projected_schema: Option<&Schema>) -> LiveStateProjection {
+    let Some(schema) = projected_schema else {
+        return LiveStateProjection::default();
+    };
+    let mut columns = Vec::new();
+    let needs_snapshot = schema
+        .fields()
+        .iter()
+        .any(|field| matches!(field.name().as_str(), "parent_id" | "name" | "hidden"));
+    if needs_snapshot {
+        columns.push("snapshot_content".to_string());
+    }
+    if schema
+        .fields()
+        .iter()
+        .any(|field| field.name() == "lixcol_metadata")
+    {
+        columns.push("metadata".to_string());
+    }
+    LiveStateProjection { columns }
 }
 
 fn validate_lix_directory_update_assignments(
@@ -1988,6 +2015,7 @@ mod tests {
             file_id: file_id.map(ToOwned::to_owned),
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: Some(json!({"source": "test"}).to_string()),
+            deleted: false,
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),

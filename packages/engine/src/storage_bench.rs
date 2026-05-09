@@ -1,8 +1,8 @@
 use crate::binary_cas::{BinaryCasContext, BlobHash, BlobWrite};
-use crate::changelog::{
-    CanonicalChange, ChangelogContext, ChangelogScanRequest, MaterializedCanonicalChange,
-};
 use crate::commit_graph::CommitGraphChangeHistoryRequest;
+use crate::commit_store::{
+    Change, ChangeScanRequest, CommitDraftBorrowed, CommitStoreContext, MaterializedChange,
+};
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::context::JsonStoreContext;
 use crate::json_store::types::{JsonProjectionPath, JsonRef, NormalizedJson};
@@ -166,7 +166,7 @@ pub struct TransactionBenchFixture {
     live_state: Arc<LiveStateContext>,
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
-    changelog: Arc<ChangelogContext>,
+    commit_store: Arc<CommitStoreContext>,
     version_ctx: Arc<VersionContext>,
     schema_catalog_source: Arc<SchemaCatalogSource>,
     rows: Vec<TransactionWriteRow>,
@@ -403,7 +403,7 @@ pub async fn transaction_commit_prepared(
         Arc::clone(&fixture.live_state),
         Arc::clone(&fixture.tracked_state),
         Arc::clone(&fixture.binary_cas),
-        Arc::clone(&fixture.changelog),
+        Arc::clone(&fixture.commit_store),
         Arc::clone(&fixture.version_ctx),
         Arc::clone(&fixture.schema_catalog_source),
     )
@@ -439,7 +439,7 @@ pub async fn transaction_open_empty_prepared(
         Arc::clone(&fixture.live_state),
         Arc::clone(&fixture.tracked_state),
         Arc::clone(&fixture.binary_cas),
-        Arc::clone(&fixture.changelog),
+        Arc::clone(&fixture.commit_store),
         Arc::clone(&fixture.version_ctx),
         Arc::clone(&fixture.schema_catalog_source),
     )
@@ -464,7 +464,7 @@ pub async fn transaction_stage_only_prepared(
         Arc::clone(&fixture.live_state),
         Arc::clone(&fixture.tracked_state),
         Arc::clone(&fixture.binary_cas),
-        Arc::clone(&fixture.changelog),
+        Arc::clone(&fixture.commit_store),
         Arc::clone(&fixture.version_ctx),
         Arc::clone(&fixture.schema_catalog_source),
     )
@@ -499,7 +499,7 @@ pub async fn prepare_transaction_commit_only(
         Arc::clone(&fixture.live_state),
         Arc::clone(&fixture.tracked_state),
         Arc::clone(&fixture.binary_cas),
-        Arc::clone(&fixture.changelog),
+        Arc::clone(&fixture.commit_store),
         Arc::clone(&fixture.version_ctx),
         Arc::clone(&fixture.schema_catalog_source),
     )
@@ -567,32 +567,29 @@ async fn prepare_transaction_fixture(
     let storage = StorageContext::new(backend);
     let tracked_state = Arc::new(TrackedStateContext::new());
     let untracked_state = Arc::new(UntrackedStateContext::new());
-    let changelog = Arc::new(ChangelogContext::new());
+    let commit_store = Arc::new(CommitStoreContext::new());
     let live_state = Arc::new(LiveStateContext::new(
         tracked_state.as_ref().clone(),
         untracked_state.as_ref().clone(),
-        crate::commit_graph::CommitGraphContext::new(changelog.as_ref().clone()),
+        crate::commit_graph::CommitGraphContext::new(),
     ));
     let binary_cas = Arc::new(BinaryCasContext::new());
     let version_ctx = Arc::new(VersionContext::new(untracked_state));
     let schema_catalog_source = Arc::new(SchemaCatalogSource::new());
-    seed_transaction_visible_schema_rows(storage.clone(), live_state.as_ref()).await?;
+    seed_transaction_visible_schema_rows(storage.clone()).await?;
     Ok(TransactionBenchFixture {
         storage,
         live_state,
         tracked_state,
         binary_cas,
-        changelog,
+        commit_store,
         version_ctx,
         schema_catalog_source,
         rows,
     })
 }
 
-async fn seed_transaction_visible_schema_rows(
-    storage: StorageContext,
-    live_state: &LiveStateContext,
-) -> Result<(), LixError> {
+async fn seed_transaction_visible_schema_rows(storage: StorageContext) -> Result<(), LixError> {
     let mut writes = StorageWriteSet::new();
     let mut json_writer = JsonStoreContext::new().writer();
     let rows = crate::schema::seed_schema_definitions()
@@ -621,10 +618,9 @@ async fn seed_transaction_visible_schema_rows(
         })
         .collect::<Result<Vec<_>, LixError>>()?;
     let mut transaction = storage.begin_write_transaction().await?;
-    {
-        let mut writer = live_state.writer(transaction.as_mut());
-        writer.stage_untracked_rows(&mut writes, rows.iter().map(|row| row.as_ref()))?;
-    }
+    UntrackedStateContext::new()
+        .writer(&mut writes)
+        .stage_rows(rows.iter().map(|row| row.as_ref()))?;
     json_writer.flush_into(&mut writes);
     writes.apply(&mut transaction.as_mut()).await?;
     transaction.commit().await
@@ -1391,22 +1387,21 @@ pub struct UntrackedStateReadFixture {
 }
 
 pub struct ChangelogAppendFixture {
-    context: ChangelogContext,
-    changes: Vec<MaterializedCanonicalChange>,
+    context: CommitStoreContext,
+    changes: Vec<MaterializedChange>,
 }
 
 pub struct ChangelogReadFixture {
-    context: ChangelogContext,
+    context: CommitStoreContext,
     rows: usize,
 }
 
 pub struct ChangelogCodecFixture {
-    changes: Vec<CanonicalChange>,
+    changes: Vec<Change>,
     encoded_changes: Vec<Vec<u8>>,
 }
 
 pub struct CommitGraphReadFixture {
-    changelog: ChangelogContext,
     commits: Vec<crate::commit_graph::CommitGraphCommit>,
     head_commit_id: String,
     rows: usize,
@@ -2290,7 +2285,7 @@ pub async fn prepare_changelog_append_changes(
     config: StorageBenchConfig,
 ) -> Result<ChangelogAppendFixture, LixError> {
     Ok(ChangelogAppendFixture {
-        context: ChangelogContext::new(),
+        context: CommitStoreContext::new(),
         changes: changelog_materialized_changes(config),
     })
 }
@@ -2299,7 +2294,7 @@ pub async fn prepare_changelog_append_tombstones(
     config: StorageBenchConfig,
 ) -> Result<ChangelogAppendFixture, LixError> {
     Ok(ChangelogAppendFixture {
-        context: ChangelogContext::new(),
+        context: CommitStoreContext::new(),
         changes: changelog_tombstone_changes(config),
     })
 }
@@ -2308,7 +2303,7 @@ pub async fn prepare_changelog_append_metadata(
     config: StorageBenchConfig,
 ) -> Result<ChangelogAppendFixture, LixError> {
     Ok(ChangelogAppendFixture {
-        context: ChangelogContext::new(),
+        context: CommitStoreContext::new(),
         changes: changelog_metadata_changes(config),
     })
 }
@@ -2317,7 +2312,7 @@ pub async fn prepare_changelog_append_shared_payload(
     config: StorageBenchConfig,
 ) -> Result<ChangelogAppendFixture, LixError> {
     Ok(ChangelogAppendFixture {
-        context: ChangelogContext::new(),
+        context: CommitStoreContext::new(),
         changes: changelog_shared_payload_changes(config),
     })
 }
@@ -2326,7 +2321,7 @@ pub async fn prepare_changelog_append_shared_metadata(
     config: StorageBenchConfig,
 ) -> Result<ChangelogAppendFixture, LixError> {
     Ok(ChangelogAppendFixture {
-        context: ChangelogContext::new(),
+        context: CommitStoreContext::new(),
         changes: changelog_shared_metadata_changes(config),
     })
 }
@@ -2335,7 +2330,7 @@ pub async fn prepare_changelog_append_shared_payload_and_metadata(
     config: StorageBenchConfig,
 ) -> Result<ChangelogAppendFixture, LixError> {
     Ok(ChangelogAppendFixture {
-        context: ChangelogContext::new(),
+        context: CommitStoreContext::new(),
         changes: changelog_shared_payload_and_metadata_changes(config),
     })
 }
@@ -2344,7 +2339,7 @@ pub async fn prepare_changelog_append_composite_entity_ids(
     config: StorageBenchConfig,
 ) -> Result<ChangelogAppendFixture, LixError> {
     Ok(ChangelogAppendFixture {
-        context: ChangelogContext::new(),
+        context: CommitStoreContext::new(),
         changes: changelog_composite_entity_id_changes(config),
     })
 }
@@ -2355,7 +2350,7 @@ pub async fn prepare_changelog_codec(
     let changes = changelog_changes(config);
     let encoded_changes = changes
         .iter()
-        .map(|change| crate::changelog::codec::encode_change_ref(change.as_ref()))
+        .map(|change| crate::commit_store::codec::encode_change_borrowed(change.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ChangelogCodecFixture {
         changes,
@@ -2372,7 +2367,7 @@ pub async fn changelog_append_changes_prepared(
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
     let verified_rows = reader
-        .scan_changes(&ChangelogScanRequest::default())
+        .scan_changes(&ChangeScanRequest::default())
         .await?
         .len();
     Ok(report(fixture.changes.len(), verified_rows, Duration::ZERO))
@@ -2382,7 +2377,7 @@ pub async fn prepare_changelog_read(
     backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<ChangelogReadFixture, LixError> {
-    let context = ChangelogContext::new();
+    let context = CommitStoreContext::new();
     let changes = changelog_materialized_changes(config);
     append_changelog_changes(backend, &context, &changes).await?;
     Ok(ChangelogReadFixture {
@@ -2395,7 +2390,7 @@ pub async fn prepare_changelog_read_with_selectivity(
     backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<ChangelogReadFixture, LixError> {
-    let context = ChangelogContext::new();
+    let context = CommitStoreContext::new();
     let changes = changelog_selective_changes(config);
     append_changelog_changes(backend, &context, &changes).await?;
     Ok(ChangelogReadFixture {
@@ -2408,7 +2403,7 @@ pub async fn prepare_changelog_read_entity_history(
     backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<ChangelogReadFixture, LixError> {
-    let context = ChangelogContext::new();
+    let context = CommitStoreContext::new();
     let changes = changelog_entity_history_changes(config);
     append_changelog_changes(backend, &context, &changes).await?;
     Ok(ChangelogReadFixture {
@@ -2423,7 +2418,7 @@ pub async fn changelog_encode_only_prepared(
     let mut verified_rows = 0;
     let mut encoded_bytes = 0;
     for change in &fixture.changes {
-        encoded_bytes += crate::changelog::codec::encode_change_ref(change.as_ref())?.len();
+        encoded_bytes += crate::commit_store::codec::encode_change_borrowed(change.as_ref())?.len();
         verified_rows += 1;
     }
     Ok(report(
@@ -2439,7 +2434,7 @@ pub async fn changelog_decode_only_prepared(
     let mut verified_rows = 0;
     let mut decoded_bytes = 0;
     for bytes in &fixture.encoded_changes {
-        let change = crate::changelog::codec::decode_change(bytes)?;
+        let change = crate::commit_store::codec::decode_change(bytes)?;
         decoded_bytes += change.schema_key.len();
         verified_rows += 1;
     }
@@ -2496,7 +2491,7 @@ pub async fn changelog_scan_all_prepared(
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
     let verified_rows = reader
-        .scan_changes(&ChangelogScanRequest::default())
+        .scan_changes(&ChangeScanRequest::default())
         .await?
         .len();
     Ok(report(fixture.rows, verified_rows, Duration::ZERO))
@@ -2518,7 +2513,7 @@ pub async fn changelog_scan_limit_100_prepared(
         .reader(StorageContext::new(Arc::clone(backend)));
     let expected = fixture.rows.min(100);
     let verified_rows = reader
-        .scan_changes(&ChangelogScanRequest {
+        .scan_changes(&ChangeScanRequest {
             limit: Some(expected),
         })
         .await?
@@ -2553,9 +2548,7 @@ pub async fn changelog_scan_schema_prepared(
     let reader = fixture
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
-    let changes = reader
-        .scan_changes(&ChangelogScanRequest::default())
-        .await?;
+    let changes = reader.scan_changes(&ChangeScanRequest::default()).await?;
     let verified_rows = changes
         .iter()
         .filter(|change| change.schema_key == CHANGELOG_MATCH_SCHEMA_KEY)
@@ -2574,9 +2567,7 @@ pub async fn changelog_scan_entity_history_prepared(
     let reader = fixture
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
-    let changes = reader
-        .scan_changes(&ChangelogScanRequest::default())
-        .await?;
+    let changes = reader.scan_changes(&ChangeScanRequest::default()).await?;
     let target = EntityIdentity::single(CHANGELOG_HISTORY_ENTITY_ID);
     let verified_rows = changes
         .iter()
@@ -2593,7 +2584,7 @@ pub async fn prepare_commit_graph_read(
     backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<CommitGraphReadFixture, LixError> {
-    let changelog = ChangelogContext::new();
+    let changelog = CommitStoreContext::new();
     let mut changes = changelog_materialized_changes(config);
     let head_commit_id = "bench-commit-head".to_string();
     changes.push(commit_graph_materialized_commit_change(
@@ -2602,11 +2593,10 @@ pub async fn prepare_commit_graph_read(
     ));
     append_changelog_changes(backend, &changelog, &changes).await?;
 
-    let graph = crate::commit_graph::CommitGraphContext::new(changelog.clone());
+    let graph = crate::commit_graph::CommitGraphContext::new();
     let mut reader = graph.reader(StorageContext::new(Arc::clone(backend)));
     let commits = reader.all_commits().await?;
     Ok(CommitGraphReadFixture {
-        changelog,
         commits,
         head_commit_id,
         rows: config.rows,
@@ -2617,7 +2607,7 @@ pub async fn commit_graph_change_set_elements_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &CommitGraphReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let graph = crate::commit_graph::CommitGraphContext::new(fixture.changelog.clone());
+    let graph = crate::commit_graph::CommitGraphContext::new();
     let mut reader = graph.reader(StorageContext::new(Arc::clone(backend)));
     let verified_rows = reader.change_set_elements(&fixture.commits).await?.len();
     Ok(report(fixture.rows, verified_rows, Duration::ZERO))
@@ -2627,7 +2617,7 @@ pub async fn commit_graph_change_history_from_commit_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &CommitGraphReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let graph = crate::commit_graph::CommitGraphContext::new(fixture.changelog.clone());
+    let graph = crate::commit_graph::CommitGraphContext::new();
     let mut reader = graph.reader(StorageContext::new(Arc::clone(backend)));
     let verified_rows = reader
         .change_history_from_commit(
@@ -3303,13 +3293,13 @@ pub async fn changelog_append_changes(
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
     let changes = changelog_materialized_changes(config);
-    let context = ChangelogContext::new();
+    let context = CommitStoreContext::new();
     let started = Instant::now();
     append_changelog_changes(backend, &context, &changes).await?;
     let elapsed = started.elapsed();
     let reader = context.reader(StorageContext::new(Arc::clone(backend)));
     let verified_rows = reader
-        .scan_changes(&ChangelogScanRequest::default())
+        .scan_changes(&ChangeScanRequest::default())
         .await?
         .len();
     Ok(report(changes.len(), verified_rows, elapsed))
@@ -3319,7 +3309,7 @@ pub async fn changelog_load_changes_hit(
     backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
-    let context = ChangelogContext::new();
+    let context = CommitStoreContext::new();
     let changes = changelog_materialized_changes(config);
     append_changelog_changes(backend, &context, &changes).await?;
     let reader = context.reader(StorageContext::new(Arc::clone(backend)));
@@ -3341,7 +3331,7 @@ pub async fn changelog_load_changes_miss(
     backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
-    let context = ChangelogContext::new();
+    let context = CommitStoreContext::new();
     let changes = changelog_materialized_changes(config);
     append_changelog_changes(backend, &context, &changes).await?;
     let reader = context.reader(StorageContext::new(Arc::clone(backend)));
@@ -3363,14 +3353,14 @@ pub async fn changelog_scan_all(
     backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
-    let context = ChangelogContext::new();
+    let context = CommitStoreContext::new();
     let changes = changelog_materialized_changes(config);
     append_changelog_changes(backend, &context, &changes).await?;
     let reader = context.reader(StorageContext::new(Arc::clone(backend)));
 
     let started = Instant::now();
     let verified_rows = reader
-        .scan_changes(&ChangelogScanRequest::default())
+        .scan_changes(&ChangeScanRequest::default())
         .await?
         .len();
     Ok(report(config.rows, verified_rows, started.elapsed()))
@@ -3380,7 +3370,7 @@ pub async fn changelog_scan_limit_100(
     backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<StorageBenchReport, LixError> {
-    let context = ChangelogContext::new();
+    let context = CommitStoreContext::new();
     let changes = changelog_materialized_changes(config);
     append_changelog_changes(backend, &context, &changes).await?;
     let reader = context.reader(StorageContext::new(Arc::clone(backend)));
@@ -3388,7 +3378,7 @@ pub async fn changelog_scan_limit_100(
 
     let started = Instant::now();
     let verified_rows = reader
-        .scan_changes(&ChangelogScanRequest {
+        .scan_changes(&ChangeScanRequest {
             limit: Some(expected),
         })
         .await?
@@ -3573,28 +3563,42 @@ async fn scan_untracked(
 
 async fn append_changelog_changes(
     backend: &Arc<dyn Backend + Send + Sync>,
-    context: &ChangelogContext,
-    changes: &[MaterializedCanonicalChange],
+    context: &CommitStoreContext,
+    changes: &[MaterializedChange],
 ) -> Result<(), LixError> {
     let storage = StorageContext::new(Arc::clone(backend));
     let mut transaction = storage.begin_write_transaction().await?;
     {
         let mut writes = StorageWriteSet::new();
-        let canonical_changes = {
-            let mut json_writer = JsonStoreContext::new().writer();
-            changes
-                .iter()
-                .map(|change| {
-                    crate::test_support::canonical_change_from_materialized(
-                        &mut writes,
-                        &mut json_writer,
-                        change,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        let mut writer = context.writer(&mut writes);
-        writer.stage_changes(canonical_changes.iter().map(|change| change.as_ref()))?;
+        let mut json_writer = JsonStoreContext::new().writer();
+        let canonical_changes = changes
+            .iter()
+            .map(|change| canonical_changelog_bench_change(&mut json_writer, change))
+            .collect::<Result<Vec<_>, _>>()?;
+        json_writer.flush_into(&mut writes);
+        let parent_ids = Vec::new();
+        let author_account_ids = vec!["bench-author".to_string()];
+        {
+            let mut transaction_ref = transaction.as_mut();
+            let mut writer = context.writer(&mut transaction_ref, &mut writes);
+            writer
+                .stage_commit_draft(
+                    CommitDraftBorrowed {
+                        id: "bench-changelog-commit-0",
+                        change_id: "bench-changelog-header-change-0",
+                        change_set_id: "bench-changelog-change-set-0",
+                        parent_ids: &parent_ids,
+                        author_account_ids: &author_account_ids,
+                        created_at: "2024-01-01T00:00:00.000Z",
+                    },
+                    canonical_changes
+                        .iter()
+                        .map(|change| change.as_ref())
+                        .collect(),
+                    Vec::new(),
+                )
+                .await?;
+        }
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await
@@ -3648,6 +3652,7 @@ fn tracked_rows(config: StorageBenchConfig, commit_id: &str) -> Vec<Materialized
             file_id: Some("bench.json".to_string()),
             snapshot_content: Some(snapshot_content(index, config.state_payload_bytes)),
             metadata: None,
+            deleted: false,
             created_at: timestamp(index),
             updated_at: timestamp(index),
             change_id: format!("tracked-change-{index}"),
@@ -3674,6 +3679,7 @@ fn tracked_rows_file_selective(
             ),
             snapshot_content: Some(snapshot_content(index, config.state_payload_bytes)),
             metadata: None,
+            deleted: false,
             created_at: timestamp(index),
             updated_at: timestamp(index),
             change_id: format!("tracked-change-{index}"),
@@ -3690,6 +3696,7 @@ fn untracked_rows(config: StorageBenchConfig) -> Vec<MaterializedUntrackedStateR
             file_id: Some("bench.json".to_string()),
             snapshot_content: Some(snapshot_content(index, config.state_payload_bytes)),
             metadata: None,
+            deleted: false,
             created_at: timestamp(index),
             updated_at: timestamp(index),
             global: false,
@@ -3698,16 +3705,16 @@ fn untracked_rows(config: StorageBenchConfig) -> Vec<MaterializedUntrackedStateR
         .collect()
 }
 
-fn changelog_changes(config: StorageBenchConfig) -> Vec<CanonicalChange> {
+fn changelog_changes(config: StorageBenchConfig) -> Vec<Change> {
     changelog_materialized_changes(config)
         .into_iter()
-        .map(canonical_changelog_bench_change)
+        .map(changelog_bench_change_ref_only)
         .collect()
 }
 
-fn changelog_materialized_changes(config: StorageBenchConfig) -> Vec<MaterializedCanonicalChange> {
+fn changelog_materialized_changes(config: StorageBenchConfig) -> Vec<MaterializedChange> {
     (0..config.rows)
-        .map(|index| MaterializedCanonicalChange {
+        .map(|index| MaterializedChange {
             id: format!("bench-change-{index}"),
             entity_id: EntityIdentity::single(entity_id(
                 "change-entity",
@@ -3723,10 +3730,7 @@ fn changelog_materialized_changes(config: StorageBenchConfig) -> Vec<Materialize
         .collect()
 }
 
-fn commit_graph_materialized_commit_change(
-    commit_id: &str,
-    rows: usize,
-) -> MaterializedCanonicalChange {
+fn commit_graph_materialized_commit_change(commit_id: &str, rows: usize) -> MaterializedChange {
     let change_ids = (0..rows)
         .map(|index| format!("bench-change-{index}"))
         .collect::<Vec<_>>();
@@ -3739,7 +3743,7 @@ fn commit_graph_materialized_commit_change(
     })
     .to_string();
 
-    MaterializedCanonicalChange {
+    MaterializedChange {
         id: format!("bench-commit-change-{commit_id}"),
         entity_id: EntityIdentity::single(commit_id.to_string()),
         schema_key: "lix_commit".to_string(),
@@ -3750,17 +3754,41 @@ fn commit_graph_materialized_commit_change(
     }
 }
 
-fn canonical_changelog_bench_change(change: MaterializedCanonicalChange) -> CanonicalChange {
+fn canonical_changelog_bench_change(
+    json_writer: &mut crate::json_store::JsonStoreWriter,
+    change: &MaterializedChange,
+) -> Result<Change, LixError> {
+    let snapshot_ref = change
+        .snapshot_content
+        .as_ref()
+        .map(|value| prepare_json_ref(json_writer, value.as_bytes()))
+        .transpose()?;
+    let metadata_ref = change
+        .metadata
+        .as_ref()
+        .map(|value| prepare_json_ref(json_writer, value.as_bytes()))
+        .transpose()?;
+    Ok(Change {
+        id: change.id.clone(),
+        entity_id: change.entity_id.clone(),
+        schema_key: change.schema_key.clone(),
+        file_id: change.file_id.clone(),
+        snapshot_ref,
+        metadata_ref,
+        created_at: change.created_at.clone(),
+    })
+}
+
+fn changelog_bench_change_ref_only(change: MaterializedChange) -> Change {
     let snapshot_ref = change
         .snapshot_content
         .as_ref()
         .map(|value| JsonRef::from_hash(blake3::hash(value.as_bytes())));
-    let metadata_ref = change.metadata.as_ref().map(|value| {
-        let bytes =
-            serde_json::to_vec(value).expect("bench metadata should serialize to JSON bytes");
-        JsonRef::from_hash(blake3::hash(&bytes))
-    });
-    CanonicalChange {
+    let metadata_ref = change
+        .metadata
+        .as_ref()
+        .map(|value| JsonRef::from_hash(blake3::hash(value.as_bytes())));
+    Change {
         id: change.id,
         entity_id: change.entity_id,
         schema_key: change.schema_key,
@@ -3771,7 +3799,7 @@ fn canonical_changelog_bench_change(change: MaterializedCanonicalChange) -> Cano
     }
 }
 
-fn changelog_tombstone_changes(config: StorageBenchConfig) -> Vec<MaterializedCanonicalChange> {
+fn changelog_tombstone_changes(config: StorageBenchConfig) -> Vec<MaterializedChange> {
     changelog_materialized_changes(config)
         .into_iter()
         .map(|mut change| {
@@ -3782,7 +3810,7 @@ fn changelog_tombstone_changes(config: StorageBenchConfig) -> Vec<MaterializedCa
         .collect()
 }
 
-fn changelog_metadata_changes(config: StorageBenchConfig) -> Vec<MaterializedCanonicalChange> {
+fn changelog_metadata_changes(config: StorageBenchConfig) -> Vec<MaterializedChange> {
     changelog_materialized_changes(config)
         .into_iter()
         .enumerate()
@@ -3793,9 +3821,7 @@ fn changelog_metadata_changes(config: StorageBenchConfig) -> Vec<MaterializedCan
         .collect()
 }
 
-fn changelog_shared_payload_changes(
-    config: StorageBenchConfig,
-) -> Vec<MaterializedCanonicalChange> {
+fn changelog_shared_payload_changes(config: StorageBenchConfig) -> Vec<MaterializedChange> {
     let shared_snapshot_content = snapshot_content(0, config.state_payload_bytes);
     changelog_materialized_changes(config)
         .into_iter()
@@ -3806,9 +3832,7 @@ fn changelog_shared_payload_changes(
         .collect()
 }
 
-fn changelog_shared_metadata_changes(
-    config: StorageBenchConfig,
-) -> Vec<MaterializedCanonicalChange> {
+fn changelog_shared_metadata_changes(config: StorageBenchConfig) -> Vec<MaterializedChange> {
     let shared_metadata = snapshot_metadata(0, config.state_payload_bytes);
     changelog_materialized_changes(config)
         .into_iter()
@@ -3822,7 +3846,7 @@ fn changelog_shared_metadata_changes(
 
 fn changelog_shared_payload_and_metadata_changes(
     config: StorageBenchConfig,
-) -> Vec<MaterializedCanonicalChange> {
+) -> Vec<MaterializedChange> {
     let shared_snapshot_content = snapshot_content(0, config.state_payload_bytes);
     let shared_metadata = snapshot_metadata(1, config.state_payload_bytes);
     changelog_materialized_changes(config)
@@ -3835,9 +3859,7 @@ fn changelog_shared_payload_and_metadata_changes(
         .collect()
 }
 
-fn changelog_composite_entity_id_changes(
-    config: StorageBenchConfig,
-) -> Vec<MaterializedCanonicalChange> {
+fn changelog_composite_entity_id_changes(config: StorageBenchConfig) -> Vec<MaterializedChange> {
     changelog_materialized_changes(config)
         .into_iter()
         .enumerate()
@@ -3854,7 +3876,7 @@ fn changelog_composite_entity_id_changes(
         .collect()
 }
 
-fn changelog_selective_changes(config: StorageBenchConfig) -> Vec<MaterializedCanonicalChange> {
+fn changelog_selective_changes(config: StorageBenchConfig) -> Vec<MaterializedChange> {
     changelog_materialized_changes(config)
         .into_iter()
         .enumerate()
@@ -3865,9 +3887,7 @@ fn changelog_selective_changes(config: StorageBenchConfig) -> Vec<MaterializedCa
         .collect()
 }
 
-fn changelog_entity_history_changes(
-    config: StorageBenchConfig,
-) -> Vec<MaterializedCanonicalChange> {
+fn changelog_entity_history_changes(config: StorageBenchConfig) -> Vec<MaterializedChange> {
     changelog_materialized_changes(config)
         .into_iter()
         .enumerate()

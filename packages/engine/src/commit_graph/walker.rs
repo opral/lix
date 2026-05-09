@@ -223,9 +223,8 @@ mod tests {
     use serde_json::json;
 
     use crate::backend::testing::UnitTestBackend;
-    use crate::changelog::{ChangelogContext, MaterializedCanonicalChange};
     use crate::commit_graph::CommitGraphContext;
-    use crate::json_store::JsonStoreContext;
+    use crate::commit_store::{Change, CommitDraftBorrowed, CommitStoreContext};
     use crate::storage::{StorageContext, StorageWriteSet};
     use crate::LixError;
 
@@ -233,10 +232,8 @@ mod tests {
     async fn reachable_commits_returns_commits_nearest_first() {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
-        let changelog = ChangelogContext::new();
         append_changes(
             storage.clone(),
-            &changelog,
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
                 commit_change(
@@ -250,7 +247,7 @@ mod tests {
         )
         .await;
 
-        let graph = CommitGraphContext::new(changelog);
+        let graph = CommitGraphContext::new();
         let mut reader = graph.reader(storage);
         let commits = reader
             .reachable_commits("commit-head")
@@ -270,10 +267,8 @@ mod tests {
     async fn reachable_commits_errors_on_missing_parent_commit() {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
-        let changelog = ChangelogContext::new();
         append_changes(
             storage.clone(),
-            &changelog,
             &[commit_change(
                 "commit-head-change",
                 "commit-head",
@@ -283,7 +278,7 @@ mod tests {
         )
         .await;
 
-        let graph = CommitGraphContext::new(changelog);
+        let graph = CommitGraphContext::new();
         let mut reader = graph.reader(storage);
         let error = reader
             .reachable_commits("commit-head")
@@ -297,10 +292,8 @@ mod tests {
     async fn reachable_commits_errors_on_cycle() {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
-        let changelog = ChangelogContext::new();
         append_changes(
             storage.clone(),
-            &changelog,
             &[
                 commit_change("commit-a-change", "commit-a", &[], &["commit-b"]),
                 commit_change("commit-b-change", "commit-b", &[], &["commit-a"]),
@@ -308,7 +301,7 @@ mod tests {
         )
         .await;
 
-        let graph = CommitGraphContext::new(changelog);
+        let graph = CommitGraphContext::new();
         let mut reader = graph.reader(storage);
         let error = reader
             .reachable_commits("commit-a")
@@ -322,10 +315,8 @@ mod tests {
     async fn reachable_commits_dedupes_shared_ancestors_in_diamond() {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
-        let changelog = ChangelogContext::new();
         append_changes(
             storage.clone(),
-            &changelog,
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
                 commit_change("commit-left-change", "commit-left", &[], &["commit-root"]),
@@ -340,7 +331,7 @@ mod tests {
         )
         .await;
 
-        let graph = CommitGraphContext::new(changelog);
+        let graph = CommitGraphContext::new();
         let mut reader = graph.reader(storage);
         let commits = reader
             .reachable_commits("commit-head")
@@ -365,10 +356,8 @@ mod tests {
     async fn reachable_commits_keeps_nearest_depth_for_multiple_paths() {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
-        let changelog = ChangelogContext::new();
         append_changes(
             storage.clone(),
-            &changelog,
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
                 commit_change(
@@ -387,7 +376,7 @@ mod tests {
         )
         .await;
 
-        let graph = CommitGraphContext::new(changelog);
+        let graph = CommitGraphContext::new();
         let mut reader = graph.reader(storage);
         let commits = reader
             .reachable_commits("commit-head")
@@ -407,10 +396,8 @@ mod tests {
     async fn reachable_commits_orders_same_depth_commits_by_id() {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
-        let changelog = ChangelogContext::new();
         append_changes(
             storage.clone(),
-            &changelog,
             &[
                 commit_change("commit-z-change", "commit-z", &[], &[]),
                 commit_change("commit-a-change", "commit-a", &[], &[]),
@@ -424,7 +411,7 @@ mod tests {
         )
         .await;
 
-        let graph = CommitGraphContext::new(changelog);
+        let graph = CommitGraphContext::new();
         let mut reader = graph.reader(storage);
         let commits = reader
             .reachable_commits("commit-head")
@@ -444,7 +431,7 @@ mod tests {
     async fn reachable_commits_errors_on_missing_head_commit() {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
-        let graph = CommitGraphContext::new(ChangelogContext::new());
+        let graph = CommitGraphContext::new();
         let mut reader = graph.reader(storage);
 
         let error = reader
@@ -459,10 +446,8 @@ mod tests {
     async fn best_common_ancestors_returns_nearest_common_commit_in_simple_graph() {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
-        let changelog = ChangelogContext::new();
         append_changes(
             storage.clone(),
-            &changelog,
             &[
                 commit_change("commit-a-change", "commit-a", &[], &[]),
                 commit_change("commit-b-change", "commit-b", &[], &["commit-a"]),
@@ -472,7 +457,7 @@ mod tests {
         )
         .await;
 
-        let graph = CommitGraphContext::new(changelog);
+        let graph = CommitGraphContext::new();
         let mut reader = graph.reader(storage);
         let ancestors = reader
             .best_common_ancestors("commit-c", "commit-d")
@@ -492,10 +477,8 @@ mod tests {
     async fn best_common_ancestors_returns_shared_fork_in_diamond_graph() {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
-        let changelog = ChangelogContext::new();
         append_changes(
             storage.clone(),
-            &changelog,
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
                 commit_change("commit-left-change", "commit-left", &[], &["commit-root"]),
@@ -516,7 +499,7 @@ mod tests {
         )
         .await;
 
-        let graph = CommitGraphContext::new(changelog);
+        let graph = CommitGraphContext::new();
         let mut reader = graph.reader(storage);
         let ancestors = reader
             .best_common_ancestors("commit-left-head", "commit-right-head")
@@ -536,10 +519,8 @@ mod tests {
     async fn best_common_ancestors_returns_parent_when_one_side_is_ancestor() {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
-        let changelog = ChangelogContext::new();
         append_changes(
             storage.clone(),
-            &changelog,
             &[
                 commit_change("commit-a-change", "commit-a", &[], &[]),
                 commit_change("commit-b-change", "commit-b", &[], &["commit-a"]),
@@ -548,7 +529,7 @@ mod tests {
         )
         .await;
 
-        let graph = CommitGraphContext::new(changelog);
+        let graph = CommitGraphContext::new();
         let mut reader = graph.reader(storage);
         let ancestors = reader
             .best_common_ancestors("commit-b", "commit-c")
@@ -568,10 +549,8 @@ mod tests {
     async fn best_common_ancestors_returns_multiple_bases_for_criss_cross_graph() {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
-        let changelog = ChangelogContext::new();
         append_changes(
             storage.clone(),
-            &changelog,
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
                 commit_change("commit-left-change", "commit-left", &[], &["commit-root"]),
@@ -592,7 +571,7 @@ mod tests {
         )
         .await;
 
-        let graph = CommitGraphContext::new(changelog);
+        let graph = CommitGraphContext::new();
         let mut reader = graph.reader(storage);
         let ancestors = reader
             .best_common_ancestors("commit-head-left", "commit-head-right")
@@ -612,10 +591,8 @@ mod tests {
     async fn merge_base_returns_single_best_common_ancestor() {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
-        let changelog = ChangelogContext::new();
         append_changes(
             storage.clone(),
-            &changelog,
             &[
                 commit_change("commit-a-change", "commit-a", &[], &[]),
                 commit_change("commit-b-change", "commit-b", &[], &["commit-a"]),
@@ -625,7 +602,7 @@ mod tests {
         )
         .await;
 
-        let graph = CommitGraphContext::new(changelog);
+        let graph = CommitGraphContext::new();
         let mut reader = graph.reader(storage);
         let base = reader
             .merge_base("commit-c", "commit-d")
@@ -639,10 +616,8 @@ mod tests {
     async fn merge_base_errors_when_histories_have_no_common_commit() {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
-        let changelog = ChangelogContext::new();
         append_changes(
             storage.clone(),
-            &changelog,
             &[
                 commit_change("commit-left-change", "commit-left", &[], &[]),
                 commit_change("commit-right-change", "commit-right", &[], &[]),
@@ -650,7 +625,7 @@ mod tests {
         )
         .await;
 
-        let graph = CommitGraphContext::new(changelog);
+        let graph = CommitGraphContext::new();
         let mut reader = graph.reader(storage);
         let error = reader
             .merge_base("commit-left", "commit-right")
@@ -664,10 +639,8 @@ mod tests {
     async fn merge_base_errors_when_best_common_ancestor_is_ambiguous() {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
-        let changelog = ChangelogContext::new();
         append_changes(
             storage.clone(),
-            &changelog,
             &[
                 commit_change("commit-root-change", "commit-root", &[], &[]),
                 commit_change("commit-left-change", "commit-left", &[], &["commit-root"]),
@@ -688,7 +661,7 @@ mod tests {
         )
         .await;
 
-        let graph = CommitGraphContext::new(changelog);
+        let graph = CommitGraphContext::new();
         let mut reader = graph.reader(storage);
         let error = reader
             .merge_base("commit-head-left", "commit-head-right")
@@ -719,34 +692,42 @@ mod tests {
         );
     }
 
-    async fn append_changes(
-        storage: StorageContext,
-        changelog: &ChangelogContext,
-        changes: &[MaterializedCanonicalChange],
-    ) {
+    #[derive(Clone)]
+    struct TestCommitChange {
+        change: Change,
+        parent_commit_ids: Vec<String>,
+        change_set_id: String,
+    }
+
+    async fn append_changes(storage: StorageContext, changes: &[TestCommitChange]) {
         let mut tx = storage
             .begin_write_transaction()
             .await
             .expect("transaction should open");
         let mut writes = StorageWriteSet::new();
-        let canonical_changes = {
-            let mut json_writer = JsonStoreContext::new().writer();
-            changes
-                .iter()
-                .map(|change| {
-                    crate::test_support::canonical_change_from_materialized(
-                        &mut writes,
-                        &mut json_writer,
-                        change,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .expect("changes should canonicalize")
-        };
-        changelog
-            .writer(&mut writes)
-            .stage_changes(canonical_changes.iter().map(|change| change.as_ref()))
-            .expect("append should succeed");
+        let commit_store = CommitStoreContext::new();
+        for change in changes {
+            let commit_id = change
+                .change
+                .entity_id
+                .as_single_string()
+                .expect("commit fixture should have single id")
+                .to_string();
+            let author_account_ids = Vec::new();
+            let commit = CommitDraftBorrowed {
+                id: &commit_id,
+                change_id: &change.change.id,
+                change_set_id: &change.change_set_id,
+                parent_ids: &change.parent_commit_ids,
+                author_account_ids: &author_account_ids,
+                created_at: &change.change.created_at,
+            };
+            commit_store
+                .writer(tx.as_mut(), &mut writes)
+                .stage_commit_draft(commit, Vec::new(), Vec::new())
+                .await
+                .expect("commit-store fixture should append");
+        }
         writes
             .apply(&mut tx.as_mut())
             .await
@@ -759,23 +740,20 @@ mod tests {
         commit_id: &str,
         change_ids: &[&str],
         parent_commit_ids: &[&str],
-    ) -> MaterializedCanonicalChange {
-        MaterializedCanonicalChange {
-            id: change_id.to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::single(commit_id),
-            schema_key: "lix_commit".to_string(),
-            file_id: None,
-            snapshot_content: Some(
-                serde_json::to_string(&json!({
-                    "id": commit_id,
-                    "change_set_id": "change-set-1",
-                    "change_ids": change_ids,
-                    "parent_commit_ids": parent_commit_ids,
-                }))
-                .expect("snapshot should serialize"),
-            ),
-            metadata: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
+    ) -> TestCommitChange {
+        let _ = change_ids;
+        TestCommitChange {
+            change: Change {
+                id: change_id.to_string(),
+                entity_id: crate::entity_identity::EntityIdentity::single(commit_id),
+                schema_key: "lix_commit".to_string(),
+                file_id: None,
+                snapshot_ref: None,
+                metadata_ref: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+            parent_commit_ids: parent_commit_ids.iter().map(|id| id.to_string()).collect(),
+            change_set_id: "change-set-1".to_string(),
         }
     }
 }

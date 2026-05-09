@@ -86,17 +86,17 @@ fn is_commit_graph_fact(schema_key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
     use crate::backend::testing::UnitTestBackend;
-    use crate::changelog::{ChangelogContext, MaterializedCanonicalChange};
     use crate::commit_graph::CommitGraphContext;
+    use crate::commit_store::{Change, ChangeBorrowed, CommitDraftBorrowed, CommitStoreContext};
     use crate::json_store::JsonStoreContext;
     use crate::storage::{StorageContext, StorageWriteSet};
     use crate::tracked_state::{
         MaterializedTrackedStateRow, TrackedStateFilter, TrackedStateScanRequest,
     };
-    use serde_json::json;
 
     #[test]
     fn rows_from_entities_converts_normal_entity() {
@@ -154,8 +154,7 @@ mod tests {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
-        let changelog = ChangelogContext::new();
-        let commit_graph = CommitGraphContext::new(changelog);
+        let commit_graph = CommitGraphContext::new();
         append_changes(
             storage.clone(),
             &[
@@ -198,8 +197,7 @@ mod tests {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
-        let changelog = ChangelogContext::new();
-        let commit_graph = CommitGraphContext::new(changelog);
+        let commit_graph = CommitGraphContext::new();
         append_changes(
             storage.clone(),
             &[
@@ -262,8 +260,7 @@ mod tests {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
-        let changelog = ChangelogContext::new();
-        let commit_graph = CommitGraphContext::new(changelog);
+        let commit_graph = CommitGraphContext::new();
         append_changes(
             storage.clone(),
             &[
@@ -308,8 +305,7 @@ mod tests {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
-        let changelog = ChangelogContext::new();
-        let commit_graph = CommitGraphContext::new(changelog);
+        let commit_graph = CommitGraphContext::new();
         append_changes(
             storage.clone(),
             &[
@@ -366,8 +362,7 @@ mod tests {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
-        let changelog = ChangelogContext::new();
-        let commit_graph = CommitGraphContext::new(changelog);
+        let commit_graph = CommitGraphContext::new();
         append_changes(
             storage.clone(),
             &[
@@ -427,8 +422,7 @@ mod tests {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
-        let changelog = ChangelogContext::new();
-        let commit_graph = CommitGraphContext::new(changelog);
+        let commit_graph = CommitGraphContext::new();
         append_changes(
             storage.clone(),
             &[
@@ -457,8 +451,7 @@ mod tests {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
         let tracked_state = TrackedStateContext::new();
-        let changelog = ChangelogContext::new();
-        let commit_graph = CommitGraphContext::new(changelog);
+        let commit_graph = CommitGraphContext::new();
         append_changes(
             storage.clone(),
             &[
@@ -507,7 +500,7 @@ mod tests {
 
     fn entity(change_id: &str, snapshot_content: Option<&str>) -> CommitGraphEntity {
         CommitGraphEntity {
-            change: crate::changelog::CanonicalChange {
+            change: Change {
                 id: change_id.to_string(),
                 entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
                 schema_key: "test_schema".to_string(),
@@ -528,22 +521,14 @@ mod tests {
     }
 
     fn commit_entity(commit_id: &str) -> CommitGraphEntity {
-        let materialized = commit_change(
+        let fixture = commit_change(
             &format!("{commit_id}-change"),
             commit_id,
             &["change-1"],
             &[],
         );
         CommitGraphEntity {
-            change: crate::changelog::CanonicalChange {
-                id: materialized.id,
-                entity_id: materialized.entity_id,
-                schema_key: materialized.schema_key,
-                file_id: materialized.file_id,
-                snapshot_ref: None,
-                metadata_ref: None,
-                created_at: materialized.created_at,
-            },
+            change: fixture.change,
             source_commit_id: commit_id.to_string(),
             depth: 0,
             created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -551,36 +536,150 @@ mod tests {
         }
     }
 
-    async fn append_changes(storage: StorageContext, changes: &[MaterializedCanonicalChange]) {
-        let changelog = ChangelogContext::new();
+    #[derive(Clone)]
+    struct TestChange {
+        change: Change,
+        snapshot_content: Option<String>,
+        commit_change_ids: Vec<String>,
+        parent_commit_ids: Vec<String>,
+        change_set_id: String,
+    }
+
+    impl TestChange {
+        fn commit(
+            change_id: &str,
+            commit_id: &str,
+            change_ids: &[&str],
+            parent_commit_ids: &[&str],
+        ) -> Self {
+            Self {
+                change: Change {
+                    id: change_id.to_string(),
+                    entity_id: crate::entity_identity::EntityIdentity::single(commit_id),
+                    schema_key: "lix_commit".to_string(),
+                    file_id: None,
+                    snapshot_ref: None,
+                    metadata_ref: None,
+                    created_at: "2026-01-02T00:00:00Z".to_string(),
+                },
+                snapshot_content: None,
+                commit_change_ids: change_ids.iter().map(|id| id.to_string()).collect(),
+                parent_commit_ids: parent_commit_ids.iter().map(|id| id.to_string()).collect(),
+                change_set_id: format!("change-set-{commit_id}"),
+            }
+        }
+
+        fn entity(
+            change_id: &str,
+            entity_id: &str,
+            schema_key: &str,
+            snapshot_content: Option<&str>,
+            created_at: &str,
+        ) -> Self {
+            Self {
+                change: Change {
+                    id: change_id.to_string(),
+                    entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
+                    schema_key: schema_key.to_string(),
+                    file_id: None,
+                    snapshot_ref: None,
+                    metadata_ref: None,
+                    created_at: created_at.to_string(),
+                },
+                snapshot_content: snapshot_content.map(str::to_string),
+                commit_change_ids: Vec::new(),
+                parent_commit_ids: Vec::new(),
+                change_set_id: String::new(),
+            }
+        }
+
+        fn is_commit(&self) -> bool {
+            self.change.schema_key == "lix_commit"
+        }
+    }
+
+    async fn append_changes(storage: StorageContext, changes: &[TestChange]) {
         let mut tx = storage
             .begin_write_transaction()
             .await
             .expect("transaction should open");
         let mut writes = StorageWriteSet::new();
-        let canonical_changes = {
-            let mut json_writer = JsonStoreContext::new().writer();
-            changes
-                .iter()
-                .map(|change| {
-                    crate::test_support::canonical_change_from_materialized(
-                        &mut writes,
-                        &mut json_writer,
-                        change,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .expect("changes should canonicalize")
-        };
-        changelog
-            .writer(&mut writes)
-            .stage_changes(canonical_changes.iter().map(|change| change.as_ref()))
-            .expect("changes should append");
+        let mut json_writer = JsonStoreContext::new().writer();
+        let canonical_changes = changes
+            .iter()
+            .filter(|change| !change.is_commit())
+            .map(|change| {
+                let mut canonical = change.change.clone();
+                if let Some(snapshot_content) = change.snapshot_content.as_deref() {
+                    canonical.snapshot_ref = Some(
+                        json_writer
+                            .prepare_json(crate::json_store::NormalizedJson::from_arc_unchecked(
+                                Arc::from(snapshot_content),
+                            ))
+                            .expect("fixture JSON should stage"),
+                    );
+                }
+                canonical
+            })
+            .collect::<Vec<_>>();
+        json_writer.flush_into(&mut writes);
+        let changes_by_id = canonical_changes
+            .iter()
+            .map(|change| (change.id.as_str(), change))
+            .collect::<BTreeMap<_, _>>();
+        let mut authored_change_ids = BTreeSet::new();
+        let commit_store = CommitStoreContext::new();
+        for change in changes.iter().filter(|change| change.is_commit()) {
+            let commit_id = change
+                .change
+                .entity_id
+                .as_single_string()
+                .expect("commit fixture should have id")
+                .to_string();
+            let author_account_ids = Vec::new();
+            let commit = CommitDraftBorrowed {
+                id: &commit_id,
+                change_id: &change.change.id,
+                change_set_id: &change.change_set_id,
+                parent_ids: &change.parent_commit_ids,
+                author_account_ids: &author_account_ids,
+                created_at: &change.change.created_at,
+            };
+            let mut authored_changes = Vec::new();
+            let mut adopted_changes = Vec::new();
+            for change_id in change.commit_change_ids.iter().cloned() {
+                let change = changes_by_id
+                    .get(change_id.as_str())
+                    .expect("commit fixture member change should exist");
+                if authored_change_ids.insert(change_id) {
+                    authored_changes.push(change_borrowed_from_canonical(change.as_ref()));
+                } else {
+                    adopted_changes.push(change_borrowed_from_canonical(change.as_ref()));
+                }
+            }
+            commit_store
+                .writer(tx.as_mut(), &mut writes)
+                .stage_commit_draft(commit, authored_changes, adopted_changes)
+                .await
+                .expect("commit-store fixture should append");
+        }
         writes
             .apply(&mut tx.as_mut())
             .await
             .expect("writes should apply");
         tx.commit().await.expect("transaction should commit");
+    }
+
+    fn change_borrowed_from_canonical<'a>(change: ChangeBorrowed<'a>) -> ChangeBorrowed<'a> {
+        ChangeBorrowed {
+            id: change.id,
+            entity_id: change.entity_id,
+            schema_key: change.schema_key,
+            file_id: change.file_id,
+            snapshot_ref: change.snapshot_ref,
+            metadata_ref: change.metadata_ref,
+            created_at: change.created_at,
+        }
     }
 
     async fn seed_tracked_root(
@@ -714,7 +813,7 @@ mod tests {
         entity_id: &str,
         schema_key: &str,
         snapshot_content: Option<&str>,
-    ) -> MaterializedCanonicalChange {
+    ) -> TestChange {
         entity_change_at(
             change_id,
             entity_id,
@@ -730,16 +829,14 @@ mod tests {
         schema_key: &str,
         snapshot_content: Option<&str>,
         created_at: &str,
-    ) -> MaterializedCanonicalChange {
-        MaterializedCanonicalChange {
-            id: change_id.to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
-            schema_key: schema_key.to_string(),
-            file_id: None,
-            snapshot_content: snapshot_content.map(str::to_string),
-            metadata: None,
-            created_at: created_at.to_string(),
-        }
+    ) -> TestChange {
+        TestChange::entity(
+            change_id,
+            entity_id,
+            schema_key,
+            snapshot_content,
+            created_at,
+        )
     }
 
     fn commit_change(
@@ -747,24 +844,8 @@ mod tests {
         commit_id: &str,
         change_ids: &[&str],
         parent_commit_ids: &[&str],
-    ) -> MaterializedCanonicalChange {
-        MaterializedCanonicalChange {
-            id: change_id.to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::single(commit_id),
-            schema_key: "lix_commit".to_string(),
-            file_id: None,
-            snapshot_content: Some(
-                serde_json::to_string(&json!({
-                    "id": commit_id,
-                    "change_set_id": format!("change-set-{commit_id}"),
-                    "change_ids": change_ids,
-                    "parent_commit_ids": parent_commit_ids,
-                }))
-                .expect("commit snapshot should serialize"),
-            ),
-            metadata: None,
-            created_at: "2026-01-02T00:00:00Z".to_string(),
-        }
+    ) -> TestChange {
+        TestChange::commit(change_id, commit_id, change_ids, parent_commit_ids)
     }
 
     fn stale_row(version_id: &str, entity_id: &str) -> MaterializedTrackedStateRow {
@@ -774,6 +855,7 @@ mod tests {
             file_id: None,
             snapshot_content: Some("{}".to_string()),
             metadata: None,
+            deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             change_id: format!("change-{entity_id}"),

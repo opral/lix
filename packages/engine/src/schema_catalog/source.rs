@@ -374,6 +374,7 @@ mod tests {
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
             metadata: None,
+            deleted: false,
             change_id: Some("change-registered-schema".to_string()),
             commit_id: None,
             global: true,

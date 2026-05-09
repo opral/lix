@@ -1,4 +1,3 @@
-use crate::changelog::MaterializedCanonicalChange;
 use crate::entity_identity::EntityIdentity;
 use crate::tracked_state::{MaterializedTrackedStateRow, TrackedStateRowRef};
 use crate::untracked_state::{
@@ -17,6 +16,7 @@ pub(crate) struct MaterializedLiveStateRow {
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
+    pub(crate) deleted: bool,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) global: bool,
@@ -38,32 +38,6 @@ pub(crate) struct LiveStateTrackedRowRef<'a> {
     pub(crate) version_id: &'a str,
 }
 
-impl LiveStateTrackedRowRef<'_> {
-    pub(crate) fn storage_version_id(&self) -> &str {
-        if self.global {
-            crate::GLOBAL_VERSION_ID
-        } else {
-            self.version_id
-        }
-    }
-}
-
-impl From<MaterializedLiveStateRow> for MaterializedCanonicalChange {
-    fn from(row: MaterializedLiveStateRow) -> Self {
-        MaterializedCanonicalChange {
-            id: row
-                .change_id
-                .expect("tracked live-state rows must carry change_id"),
-            entity_id: row.entity_id,
-            schema_key: row.schema_key,
-            file_id: row.file_id,
-            snapshot_content: row.snapshot_content,
-            metadata: row.metadata,
-            created_at: row.created_at,
-        }
-    }
-}
-
 impl From<MaterializedUntrackedStateRow> for MaterializedLiveStateRow {
     fn from(row: MaterializedUntrackedStateRow) -> Self {
         MaterializedLiveStateRow {
@@ -72,6 +46,7 @@ impl From<MaterializedUntrackedStateRow> for MaterializedLiveStateRow {
             file_id: row.file_id,
             snapshot_content: row.snapshot_content,
             metadata: row.metadata,
+            deleted: row.deleted,
             created_at: row.created_at,
             updated_at: row.updated_at,
             global: row.global,
@@ -112,6 +87,7 @@ impl TryFrom<&MaterializedLiveStateRow> for MaterializedTrackedStateRow {
             file_id: row.file_id.clone(),
             snapshot_content: row.snapshot_content.clone(),
             metadata: row.metadata.clone(),
+            deleted: row.deleted,
             created_at: row.created_at.clone(),
             updated_at: row.updated_at.clone(),
             change_id,
@@ -128,6 +104,7 @@ impl From<&MaterializedLiveStateRow> for MaterializedUntrackedStateRow {
             file_id: row.file_id.clone(),
             snapshot_content: row.snapshot_content.clone(),
             metadata: row.metadata.clone(),
+            deleted: row.deleted,
             created_at: row.created_at.clone(),
             updated_at: row.updated_at.clone(),
             global: row.global,

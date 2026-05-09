@@ -6,8 +6,8 @@ use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
 
 use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
-use crate::changelog::ChangelogReader;
 use crate::commit_graph::CommitGraphReader;
+use crate::commit_store::CommitStoreReader;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreReader;
 use crate::live_state::{
@@ -21,12 +21,12 @@ use crate::LixError;
 
 pub(crate) type SqlReadStore =
     ScopedStorageReader<Box<dyn StorageReadTransaction + Send + Sync + 'static>>;
-pub(crate) type SqlChangelogQuerySource = ChangelogQuerySource<SqlReadStore>;
+pub(crate) type SqlCommitStoreQuerySource = CommitStoreQuerySource<SqlReadStore>;
 pub(crate) type SqlJsonReader = JsonStoreReader<ScopedStorageReader<SqlReadStore>>;
 
 #[derive(Clone)]
-pub(crate) struct ChangelogQuerySource<S> {
-    pub(crate) changelog_reader: Arc<dyn ChangelogReader>,
+pub(crate) struct CommitStoreQuerySource<S> {
+    pub(crate) commit_store_reader: Arc<CommitStoreReader<ScopedStorageReader<S>>>,
     pub(crate) json_reader: JsonStoreReader<ScopedStorageReader<S>>,
 }
 
@@ -44,7 +44,7 @@ pub(crate) trait SqlExecutionContext {
     fn active_version_id(&self) -> &str;
     fn live_state(&self) -> Arc<dyn LiveStateReader>;
     fn functions(&self) -> FunctionProviderHandle;
-    fn changelog_query_source(&self) -> SqlChangelogQuerySource;
+    fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource;
     fn commit_graph(&self) -> Box<dyn CommitGraphReader>;
     fn version_ref(&self) -> Arc<dyn VersionRefReader>;
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;

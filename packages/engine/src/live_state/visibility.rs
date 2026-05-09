@@ -38,7 +38,7 @@ pub(crate) fn resolve_scan_rows(
 ) -> Vec<MaterializedLiveStateRow> {
     let mut rows = project_global_rows_into_requested_versions(rows, requested_version_ids);
     if !include_tombstones {
-        rows.retain(|row| row.snapshot_content.is_some());
+        rows.retain(|row| !row.deleted);
     }
     rows
 }
@@ -198,6 +198,7 @@ mod tests {
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
             metadata: None,
+            deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             global,
@@ -215,6 +216,7 @@ mod tests {
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
             snapshot_content: None,
+            deleted: true,
             ..row_at(version_id, "ignored", global, change_id)
         }
     }

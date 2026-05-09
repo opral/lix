@@ -21,7 +21,6 @@ use futures_util::stream;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use crate::changelog::MaterializedCanonicalChange;
 use crate::commit_graph::CommitGraphReader;
 use crate::serialize_row_metadata;
 use crate::LixError;
@@ -35,14 +34,15 @@ use super::history_route::{
     HISTORY_COL_SNAPSHOT_CONTENT, HISTORY_COL_START_COMMIT_ID,
 };
 use super::result_metadata::json_field;
-use super::SqlChangelogQuerySource;
+use super::SqlCommitStoreQuerySource;
+use crate::commit_store::MaterializedChange;
 
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
 pub(crate) async fn register_lix_directory_history_provider(
     session: &datafusion::prelude::SessionContext,
     commit_graph: Box<dyn CommitGraphReader>,
-    query_source: SqlChangelogQuerySource,
+    query_source: SqlCommitStoreQuerySource,
 ) -> Result<(), LixError> {
     session
         .register_table(
@@ -59,7 +59,7 @@ pub(crate) async fn register_lix_directory_history_provider(
 struct LixDirectoryHistoryProvider {
     schema: SchemaRef,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlChangelogQuerySource,
+    query_source: SqlCommitStoreQuerySource,
 }
 
 impl std::fmt::Debug for LixDirectoryHistoryProvider {
@@ -71,7 +71,7 @@ impl std::fmt::Debug for LixDirectoryHistoryProvider {
 impl LixDirectoryHistoryProvider {
     fn new(
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlChangelogQuerySource,
+        query_source: SqlCommitStoreQuerySource,
     ) -> Self {
         Self {
             schema: lix_directory_history_schema(),
@@ -130,7 +130,7 @@ impl TableProvider for LixDirectoryHistoryProvider {
 
 struct LixDirectoryHistoryScanExec {
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlChangelogQuerySource,
+    query_source: SqlCommitStoreQuerySource,
     schema: SchemaRef,
     route: HistoryRoute,
     limit: Option<usize>,
@@ -149,7 +149,7 @@ impl std::fmt::Debug for LixDirectoryHistoryScanExec {
 impl LixDirectoryHistoryScanExec {
     fn new(
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlChangelogQuerySource,
+        query_source: SqlCommitStoreQuerySource,
         schema: SchemaRef,
         route: HistoryRoute,
         limit: Option<usize>,
@@ -265,7 +265,7 @@ struct DirectoryHistoryOutputRow {
     parent_id: Option<String>,
     name: Option<String>,
     hidden: Option<bool>,
-    descriptor_change: MaterializedCanonicalChange,
+    descriptor_change: MaterializedChange,
     event: DirectoryHistoryEvent,
 }
 
@@ -274,7 +274,7 @@ struct DirectoryHistoryEvent {
     directory_id: String,
     start_commit_id: String,
     depth: u32,
-    change: MaterializedCanonicalChange,
+    change: MaterializedChange,
     observed_commit_id: String,
     commit_created_at: String,
 }
@@ -289,7 +289,7 @@ struct DirectoryDescriptorSnapshot {
 
 async fn load_directory_history_rows(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlChangelogQuerySource,
+    query_source: SqlCommitStoreQuerySource,
     route: &HistoryRoute,
 ) -> Result<Vec<DirectoryHistoryOutputRow>, LixError> {
     let event_route = route.traversal_only();
