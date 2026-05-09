@@ -2,7 +2,6 @@ use crate::functions::{
     state, DeterministicFunctionProvider, DeterministicSequence, FunctionProvider,
     FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
 };
-use crate::json_store::JsonStoreWriter;
 use crate::live_state::LiveStateReader;
 use crate::storage::StorageWriteSet;
 use crate::LixError;
@@ -59,7 +58,6 @@ impl FunctionContext {
     pub(crate) async fn stage_persist_if_needed(
         &self,
         writes: &mut StorageWriteSet,
-        json_writer: &mut JsonStoreWriter,
     ) -> Result<(), LixError> {
         let Some(highest_seen) = self.functions.deterministic_sequence_persist_highest_seen()
         else {
@@ -67,7 +65,6 @@ impl FunctionContext {
         };
         state::stage_sequence(
             writes,
-            json_writer,
             DeterministicSequence { highest_seen },
             &self.bookkeeping_timestamp,
         )
@@ -216,12 +213,10 @@ mod tests {
             .await
             .expect("transaction should open");
         let mut writes = StorageWriteSet::new();
-        let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
         context
-            .stage_persist_if_needed(&mut writes, &mut json_writer)
+            .stage_persist_if_needed(&mut writes)
             .await
             .expect("sequence should stage");
-        json_writer.flush_into(&mut writes);
         writes
             .apply(&mut tx.as_mut())
             .await
@@ -248,9 +243,8 @@ mod tests {
             .await
             .expect("transaction should open");
         let mut writes = StorageWriteSet::new();
-        let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
         context
-            .stage_persist_if_needed(&mut writes, &mut json_writer)
+            .stage_persist_if_needed(&mut writes)
             .await
             .expect("persist should no-op");
         assert!(writes.is_empty());
@@ -274,25 +268,29 @@ mod tests {
         }))
         .expect("snapshot should serialize");
         let mut writes = StorageWriteSet::new();
-        let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
+        crate::json_store::JsonStoreContext::new()
+            .writer()
+            .stage_batch(
+                &mut writes,
+                crate::json_store::JsonWritePlacementRef::Direct,
+                [crate::json_store::NormalizedJsonRef {
+                    normalized: snapshot_content.as_str(),
+                }],
+            )
+            .expect("snapshot should stage");
         let row = crate::untracked_state::UntrackedStateRow {
             entity_id: crate::entity_identity::EntityIdentity::single(key),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
-            snapshot_ref: Some(
-                json_writer
-                    .prepare_json(crate::json_store::NormalizedJson::from_arc_unchecked(
-                        Arc::from(snapshot_content.as_str()),
-                    ))
-                    .expect("snapshot should stage"),
-            ),
+            snapshot_ref: Some(crate::json_store::JsonRef::for_content(
+                snapshot_content.as_bytes(),
+            )),
             metadata_ref: None,
             created_at: "1970-01-01T00:00:00.000Z".to_string(),
             updated_at: "1970-01-01T00:00:00.000Z".to_string(),
             global: true,
             version_id: GLOBAL_VERSION_ID.to_string(),
         };
-        json_writer.flush_into(&mut writes);
         crate::untracked_state::UntrackedStateContext::new()
             .writer(&mut writes)
             .stage_rows(std::iter::once(row.as_ref()))

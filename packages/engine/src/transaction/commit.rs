@@ -1,8 +1,7 @@
 use crate::binary_cas::BinaryCasContext;
 use crate::commit_store::{ChangeRef, CommitDraftRef, CommitStoreContext, StagedCommitStoreCommit};
 use crate::functions::FunctionContext;
-#[cfg(test)]
-use crate::json_store::{JsonStoreContext, JsonStoreWriter, NormalizedJson};
+use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::storage::{StorageReader, StorageWriteSet, StorageWriteTransaction};
 use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
 use crate::transaction::prepare_version_ref_row;
@@ -34,7 +33,7 @@ pub(crate) async fn commit_prepared_writes(
     prepared_writes: PreparedWriteSet,
 ) -> Result<(), LixError> {
     let mut writes = StorageWriteSet::new();
-    let mut json_writer = prepared_writes.json_writer;
+    let mut json_writer = JsonStoreContext::new().writer();
 
     if !prepared_writes.file_data_writes.is_empty() {
         let mut blob_writer = binary_cas.writer(&mut writes);
@@ -60,7 +59,7 @@ pub(crate) async fn commit_prepared_writes(
 
     if let Some(runtime_functions) = runtime_functions {
         runtime_functions
-            .stage_persist_if_needed(&mut writes, &mut json_writer)
+            .stage_persist_if_needed(&mut writes)
             .await?;
     }
 
@@ -84,6 +83,15 @@ pub(crate) async fn commit_prepared_writes(
         &commit_rows,
     )
     .await?;
+
+    stage_prepared_json_payloads(
+        &mut json_writer,
+        &mut writes,
+        &state_rows,
+        &row_index.tracked_row_indices_by_commit,
+        &staged_commits,
+        &row_index.untracked_row_indices,
+    )?;
 
     // The serving projection is updated in the same backend transaction as the
     // commit-store append. Tracked rows become prolly mutations under their owning
@@ -132,17 +140,85 @@ pub(crate) async fn commit_prepared_writes(
 
     for version_head in version_heads {
         let canonical_row = prepare_version_ref_row(
-            &mut json_writer,
             &version_head.version_id,
             &version_head.commit_id,
             &version_head.timestamp,
         )?;
-        version_ctx.stage_canonical_ref_rows(&mut writes, &[canonical_row])?;
+        json_writer.stage_batch(
+            &mut writes,
+            JsonWritePlacementRef::Direct,
+            [NormalizedJsonRef {
+                normalized: canonical_row.snapshot.as_str(),
+            }],
+        )?;
+        version_ctx.stage_canonical_ref_rows(&mut writes, &[canonical_row.row])?;
     }
 
-    json_writer.flush_into(&mut writes);
     writes.apply(transaction).await?;
     Ok(())
+}
+
+fn stage_prepared_json_payloads(
+    json_writer: &mut crate::json_store::JsonStoreWriter,
+    writes: &mut StorageWriteSet,
+    state_rows: &[PreparedStateRow],
+    tracked_row_indices_by_commit: &BTreeMap<String, Vec<RowIndex>>,
+    staged_commits: &BTreeMap<String, StagedCommitStoreCommit>,
+    untracked_row_indices: &[RowIndex],
+) -> Result<(), LixError> {
+    for (commit_id, row_indices) in tracked_row_indices_by_commit {
+        let staged_commit = staged_commits.get(commit_id).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("commit '{commit_id}' has tracked JSON rows but no staged commit-store locators"),
+            )
+        })?;
+        if row_indices.len() != staged_commit.authored_locators.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "commit '{commit_id}' has {} tracked JSON rows but {} authored locators",
+                    row_indices.len(),
+                    staged_commit.authored_locators.len()
+                ),
+            ));
+        }
+        let mut row_indices_by_pack = BTreeMap::<u32, Vec<RowIndex>>::new();
+        for (&row_index, locator) in row_indices.iter().zip(&staged_commit.authored_locators) {
+            row_indices_by_pack
+                .entry(locator.source_pack_id)
+                .or_default()
+                .push(row_index);
+        }
+        for (pack_id, pack_row_indices) in row_indices_by_pack {
+            json_writer.stage_batch(
+                writes,
+                JsonWritePlacementRef::CommitPack { commit_id, pack_id },
+                pack_row_indices
+                    .iter()
+                    .flat_map(|&row_index| json_payloads_from_state_row(&state_rows[row_index])),
+            )?;
+        }
+    }
+    json_writer.stage_batch(
+        writes,
+        JsonWritePlacementRef::Direct,
+        untracked_row_indices
+            .iter()
+            .flat_map(|&row_index| json_payloads_from_state_row(&state_rows[row_index])),
+    )?;
+    Ok(())
+}
+
+fn json_payloads_from_state_row(
+    row: &PreparedStateRow,
+) -> impl Iterator<Item = NormalizedJsonRef<'_>> {
+    row.snapshot
+        .iter()
+        .chain(row.metadata.iter())
+        .map(|json| NormalizedJsonRef {
+            normalized: json.normalized.as_ref(),
+        })
 }
 
 async fn existing_untracked_overlay_delete_identities<'a>(
@@ -627,8 +703,7 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        let mut json_writer = JsonStoreContext::new().writer();
-        let state_rows = vec![tracked_global_row(&mut json_writer, "change-1")];
+        let state_rows = vec![tracked_global_row("change-1")];
         commit_prepared_writes(
             &binary_cas,
             &crate::commit_store::CommitStoreContext::new(),
@@ -645,7 +720,6 @@ mod tests {
                 )]),
                 extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
-                json_writer,
             },
         )
         .await
@@ -714,8 +788,7 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        let mut json_writer = JsonStoreContext::new().writer();
-        let state_rows = vec![untracked_global_row(&mut json_writer, "change-untracked")];
+        let state_rows = vec![untracked_global_row("change-untracked")];
         commit_prepared_writes(
             &binary_cas,
             &crate::commit_store::CommitStoreContext::new(),
@@ -729,7 +802,6 @@ mod tests {
                 commit_members_by_version: BTreeMap::new(),
                 extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
-                json_writer,
             },
         )
         .await
@@ -779,18 +851,12 @@ mod tests {
             .await
             .expect("seed transaction should open");
         let mut writes = StorageWriteSet::new();
-        let canonical_row = {
-            let mut json_writer = JsonStoreContext::new().writer();
-            let staged_row = untracked_global_row(&mut json_writer, "change-untracked");
-            let canonical_row = crate::test_support::untracked_state_row_from_materialized(
-                &mut writes,
-                &mut json_writer,
-                &MaterializedUntrackedStateRow::from(staged_row),
-            )
-            .expect("untracked seed should canonicalize");
-            json_writer.flush_into(&mut writes);
-            canonical_row
-        };
+        let staged_row = untracked_global_row("change-untracked");
+        let canonical_row = crate::test_support::untracked_state_row_from_materialized(
+            &mut writes,
+            &MaterializedUntrackedStateRow::from(staged_row),
+        )
+        .expect("untracked seed should canonicalize");
         untracked_state
             .writer(&mut writes)
             .stage_rows(std::iter::once(canonical_row.as_ref()))
@@ -808,8 +874,7 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        let mut json_writer = JsonStoreContext::new().writer();
-        let state_rows = vec![tracked_global_row(&mut json_writer, "change-tracked")];
+        let state_rows = vec![tracked_global_row("change-tracked")];
         commit_prepared_writes(
             &binary_cas,
             &crate::commit_store::CommitStoreContext::new(),
@@ -826,7 +891,6 @@ mod tests {
                 )]),
                 extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
-                json_writer,
             },
         )
         .await
@@ -871,17 +935,23 @@ mod tests {
                 .await
                 .expect("seed transaction should open");
             let mut writes = StorageWriteSet::new();
-            let mut json_writer = JsonStoreContext::new().writer();
             let mode_snapshot = serde_json::to_string(&serde_json::json!({
                 "key": DETERMINISTIC_MODE_KEY,
                 "value": { "enabled": true },
             }))
             .expect("mode snapshot should serialize");
-            let mode_snapshot_ref = json_writer
-                .prepare_json(NormalizedJson::from_arc_unchecked(Arc::from(
-                    mode_snapshot.as_str(),
-                )))
+            JsonStoreContext::new()
+                .writer()
+                .stage_batch(
+                    &mut writes,
+                    JsonWritePlacementRef::Direct,
+                    [NormalizedJsonRef {
+                        normalized: mode_snapshot.as_str(),
+                    }],
+                )
                 .expect("deterministic mode snapshot should stage");
+            let mode_snapshot_ref =
+                crate::json_store::JsonRef::for_content(mode_snapshot.as_bytes());
             let row = crate::untracked_state::UntrackedStateRow {
                 entity_id: crate::entity_identity::EntityIdentity::single(DETERMINISTIC_MODE_KEY),
                 schema_key: "lix_key_value".to_string(),
@@ -897,7 +967,6 @@ mod tests {
                 .writer(&mut writes)
                 .stage_rows(std::iter::once(row.as_ref()))
                 .expect("deterministic mode should stage");
-            json_writer.flush_into(&mut writes);
             writes
                 .apply(&mut seed_transaction.as_mut())
                 .await
@@ -920,9 +989,8 @@ mod tests {
             .await
             .expect("transaction should open");
 
-        let mut json_writer = JsonStoreContext::new().writer();
-        let tracked_row = tracked_global_row(&mut json_writer, "change-tracked");
-        let mut untracked_row = untracked_global_row(&mut json_writer, "change-untracked");
+        let tracked_row = tracked_global_row("change-tracked");
+        let mut untracked_row = untracked_global_row("change-untracked");
         untracked_row.entity_id = crate::entity_identity::EntityIdentity::single("entity-2");
 
         commit_prepared_writes(
@@ -941,7 +1009,6 @@ mod tests {
                 )]),
                 extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
-                json_writer,
             },
         )
         .await
@@ -1034,12 +1101,7 @@ mod tests {
             .begin_write_transaction()
             .await
             .expect("transaction should open");
-        let mut json_writer = JsonStoreContext::new().writer();
-        let state_rows = vec![tracked_version_row(
-            &mut json_writer,
-            "version-a",
-            "change-version-a",
-        )];
+        let state_rows = vec![tracked_version_row("version-a", "change-version-a")];
         commit_prepared_writes(
             &binary_cas,
             &crate::commit_store::CommitStoreContext::new(),
@@ -1056,7 +1118,6 @@ mod tests {
                 )]),
                 extra_commit_parents_by_version: BTreeMap::new(),
                 file_data_writes: Vec::new(),
-                json_writer,
             },
         )
         .await
@@ -1231,15 +1292,11 @@ mod tests {
         members
     }
 
-    fn tracked_global_row(json_writer: &mut JsonStoreWriter, change_id: &str) -> PreparedStateRow {
-        tracked_version_row(json_writer, GLOBAL_VERSION_ID, change_id)
+    fn tracked_global_row(change_id: &str) -> PreparedStateRow {
+        tracked_version_row(GLOBAL_VERSION_ID, change_id)
     }
 
-    fn tracked_version_row(
-        json_writer: &mut JsonStoreWriter,
-        version_id: &str,
-        change_id: &str,
-    ) -> PreparedStateRow {
+    fn tracked_version_row(version_id: &str, change_id: &str) -> PreparedStateRow {
         PreparedStateRow {
             schema_plan_id: SchemaPlanId::for_test(0),
             facts: PreparedRowFacts::default(),
@@ -1248,7 +1305,6 @@ mod tests {
             file_id: None,
             snapshot: Some(
                 crate::transaction::types::stage_json_from_value(
-                    json_writer,
                     crate::transaction::types::TransactionJson::from_value_for_test(
                         serde_json::json!({ "value": 1 }),
                     ),
@@ -1268,14 +1324,10 @@ mod tests {
         }
     }
 
-    fn untracked_global_row(
-        json_writer: &mut JsonStoreWriter,
-        change_id: &str,
-    ) -> PreparedStateRow {
-        let mut row = tracked_global_row(json_writer, change_id);
+    fn untracked_global_row(change_id: &str) -> PreparedStateRow {
+        let mut row = tracked_global_row(change_id);
         row.snapshot = Some(
             crate::transaction::types::stage_json_from_value(
-                json_writer,
                 crate::transaction::types::TransactionJson::from_value_for_test(
                     serde_json::json!({ "value": "untracked" }),
                 ),

@@ -1,4 +1,4 @@
-use crate::json_store::{JsonRef, JsonStoreReader};
+use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonStoreReader};
 use crate::storage::StorageReader;
 use crate::untracked_state::{MaterializedUntrackedStateRow, UntrackedStateRow};
 use crate::{parse_row_metadata, LixError};
@@ -85,15 +85,26 @@ where
     let Some(json_ref) = json_ref else {
         return Ok(None);
     };
-    let bytes = json_reader.load_bytes(json_ref).await?.ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "untracked_state {field} '{}' is missing from json_store",
-                json_ref.to_hex()
-            ),
-        )
-    })?;
+    let batch = json_reader
+        .load_bytes_many(JsonLoadRequestRef {
+            refs: std::slice::from_ref(json_ref),
+            scope: JsonReadScopeRef::Direct,
+        })
+        .await?;
+    let bytes = batch
+        .into_values()
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "untracked_state {field} '{}' is missing from json_store",
+                    json_ref.to_hex()
+                ),
+            )
+        })?;
     String::from_utf8(bytes).map(Some).map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",

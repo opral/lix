@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::commit_store::{Change, CommitDraftRef, CommitStoreContext};
-use crate::json_store::{JsonStoreContext, NormalizedJson};
+use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef};
 use crate::storage::StorageContext;
 use crate::storage::StorageWriteSet;
 use crate::storage::StorageWriteTransaction;
@@ -14,11 +14,8 @@ use crate::untracked_state::{
 };
 use crate::version::VersionContext;
 
-fn prepare_json_ref(
-    json_writer: &mut crate::json_store::JsonStoreWriter,
-    value: &str,
-) -> Result<crate::json_store::JsonRef, crate::LixError> {
-    json_writer.prepare_json(NormalizedJson::from_arc_unchecked(Arc::from(value)))
+fn prepare_json_ref(value: &str) -> crate::json_store::JsonRef {
+    crate::json_store::JsonRef::for_content(value.as_bytes())
 }
 use crate::GLOBAL_VERSION_ID;
 
@@ -52,15 +49,20 @@ pub(crate) async fn seed_version_head_with_rows(
         .expect("seed transaction should open");
     let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
     let mut writes = StorageWriteSet::new();
-    let canonical_row = {
-        let mut json_writer = JsonStoreContext::new().writer();
-        let row = prepare_version_ref_row(&mut json_writer, version_id, commit_id, TEST_TIMESTAMP)
-            .expect("version ref should canonicalize");
-        json_writer.flush_into(&mut writes);
-        row
-    };
+    let canonical_row = prepare_version_ref_row(version_id, commit_id, TEST_TIMESTAMP)
+        .expect("version ref should canonicalize");
+    JsonStoreContext::new()
+        .writer()
+        .stage_batch(
+            &mut writes,
+            JsonWritePlacementRef::Direct,
+            [NormalizedJsonRef {
+                normalized: canonical_row.snapshot.as_str(),
+            }],
+        )
+        .expect("version ref JSON should stage");
     version_ctx
-        .stage_canonical_ref_rows(&mut writes, &[canonical_row])
+        .stage_canonical_ref_rows(&mut writes, &[canonical_row.row])
         .expect("version ref should stage");
     writes
         .apply(&mut transaction.as_mut())
@@ -86,12 +88,21 @@ pub(crate) async fn stage_tracked_root_from_materialized(
     rows: &[MaterializedTrackedStateRow],
 ) -> Result<(), crate::LixError> {
     let mut writes = StorageWriteSet::new();
-    let mut json_writer = JsonStoreContext::new().writer();
     let changes = rows
         .iter()
-        .map(|row| tracked_change_from_materialized(&mut json_writer, row))
+        .map(tracked_change_from_materialized)
         .collect::<Result<Vec<_>, _>>()?;
-    json_writer.flush_into(&mut writes);
+    let json_payloads = materialized_tracked_json_payloads(rows);
+    JsonStoreContext::new().writer().stage_batch(
+        &mut writes,
+        JsonWritePlacementRef::CommitPack {
+            commit_id,
+            pack_id: 0,
+        },
+        json_payloads
+            .iter()
+            .map(|json| NormalizedJsonRef::from(json)),
+    )?;
 
     let parent_ids = parent_commit_id
         .map(|parent| vec![parent.to_string()])
@@ -176,7 +187,6 @@ pub(crate) async fn stage_tracked_root_from_materialized(
 }
 
 pub(crate) fn tracked_change_from_materialized(
-    json_writer: &mut crate::json_store::JsonStoreWriter,
     row: &MaterializedTrackedStateRow,
 ) -> Result<Change, crate::LixError> {
     Ok(Change {
@@ -184,50 +194,61 @@ pub(crate) fn tracked_change_from_materialized(
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
-        snapshot_ref: row
-            .snapshot_content
-            .as_deref()
-            .map(|value| prepare_json_ref(json_writer, value))
-            .transpose()?,
-        metadata_ref: row
-            .metadata
-            .as_ref()
-            .map(|value| {
-                let serialized = crate::serialize_row_metadata(value);
-                prepare_json_ref(json_writer, &serialized)
-            })
-            .transpose()?,
+        snapshot_ref: row.snapshot_content.as_deref().map(prepare_json_ref),
+        metadata_ref: row.metadata.as_ref().map(|value| {
+            let serialized = crate::serialize_row_metadata(value);
+            prepare_json_ref(&serialized)
+        }),
         created_at: row.created_at.clone(),
     })
 }
 
+fn materialized_tracked_json_payloads(rows: &[MaterializedTrackedStateRow]) -> Vec<NormalizedJson> {
+    let mut payloads = Vec::new();
+    for row in rows {
+        if let Some(snapshot) = row.snapshot_content.as_deref() {
+            payloads.push(NormalizedJson::from_arc_unchecked(Arc::from(snapshot)));
+        }
+        if let Some(metadata) = row.metadata.as_ref() {
+            payloads.push(NormalizedJson::from_arc_unchecked(Arc::from(
+                crate::serialize_row_metadata(metadata),
+            )));
+        }
+    }
+    payloads
+}
+
 pub(crate) fn untracked_state_row_from_materialized(
     writes: &mut StorageWriteSet,
-    json_writer: &mut crate::json_store::JsonStoreWriter,
     row: &MaterializedUntrackedStateRow,
 ) -> Result<UntrackedStateRow, crate::LixError> {
+    let mut payloads = Vec::new();
+    if let Some(snapshot) = row.snapshot_content.as_deref() {
+        payloads.push(NormalizedJson::from_arc_unchecked(Arc::from(snapshot)));
+    }
+    if let Some(metadata) = row.metadata.as_ref() {
+        payloads.push(NormalizedJson::from_arc_unchecked(Arc::from(
+            crate::serialize_row_metadata(metadata),
+        )));
+    }
     let row = UntrackedStateRow {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
-        snapshot_ref: row
-            .snapshot_content
-            .as_deref()
-            .map(|value| prepare_json_ref(json_writer, value))
-            .transpose()?,
-        metadata_ref: row
-            .metadata
-            .as_ref()
-            .map(|value| {
-                let serialized = crate::serialize_row_metadata(value);
-                prepare_json_ref(json_writer, &serialized)
-            })
-            .transpose()?,
+        snapshot_ref: row.snapshot_content.as_deref().map(prepare_json_ref),
+        metadata_ref: row.metadata.as_ref().map(|value| {
+            let serialized = crate::serialize_row_metadata(value);
+            prepare_json_ref(&serialized)
+        }),
         created_at: row.created_at.clone(),
         updated_at: row.updated_at.clone(),
         global: row.global,
         version_id: row.version_id.clone(),
     };
-    json_writer.flush_into(writes);
+    JsonStoreContext::new().writer().stage_batch(
+        writes,
+        JsonWritePlacementRef::Direct,
+        payloads.iter().map(|json| NormalizedJsonRef::from(json)),
+    )?;
     Ok(row)
 }

@@ -74,6 +74,14 @@ pub(crate) struct MaterializedChange {
     pub(crate) created_at: String,
 }
 
+/// Commit-store change plus the physical pack that owns its JSON payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocatedChange {
+    pub(crate) record: Change,
+    pub(crate) source_commit_id: String,
+    pub(crate) source_pack_id: u32,
+}
+
 impl Change {
     pub(crate) fn as_ref(&self) -> ChangeRef<'_> {
         ChangeRef {

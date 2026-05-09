@@ -1,8 +1,14 @@
 use crate::json_store::store;
-use crate::json_store::types::{JsonProjection, JsonProjectionPath, JsonRef, NormalizedJson};
+use crate::json_store::types::{
+    JsonLoadBatch, JsonLoadRequestRef, JsonProjection, JsonProjectionBatch,
+    JsonProjectionLoadRequestRef, JsonRef, JsonValueBatch, JsonWritePlacementRef,
+    NormalizedJsonRef,
+};
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::LixError;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
+
+const PACK_LOCAL_MAX_JSON_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct JsonStoreContext;
@@ -23,20 +29,14 @@ impl JsonStoreContext {
         JsonStoreWriter::new()
     }
 
-    pub(crate) async fn load_bytes(
-        &self,
-        store: &mut impl StorageReader,
-        json_ref: &JsonRef,
-    ) -> Result<Option<Vec<u8>>, LixError> {
-        store::load_json_bytes(store, json_ref).await
-    }
-
     pub(crate) async fn load_bytes_many(
         &self,
         store: &mut impl StorageReader,
-        json_refs: &[JsonRef],
-    ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
-        store::load_json_bytes_many(store, json_refs).await
+        request: JsonLoadRequestRef<'_>,
+    ) -> Result<JsonLoadBatch, LixError> {
+        store::load_json_bytes_many_in_scope(store, request.refs, request.scope)
+            .await
+            .map(JsonLoadBatch::new)
     }
 }
 
@@ -59,93 +59,213 @@ impl<S> JsonStoreReader<S>
 where
     S: StorageReader,
 {
-    pub(crate) async fn load_bytes(
-        &mut self,
-        json_ref: &JsonRef,
-    ) -> Result<Option<Vec<u8>>, LixError> {
-        store::load_json_bytes(&mut self.store, json_ref).await
-    }
-
     pub(crate) async fn load_bytes_many(
         &mut self,
-        json_refs: &[JsonRef],
-    ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
-        store::load_json_bytes_many(&mut self.store, json_refs).await
+        request: JsonLoadRequestRef<'_>,
+    ) -> Result<JsonLoadBatch, LixError> {
+        store::load_json_bytes_many_in_scope(&mut self.store, request.refs, request.scope)
+            .await
+            .map(JsonLoadBatch::new)
     }
 
-    pub(crate) async fn load_json_value(
+    pub(crate) async fn load_values_many(
         &mut self,
-        json_ref: &JsonRef,
-    ) -> Result<Option<serde_json::Value>, LixError> {
-        let Some(bytes) = self.load_bytes(json_ref).await? else {
-            return Ok(None);
-        };
-        serde_json::from_slice(&bytes).map(Some).map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("json ref '{}' is invalid JSON: {error}", json_ref.to_hex()),
-            )
-        })
+        request: JsonLoadRequestRef<'_>,
+    ) -> Result<JsonValueBatch, LixError> {
+        let refs = request.refs;
+        let values = self
+            .load_bytes_many(request)
+            .await?
+            .into_values()
+            .into_iter()
+            .enumerate()
+            .map(|(index, bytes)| match bytes {
+                Some(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "json ref '{}' is invalid JSON: {error}",
+                            refs[index].to_hex()
+                        ),
+                    )
+                }),
+                None => Ok(None),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(JsonValueBatch::new(values))
     }
 
-    pub(crate) async fn load_json_projection(
+    pub(crate) async fn load_projections_many(
         &mut self,
-        json_ref: &JsonRef,
-        paths: &[JsonProjectionPath],
-    ) -> Result<Option<JsonProjection>, LixError> {
-        let Some(value) = self.load_json_value(json_ref).await? else {
-            return Ok(None);
-        };
-        let values = paths
-            .iter()
-            .map(|path| value.pointer(path.as_str()).cloned())
+        request: JsonProjectionLoadRequestRef<'_>,
+    ) -> Result<JsonProjectionBatch, LixError> {
+        let values = self
+            .load_values_many(JsonLoadRequestRef {
+                refs: request.refs,
+                scope: request.scope,
+            })
+            .await?
+            .into_values()
+            .into_iter()
+            .map(|value| {
+                value.map(|value| {
+                    JsonProjection::new(
+                        request
+                            .paths
+                            .iter()
+                            .map(|path| value.pointer(path.as_str()).cloned())
+                            .collect(),
+                    )
+                })
+            })
             .collect();
-        Ok(Some(JsonProjection::new(values)))
+        Ok(JsonProjectionBatch::new(values))
     }
 }
 
-pub(crate) struct JsonStoreWriter {
-    pending: HashMap<[u8; 32], PendingJsonWrite>,
-    flushed: HashSet<[u8; 32]>,
-}
-
-struct PendingJsonWrite {
-    key: Vec<u8>,
-    value: Vec<u8>,
-}
+pub(crate) struct JsonStoreWriter;
 
 impl JsonStoreWriter {
     fn new() -> Self {
-        Self {
-            pending: HashMap::new(),
-            flushed: HashSet::new(),
-        }
+        Self
     }
 
-    pub(crate) fn prepare_json(&mut self, normalized: NormalizedJson) -> Result<JsonRef, LixError> {
-        let hash = blake3::hash(normalized.as_bytes());
-        let hash_bytes = *hash.as_bytes();
-        #[cfg(feature = "storage-benches")]
-        crate::storage_bench::record_json_store_stage_bytes(hash_bytes);
-        let json_ref = JsonRef::from_hash(hash);
-        if self.flushed.contains(&hash_bytes) {
-            return Ok(json_ref);
+    pub(crate) fn stage_batch<'a>(
+        &mut self,
+        writes: &mut StorageWriteSet,
+        placement: JsonWritePlacementRef<'a>,
+        payloads: impl IntoIterator<Item = NormalizedJsonRef<'a>>,
+    ) -> Result<Vec<JsonRef>, LixError> {
+        let mut encoded_by_hash = BTreeMap::new();
+        let mut order = Vec::new();
+        let mut seen = BTreeSet::new();
+        for payload in payloads {
+            let encoded = store::encode_json_str(payload.normalized)?;
+            let hash: [u8; 32] = encoded
+                .json_ref
+                .as_hash_bytes()
+                .try_into()
+                .expect("json ref hash is fixed size");
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_json_store_stage_bytes(hash);
+            order.push(encoded.json_ref);
+            if seen.insert(hash) {
+                encoded_by_hash.insert(hash, encoded);
+            }
         }
-        if let std::collections::hash_map::Entry::Vacant(entry) = self.pending.entry(hash_bytes) {
-            let (json_ref, stored_payload) =
-                store::encode_json_str_for_storage_with_ref(normalized.as_str(), json_ref.clone())?;
-            entry.insert(PendingJsonWrite {
-                key: json_ref.as_hash_bytes().to_vec(),
-                value: stored_payload,
-            });
-        }
-        Ok(json_ref)
-    }
 
-    pub(crate) fn flush_into(&mut self, writes: &mut StorageWriteSet) {
-        for (hash, pending) in std::mem::take(&mut self.pending) {
-            writes.put(store::JSON_NAMESPACE, pending.key, pending.value);
-            self.flushed.insert(hash);
+        let mut packed_hashes = BTreeSet::new();
+        if let JsonWritePlacementRef::CommitPack { commit_id, pack_id } = placement {
+            let pack_entries = encoded_by_hash
+                .values()
+                .filter(|encoded| encoded.uncompressed_len <= PACK_LOCAL_MAX_JSON_BYTES)
+                .collect::<Vec<_>>();
+            if !pack_entries.is_empty() {
+                let encoded_pack = store::encode_json_pack(&pack_entries)?;
+                writes.put(
+                    store::JSON_PACK_NAMESPACE,
+                    store::pack_key(commit_id, pack_id),
+                    encoded_pack,
+                );
+                for (hash, encoded) in &encoded_by_hash {
+                    if encoded.uncompressed_len <= PACK_LOCAL_MAX_JSON_BYTES {
+                        packed_hashes.insert(*hash);
+                    }
+                }
+            }
         }
+
+        for (hash, encoded) in &encoded_by_hash {
+            if packed_hashes.contains(hash) {
+                continue;
+            }
+            writes.put(
+                store::JSON_NAMESPACE,
+                encoded.json_ref.as_hash_bytes().to_vec(),
+                store::encode_direct_json_payload(encoded),
+            );
+        }
+
+        Ok(order)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::backend::testing::UnitTestBackend;
+    use crate::json_store::types::JsonReadScopeRef;
+    use crate::storage::StorageContext;
+
+    #[tokio::test]
+    async fn commit_local_batch_writes_pack_without_direct_rows() {
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let context = JsonStoreContext::new();
+        let first = "{\"value\":\"first\"}";
+        let second = "{\"value\":\"second\"}";
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        let mut writes = StorageWriteSet::new();
+        context
+            .writer()
+            .stage_batch(
+                &mut writes,
+                JsonWritePlacementRef::CommitPack {
+                    commit_id: "commit-a",
+                    pack_id: 0,
+                },
+                [
+                    NormalizedJsonRef { normalized: first },
+                    NormalizedJsonRef { normalized: second },
+                ],
+            )
+            .expect("json pack should stage");
+        writes
+            .apply(&mut transaction.as_mut())
+            .await
+            .expect("json pack should apply");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let refs = [
+            JsonRef::for_content(first.as_bytes()),
+            JsonRef::for_content(second.as_bytes()),
+        ];
+        let unknown = context
+            .reader(storage.clone())
+            .load_bytes_many(JsonLoadRequestRef {
+                refs: &refs,
+                scope: JsonReadScopeRef::Direct,
+            })
+            .await
+            .expect("unknown load should check direct rows");
+        assert_eq!(unknown.into_values(), vec![None, None]);
+
+        let pack_ids = [0];
+        let packed = context
+            .reader(storage.clone())
+            .load_bytes_many(JsonLoadRequestRef {
+                refs: &refs,
+                scope: JsonReadScopeRef::CommitPacks {
+                    commit_id: "commit-a",
+                    pack_ids: &pack_ids,
+                },
+            })
+            .await
+            .expect("packed load should hydrate");
+        assert_eq!(
+            packed.into_values(),
+            vec![
+                Some(first.as_bytes().to_vec()),
+                Some(second.as_bytes().to_vec())
+            ]
+        );
     }
 }

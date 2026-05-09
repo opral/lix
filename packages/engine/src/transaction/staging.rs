@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use crate::domain::{Domain, DomainRowIdentity};
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionProvider, FunctionProviderHandle};
-use crate::json_store::{JsonStoreContext, JsonStoreWriter};
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{LiveStateScanRequest, MaterializedLiveStateRow};
@@ -34,7 +33,6 @@ pub(crate) struct TransactionWriteBuffer {
     commit_members_by_version: Mutex<BTreeMap<String, StagedCommitMembers>>,
     extra_commit_parents_by_version: Mutex<BTreeMap<String, Vec<String>>>,
     file_data_writes: Mutex<Vec<TransactionFileData>>,
-    json_writer: Mutex<Option<JsonStoreWriter>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +50,6 @@ pub(crate) struct PreparedWriteSet {
     pub(crate) commit_members_by_version: BTreeMap<String, StagedCommitMembers>,
     pub(crate) extra_commit_parents_by_version: BTreeMap<String, Vec<String>>,
     pub(crate) file_data_writes: Vec<TransactionFileData>,
-    pub(crate) json_writer: JsonStoreWriter,
 }
 
 pub(crate) struct PreparedWriteValidationSet<'a> {
@@ -305,7 +302,6 @@ impl TransactionWriteBuffer {
             commit_members_by_version: Mutex::new(BTreeMap::new()),
             extra_commit_parents_by_version: Mutex::new(BTreeMap::new()),
             file_data_writes: Mutex::new(Vec::new()),
-            json_writer: Mutex::new(Some(JsonStoreContext::new().writer())),
         }
     }
 
@@ -354,18 +350,6 @@ impl TransactionWriteBuffer {
                     "failed to acquire transaction staged extra commit parents lock",
                 )
             })?;
-        let mut json_writer_guard = self.json_writer.lock().map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "failed to acquire transaction staged JSON writer lock",
-            )
-        })?;
-        let json_writer = json_writer_guard.take().ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "transaction staged JSON writer has already been drained",
-            )
-        })?;
         let result = Ok(PreparedWriteSet {
             state_rows: std::mem::take(&mut *rows_guard)
                 .into_iter()
@@ -379,7 +363,6 @@ impl TransactionWriteBuffer {
             commit_members_by_version: std::mem::take(&mut *commit_members_guard),
             extra_commit_parents_by_version: std::mem::take(&mut *extra_parents_guard),
             file_data_writes: std::mem::take(&mut *file_data_guard),
-            json_writer,
         });
         by_identity_guard.clear();
         result
@@ -443,25 +426,6 @@ impl TransactionWriteBuffer {
         });
         members.allow_empty();
         Ok(members.commit_id.clone())
-    }
-
-    pub(crate) fn with_json_writer<R>(
-        &self,
-        f: impl FnOnce(&mut JsonStoreWriter) -> Result<R, LixError>,
-    ) -> Result<R, LixError> {
-        let mut json_writer_guard = self.json_writer.lock().map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "failed to acquire transaction staged JSON writer lock",
-            )
-        })?;
-        let json_writer = json_writer_guard.as_mut().ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "cannot prepare JSON after transaction staged JSON writer was drained",
-            )
-        })?;
-        f(json_writer)
     }
 
     /// Builds the transaction-local read overlay from currently staged writes.
@@ -1673,9 +1637,7 @@ mod tests {
     }
 
     fn state_row(key: &str, value: &str) -> PreparedStateRow {
-        let mut json_writer = JsonStoreContext::new().writer();
         let snapshot = stage_json_from_value(
-            &mut json_writer,
             TransactionJson::from_value_for_test(serde_json::json!({ "key": key, "value": value })),
             "test staged row snapshot_content",
         )

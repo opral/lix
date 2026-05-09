@@ -5,7 +5,10 @@ use crate::commit_store::{
 };
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::context::JsonStoreContext;
-use crate::json_store::types::{JsonProjectionPath, JsonRef, NormalizedJson};
+use crate::json_store::types::{
+    JsonLoadRequestRef, JsonProjectionLoadRequestRef, JsonProjectionPath, JsonReadScopeRef,
+    JsonRef, JsonWritePlacementRef, NormalizedJsonRef,
+};
 use crate::live_state::LiveStateContext;
 use crate::schema_catalog::SchemaCatalogSource;
 use crate::session::SessionMode;
@@ -35,17 +38,14 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-fn prepare_json_ref(
-    writer: &mut crate::json_store::JsonStoreWriter,
-    document: &[u8],
-) -> Result<JsonRef, LixError> {
+fn prepare_json_ref(document: &[u8]) -> Result<JsonRef, LixError> {
     let text = std::str::from_utf8(document).map_err(|error| {
         LixError::new(
             LixError::CODE_UNKNOWN,
             format!("benchmark JSON document is invalid UTF-8: {error}"),
         )
     })?;
-    writer.prepare_json(NormalizedJson::from_arc_unchecked(Arc::from(text)))
+    Ok(JsonRef::for_content(text.as_bytes()))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -592,7 +592,7 @@ async fn prepare_transaction_fixture(
 
 async fn seed_transaction_visible_schema_rows(storage: StorageContext) -> Result<(), LixError> {
     let mut writes = StorageWriteSet::new();
-    let mut json_writer = JsonStoreContext::new().writer();
+    let mut snapshots = Vec::new();
     let rows = crate::schema::seed_schema_definitions()
         .into_iter()
         .cloned()
@@ -601,16 +601,15 @@ async fn seed_transaction_visible_schema_rows(storage: StorageContext) -> Result
             let key = crate::schema::schema_key_from_definition(&schema)
                 .expect("seed schema key should derive");
             let snapshot_content = serde_json::json!({ "value": schema }).to_string();
+            let snapshot_ref = prepare_json_ref(snapshot_content.as_bytes())?;
+            snapshots.push(snapshot_content);
             Ok(crate::untracked_state::UntrackedStateRow {
                 entity_id: crate::schema::registered_schema_entity_id(&key.schema_key)
                     .expect("registered schema identity should derive"),
                 schema_key: "lix_registered_schema".to_string(),
                 file_id: None,
                 version_id: crate::GLOBAL_VERSION_ID.to_string(),
-                snapshot_ref: Some(prepare_json_ref(
-                    &mut json_writer,
-                    snapshot_content.as_bytes(),
-                )?),
+                snapshot_ref: Some(snapshot_ref),
                 metadata_ref: None,
                 created_at: "1970-01-01T00:00:00.000Z".to_string(),
                 updated_at: "1970-01-01T00:00:00.000Z".to_string(),
@@ -619,10 +618,16 @@ async fn seed_transaction_visible_schema_rows(storage: StorageContext) -> Result
         })
         .collect::<Result<Vec<_>, LixError>>()?;
     let mut transaction = storage.begin_write_transaction().await?;
+    JsonStoreContext::new().writer().stage_batch(
+        &mut writes,
+        JsonWritePlacementRef::Direct,
+        snapshots.iter().map(|snapshot| NormalizedJsonRef {
+            normalized: snapshot.as_str(),
+        }),
+    )?;
     UntrackedStateContext::new()
         .writer(&mut writes)
         .stage_rows(rows.iter().map(|row| row.as_ref()))?;
-    json_writer.flush_into(&mut writes);
     writes.apply(&mut transaction.as_mut()).await?;
     transaction.commit().await
 }
@@ -2549,7 +2554,7 @@ pub async fn changelog_scan_schema_prepared(
     let changes = reader.scan_changes(&ChangeScanRequest::default()).await?;
     let verified_rows = changes
         .iter()
-        .filter(|change| change.schema_key == CHANGELOG_MATCH_SCHEMA_KEY)
+        .filter(|change| change.record.schema_key == CHANGELOG_MATCH_SCHEMA_KEY)
         .count();
     Ok(report(
         selectivity.expected_rows(fixture.rows),
@@ -2569,7 +2574,7 @@ pub async fn changelog_scan_entity_history_prepared(
     let target = EntityIdentity::single(CHANGELOG_HISTORY_ENTITY_ID);
     let verified_rows = changes
         .iter()
-        .filter(|change| change.entity_id == target)
+        .filter(|change| change.record.entity_id == target)
         .count();
     Ok(report(
         fixture.rows.div_ceil(10),
@@ -2743,10 +2748,24 @@ pub async fn json_store_write_prepared(
     {
         let mut writes = StorageWriteSet::new();
         let mut writer = fixture.context.writer();
-        for document in &fixture.documents {
-            prepare_json_ref(&mut writer, document)?;
-        }
-        writer.flush_into(&mut writes);
+        writer.stage_batch(
+            &mut writes,
+            JsonWritePlacementRef::Direct,
+            fixture
+                .documents
+                .iter()
+                .map(|document| {
+                    std::str::from_utf8(document)
+                        .map(|normalized| NormalizedJsonRef { normalized })
+                        .map_err(|error| {
+                            LixError::new(
+                                LixError::CODE_UNKNOWN,
+                                format!("benchmark JSON document is invalid UTF-8: {error}"),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await?;
@@ -2785,10 +2804,26 @@ pub async fn prepare_json_store_projection_read(
     {
         let mut writes = StorageWriteSet::new();
         let mut writer = context.writer();
-        for document in documents {
-            refs.push(prepare_json_ref(&mut writer, &document)?);
+        for document in &documents {
+            refs.push(prepare_json_ref(document)?);
         }
-        writer.flush_into(&mut writes);
+        writer.stage_batch(
+            &mut writes,
+            JsonWritePlacementRef::Direct,
+            documents
+                .iter()
+                .map(|document| {
+                    std::str::from_utf8(document)
+                        .map(|normalized| NormalizedJsonRef { normalized })
+                        .map_err(|error| {
+                            LixError::new(
+                                LixError::CODE_UNKNOWN,
+                                format!("benchmark JSON document is invalid UTF-8: {error}"),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await?;
@@ -2807,8 +2842,14 @@ pub async fn json_store_read_bytes_prepared(
     let mut reader = fixture
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
-    for json_ref in &fixture.refs {
-        if reader.load_bytes(json_ref).await?.is_some() {
+    let batch = reader
+        .load_bytes_many(JsonLoadRequestRef {
+            refs: &fixture.refs,
+            scope: JsonReadScopeRef::Direct,
+        })
+        .await?;
+    for value in batch.values() {
+        if value.is_some() {
             verified_rows += 1;
         }
     }
@@ -2823,8 +2864,14 @@ pub async fn json_store_read_value_prepared(
     let mut reader = fixture
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
-    for json_ref in &fixture.refs {
-        if reader.load_json_value(json_ref).await?.is_some() {
+    let batch = reader
+        .load_values_many(JsonLoadRequestRef {
+            refs: &fixture.refs,
+            scope: JsonReadScopeRef::Direct,
+        })
+        .await?;
+    for value in batch.values() {
+        if value.is_some() {
             verified_rows += 1;
         }
     }
@@ -2839,12 +2886,15 @@ pub async fn json_store_read_projection_prepared(
     let mut reader = fixture
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
-    for json_ref in &fixture.refs {
-        if reader
-            .load_json_projection(json_ref, &fixture.paths)
-            .await?
-            .is_some()
-        {
+    let batch = reader
+        .load_projections_many(JsonProjectionLoadRequestRef {
+            refs: &fixture.refs,
+            scope: JsonReadScopeRef::Direct,
+            paths: &fixture.paths,
+        })
+        .await?;
+    for value in batch.values() {
+        if value.is_some() {
             verified_rows += 1;
         }
     }
@@ -2878,10 +2928,26 @@ async fn prepare_json_store_base_update(
     {
         let mut writes = StorageWriteSet::new();
         let mut writer = context.writer();
-        for document in documents {
-            refs.push(prepare_json_ref(&mut writer, &document)?);
+        for document in &documents {
+            refs.push(prepare_json_ref(document)?);
         }
-        writer.flush_into(&mut writes);
+        writer.stage_batch(
+            &mut writes,
+            JsonWritePlacementRef::Direct,
+            documents
+                .iter()
+                .map(|document| {
+                    std::str::from_utf8(document)
+                        .map(|normalized| NormalizedJsonRef { normalized })
+                        .map_err(|error| {
+                            LixError::new(
+                                LixError::CODE_UNKNOWN,
+                                format!("benchmark JSON document is invalid UTF-8: {error}"),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await?;
@@ -2922,11 +2988,29 @@ async fn json_store_write_against_base_prepared(
     {
         let mut writes = StorageWriteSet::new();
         let mut writer = fixture.context.writer();
+        let mut updated_documents = Vec::with_capacity(fixture.refs.len());
         for (index, _json_ref) in fixture.refs.iter().enumerate() {
             let updated = updated_json_document(shape, index);
-            prepare_json_ref(&mut writer, &updated)?;
+            prepare_json_ref(&updated)?;
+            updated_documents.push(updated);
         }
-        writer.flush_into(&mut writes);
+        writer.stage_batch(
+            &mut writes,
+            JsonWritePlacementRef::Direct,
+            updated_documents
+                .iter()
+                .map(|document| {
+                    std::str::from_utf8(document)
+                        .map(|normalized| NormalizedJsonRef { normalized })
+                        .map_err(|error| {
+                            LixError::new(
+                                LixError::CODE_UNKNOWN,
+                                format!("benchmark JSON document is invalid UTF-8: {error}"),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await?;
@@ -3444,12 +3528,21 @@ async fn write_tracked_root(
     let storage = StorageContext::new(Arc::clone(backend));
     let mut transaction = storage.begin_write_transaction().await?;
     let mut writes = StorageWriteSet::new();
-    let mut json_writer = JsonStoreContext::new().writer();
     let changes = rows
         .iter()
-        .map(|row| tracked_bench_change_from_materialized(&mut json_writer, row))
+        .map(tracked_bench_change_from_materialized)
         .collect::<Result<Vec<_>, _>>()?;
-    json_writer.flush_into(&mut writes);
+    let payloads = tracked_bench_json_payloads(rows);
+    JsonStoreContext::new().writer().stage_batch(
+        &mut writes,
+        JsonWritePlacementRef::CommitPack {
+            commit_id,
+            pack_id: 0,
+        },
+        payloads.iter().map(|payload| NormalizedJsonRef {
+            normalized: payload.as_str(),
+        }),
+    )?;
 
     let parent_ids = parent_commit_id
         .map(|parent| vec![parent.to_string()])
@@ -3535,7 +3628,6 @@ async fn write_tracked_root(
 }
 
 fn tracked_bench_change_from_materialized(
-    json_writer: &mut crate::json_store::JsonStoreWriter,
     row: &MaterializedTrackedStateRow,
 ) -> Result<Change, LixError> {
     Ok(Change {
@@ -3546,18 +3638,31 @@ fn tracked_bench_change_from_materialized(
         snapshot_ref: row
             .snapshot_content
             .as_deref()
-            .map(|value| prepare_json_ref(json_writer, value.as_bytes()))
+            .map(|value| prepare_json_ref(value.as_bytes()))
             .transpose()?,
         metadata_ref: row
             .metadata
             .as_ref()
             .map(|value| {
                 let serialized = crate::serialize_row_metadata(value);
-                prepare_json_ref(json_writer, serialized.as_bytes())
+                prepare_json_ref(serialized.as_bytes())
             })
             .transpose()?,
         created_at: row.created_at.clone(),
     })
+}
+
+fn tracked_bench_json_payloads(rows: &[MaterializedTrackedStateRow]) -> Vec<String> {
+    let mut payloads = Vec::new();
+    for row in rows {
+        if let Some(snapshot) = row.snapshot_content.as_deref() {
+            payloads.push(snapshot.to_string());
+        }
+        if let Some(metadata) = row.metadata.as_ref() {
+            payloads.push(crate::serialize_row_metadata(metadata));
+        }
+    }
+    payloads
 }
 
 async fn scan_tracked(
@@ -3580,18 +3685,10 @@ async fn write_untracked_rows(
     let mut transaction = storage.begin_write_transaction().await?;
     {
         let mut writes = StorageWriteSet::new();
-        let canonical_rows = {
-            let mut json_writer = JsonStoreContext::new().writer();
-            rows.iter()
-                .map(|row| {
-                    crate::test_support::untracked_state_row_from_materialized(
-                        &mut writes,
-                        &mut json_writer,
-                        row,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        };
+        let canonical_rows = rows
+            .iter()
+            .map(|row| crate::test_support::untracked_state_row_from_materialized(&mut writes, row))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut writer = context.writer(&mut writes);
         writer.stage_rows(canonical_rows.iter().map(|row| row.as_ref()))?;
         writes.apply(&mut transaction.as_mut()).await?;
@@ -3617,12 +3714,18 @@ async fn append_changelog_changes(
     let mut transaction = storage.begin_write_transaction().await?;
     {
         let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer();
         let canonical_changes = changes
             .iter()
-            .map(|change| canonical_changelog_bench_change(&mut json_writer, change))
+            .map(canonical_changelog_bench_change)
             .collect::<Result<Vec<_>, _>>()?;
-        json_writer.flush_into(&mut writes);
+        let payloads = changelog_bench_json_payloads(changes);
+        JsonStoreContext::new().writer().stage_batch(
+            &mut writes,
+            JsonWritePlacementRef::Direct,
+            payloads.iter().map(|payload| NormalizedJsonRef {
+                normalized: payload.as_str(),
+            }),
+        )?;
         let parent_ids = Vec::new();
         let author_account_ids = vec!["bench-author".to_string()];
         {
@@ -3797,19 +3900,16 @@ fn commit_graph_materialized_commit_change(commit_id: &str, rows: usize) -> Mate
     }
 }
 
-fn canonical_changelog_bench_change(
-    json_writer: &mut crate::json_store::JsonStoreWriter,
-    change: &MaterializedChange,
-) -> Result<Change, LixError> {
+fn canonical_changelog_bench_change(change: &MaterializedChange) -> Result<Change, LixError> {
     let snapshot_ref = change
         .snapshot_content
         .as_ref()
-        .map(|value| prepare_json_ref(json_writer, value.as_bytes()))
+        .map(|value| prepare_json_ref(value.as_bytes()))
         .transpose()?;
     let metadata_ref = change
         .metadata
         .as_ref()
-        .map(|value| prepare_json_ref(json_writer, value.as_bytes()))
+        .map(|value| prepare_json_ref(value.as_bytes()))
         .transpose()?;
     Ok(Change {
         id: change.id.clone(),
@@ -3820,6 +3920,20 @@ fn canonical_changelog_bench_change(
         metadata_ref,
         created_at: change.created_at.clone(),
     })
+}
+
+fn changelog_bench_json_payloads(changes: &[MaterializedChange]) -> Vec<String> {
+    changes
+        .iter()
+        .flat_map(|change| {
+            change
+                .snapshot_content
+                .iter()
+                .chain(change.metadata.iter())
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn changelog_bench_change_ref_only(change: MaterializedChange) -> Change {

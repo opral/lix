@@ -3,7 +3,7 @@ use crate::entity_identity::EntityIdentity;
 use crate::functions::{
     FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
 };
-use crate::json_store::{JsonStoreContext, NormalizedJson};
+use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::schema::{
     registered_schema_entity_id, schema_key_from_definition, seed_schema_definitions,
 };
@@ -14,6 +14,7 @@ use crate::version::{VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_REF_SCHEMA_KEY};
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 use serde_json::json;
+#[cfg(test)]
 use std::sync::Arc;
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
@@ -185,13 +186,22 @@ pub(crate) async fn initialize(
 
     let mut transaction = storage.begin_write_transaction().await?;
     let mut writes = StorageWriteSet::new();
-    let mut json_writer = JsonStoreContext::new().writer();
 
     let authored_changes = plan
         .changes
         .iter()
-        .map(|change| seed_change_to_commit_store_change(&mut json_writer, change))
+        .map(seed_change_to_commit_store_change)
         .collect::<Result<Vec<_>, _>>()?;
+    JsonStoreContext::new().writer().stage_batch(
+        &mut writes,
+        JsonWritePlacementRef::CommitPack {
+            commit_id: &plan.commit.id,
+            pack_id: 0,
+        },
+        plan.changes.iter().map(|change| NormalizedJsonRef {
+            normalized: change.snapshot_content.as_str(),
+        }),
+    )?;
 
     let staged_commit = {
         let commit = CommitDraftRef {
@@ -214,8 +224,15 @@ pub(crate) async fn initialize(
     let untracked_rows = plan
         .untracked_rows
         .iter()
-        .map(|row| untracked_state_row_from_seed(&mut json_writer, row))
+        .map(untracked_state_row_from_seed)
         .collect::<Result<Vec<_>, _>>()?;
+    JsonStoreContext::new().writer().stage_batch(
+        &mut writes,
+        JsonWritePlacementRef::Direct,
+        plan.untracked_rows.iter().map(|row| NormalizedJsonRef {
+            normalized: row.snapshot_content.as_str(),
+        }),
+    )?;
 
     {
         untracked_state
@@ -237,40 +254,29 @@ pub(crate) async fn initialize(
             .await?;
     }
 
-    json_writer.flush_into(&mut writes);
     writes.apply(&mut transaction.as_mut()).await?;
     transaction.commit().await?;
     Ok(receipt)
 }
 
-fn seed_change_to_commit_store_change(
-    json_writer: &mut crate::json_store::JsonStoreWriter,
-    change: &InitSeedChange,
-) -> Result<Change, LixError> {
+fn seed_change_to_commit_store_change(change: &InitSeedChange) -> Result<Change, LixError> {
     Ok(Change {
         id: change.id.clone(),
         entity_id: change.entity_id.clone(),
         schema_key: change.schema_key.clone(),
         file_id: None,
-        snapshot_ref: Some(json_writer.prepare_json(NormalizedJson::from_arc_unchecked(
-            Arc::from(change.snapshot_content.as_str()),
-        ))?),
+        snapshot_ref: Some(JsonRef::for_content(change.snapshot_content.as_bytes())),
         metadata_ref: None,
         created_at: change.created_at.clone(),
     })
 }
 
-fn untracked_state_row_from_seed(
-    json_writer: &mut crate::json_store::JsonStoreWriter,
-    row: &InitSeedLiveRow,
-) -> Result<UntrackedStateRow, LixError> {
+fn untracked_state_row_from_seed(row: &InitSeedLiveRow) -> Result<UntrackedStateRow, LixError> {
     Ok(UntrackedStateRow {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
         file_id: None,
-        snapshot_ref: Some(json_writer.prepare_json(NormalizedJson::from_arc_unchecked(
-            Arc::from(row.snapshot_content.as_str()),
-        ))?),
+        snapshot_ref: Some(JsonRef::for_content(row.snapshot_content.as_bytes())),
         metadata_ref: None,
         created_at: row.created_at.clone(),
         updated_at: row.updated_at.clone(),

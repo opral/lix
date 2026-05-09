@@ -5,7 +5,7 @@ use crate::commit_graph::{
     CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
     CommitGraphEdge, CommitGraphReader, ReachableCommitGraphCommit,
 };
-use crate::commit_store::{Change, Commit, CommitStoreContext, CommitStoreReader};
+use crate::commit_store::{Change, Commit, CommitStoreContext, CommitStoreReader, LocatedChange};
 use crate::entity_identity::EntityIdentity;
 use crate::storage::StorageReader;
 use crate::storage::{ScopedStorageReader, StorageReadScope};
@@ -175,9 +175,9 @@ where
                 let change = self
                     .load_member_canonical_change(&change_id, &commit_id)
                     .await?;
-                if change_matches_history_request(&change, request) {
+                if change_matches_history_request(&change.record, request) {
                     entries.push(CommitGraphChangeHistoryEntry {
-                        change,
+                        located_change: change,
                         observed_commit_id: commit_id.clone(),
                         start_commit_id: start_commit_id.to_string(),
                         depth: reachable.depth,
@@ -193,7 +193,7 @@ where
         &mut self,
         change_id: &str,
         source_commit_id: &str,
-    ) -> Result<Change, LixError> {
+    ) -> Result<LocatedChange, LixError> {
         let change_ids = vec![change_id.to_string()];
         self.load_canonical_changes(&change_ids)
             .await?
@@ -246,14 +246,20 @@ where
     async fn load_canonical_changes(
         &self,
         change_ids: &[String],
-    ) -> Result<Vec<Option<Change>>, LixError> {
+    ) -> Result<Vec<Option<LocatedChange>>, LixError> {
         self.commit_store_reader
-            .load_changes(change_ids)
+            .load_located_changes(change_ids)
             .await
             .map(|changes| {
                 changes
                     .into_iter()
-                    .map(|change| change.map(canonical_change_from_store_change))
+                    .map(|located| {
+                        located.map(|located| LocatedChange {
+                            record: canonical_change_from_store_change(located.record),
+                            source_commit_id: located.source_commit_id,
+                            source_pack_id: located.source_pack_id,
+                        })
+                    })
                     .collect()
             })
     }
@@ -528,7 +534,7 @@ mod tests {
             history
                 .iter()
                 .map(|entry| (
-                    entry.change.id.as_str(),
+                    entry.located_change.record.id.as_str(),
                     entry.observed_commit_id.as_str(),
                     entry.start_commit_id.as_str(),
                     entry.depth
@@ -592,7 +598,7 @@ mod tests {
             .expect("history should resolve");
 
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].change.id, "change-file-a");
+        assert_eq!(history[0].located_change.record.id, "change-file-a");
         assert_eq!(history[0].depth, 1);
     }
 
@@ -633,7 +639,7 @@ mod tests {
 
         assert!(hidden.is_empty());
         assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].change.id, "change-deleted");
+        assert_eq!(visible[0].located_change.record.id, "change-deleted");
     }
 
     #[derive(Clone)]

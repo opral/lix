@@ -325,12 +325,14 @@ mod tests {
         commit_id: &str,
         timestamp: &str,
     ) -> Result<(), LixError> {
-        let canonical_row = {
-            let mut json_writer = JsonStoreContext::new().writer();
-            let row = prepare_version_ref_row(&mut json_writer, version_id, commit_id, timestamp)?;
-            json_writer.flush_into(writes);
-            row
-        };
-        version_ref.writer(writes).stage_rows(&[canonical_row])
+        let canonical_row = prepare_version_ref_row(version_id, commit_id, timestamp)?;
+        JsonStoreContext::new().writer().stage_batch(
+            writes,
+            crate::json_store::JsonWritePlacementRef::Direct,
+            [crate::json_store::NormalizedJsonRef {
+                normalized: canonical_row.snapshot.as_str(),
+            }],
+        )?;
+        version_ref.writer(writes).stage_rows(&[canonical_row.row])
     }
 }

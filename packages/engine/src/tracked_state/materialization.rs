@@ -1,7 +1,7 @@
 use crate::commit_store::CommitStoreContext;
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
-use crate::json_store::JsonStoreContext;
+use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonStoreContext};
 use crate::storage::StorageReader;
 use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey};
 use crate::tracked_state::MaterializedTrackedStateRow;
@@ -50,6 +50,7 @@ where
 
     let mut row_plans = Vec::with_capacity(entries.len());
     let mut json_refs = Vec::new();
+    let mut json_ref_localities = Vec::new();
     for (key, value) in entries {
         let pack_key = (
             value.change_locator.source_commit_id.clone(),
@@ -94,10 +95,19 @@ where
         let snapshot_ref_index = projected_json_ref_index(
             projection.snapshot_content,
             change.snapshot_ref,
+            &value.change_locator.source_commit_id,
+            value.change_locator.source_pack_id,
             &mut json_refs,
+            &mut json_ref_localities,
         );
-        let metadata_ref_index =
-            projected_json_ref_index(projection.metadata, change.metadata_ref, &mut json_refs);
+        let metadata_ref_index = projected_json_ref_index(
+            projection.metadata,
+            change.metadata_ref,
+            &value.change_locator.source_commit_id,
+            value.change_locator.source_pack_id,
+            &mut json_refs,
+            &mut json_ref_localities,
+        );
         row_plans.push(MaterializedTrackedStateRowPlan {
             entity_id: key.entity_id,
             schema_key: key.schema_key,
@@ -112,8 +122,7 @@ where
         });
     }
 
-    let json_store = JsonStoreContext::new();
-    let json_values = json_store.load_bytes_many(store, &json_refs).await?;
+    let json_values = load_projection_json_values(store, &json_refs, &json_ref_localities).await?;
     row_plans
         .into_iter()
         .map(|plan| materialize_row_plan(plan, &json_refs, &json_values))
@@ -136,14 +145,69 @@ struct MaterializedTrackedStateRowPlan {
 fn projected_json_ref_index(
     include: bool,
     json_ref: Option<JsonRef>,
+    commit_id: &str,
+    pack_id: u32,
     json_refs: &mut Vec<JsonRef>,
+    json_ref_localities: &mut Vec<(String, u32)>,
 ) -> Option<usize> {
     if !include {
         return None;
     }
     let index = json_refs.len();
     json_refs.push(json_ref?);
+    json_ref_localities.push((commit_id.to_string(), pack_id));
     Some(index)
+}
+
+async fn load_projection_json_values<S>(
+    store: &mut S,
+    json_refs: &[JsonRef],
+    json_ref_localities: &[(String, u32)],
+) -> Result<Vec<Option<Vec<u8>>>, LixError>
+where
+    S: StorageReader,
+{
+    let mut json_values = vec![None; json_refs.len()];
+    let mut refs_by_pack = BTreeMap::<(String, u32), Vec<(usize, JsonRef)>>::new();
+    for (index, json_ref) in json_refs.iter().copied().enumerate() {
+        let locality = json_ref_localities.get(index).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state materialization lost JSON locality index",
+            )
+        })?;
+        refs_by_pack
+            .entry(locality.clone())
+            .or_default()
+            .push((index, json_ref));
+    }
+
+    let json_store = JsonStoreContext::new();
+    for ((commit_id, pack_id), refs) in refs_by_pack {
+        let indexes = refs.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+        let refs = refs
+            .into_iter()
+            .map(|(_, json_ref)| json_ref)
+            .collect::<Vec<_>>();
+        let pack_ids = [pack_id];
+        let values = json_store
+            .load_bytes_many(
+                store,
+                JsonLoadRequestRef {
+                    refs: &refs,
+                    scope: JsonReadScopeRef::CommitPacks {
+                        commit_id: &commit_id,
+                        pack_ids: &pack_ids,
+                    },
+                },
+            )
+            .await?
+            .into_values();
+        for (index, value) in indexes.into_iter().zip(values) {
+            json_values[index] = value;
+        }
+    }
+    Ok(json_values)
 }
 
 fn materialize_row_plan(

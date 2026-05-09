@@ -250,19 +250,11 @@ mod tests {
         rows: &[MaterializedUntrackedStateRow],
     ) {
         let mut writes = StorageWriteSet::new();
-        let canonical_rows = {
-            let mut json_writer = JsonStoreContext::new().writer();
-            rows.iter()
-                .map(|row| {
-                    crate::test_support::untracked_state_row_from_materialized(
-                        &mut writes,
-                        &mut json_writer,
-                        row,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .expect("rows should canonicalize")
-        };
+        let canonical_rows = rows
+            .iter()
+            .map(|row| crate::test_support::untracked_state_row_from_materialized(&mut writes, row))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows should canonicalize");
         context
             .writer(&mut writes)
             .stage_rows(canonical_rows.iter().map(|row| row.as_ref()))
@@ -364,15 +356,9 @@ mod tests {
             .await
             .expect("transaction should open");
         let mut writes = StorageWriteSet::new();
-        let canonical_row = {
-            let mut json_writer = JsonStoreContext::new().writer();
-            crate::test_support::untracked_state_row_from_materialized(
-                &mut writes,
-                &mut json_writer,
-                &row,
-            )
-            .expect("row should canonicalize")
-        };
+        let canonical_row =
+            crate::test_support::untracked_state_row_from_materialized(&mut writes, &row)
+                .expect("row should canonicalize");
         let mut writer = context.writer(&mut writes);
         writer
             .stage_rows(std::iter::once(canonical_row.as_ref()))
