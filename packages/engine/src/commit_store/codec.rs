@@ -1,6 +1,5 @@
 use crate::commit_store::{
-    Change, ChangeBorrowed, ChangeIndexEntry, ChangeIndexEntryBorrowed, ChangeLocator,
-    ChangeLocatorBorrowed, Commit, StoredCommitBorrowed,
+    Change, ChangeBorrowed, ChangeLocator, ChangeLocatorBorrowed, Commit, StoredCommitBorrowed,
 };
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
@@ -10,9 +9,6 @@ const CHANGE_FILE_IDENTIFIER: &str = "LXCH";
 const COMMIT_MAGIC: &[u8; 5] = b"LXCM1";
 const CHANGE_PACK_MAGIC: &[u8; 5] = b"LXCP1";
 const MEMBERSHIP_PACK_MAGIC: &[u8; 5] = b"LXMP1";
-const CHANGE_INDEX_MAGIC: &[u8; 5] = b"LXCI1";
-const CHANGE_INDEX_COMMIT_HEADER: u8 = 1;
-const CHANGE_INDEX_PACKED_CHANGE: u8 = 2;
 
 pub(crate) fn encode_commit_borrowed(
     commit: StoredCommitBorrowed<'_>,
@@ -190,51 +186,6 @@ pub(crate) fn decode_membership_pack(
     }
     cursor.expect_end("membership pack")?;
     Ok((commit_id, pack_id, members))
-}
-
-pub(crate) fn encode_change_index_entry(
-    entry: ChangeIndexEntryBorrowed<'_>,
-) -> Result<Vec<u8>, LixError> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(CHANGE_INDEX_MAGIC);
-    match entry {
-        ChangeIndexEntryBorrowed::CommitHeader {
-            commit_id,
-            change_id,
-        } => {
-            bytes.push(CHANGE_INDEX_COMMIT_HEADER);
-            write_str(&mut bytes, commit_id)?;
-            write_str(&mut bytes, change_id)?;
-        }
-        ChangeIndexEntryBorrowed::PackedChange { locator } => {
-            bytes.push(CHANGE_INDEX_PACKED_CHANGE);
-            encode_locator(&mut bytes, locator)?;
-        }
-    }
-    Ok(bytes)
-}
-
-pub(crate) fn decode_change_index_entry(bytes: &[u8]) -> Result<ChangeIndexEntry, LixError> {
-    let mut cursor = ByteCursor::new(bytes);
-    cursor.expect_magic(CHANGE_INDEX_MAGIC, "change index entry")?;
-    let tag = cursor.read_u8("change_index_tag")?;
-    let entry = match tag {
-        CHANGE_INDEX_COMMIT_HEADER => ChangeIndexEntry::CommitHeader {
-            commit_id: cursor.read_string("commit_id")?,
-            change_id: cursor.read_string("change_id")?,
-        },
-        CHANGE_INDEX_PACKED_CHANGE => ChangeIndexEntry::PackedChange {
-            locator: decode_locator(&mut cursor)?,
-        },
-        _ => {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("failed to decode commit-store change index entry: unknown tag {tag}"),
-            ));
-        }
-    };
-    cursor.expect_end("change index entry")?;
-    Ok(entry)
 }
 
 fn encode_locator(bytes: &mut Vec<u8>, locator: ChangeLocatorBorrowed<'_>) -> Result<(), LixError> {

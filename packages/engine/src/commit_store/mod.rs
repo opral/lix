@@ -10,8 +10,7 @@ pub(crate) use context::{CommitStoreContext, CommitStoreReader, CommitStoreWrite
 pub(crate) use materialization::materialize_change;
 #[allow(unused_imports)]
 pub(crate) use types::{
-    Change, ChangeBorrowed, ChangeIndexEntry, ChangeIndexEntryBorrowed, ChangeLocator,
-    ChangeLocatorBorrowed, ChangePack, ChangePackView, ChangeScanRequest, Commit,
-    CommitDraftBorrowed, MaterializedChange, MembershipPack, MembershipPackView,
-    StagedCommitStoreCommit, StoredCommitBorrowed,
+    Change, ChangeBorrowed, ChangeIndexEntry, ChangeLocator, ChangeLocatorBorrowed, ChangePack,
+    ChangePackView, ChangeScanRequest, Commit, CommitDraftBorrowed, MaterializedChange,
+    MembershipPack, MembershipPackView, StagedCommitStoreCommit, StoredCommitBorrowed,
 };

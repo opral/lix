@@ -915,12 +915,20 @@ fn print_category_rows(rows: usize, value_bytes: usize, run: &AmplificationRun) 
     let canonical_changelog_row_namespaces = ["changelog.change", "changelog.change_pack"];
     let canonical_commit_pack_namespaces =
         ["commit_record", "change_record_pack", "change_ref_pack"];
+    let canonical_commit_store_namespaces = [
+        "commit_store.commit",
+        "commit_store.change_pack",
+        "commit_store.membership_pack",
+    ];
     let canonical_storage_namespaces = [
         "changelog.change",
         "changelog.change_pack",
         "commit_record",
         "change_record_pack",
         "change_ref_pack",
+        "commit_store.commit",
+        "commit_store.change_pack",
+        "commit_store.membership_pack",
     ];
     let index_storage_namespaces = [
         "tracked_state.tree.chunk",
@@ -942,6 +950,8 @@ fn print_category_rows(rows: usize, value_bytes: usize, run: &AmplificationRun) 
         storage_totals_for(storage, &canonical_changelog_row_namespaces);
     let canonical_commit_pack_storage =
         storage_totals_for(storage, &canonical_commit_pack_namespaces);
+    let canonical_commit_store_storage =
+        storage_totals_for(storage, &canonical_commit_store_namespaces);
     let index_storage = storage_totals_for(storage, &index_storage_namespaces);
     let payload_storage = storage_totals_for(storage, &payload_storage_namespaces);
     let sidecar_storage = storage_totals_for(storage, &sidecar_storage_namespaces);
@@ -969,7 +979,10 @@ fn print_category_rows(rows: usize, value_bytes: usize, run: &AmplificationRun) 
     let changelog_encoded_objects = counts.puts_in("changelog.change")
         + counts.puts_in("commit_record")
         + counts.puts_in("change_record_pack")
-        + counts.puts_in("change_ref_pack");
+        + counts.puts_in("change_ref_pack")
+        + counts.puts_in("commit_store.commit")
+        + counts.puts_in("commit_store.change_pack")
+        + counts.puts_in("commit_store.membership_pack");
     let tracked_encoded_objects = index_puts;
     let sidecar_encoded_objects = counts.puts_in("untracked_state.row");
 
@@ -1043,6 +1056,12 @@ fn print_category_rows(rows: usize, value_bytes: usize, run: &AmplificationRun) 
         "storage_canonical_commit_packs",
         &canonical_commit_pack_namespaces,
         &canonical_commit_pack_storage,
+    );
+    print_storage_class_row(
+        rows,
+        "storage_canonical_commit_store",
+        &canonical_commit_store_namespaces,
+        &canonical_commit_store_storage,
     );
     print_storage_class_row(
         rows,

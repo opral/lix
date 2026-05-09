@@ -182,35 +182,6 @@ pub(crate) enum ChangeIndexEntry {
     },
 }
 
-impl ChangeIndexEntry {
-    pub(crate) fn as_borrowed(&self) -> ChangeIndexEntryBorrowed<'_> {
-        match self {
-            ChangeIndexEntry::CommitHeader {
-                commit_id,
-                change_id,
-            } => ChangeIndexEntryBorrowed::CommitHeader {
-                commit_id,
-                change_id,
-            },
-            ChangeIndexEntry::PackedChange { locator } => ChangeIndexEntryBorrowed::PackedChange {
-                locator: locator.as_borrowed(),
-            },
-        }
-    }
-}
-
-/// Borrowed write-boundary view of [`ChangeIndexEntry`].
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ChangeIndexEntryBorrowed<'a> {
-    CommitHeader {
-        commit_id: &'a str,
-        change_id: &'a str,
-    },
-    PackedChange {
-        locator: ChangeLocatorBorrowed<'a>,
-    },
-}
-
 /// Commit-local physical pack of adopted/shared membership locators.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MembershipPack {
