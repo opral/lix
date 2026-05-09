@@ -1,8 +1,8 @@
 use crate::tracked_state::codec::{
     encode_key_ref as encode_tracked_key_ref, encode_value_ref as encode_tracked_value_ref,
 };
-use crate::tracked_state::tree_types::{
-    TrackedStateKey, TrackedStateKeyRef, TrackedStateTreeScanRequest, TrackedStateValueRef,
+use crate::tracked_state::types::{
+    TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TrackedStateTreeScanRequest,
 };
 use crate::tracked_state::TrackedStateScanRequest;
 use crate::NullableKeyFilter;
@@ -71,16 +71,8 @@ impl ByFileIndex {
         })
     }
 
-    pub(crate) fn encode_header_value_ref(value: TrackedStateValueRef<'_>) -> Vec<u8> {
-        encode_tracked_value_ref(TrackedStateValueRef {
-            snapshot_ref: None,
-            metadata_ref: None,
-            created_at: value.created_at,
-            updated_at: value.updated_at,
-            change_id: value.change_id,
-            commit_id: value.commit_id,
-            deleted: value.deleted,
-        })
+    pub(crate) fn encode_header_value_ref(value: TrackedStateIndexValueRef<'_>) -> Vec<u8> {
+        encode_tracked_value_ref(value)
     }
 }
 

@@ -1,861 +1,483 @@
-use crate::commit_graph::CommitGraphContext;
-use crate::commit_graph::CommitGraphEntity;
+use crate::commit_store::{Change, ChangeLocator, Commit, CommitStoreContext};
 use crate::storage::{StorageReader, StorageWriteSet};
-use crate::tracked_state::{TrackedStateContext, TrackedStateRow};
+use crate::tracked_state::context::TrackedStateWriteReport;
+use crate::tracked_state::types::TrackedStateKey;
+use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
 use crate::LixError;
+use std::collections::{BTreeMap, BTreeSet};
 
-/// Summary of a tracked-state rebuild operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TrackedStateRebuildReport {
-    pub(crate) written_rows: usize,
-}
-
-/// Rebuilds tracked-state rows at one commit from the commit graph.
+/// Owned rebuild delta used only by offline projection hydration.
 ///
-/// The caller provides the read stores and owns the transaction write set.
-pub(super) async fn rebuild_state_at_commit<R, S>(
-    tracked_state: &TrackedStateContext,
-    commit_graph: &CommitGraphContext,
-    read_store: R,
-    tracked_store: &mut S,
-    writes: &mut StorageWriteSet,
-    head_commit_id: &str,
-) -> Result<TrackedStateRebuildReport, LixError>
-where
-    R: StorageReader,
-    S: StorageReader + ?Sized,
-{
-    let entities = commit_graph
-        .reader(read_store)
-        .entities_at(head_commit_id)
-        .await?;
-    let rows = rows_from_entities(entities);
-    let written_rows = rows.len();
-
-    tracked_state
-        .writer()
-        .stage_root(
-            tracked_store,
-            writes,
-            head_commit_id,
-            None,
-            rows.iter().map(|row| row.as_ref()),
-        )
-        .await?;
-
-    Ok(TrackedStateRebuildReport { written_rows })
+/// Normal transaction commits already have borrowed `ChangeRef` and
+/// `ChangeLocatorRef` values available while staging commit_store. Rebuilds
+/// load those facts back from storage, so they own the decoded data internally
+/// and immediately pass a borrowed view into the same tracked-state writer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RebuildDelta {
+    pub(crate) change: Change,
+    pub(crate) locator: ChangeLocator,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
 }
 
-/// Converts commit-graph entities into root-local tracked-state rows.
-///
-/// The commit graph owns history resolution. This function only maps the
-/// effective canonical entities into the storage row shape tracked_state serves.
-pub(crate) fn rows_from_entities(entities: Vec<CommitGraphEntity>) -> Vec<TrackedStateRow> {
-    entities
-        .into_iter()
-        .filter(|entity| !is_commit_graph_fact(&entity.change.schema_key))
-        .map(tracked_row_from_entity)
-        .collect()
-}
-
-fn tracked_row_from_entity(entity: CommitGraphEntity) -> TrackedStateRow {
-    let CommitGraphEntity {
-        change,
-        source_commit_id,
-        created_at,
-        updated_at,
-        ..
-    } = entity;
-    TrackedStateRow {
-        entity_id: change.entity_id,
-        schema_key: change.schema_key,
-        file_id: change.file_id,
-        snapshot_ref: change.snapshot_ref,
-        metadata_ref: change.metadata_ref,
-        created_at,
-        updated_at,
-        change_id: change.id,
-        commit_id: source_commit_id,
+impl RebuildDelta {
+    pub(crate) fn as_ref(&self) -> TrackedStateDeltaRef<'_> {
+        TrackedStateDeltaRef {
+            change: self.change.as_ref(),
+            locator: self.locator.as_ref(),
+            created_at: &self.created_at,
+            updated_at: &self.updated_at,
+        }
     }
 }
 
-fn is_commit_graph_fact(schema_key: &str) -> bool {
-    schema_key == "lix_commit"
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RebuildInput {
+    pub(crate) commit_id: String,
+    pub(crate) parent_commit_id: Option<String>,
+    pub(crate) deltas: Vec<RebuildDelta>,
+}
+
+struct LocatedChange {
+    locator: ChangeLocator,
+    change: Change,
+}
+
+/// Explicit offline projection rebuild over commit_store.
+///
+/// Normal transaction commits must use `TrackedStateWriter::stage_delta` with
+/// already prepared commit_store refs. This rebuild path exists for repair and
+/// projection hydration only.
+pub(crate) async fn rebuild_at_commit<S>(
+    tracked_state: &TrackedStateContext,
+    store: &mut S,
+    writes: &mut StorageWriteSet,
+    commit_store: &CommitStoreContext,
+    commit_id: &str,
+) -> Result<TrackedStateWriteReport, LixError>
+where
+    S: StorageReader + ?Sized,
+{
+    let input = build_rebuild_input(store, commit_store, commit_id).await?;
+    let delta_refs = input
+        .deltas
+        .iter()
+        .map(RebuildDelta::as_ref)
+        .collect::<Vec<_>>();
+    tracked_state
+        .writer(store, writes)
+        .stage_delta(
+            &input.commit_id,
+            input.parent_commit_id.as_deref(),
+            delta_refs,
+        )
+        .await
+}
+
+async fn build_rebuild_input<S>(
+    store: &mut S,
+    commit_store: &CommitStoreContext,
+    commit_id: &str,
+) -> Result<RebuildInput, LixError>
+where
+    S: StorageReader + ?Sized,
+{
+    let lineage = load_first_parent_lineage(store, commit_store, commit_id).await?;
+    let mut located_changes = Vec::new();
+    for commit in lineage {
+        located_changes
+            .append(&mut load_commit_located_changes(store, commit_store, &commit).await?);
+    }
+    let deltas = project_rebuild_deltas(located_changes);
+
+    Ok(RebuildInput {
+        commit_id: commit_id.to_string(),
+        parent_commit_id: None,
+        deltas,
+    })
+}
+
+async fn load_first_parent_lineage<S>(
+    store: &mut S,
+    commit_store: &CommitStoreContext,
+    commit_id: &str,
+) -> Result<Vec<Commit>, LixError>
+where
+    S: StorageReader + ?Sized,
+{
+    let mut lineage = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut current = Some(commit_id.to_string());
+    while let Some(current_id) = current {
+        if !seen.insert(current_id.clone()) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("tracked_state rebuild found first-parent cycle at commit '{current_id}'"),
+            ));
+        }
+        let commit = commit_store
+            .load_commit_from(store, &current_id)
+            .await?
+            .ok_or_else(|| missing_commit_error(&current_id))?;
+        current = commit.parent_ids.first().cloned();
+        lineage.push(commit);
+    }
+    lineage.reverse();
+    Ok(lineage)
+}
+
+async fn load_commit_located_changes<S>(
+    store: &mut S,
+    commit_store: &CommitStoreContext,
+    commit: &Commit,
+) -> Result<Vec<LocatedChange>, LixError>
+where
+    S: StorageReader + ?Sized,
+{
+    let mut located_changes = Vec::new();
+    for pack_id in 0..commit.change_pack_count {
+        let changes = commit_store
+            .load_change_pack_from(store, &commit.id, pack_id)
+            .await?
+            .ok_or_else(|| missing_pack_error("change", &commit.id, pack_id))?;
+        for (source_ordinal, change) in changes.into_iter().enumerate() {
+            let locator = ChangeLocator {
+                source_commit_id: commit.id.clone(),
+                source_pack_id: pack_id,
+                source_ordinal: u32::try_from(source_ordinal).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state rebuild change pack ordinal exceeds u32",
+                    )
+                })?,
+                change_id: change.id.clone(),
+            };
+            located_changes.push(LocatedChange { locator, change });
+        }
+    }
+
+    let mut adopted_locators = Vec::new();
+    for pack_id in 0..commit.membership_pack_count {
+        let mut locators = commit_store
+            .load_membership_pack_from(store, &commit.id, pack_id)
+            .await?
+            .ok_or_else(|| missing_pack_error("membership", &commit.id, pack_id))?;
+        adopted_locators.append(&mut locators);
+    }
+    let adopted_changes = load_changes_by_locators(store, commit_store, &adopted_locators).await?;
+    located_changes.extend(
+        adopted_locators
+            .into_iter()
+            .zip(adopted_changes)
+            .map(|(locator, change)| LocatedChange { locator, change }),
+    );
+    Ok(located_changes)
+}
+
+fn project_rebuild_deltas(changes: impl IntoIterator<Item = LocatedChange>) -> Vec<RebuildDelta> {
+    let mut projected = BTreeMap::<TrackedStateKey, RebuildDelta>::new();
+    for LocatedChange { locator, change } in changes {
+        let key = TrackedStateKey {
+            schema_key: change.schema_key.clone(),
+            file_id: change.file_id.clone(),
+            entity_id: change.entity_id.clone(),
+        };
+        let created_at = projected
+            .get(&key)
+            .map(|delta| delta.created_at.clone())
+            .unwrap_or_else(|| change.created_at.clone());
+        let updated_at = change.created_at.clone();
+        projected.insert(
+            key,
+            RebuildDelta {
+                change,
+                locator,
+                created_at,
+                updated_at,
+            },
+        );
+    }
+    projected.into_values().collect()
+}
+
+async fn load_changes_by_locators(
+    store: &mut (impl StorageReader + ?Sized),
+    commit_store: &CommitStoreContext,
+    locators: &[ChangeLocator],
+) -> Result<Vec<Change>, LixError> {
+    let mut packs = BTreeMap::<(String, u32), Vec<Change>>::new();
+    for locator in locators {
+        let key = (locator.source_commit_id.clone(), locator.source_pack_id);
+        if packs.contains_key(&key) {
+            continue;
+        }
+        let changes = commit_store
+            .load_change_pack_from(store, &locator.source_commit_id, locator.source_pack_id)
+            .await?
+            .ok_or_else(|| {
+                missing_pack_error("change", &locator.source_commit_id, locator.source_pack_id)
+            })?;
+        packs.insert(key, changes);
+    }
+
+    locators
+        .iter()
+        .map(|locator| change_from_loaded_packs(&packs, locator))
+        .collect()
+}
+
+fn change_from_loaded_packs(
+    packs: &BTreeMap<(String, u32), Vec<Change>>,
+    locator: &ChangeLocator,
+) -> Result<Change, LixError> {
+    let key = (locator.source_commit_id.clone(), locator.source_pack_id);
+    let changes = packs.get(&key).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state rebuild lost loaded change pack ({}, {})",
+                locator.source_commit_id, locator.source_pack_id
+            ),
+        )
+    })?;
+    let change = changes
+        .get(usize::try_from(locator.source_ordinal).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state rebuild locator ordinal does not fit usize",
+            )
+        })?)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state rebuild locator for '{}' points past pack ({}, {})",
+                    locator.change_id, locator.source_commit_id, locator.source_pack_id
+                ),
+            )
+        })?;
+    if change.id != locator.change_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state rebuild locator expected '{}' but found '{}'",
+                locator.change_id, change.id
+            ),
+        ));
+    }
+    Ok(change.clone())
+}
+
+fn missing_pack_error(label: &str, commit_id: &str, pack_id: u32) -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        format!("tracked_state rebuild missing {label} pack ({commit_id}, {pack_id})"),
+    )
+}
+
+fn missing_commit_error(commit_id: &str) -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        format!("tracked_state rebuild missing commit '{commit_id}'"),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::Arc;
-
-    use crate::backend::testing::UnitTestBackend;
-    use crate::commit_graph::CommitGraphContext;
-    use crate::commit_store::{Change, ChangeRef, CommitDraftRef, CommitStoreContext};
-    use crate::json_store::JsonStoreContext;
-    use crate::storage::{StorageContext, StorageWriteSet};
-    use crate::tracked_state::{
-        MaterializedTrackedStateRow, TrackedStateFilter, TrackedStateScanRequest,
-    };
+    use crate::commit_store::ChangeLocator;
+    use crate::entity_identity::EntityIdentity;
 
     #[test]
-    fn rows_from_entities_converts_normal_entity() {
-        let rows = rows_from_entities(vec![entity("change-1", Some("{}"))]);
+    fn rebuild_delta_ref_borrows_owned_rebuild_facts() {
+        let delta = RebuildDelta {
+            change: Change {
+                id: "change-1".to_string(),
+                entity_id: EntityIdentity::single("entity-1"),
+                schema_key: "schema".to_string(),
+                file_id: Some("file".to_string()),
+                snapshot_ref: None,
+                metadata_ref: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+            locator: ChangeLocator {
+                source_commit_id: "commit-1".to_string(),
+                source_pack_id: 7,
+                source_ordinal: 11,
+                change_id: "change-1".to_string(),
+            },
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-02-01T00:00:00Z".to_string(),
+        };
 
-        assert_eq!(rows.len(), 1);
-        let row = &rows[0];
-        assert_eq!(
-            row.entity_id,
-            crate::entity_identity::EntityIdentity::single("entity-1")
+        let delta_ref = delta.as_ref();
+
+        assert_eq!(delta_ref.change.id, "change-1");
+        assert_eq!(delta_ref.change.schema_key, "schema");
+        assert_eq!(delta_ref.change.file_id, Some("file"));
+        assert_eq!(delta_ref.locator.source_commit_id, "commit-1");
+        assert_eq!(delta_ref.locator.source_pack_id, 7);
+        assert_eq!(delta_ref.locator.source_ordinal, 11);
+        assert_eq!(delta_ref.created_at, "2026-01-01T00:00:00Z");
+        assert_eq!(delta_ref.updated_at, "2026-02-01T00:00:00Z");
+    }
+
+    #[test]
+    fn change_from_loaded_packs_resolves_locator_by_pack_and_ordinal() {
+        let mut packs = BTreeMap::new();
+        packs.insert(
+            ("source-commit".to_string(), 3),
+            vec![change("change-0"), change("change-1"), change("change-2")],
         );
-        assert_eq!(row.schema_key, "test_schema");
-        assert_eq!(row.file_id.as_deref(), Some("file-1"));
-        assert!(row.snapshot_ref.is_some());
-        assert!(row.metadata_ref.is_some());
-        assert_eq!(row.change_id, "change-1");
-        assert_eq!(row.commit_id, "commit-1");
+        let locator = ChangeLocator {
+            source_commit_id: "source-commit".to_string(),
+            source_pack_id: 3,
+            source_ordinal: 1,
+            change_id: "change-1".to_string(),
+        };
+
+        let resolved = change_from_loaded_packs(&packs, &locator).expect("locator should resolve");
+
+        assert_eq!(resolved.id, "change-1");
     }
 
     #[test]
-    fn rows_from_entities_preserves_tombstones() {
-        let rows = rows_from_entities(vec![entity("change-1", None)]);
+    fn change_from_loaded_packs_rejects_locator_change_id_mismatch() {
+        let mut packs = BTreeMap::new();
+        packs.insert(("source-commit".to_string(), 3), vec![change("actual")]);
+        let locator = ChangeLocator {
+            source_commit_id: "source-commit".to_string(),
+            source_pack_id: 3,
+            source_ordinal: 0,
+            change_id: "expected".to_string(),
+        };
 
-        assert_eq!(rows[0].snapshot_ref, None);
+        let error =
+            change_from_loaded_packs(&packs, &locator).expect_err("mismatched locator should fail");
+
+        assert!(error.message.contains("expected"));
+        assert!(error.message.contains("actual"));
     }
 
     #[test]
-    fn rows_from_entities_uses_commit_graph_timestamps() {
-        let rows = rows_from_entities(vec![entity("change-1", Some("{}"))]);
+    fn project_rebuild_deltas_keeps_first_seen_created_at_and_latest_updated_at() {
+        let deltas = project_rebuild_deltas(vec![
+            located_change(
+                "commit-1",
+                0,
+                "change-create",
+                "entity-1",
+                "2026-01-01T00:00:00Z",
+            ),
+            located_change(
+                "commit-2",
+                0,
+                "change-update",
+                "entity-1",
+                "2026-02-01T00:00:00Z",
+            ),
+        ]);
 
-        assert_eq!(rows[0].created_at, "2026-01-01T00:00:00Z");
-        assert_eq!(rows[0].updated_at, "2026-01-02T00:00:00Z");
+        assert_eq!(deltas.len(), 1);
+        let delta = &deltas[0];
+        assert_eq!(delta.change.id, "change-update");
+        assert_eq!(delta.locator.source_commit_id, "commit-2");
+        assert_eq!(delta.created_at, "2026-01-01T00:00:00Z");
+        assert_eq!(delta.updated_at, "2026-02-01T00:00:00Z");
     }
 
     #[test]
-    fn rows_from_entities_is_root_local_and_version_independent() {
-        let rows = rows_from_entities(vec![entity("change-1", Some("{}"))]);
+    fn project_rebuild_deltas_uses_adopted_change_time_not_target_commit_time() {
+        let deltas = project_rebuild_deltas(vec![located_change(
+            "source-commit",
+            0,
+            "adopted-change",
+            "entity-1",
+            "2026-01-01T00:00:00Z",
+        )]);
 
-        assert_eq!(
-            rows[0].entity_id,
-            crate::entity_identity::EntityIdentity::single("entity-1")
-        );
-        assert_eq!(rows[0].schema_key, "test_schema");
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].created_at, "2026-01-01T00:00:00Z");
+        assert_eq!(deltas[0].updated_at, "2026-01-01T00:00:00Z");
     }
 
     #[test]
-    fn rows_from_entities_excludes_commit_graph_facts() {
-        let rows = rows_from_entities(vec![commit_entity("commit-1")]);
+    fn project_rebuild_deltas_tracks_entities_independently() {
+        let deltas = project_rebuild_deltas(vec![
+            located_change(
+                "commit-1",
+                0,
+                "entity-a-create",
+                "entity-a",
+                "2026-01-01T00:00:00Z",
+            ),
+            located_change(
+                "commit-1",
+                1,
+                "entity-b-create",
+                "entity-b",
+                "2026-01-02T00:00:00Z",
+            ),
+            located_change(
+                "commit-2",
+                0,
+                "entity-a-update",
+                "entity-a",
+                "2026-02-01T00:00:00Z",
+            ),
+        ]);
 
-        assert_eq!(rows.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn rebuild_state_at_commit_writes_rows_from_commit_graph() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
-        let tracked_state = TrackedStateContext::new();
-        let commit_graph = CommitGraphContext::new();
-        append_changes(
-            storage.clone(),
-            &[
-                entity_change("change-1", "entity-1", "test_schema", Some("{}")),
-                commit_change("commit-1-change", "commit-1", &["change-1"], &[]),
-            ],
-        )
-        .await;
-
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
-        let report = rebuild_state_at_commit(
-            &tracked_state,
-            &commit_graph,
-            storage.clone(),
-            tx.as_mut(),
-            &mut writes,
-            "commit-1",
-        )
-        .await
-        .expect("rebuild should succeed");
-        writes
-            .apply(&mut tx.as_mut())
-            .await
-            .expect("rebuild writes should apply");
-        tx.commit().await.expect("transaction should commit");
-
-        assert_eq!(report, TrackedStateRebuildReport { written_rows: 1 });
-        let rows = scan_rows_at_commit(&tracked_state, storage.clone(), "commit-1").await;
-        assert_eq!(rows.len(), 1);
-        assert!(rows.iter().any(|row| row.schema_key == "test_schema"
-            && row.entity_id == crate::entity_identity::EntityIdentity::single("entity-1")));
-    }
-
-    #[tokio::test]
-    async fn rebuild_state_at_commit_writes_replacement_root_for_head_commit() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
-        let tracked_state = TrackedStateContext::new();
-        let commit_graph = CommitGraphContext::new();
-        append_changes(
-            storage.clone(),
-            &[
-                entity_change("change-new", "entity-new", "test_schema", Some("{}")),
-                commit_change("commit-1-change", "commit-1", &["change-new"], &[]),
-            ],
-        )
-        .await;
-        seed_tracked_root(
-            &tracked_state,
-            storage.clone(),
-            "stale-commit",
-            &[stale_row("version-b", "stale-other")],
-        )
-        .await;
-
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
-        let report = rebuild_state_at_commit(
-            &tracked_state,
-            &commit_graph,
-            storage.clone(),
-            tx.as_mut(),
-            &mut writes,
-            "commit-1",
-        )
-        .await
-        .expect("rebuild should succeed");
-        writes
-            .apply(&mut tx.as_mut())
-            .await
-            .expect("rebuild writes should apply");
-        tx.commit().await.expect("transaction should commit");
-
-        assert_eq!(report.written_rows, 1);
-
-        let version_a_rows = scan_rows_at_commit(&tracked_state, storage.clone(), "commit-1").await;
-        assert!(!version_a_rows
+        let entity_a = deltas
             .iter()
-            .any(|row| row.entity_id
-                == crate::entity_identity::EntityIdentity::single("stale-target")));
-        assert!(version_a_rows.iter().any(
-            |row| row.entity_id == crate::entity_identity::EntityIdentity::single("entity-new")
-        ));
-
-        let version_b_rows =
-            scan_rows_at_commit(&tracked_state, storage.clone(), "stale-commit").await;
-        assert_eq!(version_b_rows.len(), 1);
-        assert_eq!(
-            version_b_rows[0].entity_id,
-            crate::entity_identity::EntityIdentity::single("stale-other")
-        );
-    }
-
-    #[tokio::test]
-    async fn rebuild_state_at_commit_is_content_address_deterministic() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
-        let tracked_state = TrackedStateContext::new();
-        let commit_graph = CommitGraphContext::new();
-        append_changes(
-            storage.clone(),
-            &[
-                entity_change("change-1", "entity-1", "test_schema", Some("{\"v\":1}")),
-                entity_change("change-2", "entity-2", "test_schema", Some("{\"v\":2}")),
-                commit_change(
-                    "commit-1-change",
-                    "commit-1",
-                    &["change-1", "change-2"],
-                    &[],
-                ),
-            ],
-        )
-        .await;
-
-        rebuild_state_at_commit_for_test(
-            &tracked_state,
-            &commit_graph,
-            storage.clone(),
-            "commit-1",
-        )
-        .await;
-        let first_root = load_root(&tracked_state, storage.clone(), "commit-1").await;
-        delete_root(&tracked_state, storage.clone(), "commit-1").await;
-        rebuild_state_at_commit_for_test(
-            &tracked_state,
-            &commit_graph,
-            storage.clone(),
-            "commit-1",
-        )
-        .await;
-        let second_root = load_root(&tracked_state, storage.clone(), "commit-1").await;
-
-        assert_eq!(
-            first_root, second_root,
-            "rebuilding the same changelog head should produce the same prolly root"
-        );
-    }
-
-    #[tokio::test]
-    async fn rebuild_state_at_commit_uses_latest_change_across_commits() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
-        let tracked_state = TrackedStateContext::new();
-        let commit_graph = CommitGraphContext::new();
-        append_changes(
-            storage.clone(),
-            &[
-                entity_change_at(
-                    "change-old",
-                    "entity-1",
-                    "test_schema",
-                    Some("{\"value\":\"old\"}"),
-                    "2026-01-01T00:00:00Z",
-                ),
-                entity_change_at(
-                    "change-new",
-                    "entity-1",
-                    "test_schema",
-                    Some("{\"value\":\"new\"}"),
-                    "2026-01-02T00:00:00Z",
-                ),
-                commit_change("commit-root-change", "commit-root", &["change-old"], &[]),
-                commit_change(
-                    "commit-head-change",
-                    "commit-head",
-                    &["change-new"],
-                    &["commit-root"],
-                ),
-            ],
-        )
-        .await;
-
-        rebuild_state_at_commit_for_test(
-            &tracked_state,
-            &commit_graph,
-            storage.clone(),
-            "commit-head",
-        )
-        .await;
-
-        let rows = scan_rows_at_commit(&tracked_state, storage.clone(), "commit-head").await;
-        let row = rows
+            .find(|delta| delta.change.entity_id == EntityIdentity::single("entity-a"))
+            .expect("entity-a delta");
+        let entity_b = deltas
             .iter()
-            .find(|row| {
-                row.schema_key == "test_schema"
-                    && row.entity_id == crate::entity_identity::EntityIdentity::single("entity-1")
-            })
-            .expect("rebuilt entity row should exist");
-        assert_eq!(row.snapshot_content.as_deref(), Some("{\"value\":\"new\"}"));
-        assert_eq!(row.change_id, "change-new");
-        assert_eq!(row.commit_id, "commit-head");
-        assert_eq!(row.created_at, "2026-01-01T00:00:00Z");
-        assert_eq!(row.updated_at, "2026-01-02T00:00:00Z");
+            .find(|delta| delta.change.entity_id == EntityIdentity::single("entity-b"))
+            .expect("entity-b delta");
+        assert_eq!(entity_a.change.id, "entity-a-update");
+        assert_eq!(entity_a.created_at, "2026-01-01T00:00:00Z");
+        assert_eq!(entity_a.updated_at, "2026-02-01T00:00:00Z");
+        assert_eq!(entity_b.change.id, "entity-b-create");
+        assert_eq!(entity_b.created_at, "2026-01-02T00:00:00Z");
+        assert_eq!(entity_b.updated_at, "2026-01-02T00:00:00Z");
     }
 
-    #[tokio::test]
-    async fn rebuild_state_at_commit_preserves_tombstone_winner() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
-        let tracked_state = TrackedStateContext::new();
-        let commit_graph = CommitGraphContext::new();
-        append_changes(
-            storage.clone(),
-            &[
-                entity_change_at(
-                    "change-created",
-                    "entity-1",
-                    "test_schema",
-                    Some("{\"value\":\"created\"}"),
-                    "2026-01-01T00:00:00Z",
-                ),
-                entity_change_at(
-                    "change-deleted",
-                    "entity-1",
-                    "test_schema",
-                    None,
-                    "2026-01-02T00:00:00Z",
-                ),
-                commit_change(
-                    "commit-root-change",
-                    "commit-root",
-                    &["change-created"],
-                    &[],
-                ),
-                commit_change(
-                    "commit-head-change",
-                    "commit-head",
-                    &["change-deleted"],
-                    &["commit-root"],
-                ),
-            ],
-        )
-        .await;
-
-        rebuild_state_at_commit_for_test(
-            &tracked_state,
-            &commit_graph,
-            storage.clone(),
-            "commit-head",
-        )
-        .await;
-
-        let rows = scan_rows_at_commit(&tracked_state, storage.clone(), "commit-head").await;
-        let row = rows
-            .iter()
-            .find(|row| {
-                row.schema_key == "test_schema"
-                    && row.entity_id == crate::entity_identity::EntityIdentity::single("entity-1")
-            })
-            .expect("rebuilt tombstone row should exist");
-        assert_eq!(row.snapshot_content, None);
-        assert_eq!(row.change_id, "change-deleted");
-        assert_eq!(row.commit_id, "commit-head");
+    fn change(id: &str) -> Change {
+        Change {
+            id: id.to_string(),
+            entity_id: EntityIdentity::single("entity-1"),
+            schema_key: "schema".to_string(),
+            file_id: Some("file".to_string()),
+            snapshot_ref: None,
+            metadata_ref: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        }
     }
 
-    #[tokio::test]
-    async fn rebuild_state_at_commit_can_rebuild_global_commit_state() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
-        let tracked_state = TrackedStateContext::new();
-        let commit_graph = CommitGraphContext::new();
-        append_changes(
-            storage.clone(),
-            &[
-                entity_change("change-1", "entity-1", "test_schema", Some("{}")),
-                commit_change("commit-1-change", "commit-1", &["change-1"], &[]),
-            ],
-        )
-        .await;
-
-        rebuild_state_at_commit_for_test(
-            &tracked_state,
-            &commit_graph,
-            storage.clone(),
-            "commit-1",
-        )
-        .await;
-
-        let rows = scan_rows_at_commit(&tracked_state, storage.clone(), "commit-1").await;
-        assert!(!rows.is_empty());
-        assert!(rows.iter().any(|row| row.schema_key == "test_schema"
-            && row.entity_id == crate::entity_identity::EntityIdentity::single("entity-1")));
-    }
-
-    #[tokio::test]
-    async fn rebuilding_one_commit_state_does_not_rewrite_another_commit_root() {
-        let backend = Arc::new(UnitTestBackend::new());
-        let storage = StorageContext::new(backend.clone());
-        let tracked_state = TrackedStateContext::new();
-        let commit_graph = CommitGraphContext::new();
-        append_changes(
-            storage.clone(),
-            &[
-                entity_change("change-global", "entity-global", "test_schema", Some("{}")),
-                entity_change("change-main", "entity-main", "test_schema", Some("{}")),
-                commit_change(
-                    "commit-global-change",
-                    "commit-global",
-                    &["change-global"],
-                    &[],
-                ),
-                commit_change("commit-main-change", "commit-main", &["change-main"], &[]),
-            ],
-        )
-        .await;
-
-        rebuild_state_at_commit_for_test(
-            &tracked_state,
-            &commit_graph,
-            storage.clone(),
-            "commit-global",
-        )
-        .await;
-        let global_root_before = load_root(&tracked_state, storage.clone(), "commit-global").await;
-
-        rebuild_state_at_commit_for_test(
-            &tracked_state,
-            &commit_graph,
-            storage.clone(),
-            "commit-main",
-        )
-        .await;
-        let global_root_after = load_root(&tracked_state, storage.clone(), "commit-global").await;
-
-        assert_eq!(
-            global_root_after, global_root_before,
-            "rebuilding one commit state must not rewrite another commit root"
-        );
-        let main_rows = scan_rows_at_commit(&tracked_state, storage.clone(), "commit-main").await;
-        assert_eq!(main_rows.len(), 1);
-        assert_eq!(
-            main_rows[0].entity_id,
-            crate::entity_identity::EntityIdentity::single("entity-main")
-        );
-    }
-
-    fn entity(change_id: &str, snapshot_content: Option<&str>) -> CommitGraphEntity {
-        CommitGraphEntity {
+    fn located_change(
+        commit_id: &str,
+        source_ordinal: u32,
+        change_id: &str,
+        entity_id: &str,
+        created_at: &str,
+    ) -> LocatedChange {
+        LocatedChange {
+            locator: ChangeLocator {
+                source_commit_id: commit_id.to_string(),
+                source_pack_id: 0,
+                source_ordinal,
+                change_id: change_id.to_string(),
+            },
             change: Change {
                 id: change_id.to_string(),
-                entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
-                schema_key: "test_schema".to_string(),
-                file_id: Some("file-1".to_string()),
-                snapshot_ref: snapshot_content.map(|content| {
-                    crate::json_store::JsonRef::from_hash(blake3::hash(content.as_bytes()))
-                }),
-                metadata_ref: Some(crate::json_store::JsonRef::from_hash(blake3::hash(
-                    br#"{"m":1}"#,
-                ))),
-                created_at: "ignored-change-created-at".to_string(),
+                entity_id: EntityIdentity::single(entity_id),
+                schema_key: "schema".to_string(),
+                file_id: Some("file".to_string()),
+                snapshot_ref: None,
+                metadata_ref: None,
+                created_at: created_at.to_string(),
             },
-            source_commit_id: "commit-1".to_string(),
-            depth: 0,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-02T00:00:00Z".to_string(),
-        }
-    }
-
-    fn commit_entity(commit_id: &str) -> CommitGraphEntity {
-        let fixture = commit_change(
-            &format!("{commit_id}-change"),
-            commit_id,
-            &["change-1"],
-            &[],
-        );
-        CommitGraphEntity {
-            change: fixture.change,
-            source_commit_id: commit_id.to_string(),
-            depth: 0,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-        }
-    }
-
-    #[derive(Clone)]
-    struct TestChange {
-        change: Change,
-        snapshot_content: Option<String>,
-        commit_change_ids: Vec<String>,
-        parent_commit_ids: Vec<String>,
-    }
-
-    impl TestChange {
-        fn commit(
-            change_id: &str,
-            commit_id: &str,
-            change_ids: &[&str],
-            parent_commit_ids: &[&str],
-        ) -> Self {
-            Self {
-                change: Change {
-                    id: change_id.to_string(),
-                    entity_id: crate::entity_identity::EntityIdentity::single(commit_id),
-                    schema_key: "lix_commit".to_string(),
-                    file_id: None,
-                    snapshot_ref: None,
-                    metadata_ref: None,
-                    created_at: "2026-01-02T00:00:00Z".to_string(),
-                },
-                snapshot_content: None,
-                commit_change_ids: change_ids.iter().map(|id| id.to_string()).collect(),
-                parent_commit_ids: parent_commit_ids.iter().map(|id| id.to_string()).collect(),
-            }
-        }
-
-        fn entity(
-            change_id: &str,
-            entity_id: &str,
-            schema_key: &str,
-            snapshot_content: Option<&str>,
-            created_at: &str,
-        ) -> Self {
-            Self {
-                change: Change {
-                    id: change_id.to_string(),
-                    entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
-                    schema_key: schema_key.to_string(),
-                    file_id: None,
-                    snapshot_ref: None,
-                    metadata_ref: None,
-                    created_at: created_at.to_string(),
-                },
-                snapshot_content: snapshot_content.map(str::to_string),
-                commit_change_ids: Vec::new(),
-                parent_commit_ids: Vec::new(),
-            }
-        }
-
-        fn is_commit(&self) -> bool {
-            self.change.schema_key == "lix_commit"
-        }
-    }
-
-    async fn append_changes(storage: StorageContext, changes: &[TestChange]) {
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer();
-        let canonical_changes = changes
-            .iter()
-            .filter(|change| !change.is_commit())
-            .map(|change| {
-                let mut canonical = change.change.clone();
-                if let Some(snapshot_content) = change.snapshot_content.as_deref() {
-                    canonical.snapshot_ref = Some(
-                        json_writer
-                            .prepare_json(crate::json_store::NormalizedJson::from_arc_unchecked(
-                                Arc::from(snapshot_content),
-                            ))
-                            .expect("fixture JSON should stage"),
-                    );
-                }
-                canonical
-            })
-            .collect::<Vec<_>>();
-        json_writer.flush_into(&mut writes);
-        let changes_by_id = canonical_changes
-            .iter()
-            .map(|change| (change.id.as_str(), change))
-            .collect::<BTreeMap<_, _>>();
-        let mut authored_change_ids = BTreeSet::new();
-        let commit_store = CommitStoreContext::new();
-        for change in changes.iter().filter(|change| change.is_commit()) {
-            let commit_id = change
-                .change
-                .entity_id
-                .as_single_string()
-                .expect("commit fixture should have id")
-                .to_string();
-            let author_account_ids = Vec::new();
-            let commit = CommitDraftRef {
-                id: &commit_id,
-                change_id: &change.change.id,
-                parent_ids: &change.parent_commit_ids,
-                author_account_ids: &author_account_ids,
-                created_at: &change.change.created_at,
-            };
-            let mut authored_changes = Vec::new();
-            let mut adopted_changes = Vec::new();
-            for change_id in change.commit_change_ids.iter().cloned() {
-                let change = changes_by_id
-                    .get(change_id.as_str())
-                    .expect("commit fixture member change should exist");
-                if authored_change_ids.insert(change_id) {
-                    authored_changes.push(change_ref_from_canonical(change.as_ref()));
-                } else {
-                    adopted_changes.push(change_ref_from_canonical(change.as_ref()));
-                }
-            }
-            commit_store
-                .writer(tx.as_mut(), &mut writes)
-                .stage_commit_draft(commit, authored_changes, adopted_changes)
-                .await
-                .expect("commit-store fixture should append");
-        }
-        writes
-            .apply(&mut tx.as_mut())
-            .await
-            .expect("writes should apply");
-        tx.commit().await.expect("transaction should commit");
-    }
-
-    fn change_ref_from_canonical<'a>(change: ChangeRef<'a>) -> ChangeRef<'a> {
-        ChangeRef {
-            id: change.id,
-            entity_id: change.entity_id,
-            schema_key: change.schema_key,
-            file_id: change.file_id,
-            snapshot_ref: change.snapshot_ref,
-            metadata_ref: change.metadata_ref,
-            created_at: change.created_at,
-        }
-    }
-
-    async fn seed_tracked_root(
-        tracked_state: &TrackedStateContext,
-        storage: StorageContext,
-        commit_id: &str,
-        rows: &[MaterializedTrackedStateRow],
-    ) {
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
-        {
-            let mut json_writer = JsonStoreContext::new().writer();
-            let canonical_rows = rows
-                .iter()
-                .map(|row| {
-                    crate::test_support::tracked_state_row_from_materialized(
-                        &mut writes,
-                        &mut json_writer,
-                        row,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .expect("rows should canonicalize");
-            tracked_state
-                .writer()
-                .stage_root(
-                    &mut tx.as_mut(),
-                    &mut writes,
-                    commit_id,
-                    None,
-                    canonical_rows.iter().map(|row| row.as_ref()),
-                )
-                .await
-                .expect("rows should seed");
-        }
-        writes
-            .apply(&mut tx.as_mut())
-            .await
-            .expect("rows should apply");
-        tx.commit().await.expect("transaction should commit");
-    }
-
-    async fn rebuild_state_at_commit_for_test(
-        tracked_state: &TrackedStateContext,
-        commit_graph: &CommitGraphContext,
-        storage: StorageContext,
-        head_commit_id: &str,
-    ) -> TrackedStateRebuildReport {
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
-        let report = rebuild_state_at_commit(
-            tracked_state,
-            commit_graph,
-            storage.clone(),
-            tx.as_mut(),
-            &mut writes,
-            head_commit_id,
-        )
-        .await
-        .expect("rebuild should succeed");
-        writes
-            .apply(&mut tx.as_mut())
-            .await
-            .expect("rebuild writes should apply");
-        tx.commit().await.expect("transaction should commit");
-        report
-    }
-
-    async fn scan_rows_at_commit(
-        tracked_state: &TrackedStateContext,
-        storage: StorageContext,
-        commit_id: &str,
-    ) -> Vec<MaterializedTrackedStateRow> {
-        tracked_state
-            .reader(storage)
-            .scan_rows_at_commit(
-                commit_id,
-                &TrackedStateScanRequest {
-                    filter: TrackedStateFilter {
-                        include_tombstones: true,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect("tracked rows should scan")
-    }
-
-    async fn load_root(
-        tracked_state: &TrackedStateContext,
-        storage: StorageContext,
-        commit_id: &str,
-    ) -> crate::tracked_state::tree_types::TrackedStateRootId {
-        let mut reader = tracked_state.reader(storage);
-        reader
-            .load_root_for_test(commit_id)
-            .await
-            .expect("root load should succeed")
-            .expect("root should exist")
-    }
-
-    async fn delete_root(
-        tracked_state: &TrackedStateContext,
-        storage: StorageContext,
-        commit_id: &str,
-    ) {
-        let mut tx = storage
-            .begin_write_transaction()
-            .await
-            .expect("transaction should open");
-        let mut writes = StorageWriteSet::new();
-        tracked_state
-            .writer()
-            .stage_delete_root_for_rebuild(&mut writes, commit_id);
-        writes
-            .apply(&mut tx.as_mut())
-            .await
-            .expect("root delete should apply");
-        tx.commit().await.expect("transaction should commit");
-    }
-
-    fn entity_change(
-        change_id: &str,
-        entity_id: &str,
-        schema_key: &str,
-        snapshot_content: Option<&str>,
-    ) -> TestChange {
-        entity_change_at(
-            change_id,
-            entity_id,
-            schema_key,
-            snapshot_content,
-            "2026-01-01T00:00:00Z",
-        )
-    }
-
-    fn entity_change_at(
-        change_id: &str,
-        entity_id: &str,
-        schema_key: &str,
-        snapshot_content: Option<&str>,
-        created_at: &str,
-    ) -> TestChange {
-        TestChange::entity(
-            change_id,
-            entity_id,
-            schema_key,
-            snapshot_content,
-            created_at,
-        )
-    }
-
-    fn commit_change(
-        change_id: &str,
-        commit_id: &str,
-        change_ids: &[&str],
-        parent_commit_ids: &[&str],
-    ) -> TestChange {
-        TestChange::commit(change_id, commit_id, change_ids, parent_commit_ids)
-    }
-
-    fn stale_row(version_id: &str, entity_id: &str) -> MaterializedTrackedStateRow {
-        MaterializedTrackedStateRow {
-            entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
-            schema_key: "test_schema".to_string(),
-            file_id: None,
-            snapshot_content: Some("{}".to_string()),
-            metadata: None,
-            deleted: false,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-            change_id: format!("change-{entity_id}"),
-            commit_id: format!("commit-{version_id}"),
         }
     }
 }

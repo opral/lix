@@ -212,12 +212,13 @@ where
                         continue;
                     };
                     let store: &mut dyn StorageReader = &mut *store;
-                    if let Some(row) = self
+                    let tracked_request = tracked_row_request_from_live(request);
+                    let mut rows = self
                         .tracked_state
                         .reader(store)
-                        .load_row_at_commit(&commit_id, &tracked_row_request_from_live(request))
-                        .await?
-                    {
+                        .load_rows_at_commit(&commit_id, &[tracked_request])
+                        .await?;
+                    if let Some(row) = rows.pop().flatten() {
                         return Ok(Some(project_tracked_row(
                             row,
                             &request.version_id,
@@ -625,11 +626,12 @@ mod tests {
 
     use super::*;
     use crate::backend::{testing::UnitTestBackend, Backend};
+    use crate::commit_store::{CommitDraftRef, CommitStoreContext};
     use crate::entity_identity::EntityIdentity;
     use crate::json_store::JsonStoreContext;
     use crate::live_state::LiveStateFilter;
     use crate::storage::{StorageContext, StorageWriteSet, StorageWriteTransaction};
-    use crate::tracked_state::TrackedStateScanRequest;
+    use crate::tracked_state::{TrackedStateDeltaRef, TrackedStateScanRequest};
     use crate::untracked_state::{MaterializedUntrackedStateRow, UntrackedStateContext};
     use crate::NullableKeyFilter;
     use serde_json::json;
@@ -679,8 +681,10 @@ mod tests {
         rows: &[MaterializedLiveStateRow],
     ) -> Result<(), LixError> {
         let mut untracked_rows = Vec::new();
-        let mut tracked_rows_by_commit =
-            std::collections::BTreeMap::<String, Vec<TestTrackedLiveRow>>::new();
+        let mut tracked_rows_by_commit = std::collections::BTreeMap::<
+            String,
+            Vec<(crate::commit_store::Change, String, String)>,
+        >::new();
         let mut parent_by_commit = std::collections::BTreeMap::<String, Option<String>>::new();
 
         for row in rows {
@@ -695,11 +699,6 @@ mod tests {
                 continue;
             }
             let materialized = MaterializedTrackedStateRow::try_from(row)?;
-            let canonical = crate::test_support::tracked_state_row_from_materialized(
-                writes,
-                json_writer,
-                &materialized,
-            )?;
             let commit_id = row.commit_id.clone().ok_or_else(|| {
                 LixError::new("LIX_ERROR_UNKNOWN", "test tracked row missing commit_id")
             })?;
@@ -709,35 +708,66 @@ mod tests {
                     parent_commit_id_from_test_commit_row(row)?,
                 );
             }
-            tracked_rows_by_commit
-                .entry(commit_id)
-                .or_default()
-                .push(TestTrackedLiveRow { row: canonical });
+            if row.schema_key != COMMIT_SCHEMA_KEY {
+                let change = crate::test_support::tracked_change_from_materialized(
+                    json_writer,
+                    &materialized,
+                )?;
+                tracked_rows_by_commit.entry(commit_id).or_default().push((
+                    change,
+                    materialized.created_at,
+                    materialized.updated_at,
+                ));
+            }
         }
 
+        json_writer.flush_into(writes);
         UntrackedStateContext::new()
             .writer(writes)
             .stage_rows(untracked_rows.iter().map(|row| row.as_ref()))?;
         for (commit_id, rows) in tracked_rows_by_commit {
             let parent_commit_id = parent_by_commit.remove(&commit_id).flatten();
-            TrackedStateContext::new()
-                .writer()
-                .stage_root(
-                    store,
-                    writes,
-                    &commit_id,
-                    parent_commit_id.as_deref(),
-                    rows.iter()
-                        .filter(|row| row.row.schema_key != COMMIT_SCHEMA_KEY)
-                        .map(|row| row.row.as_ref()),
+            let parent_ids = parent_commit_id
+                .as_ref()
+                .map(|parent| vec![parent.clone()])
+                .unwrap_or_default();
+            let commit_change_id = format!("{commit_id}:commit");
+            let commit = CommitDraftRef {
+                id: &commit_id,
+                change_id: &commit_change_id,
+                parent_ids: &parent_ids,
+                author_account_ids: &[],
+                created_at: rows
+                    .first()
+                    .map(|(change, _, _)| change.created_at.as_str())
+                    .unwrap_or("1970-01-01T00:00:00.000Z"),
+            };
+            let staged = CommitStoreContext::new()
+                .writer(&mut *store, writes)
+                .stage_commit_draft(
+                    commit,
+                    rows.iter().map(|(change, _, _)| change.as_ref()).collect(),
+                    Vec::new(),
                 )
+                .await?;
+            let deltas = rows
+                .iter()
+                .zip(&staged.authored_locators)
+                .map(
+                    |((change, created_at, updated_at), locator)| TrackedStateDeltaRef {
+                        change: change.as_ref(),
+                        locator: locator.as_ref(),
+                        created_at,
+                        updated_at,
+                    },
+                )
+                .collect::<Vec<_>>();
+            TrackedStateContext::new()
+                .writer(&mut *store, writes)
+                .stage_delta(&commit_id, parent_commit_id.as_deref(), deltas)
                 .await?;
         }
         Ok(())
-    }
-
-    struct TestTrackedLiveRow {
-        row: crate::tracked_state::TrackedStateRow,
     }
 
     fn parent_commit_id_from_test_commit_row(
@@ -1608,15 +1638,24 @@ mod tests {
             .expect("seed transaction should open");
         let mut writes = StorageWriteSet::new();
         {
-            TrackedStateContext::new()
-                .writer()
-                .stage_root(
-                    &mut seed_transaction.as_mut(),
-                    &mut writes,
-                    "parent-left",
-                    None,
-                    std::iter::empty(),
+            CommitStoreContext::new()
+                .writer(&mut seed_transaction.as_mut(), &mut writes)
+                .stage_commit_draft(
+                    CommitDraftRef {
+                        id: "parent-left",
+                        change_id: "parent-left:commit",
+                        parent_ids: &[],
+                        author_account_ids: &[],
+                        created_at: "1970-01-01T00:00:00.000Z",
+                    },
+                    Vec::new(),
+                    Vec::new(),
                 )
+                .await
+                .expect("first parent commit should stage");
+            TrackedStateContext::new()
+                .writer(&mut seed_transaction.as_mut(), &mut writes)
+                .stage_delta("parent-left", None, std::iter::empty())
                 .await
                 .expect("first parent root should exist");
         }

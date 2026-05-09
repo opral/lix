@@ -37,6 +37,32 @@ impl CommitStoreContext {
             store: Mutex::new(store),
         }
     }
+
+    pub(crate) async fn load_commit_from(
+        &self,
+        store: &mut (impl StorageReader + ?Sized),
+        commit_id: &str,
+    ) -> Result<Option<Commit>, LixError> {
+        crate::commit_store::storage::load_commit(store, commit_id).await
+    }
+
+    pub(crate) async fn load_change_pack_from(
+        &self,
+        store: &mut (impl StorageReader + ?Sized),
+        commit_id: &str,
+        pack_id: u32,
+    ) -> Result<Option<Vec<Change>>, LixError> {
+        crate::commit_store::storage::load_change_pack(store, commit_id, pack_id).await
+    }
+
+    pub(crate) async fn load_membership_pack_from(
+        &self,
+        store: &mut (impl StorageReader + ?Sized),
+        commit_id: &str,
+        pack_id: u32,
+    ) -> Result<Option<Vec<ChangeLocator>>, LixError> {
+        crate::commit_store::storage::load_membership_pack(store, commit_id, pack_id).await
+    }
 }
 
 /// Commit-store reader over a storage snapshot or transaction.

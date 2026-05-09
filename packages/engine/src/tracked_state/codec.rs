@@ -1,15 +1,15 @@
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
+use crate::commit_store::ChangeLocator;
 use crate::entity_identity::EntityIdentity;
-use crate::json_store::JsonRef;
-use crate::tracked_state::tree_types::{
-    TrackedStateKey, TrackedStateKeyRef, TrackedStateValue, TrackedStateValueRef,
+use crate::tracked_state::types::{
+    TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
     TRACKED_STATE_HASH_BYTES,
 };
 use crate::LixError;
 
 const NODE_VERSION: u8 = 1;
-const VALUE_VERSION: u8 = 2;
+const VALUE_VERSION: u8 = 4;
 const NODE_KIND_LEAF: u8 = 1;
 const NODE_KIND_INTERNAL: u8 = 2;
 const WEIBULL_K: i32 = 4;
@@ -170,43 +170,37 @@ pub(crate) fn decode_key(bytes: &[u8]) -> Result<TrackedStateKey, LixError> {
 }
 
 #[cfg(test)]
-pub(crate) fn encode_value(value: &TrackedStateValue) -> Vec<u8> {
-    encode_value_ref(TrackedStateValueRef {
-        snapshot_ref: value.snapshot_ref.as_ref(),
-        metadata_ref: value.metadata_ref.as_ref(),
+pub(crate) fn encode_value(value: &TrackedStateIndexValue) -> Vec<u8> {
+    encode_value_ref(TrackedStateIndexValueRef {
+        change_locator: value.change_locator.as_ref(),
         created_at: &value.created_at,
         updated_at: &value.updated_at,
-        change_id: &value.change_id,
-        commit_id: &value.commit_id,
-        deleted: value.deleted,
     })
 }
 
-pub(crate) fn encode_value_ref(value: TrackedStateValueRef<'_>) -> Vec<u8> {
+pub(crate) fn encode_value_ref(value: TrackedStateIndexValueRef<'_>) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(VALUE_VERSION);
-    push_optional_json_ref(&mut out, value.snapshot_ref);
-    push_optional_json_ref(&mut out, value.metadata_ref);
+    push_sized_bytes(&mut out, value.change_locator.source_commit_id.as_bytes());
+    out.extend_from_slice(&value.change_locator.source_pack_id.to_be_bytes());
+    out.extend_from_slice(&value.change_locator.source_ordinal.to_be_bytes());
+    push_sized_bytes(&mut out, value.change_locator.change_id.as_bytes());
     push_sized_bytes(&mut out, value.created_at.as_bytes());
     push_sized_bytes(&mut out, value.updated_at.as_bytes());
-    push_sized_bytes(&mut out, value.change_id.as_bytes());
-    push_sized_bytes(&mut out, value.commit_id.as_bytes());
-    out.push(u8::from(value.deleted));
     out
 }
 
 #[cfg(test)]
-pub(crate) fn encoded_value_len(value: &TrackedStateValue) -> usize {
-    1 + optional_json_ref_len(value.snapshot_ref.as_ref())
-        + optional_json_ref_len(value.metadata_ref.as_ref())
+pub(crate) fn encoded_value_len(value: &TrackedStateIndexValue) -> usize {
+    1 + sized_bytes_len(value.change_locator.source_commit_id.as_bytes())
+        + 4
+        + 4
+        + sized_bytes_len(value.change_locator.change_id.as_bytes())
         + sized_bytes_len(value.created_at.as_bytes())
         + sized_bytes_len(value.updated_at.as_bytes())
-        + sized_bytes_len(value.change_id.as_bytes())
-        + sized_bytes_len(value.commit_id.as_bytes())
-        + 1
 }
 
-pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateValue, LixError> {
+pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateIndexValue, LixError> {
     let mut cursor = 0usize;
     let version = read_u8(bytes, &mut cursor, "value version")?;
     if version != VALUE_VERSION {
@@ -215,78 +209,45 @@ pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateValue, LixError> 
             format!("unsupported tracked-state tree value version {version}"),
         ));
     }
-    let snapshot_ref = read_optional_json_ref(bytes, &mut cursor, "snapshot_ref")?;
-    let metadata_ref = read_optional_json_ref(bytes, &mut cursor, "metadata_ref")?;
+    let source_commit_id = read_sized_string(bytes, &mut cursor, "source_commit_id")?;
+    let source_pack_id =
+        u32::try_from(read_u32(bytes, &mut cursor, "source_pack_id")?).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked-state source_pack_id exceeds u32",
+            )
+        })?;
+    let source_ordinal =
+        u32::try_from(read_u32(bytes, &mut cursor, "source_ordinal")?).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked-state source_ordinal exceeds u32",
+            )
+        })?;
+    let change_id = read_sized_string(bytes, &mut cursor, "change_id")?;
     let created_at = read_sized_string(bytes, &mut cursor, "created_at")?;
     let updated_at = read_sized_string(bytes, &mut cursor, "updated_at")?;
-    let change_id = read_sized_string(bytes, &mut cursor, "change_id")?;
-    let commit_id = read_sized_string(bytes, &mut cursor, "commit_id")?;
-    let deleted = match read_u8(bytes, &mut cursor, "deleted")? {
-        0 => false,
-        1 => true,
-        other => {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("tracked-state tree value has invalid deleted byte {other}"),
-            ))
-        }
-    };
     if cursor != bytes.len() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             "tracked-state tree value decode found trailing bytes",
         ));
     }
-    Ok(TrackedStateValue {
-        snapshot_ref,
-        metadata_ref,
+    Ok(TrackedStateIndexValue {
+        change_locator: ChangeLocator {
+            source_commit_id,
+            source_pack_id,
+            source_ordinal,
+            change_id,
+        },
         created_at,
         updated_at,
-        change_id,
-        commit_id,
-        deleted,
     })
 }
 
 #[cfg(test)]
 fn sized_bytes_len(bytes: &[u8]) -> usize {
     4 + bytes.len()
-}
-
-fn push_optional_json_ref(out: &mut Vec<u8>, value: Option<&JsonRef>) {
-    match value {
-        Some(value) => {
-            out.push(1);
-            out.extend_from_slice(value.as_hash_bytes());
-        }
-        None => out.push(0),
-    }
-}
-
-#[cfg(test)]
-fn optional_json_ref_len(value: Option<&JsonRef>) -> usize {
-    match value {
-        Some(_) => 1 + TRACKED_STATE_HASH_BYTES,
-        None => 1,
-    }
-}
-
-fn read_optional_json_ref(
-    bytes: &[u8],
-    cursor: &mut usize,
-    field: &str,
-) -> Result<Option<JsonRef>, LixError> {
-    match read_u8(bytes, cursor, field)? {
-        0 => Ok(None),
-        1 => {
-            let hash = read_fixed_hash(bytes, cursor, field)?;
-            Ok(Some(JsonRef::from_hash_bytes(hash)))
-        }
-        other => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("tracked-state tree value has invalid {field} presence byte {other}"),
-        )),
-    }
 }
 
 pub(crate) fn encode_leaf_node(entries: &[EncodedLeafEntry]) -> Vec<u8> {
@@ -683,15 +644,16 @@ mod tests {
     }
 
     #[test]
-    fn value_codec_roundtrips_tombstone_value() {
-        let value = TrackedStateValue {
-            snapshot_ref: None,
-            metadata_ref: Some(JsonRef::from_hash_bytes([1; 32])),
+    fn value_codec_roundtrips_locator_value() {
+        let value = TrackedStateIndexValue {
+            change_locator: ChangeLocator {
+                source_commit_id: "commit".to_string(),
+                source_pack_id: 7,
+                source_ordinal: 11,
+                change_id: "change".to_string(),
+            },
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
-            change_id: "change".to_string(),
-            commit_id: "commit".to_string(),
-            deleted: true,
         };
 
         let encoded = encode_value(&value);
@@ -699,15 +661,16 @@ mod tests {
     }
 
     #[test]
-    fn value_codec_roundtrips_snapshot_ref() {
-        let value = TrackedStateValue {
-            snapshot_ref: Some(JsonRef::from_hash_bytes([2; 32])),
-            metadata_ref: None,
+    fn value_codec_roundtrips_second_locator_value() {
+        let value = TrackedStateIndexValue {
+            change_locator: ChangeLocator {
+                source_commit_id: "other-commit".to_string(),
+                source_pack_id: 0,
+                source_ordinal: 1,
+                change_id: "other-change".to_string(),
+            },
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
-            change_id: "change".to_string(),
-            commit_id: "commit".to_string(),
-            deleted: false,
         };
 
         let encoded = encode_value(&value);
@@ -717,32 +680,35 @@ mod tests {
     #[test]
     fn encoded_value_len_matches_encoded_value_bytes() {
         let values = [
-            TrackedStateValue {
-                snapshot_ref: None,
-                metadata_ref: None,
+            TrackedStateIndexValue {
+                change_locator: ChangeLocator {
+                    source_commit_id: "commit".to_string(),
+                    source_pack_id: 0,
+                    source_ordinal: 0,
+                    change_id: "change".to_string(),
+                },
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
-                change_id: "change".to_string(),
-                commit_id: "commit".to_string(),
-                deleted: true,
             },
-            TrackedStateValue {
-                snapshot_ref: Some(JsonRef::from_hash_bytes([3; 32])),
-                metadata_ref: Some(JsonRef::from_hash_bytes([4; 32])),
+            TrackedStateIndexValue {
+                change_locator: ChangeLocator {
+                    source_commit_id: "commit".to_string(),
+                    source_pack_id: 1,
+                    source_ordinal: 2,
+                    change_id: "change-2".to_string(),
+                },
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
-                change_id: "change".to_string(),
-                commit_id: "commit".to_string(),
-                deleted: false,
             },
-            TrackedStateValue {
-                snapshot_ref: Some(JsonRef::from_hash_bytes([5; 32])),
-                metadata_ref: None,
+            TrackedStateIndexValue {
+                change_locator: ChangeLocator {
+                    source_commit_id: "other".to_string(),
+                    source_pack_id: 4,
+                    source_ordinal: 8,
+                    change_id: "change-3".to_string(),
+                },
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
-                change_id: "change".to_string(),
-                commit_id: "commit".to_string(),
-                deleted: false,
             },
         ];
 

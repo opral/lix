@@ -7,5 +7,5 @@ pub(crate) use context::{CommitGraphContext, CommitGraphStoreReader};
 #[allow(unused_imports)]
 pub(crate) use types::{
     CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
-    CommitGraphEdge, CommitGraphEntity, CommitGraphReader, ReachableCommitGraphCommit,
+    CommitGraphEdge, CommitGraphReader, ReachableCommitGraphCommit,
 };

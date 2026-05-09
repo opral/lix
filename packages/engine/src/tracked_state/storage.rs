@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::storage::{KvGetGroup, KvGetRequest, StorageReader, StorageWriteSet};
 use crate::tracked_state::codec::PendingChunkWrite;
-use crate::tracked_state::tree_types::{TrackedStateRootId, TRACKED_STATE_HASH_BYTES};
+use crate::tracked_state::types::{TrackedStateRootId, TRACKED_STATE_HASH_BYTES};
 use crate::LixError;
 
 pub(crate) const TRACKED_STATE_CHUNK_NAMESPACE: &'static str = "tracked_state.tree.chunk";
@@ -82,15 +82,6 @@ pub(crate) fn stage_by_file_root(
         TRACKED_STATE_BY_FILE_ROOT_NAMESPACE,
         commit_id.as_bytes().to_vec(),
         root_id.as_bytes().to_vec(),
-    );
-}
-
-#[cfg(test)]
-pub(crate) fn stage_delete_root(writes: &mut StorageWriteSet, commit_id: &str) {
-    writes.delete(TRACKED_STATE_ROOT_NAMESPACE, commit_id.as_bytes().to_vec());
-    writes.delete(
-        TRACKED_STATE_BY_FILE_ROOT_NAMESPACE,
-        commit_id.as_bytes().to_vec(),
     );
 }
 

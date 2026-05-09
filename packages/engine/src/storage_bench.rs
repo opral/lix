@@ -14,8 +14,9 @@ use crate::storage::{
     StorageWriteSet,
 };
 use crate::tracked_state::{
-    MaterializedTrackedStateRow, TrackedStateContext, TrackedStateDiffRequest, TrackedStateFilter,
-    TrackedStateProjection, TrackedStateRowRequest, TrackedStateScanRequest,
+    MaterializedTrackedStateRow, TrackedStateContext, TrackedStateDeltaRef,
+    TrackedStateDiffRequest, TrackedStateFilter, TrackedStateProjection, TrackedStateRowRequest,
+    TrackedStateScanRequest,
 };
 use crate::transaction::open_transaction;
 use crate::transaction::types::{
@@ -1506,34 +1507,59 @@ pub async fn prepare_tracked_state_read_file_selective(
     })
 }
 
+fn tracked_point_hit_requests(
+    rows: usize,
+    key_pattern: StorageBenchKeyPattern,
+) -> Vec<TrackedStateRowRequest> {
+    (0..rows)
+        .map(|index| TrackedStateRowRequest {
+            schema_key: tracked_schema_key(index, StorageBenchSelectivity::Percent100),
+            entity_id: EntityIdentity::single(entity_id("tracked", index, key_pattern)),
+            file_id: NullableKeyFilter::Value("bench.json".to_string()),
+        })
+        .collect()
+}
+
+fn tracked_point_miss_requests(
+    rows: usize,
+    selectivity: StorageBenchSelectivity,
+) -> Vec<TrackedStateRowRequest> {
+    (0..rows)
+        .map(|index| TrackedStateRowRequest {
+            schema_key: tracked_schema_key(index, selectivity),
+            entity_id: EntityIdentity::single(format!("missing-{index}")),
+            file_id: NullableKeyFilter::Value("bench.json".to_string()),
+        })
+        .collect()
+}
+
+fn tracked_point_miss_requests_for_schema(
+    rows: usize,
+    schema_key: &str,
+) -> Vec<TrackedStateRowRequest> {
+    (0..rows)
+        .map(|index| TrackedStateRowRequest {
+            schema_key: schema_key.to_string(),
+            entity_id: EntityIdentity::single(format!("missing-{index}")),
+            file_id: NullableKeyFilter::Value("bench.json".to_string()),
+        })
+        .collect()
+}
+
 pub async fn tracked_state_read_point_hit_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &TrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let mut verified_rows = 0;
     let mut reader = fixture
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
-    for index in 0..fixture.rows {
-        if reader
-            .load_row_at_commit(
-                &fixture.commit_id,
-                &TrackedStateRowRequest {
-                    schema_key: tracked_schema_key(index, StorageBenchSelectivity::Percent100),
-                    entity_id: EntityIdentity::single(entity_id(
-                        "tracked",
-                        index,
-                        fixture.key_pattern,
-                    )),
-                    file_id: NullableKeyFilter::Value("bench.json".to_string()),
-                },
-            )
-            .await?
-            .is_some()
-        {
-            verified_rows += 1;
-        }
-    }
+    let requests = tracked_point_hit_requests(fixture.rows, fixture.key_pattern);
+    let verified_rows = reader
+        .load_rows_at_commit(&fixture.commit_id, &requests)
+        .await?
+        .into_iter()
+        .filter(Option::is_some)
+        .count();
     Ok(report(fixture.rows, verified_rows, Duration::ZERO))
 }
 
@@ -1542,61 +1568,34 @@ pub async fn tracked_state_read_point_hit_constant_prepared(
     fixture: &TrackedStateReadFixture,
     measured_reads: usize,
 ) -> Result<StorageBenchReport, LixError> {
-    let mut verified_rows = 0;
+    let measured_rows = measured_reads.min(fixture.rows);
     let mut reader = fixture
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
-    for index in 0..measured_reads.min(fixture.rows) {
-        if reader
-            .load_row_at_commit(
-                &fixture.commit_id,
-                &TrackedStateRowRequest {
-                    schema_key: tracked_schema_key(index, StorageBenchSelectivity::Percent100),
-                    entity_id: EntityIdentity::single(entity_id(
-                        "tracked",
-                        index,
-                        fixture.key_pattern,
-                    )),
-                    file_id: NullableKeyFilter::Value("bench.json".to_string()),
-                },
-            )
-            .await?
-            .is_some()
-        {
-            verified_rows += 1;
-        }
-    }
-    Ok(report(
-        measured_reads.min(fixture.rows),
-        verified_rows,
-        Duration::ZERO,
-    ))
+    let requests = tracked_point_hit_requests(measured_rows, fixture.key_pattern);
+    let verified_rows = reader
+        .load_rows_at_commit(&fixture.commit_id, &requests)
+        .await?
+        .into_iter()
+        .filter(Option::is_some)
+        .count();
+    Ok(report(measured_rows, verified_rows, Duration::ZERO))
 }
 
 pub async fn tracked_state_read_point_miss_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &TrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let mut misses = 0;
     let mut reader = fixture
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
-    for index in 0..fixture.rows {
-        if reader
-            .load_row_at_commit(
-                &fixture.commit_id,
-                &TrackedStateRowRequest {
-                    schema_key: "bench_tracked_entity".to_string(),
-                    entity_id: EntityIdentity::single(format!("missing-{index}")),
-                    file_id: NullableKeyFilter::Value("bench.json".to_string()),
-                },
-            )
-            .await?
-            .is_none()
-        {
-            misses += 1;
-        }
-    }
+    let requests = tracked_point_miss_requests_for_schema(fixture.rows, TRACKED_MATCH_SCHEMA_KEY);
+    let misses = reader
+        .load_rows_at_commit(&fixture.commit_id, &requests)
+        .await?
+        .into_iter()
+        .filter(Option::is_none)
+        .count();
     Ok(report(fixture.rows, misses, Duration::ZERO))
 }
 
@@ -2962,28 +2961,14 @@ pub async fn tracked_state_read_point_hit(
     write_tracked_root(backend, &context, "bench-tracked-commit", None, &rows).await?;
 
     let started = Instant::now();
-    let mut verified_rows = 0;
     let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
-    for index in 0..config.rows {
-        if reader
-            .load_row_at_commit(
-                "bench-tracked-commit",
-                &TrackedStateRowRequest {
-                    schema_key: tracked_schema_key(index, StorageBenchSelectivity::Percent100),
-                    entity_id: EntityIdentity::single(entity_id(
-                        "tracked",
-                        index,
-                        config.key_pattern,
-                    )),
-                    file_id: NullableKeyFilter::Value("bench.json".to_string()),
-                },
-            )
-            .await?
-            .is_some()
-        {
-            verified_rows += 1;
-        }
-    }
+    let requests = tracked_point_hit_requests(config.rows, config.key_pattern);
+    let verified_rows = reader
+        .load_rows_at_commit("bench-tracked-commit", &requests)
+        .await?
+        .into_iter()
+        .filter(Option::is_some)
+        .count();
     Ok(report(config.rows, verified_rows, started.elapsed()))
 }
 
@@ -2996,24 +2981,14 @@ pub async fn tracked_state_read_point_miss(
     write_tracked_root(backend, &context, "bench-tracked-commit", None, &rows).await?;
 
     let started = Instant::now();
-    let mut misses = 0;
     let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
-    for index in 0..config.rows {
-        if reader
-            .load_row_at_commit(
-                "bench-tracked-commit",
-                &TrackedStateRowRequest {
-                    schema_key: tracked_schema_key(index, StorageBenchSelectivity::Percent100),
-                    entity_id: EntityIdentity::single(format!("missing-{index}")),
-                    file_id: NullableKeyFilter::Value("bench.json".to_string()),
-                },
-            )
-            .await?
-            .is_none()
-        {
-            misses += 1;
-        }
-    }
+    let requests = tracked_point_miss_requests(config.rows, StorageBenchSelectivity::Percent100);
+    let misses = reader
+        .load_rows_at_commit("bench-tracked-commit", &requests)
+        .await?
+        .into_iter()
+        .filter(Option::is_none)
+        .count();
     Ok(report(config.rows, misses, started.elapsed()))
 }
 
@@ -3468,34 +3443,121 @@ async fn write_tracked_root(
 ) -> Result<(), LixError> {
     let storage = StorageContext::new(Arc::clone(backend));
     let mut transaction = storage.begin_write_transaction().await?;
-    {
-        let mut writes = StorageWriteSet::new();
-        {
-            let mut json_writer = JsonStoreContext::new().writer();
-            let canonical_rows = rows
-                .iter()
-                .map(|row| {
-                    crate::test_support::tracked_state_row_from_materialized(
-                        &mut writes,
-                        &mut json_writer,
-                        row,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            context
-                .writer()
-                .stage_root(
-                    &mut transaction.as_mut(),
-                    &mut writes,
-                    commit_id,
-                    parent_commit_id,
-                    canonical_rows.iter().map(|row| row.as_ref()),
-                )
-                .await?;
+    let mut writes = StorageWriteSet::new();
+    let mut json_writer = JsonStoreContext::new().writer();
+    let changes = rows
+        .iter()
+        .map(|row| tracked_bench_change_from_materialized(&mut json_writer, row))
+        .collect::<Result<Vec<_>, _>>()?;
+    json_writer.flush_into(&mut writes);
+
+    let parent_ids = parent_commit_id
+        .map(|parent| vec![parent.to_string()])
+        .unwrap_or_default();
+    let commit_change_id = format!("{commit_id}:commit");
+    let commit = CommitDraftRef {
+        id: commit_id,
+        change_id: &commit_change_id,
+        parent_ids: &parent_ids,
+        author_account_ids: &[],
+        created_at: rows
+            .first()
+            .map(|row| row.updated_at.as_str())
+            .unwrap_or("1970-01-01T00:00:00.000Z"),
+    };
+    let commit_store = CommitStoreContext::new();
+    let change_ids = changes
+        .iter()
+        .map(|change| change.id.clone())
+        .collect::<Vec<_>>();
+    let existing_changes = commit_store
+        .reader(&mut transaction.as_mut())
+        .load_change_index_entries(&change_ids)
+        .await?;
+    let mut authored_changes = Vec::new();
+    let mut authored_created_at = Vec::new();
+    let mut authored_updated_at = Vec::new();
+    let mut adopted_changes = Vec::new();
+    let mut adopted_created_at = Vec::new();
+    let mut adopted_updated_at = Vec::new();
+    for ((change, row), existing) in changes.iter().zip(rows).zip(existing_changes) {
+        if existing.is_some() {
+            adopted_changes.push(change.as_ref());
+            adopted_created_at.push(row.created_at.as_str());
+            adopted_updated_at.push(row.updated_at.as_str());
+        } else {
+            authored_changes.push(change.as_ref());
+            authored_created_at.push(row.created_at.as_str());
+            authored_updated_at.push(row.updated_at.as_str());
         }
-        writes.apply(&mut transaction.as_mut()).await?;
     }
+    let staged = commit_store
+        .writer(&mut transaction.as_mut(), &mut writes)
+        .stage_commit_draft(commit, authored_changes.clone(), adopted_changes.clone())
+        .await?;
+    let mut deltas = Vec::with_capacity(changes.len());
+    deltas.extend(
+        authored_changes
+            .iter()
+            .zip(&staged.authored_locators)
+            .zip(authored_created_at)
+            .zip(authored_updated_at)
+            .map(
+                |(((change, locator), created_at), updated_at)| TrackedStateDeltaRef {
+                    change: *change,
+                    locator: locator.as_ref(),
+                    created_at,
+                    updated_at,
+                },
+            ),
+    );
+    deltas.extend(
+        adopted_changes
+            .iter()
+            .zip(&staged.adopted_locators)
+            .zip(adopted_created_at)
+            .zip(adopted_updated_at)
+            .map(
+                |(((change, locator), created_at), updated_at)| TrackedStateDeltaRef {
+                    change: *change,
+                    locator: locator.as_ref(),
+                    created_at,
+                    updated_at,
+                },
+            ),
+    );
+    context
+        .writer(&mut transaction.as_mut(), &mut writes)
+        .stage_delta(commit_id, parent_commit_id, deltas)
+        .await?;
+    writes.apply(&mut transaction.as_mut()).await?;
     transaction.commit().await
+}
+
+fn tracked_bench_change_from_materialized(
+    json_writer: &mut crate::json_store::JsonStoreWriter,
+    row: &MaterializedTrackedStateRow,
+) -> Result<Change, LixError> {
+    Ok(Change {
+        id: row.change_id.clone(),
+        entity_id: row.entity_id.clone(),
+        schema_key: row.schema_key.clone(),
+        file_id: row.file_id.clone(),
+        snapshot_ref: row
+            .snapshot_content
+            .as_deref()
+            .map(|value| prepare_json_ref(json_writer, value.as_bytes()))
+            .transpose()?,
+        metadata_ref: row
+            .metadata
+            .as_ref()
+            .map(|value| {
+                let serialized = crate::serialize_row_metadata(value);
+                prepare_json_ref(json_writer, serialized.as_bytes())
+            })
+            .transpose()?,
+        created_at: row.created_at.clone(),
+    })
 }
 
 async fn scan_tracked(
@@ -3639,7 +3701,7 @@ fn tracked_rows(config: StorageBenchConfig, commit_id: &str) -> Vec<Materialized
             deleted: false,
             created_at: timestamp(index),
             updated_at: timestamp(index),
-            change_id: format!("tracked-change-{index}"),
+            change_id: tracked_change_id(commit_id, index),
             commit_id: commit_id.to_string(),
         })
         .collect()
@@ -3666,10 +3728,14 @@ fn tracked_rows_file_selective(
             deleted: false,
             created_at: timestamp(index),
             updated_at: timestamp(index),
-            change_id: format!("tracked-change-{index}"),
+            change_id: tracked_change_id(commit_id, index),
             commit_id: commit_id.to_string(),
         })
         .collect()
+}
+
+fn tracked_change_id(commit_id: &str, index: usize) -> String {
+    format!("{commit_id}:tracked-change-{index}")
 }
 
 fn untracked_rows(config: StorageBenchConfig) -> Vec<MaterializedUntrackedStateRow> {

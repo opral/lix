@@ -13,9 +13,9 @@ use crate::tracked_state::codec::{
     ChildSummaryRef, DecodedNode, EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkWrite,
 };
 use crate::tracked_state::storage;
-use crate::tracked_state::tree_types::{
-    TrackedStateApplyResult, TrackedStateKey, TrackedStateMutation, TrackedStateRootId,
-    TrackedStateTreeDiffEntry, TrackedStateTreeScanRequest, TrackedStateValue,
+use crate::tracked_state::types::{
+    TrackedStateApplyResult, TrackedStateIndexValue, TrackedStateKey, TrackedStateMutation,
+    TrackedStateRootId, TrackedStateTreeDiffEntry, TrackedStateTreeScanRequest,
     TRACKED_STATE_HASH_BYTES,
 };
 use crate::{LixError, NullableKeyFilter};
@@ -71,12 +71,13 @@ impl TrackedStateTree {
         storage::load_root(store, commit_id).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn get(
         &self,
         store: &mut impl StorageReader,
         root_id: &TrackedStateRootId,
         key: &TrackedStateKey,
-    ) -> Result<Option<TrackedStateValue>, LixError> {
+    ) -> Result<Option<TrackedStateIndexValue>, LixError> {
         let encoded_key = encode_key(key);
         let mut current = *root_id.as_bytes();
         loop {
@@ -112,7 +113,7 @@ impl TrackedStateTree {
         store: &mut impl StorageReader,
         root_id: &TrackedStateRootId,
         keys: &[TrackedStateKey],
-    ) -> Result<Vec<Option<TrackedStateValue>>, LixError> {
+    ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -150,7 +151,7 @@ impl TrackedStateTree {
         store: &mut impl StorageReader,
         root_id: &TrackedStateRootId,
         request: &TrackedStateTreeScanRequest,
-    ) -> Result<Vec<(TrackedStateKey, TrackedStateValue)>, LixError> {
+    ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
         if request.limit == Some(0) {
             return Ok(Vec::new());
         }
@@ -1395,7 +1396,7 @@ impl TrackedStateTree {
         store: &mut impl StorageReader,
         root_id: &TrackedStateRootId,
         request: &TrackedStateTreeScanRequest,
-    ) -> Result<Vec<(TrackedStateKey, TrackedStateValue)>, LixError> {
+    ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
         self.scan(store, root_id, request).await
     }
 
@@ -1405,7 +1406,7 @@ impl TrackedStateTree {
         hash: [u8; TRACKED_STATE_HASH_BYTES],
         request: &'a TrackedStateTreeScanRequest,
         ranges: &'a [EncodedScanRange],
-        rows: &'a mut Vec<(TrackedStateKey, TrackedStateValue)>,
+        rows: &'a mut Vec<(TrackedStateKey, TrackedStateIndexValue)>,
     ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
     where
         S: StorageReader + Send + 'a,
@@ -1451,7 +1452,7 @@ impl TrackedStateTree {
         store: &'a mut S,
         hash: [u8; TRACKED_STATE_HASH_BYTES],
         encoded_keys: &'a [(usize, Vec<u8>)],
-        values: &'a mut [Option<TrackedStateValue>],
+        values: &'a mut [Option<TrackedStateIndexValue>],
     ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
     where
         S: StorageReader + Send + 'a,
@@ -2111,7 +2112,7 @@ async fn child_summaries_are_leaves(
 
 fn decode_entry(
     entry: &EncodedLeafEntry,
-) -> Result<(TrackedStateKey, TrackedStateValue), LixError> {
+) -> Result<(TrackedStateKey, TrackedStateIndexValue), LixError> {
     Ok((decode_key(&entry.key)?, decode_value(&entry.value)?))
 }
 
@@ -2435,15 +2436,12 @@ mod tests {
             .await
             .expect("row should load")
             .expect("row should exist");
-        assert_eq!(loaded.change_id, "change-new");
-        assert_eq!(
-            loaded.snapshot_ref,
-            Some(crate::json_store::JsonRef::from_hash_bytes([2; 32]))
-        );
+        assert_eq!(loaded.change_locator.change_id, "change-new");
+        assert_eq!(loaded.change_locator.source_commit_id, "commit");
     }
 
     #[tokio::test]
-    async fn scan_filters_and_hides_tombstones_by_default() {
+    async fn scan_filters_by_index_key_without_materializing_tombstones() {
         let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let tree = TrackedStateTree::new();
 
@@ -2481,15 +2479,12 @@ mod tests {
             )
             .await
             .expect("scan should succeed");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0]
-                .0
-                .entity_id
-                .as_single_string_owned()
-                .expect("identity"),
-            "visible"
-        );
+        assert_eq!(rows.len(), 2);
+        let identities = rows
+            .iter()
+            .map(|(key, _)| key.entity_id.as_single_string_owned().expect("identity"))
+            .collect::<Vec<_>>();
+        assert_eq!(identities, vec!["deleted", "visible"]);
     }
 
     #[tokio::test]
@@ -2606,6 +2601,7 @@ mod tests {
                 .await
                 .expect("unchanged read")
                 .expect("unchanged exists")
+                .change_locator
                 .change_id,
             "c1"
         );
@@ -2614,6 +2610,7 @@ mod tests {
                 .await
                 .expect("changed read")
                 .expect("changed exists")
+                .change_locator
                 .change_id,
             "c3"
         );
@@ -2960,11 +2957,11 @@ mod tests {
         Ok(result)
     }
 
-    fn mutation(key: &TrackedStateKey, value: &TrackedStateValue) -> TrackedStateMutation {
+    fn mutation(key: &TrackedStateKey, value: &TrackedStateIndexValue) -> TrackedStateMutation {
         TrackedStateMutation::put_encoded(encode_key(key), encode_value(value))
     }
 
-    fn mutation_owned(key: TrackedStateKey, value: TrackedStateValue) -> TrackedStateMutation {
+    fn mutation_owned(key: TrackedStateKey, value: TrackedStateIndexValue) -> TrackedStateMutation {
         mutation(&key, &value)
     }
 
@@ -2976,21 +2973,22 @@ mod tests {
         }
     }
 
-    fn value(change_id: &str, snapshot_content: Option<&str>) -> TrackedStateValue {
-        let snapshot_ref = match snapshot_content {
-            Some("{\"v\":1}") => Some(crate::json_store::JsonRef::from_hash_bytes([1; 32])),
-            Some("{\"v\":2}") => Some(crate::json_store::JsonRef::from_hash_bytes([2; 32])),
-            Some(_) => Some(crate::json_store::JsonRef::from_hash_bytes([3; 32])),
-            None => None,
+    fn value(change_id: &str, snapshot_content: Option<&str>) -> TrackedStateIndexValue {
+        let source_ordinal = match snapshot_content {
+            Some("{\"v\":1}") => 1,
+            Some("{\"v\":2}") => 2,
+            Some(_) => 3,
+            None => 0,
         };
-        TrackedStateValue {
-            snapshot_ref,
-            metadata_ref: None,
+        TrackedStateIndexValue {
+            change_locator: crate::commit_store::ChangeLocator {
+                source_commit_id: "commit".to_string(),
+                source_pack_id: 0,
+                source_ordinal,
+                change_id: change_id.to_string(),
+            },
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            change_id: change_id.to_string(),
-            commit_id: "commit".to_string(),
-            deleted: snapshot_content.is_none(),
         }
     }
 }
