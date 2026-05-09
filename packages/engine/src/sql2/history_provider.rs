@@ -28,12 +28,12 @@ use super::history_route::{
     HistoryViewDescriptor,
 };
 use super::result_metadata::json_field;
-use super::SqlChangelogQuerySource;
+use super::SqlCommitStoreQuerySource;
 
 pub(crate) async fn register_history_providers(
     session: &SessionContext,
     commit_graph: Box<dyn CommitGraphReader>,
-    query_source: SqlChangelogQuerySource,
+    query_source: SqlCommitStoreQuerySource,
 ) -> Result<Arc<dyn TableProvider>, LixError> {
     let provider: Arc<dyn TableProvider> = Arc::new(LixStateHistoryProvider::new(
         Arc::new(Mutex::new(commit_graph)),
@@ -48,7 +48,7 @@ pub(crate) async fn register_history_providers(
 pub(crate) struct LixStateHistoryProvider {
     schema: SchemaRef,
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlChangelogQuerySource,
+    query_source: SqlCommitStoreQuerySource,
 }
 
 impl std::fmt::Debug for LixStateHistoryProvider {
@@ -60,7 +60,7 @@ impl std::fmt::Debug for LixStateHistoryProvider {
 impl LixStateHistoryProvider {
     pub(crate) fn new(
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlChangelogQuerySource,
+        query_source: SqlCommitStoreQuerySource,
     ) -> Self {
         Self {
             schema: lix_state_history_schema(),
@@ -121,7 +121,7 @@ impl TableProvider for LixStateHistoryProvider {
 
 struct LixStateHistoryScanExec {
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlChangelogQuerySource,
+    query_source: SqlCommitStoreQuerySource,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
     route: HistoryRoute,
@@ -141,7 +141,7 @@ impl std::fmt::Debug for LixStateHistoryScanExec {
 impl LixStateHistoryScanExec {
     fn new(
         commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-        query_source: SqlChangelogQuerySource,
+        query_source: SqlCommitStoreQuerySource,
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
         route: HistoryRoute,
@@ -360,7 +360,7 @@ fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
 
 async fn load_state_history_rows(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlChangelogQuerySource,
+    query_source: SqlCommitStoreQuerySource,
     route: &HistoryRoute,
 ) -> Result<Vec<StateHistorySqlRow>, LixError> {
     let entries = load_history_entries(

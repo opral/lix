@@ -54,7 +54,7 @@ use super::history_route::{
 };
 use super::result_metadata::{json_field, mark_json_field};
 use crate::sql2::{
-    SqlChangelogQuerySource, SqlWriteContext, WriteAccess, WriteContextLiveStateReader,
+    SqlCommitStoreQuerySource, SqlWriteContext, WriteAccess, WriteContextLiveStateReader,
     WriteContextVersionRefReader,
 };
 use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
@@ -65,7 +65,7 @@ pub(crate) async fn register_entity_providers(
     live_state: Arc<dyn LiveStateReader>,
     version_ref: Arc<dyn VersionRefReader>,
     commit_graph: Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>,
-    query_source: SqlChangelogQuerySource,
+    query_source: SqlCommitStoreQuerySource,
     schema_definitions: &[JsonValue],
 ) -> Result<(), LixError> {
     for schema in schema_definitions {
@@ -100,16 +100,18 @@ pub(crate) async fn register_entity_providers(
         )
         .map_err(datafusion_error_to_lix_error)?;
 
-        let history_name = format!("{}_history", spec.schema_key);
-        ctx.register_table(
-            &history_name,
-            Arc::new(EntityHistoryProvider::new(
-                Arc::clone(&spec),
-                Arc::clone(&commit_graph),
-                query_source.clone(),
-            )),
-        )
-        .map_err(datafusion_error_to_lix_error)?;
+        if schema_exposed_as_entity_history_surface(&spec.schema_key) {
+            let history_name = format!("{}_history", spec.schema_key);
+            ctx.register_table(
+                &history_name,
+                Arc::new(EntityHistoryProvider::new(
+                    Arc::clone(&spec),
+                    Arc::clone(&commit_graph),
+                    query_source.clone(),
+                )),
+            )
+            .map_err(datafusion_error_to_lix_error)?;
+        }
     }
 
     Ok(())
@@ -324,6 +326,7 @@ impl TableProvider for EntityProvider {
         let mut request = entity_live_state_scan_request(
             &self.spec.schema_key,
             self.version_binding.active_version_id(),
+            Some(projected_schema.as_ref()),
             limit,
         );
         if self.write_access.is_write() && matches!(self.version_binding, VersionBinding::Explicit)
@@ -418,6 +421,7 @@ impl TableProvider for EntityProvider {
             &self.spec.schema_key,
             version_binding.active_version_id(),
             None,
+            None,
         );
         if matches!(version_binding, VersionBinding::Explicit) {
             let exact_version_ids = exact_version_ids_from_filters(&filters)?;
@@ -481,6 +485,7 @@ impl TableProvider for EntityProvider {
         let mut request = entity_live_state_scan_request(
             &self.spec.schema_key,
             version_binding.active_version_id(),
+            None,
             None,
         );
         apply_exact_entity_id_filters(&mut request, &self.spec, &filters)?;
@@ -1974,6 +1979,7 @@ impl ExecutionPlan for EntityScanExec {
 fn entity_live_state_scan_request(
     schema_key: &str,
     active_version_id: Option<&str>,
+    projected_schema: Option<&Schema>,
     limit: Option<usize>,
 ) -> LiveStateScanRequest {
     LiveStateScanRequest {
@@ -1984,9 +1990,34 @@ fn entity_live_state_scan_request(
                 .unwrap_or_default(),
             ..LiveStateFilter::default()
         },
-        projection: LiveStateProjection::default(),
+        projection: entity_live_state_projection(projected_schema),
         limit,
     }
+}
+
+fn entity_live_state_projection(projected_schema: Option<&Schema>) -> LiveStateProjection {
+    let Some(schema) = projected_schema else {
+        return LiveStateProjection::default();
+    };
+    let mut columns = projection_column_names(schema);
+    if schema
+        .fields()
+        .iter()
+        .any(|field| !field.name().starts_with("lixcol_"))
+        && !columns.iter().any(|column| column == "snapshot_content")
+    {
+        columns.push("snapshot_content".to_string());
+    }
+    LiveStateProjection { columns }
+}
+
+fn projection_column_names(schema: &Schema) -> Vec<String> {
+    schema
+        .fields()
+        .iter()
+        .filter_map(|field| field.name().strip_prefix("lixcol_"))
+        .map(str::to_string)
+        .collect()
 }
 
 fn entity_record_batch(
@@ -2363,13 +2394,13 @@ fn decode_json_pointer_segment(segment: &str) -> std::result::Result<String, Lix
 }
 
 fn schema_exposed_as_entity_surface(schema_key: &str) -> bool {
+    !matches!(schema_key, "lix_active_account" | "lix_change")
+}
+
+fn schema_exposed_as_entity_history_surface(schema_key: &str) -> bool {
     !matches!(
         schema_key,
-        "lix_active_account"
-            | "lix_change"
-            | "lix_commit_edge"
-            | "lix_change_set"
-            | "lix_change_set_element"
+        "lix_commit" | "lix_commit_edge" | "lix_change_set" | "lix_change_set_element"
     )
 }
 
@@ -2578,6 +2609,7 @@ mod tests {
                     .to_string(),
             ),
             metadata: Some(json!({"source": "test"}).to_string()),
+            deleted: false,
             version_id: "version-a".to_string(),
             change_id: Some("change-a".to_string()),
             commit_id: Some("commit-a".to_string()),

@@ -1,16 +1,16 @@
-use crate::changelog::{CanonicalChange, ChangelogContext};
+use crate::commit_store::{Change, CommitDraftBorrowed, CommitStoreContext};
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{
     FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
 };
 use crate::json_store::{JsonStoreContext, NormalizedJson};
-use crate::live_state::{LiveStateContext, LiveStateTrackedRowRef};
+use crate::live_state::LiveStateTrackedRowRef;
 use crate::schema::{
     registered_schema_entity_id, schema_key_from_definition, seed_schema_definitions,
 };
 use crate::storage::{StorageContext, StorageWriteSet};
-use crate::tracked_state::TrackedStateRow;
-use crate::untracked_state::UntrackedStateRow;
+use crate::tracked_state::{TrackedStateContext, TrackedStateRow};
+use crate::untracked_state::{UntrackedStateContext, UntrackedStateRow};
 use crate::version::{VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_REF_SCHEMA_KEY};
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
@@ -20,18 +20,28 @@ use std::sync::Arc;
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const LIX_ID_KEY: &str = "lix_id";
 const WORKSPACE_VERSION_KEY: &str = "lix_workspace_version_id";
-const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Pure seed plan for initializing an engine repository.
 ///
-/// Tracked bootstrap facts go to the changelog. Moving refs such as
-/// `lix_version_ref` are seeded as untracked local state so repository heads can
-/// advance without becoming commit members.
+/// Tracked bootstrap facts go to the commit store. Moving refs such as
+/// `lix_version_ref` are seeded as untracked local state so repository heads
+/// can advance without becoming commit members.
 pub(crate) struct InitSeedPlan {
+    commit: InitSeedCommit,
     changes: Vec<InitSeedChange>,
     untracked_rows: Vec<InitSeedLiveRow>,
     pub(crate) receipt: InitReceipt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InitSeedCommit {
+    id: String,
+    change_id: String,
+    change_set_id: String,
+    parent_ids: Vec<String>,
+    author_account_ids: Vec<String>,
+    created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,7 +76,7 @@ pub struct InitReceipt {
 /// Builds the canonical bootstrap changes for a new engine repository.
 ///
 /// The initial commit tracks durable content rows. Version refs are moving
-/// pointers and therefore live in untracked local state instead of changelog.
+/// pointers and therefore live in untracked local state instead of the commit.
 pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSeedPlan, LixError> {
     let main_version_id = functions.call_uuid_v7();
     let lix_id = functions.call_uuid_v7();
@@ -108,27 +118,14 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         &timestamp,
     );
 
-    let initial_commit_change_ids = registered_schema_changes
-        .iter()
-        .map(|change| change.id.clone())
-        .chain([
-            global_version_descriptor_change.id.clone(),
-            main_version_descriptor_change.id.clone(),
-            kv_lix_id_change.id.clone(),
-        ])
-        .collect::<Vec<_>>();
-
-    let initial_commit_change = canonical_change(
-        functions.call_uuid_v7(),
-        EntityIdentity::single(&initial_commit_id),
-        COMMIT_SCHEMA_KEY,
-        commit_snapshot(
-            &initial_commit_id,
-            &initial_change_set_id,
-            &initial_commit_change_ids,
-        )?,
-        &timestamp,
-    );
+    let initial_commit = InitSeedCommit {
+        id: initial_commit_id.clone(),
+        change_id: functions.call_uuid_v7(),
+        change_set_id: initial_change_set_id,
+        parent_ids: Vec::new(),
+        author_account_ids: Vec::new(),
+        created_at: timestamp.clone(),
+    };
     let global_version_ref_row = untracked_row(
         EntityIdentity::single(GLOBAL_VERSION_ID),
         VERSION_REF_SCHEMA_KEY,
@@ -149,13 +146,13 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     );
 
     Ok(InitSeedPlan {
+        commit: initial_commit,
         changes: registered_schema_changes
             .into_iter()
             .chain([
                 global_version_descriptor_change,
                 main_version_descriptor_change,
                 kv_lix_id_change,
-                initial_commit_change,
             ])
             .collect(),
         untracked_rows: vec![
@@ -176,12 +173,13 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 ///
 /// The pure seed planner decides which bootstrap facts exist. This function is
 /// only responsible for durably writing those facts to their owning stores:
-/// changelog for tracked changes, and live_state for the serving projection plus
-/// untracked moving refs.
+/// commit_store for tracked changes, and live_state for the serving projection
+/// plus untracked moving refs.
 pub(crate) async fn initialize(
     storage: StorageContext,
-    changelog: &ChangelogContext,
-    live_state: &LiveStateContext,
+    commit_store: &CommitStoreContext,
+    tracked_state: &TrackedStateContext,
+    untracked_state: &UntrackedStateContext,
 ) -> Result<InitReceipt, LixError> {
     let functions = SharedFunctionProvider::new(
         Box::new(SystemFunctionProvider) as Box<dyn FunctionProvider + Send>
@@ -193,22 +191,34 @@ pub(crate) async fn initialize(
     let mut writes = StorageWriteSet::new();
     let mut json_writer = JsonStoreContext::new().writer();
 
-    {
-        let canonical_changes = plan
-            .changes
-            .iter()
-            .map(|change| seed_change_to_canonical_change(&mut json_writer, change))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut writer = changelog.writer(&mut writes);
-        writer.stage_changes(canonical_changes.iter().map(|change| change.as_ref()))?;
-    }
-
-    let tracked_rows = plan
+    let authored_changes = plan
         .changes
         .iter()
-        .map(|change| {
-            tracked_row_from_initial_change(&mut json_writer, change, &receipt.initial_commit_id)
-        })
+        .map(|change| seed_change_to_commit_store_change(&mut json_writer, change))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    {
+        let commit = CommitDraftBorrowed {
+            id: &plan.commit.id,
+            change_id: &plan.commit.change_id,
+            change_set_id: &plan.commit.change_set_id,
+            parent_ids: &plan.commit.parent_ids,
+            author_account_ids: &plan.commit.author_account_ids,
+            created_at: &plan.commit.created_at,
+        };
+        let mut writer = commit_store.writer(transaction.as_mut(), &mut writes);
+        writer
+            .stage_commit_draft(
+                commit,
+                authored_changes.iter().map(Change::as_borrowed).collect(),
+                Vec::new(),
+            )
+            .await?;
+    }
+
+    let tracked_rows = authored_changes
+        .iter()
+        .map(|change| tracked_row_from_initial_change(change, &receipt.initial_commit_id))
         .collect::<Result<Vec<_>, _>>()?;
     let untracked_rows = plan
         .untracked_rows
@@ -217,22 +227,26 @@ pub(crate) async fn initialize(
         .collect::<Result<Vec<_>, _>>()?;
 
     {
-        let mut writer = live_state.writer(transaction.as_mut());
-        writer.stage_untracked_rows(&mut writes, untracked_rows.iter().map(|row| row.as_ref()))?;
-        writer
-            .stage_tracked_root(
+        untracked_state
+            .writer(&mut writes)
+            .stage_rows(untracked_rows.iter().map(|row| row.as_ref()))?;
+        let tracked_root_rows = tracked_rows
+            .iter()
+            .map(|row| LiveStateTrackedRowRef {
+                row: row.as_ref(),
+                global: true,
+                version_id: GLOBAL_VERSION_ID,
+            })
+            .collect::<Vec<_>>();
+        validate_initial_tracked_root(&tracked_root_rows, &receipt.initial_commit_id)?;
+        tracked_state
+            .writer()
+            .stage_root(
+                transaction.as_mut(),
                 &mut writes,
-                GLOBAL_VERSION_ID,
                 &receipt.initial_commit_id,
                 None,
-                tracked_rows
-                    .iter()
-                    .filter(|row| row.schema_key != COMMIT_SCHEMA_KEY)
-                    .map(|row| LiveStateTrackedRowRef {
-                        row: row.as_ref(),
-                        global: true,
-                        version_id: GLOBAL_VERSION_ID,
-                    }),
+                tracked_root_rows.into_iter().map(|row| row.row),
             )
             .await?;
     }
@@ -243,18 +257,39 @@ pub(crate) async fn initialize(
     Ok(receipt)
 }
 
+fn validate_initial_tracked_root(
+    rows: &[LiveStateTrackedRowRef<'_>],
+    commit_id: &str,
+) -> Result<(), LixError> {
+    for row in rows {
+        if !row.global || row.version_id != GLOBAL_VERSION_ID {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "initial tracked root must contain only global bootstrap rows",
+            ));
+        }
+        if row.row.value.commit_id != commit_id {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "initial tracked root for commit '{commit_id}' cannot include row from commit '{}'",
+                    row.row.value.commit_id
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn tracked_row_from_initial_change(
-    json_writer: &mut crate::json_store::JsonStoreWriter,
-    change: &InitSeedChange,
+    change: &Change,
     initial_commit_id: &str,
 ) -> Result<TrackedStateRow, LixError> {
     Ok(TrackedStateRow {
         entity_id: change.entity_id.clone(),
         schema_key: change.schema_key.clone(),
         file_id: None,
-        snapshot_ref: Some(json_writer.prepare_json(NormalizedJson::from_arc_unchecked(
-            Arc::from(change.snapshot_content.as_str()),
-        ))?),
+        snapshot_ref: change.snapshot_ref.clone(),
         metadata_ref: None,
         created_at: change.created_at.clone(),
         updated_at: change.created_at.clone(),
@@ -263,11 +298,11 @@ fn tracked_row_from_initial_change(
     })
 }
 
-fn seed_change_to_canonical_change(
+fn seed_change_to_commit_store_change(
     json_writer: &mut crate::json_store::JsonStoreWriter,
     change: &InitSeedChange,
-) -> Result<CanonicalChange, LixError> {
-    Ok(CanonicalChange {
+) -> Result<Change, LixError> {
+    Ok(Change {
         id: change.id.clone(),
         entity_id: change.entity_id.clone(),
         schema_key: change.schema_key.clone(),
@@ -353,19 +388,6 @@ fn registered_schema_snapshot(schema: &serde_json::Value) -> Result<String, LixE
     }))
 }
 
-fn commit_snapshot(
-    id: &str,
-    change_set_id: &str,
-    change_ids: &[String],
-) -> Result<String, LixError> {
-    encode_snapshot(json!({
-        "id": id,
-        "change_set_id": change_set_id,
-        "change_ids": change_ids,
-        "parent_commit_ids": [],
-    }))
-}
-
 fn version_ref_snapshot(id: &str, commit_id: &str) -> Result<String, LixError> {
     encode_snapshot(json!({
         "id": id,
@@ -387,13 +409,17 @@ mod tests {
     use serde_json::Value as JsonValue;
 
     use super::*;
+    use crate::backend::{testing::UnitTestBackend, Backend};
     use crate::functions::{FunctionProvider, SharedFunctionProvider};
+    use crate::storage::StorageContext;
+    use crate::tracked_state::TrackedStateContext;
+    use crate::untracked_state::UntrackedStateContext;
 
     #[test]
     fn plan_init_seed_returns_tracked_changes_and_untracked_workspace_state() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
 
-        assert_eq!(plan.changes.len(), seed_schema_definitions().len() + 4);
+        assert_eq!(plan.changes.len(), seed_schema_definitions().len() + 3);
         assert_eq!(plan.untracked_rows.len(), 3);
         assert_eq!(plan.receipt.global_version_id, GLOBAL_VERSION_ID);
         assert_eq!(plan.receipt.main_version_id, "test-uuid-1");
@@ -402,28 +428,23 @@ mod tests {
     }
 
     #[test]
-    fn plan_init_seed_commit_tracks_schema_registrations_descriptor_and_lix_id_changes() {
+    fn plan_init_seed_commit_header_tracks_schema_registrations_descriptor_and_lix_id_changes() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
-        let commit_change = plan
+
+        assert_eq!(plan.commit.id, plan.receipt.initial_commit_id);
+        assert_eq!(plan.commit.change_set_id, "test-uuid-4");
+        assert!(plan.commit.parent_ids.is_empty());
+        assert!(plan.commit.author_account_ids.is_empty());
+        assert_eq!(plan.commit.created_at, "test-timestamp-1");
+
+        let change_ids = plan
             .changes
             .iter()
-            .find(|change| change.schema_key == COMMIT_SCHEMA_KEY)
-            .expect("initial commit change should exist");
-        let commit_snapshot = snapshot(commit_change);
-
-        assert_eq!(
-            commit_snapshot.get("id").and_then(JsonValue::as_str),
-            Some(plan.receipt.initial_commit_id.as_str())
-        );
-        let change_ids = commit_snapshot
-            .get("change_ids")
-            .and_then(JsonValue::as_array)
-            .expect("change_ids should be an array")
-            .iter()
-            .map(|value| value.as_str().expect("change id should be text"))
+            .map(|change| change.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(change_ids.len(), seed_schema_definitions().len() + 3);
         assert!(change_ids.contains(&"global"));
+        assert!(!change_ids.contains(&plan.commit.change_id.as_str()));
 
         let registered_schema_change_ids = plan
             .changes
@@ -512,6 +533,51 @@ mod tests {
             snapshot.get("value").and_then(JsonValue::as_str),
             Some(plan.receipt.main_version_id.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn initialize_writes_initial_commit_through_commit_store() {
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend);
+        let commit_store = CommitStoreContext::new();
+        let tracked_state = TrackedStateContext::new();
+        let untracked_state = UntrackedStateContext::new();
+
+        let receipt = initialize(
+            storage.clone(),
+            &commit_store,
+            &tracked_state,
+            &untracked_state,
+        )
+        .await
+        .expect("engine should initialize");
+        let reader = commit_store.reader(storage.clone());
+        let commit = reader
+            .load_commit(&receipt.initial_commit_id)
+            .await
+            .expect("commit should load")
+            .expect("initial commit should exist");
+
+        assert_eq!(commit.id, receipt.initial_commit_id);
+        assert_eq!(commit.change_pack_count, 1);
+        assert_eq!(commit.membership_pack_count, 0);
+
+        let change_pack = reader
+            .load_change_pack(&commit.id, 0)
+            .await
+            .expect("change pack should load")
+            .expect("initial change pack should exist");
+        assert_eq!(change_pack.len(), seed_schema_definitions().len() + 3);
+        assert!(change_pack
+            .iter()
+            .all(|change| change.id != commit.change_id));
+
+        let entries = reader
+            .load_change_index_entries(&[commit.change_id.clone(), "global".to_string()])
+            .await
+            .expect("change index should load");
+        assert!(entries[0].is_some());
+        assert!(entries[1].is_some());
     }
 
     fn snapshot(change: &InitSeedChange) -> JsonValue {

@@ -6,14 +6,14 @@ use std::sync::Arc;
 use serde_json::Value as JsonValue;
 
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
-use crate::changelog::ChangelogContext;
 use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
+use crate::commit_store::CommitStoreContext;
 use crate::entity_identity::EntityIdentity;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
 use crate::schema_catalog::SchemaCatalogSource;
-use crate::sql2::{ChangelogQuerySource, SqlChangelogQuerySource, SqlExecutionContext};
+use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext};
 use crate::storage::{
     ScopedStorageReader, StorageContext, StorageReadScope, StorageReadTransaction, StorageReader,
 };
@@ -48,7 +48,7 @@ pub struct SessionContext {
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) tracked_state: Arc<TrackedStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
-    pub(super) changelog: Arc<ChangelogContext>,
+    pub(super) commit_store: Arc<CommitStoreContext>,
     pub(super) version_ctx: Arc<VersionContext>,
     pub(super) schema_catalog_source: Arc<SchemaCatalogSource>,
     closed: Arc<AtomicBool>,
@@ -60,7 +60,7 @@ impl SessionContext {
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
-        changelog: Arc<ChangelogContext>,
+        commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         schema_catalog_source: Arc<SchemaCatalogSource>,
     ) -> Result<Self, LixError> {
@@ -70,7 +70,7 @@ impl SessionContext {
             live_state,
             tracked_state,
             binary_cas,
-            changelog,
+            commit_store,
             version_ctx,
             schema_catalog_source,
         );
@@ -84,7 +84,7 @@ impl SessionContext {
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
-        changelog: Arc<ChangelogContext>,
+        commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         schema_catalog_source: Arc<SchemaCatalogSource>,
     ) -> Result<Self, LixError> {
@@ -96,7 +96,7 @@ impl SessionContext {
             live_state,
             tracked_state,
             binary_cas,
-            changelog,
+            commit_store,
             version_ctx,
             schema_catalog_source,
         ))
@@ -108,7 +108,7 @@ impl SessionContext {
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
-        changelog: Arc<ChangelogContext>,
+        commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         schema_catalog_source: Arc<SchemaCatalogSource>,
     ) -> Self {
@@ -118,7 +118,7 @@ impl SessionContext {
             live_state,
             tracked_state,
             binary_cas,
-            changelog,
+            commit_store,
             version_ctx,
             schema_catalog_source,
             Arc::new(AtomicBool::new(false)),
@@ -131,7 +131,7 @@ impl SessionContext {
         live_state: Arc<LiveStateContext>,
         tracked_state: Arc<TrackedStateContext>,
         binary_cas: Arc<BinaryCasContext>,
-        changelog: Arc<ChangelogContext>,
+        commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         schema_catalog_source: Arc<SchemaCatalogSource>,
         closed: Arc<AtomicBool>,
@@ -142,7 +142,7 @@ impl SessionContext {
             live_state,
             tracked_state,
             binary_cas,
-            changelog,
+            commit_store,
             version_ctx,
             schema_catalog_source,
             closed,
@@ -285,7 +285,7 @@ impl SessionContext {
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
-            Arc::clone(&self.changelog),
+            Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.schema_catalog_source),
         )
@@ -321,7 +321,7 @@ pub(super) struct SessionSqlExecutionContext<'a> {
         ScopedStorageReader<Box<dyn StorageReadTransaction + Send + Sync + 'static>>,
     pub(super) live_state: Arc<LiveStateContext>,
     pub(super) binary_cas: Arc<BinaryCasContext>,
-    pub(super) changelog: Arc<ChangelogContext>,
+    pub(super) commit_store: Arc<CommitStoreContext>,
     pub(super) version_ctx: Arc<VersionContext>,
     pub(super) visible_schemas: Vec<JsonValue>,
     pub(super) functions: FunctionProviderHandle,
@@ -336,16 +336,16 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
         Arc::new(self.live_state.reader(self.read_store.clone())) as Arc<dyn LiveStateReader>
     }
 
-    fn changelog_query_source(&self) -> SqlChangelogQuerySource {
+    fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource {
         let read_scope = StorageReadScope::new(self.read_store.clone());
-        ChangelogQuerySource {
-            changelog_reader: Arc::new(self.changelog.reader(read_scope.store())),
+        CommitStoreQuerySource {
+            commit_store_reader: Arc::new(self.commit_store.reader(read_scope.store())),
             json_reader: JsonStoreContext::new().reader(read_scope.store()),
         }
     }
 
     fn commit_graph(&self) -> Box<dyn CommitGraphReader> {
-        Box::new(CommitGraphContext::new(ChangelogContext::new()).reader(self.read_store.clone()))
+        Box::new(CommitGraphContext::new().reader(self.read_store.clone()))
     }
 
     fn version_ref(&self) -> Arc<dyn VersionRefReader> {

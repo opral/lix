@@ -254,8 +254,11 @@ impl TableProvider for LixFileProvider {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let projected_schema = projected_schema(&self.schema, projection)?;
         let scan_limit = if filters.is_empty() { limit } else { None };
-        let mut request =
-            lix_file_scan_request(self.version_binding.active_version_id(), scan_limit);
+        let mut request = lix_file_scan_request(
+            self.version_binding.active_version_id(),
+            Some(projected_schema.as_ref()),
+            scan_limit,
+        );
         if self.write_access.is_write() && matches!(self.version_binding, VersionBinding::Explicit)
         {
             request.filter.version_ids = explicit_version_ids_from_dml_filters(filters);
@@ -336,7 +339,8 @@ impl TableProvider for LixFileProvider {
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
             .collect::<Result<Vec<_>>>()?;
         let target_file_ids = file_id_constraint_from_filters(&filters)?;
-        let mut request = lix_file_scan_request(self.version_binding.active_version_id(), None);
+        let mut request =
+            lix_file_scan_request(self.version_binding.active_version_id(), None, None);
         if matches!(self.version_binding, VersionBinding::Explicit) {
             request.filter.version_ids = explicit_version_ids_from_dml_filters(&filters);
             if request.filter.version_ids.is_empty() {
@@ -385,7 +389,7 @@ impl TableProvider for LixFileProvider {
             .iter()
             .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
             .collect::<Result<Vec<_>>>()?;
-        let request = lix_file_scan_request(self.version_binding.active_version_id(), None);
+        let request = lix_file_scan_request(self.version_binding.active_version_id(), None, None);
 
         Ok(Arc::new(LixFileUpdateExec::new(
             Arc::clone(&self.blob_reader),
@@ -1939,6 +1943,7 @@ fn projected_schema(base_schema: &SchemaRef, projection: Option<&Vec<usize>>) ->
 
 fn lix_file_scan_request(
     version_binding: Option<&str>,
+    projected_schema: Option<&Schema>,
     limit: Option<usize>,
 ) -> LiveStateScanRequest {
     LiveStateScanRequest {
@@ -1953,9 +1958,33 @@ fn lix_file_scan_request(
                 .unwrap_or_default(),
             ..LiveStateFilter::default()
         },
-        projection: LiveStateProjection::default(),
+        projection: lix_file_live_state_projection(projected_schema),
         limit,
     }
+}
+
+fn lix_file_live_state_projection(projected_schema: Option<&Schema>) -> LiveStateProjection {
+    let Some(schema) = projected_schema else {
+        return LiveStateProjection::default();
+    };
+    let mut columns = Vec::new();
+    let needs_snapshot = schema.fields().iter().any(|field| {
+        matches!(
+            field.name().as_str(),
+            "path" | "directory_id" | "name" | "hidden" | "data"
+        )
+    });
+    if needs_snapshot {
+        columns.push("snapshot_content".to_string());
+    }
+    if schema
+        .fields()
+        .iter()
+        .any(|field| field.name() == "lixcol_metadata")
+    {
+        columns.push("metadata".to_string());
+    }
+    LiveStateProjection { columns }
 }
 
 async fn scan_lix_file_live_rows(
@@ -2851,6 +2880,7 @@ mod tests {
             file_id: None,
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
+            deleted: false,
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),
@@ -2872,6 +2902,7 @@ mod tests {
             file_id: None,
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
+            deleted: false,
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),

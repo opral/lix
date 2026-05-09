@@ -333,7 +333,7 @@ impl SessionContext {
                 read_store,
                 live_state: Arc::clone(&self.live_state),
                 binary_cas: Arc::clone(&self.binary_cas),
-                changelog: Arc::clone(&self.changelog),
+                commit_store: Arc::clone(&self.commit_store),
                 version_ctx: Arc::clone(&self.version_ctx),
                 visible_schemas,
                 functions: functions.clone(),
@@ -374,11 +374,7 @@ impl SessionContext {
         let mut writes = StorageWriteSet::new();
         let mut json_writer = JsonStoreContext::new().writer();
         runtime_functions
-            .stage_persist_if_needed(
-                &mut self.live_state.writer(transaction.as_mut()),
-                &mut writes,
-                &mut json_writer,
-            )
+            .stage_persist_if_needed(&mut writes, &mut json_writer)
             .await?;
         json_writer.flush_into(&mut writes);
         if !writes.is_empty() {

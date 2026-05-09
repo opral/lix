@@ -83,6 +83,7 @@ impl TrackedStateValue {
             file_id: key.file_id,
             snapshot_content,
             metadata,
+            deleted: self.deleted,
             created_at: self.created_at,
             updated_at: self.updated_at,
             change_id: self.change_id,

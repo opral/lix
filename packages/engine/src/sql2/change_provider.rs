@@ -18,17 +18,18 @@ use datafusion::physical_plan::{
 };
 use futures_util::stream;
 
-use crate::changelog::{materialize_change, ChangelogScanRequest, MaterializedCanonicalChange};
+use crate::commit_store::ChangeScanRequest;
 use crate::serialize_row_metadata;
 use crate::LixError;
 
 use super::record_batch::record_batch_with_row_count;
 use super::result_metadata::json_field;
-use super::SqlChangelogQuerySource;
+use super::SqlCommitStoreQuerySource;
+use crate::commit_store::{materialize_change, MaterializedChange};
 
 pub(crate) async fn register_lix_change_provider(
     session: &datafusion::prelude::SessionContext,
-    query_source: SqlChangelogQuerySource,
+    query_source: SqlCommitStoreQuerySource,
 ) -> Result<(), LixError> {
     session
         .register_table("lix_change", Arc::new(LixChangeProvider::new(query_source)))
@@ -38,7 +39,7 @@ pub(crate) async fn register_lix_change_provider(
 
 struct LixChangeProvider {
     schema: SchemaRef,
-    query_source: SqlChangelogQuerySource,
+    query_source: SqlCommitStoreQuerySource,
 }
 
 impl std::fmt::Debug for LixChangeProvider {
@@ -48,7 +49,7 @@ impl std::fmt::Debug for LixChangeProvider {
 }
 
 impl LixChangeProvider {
-    fn new(query_source: SqlChangelogQuerySource) -> Self {
+    fn new(query_source: SqlCommitStoreQuerySource) -> Self {
         Self {
             schema: lix_change_schema(),
             query_source,
@@ -97,7 +98,7 @@ impl TableProvider for LixChangeProvider {
 }
 
 struct LixChangeScanExec {
-    query_source: SqlChangelogQuerySource,
+    query_source: SqlCommitStoreQuerySource,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
@@ -112,7 +113,7 @@ impl std::fmt::Debug for LixChangeScanExec {
 
 impl LixChangeScanExec {
     fn new(
-        query_source: SqlChangelogQuerySource,
+        query_source: SqlCommitStoreQuerySource,
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
         limit: Option<usize>,
@@ -191,8 +192,8 @@ impl ExecutionPlan for LixChangeScanExec {
         let stream = stream::once(async move {
             let mut json_reader = query_source.json_reader;
             let canonical_changes = query_source
-                .changelog_reader
-                .scan_changes(&ChangelogScanRequest { limit })
+                .commit_store_reader
+                .scan_changes(&ChangeScanRequest { limit })
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             let mut changes = Vec::with_capacity(canonical_changes.len());
@@ -259,7 +260,7 @@ fn projected_schema(schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Sche
 
 fn change_record_batch(
     projection: &[ChangeColumn],
-    changes: &[MaterializedCanonicalChange],
+    changes: &[MaterializedChange],
 ) -> Result<RecordBatch> {
     let arrays = projection
         .iter()

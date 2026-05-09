@@ -1,8 +1,6 @@
+use crate::commit_store::Change;
+use crate::entity_identity::EntityIdentity;
 use crate::LixError;
-use crate::{
-    changelog::{CanonicalChange, MaterializedCanonicalChange},
-    entity_identity::EntityIdentity,
-};
 
 /// Parsed `lix_commit` entity from the changelog.
 ///
@@ -13,8 +11,8 @@ use crate::{
 /// newly minted copies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphCommit {
-    pub(crate) canonical_change: CanonicalChange,
-    pub(crate) change: MaterializedCanonicalChange,
+    pub(crate) canonical_change: Change,
+    pub(crate) change: Change,
     pub(crate) commit_id: String,
     pub(crate) change_set_id: String,
     pub(crate) change_ids: Vec<String>,
@@ -47,7 +45,7 @@ pub(crate) struct CommitGraphChangeSet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphChangeSetElement {
     pub(crate) change_set_id: String,
-    pub(crate) change: MaterializedCanonicalChange,
+    pub(crate) change: Change,
 }
 
 /// Filter for canonical change history from a chosen traversal start commit.
@@ -67,7 +65,7 @@ pub(crate) struct CommitGraphChangeHistoryRequest {
 /// necessarily a graph root or a version head.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphChangeHistoryEntry {
-    pub(crate) change: CanonicalChange,
+    pub(crate) change: Change,
     pub(crate) observed_commit_id: String,
     pub(crate) start_commit_id: String,
     pub(crate) depth: u32,
@@ -77,6 +75,7 @@ pub(crate) struct CommitGraphChangeHistoryEntry {
 ///
 /// SQL surfaces consume this trait so they depend on graph semantics, not on
 /// changelog storage or traversal details.
+#[allow(dead_code)]
 #[async_trait::async_trait]
 pub(crate) trait CommitGraphReader: Send + Sync {
     #[allow(dead_code)]
@@ -138,7 +137,7 @@ pub(crate) trait CommitGraphReader: Send + Sync {
 /// traversal rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphEntity {
-    pub(crate) change: CanonicalChange,
+    pub(crate) change: Change,
     pub(crate) source_commit_id: String,
     pub(crate) depth: u32,
     pub(crate) created_at: String,

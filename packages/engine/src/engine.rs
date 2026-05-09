@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::binary_cas::BinaryCasContext;
-use crate::changelog::ChangelogContext;
 use crate::commit_graph::CommitGraphContext;
+use crate::commit_store::CommitStoreContext;
 use crate::entity_identity::EntityIdentity;
 use crate::init::InitReceipt;
 use crate::live_state::LiveStateContext;
@@ -23,7 +23,7 @@ pub struct Engine {
     live_state: Arc<LiveStateContext>,
     version_ctx: Arc<VersionContext>,
     binary_cas: Arc<BinaryCasContext>,
-    changelog: Arc<ChangelogContext>,
+    commit_store: Arc<CommitStoreContext>,
     schema_catalog_source: Arc<SchemaCatalogSource>,
 }
 
@@ -38,13 +38,15 @@ impl Engine {
     ) -> Result<InitReceipt, LixError> {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::from(backend);
         let storage = StorageContext::new(backend);
-        let changelog = ChangelogContext::new();
-        let commit_graph = CommitGraphContext::new(changelog);
-        let tracked_state = TrackedStateContext::new();
-        let untracked_state = UntrackedStateContext::new();
-        let live_state = LiveStateContext::new(tracked_state, untracked_state, commit_graph);
+        let commit_store = CommitStoreContext::new();
 
-        crate::init::initialize(storage, &changelog, &live_state).await
+        crate::init::initialize(
+            storage,
+            &commit_store,
+            &TrackedStateContext::new(),
+            &UntrackedStateContext::new(),
+        )
+        .await
     }
 
     /// Creates a clean DataFusion-first engine over an initialized backend.
@@ -57,8 +59,8 @@ impl Engine {
 
         let tracked_state = Arc::new(TrackedStateContext::new());
         let untracked_state = Arc::new(UntrackedStateContext::new());
-        let changelog = Arc::new(ChangelogContext::new());
-        let commit_graph = CommitGraphContext::new(changelog.as_ref().clone());
+        let commit_store = Arc::new(CommitStoreContext::new());
+        let commit_graph = CommitGraphContext::new();
         let live_state = Arc::new(LiveStateContext::new(
             tracked_state.as_ref().clone(),
             *untracked_state,
@@ -73,7 +75,7 @@ impl Engine {
 
         Ok(Self {
             binary_cas: Arc::new(BinaryCasContext::new()),
-            changelog,
+            commit_store,
             storage,
             tracked_state,
             live_state,
@@ -123,7 +125,7 @@ impl Engine {
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
-            Arc::clone(&self.changelog),
+            Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.schema_catalog_source),
         )
@@ -136,7 +138,7 @@ impl Engine {
             Arc::clone(&self.live_state),
             Arc::clone(&self.tracked_state),
             Arc::clone(&self.binary_cas),
-            Arc::clone(&self.changelog),
+            Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.schema_catalog_source),
         )
@@ -163,7 +165,7 @@ impl Engine {
                     "target",
                 )
             })?;
-        let commit_graph = CommitGraphContext::new(ChangelogContext::new());
+        let commit_graph = CommitGraphContext::new();
         let storage = self.storage();
         let mut read_transaction = storage.begin_read_transaction().await?;
         let mut transaction = storage.begin_write_transaction().await?;

@@ -5760,6 +5760,7 @@ mod tests {
             file_id: row.file_id,
             snapshot_content: row.snapshot.as_ref().map(|snapshot| snapshot.materialize()),
             metadata: row.metadata.as_ref().map(|metadata| metadata.materialize()),
+            deleted: row.snapshot.is_none(),
             created_at: row.created_at,
             updated_at: row.updated_at,
             global: row.global,

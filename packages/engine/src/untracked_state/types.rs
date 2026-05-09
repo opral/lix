@@ -60,6 +60,7 @@ pub(crate) struct MaterializedUntrackedStateRow {
     pub(crate) file_id: Option<String>,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
+    pub(crate) deleted: bool,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) global: bool,

@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::changelog::{CanonicalChange, MaterializedCanonicalChange};
 use crate::json_store::{JsonStoreContext, NormalizedJson};
 use crate::storage::StorageContext;
 use crate::storage::StorageWriteSet;
@@ -162,33 +161,4 @@ pub(crate) fn untracked_state_row_from_materialized(
     };
     json_writer.flush_into(writes);
     Ok(row)
-}
-
-pub(crate) fn canonical_change_from_materialized(
-    writes: &mut StorageWriteSet,
-    json_writer: &mut crate::json_store::JsonStoreWriter,
-    change: &MaterializedCanonicalChange,
-) -> Result<CanonicalChange, crate::LixError> {
-    let change = CanonicalChange {
-        id: change.id.clone(),
-        entity_id: change.entity_id.clone(),
-        schema_key: change.schema_key.clone(),
-        file_id: change.file_id.clone(),
-        snapshot_ref: change
-            .snapshot_content
-            .as_deref()
-            .map(|value| prepare_json_ref(json_writer, value))
-            .transpose()?,
-        metadata_ref: change
-            .metadata
-            .as_ref()
-            .map(|value| {
-                let serialized = crate::serialize_row_metadata(value);
-                prepare_json_ref(json_writer, &serialized)
-            })
-            .transpose()?,
-        created_at: change.created_at.clone(),
-    };
-    json_writer.flush_into(writes);
-    Ok(change)
 }

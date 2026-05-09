@@ -4,10 +4,9 @@ use std::sync::Arc;
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::json_store::{JsonStoreWriter, NormalizedJson};
-use crate::live_state::{
-    LiveStateReader, LiveStateRowRequest, LiveStateWriter, MaterializedLiveStateRow,
-};
-use crate::storage::{StorageReader, StorageWriteSet};
+use crate::live_state::{LiveStateReader, LiveStateRowRequest, MaterializedLiveStateRow};
+use crate::storage::StorageWriteSet;
+use crate::untracked_state::UntrackedStateContext;
 use crate::untracked_state::UntrackedStateRow;
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
@@ -49,16 +48,12 @@ pub(crate) async fn load_sequence(
 ///
 /// The row is untracked global `lix_key_value` state: it is durable local
 /// runtime state, not a changelog fact.
-pub(crate) async fn stage_sequence<S>(
-    writer: &mut LiveStateWriter<S>,
+pub(crate) async fn stage_sequence(
     writes: &mut StorageWriteSet,
     json_writer: &mut JsonStoreWriter,
     sequence: DeterministicSequence,
     timestamp: &str,
-) -> Result<(), LixError>
-where
-    S: StorageReader,
-{
+) -> Result<(), LixError> {
     let snapshot_content = serde_json::to_string(&serde_json::json!({
         "key": DETERMINISTIC_SEQUENCE_KEY,
         "value": sequence.highest_seen,
@@ -75,7 +70,9 @@ where
         &snapshot_content,
         timestamp,
     )?;
-    writer.stage_untracked_rows(writes, std::iter::once(row.as_ref()))
+    UntrackedStateContext::new()
+        .writer(writes)
+        .stage_rows(std::iter::once(row.as_ref()))
 }
 
 async fn load_key_value_row(
@@ -191,7 +188,7 @@ mod tests {
         LiveStateContext::new(
             crate::tracked_state::TrackedStateContext::new(),
             crate::untracked_state::UntrackedStateContext::new(),
-            crate::commit_graph::CommitGraphContext::new(crate::changelog::ChangelogContext::new()),
+            crate::commit_graph::CommitGraphContext::new(),
         )
     }
 
@@ -217,7 +214,6 @@ mod tests {
         crate::test_support::seed_global_version_head(storage.clone()).await;
         write_test_key_value(
             storage.clone(),
-            &live_state,
             DETERMINISTIC_MODE_KEY,
             serde_json::json!({
                 "enabled": true,
@@ -260,7 +256,6 @@ mod tests {
         crate::test_support::seed_global_version_head(storage.clone()).await;
         write_test_key_value(
             storage.clone(),
-            &live_state,
             DETERMINISTIC_SEQUENCE_KEY,
             serde_json::json!(41),
         )
@@ -288,18 +283,14 @@ mod tests {
 
         let mut writes = StorageWriteSet::new();
         let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
-        {
-            let mut writer = live_state.writer(tx.as_mut());
-            stage_sequence(
-                &mut writer,
-                &mut writes,
-                &mut json_writer,
-                DeterministicSequence { highest_seen: 7 },
-                "1970-01-01T00:00:00.000Z",
-            )
-            .await
-            .expect("sequence should stage");
-        }
+        stage_sequence(
+            &mut writes,
+            &mut json_writer,
+            DeterministicSequence { highest_seen: 7 },
+            "1970-01-01T00:00:00.000Z",
+        )
+        .await
+        .expect("sequence should stage");
         json_writer.flush_into(&mut writes);
         writes
             .apply(&mut tx.as_mut())
@@ -330,12 +321,7 @@ mod tests {
         );
     }
 
-    async fn write_test_key_value(
-        storage: StorageContext,
-        live_state: &LiveStateContext,
-        key: &str,
-        value: JsonValue,
-    ) {
+    async fn write_test_key_value(storage: StorageContext, key: &str, value: JsonValue) {
         let mut tx = storage
             .begin_write_transaction()
             .await
@@ -354,12 +340,10 @@ mod tests {
             "1970-01-01T00:00:00.000Z",
         )
         .expect("test key-value should canonicalize");
-        {
-            let mut writer = live_state.writer(tx.as_mut());
-            writer
-                .stage_untracked_rows(&mut writes, std::iter::once(row.as_ref()))
-                .expect("test key-value should stage");
-        }
+        UntrackedStateContext::new()
+            .writer(&mut writes)
+            .stage_rows(std::iter::once(row.as_ref()))
+            .expect("test key-value should stage");
         json_writer.flush_into(&mut writes);
         writes
             .apply(&mut tx.as_mut())

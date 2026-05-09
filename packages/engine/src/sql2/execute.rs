@@ -691,12 +691,12 @@ mod tests {
         SqlWriteExecutionContext,
     };
     use crate::binary_cas::BlobDataReader;
-    use crate::changelog::{CanonicalChange, ChangelogReader, ChangelogScanRequest};
     use crate::commit_graph::{
         CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphChangeSet,
         CommitGraphChangeSetElement, CommitGraphCommit, CommitGraphEdge, CommitGraphReader,
         ReachableCommitGraphCommit,
     };
+    use crate::commit_store::CommitStoreContext;
     use crate::functions::{
         FunctionProvider, FunctionProviderHandle, SharedFunctionProvider, SystemFunctionProvider,
     };
@@ -705,7 +705,7 @@ mod tests {
         LiveStateContext, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
         MaterializedLiveStateRow,
     };
-    use crate::sql2::{ChangelogQuerySource, SqlChangelogQuerySource};
+    use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource};
     use crate::storage::{
         KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch,
         KvValuePage, StorageContext, StorageReadScope, StorageReadTransaction, StorageReader,
@@ -727,7 +727,6 @@ mod tests {
         rows: Vec<MaterializedLiveStateRow>,
     }
     struct BackendBlobReader(StorageContext);
-    struct DummyChangelogReader;
     struct DummyCommitGraphReader;
     struct DummyVersionRefReader;
     struct TestReadTransaction(StorageContext);
@@ -875,13 +874,13 @@ mod tests {
             Arc::clone(&self.blob_reader)
         }
 
-        fn changelog_query_source(&self) -> SqlChangelogQuerySource {
+        fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource {
             let base_scope = test_read_scope(StorageContext::new(Arc::new(
                 crate::backend::testing::UnitTestBackend::new(),
             )));
             let read_scope = StorageReadScope::new(base_scope.store());
-            ChangelogQuerySource {
-                changelog_reader: Arc::new(DummyChangelogReader),
+            CommitStoreQuerySource {
+                commit_store_reader: Arc::new(CommitStoreContext::new().reader(read_scope.store())),
                 json_reader: JsonStoreContext::new().reader(read_scope.store()),
             }
         }
@@ -972,23 +971,6 @@ mod tests {
     ) -> Result<crate::SqlQueryResult, LixError> {
         let plan = create_write_logical_plan(ctx, sql).await?;
         execute_logical_plan(plan, params).await
-    }
-
-    #[async_trait]
-    impl ChangelogReader for DummyChangelogReader {
-        async fn load_changes(
-            &self,
-            change_ids: &[String],
-        ) -> Result<Vec<Option<CanonicalChange>>, LixError> {
-            Ok(vec![None; change_ids.len()])
-        }
-
-        async fn scan_changes(
-            &self,
-            _request: &ChangelogScanRequest,
-        ) -> Result<Vec<CanonicalChange>, LixError> {
-            Ok(Vec::new())
-        }
     }
 
     #[async_trait]
@@ -1134,6 +1116,7 @@ mod tests {
             file_id: None,
             snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
             metadata: metadata.map(str::to_string),
+            deleted: false,
             version_id: "version-a".to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),
@@ -1151,6 +1134,7 @@ mod tests {
             file_id: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
             metadata: Some(json!({ "source": entity_id }).to_string()),
+            deleted: false,
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),
@@ -1182,6 +1166,7 @@ mod tests {
                 .to_string(),
             ),
             metadata: Some(json!({ "source": entity_id }).to_string()),
+            deleted: false,
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),
@@ -1213,6 +1198,7 @@ mod tests {
                 .to_string(),
             ),
             metadata: Some(json!({ "source": entity_id }).to_string()),
+            deleted: false,
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),
@@ -2872,13 +2858,11 @@ mod tests {
             Arc::clone(&self.blob_reader)
         }
 
-        fn changelog_query_source(&self) -> SqlChangelogQuerySource {
+        fn commit_store_query_source(&self) -> SqlCommitStoreQuerySource {
             let base_scope = test_read_scope(self.storage.clone());
             let read_scope = StorageReadScope::new(base_scope.store());
-            ChangelogQuerySource {
-                changelog_reader: Arc::new(
-                    crate::changelog::ChangelogContext::new().reader(read_scope.store()),
-                ),
+            CommitStoreQuerySource {
+                commit_store_reader: Arc::new(CommitStoreContext::new().reader(read_scope.store())),
                 json_reader: JsonStoreContext::new().reader(read_scope.store()),
             }
         }
@@ -3011,7 +2995,7 @@ mod tests {
         LiveStateContext::new(
             TrackedStateContext::new(),
             UntrackedStateContext::new(),
-            crate::commit_graph::CommitGraphContext::new(crate::changelog::ChangelogContext::new()),
+            crate::commit_graph::CommitGraphContext::new(),
         )
     }
 

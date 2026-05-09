@@ -6,12 +6,12 @@ use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{Expr, Operator};
 use tokio::sync::Mutex;
 
-use crate::changelog::{materialize_change, MaterializedCanonicalChange};
 use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
 use crate::entity_identity::EntityIdentity;
 use crate::LixError;
 
 use super::SqlJsonReader;
+use crate::commit_store::{materialize_change, MaterializedChange};
 
 /// Shared routing state for commit-shaped history SQL surfaces.
 ///
@@ -133,7 +133,7 @@ impl HistoryRoute {
 /// history surfaces.
 #[derive(Debug, Clone)]
 pub(crate) struct HistoryEntry {
-    pub(crate) change: MaterializedCanonicalChange,
+    pub(crate) change: MaterializedChange,
     pub(crate) observed_commit_id: String,
     pub(crate) commit_created_at: String,
     pub(crate) start_commit_id: String,

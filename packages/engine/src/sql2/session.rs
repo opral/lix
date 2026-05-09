@@ -5,7 +5,6 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use crate::LixError;
 
 use super::change_provider::register_lix_change_provider;
-use super::commit_derived_provider::register_commit_derived_providers;
 use super::directory_history_provider::register_lix_directory_history_provider;
 use super::directory_provider::{
     register_lix_directory_providers, register_lix_directory_write_providers,
@@ -37,22 +36,20 @@ pub(crate) async fn build_read_session(
     )
     .await?;
     register_lix_version_provider(&session, ctx.live_state(), Arc::clone(&version_ref)).await?;
-    let changelog_query_source = ctx.changelog_query_source();
-    register_lix_change_provider(&session, changelog_query_source.clone()).await?;
-    let commit_graph = ctx.commit_graph();
-    register_commit_derived_providers(&session, commit_graph, Arc::clone(&version_ref)).await?;
+    let commit_store_query_source = ctx.commit_store_query_source();
+    register_lix_change_provider(&session, commit_store_query_source.clone()).await?;
     let state_history_commit_graph = ctx.commit_graph();
     register_history_providers(
         &session,
         state_history_commit_graph,
-        changelog_query_source.clone(),
+        commit_store_query_source.clone(),
     )
     .await?;
     let file_history_commit_graph = ctx.commit_graph();
     register_lix_file_history_provider(
         &session,
         file_history_commit_graph,
-        changelog_query_source.clone(),
+        commit_store_query_source.clone(),
         ctx.blob_reader(),
     )
     .await?;
@@ -60,7 +57,7 @@ pub(crate) async fn build_read_session(
     register_lix_directory_history_provider(
         &session,
         directory_history_commit_graph,
-        changelog_query_source.clone(),
+        commit_store_query_source.clone(),
     )
     .await?;
     let entity_commit_graph = Arc::new(tokio::sync::Mutex::new(ctx.commit_graph()));
@@ -87,7 +84,7 @@ pub(crate) async fn build_read_session(
         ctx.live_state(),
         Arc::clone(&version_ref),
         entity_commit_graph,
-        changelog_query_source,
+        commit_store_query_source,
         &ctx.list_visible_schemas()?,
     )
     .await?;

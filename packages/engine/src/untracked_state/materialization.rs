@@ -11,6 +11,7 @@ pub(crate) async fn materialize_row<S>(
 where
     S: StorageReader,
 {
+    let deleted = row.snapshot_ref.is_none();
     let snapshot_content = if projection.snapshot_content {
         load_optional_json(json_reader, row.snapshot_ref.as_ref(), "snapshot_ref").await?
     } else {
@@ -27,6 +28,7 @@ where
         file_id: row.file_id,
         snapshot_content,
         metadata,
+        deleted,
         created_at: row.created_at,
         updated_at: row.updated_at,
         global: row.global,
