@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, fmt, ops::Deref, sync::Arc};
 
 use crate::entity_identity::EntityIdentity;
-use crate::json_store::{JsonRef, JsonStoreWriter, NormalizedJson};
+use crate::json_store::JsonRef;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::schema_catalog::SchemaPlanId;
 use crate::tracked_state::MaterializedTrackedStateRow;
@@ -254,13 +254,11 @@ impl StageJson {
 }
 
 pub(crate) fn stage_json_from_value(
-    json_writer: &mut JsonStoreWriter,
     value: TransactionJson,
     _context: &str,
 ) -> Result<StageJson, LixError> {
     let (value, normalized) = value.into_parts();
-    let json_ref =
-        json_writer.prepare_json(NormalizedJson::from_arc_unchecked(Arc::clone(&normalized)))?;
+    let json_ref = JsonRef::for_content(normalized.as_bytes());
     Ok(StageJson {
         value,
         normalized,
@@ -277,8 +275,9 @@ pub(crate) struct PreparedRowFacts {
 
 /// Prepared state row owned by the transaction write buffer.
 ///
-/// This is the first boundary that owns `StageJson`: JSON has been normalized,
-/// assigned a `JsonRef`, and staged in the transaction-local `JsonStoreWriter`.
+/// This is the first boundary that owns `StageJson`: JSON has been normalized
+/// and assigned a content-addressed `JsonRef`. Durable placement belongs to the
+/// JSON store at batch staging time, not row preparation time.
 /// Storage owners must receive only the ref-backed row forms derived from this
 /// type.
 #[derive(Debug, Clone, PartialEq, Eq)]

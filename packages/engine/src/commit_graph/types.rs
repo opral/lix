@@ -1,4 +1,4 @@
-use crate::commit_store::Change;
+use crate::commit_store::{Change, LocatedChange};
 use crate::entity_identity::EntityIdentity;
 use crate::LixError;
 
@@ -51,7 +51,7 @@ pub(crate) struct CommitGraphChangeHistoryRequest {
 /// necessarily a graph root or a version head.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphChangeHistoryEntry {
-    pub(crate) change: Change,
+    pub(crate) located_change: LocatedChange,
     pub(crate) observed_commit_id: String,
     pub(crate) start_commit_id: String,
     pub(crate) depth: u32,

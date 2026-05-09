@@ -628,7 +628,9 @@ mod tests {
     use crate::backend::{testing::UnitTestBackend, Backend};
     use crate::commit_store::{CommitDraftRef, CommitStoreContext};
     use crate::entity_identity::EntityIdentity;
-    use crate::json_store::JsonStoreContext;
+    use crate::json_store::{
+        JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef,
+    };
     use crate::live_state::LiveStateFilter;
     use crate::storage::{StorageContext, StorageWriteSet, StorageWriteTransaction};
     use crate::tracked_state::{TrackedStateDeltaRef, TrackedStateScanRequest};
@@ -651,19 +653,11 @@ mod tests {
         rows: &[MaterializedUntrackedStateRow],
     ) {
         let mut writes = StorageWriteSet::new();
-        let canonical_rows = {
-            let mut json_writer = JsonStoreContext::new().writer();
-            rows.iter()
-                .map(|row| {
-                    crate::test_support::untracked_state_row_from_materialized(
-                        &mut writes,
-                        &mut json_writer,
-                        row,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .expect("untracked rows should canonicalize")
-        };
+        let canonical_rows = rows
+            .iter()
+            .map(|row| crate::test_support::untracked_state_row_from_materialized(&mut writes, row))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("untracked rows should canonicalize");
         UntrackedStateContext::new()
             .writer(&mut writes)
             .stage_rows(canonical_rows.iter().map(|row| row.as_ref()))
@@ -677,7 +671,7 @@ mod tests {
     async fn stage_materialized_live_rows(
         store: &mut (impl StorageReader + ?Sized),
         writes: &mut StorageWriteSet,
-        json_writer: &mut crate::json_store::JsonStoreWriter,
+        _json_writer: &mut crate::json_store::JsonStoreWriter,
         rows: &[MaterializedLiveStateRow],
     ) -> Result<(), LixError> {
         let mut untracked_rows = Vec::new();
@@ -692,7 +686,6 @@ mod tests {
                 let materialized = crate::untracked_state::MaterializedUntrackedStateRow::from(row);
                 let canonical = crate::test_support::untracked_state_row_from_materialized(
                     writes,
-                    json_writer,
                     &materialized,
                 )?;
                 untracked_rows.push(canonical);
@@ -709,10 +702,8 @@ mod tests {
                 );
             }
             if row.schema_key != COMMIT_SCHEMA_KEY {
-                let change = crate::test_support::tracked_change_from_materialized(
-                    json_writer,
-                    &materialized,
-                )?;
+                let change = crate::test_support::tracked_change_from_materialized(&materialized)?;
+                stage_tracked_materialized_json(writes, &commit_id, &materialized)?;
                 tracked_rows_by_commit.entry(commit_id).or_default().push((
                     change,
                     materialized.created_at,
@@ -721,7 +712,6 @@ mod tests {
             }
         }
 
-        json_writer.flush_into(writes);
         UntrackedStateContext::new()
             .writer(writes)
             .stage_rows(untracked_rows.iter().map(|row| row.as_ref()))?;
@@ -767,6 +757,33 @@ mod tests {
                 .stage_delta(&commit_id, parent_commit_id.as_deref(), deltas)
                 .await?;
         }
+        Ok(())
+    }
+
+    fn stage_tracked_materialized_json(
+        writes: &mut StorageWriteSet,
+        commit_id: &str,
+        row: &MaterializedTrackedStateRow,
+    ) -> Result<(), LixError> {
+        let mut payloads = Vec::new();
+        if let Some(snapshot) = row.snapshot_content.as_deref() {
+            payloads.push(NormalizedJson::from_arc_unchecked(Arc::from(snapshot)));
+        }
+        if let Some(metadata) = row.metadata.as_ref() {
+            payloads.push(NormalizedJson::from_arc_unchecked(Arc::from(
+                crate::serialize_row_metadata(metadata),
+            )));
+        }
+        JsonStoreContext::new().writer().stage_batch(
+            writes,
+            JsonWritePlacementRef::CommitPack {
+                commit_id,
+                pack_id: 0,
+            },
+            payloads
+                .iter()
+                .map(|payload| NormalizedJsonRef::from(payload)),
+        )?;
         Ok(())
     }
 

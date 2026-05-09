@@ -252,7 +252,7 @@ pub(crate) async fn load_history_entries(
             .collect::<BTreeMap<_, _>>();
 
         for entry in entries {
-            let change = materialize_change(&mut json_reader, entry.change).await?;
+            let change = materialize_change(&mut json_reader, entry.located_change).await?;
             rows.push(HistoryEntry {
                 commit_created_at: commit_created_at_by_id
                     .get(&entry.observed_commit_id)

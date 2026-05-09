@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{DeterministicMode, DeterministicSequence};
-use crate::json_store::{JsonStoreWriter, NormalizedJson};
+use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef};
 use crate::live_state::{LiveStateReader, LiveStateRowRequest, MaterializedLiveStateRow};
 use crate::storage::StorageWriteSet;
 use crate::untracked_state::UntrackedStateContext;
@@ -50,7 +50,6 @@ pub(crate) async fn load_sequence(
 /// runtime state, not a changelog fact.
 pub(crate) async fn stage_sequence(
     writes: &mut StorageWriteSet,
-    json_writer: &mut JsonStoreWriter,
     sequence: DeterministicSequence,
     timestamp: &str,
 ) -> Result<(), LixError> {
@@ -64,12 +63,16 @@ pub(crate) async fn stage_sequence(
             format!("deterministic sequence snapshot serialization failed: {error}"),
         )
     })?;
-    let row = deterministic_key_value_row(
-        json_writer,
-        DETERMINISTIC_SEQUENCE_KEY,
-        &snapshot_content,
-        timestamp,
+    let snapshot = NormalizedJson::from_arc_unchecked(Arc::from(snapshot_content.as_str()));
+    JsonStoreContext::new().writer().stage_batch(
+        writes,
+        JsonWritePlacementRef::Direct,
+        [NormalizedJsonRef {
+            normalized: snapshot.as_str(),
+        }],
     )?;
+    let row =
+        deterministic_key_value_row(DETERMINISTIC_SEQUENCE_KEY, snapshot.as_str(), timestamp)?;
     UntrackedStateContext::new()
         .writer(writes)
         .stage_rows(std::iter::once(row.as_ref()))
@@ -153,14 +156,11 @@ fn parse_sequence_value(value: JsonValue) -> Result<DeterministicSequence, LixEr
 }
 
 fn deterministic_key_value_row(
-    json_writer: &mut JsonStoreWriter,
     key: &str,
     snapshot_content: &str,
     timestamp: &str,
 ) -> Result<UntrackedStateRow, LixError> {
-    let snapshot_ref = json_writer.prepare_json(NormalizedJson::from_arc_unchecked(Arc::from(
-        snapshot_content,
-    )))?;
+    let snapshot_ref = crate::json_store::JsonRef::for_content(snapshot_content.as_bytes());
     Ok(UntrackedStateRow {
         entity_id: crate::entity_identity::EntityIdentity::single(key),
         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
@@ -282,16 +282,13 @@ mod tests {
             .expect("transaction should open");
 
         let mut writes = StorageWriteSet::new();
-        let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
         stage_sequence(
             &mut writes,
-            &mut json_writer,
             DeterministicSequence { highest_seen: 7 },
             "1970-01-01T00:00:00.000Z",
         )
         .await
         .expect("sequence should stage");
-        json_writer.flush_into(&mut writes);
         writes
             .apply(&mut tx.as_mut())
             .await
@@ -332,19 +329,22 @@ mod tests {
         }))
         .expect("snapshot should serialize");
         let mut writes = StorageWriteSet::new();
-        let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
-        let row = deterministic_key_value_row(
-            &mut json_writer,
-            key,
-            &snapshot_content,
-            "1970-01-01T00:00:00.000Z",
-        )
-        .expect("test key-value should canonicalize");
+        crate::json_store::JsonStoreContext::new()
+            .writer()
+            .stage_batch(
+                &mut writes,
+                crate::json_store::JsonWritePlacementRef::Direct,
+                [crate::json_store::NormalizedJsonRef {
+                    normalized: snapshot_content.as_str(),
+                }],
+            )
+            .expect("test key-value JSON should stage");
+        let row = deterministic_key_value_row(key, &snapshot_content, "1970-01-01T00:00:00.000Z")
+            .expect("test key-value should canonicalize");
         UntrackedStateContext::new()
             .writer(&mut writes)
             .stage_rows(std::iter::once(row.as_ref()))
             .expect("test key-value should stage");
-        json_writer.flush_into(&mut writes);
         writes
             .apply(&mut tx.as_mut())
             .await

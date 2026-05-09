@@ -2,14 +2,14 @@ use crate::json_store::types::JsonRef;
 use std::borrow::Cow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum JsonCodec {
+pub(crate) enum JsonCodec {
     Raw,
     Zstd,
 }
 
-pub(super) struct EncodedJson<'a> {
-    pub(super) json_ref: JsonRef,
-    pub(super) codec: JsonCodec,
-    pub(super) uncompressed_len: usize,
-    pub(super) data: Cow<'a, [u8]>,
+pub(crate) struct EncodedJson<'a> {
+    pub(crate) json_ref: JsonRef,
+    pub(crate) codec: JsonCodec,
+    pub(crate) uncompressed_len: usize,
+    pub(crate) data: Cow<'a, [u8]>,
 }

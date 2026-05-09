@@ -11,6 +11,6 @@ pub(crate) use materialization::materialize_change;
 #[allow(unused_imports)]
 pub(crate) use types::{
     Change, ChangeIndexEntry, ChangeLocator, ChangeLocatorRef, ChangePack, ChangePackView,
-    ChangeRef, ChangeScanRequest, Commit, CommitDraftRef, MaterializedChange, MembershipPack,
-    MembershipPackView, StagedCommitStoreCommit, StoredCommitRef,
+    ChangeRef, ChangeScanRequest, Commit, CommitDraftRef, LocatedChange, MaterializedChange,
+    MembershipPack, MembershipPackView, StagedCommitStoreCommit, StoredCommitRef,
 };

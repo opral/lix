@@ -1,14 +1,17 @@
 use crate::json_store::compression::{compress_json_payload, decode_json_zstd_payload};
 use crate::json_store::encoded::{EncodedJson, JsonCodec};
-use crate::json_store::types::JsonRef;
+use crate::json_store::types::{JsonReadScopeRef, JsonRef};
 use crate::storage::{KvGetGroup, KvGetRequest, StorageReader};
 use crate::LixError;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 pub(crate) const JSON_NAMESPACE: &str = "json_store.json";
+pub(crate) const JSON_PACK_NAMESPACE: &str = "json_store.pack";
 const STORED_JSON_MAGIC: &[u8] = b"lix-json:v1";
 const STORED_JSON_HEADER_LEN: usize = STORED_JSON_MAGIC.len() + 1 + 8;
+const STORED_JSON_PACK_MAGIC: &[u8] = b"lix-json-pack:v1";
+const STORED_JSON_PACK_ENTRY_HEADER_LEN: usize = 32 + 1 + 8 + 8 + 8;
 const ZSTD_MIN_JSON_BYTES: usize = 16 * 1024;
 const MIN_ZSTD_SAVINGS_BYTES: usize = 128;
 
@@ -20,6 +23,10 @@ struct StoredJsonPayload<'a> {
 
 fn raw_json_ref_for_content(json: &str) -> JsonRef {
     JsonRef::from_hash(blake3::hash(json.as_bytes()))
+}
+
+pub(crate) fn json_ref_for_content(bytes: &[u8]) -> JsonRef {
+    JsonRef::for_content(bytes)
 }
 
 #[cfg(test)]
@@ -58,6 +65,60 @@ fn encode_json_for_storage_with_ref(
     })
 }
 
+pub(crate) fn encode_json_str(json: &str) -> Result<EncodedJson<'_>, LixError> {
+    encode_json_for_storage(json)
+}
+
+pub(crate) fn encode_direct_json_payload(encoded_json: &EncodedJson<'_>) -> Vec<u8> {
+    encode_stored_json_payload(encoded_json)
+}
+
+pub(crate) fn pack_key(commit_id: &str, pack_id: u32) -> Vec<u8> {
+    let commit_id = commit_id.as_bytes();
+    let mut key = Vec::with_capacity(4 + commit_id.len() + 4);
+    key.extend_from_slice(&(commit_id.len() as u32).to_be_bytes());
+    key.extend_from_slice(commit_id);
+    key.extend_from_slice(&pack_id.to_be_bytes());
+    key
+}
+
+pub(crate) fn encode_json_pack(entries: &[&EncodedJson<'_>]) -> Result<Vec<u8>, LixError> {
+    let mut directory_len =
+        STORED_JSON_PACK_MAGIC.len() + 4 + entries.len() * STORED_JSON_PACK_ENTRY_HEADER_LEN;
+    let payload_len = entries
+        .iter()
+        .map(|entry| entry.data.as_ref().len())
+        .sum::<usize>();
+    let mut out = Vec::with_capacity(directory_len + payload_len);
+    out.extend_from_slice(STORED_JSON_PACK_MAGIC);
+    out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+
+    let mut offset = 0_u64;
+    for entry in entries {
+        let data = entry.data.as_ref();
+        out.extend_from_slice(entry.json_ref.as_hash_bytes());
+        out.push(json_codec_byte(entry.codec));
+        out.extend_from_slice(&(entry.uncompressed_len as u64).to_be_bytes());
+        out.extend_from_slice(&offset.to_be_bytes());
+        out.extend_from_slice(&(data.len() as u64).to_be_bytes());
+        offset = offset.checked_add(data.len() as u64).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "json_store pack payload offset overflow",
+            )
+        })?;
+    }
+    for entry in entries {
+        out.extend_from_slice(entry.data.as_ref());
+    }
+    directory_len = out.len() - payload_len;
+    debug_assert_eq!(
+        directory_len,
+        STORED_JSON_PACK_MAGIC.len() + 4 + entries.len() * STORED_JSON_PACK_ENTRY_HEADER_LEN
+    );
+    Ok(out)
+}
+
 pub(crate) fn encode_json_bytes_for_storage(bytes: &[u8]) -> Result<(JsonRef, Vec<u8>), LixError> {
     let json = std::str::from_utf8(bytes).map_err(|error| {
         LixError::new(
@@ -78,7 +139,7 @@ pub(crate) fn encode_json_str_for_storage_with_ref(
     Ok((json_ref, encode_stored_json_payload(&encoded_json)))
 }
 
-pub(crate) async fn load_json_bytes(
+async fn load_json_bytes_direct(
     store: &mut impl StorageReader,
     json_ref: &JsonRef,
 ) -> Result<Option<Vec<u8>>, LixError> {
@@ -98,14 +159,14 @@ pub(crate) async fn load_json_bytes(
         return Ok(None);
     };
     let stored_payload = decode_stored_json_payload(&bytes)?;
-    decode_json_payload(store, json_ref, stored_payload)
-        .await
-        .map(Some)
+    let _ = store;
+    decode_json_payload(json_ref, stored_payload).map(Some)
 }
 
-pub(crate) async fn load_json_bytes_many(
+pub(crate) async fn load_json_bytes_many_in_scope(
     store: &mut impl StorageReader,
     json_refs: &[JsonRef],
+    scope: JsonReadScopeRef<'_>,
 ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
     if json_refs.is_empty() {
         return Ok(Vec::new());
@@ -130,11 +191,34 @@ pub(crate) async fn load_json_bytes_many(
         requested_indexes.push(index);
     }
 
+    let mut unique_values = match scope {
+        JsonReadScopeRef::Direct => vec![None; unique_refs.len()],
+        JsonReadScopeRef::CommitPacks {
+            commit_id,
+            pack_ids,
+        } => load_from_packs(store, &unique_refs, commit_id, pack_ids).await?,
+    };
+
+    let missing = unique_values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| value.is_none().then_some(index))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(requested_indexes
+            .into_iter()
+            .map(|index| unique_values[index].clone())
+            .collect());
+    }
+
     let result = store
         .get_values(KvGetRequest {
             groups: vec![KvGetGroup {
                 namespace: JSON_NAMESPACE.to_string(),
-                keys: unique_keys,
+                keys: missing
+                    .iter()
+                    .map(|&index| unique_keys[index].clone())
+                    .collect(),
             }],
         })
         .await?;
@@ -144,33 +228,77 @@ pub(crate) async fn load_json_bytes_many(
             "json_store batch load returned no result group",
         )
     })?;
-    if group.len() != unique_refs.len() {
+    if group.len() != missing.len() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
                 "json_store batch load returned {} values for {} requested refs",
                 group.len(),
-                unique_refs.len()
+                missing.len()
             ),
         ));
     }
 
-    let mut unique_values = Vec::with_capacity(unique_refs.len());
     for (index, stored_bytes) in group.values_iter().enumerate() {
+        let unique_index = missing[index];
         let Some(stored_bytes) = stored_bytes else {
-            unique_values.push(None);
             continue;
         };
         let stored_payload = decode_stored_json_payload(stored_bytes)?;
-        unique_values.push(Some(
-            decode_json_payload(store, &unique_refs[index], stored_payload).await?,
-        ));
+        let _ = store;
+        unique_values[unique_index] = Some(decode_json_payload(
+            &unique_refs[unique_index],
+            stored_payload,
+        )?);
     }
 
     Ok(requested_indexes
         .into_iter()
         .map(|index| unique_values[index].clone())
         .collect())
+}
+
+async fn load_from_packs(
+    store: &mut impl StorageReader,
+    unique_refs: &[JsonRef],
+    commit_id: &str,
+    pack_ids: &[u32],
+) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+    let mut values = vec![None; unique_refs.len()];
+    if pack_ids.is_empty() || unique_refs.is_empty() {
+        return Ok(values);
+    }
+    let wanted = unique_refs
+        .iter()
+        .enumerate()
+        .map(|(index, json_ref)| (json_ref.as_hash_bytes().to_vec(), index))
+        .collect::<BTreeMap<_, _>>();
+    let keys = pack_ids
+        .iter()
+        .map(|&pack_id| pack_key(commit_id, pack_id))
+        .collect::<Vec<_>>();
+    let result = store
+        .get_values(KvGetRequest {
+            groups: vec![KvGetGroup {
+                namespace: JSON_PACK_NAMESPACE.to_string(),
+                keys,
+            }],
+        })
+        .await?;
+    let group = result.groups.into_iter().next().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "json_store pack load returned no result group",
+        )
+    })?;
+    for stored_pack in group.values_iter().flatten() {
+        for (json_ref, value) in decode_json_pack(stored_pack)? {
+            if let Some(&index) = wanted.get(json_ref.as_hash_bytes()) {
+                values[index] = Some(value);
+            }
+        }
+    }
+    Ok(values)
 }
 
 fn encode_stored_json_payload(encoded_json: &EncodedJson<'_>) -> Vec<u8> {
@@ -228,8 +356,7 @@ fn read_json_codec(byte: u8) -> Result<JsonCodec, LixError> {
     }
 }
 
-async fn decode_json_payload(
-    _store: &mut impl StorageReader,
+fn decode_json_payload(
     json_ref: &JsonRef,
     stored_payload: StoredJsonPayload<'_>,
 ) -> Result<Vec<u8>, LixError> {
@@ -260,6 +387,104 @@ async fn decode_json_payload(
         ));
     }
     Ok(data)
+}
+
+fn decode_json_pack(bytes: &[u8]) -> Result<Vec<(JsonRef, Vec<u8>)>, LixError> {
+    if bytes.len() < STORED_JSON_PACK_MAGIC.len() + 4 {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "stored JSON pack is truncated",
+        ));
+    }
+    if &bytes[..STORED_JSON_PACK_MAGIC.len()] != STORED_JSON_PACK_MAGIC {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "stored JSON pack has invalid header",
+        ));
+    }
+    let count_start = STORED_JSON_PACK_MAGIC.len();
+    let count_end = count_start + 4;
+    let count = u32::from_be_bytes(
+        bytes[count_start..count_end]
+            .try_into()
+            .expect("json pack count header is fixed size"),
+    ) as usize;
+    let directory_start = count_end;
+    let directory_len = count
+        .checked_mul(STORED_JSON_PACK_ENTRY_HEADER_LEN)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "json pack directory overflow",
+            )
+        })?;
+    let payload_start = directory_start.checked_add(directory_len).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "json pack payload offset overflow",
+        )
+    })?;
+    if bytes.len() < payload_start {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "stored JSON pack directory is truncated",
+        ));
+    }
+
+    let mut out = Vec::with_capacity(count);
+    for index in 0..count {
+        let mut cursor = directory_start + index * STORED_JSON_PACK_ENTRY_HEADER_LEN;
+        let hash: [u8; 32] = bytes[cursor..cursor + 32]
+            .try_into()
+            .expect("json pack hash header is fixed size");
+        cursor += 32;
+        let codec = read_json_codec(bytes[cursor])?;
+        cursor += 1;
+        let uncompressed_len = u64::from_be_bytes(
+            bytes[cursor..cursor + 8]
+                .try_into()
+                .expect("json pack uncompressed length is fixed size"),
+        ) as usize;
+        cursor += 8;
+        let offset = u64::from_be_bytes(
+            bytes[cursor..cursor + 8]
+                .try_into()
+                .expect("json pack payload offset is fixed size"),
+        ) as usize;
+        cursor += 8;
+        let len = u64::from_be_bytes(
+            bytes[cursor..cursor + 8]
+                .try_into()
+                .expect("json pack payload length is fixed size"),
+        ) as usize;
+        let data_start = payload_start.checked_add(offset).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "json pack entry offset overflow",
+            )
+        })?;
+        let data_end = data_start.checked_add(len).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "json pack entry length overflow",
+            )
+        })?;
+        if data_end > bytes.len() {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "stored JSON pack entry payload is truncated",
+            ));
+        }
+        let json_ref = JsonRef::from_hash_bytes(hash);
+        let payload = StoredJsonPayload {
+            codec,
+            uncompressed_len,
+            data: &bytes[data_start..data_end],
+        };
+        let value = decode_json_payload(&json_ref, payload)?;
+        out.push((json_ref, value));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -298,7 +523,7 @@ mod tests {
 
         let mut store = storage.clone();
         assert_eq!(
-            load_json_bytes(&mut store, &encoded.json_ref)
+            load_json_bytes_direct(&mut store, &encoded.json_ref)
                 .await
                 .expect("json should load"),
             Some(json.as_bytes().to_vec())
@@ -336,9 +561,10 @@ mod tests {
             .expect("transaction should commit");
 
         let mut store = storage.clone();
-        let values = load_json_bytes_many(
+        let values = load_json_bytes_many_in_scope(
             &mut store,
             &[second.json_ref, first.json_ref, second.json_ref],
+            JsonReadScopeRef::Direct,
         )
         .await
         .expect("json batch should load");

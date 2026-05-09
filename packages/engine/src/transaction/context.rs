@@ -10,7 +10,7 @@ use crate::commit_store::CommitStoreContext;
 use crate::domain::Domain;
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
-use crate::json_store::{JsonStoreContext, JsonStoreWriter};
+use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::live_state::{
     LiveStateContext, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
 };
@@ -307,12 +307,9 @@ impl Transaction {
                         .map(|row| (index, row))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            self.staged_writes.with_json_writer(|json_writer| {
-                for (index, row) in normalized_rows {
-                    prepared_rows[index] = Some(prepare_state_row(row, &functions, json_writer)?);
-                }
-                Ok(())
-            })?;
+            for (index, row) in normalized_rows {
+                prepared_rows[index] = Some(prepare_state_row(row, &functions)?);
+            }
         }
         Ok(prepared_rows
             .into_iter()
@@ -399,16 +396,9 @@ impl Transaction {
                 }
                 planned_changes.push((index, change, schema_plan_id));
             }
-            self.staged_writes.with_json_writer(|json_writer| {
-                for (index, change, schema_plan_id) in planned_changes {
-                    prepared_rows[index] = Some(prepare_adopted_state_row(
-                        change,
-                        schema_plan_id,
-                        json_writer,
-                    )?);
-                }
-                Ok(())
-            })?;
+            for (index, change, schema_plan_id) in planned_changes {
+                prepared_rows[index] = Some(prepare_adopted_state_row(change, schema_plan_id)?);
+            }
         }
         Ok(prepared_rows
             .into_iter()
@@ -511,15 +501,16 @@ impl Transaction {
     ) -> Result<(), LixError> {
         let timestamp = self.functions.call_timestamp();
         let mut writes = StorageWriteSet::new();
-        let canonical_row = {
-            let mut json_writer = JsonStoreContext::new().writer();
-            let canonical_row =
-                prepare_version_ref_row(&mut json_writer, version_id, commit_id, &timestamp)?;
-            json_writer.flush_into(&mut writes);
-            canonical_row
-        };
+        let canonical_row = prepare_version_ref_row(version_id, commit_id, &timestamp)?;
+        JsonStoreContext::new().writer().stage_batch(
+            &mut writes,
+            JsonWritePlacementRef::Direct,
+            [NormalizedJsonRef {
+                normalized: canonical_row.snapshot.as_str(),
+            }],
+        )?;
         self.version_ctx
-            .stage_canonical_ref_rows(&mut writes, &[canonical_row])?;
+            .stage_canonical_ref_rows(&mut writes, &[canonical_row.row])?;
         writes
             .apply(&mut self.storage_transaction.as_mut())
             .await
@@ -561,7 +552,6 @@ impl Transaction {
 fn prepare_state_row(
     normalized: NormalizedTransactionWriteRow,
     functions: &FunctionProviderHandle,
-    json_writer: &mut JsonStoreWriter,
 ) -> Result<PreparedStateRow, LixError> {
     let NormalizedTransactionWriteRow {
         row,
@@ -571,11 +561,11 @@ fn prepare_state_row(
     } = normalized;
     let updated_at = row.updated_at.unwrap_or_else(|| functions.call_timestamp());
     let snapshot = snapshot
-        .map(|value| stage_json_from_value(json_writer, value, "prepared row snapshot_content"))
+        .map(|value| stage_json_from_value(value, "prepared row snapshot_content"))
         .transpose()?;
     let metadata = row
         .metadata
-        .map(|value| stage_json_from_value(json_writer, value, "prepared row metadata"))
+        .map(|value| stage_json_from_value(value, "prepared row metadata"))
         .transpose()?;
     Ok(PreparedStateRow {
         schema_plan_id,
@@ -626,7 +616,6 @@ fn remember_adopted_registered_schema(
 fn prepare_adopted_state_row(
     change: TransactionAdoptedChange,
     schema_plan_id: crate::schema_catalog::SchemaPlanId,
-    json_writer: &mut JsonStoreWriter,
 ) -> Result<PreparedAdoptedStateRow, LixError> {
     if change.change_id != change.projected_row.change_id {
         return Err(LixError::new(
@@ -641,14 +630,12 @@ fn prepare_adopted_state_row(
     let snapshot = row
         .snapshot_content
         .as_deref()
-        .map(|value| {
-            stage_materialized_json_text(json_writer, value, "adopted row snapshot_content")
-        })
+        .map(|value| stage_materialized_json_text(value, "adopted row snapshot_content"))
         .transpose()?;
     let metadata = row
         .metadata
         .as_deref()
-        .map(|value| stage_materialized_json_text(json_writer, value, "adopted row metadata"))
+        .map(|value| stage_materialized_json_text(value, "adopted row metadata"))
         .transpose()?;
     Ok(PreparedAdoptedStateRow {
         schema_plan_id,
@@ -668,7 +655,6 @@ fn prepare_adopted_state_row(
 }
 
 fn stage_materialized_json_text(
-    json_writer: &mut JsonStoreWriter,
     value: &str,
     context: &str,
 ) -> Result<crate::transaction::types::StageJson, LixError> {
@@ -679,7 +665,7 @@ fn stage_materialized_json_text(
         )
     })?;
     let prepared = TransactionJson::from_value(parsed, context)?;
-    stage_json_from_value(json_writer, prepared, context)
+    stage_json_from_value(prepared, context)
 }
 
 pub(crate) struct OpenTransaction {
@@ -981,17 +967,21 @@ mod tests {
             .await
             .expect("changelog should scan");
         assert!(
-            changes.iter().any(
-                |change| change.entity_id.as_single_string_owned().as_deref()
-                    == Ok("tracked-programmatic")
-            ),
+            changes.iter().any(|change| change
+                .record
+                .entity_id
+                .as_single_string_owned()
+                .as_deref()
+                == Ok("tracked-programmatic")),
             "tracked staged row should be appended to changelog"
         );
         assert!(
-            !changes.iter().any(
-                |change| change.entity_id.as_single_string_owned().as_deref()
-                    == Ok("untracked-programmatic")
-            ),
+            !changes.iter().any(|change| change
+                .record
+                .entity_id
+                .as_single_string_owned()
+                .as_deref()
+                == Ok("untracked-programmatic")),
             "untracked staged row must not be appended to changelog"
         );
 
@@ -1122,10 +1112,12 @@ mod tests {
             .await
             .expect("changelog should scan after failed commit");
         assert!(
-            changes.iter().all(
-                |change| change.entity_id.as_single_string_owned().as_deref()
-                    != Ok("invalid-programmatic")
-            ),
+            changes.iter().all(|change| change
+                .record
+                .entity_id
+                .as_single_string_owned()
+                .as_deref()
+                != Ok("invalid-programmatic")),
             "validation failure must happen before changelog persistence"
         );
         let head = version_ctx
@@ -1440,7 +1432,6 @@ mod tests {
 
     async fn seed_visible_schema_rows(storage: StorageContext) {
         let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer();
         let rows = crate::schema::seed_schema_definitions()
             .into_iter()
             .map(|schema| {
@@ -1463,13 +1454,21 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let version_ref_row = prepare_version_ref_row(
-            &mut json_writer,
             GLOBAL_VERSION_ID,
             SCHEMA_FIXTURE_COMMIT_ID,
             "1970-01-01T00:00:00.000Z",
         )
         .expect("schema fixture version ref should stage");
-        json_writer.flush_into(&mut writes);
+        JsonStoreContext::new()
+            .writer()
+            .stage_batch(
+                &mut writes,
+                JsonWritePlacementRef::Direct,
+                [NormalizedJsonRef {
+                    normalized: version_ref_row.snapshot.as_str(),
+                }],
+            )
+            .expect("schema fixture version ref JSON should stage");
         let mut storage_transaction = storage
             .begin_write_transaction()
             .await
@@ -1485,7 +1484,7 @@ mod tests {
         .expect("schema fixture rows should stage");
         crate::untracked_state::UntrackedStateContext::new()
             .writer(&mut writes)
-            .stage_rows([version_ref_row.as_ref()])
+            .stage_rows([version_ref_row.row.as_ref()])
             .expect("schema fixture version ref should stage");
         writes
             .apply(&mut storage_transaction.as_mut())
@@ -1510,10 +1509,12 @@ mod tests {
             .await
             .expect("changelog should scan after failed commit");
         assert!(
-            changes.iter().all(
-                |change| change.entity_id.as_single_string_owned().as_deref()
-                    != Ok(rejected_entity_id)
-            ),
+            changes.iter().all(|change| change
+                .record
+                .entity_id
+                .as_single_string_owned()
+                .as_deref()
+                != Ok(rejected_entity_id)),
             "validation failure must happen before changelog persistence"
         );
         let head = version_ctx

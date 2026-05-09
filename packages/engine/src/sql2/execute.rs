@@ -2882,26 +2882,32 @@ mod tests {
                 crate::untracked_state::UntrackedStateContext::new(),
             ));
             let mut writes = StorageWriteSet::new();
-            let canonical_rows = {
-                let mut json_writer = JsonStoreContext::new().writer();
-                let rows = vec![
-                    prepare_version_ref_row(
-                        &mut json_writer,
-                        "version-a",
-                        &init_receipt.initial_commit_id,
-                        "1970-01-01T00:00:00.000Z",
-                    )?,
-                    prepare_version_ref_row(
-                        &mut json_writer,
-                        "version-b",
-                        &init_receipt.initial_commit_id,
-                        "1970-01-01T00:00:00.000Z",
-                    )?,
-                ];
-                json_writer.flush_into(&mut writes);
-                rows
-            };
-            version_ctx.stage_canonical_ref_rows(&mut writes, &canonical_rows)?;
+            let canonical_rows = vec![
+                prepare_version_ref_row(
+                    "version-a",
+                    &init_receipt.initial_commit_id,
+                    "1970-01-01T00:00:00.000Z",
+                )?,
+                prepare_version_ref_row(
+                    "version-b",
+                    &init_receipt.initial_commit_id,
+                    "1970-01-01T00:00:00.000Z",
+                )?,
+            ];
+            JsonStoreContext::new().writer().stage_batch(
+                &mut writes,
+                crate::json_store::JsonWritePlacementRef::Direct,
+                canonical_rows
+                    .iter()
+                    .map(|row| crate::json_store::NormalizedJsonRef {
+                        normalized: row.snapshot.as_str(),
+                    }),
+            )?;
+            let rows = canonical_rows
+                .into_iter()
+                .map(|prepared| prepared.row)
+                .collect::<Vec<_>>();
+            version_ctx.stage_canonical_ref_rows(&mut writes, &rows)?;
             writes.apply(&mut transaction.as_mut()).await?;
             transaction.commit().await?;
         }

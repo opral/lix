@@ -2575,10 +2575,8 @@ mod tests {
     struct EmptyLiveStateReader;
 
     fn test_stage_json(value: &str) -> StageJson {
-        let mut json_writer = crate::json_store::JsonStoreContext::new().writer();
         let parsed = test_json_text(value).expect("test staged JSON should parse");
         crate::transaction::types::stage_json_from_value(
-            &mut json_writer,
             TransactionJson::from_value_for_test(parsed),
             "test staged JSON",
         )
@@ -5353,7 +5351,6 @@ mod tests {
             commit_members_by_version: BTreeMap::new(),
             extra_commit_parents_by_version: BTreeMap::new(),
             file_data_writes: Vec::new(),
-            json_writer: crate::json_store::JsonStoreContext::new().writer(),
         }
     }
 

@@ -1,6 +1,6 @@
 use crate::commit_store::{
     Change, ChangeIndexEntry, ChangeLocator, ChangeRef, ChangeScanRequest, Commit, CommitDraftRef,
-    StagedCommitStoreCommit,
+    LocatedChange, StagedCommitStoreCommit,
 };
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::LixError;
@@ -167,6 +167,53 @@ where
         Ok(changes)
     }
 
+    pub(crate) async fn load_located_changes(
+        &self,
+        change_ids: &[String],
+    ) -> Result<Vec<Option<LocatedChange>>, LixError> {
+        if change_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut store = self.store.lock().await;
+        let entries =
+            crate::commit_store::storage::load_change_index_entries(&mut *store, change_ids)
+                .await?;
+        let mut changes = Vec::with_capacity(entries.len());
+        let mut commits_by_id = BTreeMap::new();
+        let mut packs_by_locator = BTreeMap::new();
+        for (change_id, entry) in change_ids.iter().zip(entries) {
+            changes.push(match entry {
+                Some(ChangeIndexEntry::CommitHeader { commit_id, .. }) => {
+                    if !commits_by_id.contains_key(&commit_id) {
+                        let commit =
+                            crate::commit_store::storage::load_commit(&mut *store, &commit_id)
+                                .await?;
+                        commits_by_id.insert(commit_id.clone(), commit);
+                    }
+                    commits_by_id
+                        .get(&commit_id)
+                        .cloned()
+                        .flatten()
+                        .map(|commit| located_commit_header_change(commit, 0))
+                }
+                Some(ChangeIndexEntry::PackedChange { locator }) => Some(LocatedChange {
+                    record: load_change_by_locator_cached(
+                        &mut *store,
+                        &mut packs_by_locator,
+                        &locator,
+                        change_id,
+                    )
+                    .await?,
+                    source_commit_id: locator.source_commit_id,
+                    source_pack_id: locator.source_pack_id,
+                }),
+                None => None,
+            });
+        }
+        Ok(changes)
+    }
+
     pub(crate) async fn load_commit_changes(
         &self,
         commit_id: &str,
@@ -209,7 +256,7 @@ where
     pub(crate) async fn scan_changes(
         &self,
         request: &ChangeScanRequest,
-    ) -> Result<Vec<crate::commit_store::Change>, LixError> {
+    ) -> Result<Vec<LocatedChange>, LixError> {
         scan_changes_from_commit_store(&mut *self.store.lock().await, request).await
     }
 }
@@ -305,7 +352,7 @@ async fn validate_stage_commits<'a>(
 async fn scan_changes_from_commit_store(
     store: &mut (impl StorageReader + ?Sized),
     request: &ChangeScanRequest,
-) -> Result<Vec<Change>, LixError> {
+) -> Result<Vec<LocatedChange>, LixError> {
     let limit = request.limit.unwrap_or(usize::MAX);
     let commits = crate::commit_store::storage::scan_commits(store).await?;
     let mut changes = Vec::new();
@@ -326,10 +373,14 @@ async fn scan_changes_from_commit_store(
             if pack_changes.len() > remaining {
                 pack_changes.truncate(remaining);
             }
-            changes.extend(pack_changes);
+            changes.extend(pack_changes.into_iter().map(|record| LocatedChange {
+                record,
+                source_commit_id: commit.id.clone(),
+                source_pack_id: pack_id,
+            }));
         }
         if changes.len() < limit {
-            changes.push(commit_header_change(commit));
+            changes.push(located_commit_header_change(commit, 0));
         }
     }
     Ok(changes)
@@ -447,6 +498,15 @@ fn commit_header_change(commit: Commit) -> Change {
         snapshot_ref: None,
         metadata_ref: None,
         created_at: commit.created_at,
+    }
+}
+
+fn located_commit_header_change(commit: Commit, source_pack_id: u32) -> LocatedChange {
+    let source_commit_id = commit.id.clone();
+    LocatedChange {
+        record: commit_header_change(commit),
+        source_commit_id,
+        source_pack_id,
     }
 }
 
