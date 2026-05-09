@@ -508,8 +508,14 @@ fn untracked_row_ref_from_state_row(row: &PreparedStateRow) -> UntrackedStateRow
         entity_id: &row.entity_id,
         schema_key: &row.schema_key,
         file_id: row.file_id.as_deref(),
-        snapshot_content: row.snapshot.as_ref().map(|snapshot| snapshot.normalized.as_ref()),
-        metadata: row.metadata.as_ref().map(|metadata| metadata.normalized.as_ref()),
+        snapshot_content: row
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.normalized.as_ref()),
+        metadata: row
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.normalized.as_ref()),
         created_at: &row.created_at,
         updated_at: &row.updated_at,
         global: row.global,

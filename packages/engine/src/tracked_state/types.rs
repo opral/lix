@@ -59,6 +59,16 @@ pub(crate) struct TrackedStateDeltaRef<'a> {
     pub(crate) updated_at: &'a str,
 }
 
+/// Owned per-commit projection delta entry.
+///
+/// Normal commits persist these entries in `tracked_state.delta_pack`. Full
+/// projection roots are materialized separately from these deltas.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrackedStateDeltaEntry {
+    pub(crate) key: TrackedStateKey,
+    pub(crate) value: TrackedStateIndexValue,
+}
+
 /// Projection value stored in tracked-state trees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateIndexValue {
@@ -75,7 +85,7 @@ pub(crate) struct TrackedStateIndexValueRef<'a> {
     pub(crate) updated_at: &'a str,
 }
 
-/// Materialized rebuildable tracked state row.
+/// Materialized tracked-state projection row.
 ///
 /// Tracked rows are the projection that can be rebuilt from changelog facts.
 /// They intentionally do not carry an `untracked` flag: untracked local overlay
@@ -115,7 +125,7 @@ pub(crate) struct TrackedStateProjection {
     pub(crate) columns: Vec<String>,
 }
 
-/// Scan request for the rebuildable tracked-state projection.
+/// Scan request for the tracked-state projection.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct TrackedStateScanRequest {
     #[serde(default)]

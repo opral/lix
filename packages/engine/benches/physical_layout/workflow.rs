@@ -78,6 +78,165 @@ fn bench_smoke(c: &mut Criterion, runtime: &Runtime, args: Args, profile: Backen
         )
     });
 
+    group.bench_function("select_tracked_commit_point_hit_payload_1k/1k", |b| {
+        b.iter_batched(
+            || prepare_select_tracked_commit(runtime, smoke, profile),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::tracked_state_read_point_hit_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("physical_layout/workflow smoke point select succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("select_tracked_commit_headers_only_payload_1k/1k", |b| {
+        b.iter_batched(
+            || prepare_select_tracked_commit(runtime, smoke, profile),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::tracked_state_scan_headers_only_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("physical_layout/workflow smoke header select succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("select_tracked_commit_full_rows_payload_1k/1k", |b| {
+        b.iter_batched(
+            || prepare_select_tracked_commit(runtime, smoke, profile),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::tracked_state_scan_full_rows_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("physical_layout/workflow smoke full-row select succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function(
+        "select_tracked_commit_file_selective_10pct_payload_1k/1k",
+        |b| {
+            b.iter_batched(
+                || {
+                    prepare_select_tracked_commit_file_selective(
+                        runtime,
+                        smoke.with_selectivity(storage_bench::StorageBenchSelectivity::Percent10),
+                        profile,
+                    )
+                },
+                |(backend, fixture)| {
+                    black_box(
+                        runtime
+                            .block_on(
+                                storage_bench::tracked_state_scan_file_header_selective_prepared(
+                                    &backend, &fixture,
+                                ),
+                            )
+                            .expect(
+                                "physical_layout/workflow smoke file-selective select succeeds",
+                            ),
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        },
+    );
+
+    group.bench_function("select_after_1pct_update_payload_1k/1k", |b| {
+        b.iter_batched(
+            || prepare_select_after_update(runtime, smoke, profile, 10),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::tracked_state_scan_full_rows_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("physical_layout/workflow smoke select-after-update succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("select_delta_chain_10x1pct_payload_1k/1k", |b| {
+        b.iter_batched(
+            || prepare_select_delta_chain(runtime, smoke, profile, 10, 10),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::tracked_state_scan_full_rows_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("physical_layout/workflow smoke select delta chain succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("select_materialized_delta_chain_10x1pct_payload_1k/1k", |b| {
+        b.iter_batched(
+            || prepare_select_materialized_delta_chain(runtime, smoke, profile, 10, 10),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::tracked_state_scan_full_rows_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect(
+                            "physical_layout/workflow smoke select materialized delta chain succeeds",
+                        ),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("diff_delta_chain_10x1pct_payload_1k/1k", |b| {
+        b.iter_batched(
+            || prepare_diff_delta_chain(runtime, smoke, profile, 10, 10),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::tracked_state_diff_commits_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("physical_layout/workflow smoke diff delta chain succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("materialize_delta_chain_10x1pct_payload_1k/1k", |b| {
+        b.iter_batched(
+            || prepare_materialize_delta_chain(runtime, smoke, profile, 10, 10),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::tracked_state_materialize_root_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("physical_layout/workflow smoke materialize delta chain succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
     group.finish();
 }
 
@@ -128,6 +287,102 @@ fn bench_fast(c: &mut Criterion, runtime: &Runtime, args: Args, profile: Backend
                             &backend, &fixture,
                         ))
                         .expect("physical_layout/workflow diff update succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("select_tracked_commit_point_hit/10k", |b| {
+        b.iter_batched(
+            || prepare_select_tracked_commit(runtime, args.config(), profile),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::tracked_state_read_point_hit_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("physical_layout/workflow point select succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("select_tracked_commit_headers_only/10k", |b| {
+        b.iter_batched(
+            || prepare_select_tracked_commit(runtime, args.config(), profile),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::tracked_state_scan_headers_only_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("physical_layout/workflow header select succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("select_tracked_commit_full_rows/10k", |b| {
+        b.iter_batched(
+            || prepare_select_tracked_commit(runtime, args.config(), profile),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::tracked_state_scan_full_rows_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("physical_layout/workflow full-row select succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("select_after_1pct_update/10k", |b| {
+        b.iter_batched(
+            || prepare_select_after_update(runtime, args.config(), profile, args.rows / 100),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::tracked_state_scan_full_rows_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("physical_layout/workflow select-after-update succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("select_delta_chain_10x1pct/10k", |b| {
+        b.iter_batched(
+            || prepare_select_delta_chain(runtime, args.config(), profile, 10, args.rows / 100),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::tracked_state_scan_full_rows_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("physical_layout/workflow select delta chain succeeds"),
+                )
+            },
+            BatchSize::LargeInput,
+        )
+    });
+
+    group.bench_function("diff_delta_chain_10x1pct/10k", |b| {
+        b.iter_batched(
+            || prepare_diff_delta_chain(runtime, args.config(), profile, 10, args.rows / 100),
+            |(backend, fixture)| {
+                black_box(
+                    runtime
+                        .block_on(storage_bench::tracked_state_diff_commits_prepared(
+                            &backend, &fixture,
+                        ))
+                        .expect("physical_layout/workflow diff delta chain succeeds"),
                 )
             },
             BatchSize::LargeInput,
@@ -329,6 +584,150 @@ fn prepare_diff_update(
             changed_rows,
         ))
         .expect("prepare physical_layout/workflow diff update");
+    (backend, fixture)
+}
+
+fn prepare_select_tracked_commit(
+    runtime: &Runtime,
+    config: StorageBenchConfig,
+    profile: BackendProfile,
+) -> (
+    Arc<dyn Backend + Send + Sync>,
+    storage_bench::TrackedStateReadFixture,
+) {
+    let backend = (profile.create)();
+    let fixture = runtime
+        .block_on(storage_bench::prepare_tracked_state_read(&backend, config))
+        .expect("prepare physical_layout/workflow select tracked commit");
+    (backend, fixture)
+}
+
+fn prepare_select_tracked_commit_file_selective(
+    runtime: &Runtime,
+    config: StorageBenchConfig,
+    profile: BackendProfile,
+) -> (
+    Arc<dyn Backend + Send + Sync>,
+    storage_bench::TrackedStateReadFixture,
+) {
+    let backend = (profile.create)();
+    let fixture = runtime
+        .block_on(storage_bench::prepare_tracked_state_read_file_selective(
+            &backend, config,
+        ))
+        .expect("prepare physical_layout/workflow file-selective select");
+    (backend, fixture)
+}
+
+fn prepare_select_after_update(
+    runtime: &Runtime,
+    config: StorageBenchConfig,
+    profile: BackendProfile,
+    changed_rows: usize,
+) -> (
+    Arc<dyn Backend + Send + Sync>,
+    storage_bench::TrackedStateReadFixture,
+) {
+    let backend = (profile.create)();
+    let fixture = runtime
+        .block_on(storage_bench::prepare_tracked_state_read_after_update_rows(
+            &backend,
+            config,
+            changed_rows,
+        ))
+        .expect("prepare physical_layout/workflow select after update");
+    (backend, fixture)
+}
+
+fn prepare_select_delta_chain(
+    runtime: &Runtime,
+    config: StorageBenchConfig,
+    profile: BackendProfile,
+    delta_commits: usize,
+    updated_rows_per_commit: usize,
+) -> (
+    Arc<dyn Backend + Send + Sync>,
+    storage_bench::TrackedStateReadFixture,
+) {
+    let backend = (profile.create)();
+    let fixture = runtime
+        .block_on(storage_bench::prepare_tracked_state_read_delta_chain(
+            &backend,
+            config,
+            delta_commits,
+            updated_rows_per_commit,
+        ))
+        .expect("prepare physical_layout/workflow select delta chain");
+    (backend, fixture)
+}
+
+fn prepare_select_materialized_delta_chain(
+    runtime: &Runtime,
+    config: StorageBenchConfig,
+    profile: BackendProfile,
+    delta_commits: usize,
+    updated_rows_per_commit: usize,
+) -> (
+    Arc<dyn Backend + Send + Sync>,
+    storage_bench::TrackedStateReadFixture,
+) {
+    let backend = (profile.create)();
+    let fixture = runtime
+        .block_on(
+            storage_bench::prepare_tracked_state_read_materialized_delta_chain(
+                &backend,
+                config,
+                delta_commits,
+                updated_rows_per_commit,
+            ),
+        )
+        .expect("prepare physical_layout/workflow select materialized delta chain");
+    (backend, fixture)
+}
+
+fn prepare_diff_delta_chain(
+    runtime: &Runtime,
+    config: StorageBenchConfig,
+    profile: BackendProfile,
+    delta_commits: usize,
+    updated_rows_per_commit: usize,
+) -> (
+    Arc<dyn Backend + Send + Sync>,
+    storage_bench::TrackedStateDiffFixture,
+) {
+    let backend = (profile.create)();
+    let fixture = runtime
+        .block_on(storage_bench::prepare_tracked_state_diff_delta_chain(
+            &backend,
+            config,
+            delta_commits,
+            updated_rows_per_commit,
+        ))
+        .expect("prepare physical_layout/workflow diff delta chain");
+    (backend, fixture)
+}
+
+fn prepare_materialize_delta_chain(
+    runtime: &Runtime,
+    config: StorageBenchConfig,
+    profile: BackendProfile,
+    delta_commits: usize,
+    updated_rows_per_commit: usize,
+) -> (
+    Arc<dyn Backend + Send + Sync>,
+    storage_bench::TrackedStateMaterializeFixture,
+) {
+    let backend = (profile.create)();
+    let fixture = runtime
+        .block_on(
+            storage_bench::prepare_tracked_state_materialize_delta_chain(
+                &backend,
+                config,
+                delta_commits,
+                updated_rows_per_commit,
+            ),
+        )
+        .expect("prepare physical_layout/workflow materialize delta chain");
     (backend, fixture)
 }
 

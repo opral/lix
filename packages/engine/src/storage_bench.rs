@@ -1370,6 +1370,12 @@ pub struct TrackedStateDiffFixture {
     expected_entries: usize,
 }
 
+pub struct TrackedStateMaterializeFixture {
+    context: TrackedStateContext,
+    commit_id: String,
+    expected_rows: usize,
+}
+
 pub struct UntrackedStateWriteFixture {
     context: UntrackedStateContext,
     rows: Vec<MaterializedUntrackedStateRow>,
@@ -1499,6 +1505,72 @@ pub async fn prepare_tracked_state_read_file_selective(
         commit_id: "bench-tracked-commit".to_string(),
         key_pattern: config.key_pattern,
         selectivity: config.selectivity,
+    })
+}
+
+pub async fn prepare_tracked_state_read_after_update_rows(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    config: StorageBenchConfig,
+    updated_rows: usize,
+) -> Result<TrackedStateReadFixture, LixError> {
+    let fixture = prepare_tracked_state_update_rows(backend, config, updated_rows).await?;
+    tracked_state_update_existing_prepared(backend, &fixture).await?;
+    Ok(TrackedStateReadFixture {
+        context: fixture.context,
+        rows: config.rows,
+        commit_id: "bench-tracked-child".to_string(),
+        key_pattern: config.key_pattern,
+        selectivity: config.selectivity,
+    })
+}
+
+pub async fn prepare_tracked_state_read_delta_chain(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    config: StorageBenchConfig,
+    delta_commits: usize,
+    updated_rows_per_commit: usize,
+) -> Result<TrackedStateReadFixture, LixError> {
+    let (context, final_commit_id) =
+        write_tracked_delta_chain(backend, config, delta_commits, updated_rows_per_commit).await?;
+    Ok(TrackedStateReadFixture {
+        context,
+        rows: config.rows,
+        commit_id: final_commit_id,
+        key_pattern: config.key_pattern,
+        selectivity: config.selectivity,
+    })
+}
+
+pub async fn prepare_tracked_state_read_materialized_delta_chain(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    config: StorageBenchConfig,
+    delta_commits: usize,
+    updated_rows_per_commit: usize,
+) -> Result<TrackedStateReadFixture, LixError> {
+    let (context, final_commit_id) =
+        write_tracked_delta_chain(backend, config, delta_commits, updated_rows_per_commit).await?;
+    materialize_tracked_root(backend, &context, &final_commit_id).await?;
+    Ok(TrackedStateReadFixture {
+        context,
+        rows: config.rows,
+        commit_id: final_commit_id,
+        key_pattern: config.key_pattern,
+        selectivity: config.selectivity,
+    })
+}
+
+pub async fn prepare_tracked_state_materialize_delta_chain(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    config: StorageBenchConfig,
+    delta_commits: usize,
+    updated_rows_per_commit: usize,
+) -> Result<TrackedStateMaterializeFixture, LixError> {
+    let (context, final_commit_id) =
+        write_tracked_delta_chain(backend, config, delta_commits, updated_rows_per_commit).await?;
+    Ok(TrackedStateMaterializeFixture {
+        context,
+        commit_id: final_commit_id,
+        expected_rows: config.rows,
     })
 }
 
@@ -1922,6 +1994,22 @@ pub async fn prepare_tracked_state_diff_update_rows(
     })
 }
 
+pub async fn prepare_tracked_state_diff_delta_chain(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    config: StorageBenchConfig,
+    delta_commits: usize,
+    updated_rows_per_commit: usize,
+) -> Result<TrackedStateDiffFixture, LixError> {
+    let (context, final_commit_id) =
+        write_tracked_delta_chain(backend, config, delta_commits, updated_rows_per_commit).await?;
+    Ok(TrackedStateDiffFixture {
+        context,
+        left_commit_id: "bench-tracked-base".to_string(),
+        right_commit_id: final_commit_id,
+        expected_entries: updated_rows_per_commit.min(config.rows),
+    })
+}
+
 pub async fn prepare_tracked_state_diff_tombstone_rows(
     backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
@@ -1969,6 +2057,18 @@ pub async fn tracked_state_diff_commits_prepared(
     Ok(report(
         fixture.expected_entries,
         diff.entries.len(),
+        Duration::ZERO,
+    ))
+}
+
+pub async fn tracked_state_materialize_root_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &TrackedStateMaterializeFixture,
+) -> Result<StorageBenchReport, LixError> {
+    materialize_tracked_root(backend, &fixture.context, &fixture.commit_id).await?;
+    Ok(report(
+        fixture.expected_rows,
+        fixture.expected_rows,
         Duration::ZERO,
     ))
 }
@@ -3617,6 +3717,63 @@ async fn write_tracked_root(
     transaction.commit().await
 }
 
+async fn materialize_tracked_root(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    context: &TrackedStateContext,
+    commit_id: &str,
+) -> Result<(), LixError> {
+    let storage = StorageContext::new(Arc::clone(backend));
+    let mut transaction = storage.begin_write_transaction().await?;
+    let mut writes = StorageWriteSet::new();
+    let commit_store = CommitStoreContext::new();
+    context
+        .materializer(&mut transaction.as_mut(), &mut writes, &commit_store)
+        .materialize_root_at(commit_id)
+        .await?;
+    writes.apply(&mut transaction.as_mut()).await?;
+    transaction.commit().await
+}
+
+async fn write_tracked_delta_chain(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    config: StorageBenchConfig,
+    delta_commits: usize,
+    updated_rows_per_commit: usize,
+) -> Result<(TrackedStateContext, String), LixError> {
+    let context = TrackedStateContext::new();
+    let base_commit_id = "bench-tracked-base";
+    let rows = tracked_rows(config, base_commit_id);
+    write_tracked_root(backend, &context, base_commit_id, None, &rows).await?;
+
+    let mut parent_commit_id = base_commit_id.to_string();
+    for delta_index in 0..delta_commits {
+        let commit_id = format!("bench-tracked-delta-{delta_index}");
+        let mut updated_rows = tracked_rows(
+            config.with_rows(updated_rows_per_commit.min(config.rows)),
+            &commit_id,
+        );
+        for (row_index, row) in updated_rows.iter_mut().enumerate() {
+            row.snapshot_content = Some(delta_chain_snapshot_content(
+                delta_index,
+                row_index,
+                config.state_payload_bytes,
+            ));
+            row.updated_at = timestamp(config.rows + delta_index * config.rows + row_index);
+        }
+        write_tracked_root(
+            backend,
+            &context,
+            &commit_id,
+            Some(parent_commit_id.as_str()),
+            &updated_rows,
+        )
+        .await?;
+        parent_commit_id = commit_id;
+    }
+
+    Ok((context, parent_commit_id))
+}
+
 fn tracked_bench_change_from_materialized(
     row: &MaterializedTrackedStateRow,
 ) -> Result<Change, LixError> {
@@ -4185,6 +4342,21 @@ fn partial_updated_snapshot_content(index: usize, target_bytes: usize) -> String
         "value": format!("value-{index}"),
         "index": index,
         "done": true
+    });
+    pad_snapshot_content(&mut value, target_bytes);
+    value.to_string()
+}
+
+fn delta_chain_snapshot_content(
+    delta_index: usize,
+    row_index: usize,
+    target_bytes: usize,
+) -> String {
+    let mut value = serde_json::json!({
+        "id": format!("entity-{row_index}"),
+        "value": format!("delta-{delta_index}-{row_index}"),
+        "index": row_index,
+        "delta": delta_index
     });
     pad_snapshot_content(&mut value, target_bytes);
     value.to_string()
