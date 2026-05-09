@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{DeterministicMode, DeterministicSequence};
-use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef};
+use crate::json_store::NormalizedJson;
 use crate::live_state::{LiveStateReader, LiveStateRowRequest, MaterializedLiveStateRow};
 use crate::storage::StorageWriteSet;
 use crate::untracked_state::UntrackedStateContext;
@@ -64,13 +64,6 @@ pub(crate) async fn stage_sequence(
         )
     })?;
     let snapshot = NormalizedJson::from_arc_unchecked(Arc::from(snapshot_content.as_str()));
-    JsonStoreContext::new().writer().stage_batch(
-        writes,
-        JsonWritePlacementRef::Direct,
-        [NormalizedJsonRef {
-            normalized: snapshot.as_str(),
-        }],
-    )?;
     let row =
         deterministic_key_value_row(DETERMINISTIC_SEQUENCE_KEY, snapshot.as_str(), timestamp)?;
     UntrackedStateContext::new()
@@ -160,13 +153,12 @@ fn deterministic_key_value_row(
     snapshot_content: &str,
     timestamp: &str,
 ) -> Result<UntrackedStateRow, LixError> {
-    let snapshot_ref = crate::json_store::JsonRef::for_content(snapshot_content.as_bytes());
     Ok(UntrackedStateRow {
         entity_id: crate::entity_identity::EntityIdentity::single(key),
         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
         file_id: None,
-        snapshot_ref: Some(snapshot_ref),
-        metadata_ref: None,
+        snapshot_content: Some(snapshot_content.to_string()),
+        metadata: None,
         created_at: timestamp.to_string(),
         updated_at: timestamp.to_string(),
         global: true,
@@ -329,16 +321,6 @@ mod tests {
         }))
         .expect("snapshot should serialize");
         let mut writes = StorageWriteSet::new();
-        crate::json_store::JsonStoreContext::new()
-            .writer()
-            .stage_batch(
-                &mut writes,
-                crate::json_store::JsonWritePlacementRef::Direct,
-                [crate::json_store::NormalizedJsonRef {
-                    normalized: snapshot_content.as_str(),
-                }],
-            )
-            .expect("test key-value JSON should stage");
         let row = deterministic_key_value_row(key, &snapshot_content, "1970-01-01T00:00:00.000Z")
             .expect("test key-value should canonicalize");
         UntrackedStateContext::new()

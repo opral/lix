@@ -51,16 +51,6 @@ pub(crate) async fn seed_version_head_with_rows(
     let mut writes = StorageWriteSet::new();
     let canonical_row = prepare_version_ref_row(version_id, commit_id, TEST_TIMESTAMP)
         .expect("version ref should canonicalize");
-    JsonStoreContext::new()
-        .writer()
-        .stage_batch(
-            &mut writes,
-            JsonWritePlacementRef::Direct,
-            [NormalizedJsonRef {
-                normalized: canonical_row.snapshot.as_str(),
-            }],
-        )
-        .expect("version ref JSON should stage");
     version_ctx
         .stage_canonical_ref_rows(&mut writes, &[canonical_row.row])
         .expect("version ref should stage");
@@ -219,36 +209,18 @@ fn materialized_tracked_json_payloads(rows: &[MaterializedTrackedStateRow]) -> V
 }
 
 pub(crate) fn untracked_state_row_from_materialized(
-    writes: &mut StorageWriteSet,
+    _writes: &mut StorageWriteSet,
     row: &MaterializedUntrackedStateRow,
 ) -> Result<UntrackedStateRow, crate::LixError> {
-    let mut payloads = Vec::new();
-    if let Some(snapshot) = row.snapshot_content.as_deref() {
-        payloads.push(NormalizedJson::from_arc_unchecked(Arc::from(snapshot)));
-    }
-    if let Some(metadata) = row.metadata.as_ref() {
-        payloads.push(NormalizedJson::from_arc_unchecked(Arc::from(
-            crate::serialize_row_metadata(metadata),
-        )));
-    }
-    let row = UntrackedStateRow {
+    Ok(UntrackedStateRow {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
         file_id: row.file_id.clone(),
-        snapshot_ref: row.snapshot_content.as_deref().map(prepare_json_ref),
-        metadata_ref: row.metadata.as_ref().map(|value| {
-            let serialized = crate::serialize_row_metadata(value);
-            prepare_json_ref(&serialized)
-        }),
+        snapshot_content: row.snapshot_content.clone(),
+        metadata: row.metadata.as_ref().map(crate::serialize_row_metadata),
         created_at: row.created_at.clone(),
         updated_at: row.updated_at.clone(),
         global: row.global,
         version_id: row.version_id.clone(),
-    };
-    JsonStoreContext::new().writer().stage_batch(
-        writes,
-        JsonWritePlacementRef::Direct,
-        payloads.iter().map(|json| NormalizedJsonRef::from(json)),
-    )?;
-    Ok(row)
+    })
 }

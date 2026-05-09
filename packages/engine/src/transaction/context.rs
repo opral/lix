@@ -10,7 +10,6 @@ use crate::commit_store::CommitStoreContext;
 use crate::domain::Domain;
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
-use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::live_state::{
     LiveStateContext, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
 };
@@ -502,13 +501,6 @@ impl Transaction {
         let timestamp = self.functions.call_timestamp();
         let mut writes = StorageWriteSet::new();
         let canonical_row = prepare_version_ref_row(version_id, commit_id, &timestamp)?;
-        JsonStoreContext::new().writer().stage_batch(
-            &mut writes,
-            JsonWritePlacementRef::Direct,
-            [NormalizedJsonRef {
-                normalized: canonical_row.snapshot.as_str(),
-            }],
-        )?;
         self.version_ctx
             .stage_canonical_ref_rows(&mut writes, &[canonical_row.row])?;
         writes
@@ -1459,16 +1451,6 @@ mod tests {
             "1970-01-01T00:00:00.000Z",
         )
         .expect("schema fixture version ref should stage");
-        JsonStoreContext::new()
-            .writer()
-            .stage_batch(
-                &mut writes,
-                JsonWritePlacementRef::Direct,
-                [NormalizedJsonRef {
-                    normalized: version_ref_row.snapshot.as_str(),
-                }],
-            )
-            .expect("schema fixture version ref JSON should stage");
         let mut storage_transaction = storage
             .begin_write_transaction()
             .await

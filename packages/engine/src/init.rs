@@ -226,13 +226,6 @@ pub(crate) async fn initialize(
         .iter()
         .map(untracked_state_row_from_seed)
         .collect::<Result<Vec<_>, _>>()?;
-    JsonStoreContext::new().writer().stage_batch(
-        &mut writes,
-        JsonWritePlacementRef::Direct,
-        plan.untracked_rows.iter().map(|row| NormalizedJsonRef {
-            normalized: row.snapshot_content.as_str(),
-        }),
-    )?;
 
     {
         untracked_state
@@ -276,8 +269,8 @@ fn untracked_state_row_from_seed(row: &InitSeedLiveRow) -> Result<UntrackedState
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
         file_id: None,
-        snapshot_ref: Some(JsonRef::for_content(row.snapshot_content.as_bytes())),
-        metadata_ref: None,
+        snapshot_content: Some(row.snapshot_content.clone()),
+        metadata: None,
         created_at: row.created_at.clone(),
         updated_at: row.updated_at.clone(),
         global: row.global,

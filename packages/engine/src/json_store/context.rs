@@ -242,7 +242,7 @@ mod tests {
             .reader(storage.clone())
             .load_bytes_many(JsonLoadRequestRef {
                 refs: &refs,
-                scope: JsonReadScopeRef::Direct,
+                scope: JsonReadScopeRef::OutOfBand,
             })
             .await
             .expect("unknown load should check direct rows");

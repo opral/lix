@@ -192,7 +192,7 @@ pub(crate) async fn load_json_bytes_many_in_scope(
     }
 
     let mut unique_values = match scope {
-        JsonReadScopeRef::Direct => vec![None; unique_refs.len()],
+        JsonReadScopeRef::OutOfBand => vec![None; unique_refs.len()],
         JsonReadScopeRef::CommitPacks {
             commit_id,
             pack_ids,
@@ -564,7 +564,7 @@ mod tests {
         let values = load_json_bytes_many_in_scope(
             &mut store,
             &[second.json_ref, first.json_ref, second.json_ref],
-            JsonReadScopeRef::Direct,
+            JsonReadScopeRef::OutOfBand,
         )
         .await
         .expect("json batch should load");

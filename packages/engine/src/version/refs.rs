@@ -185,7 +185,6 @@ mod tests {
     use std::sync::Arc;
 
     use crate::backend::testing::UnitTestBackend;
-    use crate::json_store::JsonStoreContext;
     use crate::storage::{StorageContext, StorageWriteSet};
     use crate::transaction::prepare_version_ref_row;
     use crate::untracked_state::{UntrackedStateContext, UntrackedStateRowRequest};
@@ -326,13 +325,6 @@ mod tests {
         timestamp: &str,
     ) -> Result<(), LixError> {
         let canonical_row = prepare_version_ref_row(version_id, commit_id, timestamp)?;
-        JsonStoreContext::new().writer().stage_batch(
-            writes,
-            crate::json_store::JsonWritePlacementRef::Direct,
-            [crate::json_store::NormalizedJsonRef {
-                normalized: canonical_row.snapshot.as_str(),
-            }],
-        )?;
         version_ref.writer(writes).stage_rows(&[canonical_row.row])
     }
 }

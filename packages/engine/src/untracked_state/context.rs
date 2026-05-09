@@ -79,7 +79,7 @@ pub(crate) struct UntrackedStateWriter<'a> {
 impl UntrackedStateWriter<'_> {
     /// Stages the latest untracked rows for their identities.
     ///
-    /// A row with `snapshot_ref = None` is treated as removal because
+    /// A row with `snapshot_content = None` is treated as removal because
     /// untracked state keeps only the current local value, not tombstones.
     pub(crate) fn stage_rows<'a, I>(&mut self, rows: I) -> Result<(), LixError>
     where

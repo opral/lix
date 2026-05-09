@@ -592,7 +592,6 @@ async fn prepare_transaction_fixture(
 
 async fn seed_transaction_visible_schema_rows(storage: StorageContext) -> Result<(), LixError> {
     let mut writes = StorageWriteSet::new();
-    let mut snapshots = Vec::new();
     let rows = crate::schema::seed_schema_definitions()
         .into_iter()
         .cloned()
@@ -601,16 +600,14 @@ async fn seed_transaction_visible_schema_rows(storage: StorageContext) -> Result
             let key = crate::schema::schema_key_from_definition(&schema)
                 .expect("seed schema key should derive");
             let snapshot_content = serde_json::json!({ "value": schema }).to_string();
-            let snapshot_ref = prepare_json_ref(snapshot_content.as_bytes())?;
-            snapshots.push(snapshot_content);
             Ok(crate::untracked_state::UntrackedStateRow {
                 entity_id: crate::schema::registered_schema_entity_id(&key.schema_key)
                     .expect("registered schema identity should derive"),
                 schema_key: "lix_registered_schema".to_string(),
                 file_id: None,
                 version_id: crate::GLOBAL_VERSION_ID.to_string(),
-                snapshot_ref: Some(snapshot_ref),
-                metadata_ref: None,
+                snapshot_content: Some(snapshot_content),
+                metadata: None,
                 created_at: "1970-01-01T00:00:00.000Z".to_string(),
                 updated_at: "1970-01-01T00:00:00.000Z".to_string(),
                 global: true,
@@ -618,13 +615,6 @@ async fn seed_transaction_visible_schema_rows(storage: StorageContext) -> Result
         })
         .collect::<Result<Vec<_>, LixError>>()?;
     let mut transaction = storage.begin_write_transaction().await?;
-    JsonStoreContext::new().writer().stage_batch(
-        &mut writes,
-        JsonWritePlacementRef::Direct,
-        snapshots.iter().map(|snapshot| NormalizedJsonRef {
-            normalized: snapshot.as_str(),
-        }),
-    )?;
     UntrackedStateContext::new()
         .writer(&mut writes)
         .stage_rows(rows.iter().map(|row| row.as_ref()))?;
@@ -2750,7 +2740,7 @@ pub async fn json_store_write_prepared(
         let mut writer = fixture.context.writer();
         writer.stage_batch(
             &mut writes,
-            JsonWritePlacementRef::Direct,
+            JsonWritePlacementRef::OutOfBand,
             fixture
                 .documents
                 .iter()
@@ -2809,7 +2799,7 @@ pub async fn prepare_json_store_projection_read(
         }
         writer.stage_batch(
             &mut writes,
-            JsonWritePlacementRef::Direct,
+            JsonWritePlacementRef::OutOfBand,
             documents
                 .iter()
                 .map(|document| {
@@ -2845,7 +2835,7 @@ pub async fn json_store_read_bytes_prepared(
     let batch = reader
         .load_bytes_many(JsonLoadRequestRef {
             refs: &fixture.refs,
-            scope: JsonReadScopeRef::Direct,
+            scope: JsonReadScopeRef::OutOfBand,
         })
         .await?;
     for value in batch.values() {
@@ -2867,7 +2857,7 @@ pub async fn json_store_read_value_prepared(
     let batch = reader
         .load_values_many(JsonLoadRequestRef {
             refs: &fixture.refs,
-            scope: JsonReadScopeRef::Direct,
+            scope: JsonReadScopeRef::OutOfBand,
         })
         .await?;
     for value in batch.values() {
@@ -2889,7 +2879,7 @@ pub async fn json_store_read_projection_prepared(
     let batch = reader
         .load_projections_many(JsonProjectionLoadRequestRef {
             refs: &fixture.refs,
-            scope: JsonReadScopeRef::Direct,
+            scope: JsonReadScopeRef::OutOfBand,
             paths: &fixture.paths,
         })
         .await?;
@@ -2933,7 +2923,7 @@ async fn prepare_json_store_base_update(
         }
         writer.stage_batch(
             &mut writes,
-            JsonWritePlacementRef::Direct,
+            JsonWritePlacementRef::OutOfBand,
             documents
                 .iter()
                 .map(|document| {
@@ -2996,7 +2986,7 @@ async fn json_store_write_against_base_prepared(
         }
         writer.stage_batch(
             &mut writes,
-            JsonWritePlacementRef::Direct,
+            JsonWritePlacementRef::OutOfBand,
             updated_documents
                 .iter()
                 .map(|document| {
@@ -3721,7 +3711,7 @@ async fn append_changelog_changes(
         let payloads = changelog_bench_json_payloads(changes);
         JsonStoreContext::new().writer().stage_batch(
             &mut writes,
-            JsonWritePlacementRef::Direct,
+            JsonWritePlacementRef::OutOfBand,
             payloads.iter().map(|payload| NormalizedJsonRef {
                 normalized: payload.as_str(),
             }),

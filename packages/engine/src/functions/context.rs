@@ -268,24 +268,12 @@ mod tests {
         }))
         .expect("snapshot should serialize");
         let mut writes = StorageWriteSet::new();
-        crate::json_store::JsonStoreContext::new()
-            .writer()
-            .stage_batch(
-                &mut writes,
-                crate::json_store::JsonWritePlacementRef::Direct,
-                [crate::json_store::NormalizedJsonRef {
-                    normalized: snapshot_content.as_str(),
-                }],
-            )
-            .expect("snapshot should stage");
         let row = crate::untracked_state::UntrackedStateRow {
             entity_id: crate::entity_identity::EntityIdentity::single(key),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
-            snapshot_ref: Some(crate::json_store::JsonRef::for_content(
-                snapshot_content.as_bytes(),
-            )),
-            metadata_ref: None,
+            snapshot_content: Some(snapshot_content),
+            metadata: None,
             created_at: "1970-01-01T00:00:00.000Z".to_string(),
             updated_at: "1970-01-01T00:00:00.000Z".to_string(),
             global: true,

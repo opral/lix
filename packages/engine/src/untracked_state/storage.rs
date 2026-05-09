@@ -1,4 +1,3 @@
-use crate::json_store::JsonStoreContext;
 use crate::storage::KvScanRange;
 use crate::storage::{KvGetGroup, KvGetRequest, KvScanRequest, StorageReader, StorageWriteSet};
 use crate::untracked_state::{
@@ -20,12 +19,9 @@ pub(crate) async fn scan_rows(
         rows.truncate(limit);
     }
     let projection = UntrackedMaterializationProjection::from_columns(&request.projection.columns);
-    let mut json_reader = JsonStoreContext::new().reader(store);
     let mut materialized = Vec::with_capacity(rows.len());
     for row in rows {
-        materialized.push(
-            crate::untracked_state::materialize_row(&mut json_reader, row, &projection).await?,
-        );
+        materialized.push(crate::untracked_state::materialize_row(row, &projection)?);
     }
     Ok(materialized)
 }
@@ -53,14 +49,8 @@ pub(crate) async fn load_row(
         return Ok(None);
     };
     let row = crate::untracked_state::codec::decode_row(&bytes)?;
-    let mut json_reader = JsonStoreContext::new().reader(store);
-    crate::untracked_state::materialize_row(
-        &mut json_reader,
-        row,
-        &UntrackedMaterializationProjection::full(),
-    )
-    .await
-    .map(Some)
+    crate::untracked_state::materialize_row(row, &UntrackedMaterializationProjection::full())
+        .map(Some)
 }
 
 pub(super) async fn existing_identities<'a>(
@@ -127,7 +117,7 @@ where
     I: IntoIterator<Item = UntrackedStateRowRef<'a>>,
 {
     for row in rows {
-        if row.snapshot_ref.is_none() {
+        if row.snapshot_content.is_none() {
             writes.delete(
                 UNTRACKED_STATE_ROW_NAMESPACE,
                 encode_untracked_state_row_key_ref(row.into()),
