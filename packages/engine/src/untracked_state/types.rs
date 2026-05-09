@@ -1,18 +1,17 @@
 use crate::entity_identity::EntityIdentity;
-use crate::json_store::JsonRef;
 use crate::NullableKeyFilter;
 
 /// Durable local row excluded from changelog and commit membership.
 ///
 /// This is the canonical physical shape: identity/header fields are stored
-/// directly, while JSON payloads live in json_store and are referenced by hash.
+/// directly, and mutable JSON payloads are stored inline in the sidecar row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UntrackedStateRow {
     pub(crate) entity_id: EntityIdentity,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) snapshot_ref: Option<JsonRef>,
-    pub(crate) metadata_ref: Option<JsonRef>,
+    pub(crate) snapshot_content: Option<String>,
+    pub(crate) metadata: Option<String>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) global: bool,
@@ -25,8 +24,8 @@ impl UntrackedStateRow {
             entity_id: &self.entity_id,
             schema_key: &self.schema_key,
             file_id: self.file_id.as_deref(),
-            snapshot_ref: self.snapshot_ref.as_ref(),
-            metadata_ref: self.metadata_ref.as_ref(),
+            snapshot_content: self.snapshot_content.as_deref(),
+            metadata: self.metadata.as_deref(),
             created_at: &self.created_at,
             updated_at: &self.updated_at,
             global: self.global,
@@ -44,8 +43,8 @@ pub(crate) struct UntrackedStateRowRef<'a> {
     pub(crate) entity_id: &'a EntityIdentity,
     pub(crate) schema_key: &'a str,
     pub(crate) file_id: Option<&'a str>,
-    pub(crate) snapshot_ref: Option<&'a JsonRef>,
-    pub(crate) metadata_ref: Option<&'a JsonRef>,
+    pub(crate) snapshot_content: Option<&'a str>,
+    pub(crate) metadata: Option<&'a str>,
     pub(crate) created_at: &'a str,
     pub(crate) updated_at: &'a str,
     pub(crate) global: bool,

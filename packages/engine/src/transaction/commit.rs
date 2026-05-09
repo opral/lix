@@ -144,13 +144,6 @@ pub(crate) async fn commit_prepared_writes(
             &version_head.commit_id,
             &version_head.timestamp,
         )?;
-        json_writer.stage_batch(
-            &mut writes,
-            JsonWritePlacementRef::Direct,
-            [NormalizedJsonRef {
-                normalized: canonical_row.snapshot.as_str(),
-            }],
-        )?;
         version_ctx.stage_canonical_ref_rows(&mut writes, &[canonical_row.row])?;
     }
 
@@ -202,7 +195,7 @@ fn stage_prepared_json_payloads(
     }
     json_writer.stage_batch(
         writes,
-        JsonWritePlacementRef::Direct,
+        JsonWritePlacementRef::OutOfBand,
         untracked_row_indices
             .iter()
             .flat_map(|&row_index| json_payloads_from_state_row(&state_rows[row_index])),
@@ -515,8 +508,8 @@ fn untracked_row_ref_from_state_row(row: &PreparedStateRow) -> UntrackedStateRow
         entity_id: &row.entity_id,
         schema_key: &row.schema_key,
         file_id: row.file_id.as_deref(),
-        snapshot_ref: row.snapshot.as_ref().map(|snapshot| &snapshot.json_ref),
-        metadata_ref: row.metadata.as_ref().map(|metadata| &metadata.json_ref),
+        snapshot_content: row.snapshot.as_ref().map(|snapshot| snapshot.normalized.as_ref()),
+        metadata: row.metadata.as_ref().map(|metadata| metadata.normalized.as_ref()),
         created_at: &row.created_at,
         updated_at: &row.updated_at,
         global: row.global,
@@ -944,20 +937,18 @@ mod tests {
                 .writer()
                 .stage_batch(
                     &mut writes,
-                    JsonWritePlacementRef::Direct,
+                    JsonWritePlacementRef::OutOfBand,
                     [NormalizedJsonRef {
                         normalized: mode_snapshot.as_str(),
                     }],
                 )
                 .expect("deterministic mode snapshot should stage");
-            let mode_snapshot_ref =
-                crate::json_store::JsonRef::for_content(mode_snapshot.as_bytes());
             let row = crate::untracked_state::UntrackedStateRow {
                 entity_id: crate::entity_identity::EntityIdentity::single(DETERMINISTIC_MODE_KEY),
                 schema_key: "lix_key_value".to_string(),
                 file_id: None,
-                snapshot_ref: Some(mode_snapshot_ref),
-                metadata_ref: None,
+                snapshot_content: Some(mode_snapshot.to_string()),
+                metadata: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
                 global: true,

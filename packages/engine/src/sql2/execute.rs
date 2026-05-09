@@ -2894,15 +2894,6 @@ mod tests {
                     "1970-01-01T00:00:00.000Z",
                 )?,
             ];
-            JsonStoreContext::new().writer().stage_batch(
-                &mut writes,
-                crate::json_store::JsonWritePlacementRef::Direct,
-                canonical_rows
-                    .iter()
-                    .map(|row| crate::json_store::NormalizedJsonRef {
-                        normalized: row.snapshot.as_str(),
-                    }),
-            )?;
             let rows = canonical_rows
                 .into_iter()
                 .map(|prepared| prepared.row)

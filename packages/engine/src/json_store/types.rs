@@ -76,12 +76,12 @@ impl<'a> From<&'a NormalizedJson> for NormalizedJsonRef<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JsonWritePlacementRef<'a> {
     CommitPack { commit_id: &'a str, pack_id: u32 },
-    Direct,
+    OutOfBand,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JsonReadScopeRef<'a> {
-    Direct,
+    OutOfBand,
     CommitPacks {
         commit_id: &'a str,
         pack_ids: &'a [u32],

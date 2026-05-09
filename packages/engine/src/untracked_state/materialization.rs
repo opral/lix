@@ -1,24 +1,19 @@
-use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonStoreReader};
-use crate::storage::StorageReader;
 use crate::untracked_state::{MaterializedUntrackedStateRow, UntrackedStateRow};
 use crate::{parse_row_metadata, LixError};
 
-pub(crate) async fn materialize_row<S>(
-    json_reader: &mut JsonStoreReader<S>,
+pub(crate) fn materialize_row(
     row: UntrackedStateRow,
     projection: &UntrackedMaterializationProjection,
 ) -> Result<MaterializedUntrackedStateRow, LixError>
-where
-    S: StorageReader,
 {
-    let deleted = row.snapshot_ref.is_none();
+    let deleted = row.snapshot_content.is_none();
     let snapshot_content = if projection.snapshot_content {
-        load_optional_json(json_reader, row.snapshot_ref.as_ref(), "snapshot_ref").await?
+        row.snapshot_content
     } else {
         None
     };
     let metadata = if projection.metadata {
-        load_optional_metadata(json_reader, row.metadata_ref.as_ref()).await?
+        load_optional_metadata(row.metadata)?
     } else {
         None
     };
@@ -61,57 +56,9 @@ impl UntrackedMaterializationProjection {
     }
 }
 
-async fn load_optional_metadata<S>(
-    json_reader: &mut JsonStoreReader<S>,
-    json_ref: Option<&JsonRef>,
-) -> Result<Option<String>, LixError>
-where
-    S: StorageReader,
-{
-    let Some(json) = load_optional_json(json_reader, json_ref, "metadata_ref").await? else {
+fn load_optional_metadata(metadata: Option<String>) -> Result<Option<String>, LixError> {
+    let Some(json) = metadata else {
         return Ok(None);
     };
-    parse_row_metadata(&json, "untracked_state metadata_ref").map(Some)
-}
-
-async fn load_optional_json<S>(
-    json_reader: &mut JsonStoreReader<S>,
-    json_ref: Option<&JsonRef>,
-    field: &str,
-) -> Result<Option<String>, LixError>
-where
-    S: StorageReader,
-{
-    let Some(json_ref) = json_ref else {
-        return Ok(None);
-    };
-    let batch = json_reader
-        .load_bytes_many(JsonLoadRequestRef {
-            refs: std::slice::from_ref(json_ref),
-            scope: JsonReadScopeRef::Direct,
-        })
-        .await?;
-    let bytes = batch
-        .into_values()
-        .into_iter()
-        .next()
-        .flatten()
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "untracked_state {field} '{}' is missing from json_store",
-                    json_ref.to_hex()
-                ),
-            )
-        })?;
-    String::from_utf8(bytes).map(Some).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "untracked_state {field} '{}' is not valid UTF-8 JSON bytes: {error}",
-                json_ref.to_hex()
-            ),
-        )
-    })
+    parse_row_metadata(&json, "untracked_state metadata").map(Some)
 }
