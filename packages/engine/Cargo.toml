@@ -24,6 +24,12 @@ path = "benches/physical_layout/main.rs"
 harness = false
 required-features = ["storage-benches"]
 
+[[bench]]
+name = "json_pointer_crud"
+path = "benches/json_pointer_crud/main.rs"
+harness = false
+required-features = ["storage-benches"]
+
 [dependencies]
 async-trait = "0.1"
 cel = { version = "0.12.0", features = ["json"] }

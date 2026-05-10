@@ -40,6 +40,11 @@ impl RocksDbBenchBackend {
             inner: Arc::new(RocksDbBenchInner { db, _dir: dir }),
         })
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn path(&self) -> &Path {
+        self.inner._dir.path()
+    }
 }
 
 #[async_trait]
