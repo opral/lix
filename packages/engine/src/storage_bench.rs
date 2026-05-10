@@ -1376,6 +1376,26 @@ pub struct TrackedStateMaterializeFixture {
     expected_rows: usize,
 }
 
+#[derive(Clone)]
+pub struct JsonPointerStorageRow {
+    pub path: String,
+    pub value_json: String,
+    pub updated_value_json: String,
+}
+
+pub struct JsonPointerTrackedStateReadFixture {
+    context: TrackedStateContext,
+    rows: Vec<JsonPointerStorageRow>,
+    commit_id: String,
+}
+
+pub struct JsonPointerTrackedStateDiffFixture {
+    context: TrackedStateContext,
+    left_commit_id: String,
+    right_commit_id: String,
+    expected_entries: usize,
+}
+
 pub struct UntrackedStateWriteFixture {
     context: UntrackedStateContext,
     rows: Vec<MaterializedUntrackedStateRow>,
@@ -2069,6 +2089,295 @@ pub async fn tracked_state_materialize_root_prepared(
     Ok(report(
         fixture.expected_rows,
         fixture.expected_rows,
+        Duration::ZERO,
+    ))
+}
+
+pub async fn prepare_json_pointer_tracked_state_write_root(
+    rows: &[JsonPointerStorageRow],
+) -> Result<TrackedStateWriteRootFixture, LixError> {
+    Ok(TrackedStateWriteRootFixture {
+        context: TrackedStateContext::new(),
+        rows: json_pointer_tracked_rows(rows, "json-pointer-base", false),
+    })
+}
+
+pub async fn prepare_json_pointer_tracked_state_read(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    rows: &[JsonPointerStorageRow],
+) -> Result<JsonPointerTrackedStateReadFixture, LixError> {
+    let context = TrackedStateContext::new();
+    let materialized_rows = json_pointer_tracked_rows(rows, "json-pointer-base", false);
+    write_tracked_root(
+        backend,
+        &context,
+        "json-pointer-base",
+        None,
+        &materialized_rows,
+    )
+    .await?;
+    Ok(JsonPointerTrackedStateReadFixture {
+        context,
+        rows: rows.to_vec(),
+        commit_id: "json-pointer-base".to_string(),
+    })
+}
+
+pub async fn prepare_json_pointer_tracked_state_diff_update_rows(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    rows: &[JsonPointerStorageRow],
+    updated_rows: usize,
+) -> Result<JsonPointerTrackedStateDiffFixture, LixError> {
+    let context = TrackedStateContext::new();
+    let base_rows = json_pointer_tracked_rows(rows, "json-pointer-base", false);
+    write_tracked_root(backend, &context, "json-pointer-base", None, &base_rows).await?;
+    let child_rows = json_pointer_tracked_rows(
+        &rows[..updated_rows.min(rows.len())],
+        "json-pointer-child",
+        true,
+    );
+    write_tracked_root(
+        backend,
+        &context,
+        "json-pointer-child",
+        Some("json-pointer-base"),
+        &child_rows,
+    )
+    .await?;
+    Ok(JsonPointerTrackedStateDiffFixture {
+        context,
+        left_commit_id: "json-pointer-base".to_string(),
+        right_commit_id: "json-pointer-child".to_string(),
+        expected_entries: child_rows.len(),
+    })
+}
+
+pub async fn json_pointer_tracked_state_get_many_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &JsonPointerTrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
+    let requests = fixture
+        .rows
+        .iter()
+        .map(|row| TrackedStateRowRequest {
+            schema_key: "json_pointer".to_string(),
+            entity_id: EntityIdentity::single(row.path.as_str()),
+            file_id: NullableKeyFilter::Null,
+        })
+        .collect::<Vec<_>>();
+    let verified_rows = reader
+        .load_rows_at_commit(&fixture.commit_id, &requests)
+        .await?
+        .into_iter()
+        .filter(Option::is_some)
+        .count();
+    Ok(report(fixture.rows.len(), verified_rows, Duration::ZERO))
+}
+
+pub async fn json_pointer_tracked_state_get_many_missing_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &JsonPointerTrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
+    let requests = fixture
+        .rows
+        .iter()
+        .map(|row| TrackedStateRowRequest {
+            schema_key: "json_pointer".to_string(),
+            entity_id: EntityIdentity::single(format!("missing{}", row.path)),
+            file_id: NullableKeyFilter::Null,
+        })
+        .collect::<Vec<_>>();
+    let verified_rows = reader
+        .load_rows_at_commit(&fixture.commit_id, &requests)
+        .await?
+        .into_iter()
+        .filter(Option::is_none)
+        .count();
+    Ok(report(fixture.rows.len(), verified_rows, Duration::ZERO))
+}
+
+pub async fn json_pointer_tracked_state_exists_many_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &JsonPointerTrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    // Tracked-state does not expose a lighter existence API yet. Keep this row
+    // as the current semantic equivalent so a future exists_many primitive has
+    // a named scoreboard slot to beat.
+    json_pointer_tracked_state_get_many_prepared(backend, fixture).await
+}
+
+pub async fn json_pointer_tracked_state_scan_keys_only_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &JsonPointerTrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    json_pointer_scan_with_projection(
+        backend,
+        fixture,
+        TrackedStateProjection {
+            columns: vec!["entity_id".to_string()],
+        },
+    )
+    .await
+}
+
+pub async fn json_pointer_tracked_state_scan_headers_only_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &JsonPointerTrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    json_pointer_scan_with_projection(
+        backend,
+        fixture,
+        TrackedStateProjection {
+            columns: tracked_state_header_columns(),
+        },
+    )
+    .await
+}
+
+pub async fn json_pointer_tracked_state_scan_full_rows_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &JsonPointerTrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    json_pointer_scan_with_projection(backend, fixture, TrackedStateProjection::default()).await
+}
+
+pub async fn json_pointer_tracked_state_prefix_scan_schema_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &JsonPointerTrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    json_pointer_scan_with_projection(backend, fixture, TrackedStateProjection::default()).await
+}
+
+pub async fn json_pointer_tracked_state_prefix_scan_schema_file_null_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &JsonPointerTrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    json_pointer_scan_with_projection(backend, fixture, TrackedStateProjection::default()).await
+}
+
+async fn json_pointer_scan_with_projection(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &JsonPointerTrackedStateReadFixture,
+    projection: TrackedStateProjection,
+) -> Result<StorageBenchReport, LixError> {
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
+    let verified_rows = reader
+        .scan_rows_at_commit(
+            &fixture.commit_id,
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: vec!["json_pointer".to_string()],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    ..Default::default()
+                },
+                projection,
+                ..Default::default()
+            },
+        )
+        .await?
+        .len();
+    Ok(report(fixture.rows.len(), verified_rows, Duration::ZERO))
+}
+
+pub async fn prepare_json_pointer_tracked_state_update_rows(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    rows: &[JsonPointerStorageRow],
+    updated_rows: usize,
+) -> Result<TrackedStateUpdateFixture, LixError> {
+    let context = TrackedStateContext::new();
+    let base_rows = json_pointer_tracked_rows(rows, "json-pointer-base", false);
+    write_tracked_root(backend, &context, "json-pointer-base", None, &base_rows).await?;
+    let child_rows = json_pointer_tracked_rows(
+        &rows[..updated_rows.min(rows.len())],
+        "json-pointer-child",
+        true,
+    );
+    Ok(TrackedStateUpdateFixture {
+        context,
+        rows: child_rows,
+    })
+}
+
+pub async fn prepare_json_pointer_tracked_state_tombstone_rows(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    rows: &[JsonPointerStorageRow],
+    tombstone_rows: usize,
+) -> Result<TrackedStateUpdateFixture, LixError> {
+    let context = TrackedStateContext::new();
+    let base_rows = json_pointer_tracked_rows(rows, "json-pointer-base", false);
+    write_tracked_root(backend, &context, "json-pointer-base", None, &base_rows).await?;
+    let mut child_rows = json_pointer_tracked_rows(
+        &rows[..tombstone_rows.min(rows.len())],
+        "json-pointer-child",
+        true,
+    );
+    for row in &mut child_rows {
+        row.snapshot_content = None;
+    }
+    Ok(TrackedStateUpdateFixture {
+        context,
+        rows: child_rows,
+    })
+}
+
+pub async fn prepare_json_pointer_tracked_state_diff_delta_chain(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    rows: &[JsonPointerStorageRow],
+    delta_commits: usize,
+    updated_rows_per_commit: usize,
+) -> Result<JsonPointerTrackedStateDiffFixture, LixError> {
+    let (context, final_commit_id) =
+        write_json_pointer_delta_chain(backend, rows, delta_commits, updated_rows_per_commit)
+            .await?;
+    Ok(JsonPointerTrackedStateDiffFixture {
+        context,
+        left_commit_id: "json-pointer-base".to_string(),
+        right_commit_id: final_commit_id,
+        expected_entries: updated_rows_per_commit.min(rows.len()),
+    })
+}
+
+pub async fn prepare_json_pointer_tracked_state_materialize_delta_chain(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    rows: &[JsonPointerStorageRow],
+    delta_commits: usize,
+    updated_rows_per_commit: usize,
+) -> Result<TrackedStateMaterializeFixture, LixError> {
+    let (context, final_commit_id) =
+        write_json_pointer_delta_chain(backend, rows, delta_commits, updated_rows_per_commit)
+            .await?;
+    Ok(TrackedStateMaterializeFixture {
+        context,
+        commit_id: final_commit_id,
+        expected_rows: rows.len(),
+    })
+}
+
+pub async fn json_pointer_tracked_state_changed_keys_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &JsonPointerTrackedStateDiffFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
+    let diff = reader
+        .diff_commits(
+            &fixture.left_commit_id,
+            &fixture.right_commit_id,
+            &TrackedStateDiffRequest::default(),
+        )
+        .await?;
+    Ok(report(
+        fixture.expected_entries,
+        diff.entries.len(),
         Duration::ZERO,
     ))
 }
@@ -3955,6 +4264,78 @@ fn tracked_rows(config: StorageBenchConfig, commit_id: &str) -> Vec<Materialized
             commit_id: commit_id.to_string(),
         })
         .collect()
+}
+
+fn json_pointer_tracked_rows(
+    rows: &[JsonPointerStorageRow],
+    commit_id: &str,
+    updated: bool,
+) -> Vec<MaterializedTrackedStateRow> {
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let value_json = if updated {
+                row.updated_value_json.as_str()
+            } else {
+                row.value_json.as_str()
+            };
+            let value = serde_json::from_str::<serde_json::Value>(value_json)
+                .unwrap_or_else(|_| serde_json::Value::String(value_json.to_string()));
+            let snapshot = serde_json::json!({
+                "path": row.path,
+                "value": value,
+            })
+            .to_string();
+            MaterializedTrackedStateRow {
+                entity_id: EntityIdentity::single(row.path.as_str()),
+                schema_key: "json_pointer".to_string(),
+                file_id: None,
+                snapshot_content: Some(snapshot),
+                metadata: None,
+                deleted: false,
+                created_at: timestamp(index),
+                updated_at: timestamp(index),
+                change_id: tracked_change_id(commit_id, index),
+                commit_id: commit_id.to_string(),
+            }
+        })
+        .collect()
+}
+
+async fn write_json_pointer_delta_chain(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    rows: &[JsonPointerStorageRow],
+    delta_commits: usize,
+    updated_rows_per_commit: usize,
+) -> Result<(TrackedStateContext, String), LixError> {
+    let context = TrackedStateContext::new();
+    let base_commit_id = "json-pointer-base";
+    let base_rows = json_pointer_tracked_rows(rows, base_commit_id, false);
+    write_tracked_root(backend, &context, base_commit_id, None, &base_rows).await?;
+
+    let mut parent_commit_id = base_commit_id.to_string();
+    for delta_index in 0..delta_commits {
+        let commit_id = format!("json-pointer-delta-{delta_index}");
+        let mut child_rows = json_pointer_tracked_rows(
+            &rows[..updated_rows_per_commit.min(rows.len())],
+            &commit_id,
+            true,
+        );
+        for row in &mut child_rows {
+            row.updated_at = timestamp(rows.len() + delta_index);
+        }
+        write_tracked_root(
+            backend,
+            &context,
+            &commit_id,
+            Some(parent_commit_id.as_str()),
+            &child_rows,
+        )
+        .await?;
+        parent_commit_id = commit_id;
+    }
+
+    Ok((context, parent_commit_id))
 }
 
 fn tracked_rows_file_selective(

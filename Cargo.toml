@@ -15,3 +15,7 @@ exclude = ["packages/plugin-json-v2"]
 
 [profile.test]
 debug = 1
+
+[profile.bench]
+debug = true
+strip = false
