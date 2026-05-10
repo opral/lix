@@ -8,11 +8,14 @@ use lix_engine::{
     BackendReadTransaction, BackendWriteTransaction, BytePageBuilder, LixError,
 };
 use rusqlite::{params, Connection, OptionalExtension};
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 #[derive(Clone)]
 pub(crate) struct SqliteBenchBackend {
     connection: Arc<Mutex<Connection>>,
+    #[allow(dead_code)]
+    path: Option<Arc<PathBuf>>,
     _temp_dir: Option<Arc<TempDir>>,
 }
 
@@ -29,13 +32,19 @@ impl SqliteBenchBackend {
                 format!("sqlite bench tempdir: {error}"),
             )
         })?);
-        let path = temp_dir.path().join("bench.sqlite");
-        let connection = Connection::open(path).map_err(sqlite_error)?;
+        let path = Arc::new(temp_dir.path().join("bench.sqlite"));
+        let connection = Connection::open(path.as_path()).map_err(sqlite_error)?;
         configure_connection(&connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            path: Some(path),
             _temp_dir: Some(temp_dir),
         })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn path(&self) -> Option<&Path> {
+        self.path.as_deref().map(PathBuf::as_path)
     }
 
     fn lock_connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, LixError> {
