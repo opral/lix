@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use crate::catalog::{SchemaCatalog, SchemaPlan, SchemaPlanId};
 use crate::common::format_json_pointer;
 use crate::common::normalize_path_segment;
 use crate::domain::Domain;
@@ -11,7 +12,6 @@ use crate::schema::{
     is_seed_schema_key, schema_from_registered_snapshot, validate_lix_schema,
     validate_lix_schema_definition,
 };
-use crate::schema_catalog::{SchemaCatalog, SchemaPlan, SchemaPlanId};
 use crate::transaction::types::{PreparedRowFacts, TransactionJson, TransactionWriteRow};
 use crate::LixError;
 

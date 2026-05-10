@@ -6,13 +6,13 @@ use std::sync::Arc;
 use serde_json::Value as JsonValue;
 
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
+use crate::catalog::SchemaCatalogContext;
 use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
 use crate::commit_store::CommitStoreContext;
 use crate::entity_identity::EntityIdentity;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
-use crate::schema_catalog::SchemaCatalogSource;
 use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext};
 use crate::storage::{
     ScopedStorageReader, StorageContext, StorageReadScope, StorageReadTransaction, StorageReader,
@@ -50,7 +50,7 @@ pub struct SessionContext {
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) commit_store: Arc<CommitStoreContext>,
     pub(super) version_ctx: Arc<VersionContext>,
-    pub(super) schema_catalog_source: Arc<SchemaCatalogSource>,
+    pub(super) schema_catalog_context: Arc<SchemaCatalogContext>,
     closed: Arc<AtomicBool>,
 }
 
@@ -62,7 +62,7 @@ impl SessionContext {
         binary_cas: Arc<BinaryCasContext>,
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
-        schema_catalog_source: Arc<SchemaCatalogSource>,
+        schema_catalog_context: Arc<SchemaCatalogContext>,
     ) -> Result<Self, LixError> {
         let session = Self::new(
             SessionMode::Workspace,
@@ -72,7 +72,7 @@ impl SessionContext {
             binary_cas,
             commit_store,
             version_ctx,
-            schema_catalog_source,
+            schema_catalog_context,
         );
         session.active_version_id().await?;
         Ok(session)
@@ -86,7 +86,7 @@ impl SessionContext {
         binary_cas: Arc<BinaryCasContext>,
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
-        schema_catalog_source: Arc<SchemaCatalogSource>,
+        schema_catalog_context: Arc<SchemaCatalogContext>,
     ) -> Result<Self, LixError> {
         Ok(Self::new(
             SessionMode::Pinned {
@@ -98,7 +98,7 @@ impl SessionContext {
             binary_cas,
             commit_store,
             version_ctx,
-            schema_catalog_source,
+            schema_catalog_context,
         ))
     }
 
@@ -110,7 +110,7 @@ impl SessionContext {
         binary_cas: Arc<BinaryCasContext>,
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
-        schema_catalog_source: Arc<SchemaCatalogSource>,
+        schema_catalog_context: Arc<SchemaCatalogContext>,
     ) -> Self {
         Self::new_with_closed(
             mode,
@@ -120,7 +120,7 @@ impl SessionContext {
             binary_cas,
             commit_store,
             version_ctx,
-            schema_catalog_source,
+            schema_catalog_context,
             Arc::new(AtomicBool::new(false)),
         )
     }
@@ -133,7 +133,7 @@ impl SessionContext {
         binary_cas: Arc<BinaryCasContext>,
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
-        schema_catalog_source: Arc<SchemaCatalogSource>,
+        schema_catalog_context: Arc<SchemaCatalogContext>,
         closed: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -144,7 +144,7 @@ impl SessionContext {
             binary_cas,
             commit_store,
             version_ctx,
-            schema_catalog_source,
+            schema_catalog_context,
             closed,
         }
     }
@@ -287,7 +287,7 @@ impl SessionContext {
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
-            Arc::clone(&self.schema_catalog_source),
+            Arc::clone(&self.schema_catalog_context),
         )
         .await?;
         let mut transaction = opened.transaction;

@@ -3,17 +3,17 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::catalog::{SchemaCatalog, SchemaCatalogContext, SchemaCatalogFact};
 use crate::domain::Domain;
 use crate::live_state::{
     LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
 };
-use crate::schema_catalog::{SchemaCatalog, SchemaCatalogFact, SchemaCatalogSource};
 use crate::transaction::live_state_overlay::overlay_scan_rows;
 use crate::transaction::staging::PreparedStateRowOverlay;
 use crate::LixError;
 
 pub(crate) struct TransactionSchemaResolver {
-    source: Arc<SchemaCatalogSource>,
+    context: Arc<SchemaCatalogContext>,
     catalogs_by_domain: BTreeMap<Domain, SchemaCatalogEntry>,
 }
 
@@ -23,9 +23,9 @@ enum SchemaCatalogEntry {
 }
 
 impl TransactionSchemaResolver {
-    pub(crate) fn new(source: Arc<SchemaCatalogSource>) -> Self {
+    pub(crate) fn new(context: Arc<SchemaCatalogContext>) -> Self {
         Self {
-            source,
+            context,
             catalogs_by_domain: BTreeMap::new(),
         }
     }
@@ -44,11 +44,11 @@ impl TransactionSchemaResolver {
                     base: live_state,
                     staged,
                 };
-                self.source
+                self.context
                     .schema_facts_for_domain(&reader, &domain)
                     .await?
             } else {
-                self.source
+                self.context
                     .schema_facts_for_domain(live_state, &domain)
                     .await?
             };

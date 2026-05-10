@@ -1,4 +1,5 @@
 use crate::binary_cas::{BinaryCasContext, BlobHash, BlobWrite};
+use crate::catalog::SchemaCatalogContext;
 use crate::commit_graph::CommitGraphChangeHistoryRequest;
 use crate::commit_store::{
     Change, ChangeScanRequest, CommitDraftRef, CommitStoreContext, MaterializedChange,
@@ -10,7 +11,6 @@ use crate::json_store::types::{
     JsonRef, JsonWritePlacementRef, NormalizedJsonRef,
 };
 use crate::live_state::LiveStateContext;
-use crate::schema_catalog::SchemaCatalogSource;
 use crate::session::SessionMode;
 use crate::storage::{
     KvGetGroup, KvGetRequest, KvScanRange, KvScanRequest, KvWriteBatch, StorageContext,
@@ -169,7 +169,7 @@ pub struct TransactionBenchFixture {
     binary_cas: Arc<BinaryCasContext>,
     commit_store: Arc<CommitStoreContext>,
     version_ctx: Arc<VersionContext>,
-    schema_catalog_source: Arc<SchemaCatalogSource>,
+    schema_catalog_context: Arc<SchemaCatalogContext>,
     rows: Vec<TransactionWriteRow>,
 }
 
@@ -406,7 +406,7 @@ pub async fn transaction_commit_prepared(
         Arc::clone(&fixture.binary_cas),
         Arc::clone(&fixture.commit_store),
         Arc::clone(&fixture.version_ctx),
-        Arc::clone(&fixture.schema_catalog_source),
+        Arc::clone(&fixture.schema_catalog_context),
     )
     .await?;
     let mut transaction = opened.transaction;
@@ -442,7 +442,7 @@ pub async fn transaction_open_empty_prepared(
         Arc::clone(&fixture.binary_cas),
         Arc::clone(&fixture.commit_store),
         Arc::clone(&fixture.version_ctx),
-        Arc::clone(&fixture.schema_catalog_source),
+        Arc::clone(&fixture.schema_catalog_context),
     )
     .await?;
     let elapsed = started_at.elapsed();
@@ -467,7 +467,7 @@ pub async fn transaction_stage_only_prepared(
         Arc::clone(&fixture.binary_cas),
         Arc::clone(&fixture.commit_store),
         Arc::clone(&fixture.version_ctx),
-        Arc::clone(&fixture.schema_catalog_source),
+        Arc::clone(&fixture.schema_catalog_context),
     )
     .await?;
     let mut transaction = opened.transaction;
@@ -502,7 +502,7 @@ pub async fn prepare_transaction_commit_only(
         Arc::clone(&fixture.binary_cas),
         Arc::clone(&fixture.commit_store),
         Arc::clone(&fixture.version_ctx),
-        Arc::clone(&fixture.schema_catalog_source),
+        Arc::clone(&fixture.schema_catalog_context),
     )
     .await?;
     let mut transaction = opened.transaction;
@@ -576,7 +576,7 @@ async fn prepare_transaction_fixture(
     ));
     let binary_cas = Arc::new(BinaryCasContext::new());
     let version_ctx = Arc::new(VersionContext::new(untracked_state));
-    let schema_catalog_source = Arc::new(SchemaCatalogSource::new());
+    let schema_catalog_context = Arc::new(SchemaCatalogContext::new());
     seed_transaction_visible_schema_rows(storage.clone()).await?;
     Ok(TransactionBenchFixture {
         storage,
@@ -585,7 +585,7 @@ async fn prepare_transaction_fixture(
         binary_cas,
         commit_store,
         version_ctx,
-        schema_catalog_source,
+        schema_catalog_context,
         rows,
     })
 }

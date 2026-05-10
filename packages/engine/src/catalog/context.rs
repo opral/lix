@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 
 use serde_json::Value as JsonValue;
 
+use crate::catalog::SchemaCatalogFact;
 use crate::domain::{committed_row_is_exact_version_scoped, Domain};
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
 use crate::schema::schema_key_from_definition;
-use crate::schema_catalog::SchemaCatalogFact;
 use crate::{LixError, NullableKeyFilter};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -15,10 +15,10 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 ///
 /// SQL planning receives a schema snapshot from live state. System schemas are
 /// seeded as ordinary `lix_registered_schema` rows during initialization, so
-/// runtime schema visibility has one source of truth.
-pub(crate) struct SchemaCatalogSource;
+/// runtime schema visibility has one context of truth.
+pub(crate) struct SchemaCatalogContext;
 
-impl SchemaCatalogSource {
+impl SchemaCatalogContext {
     pub(crate) fn new() -> Self {
         Self
     }
@@ -150,9 +150,9 @@ mod tests {
 
     #[tokio::test]
     async fn visible_schemas_are_loaded_from_registered_schema_rows() {
-        let source = SchemaCatalogSource::new();
+        let context = SchemaCatalogContext::new();
 
-        let schemas = source
+        let schemas = context
             .schema_jsons_for_sql_read_planning(
                 &RowsLiveStateReader::new(vec![
                     registered_schema_row("lix_registered_schema"),
@@ -173,9 +173,9 @@ mod tests {
 
     #[tokio::test]
     async fn visible_schemas_include_registered_schema_rows() {
-        let source = SchemaCatalogSource::new();
+        let context = SchemaCatalogContext::new();
 
-        let schemas = source
+        let schemas = context
             .schema_jsons_for_sql_read_planning(
                 &RowsLiveStateReader::new(vec![registered_schema_row("engine_dynamic_schema")]),
                 "global",
@@ -190,8 +190,8 @@ mod tests {
 
     #[tokio::test]
     async fn sql_read_planning_rejects_multiple_visible_schemas_for_same_surface() {
-        let source = SchemaCatalogSource::new();
-        let error = source
+        let context = SchemaCatalogContext::new();
+        let error = context
             .schema_jsons_for_sql_read_planning(
                 &RowsLiveStateReader::new(vec![
                     registered_schema_row("engine_dynamic_schema"),
@@ -208,11 +208,11 @@ mod tests {
 
     #[tokio::test]
     async fn tracked_domain_sees_tracked_seed_schemas_but_not_user_untracked_schemas() {
-        let source = SchemaCatalogSource::new();
+        let context = SchemaCatalogContext::new();
         let mut seed_schema = registered_schema_row("lix_key_value");
         seed_schema.untracked = false;
 
-        let facts = source
+        let facts = context
             .schema_facts_for_domain(
                 &RowsLiveStateReader::new(vec![
                     seed_schema,
@@ -237,9 +237,9 @@ mod tests {
 
     #[tokio::test]
     async fn tracked_domain_does_not_see_untracked_seed_schemas() {
-        let source = SchemaCatalogSource::new();
+        let context = SchemaCatalogContext::new();
 
-        let facts = source
+        let facts = context
             .schema_facts_for_domain(
                 &RowsLiveStateReader::new(vec![registered_schema_row("lix_key_value")]),
                 &Domain::schema_catalog("global", false),
@@ -258,12 +258,12 @@ mod tests {
 
     #[tokio::test]
     async fn visible_schemas_ignore_projected_global_schema_rows_for_version_scope() {
-        let source = SchemaCatalogSource::new();
+        let context = SchemaCatalogContext::new();
         let mut global_only = registered_schema_row("global_only_schema");
         global_only.global = true;
         global_only.version_id = "main".to_string();
 
-        let schemas = source
+        let schemas = context
             .schema_jsons_for_sql_read_planning(
                 &RowsLiveStateReader::new(vec![global_only]),
                 "main",
@@ -276,14 +276,14 @@ mod tests {
 
     #[tokio::test]
     async fn schema_facts_post_filter_non_catalog_rows_even_if_reader_returns_them() {
-        let source = SchemaCatalogSource::new();
+        let context = SchemaCatalogContext::new();
         let valid_schema = registered_schema_row("valid_schema");
         let mut file_scoped_schema = registered_schema_row("file_scoped_schema");
         file_scoped_schema.file_id = Some("file-a".to_string());
         let mut tombstoned_schema = registered_schema_row("tombstoned_schema");
         tombstoned_schema.snapshot_content = None;
 
-        let facts = source
+        let facts = context
             .schema_facts_for_domain(
                 &RowsLiveStateReader::new(vec![
                     valid_schema,
@@ -304,9 +304,9 @@ mod tests {
 
     #[tokio::test]
     async fn visible_schemas_are_empty_when_no_schema_rows_are_visible() {
-        let source = SchemaCatalogSource::new();
+        let context = SchemaCatalogContext::new();
 
-        let schemas = source
+        let schemas = context
             .schema_jsons_for_sql_read_planning(&RowsLiveStateReader::new(Vec::new()), "global")
             .await
             .expect("schema visibility should load");
