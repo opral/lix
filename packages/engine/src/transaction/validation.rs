@@ -2,6 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value as JsonValue;
 
+use crate::catalog::{
+    ForeignKeyPlan, SchemaCatalog, SchemaCatalogKey, SchemaPlan, StateForeignKeyPlan,
+};
 use crate::common::format_json_pointer;
 #[cfg(test)]
 use crate::common::parse_json_pointer;
@@ -19,9 +22,6 @@ use crate::schema::{
 #[cfg(test)]
 use crate::schema::{
     is_seed_schema_key, validate_lix_schema, validate_lix_schema_definition, SchemaKey,
-};
-use crate::schema_catalog::{
-    ForeignKeyPlan, SchemaCatalog, SchemaCatalogKey, SchemaPlan, StateForeignKeyPlan,
 };
 use crate::transaction::staging::duplicate_insert_identity_message;
 #[cfg(test)]
@@ -5411,7 +5411,7 @@ mod tests {
     fn pending_registered_schema_from_definition(schema: JsonValue) -> PreparedStateRow {
         let key = schema_key_from_definition(&schema).expect("test schema should have a key");
         PreparedStateRow {
-            schema_plan_id: crate::schema_catalog::SchemaPlanId::for_test(0),
+            schema_plan_id: crate::catalog::SchemaPlanId::for_test(0),
             facts: crate::transaction::types::PreparedRowFacts::default(),
             entity_id: registered_schema_entity_id(&key.schema_key),
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
@@ -5778,7 +5778,7 @@ mod tests {
 
     fn staged_row(schema_key: &str, snapshot_content: Option<String>) -> PreparedStateRow {
         PreparedStateRow {
-            schema_plan_id: crate::schema_catalog::SchemaPlanId::for_test(0),
+            schema_plan_id: crate::catalog::SchemaPlanId::for_test(0),
             facts: crate::transaction::types::PreparedRowFacts::default(),
             entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
             schema_key: schema_key.to_string(),

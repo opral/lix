@@ -1,9 +1,9 @@
 use std::{collections::BTreeSet, fmt, ops::Deref, sync::Arc};
 
+use crate::catalog::SchemaPlanId;
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
 use crate::live_state::MaterializedLiveStateRow;
-use crate::schema_catalog::SchemaPlanId;
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::untracked_state::MaterializedUntrackedStateRow;
 use crate::LixError;

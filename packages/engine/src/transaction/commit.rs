@@ -667,9 +667,9 @@ mod tests {
         BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction,
         BackendWriteTransaction,
     };
+    use crate::catalog::SchemaPlanId;
     use crate::commit_store::{ChangeIndexEntry, ChangeLocator};
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
-    use crate::schema_catalog::SchemaPlanId;
     use crate::storage::StorageContext;
     use crate::transaction::types::PreparedRowFacts;
     use crate::untracked_state::{

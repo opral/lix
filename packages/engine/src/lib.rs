@@ -1,5 +1,6 @@
 mod backend;
 mod binary_cas;
+pub(crate) mod catalog;
 pub(crate) mod cel;
 pub(crate) mod commit_graph;
 #[allow(dead_code, unused_imports)]
@@ -14,7 +15,6 @@ pub(crate) mod init;
 pub(crate) mod json_store;
 pub(crate) mod live_state;
 mod schema;
-pub(crate) mod schema_catalog;
 pub mod session;
 pub(crate) mod sql2;
 #[allow(dead_code, unused_imports)]

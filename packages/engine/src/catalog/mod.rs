@@ -1,8 +1,8 @@
 mod catalog;
-mod source;
+mod context;
 
 pub(crate) use catalog::{
     ForeignKeyPlan, SchemaCatalog, SchemaCatalogFact, SchemaCatalogKey, SchemaPlan, SchemaPlanId,
     StateForeignKeyPlan,
 };
-pub(crate) use source::SchemaCatalogSource;
+pub(crate) use context::SchemaCatalogContext;

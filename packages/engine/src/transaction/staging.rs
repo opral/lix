@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
+use crate::catalog::SchemaPlanId;
 use crate::domain::{Domain, DomainRowIdentity};
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionProvider, FunctionProviderHandle};
 #[cfg(test)]
 use crate::live_state::LiveStateRowRequest;
 use crate::live_state::{LiveStateScanRequest, MaterializedLiveStateRow};
-use crate::schema_catalog::SchemaPlanId;
 #[cfg(test)]
 use crate::transaction::types::{stage_json_from_value, TransactionJson};
 use crate::transaction::types::{
