@@ -337,16 +337,6 @@ pub(crate) fn decode_visible_value(
     decode_value_after_header(bytes, cursor, deleted).map(Some)
 }
 
-pub(crate) fn decode_value_deleted(bytes: &[u8]) -> Result<bool, LixError> {
-    let value_header = *bytes.first().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "tracked-state tree value is truncated before header",
-        )
-    })?;
-    decode_value_header(value_header)
-}
-
 fn decode_value_header(value_header: u8) -> Result<bool, LixError> {
     let version = value_header & VALUE_VERSION_MASK;
     let deleted = value_header & VALUE_DELETED_FLAG != 0;
@@ -1644,36 +1634,6 @@ mod tests {
             distinct_len - compact_len,
             sized_bytes_len(compact.updated_at.as_bytes())
         );
-    }
-
-    #[test]
-    fn value_deleted_header_decode_does_not_require_full_value() {
-        let live = TrackedStateIndexValue {
-            change_locator: ChangeLocator {
-                source_commit_id: "commit".to_string(),
-                source_pack_id: 0,
-                source_ordinal: 1,
-                change_id: "change".to_string(),
-            },
-            deleted: false,
-            snapshot_ref: None,
-            metadata_ref: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-02T00:00:00Z".to_string(),
-        };
-        let mut tombstone = live.clone();
-        tombstone.deleted = true;
-
-        assert!(!decode_value_deleted(&encode_value(&live)).expect("live header"));
-        assert!(decode_value_deleted(&encode_value(&tombstone)).expect("tombstone header"));
-        assert!(decode_value_deleted(&[]).is_err());
-
-        let mut unsupported = encode_value(&live);
-        unsupported[0] = VALUE_VERSION + 1;
-        assert!(decode_value_deleted(&unsupported)
-            .expect_err("unsupported version should reject")
-            .to_string()
-            .contains("unsupported tracked-state tree value version"));
     }
 
     #[test]

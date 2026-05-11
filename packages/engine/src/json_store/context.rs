@@ -4,7 +4,7 @@ use crate::json_store::types::{
     JsonProjectionLoadRequestRef, JsonRef, JsonValueBatch, JsonWritePlacementRef,
     NormalizedJsonRef,
 };
-use crate::storage::{StorageReader, StorageWriteSet};
+use crate::storage::{KvGetGroup, StorageReader, StorageWriteSet};
 use crate::LixError;
 use std::collections::{HashMap, HashSet};
 
@@ -37,6 +37,17 @@ impl JsonStoreContext {
         store::load_json_bytes_many_in_scope(store, request.refs, request.scope)
             .await
             .map(JsonLoadBatch::new)
+    }
+
+    pub(crate) fn commit_pack_get_group(&self, commit_id: &str, pack_id: u32) -> KvGetGroup {
+        KvGetGroup {
+            namespace: store::JSON_PACK_NAMESPACE.to_string(),
+            keys: vec![store::pack_key(commit_id, pack_id)],
+        }
+    }
+
+    pub(crate) fn decode_pack_refs(&self, bytes: &[u8]) -> Result<Vec<JsonRef>, LixError> {
+        store::decode_json_pack_refs(bytes)
     }
 }
 

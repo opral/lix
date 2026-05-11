@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::json_store::store as json_store;
+use crate::json_store::JsonStoreContext;
 use crate::storage::{KvGetGroup, KvGetRequest, StorageReader, StorageWriteSet};
 use crate::tracked_state::codec::PendingChunkWrite;
 use crate::tracked_state::types::{
@@ -93,6 +93,7 @@ pub(crate) async fn load_delta_pack(
     store: &mut (impl StorageReader + ?Sized),
     commit_id: &str,
 ) -> Result<Option<Vec<TrackedStateDeltaEntry>>, LixError> {
+    let json_store = JsonStoreContext::new();
     let result = store
         .get_values(KvGetRequest {
             groups: vec![
@@ -100,10 +101,7 @@ pub(crate) async fn load_delta_pack(
                     namespace: TRACKED_STATE_DELTA_PACK_NAMESPACE.to_string(),
                     keys: vec![commit_id.as_bytes().to_vec()],
                 },
-                KvGetGroup {
-                    namespace: json_store::JSON_PACK_NAMESPACE.to_string(),
-                    keys: vec![json_store::pack_key(commit_id, 0)],
-                },
+                json_store.commit_pack_get_group(commit_id, 0),
             ],
         })
         .await?;
@@ -126,7 +124,7 @@ pub(crate) async fn load_delta_pack(
     let pack_refs = if crate::tracked_state::codec::delta_pack_uses_json_pack_indexes(&bytes)? {
         json_pack_group
             .single_value_owned()
-            .map(|bytes| json_store::decode_json_pack_refs(&bytes))
+            .map(|bytes| json_store.decode_pack_refs(&bytes))
             .transpose()?
     } else {
         None
