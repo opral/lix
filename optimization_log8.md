@@ -2308,6 +2308,126 @@ treated as a small supporting optimization rather than a budget-moving step.
 No storage format change. No temporary shim.
 ```
 
+## Optimization 20: Stage generated bench roots as authored changes
+
+### Hypothesis
+
+The physical storage benchmark helper for tracked roots was doing an extra
+commit-store index scan to classify generated rows as authored or adopted
+before calling `stage_commit_draft`. That pre-pass does not match the
+production transaction boundary: production staging already separates authored
+rows from adopted rows before entering the commit store.
+
+The helper-generated rows use commit-scoped fresh change ids
+(`tracked_change_id(commit_id, index)`, with a separate fresh append namespace),
+so every `write_tracked_root` row in these benchmark fixtures is authored.
+Staging those rows directly as authored changes keeps commit-store uniqueness
+validation intact while removing a redundant history scan from root/delta write
+measurement.
+
+### Change
+
+- Removed `load_change_index_entries` pre-classification from
+  `storage_bench.rs::write_tracked_root`.
+- Stage all helper-generated changes as authored changes and build tracked
+  deltas by zipping staged authored locators back to the original rows.
+- Kept commit-store validation in `stage_commit_draft`; no storage format
+  change and no validation weakening inside the commit store.
+
+Discarded experiment: a physical `change_id -> locator` commit-store index
+improved RocksDB delta writes but regressed SQLite writes and increased storage
+footprint, so it was reverted before this optimization.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+Result: passed.
+
+| row                                             | after median | criterion status |
+| ----------------------------------------------- | -----------: | ---------------- |
+| `raw_sqlite/write_root_all_rows/1k`             |    2.4088 ms | reference |
+| `raw_sqlite/write_delta_10pct_updates/1k`       |    1.2788 ms | reference |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k`   |    1.2642 ms | reference |
+| `sqlite/write_root_all_rows/1k`                 |    5.3781 ms | improved |
+| `sqlite/write_delta_10pct_updates/1k`           |    1.9665 ms | improved |
+| `sqlite/write_tombstone_10pct_deletes/1k`       |    1.8551 ms | improved |
+| `rocksdb/write_root_all_rows/1k`                |    4.6757 ms | improved |
+| `rocksdb/write_delta_10pct_updates/1k`          |  911.94 µs | noisy, below pre-index baseline |
+| `rocksdb/write_tombstone_10pct_deletes/1k`      |  893.40 µs | noisy, below pre-index baseline |
+
+Criterion marked RocksDB delta/tombstone as regressions only because the
+abandoned change-index experiment had just updated the local Criterion
+baseline. Compared to Optimization 19, both are lower medians.
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                     | bytes | bytes/row | status |
+| --------------------------------------- | ----: | --------: | ------ |
+| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
+| Lix SQLite / inserted                   | 1054536 | 1054.5 | unchanged |
+| Lix SQLite / after create_version       | 1071016 | 1071.0 | unchanged |
+| Lix SQLite / after fast-forward merge   | 5279392 | 5279.4 | unchanged |
+| Lix SQLite / after divergent merge      | 5570208 | 5570.2 | unchanged |
+| Lix RocksDB / inserted                  | 964892 | 964.9 | unchanged |
+| Lix RocksDB / after create_version      | 966733 | 966.7 | unchanged |
+| Lix RocksDB / after fast-forward merge  | 1125265 | 1125.3 | unchanged |
+| Lix RocksDB / after divergent merge     | 1494060 | 1494.1 | unchanged |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+Reviewer confirmed no `write_tracked_root` benchmark path legitimately needs
+adopted changes: row generators use fresh commit-scoped change ids, and the
+append-child helper uses a separate fresh namespace. Ordering and timestamps
+remain preserved by zipping authored locators back to the original rows.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine commit_store::storage:: --features storage-benches
+cargo test -p lix_engine tracked_state::materializer:: --features storage-benches
+cargo test -p lix_engine transaction::commit:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a benchmark-path correction and write optimization.
+
+The change removes work that production transaction staging does not do and
+keeps the commit-store validation boundary intact. SQLite delta/tombstone writes
+move under 2 ms in this run; root writes are modestly better but remain above
+the 1.5x target. No storage change, no backward shim.
+```
+
 ## Optimization 15: Move JSON content hash verification off hot reads
 
 Date: 2026-05-11
