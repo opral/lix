@@ -27,11 +27,10 @@ use crate::schema::{
 use crate::transaction::staging::duplicate_insert_identity_message;
 #[cfg(test)]
 use crate::transaction::staging::PreparedWriteSet;
-use crate::transaction::staging::{
-    PreparedStateRowIdentity, PreparedValidationRow, PreparedWriteValidationSet,
-};
+use crate::transaction::staging::{PreparedValidationRow, PreparedWriteValidationSet};
 #[cfg(test)]
 use crate::transaction::types::PreparedStateRow;
+use crate::transaction::types::TransactionWriteOrigin;
 use crate::version::{VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_REF_SCHEMA_KEY};
 use crate::LixError;
 
@@ -792,37 +791,60 @@ async fn validate_committed_insert_identities(
     input: &TransactionValidationInput<'_>,
     pending_constraints: &PendingConstraintIndexes,
 ) -> Result<(), LixError> {
+    let pending_identity_targets = pending_constraints
+        .identity_targets
+        .iter()
+        .map(|target| target.identity.clone())
+        .collect::<BTreeSet<_>>();
+    let mut checks_by_domain_schema =
+        BTreeMap::<(Domain, String), Vec<(EntityIdentity, Option<TransactionWriteOrigin>)>>::new();
     for (identity, origin) in input.staged_writes.insert_identities() {
-        let Some(pending_identity) =
-            pending_constraints.has_identity_target_for_staged_identity(identity)
-        else {
-            continue;
-        };
-        let Some(committed_row) = load_committed_constraint_row(
-            input.live_state,
-            pending_identity.domain(),
-            pending_identity.schema_key(),
-            pending_identity.entity_id_owned(),
-            false,
-        )
-        .await?
-        else {
-            continue;
-        };
-        if committed_row.snapshot_content.is_none()
-            || pending_constraints.tombstones_identity(&committed_row)
-        {
+        let pending_identity = DomainRowIdentity::in_domain(
+            identity.domain(),
+            identity.schema_key().to_string(),
+            identity.entity_id().clone(),
+        );
+        if !pending_identity_targets.contains(&pending_identity) {
             continue;
         }
-        return Err(LixError::new(
-            LixError::CODE_UNIQUE,
-            duplicate_insert_identity_message(
-                identity.schema_key(),
-                identity.entity_id(),
-                None,
-                origin,
-            ),
-        ));
+        checks_by_domain_schema
+            .entry((
+                pending_identity.domain().clone(),
+                pending_identity.schema_key_owned(),
+            ))
+            .or_default()
+            .push((pending_identity.entity_id_owned(), origin.cloned()));
+    }
+
+    for ((domain, schema_key), checks) in checks_by_domain_schema {
+        let entity_ids = checks
+            .iter()
+            .map(|(entity_id, _)| entity_id.clone())
+            .collect::<Vec<_>>();
+        let committed_rows = scan_committed_constraint_rows(
+            input.live_state,
+            &domain,
+            vec![schema_key.clone()],
+            entity_ids,
+            false,
+        )
+        .await?;
+        let committed_rows_by_entity_id = committed_rows
+            .into_iter()
+            .filter(|row| {
+                row.snapshot_content.is_some() && !pending_constraints.tombstones_identity(row)
+            })
+            .map(|row| (row.entity_id.clone(), row))
+            .collect::<BTreeMap<_, _>>();
+        for (entity_id, origin) in checks {
+            if !committed_rows_by_entity_id.contains_key(&entity_id) {
+                continue;
+            }
+            return Err(LixError::new(
+                LixError::CODE_UNIQUE,
+                duplicate_insert_identity_message(&schema_key, &entity_id, None, origin.as_ref()),
+            ));
+        }
     }
     Ok(())
 }
@@ -1340,23 +1362,6 @@ impl PendingConstraintIndexes {
             .reachable_target_identities()
             .iter()
             .any(|candidate| self.has_identity_target(candidate))
-    }
-
-    fn has_identity_target_for_staged_identity(
-        &self,
-        identity: &PreparedStateRowIdentity,
-    ) -> Option<DomainRowIdentity> {
-        let expected_domain = identity.domain();
-        self.identity_targets
-            .iter()
-            .find(|target| {
-                target.identity.matches_parts(
-                    &expected_domain,
-                    identity.schema_key(),
-                    identity.entity_id(),
-                )
-            })
-            .map(|target| target.identity.clone())
     }
 
     fn tombstones_target_identity(&self, identity: &DomainRowIdentity) -> bool {
