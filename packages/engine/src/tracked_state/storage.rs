@@ -101,7 +101,16 @@ pub(crate) async fn load_delta_pack(
     else {
         return Ok(None);
     };
-    crate::tracked_state::codec::decode_delta_pack(&bytes).map(Some)
+    let (stored_commit_id, entries) = crate::tracked_state::codec::decode_delta_pack(&bytes)?;
+    if stored_commit_id != commit_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked-state delta pack identity mismatch: expected '{commit_id}', got '{stored_commit_id}'"
+            ),
+        ));
+    }
+    Ok(Some(entries))
 }
 
 pub(crate) fn stage_delta_pack_refs(
@@ -112,7 +121,7 @@ pub(crate) fn stage_delta_pack_refs(
     writes.put(
         TRACKED_STATE_DELTA_PACK_NAMESPACE,
         commit_id.as_bytes().to_vec(),
-        crate::tracked_state::codec::encode_delta_pack_refs(deltas)?,
+        crate::tracked_state::codec::encode_delta_pack_refs(commit_id, deltas)?,
     );
     Ok(())
 }

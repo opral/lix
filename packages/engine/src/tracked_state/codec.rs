@@ -13,7 +13,9 @@ const NODE_VERSION: u8 = 2;
 const VALUE_VERSION: u8 = 6;
 const VALUE_DELETED_FLAG: u8 = 0b1000_0000;
 const VALUE_VERSION_MASK: u8 = 0b0111_1111;
-const DELTA_PACK_VERSION: u8 = 1;
+const DELTA_PACK_VERSION: u8 = 2;
+const DELTA_LOCATOR_SAME_COMMIT: u8 = 0;
+const DELTA_LOCATOR_FULL: u8 = 1;
 const NODE_KIND_LEAF: u8 = 1;
 const NODE_KIND_INTERNAL: u8 = 2;
 const WEIBULL_K: i32 = 4;
@@ -358,11 +360,13 @@ fn decode_value_after_header(
 }
 
 pub(crate) fn encode_delta_pack_refs(
+    commit_id: &str,
     deltas: &[TrackedStateDeltaRef<'_>],
 ) -> Result<Vec<u8>, LixError> {
     let mut out = Vec::new();
     out.extend_from_slice(b"LXTD");
     out.push(DELTA_PACK_VERSION);
+    push_sized_bytes(&mut out, commit_id.as_bytes());
     push_u32(&mut out, deltas.len());
     for delta in deltas {
         push_sized_section(&mut out, |out| {
@@ -376,8 +380,9 @@ pub(crate) fn encode_delta_pack_refs(
             );
         });
         push_sized_section(&mut out, |out| {
-            append_value_ref(
+            append_delta_value_ref(
                 out,
+                commit_id,
                 TrackedStateIndexValueRef {
                     change_locator: delta.locator,
                     deleted: delta.change.snapshot_ref.is_none(),
@@ -392,6 +397,27 @@ pub(crate) fn encode_delta_pack_refs(
     Ok(out)
 }
 
+fn append_delta_value_ref(
+    out: &mut Vec<u8>,
+    pack_commit_id: &str,
+    value: TrackedStateIndexValueRef<'_>,
+) {
+    out.push(VALUE_VERSION | if value.deleted { VALUE_DELETED_FLAG } else { 0 });
+    if value.change_locator.source_commit_id == pack_commit_id {
+        out.push(DELTA_LOCATOR_SAME_COMMIT);
+    } else {
+        out.push(DELTA_LOCATOR_FULL);
+        push_sized_bytes(out, value.change_locator.source_commit_id.as_bytes());
+    }
+    out.extend_from_slice(&value.change_locator.source_pack_id.to_be_bytes());
+    out.extend_from_slice(&value.change_locator.source_ordinal.to_be_bytes());
+    push_sized_bytes(out, value.change_locator.change_id.as_bytes());
+    push_sized_bytes(out, value.created_at.as_bytes());
+    push_sized_bytes(out, value.updated_at.as_bytes());
+    push_optional_json_ref(out, value.snapshot_ref);
+    push_optional_json_ref(out, value.metadata_ref);
+}
+
 fn push_sized_section(out: &mut Vec<u8>, write: impl FnOnce(&mut Vec<u8>)) {
     let len_offset = out.len();
     push_u32(out, 0);
@@ -401,7 +427,9 @@ fn push_sized_section(out: &mut Vec<u8>, write: impl FnOnce(&mut Vec<u8>)) {
     out[len_offset..len_offset + 4].copy_from_slice(&(len as u32).to_be_bytes());
 }
 
-pub(crate) fn decode_delta_pack(bytes: &[u8]) -> Result<Vec<TrackedStateDeltaEntry>, LixError> {
+pub(crate) fn decode_delta_pack(
+    bytes: &[u8],
+) -> Result<(String, Vec<TrackedStateDeltaEntry>), LixError> {
     let mut cursor = 0usize;
     let magic = bytes.get(0..4).ok_or_else(|| {
         LixError::new(
@@ -423,11 +451,15 @@ pub(crate) fn decode_delta_pack(bytes: &[u8]) -> Result<Vec<TrackedStateDeltaEnt
             format!("unsupported tracked-state delta pack version {version}"),
         ));
     }
+    let commit_id = read_sized_string(bytes, &mut cursor, "delta pack commit_id")?;
     let count = read_u32(bytes, &mut cursor, "delta pack entry count")?;
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         let key = decode_key(&read_sized_bytes(bytes, &mut cursor, "delta key")?)?;
-        let value = decode_value(&read_sized_bytes(bytes, &mut cursor, "delta value")?)?;
+        let value = decode_delta_value(
+            &read_sized_bytes(bytes, &mut cursor, "delta value")?,
+            &commit_id,
+        )?;
         entries.push(TrackedStateDeltaEntry { key, value });
     }
     if cursor != bytes.len() {
@@ -436,7 +468,64 @@ pub(crate) fn decode_delta_pack(bytes: &[u8]) -> Result<Vec<TrackedStateDeltaEnt
             "tracked-state delta pack decode found trailing bytes",
         ));
     }
-    Ok(entries)
+    Ok((commit_id, entries))
+}
+
+fn decode_delta_value(
+    bytes: &[u8],
+    pack_commit_id: &str,
+) -> Result<TrackedStateIndexValue, LixError> {
+    let mut cursor = 0usize;
+    let value_header = read_u8(bytes, &mut cursor, "delta value header")?;
+    let deleted = decode_value_header(value_header)?;
+    let source_commit_id = match read_u8(bytes, &mut cursor, "delta locator tag")? {
+        DELTA_LOCATOR_SAME_COMMIT => pack_commit_id.to_string(),
+        DELTA_LOCATOR_FULL => read_sized_string(bytes, &mut cursor, "source_commit_id")?,
+        other => {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("tracked-state delta value has invalid locator tag {other}"),
+            ))
+        }
+    };
+    let source_pack_id =
+        u32::try_from(read_u32(bytes, &mut cursor, "source_pack_id")?).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked-state source_pack_id exceeds u32",
+            )
+        })?;
+    let source_ordinal =
+        u32::try_from(read_u32(bytes, &mut cursor, "source_ordinal")?).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked-state source_ordinal exceeds u32",
+            )
+        })?;
+    let change_id = read_sized_string(bytes, &mut cursor, "change_id")?;
+    let created_at = read_sized_string(bytes, &mut cursor, "created_at")?;
+    let updated_at = read_sized_string(bytes, &mut cursor, "updated_at")?;
+    let snapshot_ref = read_optional_json_ref(bytes, &mut cursor, "snapshot_ref")?;
+    let metadata_ref = read_optional_json_ref(bytes, &mut cursor, "metadata_ref")?;
+    if cursor != bytes.len() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state delta value decode found trailing bytes",
+        ));
+    }
+    Ok(TrackedStateIndexValue {
+        change_locator: ChangeLocator {
+            source_commit_id,
+            source_pack_id,
+            source_ordinal,
+            change_id,
+        },
+        deleted,
+        snapshot_ref,
+        metadata_ref,
+        created_at,
+        updated_at,
+    })
 }
 
 #[cfg(test)]
@@ -1048,29 +1137,34 @@ mod tests {
             change_id: "change-live",
         };
         let tombstone_locator = crate::commit_store::ChangeLocatorRef {
-            source_commit_id: "commit-a",
+            source_commit_id: "source-commit",
             source_pack_id: 3,
             source_ordinal: 6,
             change_id: "change-deleted",
         };
-        let encoded = encode_delta_pack_refs(&[
-            TrackedStateDeltaRef {
-                change: live_change,
-                locator: live_locator,
-                created_at: "2026-01-01T00:00:00Z",
-                updated_at: "2026-01-02T00:00:00Z",
-            },
-            TrackedStateDeltaRef {
-                change: tombstone_change,
-                locator: tombstone_locator,
-                created_at: "2026-01-03T00:00:00Z",
-                updated_at: "2026-01-04T00:00:00Z",
-            },
-        ])
+        let encoded = encode_delta_pack_refs(
+            "commit-a",
+            &[
+                TrackedStateDeltaRef {
+                    change: live_change,
+                    locator: live_locator,
+                    created_at: "2026-01-01T00:00:00Z",
+                    updated_at: "2026-01-02T00:00:00Z",
+                },
+                TrackedStateDeltaRef {
+                    change: tombstone_change,
+                    locator: tombstone_locator,
+                    created_at: "2026-01-03T00:00:00Z",
+                    updated_at: "2026-01-04T00:00:00Z",
+                },
+            ],
+        )
         .expect("delta pack should encode");
 
-        let decoded = decode_delta_pack(&encoded).expect("delta pack should decode");
+        let (decoded_commit_id, decoded) =
+            decode_delta_pack(&encoded).expect("delta pack should decode");
 
+        assert_eq!(decoded_commit_id, "commit-a");
         assert_eq!(
             decoded,
             vec![
@@ -1102,7 +1196,7 @@ mod tests {
                     },
                     value: TrackedStateIndexValue {
                         change_locator: ChangeLocator {
-                            source_commit_id: "commit-a".to_string(),
+                            source_commit_id: "source-commit".to_string(),
                             source_pack_id: 3,
                             source_ordinal: 6,
                             change_id: "change-deleted".to_string(),
