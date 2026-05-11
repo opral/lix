@@ -2308,6 +2308,136 @@ treated as a small supporting optimization rather than a budget-moving step.
 No storage format change. No temporary shim.
 ```
 
+## Optimization 25: Dictionary-code delta-pack key prefixes
+
+### Hypothesis
+
+Tracked-state delta packs repeat the same `schema_key` and `file_id` for every
+JSON-pointer row. The v2 delta-pack key format stored that full prefix inside
+each entry key even though the pack is already a locality unit. A pack-level
+prefix table should remove repeated key bytes while keeping decoded keys exactly
+the same shape for downstream ordering and filtering.
+
+This follows the same first-principles shape as page/segment dictionaries in
+systems like DuckDB/Turso/Dolt-style physical layouts: pay one compact table per
+storage unit, then store small indexes in repeated records.
+
+### Change
+
+- Bumped tracked delta packs from version 2 to version 3. No backward shim.
+- Added a pack-level key-prefix dictionary of `(schema_key, file_id)`.
+- Encoded each delta key as `prefix_index + entity_id`.
+- Kept decode output as full `TrackedStateKey` values so scan collapse,
+  ordering, and prefix filtering continue to operate on the existing key type.
+- Added coverage that verifies the prefix table is written for mixed file
+  prefixes and corrupt out-of-bounds prefix indexes reject.
+- Avoided a `HashMap` prefix-index path after a focused rerun showed write
+  regressions; the kept version uses the small prefix vector plus per-delta
+  prefix indexes built during the prefix pass.
+
+### Benchmarks
+
+Focused scan/write command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite)/smoke/(write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                                   | median | criterion status |
+| ----------------------------------------------------- | -----: | ---------------- |
+| `raw_sqlite/scan_keys_only/1k`                        | 1.2058 ms | reference |
+| `raw_sqlite/scan_full_rows/1k`                        | 1.1330 ms | reference |
+| `raw_sqlite/prefix_scan_schema_file_null/1k`          | 1.1647 ms | reference |
+| `raw_sqlite/write_delta_10pct_updates/1k`             | 1.2337 ms | reference |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k`         | 1.2127 ms | reference |
+| `sqlite/scan_keys_only/1k`                            | 1.9801 ms | improved |
+| `sqlite/scan_full_rows/1k`                            | 2.5814 ms | improved |
+| `sqlite/prefix_scan_schema_file_null/1k`              | 2.6188 ms | no change |
+
+Final write-focused command after replacing the regressing `HashMap` prefix
+indexer:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+Result: passed.
+
+| row                                             | median | criterion status |
+| ----------------------------------------------- | -----: | ---------------- |
+| `sqlite/write_delta_10pct_updates/1k`           | 2.2536 ms | no change |
+| `sqlite/write_tombstone_10pct_deletes/1k`       | 2.2861 ms | no change |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                     | bytes | bytes/row | vs Optimization 24 |
+| --------------------------------------- | ----: | --------: | -----------------: |
+| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
+| Lix SQLite / inserted                   | 996856 | 996.9 | -16480 |
+| Lix SQLite / after create_version       | 1013336 | 1013.3 | -16480 |
+| Lix SQLite / after fast-forward merge   | 5201424 | 5201.4 | -28768 |
+| Lix SQLite / after divergent merge      | 5361240 | 5361.2 | -24600 |
+| Lix RocksDB / inserted                  | 912032 | 912.0 | -13272 |
+| Lix RocksDB / after create_version      | 913889 | 913.9 | -13257 |
+| Lix RocksDB / after fast-forward merge  | 1073314 | 1073.3 | -12464 |
+| Lix RocksDB / after divergent merge     | 1442794 | 1442.8 | -12128 |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+The v3 shape writes a header-level key-prefix table, then each entry key stores
+only `prefix_index + entity_id`. Decode reconstructs full `TrackedStateKey`s, so
+downstream ordering/filter behavior still sees ordinary full keys. Corrupt
+prefix indexes and invalid prefix file-id tags reject. Empty packs work
+naturally with zero prefixes and zero entries.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo test -p lix_engine tracked_state::codec:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite)/smoke/(write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a storage-layout optimization.
+
+Primary axis: bytes per row. The JSON-pointer workload now pays for
+`json_pointer + NULL file_id` once per delta pack instead of once per delta row.
+The win is modest but repeatable across SQLite and RocksDB accounting, and the
+write guardrail is neutral after removing the HashMap indexer.
+
+This does not close the remaining <=1.5x gap by itself. It is a clean physical
+layout step that reduces repeated key bytes without changing the logical scan
+surface.
+```
+
 ## Optimization 21: Load scan roots once
 
 ### Hypothesis
