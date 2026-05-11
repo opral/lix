@@ -2553,6 +2553,125 @@ rows remain mostly around the same medians as Optimization 21, with keys-only
 improving on rerun. No storage change.
 ```
 
+## Optimization 23: Encode delta packs directly into the output buffer
+
+### Hypothesis
+
+`encode_delta_pack_refs` still allocated a temporary encoded key `Vec` and
+temporary encoded value `Vec` for every tracked delta, only to copy both into
+the delta pack as length-prefixed sections. Reference storage systems avoid
+per-row temporary records on hot write paths when the final output buffer can be
+written directly.
+
+Writing each key/value section directly into the pack and backpatching the
+section length should preserve the binary format while removing per-delta
+allocation/copy work.
+
+### Change
+
+- Split `encode_key_ref` and `encode_value_ref` into allocation-returning public
+  helpers plus private `append_key_ref` / `append_value_ref` buffer writers.
+- Changed `encode_delta_pack_refs` to write key/value sections directly via
+  `push_sized_section`.
+- `decode_delta_pack` is unchanged; the encoded wire shape remains
+  length-prefixed key bytes followed by length-prefixed value bytes.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+Result: passed.
+
+| row                                             | after median | criterion status |
+| ----------------------------------------------- | -----------: | ---------------- |
+| `raw_sqlite/write_root_all_rows/1k`             |    2.4262 ms | reference |
+| `raw_sqlite/write_delta_10pct_updates/1k`       |    1.3524 ms | reference |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k`   |    1.2769 ms | reference |
+| `sqlite/write_root_all_rows/1k`                 |    4.9586 ms | no change, lower median |
+| `sqlite/write_delta_10pct_updates/1k`           |    1.9208 ms | no change |
+| `sqlite/write_tombstone_10pct_deletes/1k`       |    2.0990 ms | noisy regression |
+| `rocksdb/write_root_all_rows/1k`                |    4.2122 ms | no change, lower median |
+| `rocksdb/write_delta_10pct_updates/1k`          |  880.26 µs | no change |
+| `rocksdb/write_tombstone_10pct_deletes/1k`      |  836.97 µs | no change, lower median |
+
+SQLite rerun:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+| row                                           | rerun median | criterion status |
+| --------------------------------------------- | -----------: | ---------------- |
+| `sqlite/write_root_all_rows/1k`               |    5.0104 ms | no change |
+| `sqlite/write_delta_10pct_updates/1k`         |    1.9488 ms | no change |
+| `sqlite/write_tombstone_10pct_deletes/1k`     |    1.7955 ms | improved |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                     | bytes | bytes/row | status |
+| --------------------------------------- | ----: | --------: | ------ |
+| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
+| Lix SQLite / inserted                   | 1054536 | 1054.5 | unchanged |
+| Lix SQLite / after create_version       | 1071016 | 1071.0 | unchanged |
+| Lix SQLite / after fast-forward merge   | 5279368 | 5279.4 | unchanged |
+| Lix SQLite / after divergent merge      | 5430920 | 5430.9 | unchanged |
+| Lix RocksDB / inserted                  | 964892 | 964.9 | unchanged |
+| Lix RocksDB / after create_version      | 966733 | 966.7 | unchanged |
+| Lix RocksDB / after fast-forward merge  | 1125265 | 1125.3 | unchanged |
+| Lix RocksDB / after divergent merge     | 1494068 | 1494.1 | unchanged |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+Reviewer confirmed the binary shape is compatible: the append helpers preserve
+field order and primitive encoders, while `push_sized_section` backpatches the
+same four-byte length consumed by `decode_delta_pack`.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine tracked_state::codec:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state::context:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a write-path allocation cleanup.
+
+This is a structural writer improvement with neutral-to-better medians on rerun
+and no storage format change. It does not close the remaining root-write gap by
+itself.
+```
+
 ## Optimization 20: Stage generated bench roots as authored changes
 
 ### Hypothesis
