@@ -6,7 +6,7 @@ use crate::json_store::types::{
 };
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::LixError;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::HashSet;
 
 const PACK_LOCAL_MAX_JSON_BYTES: usize = 64 * 1024;
 
@@ -136,9 +136,9 @@ impl JsonStoreWriter {
         placement: JsonWritePlacementRef<'a>,
         payloads: impl IntoIterator<Item = NormalizedJsonRef<'a>>,
     ) -> Result<Vec<JsonRef>, LixError> {
-        let mut encoded_by_hash = BTreeMap::new();
+        let mut unique_encoded = Vec::new();
         let mut order = Vec::new();
-        let mut seen = BTreeSet::new();
+        let mut seen = HashSet::new();
         for payload in payloads {
             let encoded = store::encode_json_str(payload.normalized)?;
             let hash: [u8; 32] = encoded
@@ -150,14 +150,14 @@ impl JsonStoreWriter {
             crate::storage_bench::record_json_store_stage_bytes(hash);
             order.push(encoded.json_ref);
             if seen.insert(hash) {
-                encoded_by_hash.insert(hash, encoded);
+                unique_encoded.push(encoded);
             }
         }
 
-        let mut packed_hashes = BTreeSet::new();
+        let pack_local = matches!(placement, JsonWritePlacementRef::CommitPack { .. });
         if let JsonWritePlacementRef::CommitPack { commit_id, pack_id } = placement {
-            let pack_entries = encoded_by_hash
-                .values()
+            let pack_entries = unique_encoded
+                .iter()
                 .filter(|encoded| encoded.uncompressed_len <= PACK_LOCAL_MAX_JSON_BYTES)
                 .collect::<Vec<_>>();
             if !pack_entries.is_empty() {
@@ -167,16 +167,11 @@ impl JsonStoreWriter {
                     store::pack_key(commit_id, pack_id),
                     encoded_pack,
                 );
-                for (hash, encoded) in &encoded_by_hash {
-                    if encoded.uncompressed_len <= PACK_LOCAL_MAX_JSON_BYTES {
-                        packed_hashes.insert(*hash);
-                    }
-                }
             }
         }
 
-        for (hash, encoded) in &encoded_by_hash {
-            if packed_hashes.contains(hash) {
+        for encoded in &unique_encoded {
+            if pack_local && encoded.uncompressed_len <= PACK_LOCAL_MAX_JSON_BYTES {
                 continue;
             }
             writes.put(
@@ -238,6 +233,78 @@ mod tests {
             JsonRef::for_content(first.as_bytes()),
             JsonRef::for_content(second.as_bytes()),
         ];
+        let unknown = context
+            .reader(storage.clone())
+            .load_bytes_many(JsonLoadRequestRef {
+                refs: &refs,
+                scope: JsonReadScopeRef::OutOfBand,
+            })
+            .await
+            .expect("unknown load should check direct rows");
+        assert_eq!(unknown.into_values(), vec![None, None]);
+
+        let pack_ids = [0];
+        let packed = context
+            .reader(storage.clone())
+            .load_bytes_many(JsonLoadRequestRef {
+                refs: &refs,
+                scope: JsonReadScopeRef::CommitPacks {
+                    commit_id: "commit-a",
+                    pack_ids: &pack_ids,
+                },
+            })
+            .await
+            .expect("packed load should hydrate");
+        assert_eq!(
+            packed.into_values(),
+            vec![
+                Some(first.as_bytes().to_vec()),
+                Some(second.as_bytes().to_vec())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_local_batch_dedupes_pack_payloads_but_returns_request_order() {
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let context = JsonStoreContext::new();
+        let first = "{\"value\":\"first\"}";
+        let second = "{\"value\":\"second\"}";
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        let mut writes = StorageWriteSet::new();
+        let staged_refs = context
+            .writer()
+            .stage_batch(
+                &mut writes,
+                JsonWritePlacementRef::CommitPack {
+                    commit_id: "commit-a",
+                    pack_id: 0,
+                },
+                [
+                    NormalizedJsonRef { normalized: first },
+                    NormalizedJsonRef { normalized: first },
+                    NormalizedJsonRef { normalized: second },
+                ],
+            )
+            .expect("json pack should stage");
+        writes
+            .apply(&mut transaction.as_mut())
+            .await
+            .expect("json pack should apply");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let first_ref = JsonRef::for_content(first.as_bytes());
+        let second_ref = JsonRef::for_content(second.as_bytes());
+        assert_eq!(staged_refs, vec![first_ref, first_ref, second_ref]);
+
+        let refs = [first_ref, second_ref];
         let unknown = context
             .reader(storage.clone())
             .load_bytes_many(JsonLoadRequestRef {

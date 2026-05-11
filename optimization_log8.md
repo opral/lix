@@ -2064,3 +2064,128 @@ Next optimization needs a larger cut in JSON pack staging or transaction
 write-set application; the obvious per-row encoder clones in tracked and
 commit-store delta packing have now been reduced.
 ```
+
+## Optimization 12: Preserve JSON Pack Input Order Without Tree Sorting
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Changed `JsonStoreWriter::stage_batch` to keep unique encoded payloads in
+first-seen input order instead of inserting them into a `BTreeMap` sorted by
+hash.
+
+The writer still returns refs in request order and still deduplicates repeated
+payload hashes. The new shape is:
+
+- `order: Vec<JsonRef>` for the caller-visible result;
+- `unique_encoded: Vec<EncodedJson>` for first-seen unique payloads;
+- `HashSet<[u8; 32]>` only for duplicate suppression.
+
+For commit-pack placement, pack-local entries are selected from
+`unique_encoded.iter()` in input order. Direct out-of-band writes iterate the
+same vector and skip pack-local payloads.
+
+This intentionally changes pack entry order from hash-sorted to input order.
+Pack lookup is hash-addressed and scans decoded entries by hash, so entry order
+is not part of the semantic contract. Lix has not shipped, and storage
+accounting stayed unchanged.
+
+Added regression coverage for duplicate writer input: `[A, A, B]` returns
+`[refA, refA, refB]`, stores only the pack-local payloads, and hydrates both
+unique refs from the commit pack.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+Result: passed.
+
+| row                                             | after median | criterion status |
+| ----------------------------------------------- | -----------: | ---------------- |
+| `sqlite/write_root_all_rows/1k`                 |    5.9331 ms | improved |
+| `sqlite/write_delta_10pct_updates/1k`           |    2.6203 ms | no change, noisy guardrail |
+| `sqlite/write_tombstone_10pct_deletes/1k`       |    2.4790 ms | no change, noisy guardrail |
+| `rocksdb/write_root_all_rows/1k`                |    5.3019 ms | no change |
+| `rocksdb/write_delta_10pct_updates/1k`          |    1.3004 ms | no change |
+| `rocksdb/write_tombstone_10pct_deletes/1k`      |    1.2178 ms | no change |
+
+SQLite root writes improved by Criterion. RocksDB root-write median moved lower
+than recent committed samples but remains Criterion-neutral.
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                     | bytes | bytes/row | status |
+| --------------------------------------- | ----: | --------: | ------ |
+| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
+| Lix SQLite / inserted                   | 1112216 | 1112.2 | unchanged |
+| Lix SQLite / after create_version       | 1124576 | 1124.6 | unchanged |
+| Lix SQLite / after fast-forward merge   | 5324328 | 5324.3 | unchanged |
+| Lix SQLite / after divergent merge      | 5652176 | 5652.2 | unchanged |
+| Lix RocksDB / inserted                  | 1028557 | 1028.6 | unchanged |
+| Lix RocksDB / after create_version      | 1030457 | 1030.5 | unchanged |
+| Lix RocksDB / after fast-forward merge  | 1195234 | 1195.2 | unchanged |
+| Lix RocksDB / after divergent merge     | 1576587 | 1576.6 | unchanged |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: add duplicate writer-input coverage for [A, A, B]. Fixed.
+
+Recommendation: keep. This is a real hot-path structural improvement with a
+measured SQLite root-write win, no storage accounting regression, and acceptable
+pack-order semantics.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine json_store:: --features storage-benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a JSON pack write-path improvement.
+
+Primary axis: root writes. Structural win: unique JSON-pointer payloads no
+longer pay hash-sorted tree-map insertion and sorted iteration before being
+packed into a commit-local JSON pack. Dedupe remains hash-based, while physical
+pack order follows deterministic input order.
+
+Timing: SQLite write_root_all_rows improved. RocksDB remains neutral but did
+not regress materially. The root-write target is still above 1.5x raw SQLite.
+
+No temporary shim.
+
+Next optimization should keep attacking write_root_all_rows, likely below the
+generic StorageWriteSet/backend batch application or by reducing JSON payload
+encoding work before commit-pack staging.
+```
