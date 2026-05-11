@@ -5,8 +5,8 @@ use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
 use crate::LixError;
 
-const CHANGE_FILE_IDENTIFIER: &str = "LXCH";
 const COMMIT_MAGIC: &[u8; 5] = b"LXCM1";
+const CHANGE_MAGIC: &[u8; 5] = b"LXCH2";
 const CHANGE_PACK_MAGIC: &[u8; 5] = b"LXCP1";
 const MEMBERSHIP_PACK_MAGIC: &[u8; 5] = b"LXMP1";
 
@@ -55,67 +55,42 @@ pub(crate) fn encode_change_ref(change: ChangeRef<'_>) -> Result<Vec<u8>, LixErr
         ))
     })?;
 
-    let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(256);
-    let id = builder.create_string(change.id);
-    let entity_id = builder.create_string(&entity_id);
-    let schema_key = builder.create_string(change.schema_key);
-    let file_id = change.file_id.map(|value| builder.create_string(value));
-    let snapshot_ref = change
-        .snapshot_ref
-        .map(|value| builder.create_vector(value.as_hash_bytes()));
-    let metadata_ref = change
-        .metadata_ref
-        .map(|value| builder.create_vector(value.as_hash_bytes()));
-    let created_at = builder.create_string(change.created_at);
-
-    let root = flatbuffer::create_canonical_change(
-        &mut builder,
-        &flatbuffer::CanonicalChangeArgs {
-            id,
-            entity_id,
-            schema_key,
-            file_id,
-            snapshot_ref,
-            metadata_ref,
-            created_at,
-        },
-    );
-    builder.finish(root, Some(CHANGE_FILE_IDENTIFIER));
-    Ok(builder.finished_data().to_vec())
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(CHANGE_MAGIC);
+    write_str(&mut bytes, change.id)?;
+    write_str(&mut bytes, &entity_id)?;
+    write_str(&mut bytes, change.schema_key)?;
+    write_optional_str(&mut bytes, change.file_id)?;
+    write_optional_json_ref(&mut bytes, change.snapshot_ref);
+    write_optional_json_ref(&mut bytes, change.metadata_ref);
+    write_str(&mut bytes, change.created_at)?;
+    Ok(bytes)
 }
 
 pub(crate) fn decode_change(bytes: &[u8]) -> Result<Change, LixError> {
-    if bytes.len() < flatbuffers::SIZE_UOFFSET + flatbuffers::FILE_IDENTIFIER_LENGTH
-        || !flatbuffers::buffer_has_identifier(bytes, CHANGE_FILE_IDENTIFIER, false)
-    {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "failed to decode commit-store change: invalid FlatBuffers file identifier",
-        ));
-    }
-
-    let change = flatbuffer::root_as_canonical_change(bytes).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("failed to decode commit-store change: {error}"),
-        )
-    })?;
-
-    let entity_id = required_str(change.entity_id(), "entity_id")?;
-    let entity_id = EntityIdentity::from_json_array_text(entity_id).map_err(|error| {
+    let mut cursor = ByteCursor::new(bytes);
+    cursor.expect_magic(CHANGE_MAGIC, "change")?;
+    let id = cursor.read_string("id")?;
+    let entity_id = cursor.read_string("entity_id")?;
+    let entity_id = EntityIdentity::from_json_array_text(&entity_id).map_err(|error| {
         LixError::unknown(format!(
             "failed to decode commit-store change entity identity: {error}"
         ))
     })?;
-
+    let schema_key = cursor.read_string("schema_key")?;
+    let file_id = cursor.read_optional_string("file_id")?;
+    let snapshot_ref = cursor.read_optional_json_ref("snapshot_ref")?;
+    let metadata_ref = cursor.read_optional_json_ref("metadata_ref")?;
+    let created_at = cursor.read_string("created_at")?;
+    cursor.expect_end("change")?;
     Ok(Change {
-        id: required_str(change.id(), "id")?.to_string(),
+        id,
         entity_id,
-        schema_key: required_str(change.schema_key(), "schema_key")?.to_string(),
-        file_id: change.file_id().map(ToString::to_string),
-        snapshot_ref: optional_json_ref(change.snapshot_ref(), "snapshot_ref")?,
-        metadata_ref: optional_json_ref(change.metadata_ref(), "metadata_ref")?,
-        created_at: required_str(change.created_at(), "created_at")?.to_string(),
+        schema_key,
+        file_id,
+        snapshot_ref,
+        metadata_ref,
+        created_at,
     })
 }
 
@@ -210,6 +185,27 @@ fn write_str(bytes: &mut Vec<u8>, value: &str) -> Result<(), LixError> {
     Ok(())
 }
 
+fn write_optional_str(bytes: &mut Vec<u8>, value: Option<&str>) -> Result<(), LixError> {
+    match value {
+        Some(value) => {
+            bytes.push(1);
+            write_str(bytes, value)?;
+        }
+        None => bytes.push(0),
+    }
+    Ok(())
+}
+
+fn write_optional_json_ref(bytes: &mut Vec<u8>, value: Option<&JsonRef>) {
+    match value {
+        Some(value) => {
+            bytes.push(1);
+            bytes.extend_from_slice(value.as_hash_bytes());
+        }
+        None => bytes.push(0),
+    }
+}
+
 fn write_bytes(bytes: &mut Vec<u8>, value: &[u8]) -> Result<(), LixError> {
     write_len(bytes, value.len(), "bytes field")?;
     bytes.extend_from_slice(value);
@@ -298,6 +294,44 @@ impl<'a> ByteCursor<'a> {
         Ok(values)
     }
 
+    fn read_optional_string(&mut self, field: &str) -> Result<Option<String>, LixError> {
+        match self.read_u8(field)? {
+            0 => Ok(None),
+            1 => self.read_string(field).map(Some),
+            tag => Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("failed to decode commit-store field `{field}`: invalid option tag {tag}"),
+            )),
+        }
+    }
+
+    fn read_optional_json_ref(&mut self, field: &str) -> Result<Option<JsonRef>, LixError> {
+        match self.read_u8(field)? {
+            0 => Ok(None),
+            1 => {
+                let end = self.offset.checked_add(32).ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("failed to decode commit-store field `{field}`: offset overflow"),
+                    )
+                })?;
+                let bytes = self.bytes.get(self.offset..end).ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("failed to decode commit-store field `{field}`: truncated ref"),
+                    )
+                })?;
+                self.offset = end;
+                let hash = <[u8; 32]>::try_from(bytes).expect("json ref length was checked");
+                Ok(Some(JsonRef::from_hash_bytes(hash)))
+            }
+            tag => Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("failed to decode commit-store field `{field}`: invalid option tag {tag}"),
+            )),
+        }
+    }
+
     fn read_bytes(&mut self, field: &str) -> Result<&'a [u8], LixError> {
         let len = self.read_u32(field)? as usize;
         let end = self.offset.checked_add(len).ok_or_else(|| {
@@ -359,224 +393,6 @@ impl<'a> ByteCursor<'a> {
     }
 }
 
-fn required_str<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str, LixError> {
-    value.ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("failed to decode commit-store change: missing required field `{field}`"),
-        )
-    })
-}
-
-fn optional_json_ref(
-    value: Option<flatbuffers::Vector<'_, u8>>,
-    field: &str,
-) -> Result<Option<JsonRef>, LixError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let bytes = value.bytes();
-    let hash = <[u8; 32]>::try_from(bytes).map_err(|_| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "failed to decode commit-store change: field `{field}` must be exactly 32 bytes"
-            ),
-        )
-    })?;
-    Ok(Some(JsonRef::from_hash_bytes(hash)))
-}
-
-mod flatbuffer {
-    #[derive(Copy, Clone, PartialEq)]
-    pub(super) struct CanonicalChange<'a> {
-        table: flatbuffers::Table<'a>,
-    }
-
-    impl<'a> flatbuffers::Follow<'a> for CanonicalChange<'a> {
-        type Inner = CanonicalChange<'a>;
-
-        #[inline]
-        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-            Self {
-                table: unsafe { flatbuffers::Table::new(buf, loc) },
-            }
-        }
-    }
-
-    impl<'a> CanonicalChange<'a> {
-        const VT_ID: flatbuffers::VOffsetT = 4;
-        const VT_ENTITY_ID: flatbuffers::VOffsetT = 6;
-        const VT_SCHEMA_KEY: flatbuffers::VOffsetT = 8;
-        const VT_FILE_ID: flatbuffers::VOffsetT = 10;
-        const VT_SNAPSHOT_REF: flatbuffers::VOffsetT = 12;
-        const VT_METADATA_REF: flatbuffers::VOffsetT = 14;
-        const VT_CREATED_AT: flatbuffers::VOffsetT = 16;
-
-        #[inline]
-        pub(super) fn id(&self) -> Option<&'a str> {
-            unsafe {
-                self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_ID, None)
-            }
-        }
-
-        #[inline]
-        pub(super) fn entity_id(&self) -> Option<&'a str> {
-            unsafe {
-                self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_ENTITY_ID, None)
-            }
-        }
-
-        #[inline]
-        pub(super) fn schema_key(&self) -> Option<&'a str> {
-            unsafe {
-                self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_SCHEMA_KEY, None)
-            }
-        }
-
-        pub(super) fn file_id(&self) -> Option<&'a str> {
-            unsafe {
-                self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_FILE_ID, None)
-            }
-        }
-
-        #[inline]
-        pub(super) fn snapshot_ref(&self) -> Option<flatbuffers::Vector<'a, u8>> {
-            unsafe {
-                self.table
-                    .get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(
-                        Self::VT_SNAPSHOT_REF,
-                        None,
-                    )
-            }
-        }
-
-        #[inline]
-        pub(super) fn metadata_ref(&self) -> Option<flatbuffers::Vector<'a, u8>> {
-            unsafe {
-                self.table
-                    .get::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'a, u8>>>(
-                        Self::VT_METADATA_REF,
-                        None,
-                    )
-            }
-        }
-
-        #[inline]
-        pub(super) fn created_at(&self) -> Option<&'a str> {
-            unsafe {
-                self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_CREATED_AT, None)
-            }
-        }
-    }
-
-    impl flatbuffers::Verifiable for CanonicalChange<'_> {
-        #[inline]
-        fn run_verifier(
-            verifier: &mut flatbuffers::Verifier,
-            position: usize,
-        ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
-            verifier
-                .visit_table(position)?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>("id", Self::VT_ID, true)?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "entity_id",
-                    Self::VT_ENTITY_ID,
-                    true,
-                )?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "schema_key",
-                    Self::VT_SCHEMA_KEY,
-                    true,
-                )?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "file_id",
-                    Self::VT_FILE_ID,
-                    false,
-                )?
-                .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>(
-                    "snapshot_ref",
-                    Self::VT_SNAPSHOT_REF,
-                    false,
-                )?
-                .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>(
-                    "metadata_ref",
-                    Self::VT_METADATA_REF,
-                    false,
-                )?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "created_at",
-                    Self::VT_CREATED_AT,
-                    true,
-                )?
-                .finish();
-            Ok(())
-        }
-    }
-
-    pub(super) struct CanonicalChangeArgs<'a> {
-        pub(super) id: flatbuffers::WIPOffset<&'a str>,
-        pub(super) entity_id: flatbuffers::WIPOffset<&'a str>,
-        pub(super) schema_key: flatbuffers::WIPOffset<&'a str>,
-        pub(super) file_id: Option<flatbuffers::WIPOffset<&'a str>>,
-        pub(super) snapshot_ref: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
-        pub(super) metadata_ref: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
-        pub(super) created_at: flatbuffers::WIPOffset<&'a str>,
-    }
-
-    pub(super) fn create_canonical_change<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
-        builder: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
-        args: &'args CanonicalChangeArgs<'args>,
-    ) -> flatbuffers::WIPOffset<CanonicalChange<'bldr>> {
-        let start = builder.start_table();
-        builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-            CanonicalChange::VT_CREATED_AT,
-            args.created_at,
-        );
-        if let Some(metadata_ref) = args.metadata_ref {
-            builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-                CanonicalChange::VT_METADATA_REF,
-                metadata_ref,
-            );
-        }
-        if let Some(snapshot_ref) = args.snapshot_ref {
-            builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-                CanonicalChange::VT_SNAPSHOT_REF,
-                snapshot_ref,
-            );
-        }
-        if let Some(file_id) = args.file_id {
-            builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-                CanonicalChange::VT_FILE_ID,
-                file_id,
-            );
-        }
-        builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-            CanonicalChange::VT_SCHEMA_KEY,
-            args.schema_key,
-        );
-        builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-            CanonicalChange::VT_ENTITY_ID,
-            args.entity_id,
-        );
-        builder.push_slot_always::<flatbuffers::WIPOffset<_>>(CanonicalChange::VT_ID, args.id);
-        let offset = builder.end_table(start);
-        flatbuffers::WIPOffset::new(offset.value())
-    }
-
-    #[inline]
-    pub(super) fn root_as_canonical_change(
-        bytes: &[u8],
-    ) -> Result<CanonicalChange<'_>, flatbuffers::InvalidFlatbuffer> {
-        flatbuffers::root::<CanonicalChange>(bytes)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,5 +431,99 @@ mod tests {
         let decoded = decode_change(&encoded).expect("change should decode");
 
         assert_eq!(decoded, change);
+    }
+
+    #[test]
+    fn change_codec_roundtrips_empty_optionals() {
+        let change = Change {
+            id: "change-1".to_string(),
+            entity_id: EntityIdentity::single("entity-1"),
+            schema_key: "test_schema".to_string(),
+            file_id: None,
+            snapshot_ref: None,
+            metadata_ref: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let encoded = encode_change_ref(change.as_ref()).expect("change should encode");
+        let decoded = decode_change(&encoded).expect("change should decode");
+
+        assert_eq!(decoded, change);
+    }
+
+    #[test]
+    fn change_codec_rejects_invalid_optional_tag() {
+        let change = Change {
+            id: "change-1".to_string(),
+            entity_id: EntityIdentity::single("entity-1"),
+            schema_key: "test_schema".to_string(),
+            file_id: None,
+            snapshot_ref: None,
+            metadata_ref: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let mut encoded = encode_change_ref(change.as_ref()).expect("change should encode");
+        let mut cursor = ByteCursor::new(&encoded);
+        cursor.expect_magic(CHANGE_MAGIC, "change").unwrap();
+        cursor.read_string("id").unwrap();
+        cursor.read_string("entity_id").unwrap();
+        cursor.read_string("schema_key").unwrap();
+        let file_tag_offset = cursor.offset;
+        encoded[file_tag_offset] = 2;
+
+        let error = decode_change(&encoded).expect_err("invalid optional tag should fail");
+        assert!(
+            error.to_string().contains("invalid option tag"),
+            "error should mention invalid tag: {error}"
+        );
+    }
+
+    #[test]
+    fn change_codec_rejects_truncated_json_ref() {
+        let change = Change {
+            id: "change-1".to_string(),
+            entity_id: EntityIdentity::single("entity-1"),
+            schema_key: "test_schema".to_string(),
+            file_id: None,
+            snapshot_ref: Some(JsonRef::from_hash_bytes([1; 32])),
+            metadata_ref: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let mut encoded = encode_change_ref(change.as_ref()).expect("change should encode");
+        let mut cursor = ByteCursor::new(&encoded);
+        cursor.expect_magic(CHANGE_MAGIC, "change").unwrap();
+        cursor.read_string("id").unwrap();
+        cursor.read_string("entity_id").unwrap();
+        cursor.read_string("schema_key").unwrap();
+        cursor.read_optional_string("file_id").unwrap();
+        cursor.read_u8("snapshot_ref").unwrap();
+        encoded.truncate(cursor.offset + 16);
+
+        let error = decode_change(&encoded).expect_err("truncated ref should fail");
+        assert!(
+            error.to_string().contains("truncated ref"),
+            "error should mention truncation: {error}"
+        );
+    }
+
+    #[test]
+    fn change_codec_rejects_trailing_bytes() {
+        let change = Change {
+            id: "change-1".to_string(),
+            entity_id: EntityIdentity::single("entity-1"),
+            schema_key: "test_schema".to_string(),
+            file_id: None,
+            snapshot_ref: None,
+            metadata_ref: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let mut encoded = encode_change_ref(change.as_ref()).expect("change should encode");
+        encoded.push(0);
+
+        let error = decode_change(&encoded).expect_err("trailing bytes should fail");
+        assert!(
+            error.to_string().contains("trailing bytes"),
+            "error should mention trailing bytes: {error}"
+        );
     }
 }

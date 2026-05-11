@@ -2824,6 +2824,152 @@ pack-read cleanup.
 No storage format change. No temporary shim.
 ```
 
+## Optimization 19: Encode commit-store changes directly
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Replaced the per-change FlatBuffer record inside commit-store change packs with
+a direct binary `LXCH2` row:
+
+- `encode_change_ref` now writes length-prefixed fields directly:
+  `id`, canonical entity-id JSON-array text, `schema_key`, optional `file_id`,
+  optional 32-byte `snapshot_ref`, optional 32-byte `metadata_ref`, and
+  `created_at`.
+- `decode_change` uses the existing checked `ByteCursor` machinery with new
+  optional string and optional JSON-ref readers.
+- Removed the private FlatBuffer table/verifier scaffolding for commit-store
+  changes. There is no backwards shim because Lix has not shipped.
+
+This matches the surrounding commit-store pack shape better: one pack-level
+codec with row fields encoded in place, rather than building and copying a
+separate tiny FlatBuffer for every authored change.
+
+Added direct malformed-input coverage for empty optionals, invalid option tags,
+truncated fixed-width refs, and trailing bytes.
+
+### Benchmarks
+
+Codec command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench storage -- 'storage/changelog/(encode_only|decode_only)/full_row/10k'
+```
+
+Result: passed.
+
+| row                                      | after median |
+| ---------------------------------------- | -----------: |
+| `storage/changelog/encode_only/full_row/10k` |    2.6886 ms |
+| `storage/changelog/decode_only/full_row/10k` |    2.7384 ms |
+
+Focused physical write command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+Result: passed.
+
+| row                                             | after median | criterion status |
+| ----------------------------------------------- | -----------: | ---------------- |
+| `raw_sqlite/write_root_all_rows/1k`             |    2.4888 ms | reference/no change |
+| `raw_sqlite/write_delta_10pct_updates/1k`       |    1.2667 ms | reference/no change |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k`   |    1.1804 ms | noisy reference |
+| `sqlite/write_root_all_rows/1k`                 |    5.0831 ms | no change, lower median |
+| `sqlite/write_delta_10pct_updates/1k`           |    2.2437 ms | improved |
+| `sqlite/write_tombstone_10pct_deletes/1k`       |    2.0885 ms | improved |
+| `rocksdb/write_root_all_rows/1k`                |    4.5929 ms | no change, lower median |
+| `rocksdb/write_delta_10pct_updates/1k`          |    1.1566 ms | no change, lower median |
+| `rocksdb/write_tombstone_10pct_deletes/1k`      |    1.1288 ms | improved |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                     | bytes | bytes/row | status |
+| --------------------------------------- | ----: | --------: | ------ |
+| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
+| Lix SQLite / inserted                   | 1054536 | 1054.5 | improved |
+| Lix SQLite / after create_version       | 1071016 | 1071.0 | improved |
+| Lix SQLite / after fast-forward merge   | 5279368 | 5279.4 | improved |
+| Lix SQLite / after divergent merge      | 5430920 | 5430.9 | improved |
+| Lix RocksDB / inserted                  | 964892 | 964.9 | improved |
+| Lix RocksDB / after create_version      | 966733 | 966.7 | improved |
+| Lix RocksDB / after fast-forward merge  | 1125265 | 1125.3 | improved |
+| Lix RocksDB / after divergent merge     | 1494060 | 1494.1 | improved |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+Initial review:
+HIGH: none.
+MEDIUM: none.
+LOW: add malformed-input coverage for the hand-rolled format, especially empty
+optionals, invalid option tags, truncated 32-byte refs, and trailing bytes.
+
+Follow-up review:
+HIGH: none.
+MEDIUM: none.
+LOW: truncated-ref test was not actually truncating inside the fixed-width ref.
+
+Second follow-up review:
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+The truncated-ref test now advances to the snapshot_ref tag, truncates after
+only 16 ref bytes, and asserts the specific `truncated ref` error.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine commit_store::codec:: --features storage-benches
+cargo test -p lix_engine commit_store::storage:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine commit_store:: --features storage-benches
+cargo test -p lix_engine transaction::commit:: --features storage-benches
+cargo test -p lix_engine tracked_state::materializer:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench storage -- 'storage/changelog/(encode_only|decode_only)/full_row/10k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a commit-store physical row codec cleanup.
+
+Primary axis: write rows, especially delta/tombstone writes that stage compact
+commit-store change packs. The structural win removes per-change FlatBuffer
+builder allocation and nested row blobs from the pack format.
+
+Timing: SQLite delta and tombstone writes improved by Criterion; RocksDB
+tombstone writes improved and root-write medians moved down on both backends.
+Root writes remain over budget, so this is not the final write-side cut.
+
+Storage: inserted and merge-state byte counts improve on both SQLite and
+RocksDB because each change row carries less codec overhead.
+
+No storage compatibility shim. No benchmark measurement change.
+```
+
 ## Optimization 14: Reuse trusted JSON refs during payload staging
 
 Date: 2026-05-11
