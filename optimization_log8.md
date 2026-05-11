@@ -2423,6 +2423,136 @@ full/prefix scans remain above the 1.5x target and need deeper tree/materialize
 work next.
 ```
 
+## Optimization 22: Fast-path single delta-pack scans
+
+### Hypothesis
+
+The JSON-pointer tracked scan fixtures usually read a commit with no materialized
+projection root and exactly one tracked-state delta pack. The general overlay
+path inserts those delta entries into a `BTreeMap` and then collects the map
+back into sorted rows. For the single-pack/no-base case, that map is only doing
+three things: key filtering, sorted order, and duplicate-key last-write-wins
+collapse.
+
+A direct vector path can preserve those semantics with less per-row map work.
+
+### Change
+
+- Added `single_delta_pack_entries` for the `base_commit_id == None` and
+  `delta_commit_ids.len() == 1` case.
+- The fast path:
+  - filters with the same `request.matches_key` predicate as the existing
+    overlay path;
+  - sorts by `(TrackedStateKey, original ordinal)`;
+  - collapses duplicate keys by keeping the last ordinal;
+  - skips final tombstones when `include_tombstones` is false.
+- Added coverage for duplicate-key and tombstone behavior in a single delta
+  pack.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                                     | after median | criterion status |
+| ------------------------------------------------------- | -----------: | ---------------- |
+| `raw_sqlite/scan_keys_only/1k`                          |    1.1288 ms | reference |
+| `raw_sqlite/scan_headers_only/1k`                       |    1.1685 ms | reference |
+| `raw_sqlite/scan_full_rows/1k`                          |    1.1922 ms | reference |
+| `raw_sqlite/prefix_scan_schema/1k`                      |    1.2255 ms | reference |
+| `raw_sqlite/prefix_scan_schema_file_null/1k`            |    1.7144 ms | reference/noisy |
+| `sqlite/scan_keys_only/1k`                              |    2.3765 ms | noisy regression |
+| `sqlite/scan_headers_only/1k`                           |    2.2331 ms | improved |
+| `sqlite/scan_full_rows/1k`                              |    2.6767 ms | within noise |
+| `sqlite/prefix_scan_schema/1k`                          |    2.7255 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k`                |    2.7038 ms | no change |
+| `rocksdb/scan_keys_only/1k`                             |    1.2053 ms | no change |
+| `rocksdb/scan_headers_only/1k`                          |    1.1988 ms | improved |
+| `rocksdb/scan_full_rows/1k`                             |    1.6527 ms | improved |
+| `rocksdb/prefix_scan_schema/1k`                         |    1.6875 ms | improved |
+| `rocksdb/prefix_scan_schema_file_null/1k`               |    1.6230 ms | improved |
+
+SQLite rerun:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+| row                                      | rerun median | criterion status |
+| ---------------------------------------- | -----------: | ---------------- |
+| `sqlite/scan_keys_only/1k`               |    2.0399 ms | improved |
+| `sqlite/scan_headers_only/1k`            |    2.1180 ms | no change |
+| `sqlite/scan_full_rows/1k`               |    2.8050 ms | no change |
+| `sqlite/prefix_scan_schema/1k`           |    2.7217 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k` |    2.6412 ms | no change |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                     | bytes | bytes/row | status |
+| --------------------------------------- | ----: | --------: | ------ |
+| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
+| Lix SQLite / inserted                   | 1054536 | 1054.5 | unchanged |
+| Lix SQLite / after create_version       | 1071016 | 1071.0 | unchanged |
+| Lix SQLite / after fast-forward merge   | 5279392 | 5279.4 | unchanged |
+| Lix SQLite / after divergent merge      | 5586736 | 5586.7 | unchanged |
+| Lix RocksDB / inserted                  | 964892 | 964.9 | unchanged |
+| Lix RocksDB / after create_version      | 966733 | 966.7 | unchanged |
+| Lix RocksDB / after fast-forward merge  | 1125265 | 1125.3 | unchanged |
+| Lix RocksDB / after divergent merge     | 1494068 | 1494.1 | unchanged |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+Reviewer confirmed the fast path matches the old BTreeMap overlay semantics:
+same key-only filtering, sorted key order, last duplicate wins, final tombstone
+removal when tombstones are excluded, and limits remain above materialization.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine tracked_state::context:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state::materializer:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a narrow delta-pack scan optimization.
+
+The best movement is headers/full rows and RocksDB scans; SQLite full/prefix
+rows remain mostly around the same medians as Optimization 21, with keys-only
+improving on rerun. No storage change.
+```
+
 ## Optimization 20: Stage generated bench roots as authored changes
 
 ### Hypothesis

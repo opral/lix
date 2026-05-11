@@ -377,6 +377,11 @@ where
         let base_commit_id = self
             .projection_base_commit_id(commit_id, &delta_commit_ids)
             .await?;
+        if base_commit_id.is_none() && delta_commit_ids.len() == 1 {
+            return self
+                .single_delta_pack_entries(&delta_commit_ids[0], request)
+                .await;
+        }
         let mut entries = if let Some(base_commit_id) = base_commit_id {
             let root_id = self
                 .tree
@@ -401,6 +406,43 @@ where
         self.apply_delta_packs_to_entries(&delta_commit_ids, Some(request), &mut entries)
             .await?;
         Ok(entries.into_iter().collect())
+    }
+
+    async fn single_delta_pack_entries(
+        &mut self,
+        commit_id: &str,
+        request: &TrackedStateTreeScanRequest,
+    ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
+        let Some(delta_entries) = storage::load_delta_pack(&mut self.store, commit_id).await?
+        else {
+            return Ok(Vec::new());
+        };
+        let mut rows = delta_entries
+            .into_iter()
+            .enumerate()
+            .filter_map(|(ordinal, delta)| {
+                request
+                    .matches_key(&delta.key)
+                    .then_some((ordinal, delta.key, delta.value))
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
+
+        let mut out = Vec::new();
+        let mut rows = rows.into_iter().peekable();
+        while let Some((_, key, mut value)) = rows.next() {
+            while rows.peek().is_some_and(|(_, next_key, _)| next_key == &key) {
+                let (_, _, next_value) = rows
+                    .next()
+                    .expect("peek confirmed duplicate delta entry exists");
+                value = next_value;
+            }
+            if !request.include_tombstones && value.deleted {
+                continue;
+            }
+            out.push((key, value));
+        }
+        Ok(out)
     }
 
     async fn projection_values_at_commit_for_keys(
@@ -1369,6 +1411,62 @@ mod tests {
             .await
             .expect("exists_many should apply pending tombstone over base root");
         assert_eq!(exists, vec![false]);
+    }
+
+    #[tokio::test]
+    async fn single_delta_pack_scan_keeps_last_delta_for_duplicate_key() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
+        let tracked_state = TrackedStateContext::new();
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        write_root_for_test(
+            transaction.as_mut(),
+            &tracked_state,
+            "commit-1",
+            None,
+            &[
+                row_with_value("entity-a", "change-a1", "commit-1", "first"),
+                row_with_value("entity-b", "change-b", "commit-1", "middle"),
+                row_with_value("entity-a", "change-a2", "commit-1", "second"),
+                tombstone("entity-c", "change-c1", "commit-1"),
+            ],
+        )
+        .await
+        .expect("delta pack should write");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let rows = tracked_state
+            .reader(storage.clone())
+            .scan_rows_at_commit("commit-1", &TrackedStateScanRequest::default())
+            .await
+            .expect("single delta pack should scan");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (
+                    row.entity_id.as_single_string_owned().expect("entity id"),
+                    row.snapshot_content.clone()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "entity-a".to_string(),
+                    Some("{\"value\":\"second\"}".to_string())
+                ),
+                (
+                    "entity-b".to_string(),
+                    Some("{\"value\":\"middle\"}".to_string())
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
