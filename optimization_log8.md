@@ -2308,6 +2308,147 @@ treated as a small supporting optimization rather than a budget-moving step.
 No storage format change. No temporary shim.
 ```
 
+## Optimization 15: Move JSON content hash verification off hot reads
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Changed JSON payload decoding to split hot reads from explicit integrity
+verification:
+
+- `load_json_bytes_many_in_scope` uses `JsonHashCheck::TrustedHotRead` and no
+  longer rehashes every decoded payload.
+- Added non-hot `verify_json_bytes_many_in_scope`, which uses
+  `JsonHashCheck::Verify` and checks
+  `blake3(decoded_payload) == JsonRef`.
+- Pack, direct, and direct-fallback decode paths share the same internal loader
+  and thread the hash-check policy through to `decode_json_payload`.
+- Added `verified_batch_load_rejects_hash_mismatch`, which stores mismatched
+  bytes under a requested JSON ref key, confirms the trusted hot path returns
+  bytes without hashing, and confirms the verifier rejects the same row with a
+  hash mismatch.
+
+This follows the reference-system shape: normal scans trust the storage layer
+and write-time content-address facts, while explicit integrity/fsck callers pay
+the exhaustive hash cost. SQLite has explicit integrity checks, and
+Sapling/Mononoke separates content-addressed storage from walker/validation
+jobs.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows)/1k'
+```
+
+Result: passed.
+
+| row                                             | after median | criterion status |
+| ----------------------------------------------- | -----------: | ---------------- |
+| `raw_sqlite/get_many_exact_keys/1k`             |    3.1921 ms | noisy reference |
+| `raw_sqlite/scan_full_rows/1k`                  |    1.8065 ms | noisy reference |
+| `sqlite/get_many_exact_keys/1k`                 |    3.4570 ms | no change, lower median |
+| `sqlite/scan_full_rows/1k`                      |    3.5119 ms | no change, lower median |
+| `rocksdb/get_many_exact_keys/1k`                |    2.3411 ms | improved |
+| `rocksdb/scan_full_rows/1k`                     |    2.1430 ms | improved |
+
+Rerun command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                             | rerun median | criterion status |
+| ----------------------------------------------- | -----------: | ---------------- |
+| `sqlite/get_many_exact_keys/1k`                 |    4.1679 ms | no change, noisy guardrail |
+| `sqlite/scan_full_rows/1k`                      |    3.5295 ms | no change, noisy guardrail |
+| `sqlite/prefix_scan_schema/1k`                  |    3.3561 ms | improved |
+| `sqlite/prefix_scan_schema_file_null/1k`        |    3.7939 ms | no change |
+| `rocksdb/get_many_exact_keys/1k`                |    2.3749 ms | no change, lower than pre-patch |
+| `rocksdb/scan_full_rows/1k`                     |    2.2115 ms | no change, lower than pre-patch |
+| `rocksdb/prefix_scan_schema/1k`                 |    2.0643 ms | improved |
+| `rocksdb/prefix_scan_schema_file_null/1k`       |    2.1547 ms | improved |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                     | bytes | bytes/row | status |
+| --------------------------------------- | ----: | --------: | ------ |
+| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
+| Lix SQLite / inserted                   | 1112216 | 1112.2 | unchanged |
+| Lix SQLite / after create_version       | 1124576 | 1124.6 | unchanged |
+| Lix SQLite / after fast-forward merge   | 5324328 | 5324.3 | unchanged |
+| Lix SQLite / after divergent merge      | 5652176 | 5652.2 | unchanged |
+| Lix RocksDB / inserted                  | 1028557 | 1028.6 | unchanged |
+| Lix RocksDB / after create_version      | 1030457 | 1030.5 | unchanged |
+| Lix RocksDB / after fast-forward merge  | 1195234 | 1195.2 | unchanged |
+| Lix RocksDB / after divergent merge     | 1576587 | 1576.6 | unchanged |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+Initial review:
+HIGH: none.
+MEDIUM: hot reads now point to an integrity-check/fsck policy, but JSON store
+did not have a non-hot verifier entry point. Add one or keep a dedicated
+verification helper.
+LOW: make the decode API shape less likely to imply the ref is always checked.
+
+Follow-up review:
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+The prior MEDIUM is resolved by verify_json_bytes_many_in_scope and the shared
+JsonHashCheck policy. The mismatch regression test covers the dangerous case.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine json_store:: --features storage-benches
+cargo test -p lix_engine tracked_state::materialization:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a read-path policy and CPU optimization.
+
+Primary axis: full-row and prefix scans, especially RocksDB. The structural
+win removes a full BLAKE3 pass over every JSON payload from normal reads while
+preserving a non-hot verifier for fsck/integrity workflows.
+
+Timing: RocksDB exact reads and scans improved strongly in the first focused
+run; RocksDB prefix scans improved again on rerun. SQLite was noisier, but
+prefix_scan_schema improved and full-scan medians stayed in the intended range.
+
+No storage format change. No benchmark shape change. No temporary shim.
+```
+
 ## Optimization 14: Reuse trusted JSON refs during payload staging
 
 Date: 2026-05-11
