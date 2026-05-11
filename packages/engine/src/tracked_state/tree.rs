@@ -7,12 +7,12 @@ use std::{
 
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::tracked_state::codec::{
-    boundary_trigger, child_summary_from_node, decode_key, decode_node, decode_node_ref,
-    decode_value, decode_value_deleted, decode_visible_value, encode_internal_node,
-    encode_internal_node_refs, encode_key, encode_leaf_node, encode_leaf_node_refs,
-    encode_schema_file_prefix, encode_schema_key_prefix, ChildSummary, ChildSummaryRef,
-    DecodedLeafNodeRef, DecodedNode, DecodedNodeRef, EncodedLeafEntry, EncodedLeafEntryRef,
-    PendingChunkWrite,
+    boundary_trigger, child_summary_from_node, decode_key, decode_key_with_trusted_prefix,
+    decode_node, decode_node_ref, decode_value, decode_value_deleted, decode_visible_value,
+    encode_internal_node, encode_internal_node_refs, encode_key, encode_leaf_node,
+    encode_leaf_node_refs, encode_schema_file_prefix, encode_schema_key_prefix, ChildSummary,
+    ChildSummaryRef, DecodedLeafNodeRef, DecodedNode, DecodedNodeRef, EncodedLeafEntry,
+    EncodedLeafEntryRef, PendingChunkWrite,
 };
 use crate::tracked_state::storage;
 use crate::tracked_state::types::{
@@ -182,9 +182,17 @@ impl TrackedStateTree {
         }
 
         let ranges = scan_ranges(request);
+        let key_decode_hint = scan_key_decode_hint(request, &ranges);
         let mut rows = Vec::new();
-        self.scan_node(store, *root_id.as_bytes(), request, &ranges, &mut rows)
-            .await?;
+        self.scan_node(
+            store,
+            *root_id.as_bytes(),
+            request,
+            &ranges,
+            key_decode_hint,
+            &mut rows,
+        )
+        .await?;
         Ok(rows)
     }
 
@@ -1431,6 +1439,7 @@ impl TrackedStateTree {
         hash: [u8; TRACKED_STATE_HASH_BYTES],
         request: &'a TrackedStateTreeScanRequest,
         ranges: &'a [EncodedScanRange],
+        key_decode_hint: Option<ScanKeyDecodeHint<'a>>,
         rows: &'a mut Vec<(TrackedStateKey, TrackedStateIndexValue)>,
     ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
     where
@@ -1453,8 +1462,16 @@ impl TrackedStateTree {
                         if !encoded_key_in_scan_ranges(entry.key, ranges) {
                             continue;
                         }
-                        let key = decode_key(entry.key)?;
-                        if !key_matches_scan_filters(request, &key) {
+                        let key = match key_decode_hint {
+                            Some(hint) => decode_key_with_trusted_prefix(
+                                entry.key,
+                                hint.schema_key,
+                                hint.file_id,
+                                hint.prefix_len,
+                            )?,
+                            None => decode_key(entry.key)?,
+                        };
+                        if key_decode_hint.is_none() && !key_matches_scan_filters(request, &key) {
                             continue;
                         }
                         let Some(value) =
@@ -1462,7 +1479,7 @@ impl TrackedStateTree {
                         else {
                             continue;
                         };
-                        if request.matches(&key, &value) {
+                        if key_decode_hint.is_some() || request.matches(&key, &value) {
                             rows.push((key, value));
                         }
                     }
@@ -1473,8 +1490,15 @@ impl TrackedStateTree {
                             break;
                         }
                         if child_summary_overlaps_scan_ranges(child, ranges) {
-                            self.scan_node(store, child.child_hash, request, ranges, rows)
-                                .await?;
+                            self.scan_node(
+                                store,
+                                child.child_hash,
+                                request,
+                                ranges,
+                                key_decode_hint,
+                                rows,
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -1832,6 +1856,13 @@ struct SeekPathFrame {
 struct EncodedScanRange {
     start: Vec<u8>,
     end: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScanKeyDecodeHint<'a> {
+    schema_key: &'a str,
+    file_id: Option<&'a str>,
+    prefix_len: usize,
 }
 
 fn binary_search_leaf_key(
@@ -2412,6 +2443,28 @@ fn scan_ranges(request: &TrackedStateTreeScanRequest) -> Vec<EncodedScanRange> {
     ranges
 }
 
+fn scan_key_decode_hint<'a>(
+    request: &'a TrackedStateTreeScanRequest,
+    ranges: &[EncodedScanRange],
+) -> Option<ScanKeyDecodeHint<'a>> {
+    if ranges.len() != 1 || request.schema_keys.len() != 1 || request.file_ids.len() != 1 {
+        return None;
+    }
+    if !request.entity_ids.is_empty() {
+        return None;
+    }
+    let file_id = match request.file_ids.first()? {
+        NullableKeyFilter::Null => None,
+        NullableKeyFilter::Value(file_id) => Some(file_id.as_str()),
+        NullableKeyFilter::Any => return None,
+    };
+    Some(ScanKeyDecodeHint {
+        schema_key: request.schema_keys.first()?.as_str(),
+        file_id,
+        prefix_len: ranges.first()?.start.len(),
+    })
+}
+
 fn prefix_scan_range(prefix: Vec<u8>) -> EncodedScanRange {
     EncodedScanRange {
         end: lexicographic_successor(&prefix),
@@ -2751,6 +2804,74 @@ mod tests {
             "entity-a"
         );
         assert_eq!(rows[0].0.file_id.as_deref(), Some("file-a"));
+    }
+
+    #[tokio::test]
+    async fn scan_schema_file_prefix_honors_tombstones_and_limit() {
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let tree = TrackedStateTree::new();
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        let result = apply_mutations_for_test(
+            &tree,
+            transaction.as_mut(),
+            None,
+            vec![
+                mutation_owned(
+                    key("schema-a", Some("file-a"), "entity-a"),
+                    value("c1", Some("{}")),
+                ),
+                mutation_owned(
+                    key("schema-a", Some("file-a"), "entity-b"),
+                    value("c2", None),
+                ),
+                mutation_owned(
+                    key("schema-a", Some("file-a"), "entity-c"),
+                    value("c3", Some("{}")),
+                ),
+                mutation_owned(
+                    key("schema-a", Some("file-b"), "entity-d"),
+                    value("c4", Some("{}")),
+                ),
+            ],
+            None,
+        )
+        .await
+        .expect("mutations should apply");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let mut store = storage.clone();
+        let rows = tree
+            .scan(
+                &mut store,
+                &result.root_id,
+                &TrackedStateTreeScanRequest {
+                    schema_keys: vec!["schema-a".to_string()],
+                    file_ids: vec![crate::NullableKeyFilter::Value("file-a".to_string())],
+                    include_tombstones: false,
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("scan should succeed");
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(
+            |(key, _)| key.schema_key == "schema-a" && key.file_id.as_deref() == Some("file-a")
+        ));
+        assert_eq!(
+            rows.iter()
+                .map(|(key, _)| key.entity_id.as_single_string_owned().expect("identity"))
+                .collect::<Vec<_>>(),
+            vec!["entity-a", "entity-c"]
+        );
     }
 
     #[tokio::test]

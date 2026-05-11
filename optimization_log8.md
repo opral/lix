@@ -2566,6 +2566,140 @@ measurement change. This does not complete the <= 1.5x target; SQLite full and
 prefix scans remain above budget and root writes still need a larger cut.
 ```
 
+## Optimization 36: Decode scan keys from trusted schema/file prefix
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Added a tracked-tree scan fast path for the common single schema/file prefix
+shape:
+
+- `scan_ranges` already proves rows are inside one encoded
+  `schema_key + file_id` prefix when a request has one schema key, one non-Any
+  file filter, and no entity filter.
+- `scan_key_decode_hint` carries that trusted prefix shape through recursive
+  tree scans.
+- Leaf scans now decode only the entity suffix with
+  `decode_key_with_trusted_prefix`, then materialize the known schema/file
+  fields directly.
+- The normal full-key decoder and filter recheck remain in place for multi
+  schema/file scans, Any-file scans, entity-filter scans, and all other shapes.
+
+Added direct coverage for the trusted suffix decoder and a tree scan test that
+locks the hinted branch against tombstone visibility, file filtering, and limit
+handling.
+
+### Benchmarks
+
+Focused read command:
+
+```sh
+cargo bench -p lix_engine --bench json_pointer_crud --features storage-benches -- 'json_pointer_crud/(raw_sqlite/smoke/(select_all_path_value|select_one_by_pk)|raw_storage_(sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema_file_null))/1k'
+```
+
+Result: passed.
+
+| row                                                               | median | criterion status |
+| ----------------------------------------------------------------- | -----: | ---------------- |
+| `raw_sqlite/select_all_path_value/1k`                             | 1.2300 ms | reference/no change |
+| `raw_sqlite/select_one_by_pk/1k`                                  | 1.0905 ms | reference/no change |
+| `sqlite/get_many_exact_keys/1k`                                   | 2.8295 ms | no change |
+| `sqlite/scan_full_rows/1k`                                        | 2.3559 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k`                          | 2.2079 ms | improved |
+| `rocksdb/get_many_exact_keys/1k`                                  | 2.0448 ms | no change |
+| `rocksdb/scan_full_rows/1k`                                       | 1.5172 ms | no change |
+| `rocksdb/prefix_scan_schema_file_null/1k`                         | 1.4547 ms | no change |
+
+Rerun command:
+
+```sh
+cargo bench -p lix_engine --bench json_pointer_crud --features storage-benches -- 'json_pointer_crud/(raw_sqlite/smoke/select_all_path_value|raw_storage_(sqlite|rocksdb)/smoke/(scan_full_rows|prefix_scan_schema_file_null))/1k'
+```
+
+Result: passed.
+
+| row                                                               | median | criterion status |
+| ----------------------------------------------------------------- | -----: | ---------------- |
+| `raw_sqlite/select_all_path_value/1k`                             | 1.1630 ms | reference/no change |
+| `sqlite/scan_full_rows/1k`                                        | 2.2529 ms | no change, lower median |
+| `sqlite/prefix_scan_schema_file_null/1k`                          | 2.2044 ms | no change, lower median |
+| `rocksdb/scan_full_rows/1k`                                       | 1.4055 ms | improved |
+| `rocksdb/prefix_scan_schema_file_null/1k`                         | 1.4103 ms | no change |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                     | bytes | bytes/row | status |
+| --------------------------------------- | ----: | --------: | ------ |
+| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
+| Lix SQLite / inserted                   | 897976 | 898.0 | unchanged |
+| Lix SQLite / after create_version       | 910336 | 910.3 | unchanged |
+| Lix SQLite / after fast-forward merge   | 5090808 | 5090.8 | unchanged/noisy |
+| Lix SQLite / after divergent merge      | 5234168 | 5234.2 | unchanged/noisy |
+| Lix RocksDB / inserted                  | 811776 | 811.8 | unchanged |
+| Lix RocksDB / after create_version      | 813523 | 813.5 | unchanged |
+| Lix RocksDB / after fast-forward merge  | 962754 | 962.8 | unchanged |
+| Lix RocksDB / after divergent merge     | 1306404 | 1306.4 | unchanged |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+Initial review:
+HIGH: none.
+MEDIUM: none.
+LOW: trusted prefix helper should make its caller proof sharper; add targeted
+coverage for the hinted schema/file scan branch with tombstones and limits.
+
+Follow-up review:
+No HIGH/MEDIUM/LOW findings.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo check -p lix_engine --features storage-benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine scan_schema_file_prefix_honors_tombstones_and_limit --features storage-benches
+cargo test -p lix_engine key_codec_decodes_entity_suffix_with_trusted_prefix --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --bench json_pointer_crud --features storage-benches -- 'json_pointer_crud/(raw_sqlite/smoke/(select_all_path_value|select_one_by_pk)|raw_storage_(sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema_file_null))/1k'
+cargo bench -p lix_engine --bench json_pointer_crud --features storage-benches -- 'json_pointer_crud/(raw_sqlite/smoke/select_all_path_value|raw_storage_(sqlite|rocksdb)/smoke/(scan_full_rows|prefix_scan_schema_file_null))/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a scan key-decoding optimization.
+
+Primary axis: schema/file prefix scans. The structural win avoids reparsing
+schema/file fields from every matched encoded key and avoids repeating the key
+filter check when the encoded prefix range already proved those fields.
+
+Timing: SQLite prefix scan improved by Criterion in the first focused run.
+Rerun medians stayed lower but were Criterion-neutral, while RocksDB full scan
+improved by Criterion. Exact reads remained neutral, as expected.
+
+Storage is unchanged. No format change, no backward shim. This does not complete
+the <= 1.5x target; SQLite scans and root writes still need larger cuts.
+```
+
 ## Optimization 33: Varint tracked-state delta-pack local fields
 
 ### Change
