@@ -1021,3 +1021,147 @@ directly from borrowed value bytes for scan visibility and exists-style reads,
 then attack exact-read value decode/allocation costs that remain above the
 1.5x SQLite target.
 ```
+
+## Optimization 3: Header-Only Visibility And Exists Reads
+
+Date: 2026-05-10
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Added a live-row `rows_exist_at_commit` path for tracked-state readers and a
+physical `TrackedStateTree::exists_many` traversal. The tree reuses the v2 leaf
+offset table from Optimization 2, binary-searches borrowed leaf keys, and reads
+only the matched value header to reject tombstones.
+
+Scan visibility now also reads the value header before full value decode.
+`decode_visible_value` parses the header once, skips hidden tombstones without
+decoding locator/timestamp strings, and continues decoding live rows from the
+same cursor. `TrackedStateTreeScanRequest` now carries `include_tombstones`;
+its default keeps physical/internal tree scans tombstone-inclusive, while
+serving scans copy the user-facing filter.
+
+Pending delta overlay semantics were preserved: when tombstones are excluded,
+a pending tombstone removes a matching materialized base row instead of being
+ignored. Diff scans explicitly include tombstones.
+
+No backward compatibility shim was kept.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(get_many_exact_keys|exists_many_exact_keys|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                                | after median | criterion status |
+| -------------------------------------------------- | -----------: | ---------------- |
+| `sqlite/get_many_exact_keys/1k`                    |    4.4035 ms | no change |
+| `sqlite/exists_many_exact_keys/1k`                 |    2.4097 ms | improved vs pre-change get/materialize path |
+| `sqlite/scan_keys_only/1k`                         |    2.4736 ms | no change |
+| `sqlite/scan_headers_only/1k`                      |    3.0070 ms | no change |
+| `sqlite/scan_full_rows/1k`                         |    4.1861 ms | no change |
+| `sqlite/prefix_scan_schema/1k`                     |    4.1514 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k`           |    4.1977 ms | no change |
+| `rocksdb/get_many_exact_keys/1k`                   |    3.4003 ms | no change |
+| `rocksdb/exists_many_exact_keys/1k`                |    1.4389 ms | improved vs pre-change get/materialize path |
+| `rocksdb/scan_keys_only/1k`                        |    1.5966 ms | no change |
+| `rocksdb/scan_headers_only/1k`                     |    1.9876 ms | no change |
+| `rocksdb/scan_full_rows/1k`                        |    3.2413 ms | no change |
+| `rocksdb/prefix_scan_schema/1k`                    |    3.6050 ms | no change; noisy high interval |
+| `rocksdb/prefix_scan_schema_file_null/1k`          |    3.3356 ms | no change |
+
+Final exists-only rerun after the tombstone semantic fix:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/exists_many_exact_keys/1k'
+```
+
+| row                                | final median |
+| ---------------------------------- | -----------: |
+| `sqlite/exists_many_exact_keys/1k`  |    2.4097 ms |
+| `rocksdb/exists_many_exact_keys/1k` |    1.4389 ms |
+
+### Storage
+
+Storage fixture command:
+
+```sh
+cargo test -p lix_engine --features storage-benches --test json_pointer_crud_storage -- --ignored --nocapture --test-threads=1
+```
+
+Result: passed.
+
+| backend / state                        | bytes | status |
+| -------------------------------------- | ----: | ------ |
+| raw SQLite / inserted                  | 1692456 | unchanged |
+| Lix SQLite / inserted                  | 1075136 | unchanged |
+| Lix SQLite / after create_version      | 1087496 | unchanged |
+| Lix SQLite / after fast-forward merge  | 5291608 | one SQLite page over the prior run; known page-layout noise |
+| Lix SQLite / after divergent merge     | 5619288 | one SQLite page over the prior run; known page-layout noise |
+| Lix RocksDB / inserted                 |  993900 | unchanged |
+| Lix RocksDB / after create_version     |  995766 | unchanged |
+| Lix RocksDB / after fast-forward merge | 1157143 | unchanged |
+| Lix RocksDB / after divergent merge    | 1528256 | unchanged |
+
+### Review Loop
+
+Reviewer pass 1:
+
+```text
+HIGH: rows_exist_at_commit reported tombstones as existing. Fixed by checking
+the value header in tree.exists_many and by applying pending delta tombstones
+as false in projection_keys_exist_at_commit.
+```
+
+Reviewer pass 2:
+
+```text
+HIGH: none.
+The fixed paths now return false for tombstones, pending delta tombstones clear
+existence, diff scans still include tombstones, and the benchmark uses the new
+existence API.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine --features storage-benches --test json_pointer_crud_storage -- --ignored --nocapture --test-threads=1
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(get_many_exact_keys|exists_many_exact_keys|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/exists_many_exact_keys/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep.
+
+Primary axis: exists reads and tombstone visibility. Structural win:
+exists_many no longer piggybacks on full exact-row materialization, and
+visibility filtering can reject hidden tombstones from the value header before
+locator/string decode or commit_store materialization.
+
+Timing win: exists_many_exact_keys moves from the previous materializing path
+around 4.5 ms SQLite / 3.5 ms RocksDB to 2.4097 ms SQLite / 1.4389 ms RocksDB.
+The ordinary scan fixture is mostly live rows, so header visibility is neutral
+there rather than a tombstone-heavy win.
+
+Guardrails: storage shape is unchanged, hidden pending tombstones still remove
+base rows, diff keeps tombstones visible, tracked logic stays on the tracked
+path, and the benchmark row now measures the named exists API rather than a
+full materialized get.
+
+Next optimization should attack get_many_exact_keys itself: the exact-read path
+still decodes full locator/timestamp strings and materializes full rows even
+when the caller only needs the JSON payload, so the remaining budget is likely
+in value decode and commit/json materialization grouping.
+```

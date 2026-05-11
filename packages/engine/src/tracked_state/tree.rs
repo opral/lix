@@ -8,10 +8,11 @@ use std::{
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::tracked_state::codec::{
     boundary_trigger, child_summary_from_node, decode_key, decode_node, decode_node_ref,
-    decode_value, encode_internal_node, encode_internal_node_refs, encode_key, encode_leaf_node,
-    encode_leaf_node_refs, encode_schema_file_prefix, encode_schema_key_prefix, ChildSummary,
-    ChildSummaryRef, DecodedLeafNodeRef, DecodedNode, DecodedNodeRef, EncodedLeafEntry,
-    EncodedLeafEntryRef, PendingChunkWrite,
+    decode_value, decode_value_deleted, decode_visible_value, encode_internal_node,
+    encode_internal_node_refs, encode_key, encode_leaf_node, encode_leaf_node_refs,
+    encode_schema_file_prefix, encode_schema_key_prefix, ChildSummary, ChildSummaryRef,
+    DecodedLeafNodeRef, DecodedNode, DecodedNodeRef, EncodedLeafEntry, EncodedLeafEntryRef,
+    PendingChunkWrite,
 };
 use crate::tracked_state::storage;
 use crate::tracked_state::types::{
@@ -128,6 +129,29 @@ impl TrackedStateTree {
 
         let mut values = vec![None; keys.len()];
         self.get_many_node(store, *root_id.as_bytes(), &encoded_keys, &mut values)
+            .await?;
+        Ok(values)
+    }
+
+    pub(crate) async fn exists_many(
+        &self,
+        store: &mut impl StorageReader,
+        root_id: &TrackedStateRootId,
+        keys: &[TrackedStateKey],
+    ) -> Result<Vec<bool>, LixError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut encoded_keys = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (index, encode_key(key)))
+            .collect::<Vec<_>>();
+        encoded_keys.sort_by(|left, right| left.1.cmp(&right.1));
+
+        let mut values = vec![false; keys.len()];
+        self.exists_many_node(store, *root_id.as_bytes(), &encoded_keys, &mut values)
             .await?;
         Ok(values)
     }
@@ -1433,7 +1457,11 @@ impl TrackedStateTree {
                         if !key_matches_scan_filters(request, &key) {
                             continue;
                         }
-                        let value = decode_value(entry.value)?;
+                        let Some(value) =
+                            decode_visible_value(entry.value, request.include_tombstones)?
+                        else {
+                            continue;
+                        };
                         if request.matches(&key, &value) {
                             rows.push((key, value));
                         }
@@ -1448,6 +1476,72 @@ impl TrackedStateTree {
                             self.scan_node(store, child.child_hash, request, ranges, rows)
                                 .await?;
                         }
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn exists_many_node<'a, S>(
+        &'a self,
+        store: &'a mut S,
+        hash: [u8; TRACKED_STATE_HASH_BYTES],
+        encoded_keys: &'a [(usize, Vec<u8>)],
+        values: &'a mut [bool],
+    ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
+    where
+        S: StorageReader + Send + 'a,
+    {
+        Box::pin(async move {
+            if encoded_keys.is_empty() {
+                return Ok(());
+            }
+
+            let bytes = self.load_node_bytes(store, &hash).await?;
+            match decode_node_ref(&bytes)? {
+                DecodedNodeRef::Leaf(leaf) => {
+                    for (original_index, encoded_key) in encoded_keys {
+                        if let Some(entry_index) = binary_search_leaf_key(&leaf, encoded_key)? {
+                            let entry = leaf.entry(entry_index)?.ok_or_else(|| {
+                                LixError::new(
+                                    "LIX_ERROR_UNKNOWN",
+                                    "tracked-state leaf entry disappeared during exists_many",
+                                )
+                            })?;
+                            values[*original_index] = !decode_value_deleted(entry.value)?;
+                        }
+                    }
+                }
+                DecodedNodeRef::Internal(internal) => {
+                    let mut start = 0usize;
+                    let children = internal.children();
+                    for (child_index, child) in children.iter().enumerate() {
+                        if start >= encoded_keys.len() {
+                            break;
+                        }
+
+                        let mut end = start;
+                        if child_index + 1 == children.len() {
+                            end = encoded_keys.len();
+                        } else {
+                            while end < encoded_keys.len()
+                                && encoded_keys[end].1.as_slice() <= child.last_key.as_slice()
+                            {
+                                end += 1;
+                            }
+                        }
+
+                        if start < end {
+                            self.exists_many_node(
+                                store,
+                                child.child_hash,
+                                &encoded_keys[start..end],
+                                values,
+                            )
+                            .await?;
+                        }
+                        start = end;
                     }
                 }
             }
@@ -2450,6 +2544,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exists_many_checks_leaf_keys_without_decoding_values() {
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let tree = TrackedStateTree::new();
+        let present = key("schema", None, "present");
+        let deleted = key("schema", None, "deleted");
+        let missing = key("schema", None, "missing");
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        let result = apply_mutations_for_test(
+            &tree,
+            transaction.as_mut(),
+            None,
+            vec![
+                mutation(&present, &value("change-live", Some("{}"))),
+                mutation(&deleted, &value("change-deleted", None)),
+            ],
+            None,
+        )
+        .await
+        .expect("mutations should apply");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let mut store = storage.clone();
+        let exists = tree
+            .exists_many(
+                &mut store,
+                &result.root_id,
+                &[missing.clone(), present.clone(), deleted.clone()],
+            )
+            .await
+            .expect("exists_many should load");
+        assert_eq!(exists, vec![false, true, false]);
+    }
+
+    #[tokio::test]
     async fn latest_mutation_for_key_wins() {
         let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
         let tree = TrackedStateTree::new();
@@ -2530,6 +2665,24 @@ mod tests {
             .map(|(key, _)| key.entity_id.as_single_string_owned().expect("identity"))
             .collect::<Vec<_>>();
         assert_eq!(identities, vec!["deleted", "visible"]);
+
+        let live_rows = tree
+            .scan(
+                &mut store,
+                &result.root_id,
+                &TrackedStateTreeScanRequest {
+                    schema_keys: vec!["schema-a".to_string()],
+                    include_tombstones: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("live scan should succeed");
+        let live_identities = live_rows
+            .iter()
+            .map(|(key, _)| key.entity_id.as_single_string_owned().expect("identity"))
+            .collect::<Vec<_>>();
+        assert_eq!(live_identities, vec!["visible"]);
     }
 
     #[tokio::test]
