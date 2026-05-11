@@ -21,6 +21,17 @@ struct StoredJsonPayload<'a> {
     data: &'a [u8],
 }
 
+struct JsonPackLayout {
+    directory_start: usize,
+    payload_start: usize,
+    count: usize,
+}
+
+struct JsonPackEntry<'a> {
+    hash: [u8; 32],
+    payload: StoredJsonPayload<'a>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JsonHashCheck {
     /// Hot reads trust the local storage layer and pack directory. Content
@@ -337,11 +348,6 @@ async fn load_from_packs(
     if pack_ids.is_empty() || unique_refs.is_empty() {
         return Ok(values);
     }
-    let wanted = unique_refs
-        .iter()
-        .enumerate()
-        .map(|(index, json_ref)| (*json_ref.as_hash_array(), index))
-        .collect::<HashMap<_, _>>();
     let keys = pack_ids
         .iter()
         .map(|&pack_id| pack_key(commit_id, pack_id))
@@ -360,6 +366,24 @@ async fn load_from_packs(
             "json_store pack load returned no result group",
         )
     })?;
+    if pack_ids.len() == 1 && group.len() == 1 {
+        if let Some(stored_pack) = group.value(0).flatten() {
+            if load_json_pack_values_in_request_order(
+                stored_pack,
+                hash_check,
+                unique_refs,
+                &mut values,
+            )? {
+                return Ok(values);
+            }
+        }
+    }
+
+    let wanted = unique_refs
+        .iter()
+        .enumerate()
+        .map(|(index, json_ref)| (*json_ref.as_hash_array(), index))
+        .collect::<HashMap<_, _>>();
     for stored_pack in group.values_iter().flatten() {
         load_json_pack_values(stored_pack, hash_check, &wanted, &mut values)?;
     }
@@ -457,12 +481,55 @@ fn decode_json_payload(
     Ok(data)
 }
 
+fn load_json_pack_values_in_request_order(
+    bytes: &[u8],
+    hash_check: JsonHashCheck,
+    requested_refs: &[JsonRef],
+    values: &mut [Option<Vec<u8>>],
+) -> Result<bool, LixError> {
+    if values.len() < requested_refs.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "json_store ordered pack load has fewer result slots than refs",
+        ));
+    }
+    let layout = json_pack_layout(bytes)?;
+    if layout.count != requested_refs.len() {
+        return Ok(false);
+    }
+
+    for (index, json_ref) in requested_refs.iter().enumerate() {
+        let entry = json_pack_entry(bytes, &layout, index)?;
+        if &entry.hash != json_ref.as_hash_array() {
+            for value in &mut values[..index] {
+                *value = None;
+            }
+            return Ok(false);
+        }
+        values[index] = Some(decode_json_payload(json_ref, entry.payload, hash_check)?);
+    }
+    Ok(true)
+}
+
 fn load_json_pack_values(
     bytes: &[u8],
     hash_check: JsonHashCheck,
     wanted: &HashMap<[u8; 32], usize>,
     values: &mut [Option<Vec<u8>>],
 ) -> Result<(), LixError> {
+    let layout = json_pack_layout(bytes)?;
+    for index in 0..layout.count {
+        let entry = json_pack_entry(bytes, &layout, index)?;
+        let Some(&value_index) = wanted.get(&entry.hash) else {
+            continue;
+        };
+        let json_ref = JsonRef::from_hash_bytes(entry.hash);
+        values[value_index] = Some(decode_json_payload(&json_ref, entry.payload, hash_check)?);
+    }
+    Ok(())
+}
+
+fn json_pack_layout(bytes: &[u8]) -> Result<JsonPackLayout, LixError> {
     if bytes.len() < STORED_JSON_PACK_MAGIC.len() + 4 {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -503,62 +570,74 @@ fn load_json_pack_values(
             "stored JSON pack directory is truncated",
         ));
     }
+    Ok(JsonPackLayout {
+        directory_start,
+        payload_start,
+        count,
+    })
+}
 
-    for index in 0..count {
-        let mut cursor = directory_start + index * STORED_JSON_PACK_ENTRY_HEADER_LEN;
-        let hash: [u8; 32] = bytes[cursor..cursor + 32]
+fn json_pack_entry<'a>(
+    bytes: &'a [u8],
+    layout: &JsonPackLayout,
+    index: usize,
+) -> Result<JsonPackEntry<'a>, LixError> {
+    if index >= layout.count {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "json pack entry index exceeds directory count",
+        ));
+    }
+    let mut cursor = layout.directory_start + index * STORED_JSON_PACK_ENTRY_HEADER_LEN;
+    let hash: [u8; 32] = bytes[cursor..cursor + 32]
+        .try_into()
+        .expect("json pack hash header is fixed size");
+    cursor += 32;
+    let codec = read_json_codec(bytes[cursor])?;
+    cursor += 1;
+    let uncompressed_len = u64::from_be_bytes(
+        bytes[cursor..cursor + 8]
             .try_into()
-            .expect("json pack hash header is fixed size");
-        cursor += 32;
-        let codec = read_json_codec(bytes[cursor])?;
-        cursor += 1;
-        let uncompressed_len = u64::from_be_bytes(
-            bytes[cursor..cursor + 8]
-                .try_into()
-                .expect("json pack uncompressed length is fixed size"),
-        ) as usize;
-        cursor += 8;
-        let offset = u64::from_be_bytes(
-            bytes[cursor..cursor + 8]
-                .try_into()
-                .expect("json pack payload offset is fixed size"),
-        ) as usize;
-        cursor += 8;
-        let len = u64::from_be_bytes(
-            bytes[cursor..cursor + 8]
-                .try_into()
-                .expect("json pack payload length is fixed size"),
-        ) as usize;
-        let data_start = payload_start.checked_add(offset).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "json pack entry offset overflow",
-            )
-        })?;
-        let data_end = data_start.checked_add(len).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "json pack entry length overflow",
-            )
-        })?;
-        if data_end > bytes.len() {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "stored JSON pack entry payload is truncated",
-            ));
-        }
-        let Some(&value_index) = wanted.get(&hash) else {
-            continue;
-        };
-        let json_ref = JsonRef::from_hash_bytes(hash);
-        let payload = StoredJsonPayload {
+            .expect("json pack uncompressed length is fixed size"),
+    ) as usize;
+    cursor += 8;
+    let offset = u64::from_be_bytes(
+        bytes[cursor..cursor + 8]
+            .try_into()
+            .expect("json pack payload offset is fixed size"),
+    ) as usize;
+    cursor += 8;
+    let len = u64::from_be_bytes(
+        bytes[cursor..cursor + 8]
+            .try_into()
+            .expect("json pack payload length is fixed size"),
+    ) as usize;
+    let data_start = layout.payload_start.checked_add(offset).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "json pack entry offset overflow",
+        )
+    })?;
+    let data_end = data_start.checked_add(len).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "json pack entry length overflow",
+        )
+    })?;
+    if data_end > bytes.len() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "stored JSON pack entry payload is truncated",
+        ));
+    }
+    Ok(JsonPackEntry {
+        hash,
+        payload: StoredJsonPayload {
             codec,
             uncompressed_len,
             data: &bytes[data_start..data_end],
-        };
-        values[value_index] = Some(decode_json_payload(&json_ref, payload, hash_check)?);
-    }
-    Ok(())
+        },
+    })
 }
 
 #[cfg(test)]
@@ -757,6 +836,87 @@ mod tests {
         assert!(
             error.to_string().contains("hash mismatch"),
             "error should mention hash mismatch: {error}"
+        );
+    }
+
+    #[test]
+    fn ordered_pack_load_fast_path_requires_exact_pack_order() {
+        let first = encode_json("{\"value\":\"first\"}").expect("first json should encode");
+        let second = encode_json("{\"value\":\"second\"}").expect("second json should encode");
+        let pack = encode_json_pack(&[&first, &second]).expect("pack should encode");
+
+        let mut values = vec![None, None];
+        let loaded = load_json_pack_values_in_request_order(
+            &pack,
+            JsonHashCheck::Verify,
+            &[first.json_ref, second.json_ref],
+            &mut values,
+        )
+        .expect("ordered pack load should parse");
+        assert!(loaded);
+        assert_eq!(
+            values,
+            vec![
+                Some(first.data.as_ref().to_vec()),
+                Some(second.data.as_ref().to_vec()),
+            ]
+        );
+
+        let mut values = vec![None, None];
+        let loaded = load_json_pack_values_in_request_order(
+            &pack,
+            JsonHashCheck::Verify,
+            &[second.json_ref, first.json_ref],
+            &mut values,
+        )
+        .expect("unordered refs should fall back without error");
+        assert!(!loaded);
+        assert_eq!(values, vec![None, None]);
+    }
+
+    #[tokio::test]
+    async fn pack_batch_load_falls_back_for_unordered_refs() {
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let first = encode_json("{\"value\":\"first\"}").expect("first json should encode");
+        let second = encode_json("{\"value\":\"second\"}").expect("second json should encode");
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            JSON_PACK_NAMESPACE,
+            pack_key("commit-a", 0),
+            encode_json_pack(&[&first, &second]).expect("pack should encode"),
+        );
+        writes
+            .apply(&mut transaction.as_mut())
+            .await
+            .expect("json pack should store");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let pack_ids = [0];
+        let mut store = storage.clone();
+        let values = load_json_bytes_many_in_scope(
+            &mut store,
+            &[second.json_ref, first.json_ref],
+            JsonReadScopeRef::CommitPacks {
+                commit_id: "commit-a",
+                pack_ids: &pack_ids,
+            },
+        )
+        .await
+        .expect("unordered refs should load through fallback");
+        assert_eq!(
+            values,
+            vec![
+                Some(second.data.as_ref().to_vec()),
+                Some(first.data.as_ref().to_vec()),
+            ]
         );
     }
 }
