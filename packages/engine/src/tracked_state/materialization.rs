@@ -55,10 +55,11 @@ where
         });
     }
 
-    let json_values = load_projection_json_values(store, &json_refs, &json_ref_localities).await?;
+    let mut json_values =
+        load_projection_json_values(store, &json_refs, &json_ref_localities).await?;
     row_plans
         .into_iter()
-        .map(|plan| materialize_row_plan(plan, &json_refs, &json_values))
+        .map(|plan| materialize_row_plan(plan, &json_refs, &mut json_values))
         .collect()
 }
 
@@ -146,7 +147,7 @@ where
 fn materialize_row_plan(
     plan: MaterializedTrackedStateRowPlan,
     json_refs: &[JsonRef],
-    json_values: &[Option<Vec<u8>>],
+    json_values: &mut [Option<Vec<u8>>],
 ) -> Result<MaterializedTrackedStateRow, LixError> {
     Ok(MaterializedTrackedStateRow {
         entity_id: plan.entity_id,
@@ -169,7 +170,7 @@ fn materialize_row_plan(
 fn materialized_json_string(
     index: Option<usize>,
     json_refs: &[JsonRef],
-    json_values: &[Option<Vec<u8>>],
+    json_values: &mut [Option<Vec<u8>>],
 ) -> Result<Option<String>, LixError> {
     let Some(index) = index else {
         return Ok(None);
@@ -180,9 +181,17 @@ fn materialized_json_string(
             "tracked_state materialization lost JSON ref index",
         )
     })?;
+    // Each row plan owns its projected JSON slots. If this path starts
+    // deduplicating refs, duplicate consumers must clone intentionally.
     let bytes = json_values
-        .get(index)
-        .and_then(Option::as_deref)
+        .get_mut(index)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state materialization lost JSON value index",
+            )
+        })?
+        .take()
         .ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -192,14 +201,13 @@ fn materialized_json_string(
                 ),
             )
         })?;
-    std::str::from_utf8(bytes)
-        .map(|json| Some(json.to_string()))
-        .map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("tracked_state materialized JSON payload is not UTF-8: {error}"),
-            )
-        })
+    String::from_utf8(bytes).map(Some).map_err(|error| {
+        let utf8_error = error.utf8_error();
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("tracked_state materialized JSON payload is not UTF-8: {utf8_error}"),
+        )
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,5 +232,23 @@ impl TrackedMaterializationProjection {
             snapshot_content: columns.iter().any(|column| column == "snapshot_content"),
             metadata: columns.iter().any(|column| column == "metadata"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn materialized_json_string_consumes_owned_payload_bytes() {
+        let json = br#"{"value":1}"#.to_vec();
+        let json_ref = JsonRef::for_content(&json);
+        let mut json_values = vec![Some(json)];
+
+        let materialized = materialized_json_string(Some(0), &[json_ref], &mut json_values)
+            .expect("json should materialize");
+
+        assert_eq!(materialized, Some(r#"{"value":1}"#.to_string()));
+        assert!(json_values[0].is_none());
     }
 }

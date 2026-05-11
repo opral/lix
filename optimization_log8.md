@@ -1318,3 +1318,99 @@ TrackedStateKey/TrackedStateIndexValue/MaterializedTrackedStateRow objects
 even for fixed-shape JSON-pointer reads, and SQLite full reads remain above the
 1.5x target.
 ```
+
+## Optimization 5: Consume JSON Bytes Into Materialized Strings
+
+Date: 2026-05-10
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Changed tracked-state JSON materialization to consume each owned `Vec<u8>`
+payload slot with `String::from_utf8` instead of validating `&[u8]` and then
+copying with `to_string`.
+
+This does not change storage layout or APIs. It is a narrow ownership cleanup
+inside the read path after Optimization 4 removed commit-pack lookup from
+payload materialization.
+
+The implementation keeps the current invariant explicit: each row plan owns its
+projected JSON slots. If tracked-state materialization later deduplicates refs
+before row planning, duplicate consumers must clone intentionally.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                       | after median | criterion status |
+| ----------------------------------------- | -----------: | ---------------- |
+| `sqlite/get_many_exact_keys/1k`           |    4.1139 ms | no change |
+| `sqlite/scan_full_rows/1k`                |    3.8428 ms | no change |
+| `sqlite/prefix_scan_schema/1k`            |    3.8457 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k`  |    3.8080 ms | no change |
+| `rocksdb/get_many_exact_keys/1k`          |    2.9443 ms | no change |
+| `rocksdb/scan_full_rows/1k`               |    2.7510 ms | no change |
+| `rocksdb/prefix_scan_schema/1k`           |    2.6865 ms | no change |
+| `rocksdb/prefix_scan_schema_file_null/1k` |    2.7327 ms | no change |
+
+This is not a Criterion-proven timing win on the 1k fixture. It removes an
+avoidable allocation/copy in the payload-heavy path and should matter more for
+larger JSON payloads than the small smoke rows.
+
+### Storage
+
+No storage change. The storage fixture from Optimization 4 still describes the
+current byte shape.
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: remove test-only wrapper around materialized_json_string. Fixed.
+LOW: document one-shot JSON slot invariant for .take(). Fixed.
+
+Recommendation: keep, but do not market it as a Criterion-proven optimization.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine materialized_json_string_consumes_owned_payload_bytes --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a small ownership cleanup.
+
+Primary axis: full materialization allocation pressure. Structural win:
+materialization consumes owned JSON bytes directly into String, avoiding a
+validate-then-copy path.
+
+Timing: no measured Criterion win on the 1k smoke fixture, so this does not
+advance the budget by itself. It is low-risk, read-path-only, and keeps the
+payload materialization shape moving toward fewer copies.
+
+No temporary shim.
+
+Next optimization still needs a larger structural cut for full scans, likely
+avoiding full row object construction where callers only need counts or using a
+more borrowed/streamed row materialization path without changing benchmark
+semantics.
+```
