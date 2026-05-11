@@ -2672,6 +2672,147 @@ and no storage format change. It does not close the remaining root-write gap by
 itself.
 ```
 
+## Optimization 24: Compact same-commit delta locators
+
+### Hypothesis
+
+Tracked-state delta packs repeat `source_commit_id` inside every row locator,
+even though ordinary authored deltas point back to the delta pack's own commit.
+This is duplicated physical layout metadata: the storage key already identifies
+the delta pack commit, and the pack can carry that identity once in its header.
+
+Reference storage layouts avoid repeating page/segment identity in every record
+when a compact local locator can refer to the owning container. For Lix, a
+delta-pack-local `SAME_COMMIT` locator tag should shrink write bytes, scan decode
+bytes, and storage footprint while still preserving full locators for adopted
+cross-commit changes.
+
+### Change
+
+- Bumped tracked-state delta packs from version 1 to version 2 with no backward
+  shim; Lix has not shipped.
+- Delta packs now store `commit_id` once in the pack header.
+- Delta values encode locator source as:
+  - `SAME_COMMIT`: no repeated source commit id, decoded from the pack header.
+  - `FULL`: explicit source commit id for adopted/cross-commit locators.
+- Tree value encoding is unchanged.
+- `storage::load_delta_pack` validates the embedded pack commit id against the
+  storage key before returning entries, so swapped/corrupt packs cannot silently
+  rewrite same-commit locators.
+- Tests cover decoded pack identity plus same-commit and full locator roundtrip.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                                     | after median | criterion status |
+| ------------------------------------------------------- | -----------: | ---------------- |
+| `raw_sqlite/write_root_all_rows/1k`                     |    2.4003 ms | reference |
+| `raw_sqlite/write_delta_10pct_updates/1k`               |    1.2992 ms | reference |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k`           |    1.2201 ms | reference |
+| `raw_sqlite/scan_keys_only/1k`                          |    1.1429 ms | reference |
+| `raw_sqlite/scan_full_rows/1k`                          |    1.1458 ms | reference |
+| `raw_sqlite/prefix_scan_schema_file_null/1k`            |    1.2437 ms | reference |
+| `sqlite/write_root_all_rows/1k`                         |    4.8006 ms | no change, lower median |
+| `sqlite/write_delta_10pct_updates/1k`                   |    2.0113 ms | no change |
+| `sqlite/write_tombstone_10pct_deletes/1k`               |    1.7745 ms | no change, lower median |
+| `sqlite/scan_keys_only/1k`                              |    2.1931 ms | noisy regression |
+| `sqlite/scan_full_rows/1k`                              |    2.6153 ms | no change, lower median |
+| `sqlite/prefix_scan_schema_file_null/1k`                |    3.0283 ms | no change |
+| `rocksdb/write_root_all_rows/1k`                        |    4.5488 ms | no change |
+| `rocksdb/write_delta_10pct_updates/1k`                  |  883.15 µs | no change |
+| `rocksdb/write_tombstone_10pct_deletes/1k`              |  830.45 µs | no change |
+| `rocksdb/scan_keys_only/1k`                             |    1.1580 ms | no change |
+| `rocksdb/scan_full_rows/1k`                             |    1.6353 ms | no change |
+| `rocksdb/prefix_scan_schema_file_null/1k`               |    1.8247 ms | no change |
+
+SQLite scan rerun:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+| row                                      | rerun median | criterion status |
+| ---------------------------------------- | -----------: | ---------------- |
+| `sqlite/scan_keys_only/1k`               |    1.9420 ms | improved |
+| `sqlite/scan_full_rows/1k`               |    2.5912 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k` |    2.6909 ms | no change |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                     | bytes | bytes/row | status |
+| --------------------------------------- | ----: | --------: | ------ |
+| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
+| Lix SQLite / inserted                   | 1013336 | 1013.3 | improved |
+| Lix SQLite / after create_version       | 1029816 | 1029.8 | improved |
+| Lix SQLite / after fast-forward merge   | 5230192 | 5230.2 | improved |
+| Lix SQLite / after divergent merge      | 5385840 | 5385.8 | improved |
+| Lix RocksDB / inserted                  | 925304 | 925.3 | improved |
+| Lix RocksDB / after create_version      | 927146 | 927.1 | improved |
+| Lix RocksDB / after fast-forward merge  | 1085778 | 1085.8 | improved |
+| Lix RocksDB / after divergent merge     | 1454922 | 1454.9 | improved |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+Initial review:
+HIGH: none.
+MEDIUM: none.
+LOW: delta pack embeds commit_id but storage did not check it against the key;
+swapped/corrupt packs could produce wrong SAME_COMMIT locators.
+
+Follow-up review:
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+The LOW is resolved by returning the decoded pack commit id from the codec and
+checking it in storage::load_delta_pack before exposing entries.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine tracked_state::codec:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state::context:: --features storage-benches
+cargo test -p lix_engine tracked_state::materializer:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a physical layout optimization.
+
+Primary axis: storage footprint and delta-pack decode bytes. Timing is mostly
+neutral with lower medians in the hot write rows and a cleaner SQLite keys-only
+rerun. Storage improves on both SQLite and RocksDB for inserted and merge
+states. No backward shim.
+```
+
 ## Optimization 20: Stage generated bench roots as authored changes
 
 ### Hypothesis
