@@ -299,10 +299,48 @@ where
         })
     }
 
+    /// Validates and stages a tracked commit whose authored rows will be stored
+    /// in the tracked-state delta pack instead of a duplicate commit-store pack.
+    pub(crate) async fn stage_tracked_commit_draft<'a>(
+        &mut self,
+        commit: CommitDraftRef<'a>,
+        authored_changes: Vec<ChangeRef<'a>>,
+        adopted_changes: Vec<ChangeRef<'a>>,
+    ) -> Result<StagedCommitStoreCommit, LixError> {
+        let mut staged = self
+            .stage_tracked_commit_drafts([(commit, authored_changes, adopted_changes)])
+            .await?;
+        staged.pop().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "commit-store staged no result for one tracked commit draft",
+            )
+        })
+    }
+
     /// Validates and stages multiple commit drafts as one commit-store batch.
     pub(crate) async fn stage_commit_drafts<'a>(
         &mut self,
         commits: impl IntoIterator<Item = (CommitDraftRef<'a>, Vec<ChangeRef<'a>>, Vec<ChangeRef<'a>>)>,
+    ) -> Result<Vec<StagedCommitStoreCommit>, LixError> {
+        self.stage_commit_drafts_with_authored_pack(commits, true)
+            .await
+    }
+
+    /// Validates and stages multiple tracked commit drafts whose authored rows
+    /// will be stored in tracked-state delta packs.
+    pub(crate) async fn stage_tracked_commit_drafts<'a>(
+        &mut self,
+        commits: impl IntoIterator<Item = (CommitDraftRef<'a>, Vec<ChangeRef<'a>>, Vec<ChangeRef<'a>>)>,
+    ) -> Result<Vec<StagedCommitStoreCommit>, LixError> {
+        self.stage_commit_drafts_with_authored_pack(commits, false)
+            .await
+    }
+
+    async fn stage_commit_drafts_with_authored_pack<'a>(
+        &mut self,
+        commits: impl IntoIterator<Item = (CommitDraftRef<'a>, Vec<ChangeRef<'a>>, Vec<ChangeRef<'a>>)>,
+        write_authored_change_pack: bool,
     ) -> Result<Vec<StagedCommitStoreCommit>, LixError> {
         let commits = commits
             .into_iter()
@@ -330,12 +368,21 @@ where
                 };
                 adopted_changes.push(locator.clone());
             }
-            staged.push(crate::commit_store::storage::stage_commit(
-                self.writes,
-                commit.commit,
-                commit.authored_changes,
-                adopted_changes,
-            )?);
+            staged.push(if write_authored_change_pack {
+                crate::commit_store::storage::stage_commit(
+                    self.writes,
+                    commit.commit,
+                    commit.authored_changes,
+                    adopted_changes,
+                )?
+            } else {
+                crate::commit_store::storage::stage_commit_with_external_authored_pack(
+                    self.writes,
+                    commit.commit,
+                    commit.authored_changes,
+                    adopted_changes,
+                )?
+            });
         }
         Ok(staged)
     }

@@ -23,6 +23,7 @@ pub(crate) use materialization::{materialize_index_entries, TrackedMaterializati
 pub(crate) use merge::{
     plan_merge, TrackedStateMergeConflict, TrackedStateMergePatch, TrackedStateMergePlan,
 };
+pub(crate) use storage::load_delta_pack;
 #[allow(unused_imports)]
 pub(crate) use types::{
     MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateFilter,

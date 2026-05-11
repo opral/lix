@@ -317,7 +317,7 @@ async fn stage_commit_store_commits(
     }
     let staged = commit_store
         .writer(transaction, writes)
-        .stage_commit_drafts(commits)
+        .stage_tracked_commit_drafts(commits)
         .await?;
     if staged.len() != commit_ids.len() {
         return Err(LixError::new(

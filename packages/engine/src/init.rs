@@ -213,7 +213,7 @@ pub(crate) async fn initialize(
         };
         let mut writer = commit_store.writer(transaction.as_mut(), &mut writes);
         writer
-            .stage_commit_draft(
+            .stage_tracked_commit_draft(
                 commit,
                 authored_changes.iter().map(Change::as_ref).collect(),
                 Vec::new(),

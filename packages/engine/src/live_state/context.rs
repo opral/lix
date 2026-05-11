@@ -763,7 +763,7 @@ mod tests {
             };
             let staged = CommitStoreContext::new()
                 .writer(&mut *store, writes)
-                .stage_commit_draft(
+                .stage_tracked_commit_draft(
                     commit,
                     rows.iter().map(|(change, _, _)| change.as_ref()).collect(),
                     Vec::new(),

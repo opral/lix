@@ -20,6 +20,25 @@ pub(crate) fn stage_commit(
     authored_changes: Vec<ChangeRef<'_>>,
     adopted_changes: Vec<ChangeLocator>,
 ) -> Result<StagedCommitStoreCommit, LixError> {
+    stage_commit_with_authored_pack(writes, commit, authored_changes, adopted_changes, true)
+}
+
+pub(crate) fn stage_commit_with_external_authored_pack(
+    writes: &mut StorageWriteSet,
+    commit: CommitDraftRef<'_>,
+    authored_changes: Vec<ChangeRef<'_>>,
+    adopted_changes: Vec<ChangeLocator>,
+) -> Result<StagedCommitStoreCommit, LixError> {
+    stage_commit_with_authored_pack(writes, commit, authored_changes, adopted_changes, false)
+}
+
+fn stage_commit_with_authored_pack(
+    writes: &mut StorageWriteSet,
+    commit: CommitDraftRef<'_>,
+    authored_changes: Vec<ChangeRef<'_>>,
+    adopted_changes: Vec<ChangeLocator>,
+    write_authored_change_pack: bool,
+) -> Result<StagedCommitStoreCommit, LixError> {
     let stored_commit = StoredCommitRef {
         id: commit.id,
         change_id: commit.change_id,
@@ -38,15 +57,17 @@ pub(crate) fn stage_commit(
 
     let mut authored_locators = Vec::with_capacity(authored_changes.len());
     if !authored_changes.is_empty() {
-        writes.put(
-            CHANGE_PACK_NAMESPACE,
-            pack_key(commit.id, SINGLE_PACK_ID)?,
-            crate::commit_store::codec::encode_change_pack(
-                commit.id,
-                SINGLE_PACK_ID,
-                &authored_changes,
-            )?,
-        );
+        if write_authored_change_pack {
+            writes.put(
+                CHANGE_PACK_NAMESPACE,
+                pack_key(commit.id, SINGLE_PACK_ID)?,
+                crate::commit_store::codec::encode_change_pack(
+                    commit.id,
+                    SINGLE_PACK_ID,
+                    &authored_changes,
+                )?,
+            );
+        }
         for (source_ordinal, change) in authored_changes.iter().enumerate() {
             authored_locators.push(ChangeLocator {
                 source_commit_id: commit.id.to_string(),
@@ -114,7 +135,7 @@ pub(crate) async fn load_change_pack(
 ) -> Result<Option<Vec<Change>>, LixError> {
     let Some(bytes) = get_one(store, CHANGE_PACK_NAMESPACE, pack_key(commit_id, pack_id)?).await?
     else {
-        return Ok(None);
+        return load_tracked_authored_change_pack(store, commit_id, pack_id).await;
     };
     let (stored_commit_id, stored_pack_id, changes) =
         crate::commit_store::codec::decode_change_pack(&bytes)?;
@@ -125,6 +146,57 @@ pub(crate) async fn load_change_pack(
         &stored_commit_id,
         stored_pack_id,
     )?;
+    Ok(Some(changes))
+}
+
+pub(crate) async fn load_tracked_authored_change_pack(
+    store: &mut (impl StorageReader + ?Sized),
+    commit_id: &str,
+    pack_id: u32,
+) -> Result<Option<Vec<Change>>, LixError> {
+    let Some(delta_entries) = crate::tracked_state::load_delta_pack(store, commit_id).await? else {
+        return Ok(None);
+    };
+    let mut changes_by_ordinal = BTreeMap::<u32, Change>::new();
+    for delta in delta_entries {
+        let locator = &delta.value.change_locator;
+        if locator.source_commit_id != commit_id || locator.source_pack_id != pack_id {
+            continue;
+        }
+        let ordinal = locator.source_ordinal;
+        let change = Change {
+            id: locator.change_id.clone(),
+            entity_id: delta.key.entity_id,
+            schema_key: delta.key.schema_key,
+            file_id: delta.key.file_id,
+            snapshot_ref: delta.value.snapshot_ref,
+            metadata_ref: delta.value.metadata_ref,
+            created_at: delta.value.updated_at,
+        };
+        if changes_by_ordinal.insert(ordinal, change).is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked authored change pack ({commit_id}, {pack_id}) has duplicate ordinal {ordinal}"
+                ),
+            ));
+        }
+    }
+    if changes_by_ordinal.is_empty() {
+        return Ok(None);
+    }
+    let mut changes = Vec::with_capacity(changes_by_ordinal.len());
+    for (expected_ordinal, (ordinal, change)) in (0u32..).zip(changes_by_ordinal) {
+        if ordinal != expected_ordinal {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked authored change pack ({commit_id}, {pack_id}) is missing ordinal {expected_ordinal}"
+                ),
+            ));
+        }
+        changes.push(change);
+    }
     Ok(Some(changes))
 }
 
@@ -292,6 +364,7 @@ mod tests {
     use crate::entity_identity::EntityIdentity;
     use crate::json_store::JsonRef;
     use crate::storage::{StorageContext, StorageWriteTransaction};
+    use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
 
     use super::*;
 
@@ -384,6 +457,120 @@ mod tests {
                     },
                 }),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tracked_commit_change_pack_loads_from_delta_pack() {
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let mut tx = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        let mut writes = StorageWriteSet::new();
+        let commit = test_commit();
+        let change = test_change("change-1");
+
+        let staged = stage_commit_with_external_authored_pack(
+            &mut writes,
+            CommitDraftRef {
+                id: &commit.id,
+                change_id: &commit.change_id,
+                parent_ids: &commit.parent_ids,
+                author_account_ids: &commit.author_account_ids,
+                created_at: &commit.created_at,
+            },
+            vec![change.as_ref()],
+            Vec::new(),
+        )
+        .expect("tracked commit should stage");
+        let deltas = [TrackedStateDeltaRef {
+            change: change.as_ref(),
+            locator: staged.authored_locators[0].as_ref(),
+            created_at: "2026-01-01T00:00:00Z",
+            updated_at: "2026-01-02T00:00:00Z",
+        }];
+        TrackedStateContext::new()
+            .writer(&mut tx.as_mut(), &mut writes)
+            .stage_delta(&commit.id, None, &deltas)
+            .await
+            .expect("tracked delta should stage");
+        writes
+            .apply(&mut tx.as_mut())
+            .await
+            .expect("writes should apply");
+        tx.commit().await.expect("commit should succeed");
+
+        let mut reader = storage.clone();
+        assert_eq!(
+            get_one(
+                &mut reader,
+                CHANGE_PACK_NAMESPACE,
+                pack_key("commit-1", 0).unwrap()
+            )
+            .await
+            .expect("direct change pack lookup should succeed"),
+            None
+        );
+        assert_eq!(
+            load_change_pack(&mut reader, "commit-1", 0)
+                .await
+                .expect("tracked change pack should load"),
+            Some(vec![Change {
+                created_at: "2026-01-02T00:00:00Z".to_string(),
+                ..change.clone()
+            }])
+        );
+        assert_eq!(
+            load_change_index_entries(&mut reader, &["change-1".to_string()])
+                .await
+                .expect("index entries should load"),
+            vec![Some(ChangeIndexEntry::PackedChange {
+                locator: staged.authored_locators[0].clone(),
+            })]
+        );
+    }
+
+    #[tokio::test]
+    async fn tracked_commit_change_pack_rejects_sparse_delta_ordinals() {
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let mut tx = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        let mut writes = StorageWriteSet::new();
+        let commit = test_commit();
+        let change = test_change("change-1");
+        let sparse_locator = ChangeLocator {
+            source_commit_id: commit.id.clone(),
+            source_pack_id: 0,
+            source_ordinal: 1,
+            change_id: change.id.clone(),
+        };
+        let deltas = [TrackedStateDeltaRef {
+            change: change.as_ref(),
+            locator: sparse_locator.as_ref(),
+            created_at: "2026-01-01T00:00:00Z",
+            updated_at: "2026-01-02T00:00:00Z",
+        }];
+        TrackedStateContext::new()
+            .writer(&mut tx.as_mut(), &mut writes)
+            .stage_delta(&commit.id, None, &deltas)
+            .await
+            .expect("tracked delta should stage");
+        writes
+            .apply(&mut tx.as_mut())
+            .await
+            .expect("writes should apply");
+        tx.commit().await.expect("commit should succeed");
+
+        let mut reader = storage.clone();
+        let error = load_change_pack(&mut reader, "commit-1", 0)
+            .await
+            .expect_err("sparse tracked authored ordinals should reject");
+        assert!(
+            error.to_string().contains("missing ordinal 0"),
+            "error should mention missing ordinal: {error}"
         );
     }
 

@@ -5620,3 +5620,168 @@ The independent first-principles sidecar pass ranked the next plausible
    timestamp codes, and payload refs.
 
 Those are the likely paths for the remaining root-write and SQLite scan misses.
+
+## Optimization 39: Use tracked delta packs as authored commit row groups
+
+Date: 2026-05-11
+
+Status: kept and committed.
+
+### Hypothesis
+
+Tracked commits still wrote authored row facts twice:
+
+1. `commit_store.change_pack`, for commit/change APIs.
+2. `tracked_state.delta_pack`, for tracked projection reads and diffs.
+
+Both streams carry the same authored change identity, schema/file/entity key,
+payload refs, change id, commit locator, and change timestamp. Removing the
+duplicate commit-store authored pack for tracked commits should cut root-write
+work and storage materially, while keeping commit-store APIs as views over the
+same tracked delta row group.
+
+This follows the row-group principle from DuckDB/Parquet and the
+content-addressed shared-structure principle from Dolt/Sapling: store the
+commit-local row facts once, then expose logical views over that one physical
+segment.
+
+### Change
+
+- Added `CommitStoreWriter::stage_tracked_commit_draft(s)`.
+- Tracked commit call sites now use the tracked staging path:
+  transaction commit, initialization, test support, live-state test helper, and
+  storage-bench tracked root writes.
+- The tracked staging path still validates uniqueness/adoption through
+  commit_store, still writes the commit header, and still writes membership
+  packs for adopted rows, but it does not write a duplicate
+  `commit_store.change_pack` for authored tracked rows.
+- `commit_store::storage::load_change_pack` still prefers a direct commit-store
+  change pack. When it is absent, it reconstructs authored changes from
+  `tracked_state.delta_pack` entries whose locators point at the requested
+  `(commit_id, pack_id)`.
+- Fallback reconstruction uses `delta.value.updated_at` as
+  `Change.created_at`, because commit-store `Change.created_at` is the change
+  timestamp, not the original entity creation timestamp.
+- Fallback reconstruction collects by ordinal in a `BTreeMap` and validates
+  dense ordinals from zero, avoiding allocations based on untrusted
+  `source_ordinal` values.
+- Added focused tests for tracked commit-pack fallback and sparse ordinal
+  rejection.
+
+No backward shim was added. Lix has not shipped.
+
+### Benchmarks
+
+Primary command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|get_many_exact_keys|scan_full_rows|prefix_scan_schema_file_null|changed_keys_update_10pct|changed_keys_delta_chain_10x1pct)/1k'
+```
+
+Key medians:
+
+| row                                                               |   median | criterion status |
+| ----------------------------------------------------------------- | -------: | ---------------- |
+| `sqlite/write_root_all_rows/1k`                                   | 4.3853 ms | improved -10.019% |
+| `sqlite/get_many_exact_keys/1k`                                   | 2.7779 ms | improved -12.889% |
+| `sqlite/scan_full_rows/1k`                                        | 2.9966 ms | regressed +35.198%; contradicted by rerun |
+| `sqlite/prefix_scan_schema_file_null/1k`                          | 2.9472 ms | regressed +26.394%; contradicted by rerun |
+| `sqlite/changed_keys_update_10pct/1k`                             | 2.4469 ms | regressed +18.411%; contradicted by rerun |
+| `sqlite/changed_keys_delta_chain_10x1pct/1k`                      | 2.3284 ms | improved -7.6062% |
+| `rocksdb/write_root_all_rows/1k`                                  | 4.5553 ms | improved -43.051% |
+| `rocksdb/get_many_exact_keys/1k`                                  | 2.1086 ms | improved -17.576% |
+| `rocksdb/scan_full_rows/1k`                                       | 1.5743 ms | improved -8.0804% |
+| `rocksdb/prefix_scan_schema_file_null/1k`                         | 1.6102 ms | no change +2.5900% |
+| `rocksdb/changed_keys_update_10pct/1k`                            | 1.3325 ms | no change -17.007%; p=0.15 |
+
+Rerun command for red-flag rows:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(write_root_all_rows|scan_full_rows|prefix_scan_schema_file_null|changed_keys_update_10pct)/1k'
+```
+
+Rerun:
+
+| row                                           |   median | criterion status |
+| --------------------------------------------- | -------: | ---------------- |
+| `sqlite/write_root_all_rows/1k`               | 4.6088 ms | no change +1.6643% |
+| `sqlite/scan_full_rows/1k`                    | 2.2111 ms | improved -35.751% |
+| `sqlite/prefix_scan_schema_file_null/1k`      | 2.1713 ms | improved -28.351% |
+| `sqlite/changed_keys_update_10pct/1k`         | 2.1967 ms | improved -15.575% |
+| `rocksdb/write_root_all_rows/1k`              | 4.3510 ms | no change -3.8310% |
+| `rocksdb/scan_full_rows/1k`                   | 1.5100 ms | no change -1.8000% |
+| `rocksdb/prefix_scan_schema_file_null/1k`     | 1.7379 ms | no change +3.0011% |
+| `rocksdb/changed_keys_update_10pct/1k`        | 1.4297 ms | no change +2.7686% |
+
+Interpretation: keep. Criterion timing is noisy, but the primary run clears
+the >=10% bar on SQLite root writes, RocksDB root writes, and exact reads. The
+rerun clears the scan red flags. The structural storage reduction below is the
+stronger evidence that this is a real physical-layout win.
+
+### Storage
+
+Command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                    | before bytes/row | after bytes/row | delta |
+| -------------------------------------- | ---------------: | --------------: | ----: |
+| raw SQLite / inserted                  |           1692.5 |          1692.5 |   0% |
+| Lix SQLite / inserted                  |            898.0 |           724.9 | -19.3% |
+| Lix SQLite / after create_version      |            910.3 |           745.5 | -18.1% |
+| Lix SQLite / after fast-forward merge  |           5115.5 |          3209.3 | -37.3% |
+| Lix SQLite / after divergent merge     |           5275.2 |          5111.4 |  -3.1% |
+| Lix RocksDB / inserted                 |            809.7 |           655.7 | -19.0% |
+| Lix RocksDB / after create_version     |            811.5 |           657.2 | -19.0% |
+| Lix RocksDB / after fast-forward merge |            960.5 |           776.7 | -19.1% |
+| Lix RocksDB / after divergent merge    |           1303.4 |          1060.1 | -18.7% |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+Initial review:
+HIGH: fallback Change.created_at used delta.value.created_at, but commit-store
+Change.created_at is the change timestamp. Use delta.value.updated_at.
+MEDIUM: fallback Vec resized from untrusted source_ordinal before dense-order
+validation. Avoid allocation from corrupt ordinal values.
+LOW: stage_tracked_commit_draft(s) leaves a two-step internal invariant:
+callers must also stage the matching tracked delta pack.
+
+Follow-up review:
+HIGH: none.
+MEDIUM: none.
+LOW: the two-step invariant remains acceptable for this first row-group step;
+eventual API should make tracked commit + delta staging atomic.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo check -p lix_engine --features storage-benches
+cargo test -p lix_engine commit_store:: --features storage-benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine transaction --features storage-benches
+cargo test -p lix_engine commit_store::storage::tests::tracked_commit_change_pack --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|get_many_exact_keys|scan_full_rows|prefix_scan_schema_file_null|changed_keys_update_10pct|changed_keys_delta_chain_10x1pct)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(write_root_all_rows|scan_full_rows|prefix_scan_schema_file_null|changed_keys_update_10pct)/1k'
+```
+
+All commands passed.
+
+### Next Work
+
+This is not the final row-group API yet. The next clean cut should remove the
+two-step invariant by making tracked commit staging and tracked delta staging
+one atomic commit-local row-group operation. After that, the projection-page
+scan API remains the likely path for the remaining SQLite scan/root-write
+ratio misses.

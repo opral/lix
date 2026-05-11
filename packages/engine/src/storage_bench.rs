@@ -3977,7 +3977,7 @@ async fn write_tracked_root(
     let authored_changes = changes.iter().map(Change::as_ref).collect::<Vec<_>>();
     let staged = commit_store
         .writer(&mut transaction.as_mut(), &mut writes)
-        .stage_commit_draft(commit, authored_changes.clone(), Vec::new())
+        .stage_tracked_commit_draft(commit, authored_changes.clone(), Vec::new())
         .await?;
     let mut deltas = Vec::with_capacity(changes.len());
     deltas.extend(
