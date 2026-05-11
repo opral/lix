@@ -361,11 +361,7 @@ async fn load_from_packs(
         )
     })?;
     for stored_pack in group.values_iter().flatten() {
-        for (json_ref, value) in decode_json_pack(stored_pack, hash_check)? {
-            if let Some(&index) = wanted.get(json_ref.as_hash_array()) {
-                values[index] = Some(value);
-            }
-        }
+        load_json_pack_values(stored_pack, hash_check, &wanted, &mut values)?;
     }
     Ok(values)
 }
@@ -461,10 +457,12 @@ fn decode_json_payload(
     Ok(data)
 }
 
-fn decode_json_pack(
+fn load_json_pack_values(
     bytes: &[u8],
     hash_check: JsonHashCheck,
-) -> Result<Vec<(JsonRef, Vec<u8>)>, LixError> {
+    wanted: &HashMap<[u8; 32], usize>,
+    values: &mut [Option<Vec<u8>>],
+) -> Result<(), LixError> {
     if bytes.len() < STORED_JSON_PACK_MAGIC.len() + 4 {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -506,7 +504,6 @@ fn decode_json_pack(
         ));
     }
 
-    let mut out = Vec::with_capacity(count);
     for index in 0..count {
         let mut cursor = directory_start + index * STORED_JSON_PACK_ENTRY_HEADER_LEN;
         let hash: [u8; 32] = bytes[cursor..cursor + 32]
@@ -550,16 +547,18 @@ fn decode_json_pack(
                 "stored JSON pack entry payload is truncated",
             ));
         }
+        let Some(&value_index) = wanted.get(&hash) else {
+            continue;
+        };
         let json_ref = JsonRef::from_hash_bytes(hash);
         let payload = StoredJsonPayload {
             codec,
             uncompressed_len,
             data: &bytes[data_start..data_end],
         };
-        let value = decode_json_payload(&json_ref, payload, hash_check)?;
-        out.push((json_ref, value));
+        values[value_index] = Some(decode_json_payload(&json_ref, payload, hash_check)?);
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -697,6 +696,64 @@ mod tests {
         )
         .await
         .expect_err("verified read should reject mismatched content address");
+        assert!(
+            error.to_string().contains("hash mismatch"),
+            "error should mention hash mismatch: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_pack_load_checks_only_requested_entries() {
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let good = encode_json("{\"value\":\"good\"}").expect("good json should encode");
+        let bad_ref = JsonRef::for_content(br#"{"value":"expected"}"#);
+        let bad = encode_json_for_storage_with_ref("{\"value\":\"wrong\"}", bad_ref)
+            .expect("bad json should encode with mismatched ref");
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            JSON_PACK_NAMESPACE,
+            pack_key("commit-a", 0),
+            encode_json_pack(&[&good, &bad]).expect("pack should encode"),
+        );
+        writes
+            .apply(&mut transaction.as_mut())
+            .await
+            .expect("json pack should store");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let pack_ids = [0];
+        let mut store = storage.clone();
+        let good_values = verify_json_bytes_many_in_scope(
+            &mut store,
+            &[good.json_ref],
+            JsonReadScopeRef::CommitPacks {
+                commit_id: "commit-a",
+                pack_ids: &pack_ids,
+            },
+        )
+        .await
+        .expect("unrequested bad pack entry should not be decoded");
+        assert_eq!(good_values, vec![Some(good.data.as_ref().to_vec())]);
+
+        let mut store = storage.clone();
+        let error = verify_json_bytes_many_in_scope(
+            &mut store,
+            &[bad_ref],
+            JsonReadScopeRef::CommitPacks {
+                commit_id: "commit-a",
+                pack_ids: &pack_ids,
+            },
+        )
+        .await
+        .expect_err("requested bad pack entry should be verified");
         assert!(
             error.to_string().contains("hash mismatch"),
             "error should mention hash mismatch: {error}"
