@@ -132,6 +132,31 @@ async fn load_projection_json_values<S>(
 where
     S: StorageReader,
 {
+    if json_refs.len() != json_ref_localities.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state materialization JSON refs and locality indexes diverged",
+        ));
+    }
+
+    let json_store = JsonStoreContext::new();
+    if let Some((commit_id, pack_id)) = single_projection_pack(json_ref_localities, row_plans)? {
+        let pack_ids = [pack_id];
+        return json_store
+            .load_bytes_many(
+                store,
+                JsonLoadRequestRef {
+                    refs: json_refs,
+                    scope: JsonReadScopeRef::CommitPacks {
+                        commit_id,
+                        pack_ids: &pack_ids,
+                    },
+                },
+            )
+            .await
+            .map(|batch| batch.into_values());
+    }
+
     let mut json_values = vec![None; json_refs.len()];
     let mut refs_by_pack = BTreeMap::<(&str, u32), Vec<(usize, JsonRef)>>::new();
     for (index, json_ref) in json_refs.iter().copied().enumerate() {
@@ -153,7 +178,6 @@ where
             .push((index, json_ref));
     }
 
-    let json_store = JsonStoreContext::new();
     for ((commit_id, pack_id), refs) in refs_by_pack {
         let indexes = refs.iter().map(|(index, _)| *index).collect::<Vec<_>>();
         let refs = refs
@@ -179,6 +203,36 @@ where
         }
     }
     Ok(json_values)
+}
+
+fn single_projection_pack<'a>(
+    json_ref_localities: &[JsonRefLocality],
+    row_plans: &'a [MaterializedTrackedStateRowPlan],
+) -> Result<Option<(&'a str, u32)>, LixError> {
+    let Some(first_locality) = json_ref_localities.first() else {
+        return Ok(None);
+    };
+    let first_plan = row_plans.get(first_locality.row_index).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state materialization lost JSON row locality index",
+        )
+    })?;
+    let commit_id = first_plan.commit_id.as_str();
+    let pack_id = first_locality.pack_id;
+
+    for locality in &json_ref_localities[1..] {
+        let row_plan = row_plans.get(locality.row_index).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state materialization lost JSON row locality index",
+            )
+        })?;
+        if row_plan.commit_id != commit_id || locality.pack_id != pack_id {
+            return Ok(None);
+        }
+    }
+    Ok(Some((commit_id, pack_id)))
 }
 
 fn materialize_row_plan(
@@ -275,6 +329,61 @@ impl TrackedMaterializationProjection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row_plan(commit_id: &str) -> MaterializedTrackedStateRowPlan {
+        MaterializedTrackedStateRowPlan {
+            entity_id: EntityIdentity::single("entity"),
+            schema_key: "schema".to_string(),
+            file_id: None,
+            deleted: false,
+            created_at: "2024-01-01T00:00:00.000Z".to_string(),
+            updated_at: "2024-01-01T00:00:00.000Z".to_string(),
+            change_id: "change".to_string(),
+            commit_id: commit_id.to_string(),
+            snapshot_ref_index: None,
+            metadata_ref_index: None,
+        }
+    }
+
+    #[test]
+    fn single_projection_pack_accepts_duplicate_slots_from_same_pack() {
+        let row_plans = vec![row_plan("commit-a")];
+        let localities = vec![
+            JsonRefLocality {
+                row_index: 0,
+                pack_id: 7,
+            },
+            JsonRefLocality {
+                row_index: 0,
+                pack_id: 7,
+            },
+        ];
+
+        assert_eq!(
+            single_projection_pack(&localities, &row_plans).expect("pack detection should succeed"),
+            Some(("commit-a", 7))
+        );
+    }
+
+    #[test]
+    fn single_projection_pack_rejects_mixed_packs() {
+        let row_plans = vec![row_plan("commit-a")];
+        let localities = vec![
+            JsonRefLocality {
+                row_index: 0,
+                pack_id: 7,
+            },
+            JsonRefLocality {
+                row_index: 0,
+                pack_id: 8,
+            },
+        ];
+
+        assert_eq!(
+            single_projection_pack(&localities, &row_plans).expect("pack detection should succeed"),
+            None
+        );
+    }
 
     #[test]
     fn materialized_json_string_consumes_owned_payload_bytes() {

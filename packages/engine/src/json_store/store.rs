@@ -4,7 +4,7 @@ use crate::json_store::types::{JsonReadScopeRef, JsonRef};
 use crate::storage::{KvGetGroup, KvGetRequest, StorageReader};
 use crate::LixError;
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 pub(crate) const JSON_NAMESPACE: &str = "json_store.json";
 pub(crate) const JSON_PACK_NAMESPACE: &str = "json_store.pack";
@@ -174,20 +174,20 @@ pub(crate) async fn load_json_bytes_many_in_scope(
 
     let mut unique_keys = Vec::new();
     let mut unique_refs = Vec::new();
-    let mut key_indexes = BTreeMap::<Vec<u8>, usize>::new();
+    let mut key_indexes = HashMap::<[u8; 32], usize>::new();
     let mut requested_indexes = Vec::with_capacity(json_refs.len());
     let mut has_duplicate_refs = false;
     for json_ref in json_refs {
-        let key = json_ref.as_hash_bytes().to_vec();
-        let index = match key_indexes.get(&key) {
+        let hash = *json_ref.as_hash_array();
+        let index = match key_indexes.get(&hash) {
             Some(index) => {
                 has_duplicate_refs = true;
                 *index
             }
             None => {
                 let index = unique_keys.len();
-                key_indexes.insert(key.clone(), index);
-                unique_keys.push(key);
+                key_indexes.insert(hash, index);
+                unique_keys.push(hash.to_vec());
                 unique_refs.push(*json_ref);
                 index
             }
@@ -297,8 +297,8 @@ async fn load_from_packs(
     let wanted = unique_refs
         .iter()
         .enumerate()
-        .map(|(index, json_ref)| (json_ref.as_hash_bytes().to_vec(), index))
-        .collect::<BTreeMap<_, _>>();
+        .map(|(index, json_ref)| (*json_ref.as_hash_array(), index))
+        .collect::<HashMap<_, _>>();
     let keys = pack_ids
         .iter()
         .map(|&pack_id| pack_key(commit_id, pack_id))
@@ -319,7 +319,7 @@ async fn load_from_packs(
     })?;
     for stored_pack in group.values_iter().flatten() {
         for (json_ref, value) in decode_json_pack(stored_pack)? {
-            if let Some(&index) = wanted.get(json_ref.as_hash_bytes()) {
+            if let Some(&index) = wanted.get(json_ref.as_hash_array()) {
                 values[index] = Some(value);
             }
         }

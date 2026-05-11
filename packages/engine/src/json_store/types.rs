@@ -55,6 +55,10 @@ impl JsonRef {
         &self.hash
     }
 
+    pub(crate) fn as_hash_array(&self) -> &[u8; 32] {
+        &self.hash
+    }
+
     pub(crate) fn to_hex(&self) -> String {
         self.hash.iter().map(|byte| format!("{byte:02x}")).collect()
     }
