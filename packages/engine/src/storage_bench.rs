@@ -4036,7 +4036,7 @@ async fn write_tracked_root(
     );
     context
         .writer(&mut transaction.as_mut(), &mut writes)
-        .stage_delta(commit_id, parent_commit_id, deltas)
+        .stage_delta(commit_id, parent_commit_id, &deltas)
         .await?;
     writes.apply(&mut transaction.as_mut()).await?;
     transaction.commit().await

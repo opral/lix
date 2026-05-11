@@ -2566,6 +2566,112 @@ a structural regression.
 No storage format change. No temporary shim.
 ```
 
+## Optimization 17: Borrow tracked-state delta slices
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Changed `TrackedStateWriter::stage_delta` to accept
+`&[TrackedStateDeltaRef<'_>]` instead of a generic `IntoIterator`:
+
+- Removed the internal `collect::<Vec<_>>()` before delta-pack encoding.
+- Updated production and test callers to borrow their already-built delta
+  vectors.
+- Kept `stage_projection_root` unchanged because it still needs to own and
+  reuse the collected deltas while building projection roots.
+
+This lines the public staging helper up with the delta-pack encoder, which
+already accepts borrowed slices and immediately writes owned encoded bytes into
+the write set.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/write_root_all_rows/1k'
+```
+
+Result: passed.
+
+| row                                             | after median | criterion status |
+| ----------------------------------------------- | -----------: | ---------------- |
+| `raw_sqlite/write_root_all_rows/1k`             |    2.3512 ms | reference/no change |
+| `sqlite/write_root_all_rows/1k`                 |    5.5212 ms | no change |
+| `rocksdb/write_root_all_rows/1k`                |    4.6132 ms | no change, lower median |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                     | bytes | bytes/row | status |
+| --------------------------------------- | ----: | --------: | ------ |
+| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
+| Lix SQLite / inserted                   | 1112216 | 1112.2 | unchanged |
+| Lix SQLite / after create_version       | 1124576 | 1124.6 | unchanged |
+| Lix SQLite / after fast-forward merge   | 5324328 | 5324.3 | unchanged |
+| Lix SQLite / after divergent merge      | 5652176 | 5652.2 | unchanged |
+| Lix RocksDB / inserted                  | 1028557 | 1028.6 | unchanged |
+| Lix RocksDB / after create_version      | 1030457 | 1030.5 | unchanged |
+| Lix RocksDB / after fast-forward merge  | 1195234 | 1195.2 | unchanged |
+| Lix RocksDB / after divergent merge     | 1576587 | 1576.6 | unchanged |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+Recommendation: keep, but log it as a small allocation/API cleanup rather than
+a measured benchmark optimization. The slice API is clean because stage_delta
+only synchronously encodes into owned write-set bytes, and the production
+callers already hold the delta Vecs.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine transaction::commit:: --features storage-benches
+cargo test -p lix_engine live_state::context:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/write_root_all_rows/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a small root-write allocation cleanup.
+
+Primary axis: write_root_all_rows. The structural win removes a redundant Vec
+allocation/copy on the tracked-state delta staging path after callers have
+already built the delta Vec.
+
+Timing: Criterion reported no statistically significant change. This is kept
+because it simplifies the hot staging API and removes real production work,
+not because it demonstrates a standalone benchmark win.
+
+No storage format change. No temporary shim.
+```
+
 ## Optimization 14: Reuse trusted JSON refs during payload staging
 
 Date: 2026-05-11

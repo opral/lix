@@ -469,7 +469,7 @@ async fn stage_tracked_roots(
                 ),
         );
         writer
-            .stage_delta(&root.commit_id, root.parent_commit_id.as_deref(), deltas)
+            .stage_delta(&root.commit_id, root.parent_commit_id.as_deref(), &deltas)
             .await?;
     }
     if !tracked_row_indices_by_commit.is_empty() || !adopted_row_indices_by_commit.is_empty() {
