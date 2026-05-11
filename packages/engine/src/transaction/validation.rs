@@ -2367,6 +2367,13 @@ fn primary_key_identity_error(
         EntityIdentityError::EmptyPrimaryKeyPath { index } => {
             format!("empty x-lix-primary-key pointer at index {index}")
         }
+        EntityIdentityError::EmptyPrimaryKeyValue { index } => {
+            let pointer = primary_key_paths
+                .get(index)
+                .map(|path| format_json_pointer(path))
+                .unwrap_or_else(|| format!("index {index}"));
+            format!("empty value at primary-key pointer '{pointer}'")
+        }
         EntityIdentityError::MissingPrimaryKeyValue { index } => {
             let pointer = format_json_pointer(&primary_key_paths[index]);
             format!("missing value at primary-key pointer '{pointer}'")

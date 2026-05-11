@@ -1,7 +1,7 @@
 use serde_json::{json, Value as JsonValue};
 
 use crate::transaction::types::TransactionWrite;
-use crate::version::VersionRefReader;
+use crate::version::{VersionLifecycle, VersionOperation, VersionReferenceRole};
 use crate::LixError;
 
 use super::analysis::{analyze, MergeCommits, MergeOutcome};
@@ -117,26 +117,21 @@ impl SessionContext {
 
                 let (target_head, source_head) = {
                     let reader = transaction.version_ref_reader();
-                    let target_head = reader
-                        .load_head_commit_id(&active_version_id)
-                        .await?
-                        .ok_or_else(|| {
-                            LixError::version_not_found(
-                                active_version_id.clone(),
-                                "merge_version_preview",
-                                "target",
-                            )
-                        })?;
-                    let source_head = reader
-                        .load_head_commit_id(&source_version_id)
-                        .await?
-                        .ok_or_else(|| {
-                            LixError::version_not_found(
-                                source_version_id.clone(),
-                                "merge_version_preview",
-                                "source",
-                            )
-                        })?;
+                    let lifecycle = VersionLifecycle::new(&reader);
+                    let target_head = lifecycle
+                        .require_existing_commit_id(
+                            &active_version_id,
+                            VersionOperation::MergeVersionPreview,
+                            VersionReferenceRole::Target,
+                        )
+                        .await?;
+                    let source_head = lifecycle
+                        .require_existing_commit_id(
+                            &source_version_id,
+                            VersionOperation::MergeVersionPreview,
+                            VersionReferenceRole::Source,
+                        )
+                        .await?;
                     (target_head, source_head)
                 };
 
@@ -189,26 +184,21 @@ impl SessionContext {
 
                 let (target_head, source_head) = {
                     let reader = transaction.version_ref_reader();
-                    let target_head = reader
-                        .load_head_commit_id(&active_version_id)
-                        .await?
-                        .ok_or_else(|| {
-                            LixError::version_not_found(
-                                active_version_id.clone(),
-                                "merge_version",
-                                "target",
-                            )
-                        })?;
-                    let source_head = reader
-                        .load_head_commit_id(&source_version_id)
-                        .await?
-                        .ok_or_else(|| {
-                            LixError::version_not_found(
-                                source_version_id.clone(),
-                                "merge_version",
-                                "source",
-                            )
-                        })?;
+                    let lifecycle = VersionLifecycle::new(&reader);
+                    let target_head = lifecycle
+                        .require_existing_commit_id(
+                            &active_version_id,
+                            VersionOperation::MergeVersion,
+                            VersionReferenceRole::Target,
+                        )
+                        .await?;
+                    let source_head = lifecycle
+                        .require_existing_commit_id(
+                            &source_version_id,
+                            VersionOperation::MergeVersion,
+                            VersionReferenceRole::Source,
+                        )
+                        .await?;
                     (target_head, source_head)
                 };
 

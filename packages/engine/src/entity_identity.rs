@@ -18,6 +18,7 @@ pub(crate) struct EntityIdentity {
 pub(crate) enum EntityIdentityError {
     EmptyPrimaryKey,
     EmptyPrimaryKeyPath { index: usize },
+    EmptyPrimaryKeyValue { index: usize },
     MissingPrimaryKeyValue { index: usize },
     UnsupportedPrimaryKeyValue { index: usize },
     InvalidEncodedEntityIdentity,
@@ -33,6 +34,12 @@ impl std::fmt::Display for EntityIdentityError {
                 write!(
                     formatter,
                     "primary-key path at index {index} must not be empty"
+                )
+            }
+            Self::EmptyPrimaryKeyValue { index } => {
+                write!(
+                    formatter,
+                    "primary-key value at index {index} must not be empty"
                 )
             }
             Self::MissingPrimaryKeyValue { index } => {
@@ -63,6 +70,9 @@ impl EntityIdentity {
     pub(crate) fn tuple(parts: Vec<String>) -> Result<Self, EntityIdentityError> {
         if parts.is_empty() {
             return Err(EntityIdentityError::EmptyPrimaryKey);
+        }
+        if let Some((index, _)) = parts.iter().enumerate().find(|(_, part)| part.is_empty()) {
+            return Err(EntityIdentityError::EmptyPrimaryKeyValue { index });
         }
         Ok(Self { parts })
     }
@@ -159,6 +169,9 @@ fn string_part_from_json_value(
     index: usize,
 ) -> Result<String, EntityIdentityError> {
     match value {
+        JsonValue::String(value) if value.is_empty() => {
+            Err(EntityIdentityError::EmptyPrimaryKeyValue { index })
+        }
         JsonValue::String(value) => Ok(value.clone()),
         _ => Err(EntityIdentityError::UnsupportedPrimaryKeyValue { index }),
     }
@@ -243,15 +256,18 @@ mod tests {
     }
 
     #[test]
-    fn entity_id_json_array_allows_empty_string_part() {
-        let identity = EntityIdentity::from_json_array_text("[\"\"]").expect("decode should work");
-
-        assert_eq!(identity, EntityIdentity::single(""));
+    fn entity_id_json_array_rejects_empty_string_part() {
         assert_eq!(
-            identity
-                .as_json_array_text()
-                .expect("projection should work"),
-            "[\"\"]"
+            EntityIdentity::from_json_array_text("[\"\"]"),
+            Err(EntityIdentityError::EmptyPrimaryKeyValue { index: 0 })
+        );
+    }
+
+    #[test]
+    fn tuple_rejects_empty_string_part() {
+        assert_eq!(
+            EntityIdentity::tuple(vec!["namespace".to_string(), "".to_string()]),
+            Err(EntityIdentityError::EmptyPrimaryKeyValue { index: 1 })
         );
     }
 
@@ -339,6 +355,22 @@ mod tests {
                 &[vec!["namespace".to_string()], vec!["index".to_string()],],
             ),
             Err(EntityIdentityError::UnsupportedPrimaryKeyValue { index: 1 })
+        );
+    }
+
+    #[test]
+    fn from_primary_key_paths_rejects_empty_string_parts() {
+        let snapshot = json!({
+            "namespace": "messages",
+            "id": ""
+        });
+
+        assert_eq!(
+            EntityIdentity::from_primary_key_paths(
+                &snapshot,
+                &[vec!["namespace".to_string()], vec!["id".to_string()],],
+            ),
+            Err(EntityIdentityError::EmptyPrimaryKeyValue { index: 1 })
         );
     }
 

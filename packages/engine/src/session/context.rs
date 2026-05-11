@@ -19,7 +19,9 @@ use crate::storage::{
 };
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{open_transaction, Transaction};
-use crate::version::{VersionContext, VersionRefReader};
+use crate::version::{
+    VersionContext, VersionLifecycle, VersionOperation, VersionRefReader, VersionReferenceRole,
+};
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
@@ -256,18 +258,14 @@ impl SessionContext {
             })?
             .to_string();
 
-        let head = self
-            .version_ctx
-            .ref_reader(&mut *reader)
-            .load_head_commit_id(&version_id)
+        let version_ref = self.version_ctx.ref_reader(&mut *reader);
+        VersionLifecycle::new(&version_ref)
+            .require_existing_ref(
+                &version_id,
+                VersionOperation::LoadWorkspaceSelector,
+                VersionReferenceRole::WorkspaceSelector,
+            )
             .await?;
-        if head.is_none() {
-            return Err(LixError::version_not_found(
-                version_id,
-                "load_workspace_version_id",
-                "workspace_selector",
-            ));
-        }
 
         Ok(version_id)
     }

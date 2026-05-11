@@ -17,8 +17,8 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data, hidden) \
-                 VALUES ('history-file', '/docs/guides/readme.md', X'68656C6C6F', false)",
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('history-file', '/docs/guides/readme.md', X'68656C6C6F')",
                 &[],
             )
             .await
@@ -49,7 +49,7 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, path, name, hidden, data, lixcol_start_commit_id, lixcol_depth \
+                    "SELECT id, path, name, data, lixcol_start_commit_id, lixcol_depth \
                      FROM lix_file_history \
                      WHERE lixcol_start_commit_id = '{second_commit_id}' \
                        AND id = 'history-file' \
@@ -68,7 +68,6 @@ simulation_test!(
                     Value::Text("history-file".to_string()),
                     Value::Text("/docs/readme-renamed.md".to_string()),
                     Value::Text("readme-renamed.md".to_string()),
-                    Value::Boolean(false),
                     Value::Blob(b"hello".to_vec()),
                     Value::Text(second_commit_id.clone()),
                     Value::Integer(0),
@@ -77,7 +76,6 @@ simulation_test!(
                     Value::Text("history-file".to_string()),
                     Value::Text("/docs/guides/readme.md".to_string()),
                     Value::Text("readme.md".to_string()),
-                    Value::Boolean(false),
                     Value::Blob(b"hello".to_vec()),
                     Value::Text(second_commit_id.clone()),
                     Value::Integer(1),
@@ -105,7 +103,6 @@ simulation_test!(
             panic!("snapshot_content should be semantic JSON, got {snapshot:?}");
         };
         assert_eq!(snapshot["name"], json!("readme-renamed.md"));
-        assert_eq!(snapshot["hidden"], json!(false));
 
         let result = session
             .execute(
@@ -169,8 +166,8 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data, hidden) \
-                 VALUES ('history-file-blob-filter', '/docs/blob-filter.txt', X'626C6F62', false)",
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('history-file-blob-filter', '/docs/blob-filter.txt', X'626C6F62')",
                 &[],
             )
             .await

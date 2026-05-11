@@ -2445,6 +2445,56 @@ fn current_sql2_data_sink_exec_violations() -> Vec<SqlRuntimeOwnershipViolation>
     violations.into_iter().collect()
 }
 
+fn current_schema_catalog_dependency_violations() -> Vec<ImportPathViolation> {
+    let module_set = top_level_module_set();
+    let mut violations = BTreeSet::new();
+
+    for (relative_path, source) in production_source_files() {
+        if !relative_path.starts_with("schema/") {
+            continue;
+        }
+
+        let current_module_path = module_path_for_file(&relative_path);
+        for imported_path in
+            collect_module_paths_from_source(&source, &current_module_path, &module_set)
+        {
+            if imported_path
+                .first()
+                .is_some_and(|root| root == "schema_catalog")
+            {
+                violations.insert(ImportPathViolation {
+                    importer_file: relative_path.clone(),
+                    imported_path: imported_path.join("::"),
+                });
+            }
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
+fn current_schema_invalid_param_violations() -> Vec<RawSqlExecutionViolation> {
+    let mut violations = BTreeSet::new();
+
+    for (relative_path, source) in production_source_files() {
+        if !relative_path.starts_with("schema/") {
+            continue;
+        }
+
+        let masked_source = mask_rust_source(&source);
+        for pattern in ["CODE_INVALID_PARAM", "LIX_INVALID_PARAM"] {
+            if masked_source.contains(pattern) {
+                violations.insert(RawSqlExecutionViolation {
+                    file: relative_path.clone(),
+                    pattern,
+                });
+            }
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
 #[test]
 fn sealed_owner_violations_are_empty() {
     let violations = current_sealed_owner_violations();
@@ -2489,6 +2539,28 @@ fn target_core_owner_graph_has_no_cycles() {
         "target core owner-root graph has cycles.\n\nTarget core graph:\n{}\nCycles:\n{}",
         render_target_core_graph(&core_graph),
         render_owner_root_cycles(&cycles),
+    );
+}
+
+#[test]
+fn schema_domain_does_not_depend_on_schema_catalog() {
+    let violations = current_schema_catalog_dependency_violations();
+
+    assert!(
+        violations.is_empty(),
+        "`schema/*` owns schema-document semantics and must not depend on `schema_catalog/*`; transaction/public boundary adapters should compose the two domains.\n\nCurrent violations:\n{}",
+        render_grouped_import_path_violations(&violations),
+    );
+}
+
+#[test]
+fn schema_domain_does_not_emit_public_invalid_param() {
+    let violations = current_schema_invalid_param_violations();
+
+    assert!(
+        violations.is_empty(),
+        "`schema/*` must return schema-domain errors only. Public `INVALID_PARAM` classification belongs at transaction/API/SQL public boundaries.\n\nCurrent violations:\n{}",
+        render_grouped_raw_sql_execution_violations(&violations),
     );
 }
 
@@ -2672,6 +2744,45 @@ fn sql2_write_providers_do_not_delegate_dml_execution_to_datafusion_sinks() {
         violations.is_empty(),
         "SQL2 write providers must not use DataFusion `DataSinkExec`; DML source batches should be collected through the SQL runtime and staged by transaction-owned write code.\n\nCurrent violations:\n{}",
         render_grouped_sql_runtime_ownership_violations(&violations),
+    );
+}
+
+#[test]
+fn sql2_public_boundary_does_not_reintroduce_stringly_validation() {
+    let mut violations = Vec::new();
+
+    for (relative_path, source) in production_source_files() {
+        if !relative_path.starts_with("sql2/") {
+            continue;
+        }
+        let stripped = strip_test_code(&source);
+        let masked_source = mask_rust_source(&stripped);
+
+        for pattern in [
+            "PublicPredicateSpec {",
+            "public_input::expect_text_column(\"",
+            "public_input::expect_bool_column(\"",
+            "public_input::expect_json_object_metadata(\"",
+            "public_input::expect_json_text(\"",
+            "public_input::expect_file_path_public(\"",
+            "public_input::expect_directory_path_public(\"",
+            "public_input::expect_entity_identity_public(\"",
+            "public_input::expect_non_blob_public_id(\"",
+            "require_write(\"",
+            "routed_surface(",
+            "operation: &str",
+            "table: &str",
+        ] {
+            if masked_source.contains(pattern) {
+                violations.push(format!("{relative_path}: {pattern}"));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "SQL2 public boundary validation must flow through typed PublicBoundaryContext/PublicSurface helpers, not raw operation/table strings.\n\nCurrent violations:\n{}",
+        violations.join("\n"),
     );
 }
 

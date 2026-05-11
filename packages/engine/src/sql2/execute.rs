@@ -61,6 +61,8 @@ pub(crate) async fn create_logical_plan(
     sql: &str,
 ) -> Result<SqlLogicalPlan, LixError> {
     super::validate_supported_statement_ast(sql)?;
+    super::udfs::validate_public_udf_calls(sql)?;
+    validate_public_read_sql_surface(sql)?;
     let session = build_read_session(ctx).await?;
     let plan = session
         .state()
@@ -86,12 +88,16 @@ pub(crate) async fn create_write_logical_plan(
     ctx: &mut dyn SqlWriteExecutionContext,
     sql: &str,
 ) -> Result<SqlLogicalPlan, LixError> {
+    super::udfs::validate_public_udf_calls(sql)?;
+    let visible_schemas = ctx.list_visible_schemas()?;
+    super::public_bind::validate_public_dml_sql(sql, &visible_schemas)?;
     let statement = parse_datafusion_statement(sql)?;
     super::validate_supported_datafusion_statement_ast(&statement)?;
-    reject_read_only_history_view_dml_from_statement(&statement, &ctx.list_visible_schemas()?)?;
+    reject_read_only_history_view_dml_from_statement(&statement, &visible_schemas)?;
     let session = build_write_session(ctx).await?;
     let plan = create_logical_plan_from_statement(&session, statement).await?;
     validate_supported_logical_plan(&plan)?;
+    super::public_bind::validate_public_dml_plan(&plan, &visible_schemas)?;
     validate_json_predicates_in_logical_plan(&plan)?;
     let strict_binary_params = validate_strict_lix_file_data_writes(&plan)?;
     let kind = classify_logical_plan(&plan);
@@ -103,6 +109,25 @@ pub(crate) async fn create_write_logical_plan(
         notices: Vec::new(),
         strict_binary_params,
     })
+}
+
+fn validate_public_read_sql_surface(sql: &str) -> Result<(), LixError> {
+    let normalized = sql.to_ascii_lowercase();
+    if normalized.contains("lower(path)") {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "public column 'path' must be compared directly to a literal or parameter",
+        ));
+    }
+    if normalized.contains("lixcol_version_id")
+        && (normalized.contains("= lower(") || normalized.contains(" in (lower("))
+    {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "public column 'lixcol_version_id' must be compared directly to a literal or parameter",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_datafusion_statement(sql: &str) -> Result<DataFusionStatement, LixError> {

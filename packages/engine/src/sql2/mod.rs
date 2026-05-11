@@ -18,6 +18,7 @@ mod history_provider;
 mod history_route;
 mod lix_state_provider;
 mod predicate_typecheck;
+mod public_bind;
 mod read_only;
 mod record_batch;
 mod result_metadata;

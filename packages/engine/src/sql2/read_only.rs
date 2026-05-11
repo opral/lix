@@ -5,38 +5,38 @@ use crate::LixError;
 
 pub(crate) fn reject_read_only_entity_surface(
     schema_key: &str,
-    operation: &str,
+    action: &str,
 ) -> Result<(), DataFusionError> {
     if schema_key == "lix_directory_descriptor" {
         return Err(read_only_error(
-            operation,
+            action,
             schema_key,
             "Use the writable lix_directory surface to create, update, or delete directories.",
         ));
     }
     if let Some(message) = read_only_schema_message(schema_key) {
-        return Err(read_only_error(operation, schema_key, message));
+        return Err(read_only_error(action, schema_key, message));
     }
     Ok(())
 }
 
 pub(crate) fn reject_read_only_stage_rows(
     rows: &[TransactionWriteRow],
-    operation: &str,
+    action: &str,
 ) -> Result<(), DataFusionError> {
     for row in rows {
         if let Some(message) = read_only_schema_message(&row.schema_key) {
-            return Err(read_only_error(operation, &row.schema_key, message));
+            return Err(read_only_error(action, &row.schema_key, message));
         }
     }
     Ok(())
 }
 
-fn read_only_error(operation: &str, schema_key: &str, message: &'static str) -> DataFusionError {
+fn read_only_error(action: &str, schema_key: &str, message: &'static str) -> DataFusionError {
     super::error::lix_error_to_datafusion_error(
         LixError::new(
             LixError::CODE_READ_ONLY,
-            format!("{operation} cannot write read-only surface '{schema_key}'"),
+            format!("{action} cannot write read-only surface '{schema_key}'"),
         )
         .with_hint(message),
     )

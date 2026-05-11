@@ -25,7 +25,7 @@ simulation_test!(
             )
             .await
             .expect_err("overlong directory path segment should be rejected");
-        assert_eq!(segment_error.code, "LIX_ERROR_PATH_SEGMENT_TOO_LONG");
+        assert_eq!(segment_error.code, LixError::CODE_INVALID_PARAM);
 
         let long_path = format!("/{}/", ["abcd"; 820].join("/"));
         let path_error = session
@@ -35,7 +35,7 @@ simulation_test!(
             )
             .await
             .expect_err("overlong directory path should be rejected");
-        assert_eq!(path_error.code, "LIX_ERROR_PATH_TOO_LONG");
+        assert_eq!(path_error.code, LixError::CODE_INVALID_PARAM);
 
         let encoded_segment_at_limit = "%61".repeat(255);
         session
@@ -54,10 +54,7 @@ simulation_test!(
             )
             .await
             .expect_err("overlong canonical segment should be rejected");
-        assert_eq!(
-            encoded_segment_error.code,
-            "LIX_ERROR_PATH_SEGMENT_TOO_LONG"
-        );
+        assert_eq!(encoded_segment_error.code, LixError::CODE_INVALID_PARAM);
 
         let huge_path = format!("/{}/", "a".repeat(1024 * 1024));
         let huge_error = session
@@ -67,7 +64,7 @@ simulation_test!(
             )
             .await
             .expect_err("huge path input should be rejected without runtime internals");
-        assert_eq!(huge_error.code, "LIX_ERROR_PATH_INPUT_TOO_LONG");
+        assert_eq!(huge_error.code, LixError::CODE_INVALID_PARAM);
     }
 );
 
@@ -83,17 +80,9 @@ simulation_test!(
             &engine,
         );
 
-        for (id, path, expected_code) in [
-            (
-                "dir-percent-nul",
-                "/docs/%00evil/",
-                "LIX_ERROR_PATH_NUL_BYTE",
-            ),
-            (
-                "dir-percent-bidi",
-                "/docs/%E2%80%AEevil/",
-                "LIX_ERROR_PATH_INVALID_SEGMENT_CODE_POINT",
-            ),
+        for (id, path) in [
+            ("dir-percent-nul", "/docs/%00evil/"),
+            ("dir-percent-bidi", "/docs/%E2%80%AEevil/"),
         ] {
             let error = session
                 .execute(
@@ -102,7 +91,7 @@ simulation_test!(
                 )
                 .await
                 .expect_err("percent-encoded forbidden path code point should be rejected");
-            assert_eq!(error.code, expected_code);
+            assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         }
     }
 );
@@ -119,8 +108,8 @@ simulation_test!(lix_directory_insert_reads_nested_paths, |sim| async move {
 
     let insert_result = session
         .execute(
-            "INSERT INTO lix_directory (id, parent_id, name, hidden) \
-             VALUES ('dir-docs', NULL, 'docs', false)",
+            "INSERT INTO lix_directory (id, parent_id, name) \
+             VALUES ('dir-docs', NULL, 'docs')",
             &[],
         )
         .await
@@ -129,8 +118,8 @@ simulation_test!(lix_directory_insert_reads_nested_paths, |sim| async move {
 
     let nested_insert_result = session
         .execute(
-            "INSERT INTO lix_directory (id, path, hidden) \
-             VALUES ('dir-nested', '/docs/nested/', false)",
+            "INSERT INTO lix_directory (id, path) \
+             VALUES ('dir-nested', '/docs/nested/')",
             &[],
         )
         .await
@@ -139,7 +128,7 @@ simulation_test!(lix_directory_insert_reads_nested_paths, |sim| async move {
 
     let result = session
         .execute(
-            "SELECT id, path, parent_id, name, hidden \
+            "SELECT id, path, parent_id, name \
              FROM lix_directory \
              WHERE id IN ('dir-docs', 'dir-nested') \
              ORDER BY path",
@@ -156,7 +145,6 @@ simulation_test!(lix_directory_insert_reads_nested_paths, |sim| async move {
             Value::Text("/docs/".to_string()),
             Value::Null,
             Value::Text("docs".to_string()),
-            Value::Boolean(false),
         ]
     );
     assert_eq!(
@@ -166,7 +154,6 @@ simulation_test!(lix_directory_insert_reads_nested_paths, |sim| async move {
             Value::Text("/docs/nested/".to_string()),
             Value::Text("dir-docs".to_string()),
             Value::Text("nested".to_string()),
-            Value::Boolean(false),
         ]
     );
 });
@@ -190,12 +177,12 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("directory insert should apply defaulted id and hidden flag");
+            .expect("directory insert should apply defaulted id");
         assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
 
         let result = session
             .execute(
-                "SELECT id, path, parent_id, name, hidden \
+                "SELECT id, path, parent_id, name \
              FROM lix_directory \
              WHERE path = '/docs/'",
                 &[],
@@ -205,15 +192,12 @@ simulation_test!(
         let row_set = result;
         assert_eq!(row_set.len(), 1);
         let values = row_set.rows()[0].values();
-        let [Value::Text(id), Value::Text(path), Value::Null, Value::Text(name), Value::Boolean(hidden)] =
-            values
-        else {
+        let [Value::Text(id), Value::Text(path), Value::Null, Value::Text(name)] = values else {
             panic!("expected generated directory row, got {values:?}");
         };
         assert!(!id.is_empty(), "defaulted directory id should be non-empty");
         assert_eq!(path, "/docs/");
         assert_eq!(name, "docs");
-        assert!(!hidden);
     }
 );
 
@@ -237,7 +221,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, path, parent_id, name, hidden \
+                "SELECT id, path, parent_id, name \
              FROM lix_directory \
              WHERE path = '/docs/'",
                 &[],
@@ -247,15 +231,12 @@ simulation_test!(
         let row_set = result;
         assert_eq!(row_set.len(), 1);
         let values = row_set.rows()[0].values();
-        let [Value::Text(id), Value::Text(path), Value::Null, Value::Text(name), Value::Boolean(hidden)] =
-            values
-        else {
+        let [Value::Text(id), Value::Text(path), Value::Null, Value::Text(name)] = values else {
             panic!("expected generated directory path row, got {values:?}");
         };
         assert!(!id.is_empty(), "defaulted directory id should be non-empty");
         assert_eq!(path, "/docs/");
         assert_eq!(name, "docs");
-        assert!(!hidden);
     }
 );
 
@@ -486,7 +467,7 @@ simulation_test!(
                 .await
                 .expect_err("directory path insert should reject dot segments");
 
-            assert_eq!(error.code, "LIX_ERROR_PATH_DOT_SEGMENT");
+            assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         }
 
         let result = session
@@ -565,8 +546,7 @@ simulation_test!(
 					"id": "dir-cafe-decomposed",
 					"parent_id": null,
                     "name": "Cafe\u{301}",
-                    "hidden": false,
-                }))],
+                                    }))],
             )
             .await
             .expect_err("decomposed descriptor name should normalize before uniqueness");
@@ -581,8 +561,7 @@ simulation_test!(
 					"id": "dir-zero-width",
 					"parent_id": null,
                     "name": "zero\u{200D}width",
-                    "hidden": false,
-                }))],
+                                    }))],
             )
             .await
             .expect_err("descriptor name should reject zero-width characters");
@@ -607,8 +586,8 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES \
-                 (lix_json('[\"dir-a\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-a\",\"parent_id\":\"dir-b\",\"name\":\"a\",\"hidden\":false}'), false, false), \
-                 (lix_json('[\"dir-b\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-b\",\"parent_id\":\"dir-a\",\"name\":\"b\",\"hidden\":false}'), false, false)",
+                 (lix_json('[\"dir-a\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-a\",\"parent_id\":\"dir-b\",\"name\":\"a\"}'), false, false), \
+                 (lix_json('[\"dir-b\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-b\",\"parent_id\":\"dir-a\",\"name\":\"b\"}'), false, false)",
                 &[],
             )
             .await
@@ -640,7 +619,7 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, snapshot_content, global, untracked\
                  ) VALUES \
-                 (lix_json('[\"dir-foo\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-foo\",\"parent_id\":null,\"name\":\"foo\",\"hidden\":false}'), false, false)",
+                 (lix_json('[\"dir-foo\"]'), 'lix_directory_descriptor', NULL, lix_json('{\"id\":\"dir-foo\",\"parent_id\":null,\"name\":\"foo\"}'), false, false)",
                 &[],
             )
             .await
@@ -721,8 +700,8 @@ simulation_test!(
 
         let file_result = session
             .execute(
-                "INSERT INTO lix_file (id, path, data, hidden) \
-             VALUES ('file-readme', '/docs/guides/readme.md', X'68656C6C6F', false)",
+                "INSERT INTO lix_file (id, path, data) \
+             VALUES ('file-readme', '/docs/guides/readme.md', X'68656C6C6F')",
                 &[],
             )
             .await
@@ -827,8 +806,8 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_directory (id, path, hidden, lixcol_global, lixcol_untracked) \
-                 VALUES ('dir-global-overlay', '/shared/', false, true, false)",
+                "INSERT INTO lix_directory (id, path, lixcol_global, lixcol_untracked) \
+                 VALUES ('dir-global-overlay', '/shared/', true, false)",
                 &[],
             )
             .await

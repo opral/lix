@@ -66,7 +66,7 @@ simulation_test!(
                 .execute(
                     "INSERT INTO lix_state (entity_id, schema_key, snapshot_content) \
                      VALUES (lix_json('[\"orphan-descriptor\"]'), 'lix_version_descriptor', \
-                       lix_json('{\"id\":\"orphan-descriptor\",\"name\":\"Orphan\",\"hidden\":false}'))",
+                       lix_json('{\"id\":\"orphan-descriptor\",\"name\":\"Orphan\"}'))",
                     &[],
                 )
                 .await

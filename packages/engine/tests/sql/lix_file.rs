@@ -5,6 +5,56 @@ use lix_engine::Value;
 use super::assert_rows_eq;
 
 simulation_test!(
+    lix_file_read_rejects_public_path_inside_scalar_function,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "SELECT id FROM lix_file WHERE lower(path) = '/readme.md'",
+                &[],
+            )
+            .await
+            .expect_err("public path column should not be hidden inside scalar functions");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(error.message.contains("public column 'path'"));
+    }
+);
+
+simulation_test!(
+    lix_file_by_version_read_rejects_dynamic_version_id_operand,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "SELECT id FROM lix_file_by_version WHERE lixcol_version_id = lower('main')",
+                &[],
+            )
+            .await
+            .expect_err("public version id predicate should only accept literal/param operands");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(error.message.contains("public column 'lixcol_version_id'"));
+    }
+);
+
+simulation_test!(
     lix_file_path_insert_rejects_overlong_paths_and_segments,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -24,7 +74,8 @@ simulation_test!(
             )
             .await
             .expect_err("overlong file path segment should be rejected");
-        assert_eq!(segment_error.code, "LIX_ERROR_PATH_SEGMENT_TOO_LONG");
+        assert_eq!(segment_error.code, LixError::CODE_INVALID_PARAM);
+        assert!(segment_error.message.contains("path segment is too long"));
 
         let long_path = format!("/{}", ["abcd"; 820].join("/"));
         let path_error = session
@@ -34,7 +85,8 @@ simulation_test!(
             )
             .await
             .expect_err("overlong file path should be rejected");
-        assert_eq!(path_error.code, "LIX_ERROR_PATH_TOO_LONG");
+        assert_eq!(path_error.code, LixError::CODE_INVALID_PARAM);
+        assert!(path_error.message.contains("path is too long"));
 
         let encoded_segment_at_limit = "%61".repeat(255);
         session
@@ -53,10 +105,10 @@ simulation_test!(
             )
             .await
             .expect_err("overlong canonical segment should be rejected");
-        assert_eq!(
-            encoded_segment_error.code,
-            "LIX_ERROR_PATH_SEGMENT_TOO_LONG"
-        );
+        assert_eq!(encoded_segment_error.code, LixError::CODE_INVALID_PARAM);
+        assert!(encoded_segment_error
+            .message
+            .contains("path segment is too long"));
 
         let huge_path = format!("/{}", "a".repeat(1024 * 1024));
         let huge_error = session
@@ -66,7 +118,8 @@ simulation_test!(
             )
             .await
             .expect_err("huge path input should be rejected without runtime internals");
-        assert_eq!(huge_error.code, "LIX_ERROR_PATH_INPUT_TOO_LONG");
+        assert_eq!(huge_error.code, LixError::CODE_INVALID_PARAM);
+        assert!(huge_error.message.contains("path input is too long"));
     }
 );
 
@@ -82,16 +135,16 @@ simulation_test!(
             &engine,
         );
 
-        for (id, path, expected_code) in [
+        for (id, path, expected_reason) in [
             (
                 "file-percent-nul",
                 "/docs/%00evil.txt",
-                "LIX_ERROR_PATH_NUL_BYTE",
+                "path must not contain a NUL byte",
             ),
             (
                 "file-percent-bidi",
                 "/docs/%E2%80%AEevil.txt",
-                "LIX_ERROR_PATH_INVALID_SEGMENT_CODE_POINT",
+                "path segment contains a character that is not allowed",
             ),
         ] {
             let error = session
@@ -101,7 +154,8 @@ simulation_test!(
                 )
                 .await
                 .expect_err("percent-encoded forbidden path code point should be rejected");
-            assert_eq!(error.code, expected_code);
+            assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+            assert!(error.message.contains(expected_reason), "{error:?}");
         }
     }
 );
@@ -326,8 +380,8 @@ simulation_test!(
 
         let file_result = session
             .execute(
-                "INSERT INTO lix_file (id, path, data, hidden) \
-             VALUES ('file-readme', '/docs/guides/readme.md', X'68656C6C6F', false)",
+                "INSERT INTO lix_file (id, path, data) \
+             VALUES ('file-readme', '/docs/guides/readme.md', X'68656C6C6F')",
                 &[],
             )
             .await
@@ -336,7 +390,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, path, data, hidden, lixcol_schema_key \
+                "SELECT id, path, data, lixcol_schema_key \
              FROM lix_file \
              WHERE id = 'file-readme'",
                 &[],
@@ -351,7 +405,6 @@ simulation_test!(
                 Value::Text("file-readme".to_string()),
                 Value::Text("/docs/guides/readme.md".to_string()),
                 Value::Blob(b"hello".to_vec()),
-                Value::Boolean(false),
                 Value::Text("lix_file_descriptor".to_string()),
             ]
         );
@@ -404,8 +457,8 @@ simulation_test!(lix_file_insert_applies_defaulted_id, |sim| async move {
 
     session
         .execute(
-            "INSERT INTO lix_directory (id, parent_id, name, hidden) \
-             VALUES ('dir-docs', NULL, 'docs', false)",
+            "INSERT INTO lix_directory (id, parent_id, name) \
+             VALUES ('dir-docs', NULL, 'docs')",
             &[],
         )
         .await
@@ -418,12 +471,12 @@ simulation_test!(lix_file_insert_applies_defaulted_id, |sim| async move {
             &[],
         )
         .await
-        .expect("file insert should apply defaulted id and hidden flag");
+        .expect("file insert should apply defaulted id");
     assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
 
     let result = session
         .execute(
-            "SELECT id, path, directory_id, name, hidden \
+            "SELECT id, path, directory_id, name \
              FROM lix_file \
              WHERE path = '/docs/readme.md'",
             &[],
@@ -433,8 +486,7 @@ simulation_test!(lix_file_insert_applies_defaulted_id, |sim| async move {
     let row_set = result;
     assert_eq!(row_set.len(), 1);
     let values = row_set.rows()[0].values();
-    let [Value::Text(id), Value::Text(path), Value::Text(directory_id), Value::Text(name), Value::Boolean(hidden)] =
-        values
+    let [Value::Text(id), Value::Text(path), Value::Text(directory_id), Value::Text(name)] = values
     else {
         panic!("expected generated file row, got {values:?}");
     };
@@ -442,7 +494,6 @@ simulation_test!(lix_file_insert_applies_defaulted_id, |sim| async move {
     assert_eq!(path, "/docs/readme.md");
     assert_eq!(directory_id, "dir-docs");
     assert_eq!(name, "readme.md");
-    assert!(!hidden);
 });
 
 simulation_test!(
@@ -468,7 +519,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, path, name, hidden \
+                "SELECT id, path, name \
              FROM lix_file \
              WHERE path = '/docs/readme.md'",
                 &[],
@@ -478,15 +529,12 @@ simulation_test!(
         let row_set = result;
         assert_eq!(row_set.len(), 1);
         let values = row_set.rows()[0].values();
-        let [Value::Text(id), Value::Text(path), Value::Text(name), Value::Boolean(hidden)] =
-            values
-        else {
+        let [Value::Text(id), Value::Text(path), Value::Text(name)] = values else {
             panic!("expected generated file path row, got {values:?}");
         };
         assert!(!id.is_empty(), "defaulted file id should be non-empty");
         assert_eq!(path, "/docs/readme.md");
         assert_eq!(name, "readme.md");
-        assert!(!hidden);
     }
 );
 
@@ -1180,7 +1228,8 @@ simulation_test!(
                 .await
                 .expect_err("file path insert should reject dot segments");
 
-            assert_eq!(error.code, "LIX_ERROR_PATH_DOT_SEGMENT");
+            assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+            assert!(error.message.contains("path segment cannot be '.' or '..'"));
         }
 
         let result = session
@@ -1205,8 +1254,8 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_directory (id, parent_id, name, hidden) \
-             VALUES ('dir-docs', NULL, 'docs', false)",
+                "INSERT INTO lix_directory (id, parent_id, name) \
+             VALUES ('dir-docs', NULL, 'docs')",
                 &[],
             )
             .await
@@ -1255,8 +1304,8 @@ simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
 
     let insert_result = session
         .execute(
-            "INSERT INTO lix_file (id, path, data, hidden) \
-             VALUES ('file-readme', '/docs/guides/readme.md', X'68656C6C6F', false)",
+            "INSERT INTO lix_file (id, path, data) \
+             VALUES ('file-readme', '/docs/guides/readme.md', X'68656C6C6F')",
             &[],
         )
         .await
@@ -1574,8 +1623,8 @@ simulation_test!(lix_file_by_version_expands_global_rows, |sim| async move {
 
     session
         .execute(
-            "INSERT INTO lix_file (id, path, data, hidden, lixcol_global, lixcol_untracked) \
-             VALUES ('file-global-overlay', '/global.txt', X'67', false, true, false)",
+            "INSERT INTO lix_file (id, path, data, lixcol_global, lixcol_untracked) \
+             VALUES ('file-global-overlay', '/global.txt', X'67', true, false)",
             &[],
         )
         .await

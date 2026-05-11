@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
-use crate::version::VersionRefReader;
+use crate::version::{VersionLifecycle, VersionOperation, VersionReferenceRole};
 use crate::LixError;
 use crate::GLOBAL_VERSION_ID;
 
@@ -39,17 +39,16 @@ impl SessionContext {
         let next_mode = self
             .with_write_transaction(|transaction| {
                 Box::pin(async move {
-                    let head = {
+                    {
                         let reader = transaction.version_ref_reader();
-                        reader.load_head_commit_id(&version_id).await?
+                        VersionLifecycle::new(&reader)
+                            .require_existing_commit_id(
+                                &version_id,
+                                VersionOperation::SwitchVersion,
+                                VersionReferenceRole::Target,
+                            )
+                            .await?
                     };
-                    if head.is_none() {
-                        return Err(LixError::version_not_found(
-                            version_id.clone(),
-                            "switch_version",
-                            "target",
-                        ));
-                    }
 
                     match current_mode {
                         SessionMode::Pinned { .. } => Ok(SessionMode::Pinned {

@@ -16,7 +16,10 @@ pub(crate) fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError 
 
 fn lix_error_from_datafusion_error(error: &DataFusionError) -> Option<LixError> {
     match error {
-        DataFusionError::External(error) => error.downcast_ref::<LixError>().cloned(),
+        DataFusionError::External(error) => error
+            .downcast_ref::<LixError>()
+            .cloned()
+            .map(normalize_external_sql_error),
         DataFusionError::Context(_, error) | DataFusionError::Diagnostic(_, error) => {
             lix_error_from_datafusion_error(error)
         }
@@ -26,6 +29,23 @@ fn lix_error_from_datafusion_error(error: &DataFusionError) -> Option<LixError> 
         }
         _ => None,
     }
+}
+
+fn normalize_external_sql_error(error: LixError) -> LixError {
+    let lower = error.message.to_ascii_lowercase();
+    if (error.code.starts_with("LIX_ERROR_PATH_")
+        && error.code != "LIX_ERROR_PATH_INVALID_SEGMENT_CODE_POINT")
+        || error.code == LixError::CODE_INVALID_JSON_PATH
+        || (error.code == LixError::CODE_TYPE_MISMATCH
+            && lower.contains("cannot store blob values directly"))
+        || (error.code == LixError::CODE_SCHEMA_DEFINITION && lower.contains("system schema"))
+    {
+        return LixError {
+            code: LixError::CODE_INVALID_PARAM.to_string(),
+            ..error
+        };
+    }
+    error
 }
 
 fn classify_datafusion_error(error: &DataFusionError) -> LixError {

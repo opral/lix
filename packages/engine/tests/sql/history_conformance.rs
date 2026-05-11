@@ -95,7 +95,7 @@ simulation_test!(
                'engine_history_contract_schema_history'\
              ) \
                AND (\
-                 column_name IN ('path', 'directory_id', 'parent_id', 'name', 'hidden', 'data', 'id', 'count', 'active', 'meta') \
+                 column_name IN ('path', 'directory_id', 'parent_id', 'name', 'data', 'id', 'count', 'active', 'meta') \
                  OR column_name = 'lixcol_snapshot_content'\
                ) \
              ORDER BY table_name, column_name",
@@ -112,7 +112,6 @@ simulation_test!(
                 "YES",
             ),
             ("engine_history_contract_schema_history", "meta", "YES"),
-            ("lix_directory_history", "hidden", "YES"),
             ("lix_directory_history", "id", "NO"),
             ("lix_directory_history", "lixcol_snapshot_content", "YES"),
             ("lix_directory_history", "name", "YES"),
@@ -120,7 +119,6 @@ simulation_test!(
             ("lix_directory_history", "path", "YES"),
             ("lix_file_history", "data", "YES"),
             ("lix_file_history", "directory_id", "YES"),
-            ("lix_file_history", "hidden", "YES"),
             ("lix_file_history", "id", "NO"),
             ("lix_file_history", "lixcol_snapshot_content", "YES"),
             ("lix_file_history", "name", "YES"),
@@ -384,8 +382,8 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data, hidden) \
-                 VALUES ('history-conformance-file', '/docs/conformance.txt', X'6F6E65', false)",
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('history-conformance-file', '/docs/conformance.txt', X'6F6E65')",
                 &[],
             )
             .await
@@ -407,7 +405,7 @@ simulation_test!(
 
         let file_rows = select_rows(
             &session,
-            "SELECT id, path, name, hidden, data, lixcol_entity_id, lixcol_file_id, lixcol_snapshot_content, lixcol_depth \
+            "SELECT id, path, name, data, lixcol_entity_id, lixcol_file_id, lixcol_snapshot_content, lixcol_depth \
              FROM lix_file_history \
              WHERE lixcol_start_commit_id = lix_active_version_commit_id() \
                AND id = 'history-conformance-file' \
@@ -418,7 +416,6 @@ simulation_test!(
             file_rows,
             vec![vec![
                 Value::Text("history-conformance-file".to_string()),
-                Value::Null,
                 Value::Null,
                 Value::Null,
                 Value::Null,
@@ -457,15 +454,15 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_directory (id, path, hidden) \
-                 VALUES ('history-conformance-dir', '/conformance/', false)",
+                "INSERT INTO lix_directory (id, path) \
+                 VALUES ('history-conformance-dir', '/conformance/')",
                 &[],
             )
             .await
             .expect("directory insert should succeed");
         session
             .execute(
-                "UPDATE lix_directory SET hidden = true \
+                "UPDATE lix_directory SET name = 'conformance-updated' \
                  WHERE id = 'history-conformance-dir'",
                 &[],
             )
@@ -481,7 +478,7 @@ simulation_test!(
 
         let directory_rows = select_rows(
             &session,
-            "SELECT id, path, parent_id, name, hidden, lixcol_entity_id, lixcol_snapshot_content, lixcol_depth \
+            "SELECT id, path, parent_id, name, lixcol_entity_id, lixcol_snapshot_content, lixcol_depth \
              FROM lix_directory_history \
              WHERE lixcol_start_commit_id = lix_active_version_commit_id() \
                AND id = 'history-conformance-dir' \
@@ -492,7 +489,6 @@ simulation_test!(
             directory_rows,
             vec![vec![
                 Value::Text("history-conformance-dir".to_string()),
-                Value::Null,
                 Value::Null,
                 Value::Null,
                 Value::Null,

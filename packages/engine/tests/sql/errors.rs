@@ -132,23 +132,26 @@ simulation_test!(
     }
 );
 
-simulation_test!(sql_udf_argument_mismatch_has_type_code, |sim| async move {
-    let engine = sim.boot_engine().await;
-    let session = sim.wrap_session(
-        engine
-            .open_workspace_session()
+simulation_test!(
+    sql_udf_argument_mismatch_is_public_invalid_param,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute("SELECT lix_uuid_v7('unexpected')", &[])
             .await
-            .expect("main session should open"),
-        &engine,
-    );
+            .expect_err("wrong UDF arity should fail as public invalid input");
 
-    let error = session
-        .execute("SELECT lix_uuid_v7('unexpected')", &[])
-        .await
-        .expect_err("wrong UDF arity should fail with a type mismatch");
-
-    assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
-});
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+    }
+);
 
 simulation_test!(
     sql_non_utf8_blob_parameter_has_targeted_error,
@@ -201,7 +204,7 @@ simulation_test!(
             .await
             .expect_err("blob entity insert should fail cleanly");
 
-        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         assert!(
             error.message.contains("cannot store blob values directly"),
             "expected targeted blob-to-JSON message: {error}"

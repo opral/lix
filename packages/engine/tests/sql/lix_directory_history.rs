@@ -17,8 +17,8 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_directory (id, path, hidden) \
-                 VALUES ('history-dir-docs', '/docs/', false)",
+                "INSERT INTO lix_directory (id, path) \
+                 VALUES ('history-dir-docs', '/docs/')",
                 &[],
             )
             .await
@@ -31,8 +31,8 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_directory (id, path, hidden) \
-                 VALUES ('history-dir-guides', '/docs/guides/', false)",
+                "INSERT INTO lix_directory (id, path) \
+                 VALUES ('history-dir-guides', '/docs/guides/')",
                 &[],
             )
             .await
@@ -48,7 +48,7 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, path, parent_id, name, hidden, lixcol_start_commit_id, lixcol_depth \
+                    "SELECT id, path, parent_id, name, lixcol_start_commit_id, lixcol_depth \
                      FROM lix_directory_history \
                      WHERE lixcol_start_commit_id = '{second_commit_id}' \
                        AND id IN ('history-dir-docs', 'history-dir-guides') \
@@ -67,7 +67,6 @@ simulation_test!(
                     Value::Text("/docs/guides/".to_string()),
                     Value::Text("history-dir-docs".to_string()),
                     Value::Text("guides".to_string()),
-                    Value::Boolean(false),
                     Value::Text(second_commit_id.clone()),
                     Value::Integer(0),
                 ],
@@ -76,7 +75,6 @@ simulation_test!(
                     Value::Text("/docs/".to_string()),
                     Value::Null,
                     Value::Text("docs".to_string()),
-                    Value::Boolean(false),
                     Value::Text(second_commit_id.clone()),
                     Value::Integer(1),
                 ],
@@ -104,7 +102,6 @@ simulation_test!(
         };
         assert_eq!(snapshot["parent_id"], json!("history-dir-docs"));
         assert_eq!(snapshot["name"], json!("guides"));
-        assert_eq!(snapshot["hidden"], json!(false));
     }
 );
 
@@ -154,16 +151,16 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_directory (id, path, hidden) \
-                 VALUES ('history-delete-docs', '/docs/', false)",
+                "INSERT INTO lix_directory (id, path) \
+                 VALUES ('history-delete-docs', '/docs/')",
                 &[],
             )
             .await
             .expect("root directory insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_directory (id, path, hidden) \
-                 VALUES ('history-delete-guides', '/docs/guides/', false)",
+                "INSERT INTO lix_directory (id, path) \
+                 VALUES ('history-delete-guides', '/docs/guides/')",
                 &[],
             )
             .await
@@ -185,7 +182,7 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-					"SELECT id, path, name, hidden, lixcol_snapshot_content, lixcol_schema_key, lixcol_start_commit_id, lixcol_depth \
+					"SELECT id, path, name, lixcol_snapshot_content, lixcol_schema_key, lixcol_start_commit_id, lixcol_depth \
 	                 FROM lix_directory_history \
 	                 WHERE lixcol_start_commit_id = '{delete_commit_id}' \
 	                   AND lixcol_entity_id IN (lix_json('[\"history-delete-docs\"]'), lix_json('[\"history-delete-guides\"]')) \
@@ -205,14 +202,12 @@ simulation_test!(
                     Value::Null,
                     Value::Null,
                     Value::Null,
-                    Value::Null,
                     Value::Text("lix_directory_descriptor".to_string()),
                     Value::Text(delete_commit_id.clone()),
                     Value::Integer(0),
                 ],
                 vec![
                     Value::Text("history-delete-guides".to_string()),
-                    Value::Null,
                     Value::Null,
                     Value::Null,
                     Value::Null,

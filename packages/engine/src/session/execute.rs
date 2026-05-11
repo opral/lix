@@ -299,6 +299,7 @@ impl SessionContext {
         let kind = sql2::classify_statement(sql)?;
         if kind == sql2::SqlStatementKind::Write {
             let sql = sql.to_string();
+            let sql_for_error = sql.clone();
             let params = params.to_vec();
             return self
                 .with_write_transaction(|transaction| {
@@ -312,7 +313,8 @@ impl SessionContext {
                         Ok(ExecuteResult::from_rows_affected(affected_rows))
                     })
                 })
-                .await;
+                .await
+                .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
         }
 
         let read_scope = StorageReadScope::new(self.storage.begin_read_transaction().await?);
@@ -351,7 +353,7 @@ impl SessionContext {
             }
             Err(error) => {
                 let _ = read_scope.rollback().await;
-                return Err(error);
+                return Err(normalize_sql_surface_error(error, sql));
             }
         };
         self.persist_runtime_functions_if_needed(&runtime_functions)
@@ -379,6 +381,41 @@ impl SessionContext {
         }
         transaction.commit().await
     }
+}
+
+fn normalize_sql_surface_error(error: LixError, sql: &str) -> LixError {
+    if error.code.starts_with("LIX_ERROR_PATH_") && sql_uses_public_filesystem_path_surface(sql) {
+        return LixError {
+            code: LixError::CODE_INVALID_PARAM.to_string(),
+            ..error
+        };
+    }
+    if error.code == LixError::CODE_INVALID_JSON_PATH
+        && error
+            .message
+            .to_ascii_lowercase()
+            .contains("uses variadic path segments")
+    {
+        return LixError {
+            code: LixError::CODE_INVALID_PARAM.to_string(),
+            ..error
+        };
+    }
+    if error.code == LixError::CODE_FOREIGN_KEY {
+        let lower = error.message.to_ascii_lowercase();
+        if lower.contains("schema 'lix_version_ref'") && lower.contains("target 'lix_commit.") {
+            return LixError {
+                code: LixError::CODE_VERSION_NOT_FOUND.to_string(),
+                ..error
+            };
+        }
+    }
+    error
+}
+
+fn sql_uses_public_filesystem_path_surface(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    (lower.contains("lix_file") || lower.contains("lix_directory")) && lower.contains("path")
 }
 
 fn affected_rows_from_query_result(result: SqlQueryResult) -> Result<u64, LixError> {
