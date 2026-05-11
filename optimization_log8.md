@@ -878,3 +878,146 @@ budget failures by adding a borrowed/header decode path for tracked-state leaf
 entries. The tombstone bit is now in the first value byte, so the next cut can
 filter visibility without allocating owned locators or full row values.
 ```
+
+## Optimization 2: Indexable Borrowed Leaf Nodes
+
+Date: 2026-05-10
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Changed tracked-state leaf node bytes from a sequential record stream to a v2
+offset-table layout:
+
+```text
+kind: u8
+version: u8
+entry_count: u32
+entry_offsets: (entry_count + 1) * u32
+payload: [key_len: u32, key, value_len: u32, value]*
+```
+
+The offset table lets exact reads binary-search leaf keys without first cloning
+every key/value pair in the leaf. Scans now borrow leaf entries out of the
+verified node byte buffer and decode only matching rows. Owned `decode_node`
+still exists for callers that need it, but it is built on the borrowed decoder.
+
+The leaf splitter now accounts for the exact v2 physical size:
+
+```text
+leaf_size = 10 + entry_count * 12 + key_bytes + value_bytes
+entry_size = 12 + key_bytes + value_bytes
+```
+
+No backward compatibility shim was kept. Lix has not shipped, and this is a
+physical layout cutover.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(get_many_exact_keys|exists_many_exact_keys|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                                | after median | criterion status |
+| -------------------------------------------------- | -----------: | ---------------- |
+| `sqlite/get_many_exact_keys/1k`                    |    4.4327 ms | no change |
+| `sqlite/exists_many_exact_keys/1k`                 |    4.5704 ms | no change |
+| `sqlite/scan_keys_only/1k`                         |    2.7218 ms | no change |
+| `sqlite/scan_headers_only/1k`                      |    3.0616 ms | no change |
+| `sqlite/scan_full_rows/1k`                         |    4.4447 ms | no change |
+| `sqlite/prefix_scan_schema/1k`                     |    4.3002 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k`           |    4.2372 ms | no change |
+| `rocksdb/get_many_exact_keys/1k`                   |    3.5170 ms | no change |
+| `rocksdb/exists_many_exact_keys/1k`                |    3.5438 ms | improved |
+| `rocksdb/scan_keys_only/1k`                        |    1.5767 ms | no change |
+| `rocksdb/scan_headers_only/1k`                     |    2.0217 ms | no change |
+| `rocksdb/scan_full_rows/1k`                        |    3.3787 ms | no change |
+| `rocksdb/prefix_scan_schema/1k`                    |    3.2941 ms | no change |
+| `rocksdb/prefix_scan_schema_file_null/1k`          |    3.2749 ms | no change |
+
+### Storage
+
+Storage fixture command:
+
+```sh
+cargo test -p lix_engine --features storage-benches --test json_pointer_crud_storage -- --ignored --nocapture --test-threads=1
+```
+
+Result: passed.
+
+| backend / state                        | bytes | bytes/row | status |
+| -------------------------------------- | ----: | --------: | ------ |
+| raw SQLite / inserted                  | 1692456 | 1692.5 | unchanged |
+| Lix SQLite / inserted                  | 1075136 | 1075.1 | unchanged |
+| Lix SQLite / after create_version      | 1087496 | 1087.5 | unchanged |
+| Lix SQLite / after fast-forward merge  | 5287488 | 5287.5 | unchanged |
+| Lix SQLite / after divergent merge     | 5615168 | 5615.2 | unchanged |
+| Lix RocksDB / inserted                 |  993900 |  993.9 | unchanged |
+| Lix RocksDB / after create_version     |  995766 |  995.8 | unchanged |
+| Lix RocksDB / after fast-forward merge | 1157143 | 1157.1 | unchanged |
+| Lix RocksDB / after divergent merge    | 1528256 | 1528.3 | unchanged |
+
+### Review Loop
+
+Reviewer pass 1:
+
+```text
+HIGH: none.
+MEDIUM: leaf chunk sizing still estimated the old sequential format. Fixed by
+including the v2 offset directory in estimate_leaf_chunk_size and by feeding
+physical entry bytes into boundary_trigger.
+LOW: add direct codec regression tests for v2 leaf bytes and malformed offset
+tables. Fixed with indexable offset-table, empty-leaf, and malformed-offset
+tests.
+```
+
+Reviewer pass 2:
+
+```text
+HIGH: none.
+The previous sizing concern appears addressed, borrowed decode paths do not
+carry leaf borrows across recursive awaits, and v2 offset validation/tests are
+present.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine --features storage-benches --test json_pointer_crud_storage -- --ignored --nocapture --test-threads=1
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(get_many_exact_keys|exists_many_exact_keys|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep.
+
+Primary axis: exact reads and scan decode overhead. Structural win: leaves now
+have a pointer/offset directory, matching the page-local indexing pattern used
+by reference storage engines, and scan/get_many no longer clone every leaf
+entry before discovering the row they need.
+
+Timing: mostly neutral in Criterion, with a measured RocksDB
+exists_many_exact_keys improvement from 4.0071 ms in the pre-sizing run to
+3.5438 ms after the final fix. SQLite exact reads remain over budget, so this
+is a necessary layout foundation rather than the final performance win.
+
+Guardrails: storage fixture stayed unchanged at the 1k guardrail, tracked logic
+stays on the tracked path, no workload moved to untracked machinery, and no
+benchmark measurement changed.
+
+Next optimization should use the v2 leaf layout to decode tracked value headers
+directly from borrowed value bytes for scan visibility and exists-style reads,
+then attack exact-read value decode/allocation costs that remain above the
+1.5x SQLite target.
+```

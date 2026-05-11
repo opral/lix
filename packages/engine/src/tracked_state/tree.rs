@@ -7,10 +7,11 @@ use std::{
 
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::tracked_state::codec::{
-    boundary_trigger, child_summary_from_node, decode_key, decode_node, decode_value,
-    encode_internal_node, encode_internal_node_refs, encode_key, encode_leaf_node,
+    boundary_trigger, child_summary_from_node, decode_key, decode_node, decode_node_ref,
+    decode_value, encode_internal_node, encode_internal_node_refs, encode_key, encode_leaf_node,
     encode_leaf_node_refs, encode_schema_file_prefix, encode_schema_key_prefix, ChildSummary,
-    ChildSummaryRef, DecodedNode, EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkWrite,
+    ChildSummaryRef, DecodedLeafNodeRef, DecodedNode, DecodedNodeRef, EncodedLeafEntry,
+    EncodedLeafEntryRef, PendingChunkWrite,
 };
 use crate::tracked_state::storage;
 use crate::tracked_state::types::{
@@ -1412,26 +1413,33 @@ impl TrackedStateTree {
         S: StorageReader + Send + 'a,
     {
         Box::pin(async move {
-            match self.load_node(store, &hash).await? {
-                DecodedNode::Leaf(leaf) => {
-                    for entry in leaf.entries() {
+            let bytes = self.load_node_bytes(store, &hash).await?;
+            match decode_node_ref(&bytes)? {
+                DecodedNodeRef::Leaf(leaf) => {
+                    for index in 0..leaf.len() {
                         if scan_limit_reached(request, rows.len()) {
                             break;
                         }
-                        if !encoded_key_in_scan_ranges(&entry.key, ranges) {
+                        let entry = leaf.entry(index)?.ok_or_else(|| {
+                            LixError::new(
+                                "LIX_ERROR_UNKNOWN",
+                                "tracked-state leaf entry disappeared during scan",
+                            )
+                        })?;
+                        if !encoded_key_in_scan_ranges(entry.key, ranges) {
                             continue;
                         }
-                        let key = decode_key(&entry.key)?;
+                        let key = decode_key(entry.key)?;
                         if !key_matches_scan_filters(request, &key) {
                             continue;
                         }
-                        let value = decode_value(&entry.value)?;
+                        let value = decode_value(entry.value)?;
                         if request.matches(&key, &value) {
                             rows.push((key, value));
                         }
                     }
                 }
-                DecodedNode::Internal(internal) => {
+                DecodedNodeRef::Internal(internal) => {
                     for child in internal.children() {
                         if scan_limit_reached(request, rows.len()) {
                             break;
@@ -1462,21 +1470,22 @@ impl TrackedStateTree {
                 return Ok(());
             }
 
-            match self.load_node(store, &hash).await? {
-                DecodedNode::Leaf(leaf) => {
+            let bytes = self.load_node_bytes(store, &hash).await?;
+            match decode_node_ref(&bytes)? {
+                DecodedNodeRef::Leaf(leaf) => {
                     for (original_index, encoded_key) in encoded_keys {
-                        let Some(entry_index) = leaf
-                            .entries()
-                            .binary_search_by(|entry| entry.key.as_slice().cmp(encoded_key))
-                            .ok()
-                        else {
-                            continue;
-                        };
-                        values[*original_index] =
-                            Some(decode_value(&leaf.entries()[entry_index].value)?);
+                        if let Some(entry_index) = binary_search_leaf_key(&leaf, encoded_key)? {
+                            let entry = leaf.entry(entry_index)?.ok_or_else(|| {
+                                LixError::new(
+                                    "LIX_ERROR_UNKNOWN",
+                                    "tracked-state leaf entry disappeared during get_many",
+                                )
+                            })?;
+                            values[*original_index] = Some(decode_value(entry.value)?);
+                        }
                     }
                 }
-                DecodedNode::Internal(internal) => {
+                DecodedNodeRef::Internal(internal) => {
                     let mut start = 0usize;
                     let children = internal.children();
                     for (child_index, child) in children.iter().enumerate() {
@@ -1675,11 +1684,20 @@ impl TrackedStateTree {
         store: &mut (impl StorageReader + ?Sized),
         hash: &[u8; TRACKED_STATE_HASH_BYTES],
     ) -> Result<DecodedNode, LixError> {
+        let bytes = self.load_node_bytes(store, hash).await?;
+        decode_node(&bytes)
+    }
+
+    async fn load_node_bytes(
+        &self,
+        store: &mut (impl StorageReader + ?Sized),
+        hash: &[u8; TRACKED_STATE_HASH_BYTES],
+    ) -> Result<Vec<u8>, LixError> {
         let bytes = storage::read_chunk(store, hash).await?.ok_or_else(|| {
             LixError::new("LIX_ERROR_UNKNOWN", "tracked-state tree chunk is missing")
         })?;
         storage::verify_chunk_hash(hash, &bytes)?;
-        decode_node(&bytes)
+        Ok(bytes)
     }
 
     async fn load_node_with_overlay(
@@ -1720,6 +1738,29 @@ struct SeekPathFrame {
 struct EncodedScanRange {
     start: Vec<u8>,
     end: Option<Vec<u8>>,
+}
+
+fn binary_search_leaf_key(
+    leaf: &DecodedLeafNodeRef<'_>,
+    encoded_key: &[u8],
+) -> Result<Option<usize>, LixError> {
+    let mut low = 0usize;
+    let mut high = leaf.len();
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let key = leaf.key(mid)?.ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state leaf key disappeared during binary search",
+            )
+        })?;
+        match key.cmp(encoded_key) {
+            std::cmp::Ordering::Less => low = mid + 1,
+            std::cmp::Ordering::Equal => return Ok(Some(mid)),
+            std::cmp::Ordering::Greater => high = mid,
+        }
+    }
+    Ok(None)
 }
 
 struct LeafSummaryCursor {
@@ -1868,7 +1909,7 @@ fn chunk_leaf_entries(
     let mut groups = Vec::new();
     let mut current = LeafChunkAccumulator::default();
     for entry in entries {
-        let item_size = entry.key.len() + entry.value.len();
+        let item_size = estimate_leaf_entry_size(entry.key.len(), entry.value.len());
         let projected_size = estimate_leaf_chunk_size(
             current.entries.len() + 1,
             current.key_bytes + entry.key.len(),
@@ -1918,7 +1959,7 @@ fn chunk_leaf_entry_refs<'a>(
     let mut groups = Vec::new();
     let mut current = LeafChunkRefAccumulator::default();
     for entry in iter {
-        let item_size = entry.key.len() + entry.value.len();
+        let item_size = estimate_leaf_entry_size(entry.key.len(), entry.value.len());
         let projected_size = estimate_leaf_chunk_size(
             current.entries.len() + 1,
             current.key_bytes + entry.key.len(),
@@ -2058,7 +2099,11 @@ fn chunk_internal_entry_refs<'a>(
 }
 
 fn estimate_leaf_chunk_size(entry_count: usize, key_bytes: usize, value_bytes: usize) -> usize {
-    16 + entry_count * 8 + key_bytes + value_bytes
+    10 + entry_count * 12 + key_bytes + value_bytes
+}
+
+fn estimate_leaf_entry_size(key_bytes: usize, value_bytes: usize) -> usize {
+    12 + key_bytes + value_bytes
 }
 
 fn estimate_internal_chunk_size(
