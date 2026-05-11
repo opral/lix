@@ -49,22 +49,26 @@ pub(crate) fn decode_commit(bytes: &[u8]) -> Result<Commit, LixError> {
 }
 
 pub(crate) fn encode_change_ref(change: ChangeRef<'_>) -> Result<Vec<u8>, LixError> {
+    let mut bytes = Vec::new();
+    write_change_ref(&mut bytes, change)?;
+    Ok(bytes)
+}
+
+fn write_change_ref(bytes: &mut Vec<u8>, change: ChangeRef<'_>) -> Result<(), LixError> {
     let entity_id = change.entity_id.as_json_array_text().map_err(|error| {
         LixError::unknown(format!(
             "failed to encode commit-store change entity identity: {error}"
         ))
     })?;
 
-    let mut bytes = Vec::new();
     bytes.extend_from_slice(CHANGE_MAGIC);
-    write_str(&mut bytes, change.id)?;
-    write_str(&mut bytes, &entity_id)?;
-    write_str(&mut bytes, change.schema_key)?;
-    write_optional_str(&mut bytes, change.file_id)?;
-    write_optional_json_ref(&mut bytes, change.snapshot_ref);
-    write_optional_json_ref(&mut bytes, change.metadata_ref);
-    write_str(&mut bytes, change.created_at)?;
-    Ok(bytes)
+    write_str(bytes, change.id)?;
+    write_str(bytes, &entity_id)?;
+    write_str(bytes, change.schema_key)?;
+    write_optional_str(bytes, change.file_id)?;
+    write_optional_json_ref(bytes, change.snapshot_ref);
+    write_optional_json_ref(bytes, change.metadata_ref);
+    write_str(bytes, change.created_at)
 }
 
 pub(crate) fn decode_change(bytes: &[u8]) -> Result<Change, LixError> {
@@ -105,7 +109,9 @@ pub(crate) fn encode_change_pack(
     bytes.extend_from_slice(&pack_id.to_le_bytes());
     write_len(&mut bytes, changes.len(), "change pack changes")?;
     for change in changes.iter().copied() {
-        write_bytes(&mut bytes, &encode_change_ref(change)?)?;
+        write_sized_section(&mut bytes, "change", |bytes| {
+            write_change_ref(bytes, change)
+        })?;
     }
     Ok(bytes)
 }
@@ -206,9 +212,23 @@ fn write_optional_json_ref(bytes: &mut Vec<u8>, value: Option<&JsonRef>) {
     }
 }
 
-fn write_bytes(bytes: &mut Vec<u8>, value: &[u8]) -> Result<(), LixError> {
-    write_len(bytes, value.len(), "bytes field")?;
-    bytes.extend_from_slice(value);
+fn write_sized_section(
+    bytes: &mut Vec<u8>,
+    field: &str,
+    write: impl FnOnce(&mut Vec<u8>) -> Result<(), LixError>,
+) -> Result<(), LixError> {
+    let len_offset = bytes.len();
+    bytes.extend_from_slice(&0_u32.to_le_bytes());
+    let content_start = bytes.len();
+    write(bytes)?;
+    let len = bytes.len() - content_start;
+    let len = u32::try_from(len).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("commit-store {field} exceeds u32 length"),
+        )
+    })?;
+    bytes[len_offset..len_offset + 4].copy_from_slice(&len.to_le_bytes());
     Ok(())
 }
 
@@ -449,6 +469,33 @@ mod tests {
         let decoded = decode_change(&encoded).expect("change should decode");
 
         assert_eq!(decoded, change);
+    }
+
+    #[test]
+    fn change_pack_entry_bytes_match_standalone_change_encoding() {
+        let change = Change {
+            id: "change-1".to_string(),
+            entity_id: EntityIdentity::single("entity-1"),
+            schema_key: "test_schema".to_string(),
+            file_id: Some("file-1".to_string()),
+            snapshot_ref: Some(JsonRef::from_hash_bytes([1; 32])),
+            metadata_ref: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let encoded_change = encode_change_ref(change.as_ref()).expect("change should encode");
+        let encoded_pack =
+            encode_change_pack("commit-1", 0, &[change.as_ref()]).expect("pack should encode");
+        let mut cursor = ByteCursor::new(&encoded_pack);
+        cursor
+            .expect_magic(CHANGE_PACK_MAGIC, "change pack")
+            .unwrap();
+        assert_eq!(cursor.read_string("commit_id").unwrap(), "commit-1");
+        assert_eq!(cursor.read_u32("pack_id").unwrap(), 0);
+        assert_eq!(cursor.read_u32("change_count").unwrap(), 1);
+
+        assert_eq!(cursor.read_bytes("change").unwrap(), encoded_change);
+        cursor.expect_end("change pack").unwrap();
     }
 
     #[test]
