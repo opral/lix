@@ -2308,6 +2308,121 @@ treated as a small supporting optimization rather than a budget-moving step.
 No storage format change. No temporary shim.
 ```
 
+## Optimization 21: Load scan roots once
+
+### Hypothesis
+
+`TrackedStateStoreReader::scan_rows_at_commit` was using
+`projection_has_pending_deltas` as a routing check before scan execution. For
+delta-pack-backed commits that helper walked the first-parent/delta chain, then
+`projection_entries_at_commit` walked it again to produce rows. For materialized
+root commits, the route also checked root existence and then loaded the same
+root again before scanning.
+
+Loading the target root once at scan entry should preserve the same routing:
+scan the root directly when it exists; otherwise let `projection_entries_at_commit`
+perform the delta/base walk exactly once.
+
+### Change
+
+- `scan_rows_at_commit` now calls `tree.load_root(commit_id)` once.
+- If a root exists, scan it directly, preserving the by-file index fast path and
+  fallback to the primary tree when no by-file root exists.
+- If no root exists, call `projection_entries_at_commit` directly.
+- Tombstone filtering, materialization, and request limit handling remain after
+  row collection as before.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                                     | after median | criterion status |
+| ------------------------------------------------------- | -----------: | ---------------- |
+| `raw_sqlite/scan_keys_only/1k`                          |    1.1587 ms | reference |
+| `raw_sqlite/scan_headers_only/1k`                       |    1.1213 ms | reference |
+| `raw_sqlite/scan_full_rows/1k`                          |    1.2689 ms | reference |
+| `raw_sqlite/prefix_scan_schema/1k`                      |    1.1597 ms | reference |
+| `raw_sqlite/prefix_scan_schema_file_null/1k`            |    1.1929 ms | reference |
+| `sqlite/scan_keys_only/1k`                              |    2.1147 ms | improved |
+| `sqlite/scan_headers_only/1k`                           |    2.7995 ms | no change |
+| `sqlite/scan_full_rows/1k`                              |    2.8024 ms | improved |
+| `sqlite/prefix_scan_schema/1k`                          |    2.7534 ms | improved |
+| `sqlite/prefix_scan_schema_file_null/1k`                |    2.7506 ms | improved |
+| `rocksdb/scan_keys_only/1k`                             |    1.2154 ms | improved |
+| `rocksdb/scan_headers_only/1k`                          |    1.2315 ms | improved |
+| `rocksdb/scan_full_rows/1k`                             |    1.7649 ms | improved |
+| `rocksdb/prefix_scan_schema/1k`                         |    1.7814 ms | improved |
+| `rocksdb/prefix_scan_schema_file_null/1k`               |    1.8046 ms | improved |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                     | bytes | bytes/row | status |
+| --------------------------------------- | ----: | --------: | ------ |
+| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
+| Lix SQLite / inserted                   | 1054536 | 1054.5 | unchanged |
+| Lix SQLite / after create_version       | 1071016 | 1071.0 | unchanged |
+| Lix SQLite / after fast-forward merge   | 5279368 | 5279.4 | unchanged |
+| Lix SQLite / after divergent merge      | 5463856 | 5463.9 | unchanged |
+| Lix RocksDB / inserted                  | 964892 | 964.9 | unchanged |
+| Lix RocksDB / after create_version      | 966733 | 966.7 | unchanged |
+| Lix RocksDB / after fast-forward merge  | 1125265 | 1125.3 | unchanged |
+| Lix RocksDB / after divergent merge     | 1494068 | 1494.1 | unchanged |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+Reviewer confirmed the root-first routing is equivalent: the old pending-delta
+predicate already stopped immediately when the target commit had a root, while
+delta-only and missing commits still go through the same projection/delta walk.
+By-file fallback, tombstone filtering, and limit behavior are preserved.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine tracked_state::context:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state::materializer:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a scan-path optimization.
+
+This removes duplicated route-discovery reads without changing storage or scan
+semantics. It improves most SQLite and RocksDB tracked scan rows, but SQLite
+full/prefix scans remain above the 1.5x target and need deeper tree/materialize
+work next.
+```
+
 ## Optimization 20: Stage generated bench roots as authored changes
 
 ### Hypothesis

@@ -103,22 +103,23 @@ where
         commit_id: &str,
         request: &TrackedStateScanRequest,
     ) -> Result<Vec<MaterializedTrackedStateRow>, LixError> {
-        let rows = if self.projection_has_pending_deltas(commit_id).await?
-            || !self.projection_root_exists(commit_id).await?
-        {
-            self.projection_entries_at_commit(commit_id, &tree_scan_request_from_tracked(request))
-                .await?
-        } else if ByFileIndex::should_use(request) {
-            let root_id = self
-                .tree
-                .load_root(&mut self.store, commit_id)
-                .await?
-                .expect("projection root existence checked above");
-            if let Some(by_file_root_id) =
-                storage::load_by_file_root(&mut self.store, commit_id).await?
-            {
-                self.scan_rows_at_commit_by_file_index(&root_id, &by_file_root_id, request)
-                    .await?
+        let root_id = self.tree.load_root(&mut self.store, commit_id).await?;
+        let rows = if let Some(root_id) = root_id {
+            if ByFileIndex::should_use(request) {
+                if let Some(by_file_root_id) =
+                    storage::load_by_file_root(&mut self.store, commit_id).await?
+                {
+                    self.scan_rows_at_commit_by_file_index(&root_id, &by_file_root_id, request)
+                        .await?
+                } else {
+                    self.tree
+                        .scan(
+                            &mut self.store,
+                            &root_id,
+                            &tree_scan_request_from_tracked(request),
+                        )
+                        .await?
+                }
             } else {
                 self.tree
                     .scan(
@@ -129,20 +130,8 @@ where
                     .await?
             }
         } else {
-            let root_id = self
-                .tree
-                .load_root(&mut self.store, commit_id)
+            self.projection_entries_at_commit(commit_id, &tree_scan_request_from_tracked(request))
                 .await?
-                .expect("projection root existence checked above");
-            let rows = self
-                .tree
-                .scan(
-                    &mut self.store,
-                    &root_id,
-                    &tree_scan_request_from_tracked(request),
-                )
-                .await?;
-            rows
         };
         let projection = crate::tracked_state::TrackedMaterializationProjection::from_columns(
             &request.projection.columns,
