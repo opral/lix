@@ -2308,6 +2308,125 @@ treated as a small supporting optimization rather than a budget-moving step.
 No storage format change. No temporary shim.
 ```
 
+## Optimization 31: Narrow JSON pack directory fields
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Changed the unshipped JSON commit-pack format from `lix-json-pack:v1` to
+`lix-json-pack:v2`.
+
+The per-entry directory keeps the same explicit shape:
+
+```text
+hash, codec, uncompressed_len, payload_offset, payload_len
+```
+
+but narrows the three numeric payload fields from `u64` to `u32`. The entry
+header shrinks from `32 + 1 + 8 + 8 + 8 = 57` bytes to
+`32 + 1 + 4 + 4 + 4 = 45` bytes.
+
+This is a clean cut with no backwards shim because Lix has not shipped. Unlike
+the rejected implicit-offset JSON-pack experiment, this keeps explicit offsets,
+so unordered/fallback pack reads retain direct payload slicing instead of
+reconstructing offsets from earlier directory entries.
+
+Added codec tests for the compact 45-byte directory shape and for checked
+rejection of oversized u32 directory fields.
+
+### Storage
+
+Command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| state | before | after | delta |
+| --- | ---: | ---: | ---: |
+| raw SQLite inserted | 1,692,456 | 1,692,456 | 0 |
+| Lix SQLite inserted | 947,416 | 939,176 | -8,240 |
+| Lix SQLite create_version | 959,776 | 951,536 | -8,240 |
+| Lix SQLite fast-forward | 5,152,248 | 5,152,296 | +48 |
+| Lix SQLite divergent | 5,353,168 | 5,320,304 | -32,864 |
+| Lix RocksDB inserted | 864,114 | 851,910 | -12,204 |
+| Lix RocksDB create_version | 865,938 | 853,721 | -12,217 |
+| Lix RocksDB fast-forward | 1,022,770 | 1,009,345 | -13,425 |
+| Lix RocksDB divergent | 1,384,417 | 1,368,580 | -15,837 |
+
+### Timing
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+Representative medians:
+
+| row | median | criterion status |
+| --- | ---: | --- |
+| `raw_sqlite/write_root_all_rows/1k` | 2.4135 ms | no change |
+| `raw_sqlite/scan_full_rows/1k` | 1.2061 ms | no change |
+| `raw_sqlite/prefix_scan_schema_file_null/1k` | 1.1669 ms | no change |
+| `raw_sqlite/write_delta_10pct_updates/1k` | 1.2859 ms | no change |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k` | 1.1947 ms | no change |
+| `sqlite/write_root_all_rows/1k` | 4.6431 ms | no change |
+| `sqlite/scan_full_rows/1k` | 2.2783 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k` | 2.3420 ms | no change |
+| `sqlite/write_delta_10pct_updates/1k` | 1.7931 ms | no change |
+| `sqlite/write_tombstone_10pct_deletes/1k` | 1.6065 ms | no change |
+| `rocksdb/write_root_all_rows/1k` | 4.1708 ms | no change |
+| `rocksdb/scan_full_rows/1k` | 1.4051 ms | no change |
+| `rocksdb/prefix_scan_schema_file_null/1k` | 1.3823 ms | no change |
+| `rocksdb/write_delta_10pct_updates/1k` | 818.06 us | no change |
+| `rocksdb/write_tombstone_10pct_deletes/1k` | 765.78 us | no change |
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo test -p lix_engine json_store:: --features storage-benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+Reviewer loop:
+
+- First pass: HIGH none, MEDIUM none, LOW requested direct overflow coverage
+  for narrowed fields.
+- Added `json_pack_u32_rejects_oversized_directory_fields`.
+- Second pass: HIGH none, MEDIUM none, LOW none. Recommendation: keep.
+
+### Interpretation
+
+```text
+Keep as a compact physical-layout cleanup.
+
+Primary axis: storage bytes. Commit-local JSON packs are bounded KV blobs, not
+large archive files, so u32 payload lengths and offsets are enough while the
+encoder still rejects oversized packs explicitly.
+
+Timing: no Lix runtime row showed a detected regression in the focused write
+and scan guardrail. Keeping explicit offsets preserves the direct random-access
+fallback shape that the earlier implicit-offset experiment lost.
+
+No backwards shim.
+```
+
 ## Optimization 30: Compact commit and delta change ids
 
 Date: 2026-05-11

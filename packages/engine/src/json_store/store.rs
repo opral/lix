@@ -10,8 +10,8 @@ pub(crate) const JSON_NAMESPACE: &str = "json_store.json";
 pub(crate) const JSON_PACK_NAMESPACE: &str = "json_store.pack";
 const STORED_JSON_MAGIC: &[u8] = b"lix-json:v1";
 const STORED_JSON_HEADER_LEN: usize = STORED_JSON_MAGIC.len() + 1 + 8;
-const STORED_JSON_PACK_MAGIC: &[u8] = b"lix-json-pack:v1";
-const STORED_JSON_PACK_ENTRY_HEADER_LEN: usize = 32 + 1 + 8 + 8 + 8;
+const STORED_JSON_PACK_MAGIC: &[u8] = b"lix-json-pack:v2";
+const STORED_JSON_PACK_ENTRY_HEADER_LEN: usize = 32 + 1 + 4 + 4 + 4;
 const ZSTD_MIN_JSON_BYTES: usize = 16 * 1024;
 const MIN_ZSTD_SAVINGS_BYTES: usize = 128;
 
@@ -121,15 +121,18 @@ pub(crate) fn encode_json_pack(entries: &[&EncodedJson<'_>]) -> Result<Vec<u8>, 
     out.extend_from_slice(STORED_JSON_PACK_MAGIC);
     out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
 
-    let mut offset = 0_u64;
+    let mut offset = 0usize;
     for entry in entries {
         let data = entry.data.as_ref();
         out.extend_from_slice(entry.json_ref.as_hash_bytes());
         out.push(json_codec_byte(entry.codec));
-        out.extend_from_slice(&(entry.uncompressed_len as u64).to_be_bytes());
-        out.extend_from_slice(&offset.to_be_bytes());
-        out.extend_from_slice(&(data.len() as u64).to_be_bytes());
-        offset = offset.checked_add(data.len() as u64).ok_or_else(|| {
+        out.extend_from_slice(&json_pack_u32(
+            entry.uncompressed_len,
+            "uncompressed length",
+        )?);
+        out.extend_from_slice(&json_pack_u32(offset, "payload offset")?);
+        out.extend_from_slice(&json_pack_u32(data.len(), "payload length")?);
+        offset = offset.checked_add(data.len()).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "json_store pack payload offset overflow",
@@ -145,6 +148,16 @@ pub(crate) fn encode_json_pack(entries: &[&EncodedJson<'_>]) -> Result<Vec<u8>, 
         STORED_JSON_PACK_MAGIC.len() + 4 + entries.len() * STORED_JSON_PACK_ENTRY_HEADER_LEN
     );
     Ok(out)
+}
+
+fn json_pack_u32(value: usize, field: &str) -> Result<[u8; 4], LixError> {
+    let value = u32::try_from(value).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("json_store pack {field} exceeds u32"),
+        )
+    })?;
+    Ok(value.to_be_bytes())
 }
 
 pub(crate) fn encode_json_bytes_for_storage(bytes: &[u8]) -> Result<(JsonRef, Vec<u8>), LixError> {
@@ -595,20 +608,20 @@ fn json_pack_entry<'a>(
     cursor += 32;
     let codec = read_json_codec(bytes[cursor])?;
     cursor += 1;
-    let uncompressed_len = u64::from_be_bytes(
-        bytes[cursor..cursor + 8]
+    let uncompressed_len = u32::from_be_bytes(
+        bytes[cursor..cursor + 4]
             .try_into()
             .expect("json pack uncompressed length is fixed size"),
     ) as usize;
-    cursor += 8;
-    let offset = u64::from_be_bytes(
-        bytes[cursor..cursor + 8]
+    cursor += 4;
+    let offset = u32::from_be_bytes(
+        bytes[cursor..cursor + 4]
             .try_into()
             .expect("json pack payload offset is fixed size"),
     ) as usize;
-    cursor += 8;
-    let len = u64::from_be_bytes(
-        bytes[cursor..cursor + 8]
+    cursor += 4;
+    let len = u32::from_be_bytes(
+        bytes[cursor..cursor + 4]
             .try_into()
             .expect("json pack payload length is fixed size"),
     ) as usize;
@@ -836,6 +849,30 @@ mod tests {
         assert!(
             error.to_string().contains("hash mismatch"),
             "error should mention hash mismatch: {error}"
+        );
+    }
+
+    #[test]
+    fn json_pack_directory_uses_compact_u32_fields() {
+        let first = encode_json("{\"value\":\"first\"}").expect("first json should encode");
+        let second = encode_json("{\"value\":\"second\"}").expect("second json should encode");
+        let pack = encode_json_pack(&[&first, &second]).expect("pack should encode");
+        let payload_len = first.data.as_ref().len() + second.data.as_ref().len();
+
+        assert_eq!(STORED_JSON_PACK_ENTRY_HEADER_LEN, 32 + 1 + 4 + 4 + 4);
+        assert_eq!(
+            pack.len(),
+            STORED_JSON_PACK_MAGIC.len() + 4 + 2 * STORED_JSON_PACK_ENTRY_HEADER_LEN + payload_len
+        );
+    }
+
+    #[test]
+    fn json_pack_u32_rejects_oversized_directory_fields() {
+        let error = json_pack_u32((u32::MAX as usize) + 1, "payload offset")
+            .expect_err("oversized pack directory field should reject");
+        assert!(
+            error.to_string().contains("payload offset exceeds u32"),
+            "error should identify oversized field: {error}"
         );
     }
 
