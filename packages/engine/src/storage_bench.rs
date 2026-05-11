@@ -3170,7 +3170,7 @@ pub async fn json_store_write_prepared(
                 .iter()
                 .map(|document| {
                     std::str::from_utf8(document)
-                        .map(|normalized| NormalizedJsonRef { normalized })
+                        .map(NormalizedJsonRef::new)
                         .map_err(|error| {
                             LixError::new(
                                 LixError::CODE_UNKNOWN,
@@ -3228,7 +3228,7 @@ pub async fn prepare_json_store_projection_read(
                 .iter()
                 .map(|document| {
                     std::str::from_utf8(document)
-                        .map(|normalized| NormalizedJsonRef { normalized })
+                        .map(NormalizedJsonRef::new)
                         .map_err(|error| {
                             LixError::new(
                                 LixError::CODE_UNKNOWN,
@@ -3352,7 +3352,7 @@ async fn prepare_json_store_base_update(
                 .iter()
                 .map(|document| {
                     std::str::from_utf8(document)
-                        .map(|normalized| NormalizedJsonRef { normalized })
+                        .map(NormalizedJsonRef::new)
                         .map_err(|error| {
                             LixError::new(
                                 LixError::CODE_UNKNOWN,
@@ -3415,7 +3415,7 @@ async fn json_store_write_against_base_prepared(
                 .iter()
                 .map(|document| {
                     std::str::from_utf8(document)
-                        .map(|normalized| NormalizedJsonRef { normalized })
+                        .map(NormalizedJsonRef::new)
                         .map_err(|error| {
                             LixError::new(
                                 LixError::CODE_UNKNOWN,
@@ -3946,15 +3946,16 @@ async fn write_tracked_root(
         .iter()
         .map(tracked_bench_change_from_materialized)
         .collect::<Result<Vec<_>, _>>()?;
-    let payloads = tracked_bench_json_payloads(rows);
+    let payloads = tracked_bench_json_payloads(rows, &changes);
     JsonStoreContext::new().writer().stage_batch(
         &mut writes,
         JsonWritePlacementRef::CommitPack {
             commit_id,
             pack_id: 0,
         },
-        payloads.iter().map(|payload| NormalizedJsonRef {
-            normalized: payload.as_str(),
+        payloads.iter().map(|(payload, json_ref)| match json_ref {
+            Some(json_ref) => NormalizedJsonRef::trusted_prehashed(payload.as_str(), *json_ref),
+            None => NormalizedJsonRef::new(payload.as_str()),
         }),
     )?;
 
@@ -4123,14 +4124,17 @@ fn tracked_bench_change_from_materialized(
     })
 }
 
-fn tracked_bench_json_payloads(rows: &[MaterializedTrackedStateRow]) -> Vec<String> {
+fn tracked_bench_json_payloads(
+    rows: &[MaterializedTrackedStateRow],
+    changes: &[Change],
+) -> Vec<(String, Option<JsonRef>)> {
     let mut payloads = Vec::new();
-    for row in rows {
+    for (row, change) in rows.iter().zip(changes) {
         if let Some(snapshot) = row.snapshot_content.as_deref() {
-            payloads.push(snapshot.to_string());
+            payloads.push((snapshot.to_string(), change.snapshot_ref));
         }
         if let Some(metadata) = row.metadata.as_ref() {
-            payloads.push(crate::serialize_row_metadata(metadata));
+            payloads.push((crate::serialize_row_metadata(metadata), change.metadata_ref));
         }
     }
     payloads
@@ -4193,9 +4197,9 @@ async fn append_changelog_changes(
         JsonStoreContext::new().writer().stage_batch(
             &mut writes,
             JsonWritePlacementRef::OutOfBand,
-            payloads.iter().map(|payload| NormalizedJsonRef {
-                normalized: payload.as_str(),
-            }),
+            payloads
+                .iter()
+                .map(|payload| NormalizedJsonRef::new(payload.as_str())),
         )?;
         let parent_ids = Vec::new();
         let author_account_ids = vec!["bench-author".to_string()];

@@ -140,7 +140,10 @@ impl JsonStoreWriter {
         let mut order = Vec::new();
         let mut seen = HashSet::new();
         for payload in payloads {
-            let encoded = store::encode_json_str(payload.normalized)?;
+            let encoded = match payload.trusted_json_ref() {
+                Some(json_ref) => store::encode_json_str_with_ref(payload.normalized(), json_ref)?,
+                None => store::encode_json_str(payload.normalized())?,
+            };
             let hash: [u8; 32] = encoded
                 .json_ref
                 .as_hash_bytes()
@@ -215,8 +218,8 @@ mod tests {
                     pack_id: 0,
                 },
                 [
-                    NormalizedJsonRef { normalized: first },
-                    NormalizedJsonRef { normalized: second },
+                    NormalizedJsonRef::new(first),
+                    NormalizedJsonRef::new(second),
                 ],
             )
             .expect("json pack should stage");
@@ -285,9 +288,9 @@ mod tests {
                     pack_id: 0,
                 },
                 [
-                    NormalizedJsonRef { normalized: first },
-                    NormalizedJsonRef { normalized: first },
-                    NormalizedJsonRef { normalized: second },
+                    NormalizedJsonRef::new(first),
+                    NormalizedJsonRef::new(first),
+                    NormalizedJsonRef::new(second),
                 ],
             )
             .expect("json pack should stage");
@@ -334,5 +337,53 @@ mod tests {
                 Some(second.as_bytes().to_vec())
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn commit_local_batch_accepts_trusted_prehashed_payload() {
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let context = JsonStoreContext::new();
+        let json = "{\"value\":\"prehashed\"}";
+        let json_ref = JsonRef::for_content(json.as_bytes());
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        let mut writes = StorageWriteSet::new();
+        let refs = context
+            .writer()
+            .stage_batch(
+                &mut writes,
+                JsonWritePlacementRef::CommitPack {
+                    commit_id: "commit-a",
+                    pack_id: 0,
+                },
+                [NormalizedJsonRef::trusted_prehashed(json, json_ref)],
+            )
+            .expect("prehashed json should stage");
+        assert_eq!(refs, vec![json_ref]);
+        writes
+            .apply(&mut transaction.as_mut())
+            .await
+            .expect("json pack should apply");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let pack_ids = [0];
+        let packed = context
+            .reader(storage.clone())
+            .load_bytes_many(JsonLoadRequestRef {
+                refs: &refs,
+                scope: JsonReadScopeRef::CommitPacks {
+                    commit_id: "commit-a",
+                    pack_ids: &pack_ids,
+                },
+            })
+            .await
+            .expect("prehashed payload should hydrate");
+        assert_eq!(packed.into_values(), vec![Some(json.as_bytes().to_vec())]);
     }
 }
