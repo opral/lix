@@ -2449,6 +2449,123 @@ prefix_scan_schema improved and full-scan medians stayed in the intended range.
 No storage format change. No benchmark shape change. No temporary shim.
 ```
 
+## Optimization 16: Fill JSON pack results directly
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Fused JSON pack decode with result placement:
+
+- Replaced `decode_json_pack(...) -> Vec<(JsonRef, Vec<u8>)>` plus a second
+  pass in `load_from_packs`.
+- Added `load_json_pack_values(...)`, which parses the pack directory and
+  writes matching decoded payloads directly into the caller's result slice
+  using the existing `wanted: HashMap<[u8; 32], usize>`.
+- Unrequested pack entries are skipped without payload decode.
+- Requested entries still flow through `decode_json_payload(..., hash_check)`,
+  so verified reads still hash-check requested refs.
+
+Added `verified_pack_load_checks_only_requested_entries` to pin the intended
+boundary: a bad unrequested pack entry is ignored by a verified read for a good
+ref, while requesting the bad ref fails with a hash mismatch.
+
+This is the same projection/predicate-pushdown shape used by database storage
+engines: do not decode rows or payloads outside the request path.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                             | after median | criterion status |
+| ----------------------------------------------- | -----------: | ---------------- |
+| `sqlite/get_many_exact_keys/1k`                 |    3.5231 ms | no change, noisy guardrail |
+| `sqlite/scan_full_rows/1k`                      |    3.1738 ms | no change |
+| `sqlite/prefix_scan_schema/1k`                  |    3.0404 ms | improved |
+| `sqlite/prefix_scan_schema_file_null/1k`        |    3.4798 ms | no change |
+| `rocksdb/get_many_exact_keys/1k`                |    2.2726 ms | no change |
+| `rocksdb/scan_full_rows/1k`                     |    2.0346 ms | no change |
+| `rocksdb/prefix_scan_schema/1k`                 |    2.1176 ms | no change |
+| `rocksdb/prefix_scan_schema_file_null/1k`       |    2.0395 ms | improved |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                     | bytes | bytes/row | status |
+| --------------------------------------- | ----: | --------: | ------ |
+| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
+| Lix SQLite / inserted                   | 1112216 | 1112.2 | unchanged |
+| Lix SQLite / after create_version       | 1124576 | 1124.6 | unchanged |
+| Lix SQLite / after fast-forward merge   | 5324328 | 5324.3 | unchanged |
+| Lix SQLite / after divergent merge      | 5652176 | 5652.2 | unchanged |
+| Lix RocksDB / inserted                  | 1028557 | 1028.6 | unchanged |
+| Lix RocksDB / after create_version      | 1030457 | 1030.5 | unchanged |
+| Lix RocksDB / after fast-forward merge  | 1195234 | 1195.2 | unchanged |
+| Lix RocksDB / after divergent merge     | 1576587 | 1576.6 | unchanged |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+Initial review:
+HIGH: none.
+MEDIUM: none.
+LOW: add focused pack-local coverage for verifying requested entries while
+skipping unrequested entries. Fixed.
+
+Follow-up review:
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+The new pack test covers the intended boundary.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine json_store:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a small pack-read cleanup.
+
+Primary axis: scan and prefix-scan reads. The structural win removes an
+intermediate vector of decoded pack entries and avoids decoding unrequested pack
+payloads. This compounds with the previous hot-read hash policy change.
+
+Timing: SQLite prefix_scan_schema and RocksDB prefix_scan_schema_file_null
+improved by Criterion. Other targeted rows were neutral/noisy but did not show
+a structural regression.
+
+No storage format change. No temporary shim.
+```
+
 ## Optimization 14: Reuse trusted JSON refs during payload staging
 
 Date: 2026-05-11
