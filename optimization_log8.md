@@ -5482,3 +5482,141 @@ Storage is unchanged. No format change, no backward shim, and no benchmark
 measurement change. This does not complete the <= 1.5x target; SQLite scans and
 root writes still need larger structural cuts.
 ```
+
+## Optimization 38: Stream delta-pack entries without per-field sections
+
+Date: 2026-05-11
+
+Status: kept and committed.
+
+### Hypothesis
+
+Tracked-state delta packs still carried a length-prefixed sub-section around
+every encoded delta key and every encoded delta value. Those wrappers were not
+needed for decoding because the key and value fields are already
+self-delimiting. Removing them should shrink delta packs and avoid per-entry
+encoder buffer surgery, improving any path that writes or decodes delta packs:
+root writes, exact reads from unmaterialized roots, scans from single delta
+packs, and changed-key suffix diffs.
+
+This is a clean-cut physical format change. Lix has not shipped, so the delta
+pack version was bumped from v5 to v6 without a backward shim.
+
+### Change
+
+- Bumped `tracked_state` delta pack version from 5 to 6.
+- Changed `encode_delta_pack_refs` to stream each entry as:
+  `delta key fields` followed by `delta value fields`.
+- Removed the old `push_var_sized_section` helper and the corresponding
+  per-entry `read_var_sized_slice` boundaries.
+- Changed `decode_delta_pack` to advance a single cursor through each
+  self-delimiting key/value pair, while retaining the whole-pack trailing-byte
+  check.
+- Added `delta_pack_stream_decoder_rejects_trailing_entry_bytes` to lock the
+  new stream boundary behavior.
+
+Reference-system rationale: this follows the DuckDB/Parquet-style row-group
+principle of removing unnecessary per-row wrapper overhead from hot physical
+streams. It is not the full columnar row-group design, but it moves the delta
+segment format one step toward compact, sequential, projection-friendly pages.
+
+### Benchmarks
+
+Command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|changed_keys_update_10pct|changed_keys_delta_chain_10x1pct)/1k'
+```
+
+Result:
+
+| row                                                               |   median | criterion status |
+| ----------------------------------------------------------------- | -------: | ---------------- |
+| `sqlite/write_root_all_rows/1k`                                   | 4.7096 ms | improved -6.2208% |
+| `sqlite/get_many_exact_keys/1k`                                   | 2.8942 ms | improved -12.163% |
+| `sqlite/scan_full_rows/1k`                                        | 2.2839 ms | improved -5.5690% |
+| `sqlite/prefix_scan_schema_file_null/1k`                          | 2.2837 ms | improved -9.4296% |
+| `sqlite/changed_keys_update_10pct/1k`                             | 2.3014 ms | improved -39.610% |
+| `sqlite/changed_keys_delta_chain_10x1pct/1k`                      | 2.5375 ms | improved -57.367% |
+| `rocksdb/write_root_all_rows/1k`                                  | 4.5390 ms | no change (-3.8047%) |
+| `rocksdb/get_many_exact_keys/1k`                                  | 2.1650 ms | improved -15.785% |
+| `rocksdb/scan_full_rows/1k`                                       | 1.5886 ms | improved -6.3037% |
+| `rocksdb/prefix_scan_schema_file_null/1k`                         | 1.5596 ms | improved -8.6713% |
+| `rocksdb/changed_keys_update_10pct/1k`                            | 1.7168 ms | improved -41.184% |
+| `rocksdb/changed_keys_delta_chain_10x1pct/1k`                     | 1.8068 ms | no change (-2.2237%) |
+
+Interpretation: keep. The root-write and scan rows did not clear the 10% bar,
+but exact reads and changed-key rows did on both backends or on the primary
+SQLite delta-chain rows. There were no Criterion regressions in the target
+guardrails.
+
+This still does not complete the <= 1.5x target. The remaining root-write and
+SQLite scan misses need the larger row-group/projection-page work identified by
+the first-principles pass.
+
+### Storage
+
+Command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                    |   bytes | bytes/row |
+| -------------------------------------- | ------: | --------: |
+| raw SQLite / inserted                  | 1692456 |    1692.5 |
+| Lix SQLite / inserted                  |  897976 |     898.0 |
+| Lix SQLite / after create_version      |  910336 |     910.3 |
+| Lix SQLite / after fast-forward merge  | 5115504 |    5115.5 |
+| Lix SQLite / after divergent merge     | 5275248 |    5275.2 |
+| Lix RocksDB / inserted                 |  809722 |     809.7 |
+| Lix RocksDB / after create_version     |  811467 |     811.5 |
+| Lix RocksDB / after fast-forward merge |  960498 |     960.5 |
+| Lix RocksDB / after divergent merge    | 1303449 |    1303.4 |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+Initial review:
+HIGH: none.
+MEDIUM: none.
+LOW: add a focused malformed v6 entry test for the stream boundary behavior.
+
+Follow-up review:
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo check -p lix_engine --features storage-benches
+cargo test -p lix_engine tracked_state::codec:: --features storage-benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|changed_keys_update_10pct|changed_keys_delta_chain_10x1pct)/1k'
+```
+
+All commands passed.
+
+### Next Work
+
+The independent first-principles sidecar pass ranked the next plausible
+>=10% structural moves as:
+
+1. A unified commit/tracked row group that removes duplicated authored row facts
+   between `commit_store.change_pack` and `tracked_state.delta_pack`.
+2. A projection-page scan API so key/header/payload-ref/full-row scans decode
+   only the columns they need.
+3. Columnar tracked leaves/row groups for key suffixes, scalar headers,
+   timestamp codes, and payload refs.
+
+Those are the likely paths for the remaining root-write and SQLite scan misses.
