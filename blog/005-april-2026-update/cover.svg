@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <rect width="1200" height="630" fill="#ffffff"/>
+
+  <g transform="translate(60, 50) scale(2.8)">
+    <path d="M14.7618 5.74842L16.9208 9.85984L22.3675 0.358398H25.7133L19.0723 11.6284L22.5712 17.5085H19.2407L16.9208 13.443L14.6393 17.5085H11.2705L14.7618 11.6284L11.393 5.74842H14.7618Z" fill="#08B5D6"/>
+    <path d="M6.16211 17.5081V5.74805H9.42368V17.5081H6.16211Z" fill="#08B5D6"/>
+    <path d="M3.52112 0.393555V17.6416H0.287109V0.393555H3.52112Z" fill="#08B5D6"/>
+    <path d="M6.21582 0.393555H14.8399V3.08856H6.21582V0.393555Z" fill="#08B5D6"/>
+  </g>
+
+  <text x="150" y="92" font-family="'Courier New', 'Courier', monospace" font-size="56" font-weight="bold" fill="#111111">Owning the storage model</text>
+  <text x="150" y="124" font-family="'Courier New', 'Courier', monospace" font-size="24" fill="#666666">SQL stays · DataFusion plans · backends plug in below</text>
+
+  <rect x="40" y="150" width="1120" height="430" fill="#1a1a2e" stroke="#111111" stroke-width="3"/>
+  <rect x="40" y="150" width="1120" height="50" fill="#f0f0f0" stroke="#111111" stroke-width="3"/>
+  <circle cx="80" cy="175" r="8" fill="#111111"/>
+  <circle cx="108" cy="175" r="8" fill="#111111"/>
+  <circle cx="136" cy="175" r="8" fill="#111111"/>
+
+  <text x="80" y="245" font-family="'Courier New', 'Courier', monospace" font-size="30" fill="#c0c0d0">SQL query</text>
+  <text x="95" y="285" font-family="'Courier New', 'Courier', monospace" font-size="30" fill="#666688">↓</text>
+  <text x="80" y="325" font-family="'Courier New', 'Courier', monospace" font-size="30" fill="#c0c0d0">DataFusion ........ query planner / executor</text>
+  <text x="95" y="365" font-family="'Courier New', 'Courier', monospace" font-size="30" fill="#666688">↓</text>
+
+  <rect x="70" y="390" width="1000" height="62" fill="#08B5D6"/>
+  <text x="95" y="430" font-family="'Courier New', 'Courier', monospace" font-size="30" font-weight="bold" fill="#111111">Lix-owned layer ... state · versions · history · merge</text>
+
+  <text x="95" y="485" font-family="'Courier New', 'Courier', monospace" font-size="30" fill="#666688">↓</text>
+  <text x="80" y="525" font-family="'Courier New', 'Courier', monospace" font-size="30" fill="#c0c0d0">SQLite · RocksDB · S3/R2 · OPFS</text>
+  <text x="80" y="560" font-family="'Courier New', 'Courier', monospace" font-size="22" fill="#666688">physical persistence is swappable</text>
+
+  <text x="60" y="615" font-family="'Courier New', 'Courier', monospace" font-size="20" fill="#666666">MVP flow runs on the new path · v0.6 targeted for May</text>
+</svg>
