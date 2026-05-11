@@ -8,6 +8,7 @@ use crate::tracked_state::diff::{diff_commits, TrackedStateDiff, TrackedStateDif
 use crate::tracked_state::materialize_index_entries;
 use crate::tracked_state::merge::{self, TrackedStateMergePlan};
 use crate::tracked_state::storage;
+use crate::tracked_state::storage::DeltaJsonPackIndexesRef;
 use crate::tracked_state::tree::TrackedStateTree;
 use crate::tracked_state::types::{
     TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef, TrackedStateMutation,
@@ -810,6 +811,27 @@ where
         deltas: &[TrackedStateDeltaRef<'_>],
     ) -> Result<TrackedStateWriteReport, LixError> {
         storage::stage_delta_pack_refs(self.writes, commit_id, deltas)?;
+        Ok(TrackedStateWriteReport {
+            commit_id: commit_id.to_string(),
+            changed_rows: deltas.len(),
+            primary_chunk_puts: 0,
+            by_file_chunk_puts: 0,
+        })
+    }
+
+    pub(crate) async fn stage_delta_with_json_pack_indexes(
+        &mut self,
+        commit_id: &str,
+        _parent_commit_id: Option<&str>,
+        deltas: &[TrackedStateDeltaRef<'_>],
+        json_pack_indexes: DeltaJsonPackIndexesRef<'_>,
+    ) -> Result<TrackedStateWriteReport, LixError> {
+        storage::stage_delta_pack_refs_with_json_pack_indexes(
+            self.writes,
+            commit_id,
+            deltas,
+            json_pack_indexes,
+        )?;
         Ok(TrackedStateWriteReport {
             commit_id: commit_id.to_string(),
             changed_rows: deltas.len(),

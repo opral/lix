@@ -5785,3 +5785,105 @@ two-step invariant by making tracked commit staging and tracked delta staging
 one atomic commit-local row-group operation. After that, the projection-page
 scan API remains the likely path for the remaining SQLite scan/root-write
 ratio misses.
+
+## Opt 40: Mixed JSON Pack Indexes in Delta Packs
+
+Implemented a corrected delta-pack JSON reference row-group: when tracked
+state and JSON payloads are staged into the same commit-local JSON pack,
+`tracked_state.delta_pack` v7 can encode JSON refs as pack-local ordinals
+instead of repeating 32-byte hashes. Refs that are not in the pack still fall
+back to inline hashes, and empty index maps fall back to the old inline mode.
+
+The index map comes from the actual `json_store.pack` write order in
+`JsonStoreWriter::stage_batch_report`, avoiding the failed guessed-ordinal
+attempt. Decode resolves ordinals against `json_store.pack` refs only when the
+delta pack declares mixed mode; inline packs do not depend on parsing a JSON
+pack. The public internal staging edge now carries explicit `(commit_id,
+pack_id)` identity and validates that this path is pack-0-only.
+
+### Storage
+
+Command:
+
+```sh
+cargo test -p lix_engine lix_key_value_insert_amplification_north_star --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| namespace                  | before bytes | after bytes | delta |
+| -------------------------- | -----------: | ----------: | ----: |
+| `commit_store.commit`      |          205 |         205 |  0.0% |
+| `json_store.pack`          |      100,064 |     100,064 |  0.0% |
+| `tracked_state.delta_pack` |      131,968 |     101,841 | -22.8% |
+| `untracked_state.row`      |          386 |         386 |  0.0% |
+| total write bytes          |      232,623 |     202,496 | -12.9% |
+
+Read-call accounting improved from 95 to 85 calls for the 1k north-star run
+because delta and JSON-pack lookup are batched.
+
+### Physical Benchmark
+
+Command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|get_many_exact_keys|scan_full_rows|prefix_scan_schema_file_null|changed_keys_update_10pct)/1k'
+```
+
+Final run:
+
+| benchmark                                      | mean      | criterion result |
+| ---------------------------------------------- | --------: | ---------------- |
+| `raw_sqlite/write_root_all_rows/1k`            | 2.6157 ms | no change |
+| `raw_sqlite/get_many_exact_keys/1k`            | 2.3298 ms | no change |
+| `raw_sqlite/scan_full_rows/1k`                 | 1.2697 ms | no change |
+| `raw_sqlite/prefix_scan_schema_file_null/1k`   | 1.2167 ms | no change |
+| `sqlite/write_root_all_rows/1k`                | 4.4511 ms | no change |
+| `sqlite/get_many_exact_keys/1k`                | 2.7910 ms | no change |
+| `sqlite/scan_full_rows/1k`                     | 2.2780 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k`       | 2.3066 ms | no change |
+| `sqlite/changed_keys_update_10pct/1k`          | 2.2692 ms | no change |
+| `rocksdb/write_root_all_rows/1k`               | 4.7723 ms | no change |
+| `rocksdb/get_many_exact_keys/1k`               | 2.1705 ms | improved -7.8977% |
+| `rocksdb/scan_full_rows/1k`                    | 1.6106 ms | no change |
+| `rocksdb/prefix_scan_schema_file_null/1k`      | 1.6688 ms | noise +4.5902% |
+| `rocksdb/changed_keys_update_10pct/1k`         | 1.5158 ms | no change |
+
+Interpretation: keep. The durable result is a 12.9% root-write byte reduction
+with no significant physical-benchmark regression in the final run. This does
+not solve the remaining <=1.5x SQLite scan/write ratios, but it removes a real
+duplicate 32-byte-ref payload from the row-group layout.
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+Initial review:
+HIGH: packless/empty-index batches could emit mixed mode with no JSON pack,
+making inline-only delta packs unreadable.
+MEDIUM: bare pack-index maps were too easy to misuse across commit/pack ids.
+
+Follow-up review:
+MEDIUM: load_delta_pack decoded JSON pack refs before knowing whether the
+delta pack was mixed-mode, so corrupt JSON pack data could break inline packs.
+
+Final review:
+HIGH: none.
+MEDIUM: none.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine tracked_state::codec:: --features storage-benches
+cargo test -p lix_engine json_store:: --features storage-benches
+cargo test -p lix_engine transaction --features storage-benches
+cargo test -p lix_engine lix_key_value_insert_amplification_north_star --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|get_many_exact_keys|scan_full_rows|prefix_scan_schema_file_null|changed_keys_update_10pct)/1k'
+```
+
+All commands passed.

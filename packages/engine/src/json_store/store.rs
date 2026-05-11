@@ -116,6 +116,17 @@ pub(crate) fn pack_key(commit_id: &str, pack_id: u32) -> Vec<u8> {
     key
 }
 
+pub(crate) fn decode_json_pack_refs(bytes: &[u8]) -> Result<Vec<JsonRef>, LixError> {
+    let layout = json_pack_layout(bytes)?;
+    let mut refs = Vec::with_capacity(layout.count);
+    for index in 0..layout.count {
+        refs.push(JsonRef::from_hash_bytes(
+            json_pack_entry(bytes, &layout, index)?.hash,
+        ));
+    }
+    Ok(refs)
+}
+
 pub(crate) fn encode_json_pack(entries: &[&EncodedJson<'_>]) -> Result<Vec<u8>, LixError> {
     let mut directory_len =
         STORED_JSON_PACK_MAGIC.len() + 4 + entries.len() * STORED_JSON_PACK_ENTRY_HEADER_LEN;
