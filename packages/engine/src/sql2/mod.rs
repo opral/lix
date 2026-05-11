@@ -29,7 +29,9 @@ mod version_scope;
 mod write_normalization;
 
 pub(crate) use classify::{
-    classify_statement, dml_target_table_names, validate_supported_statement_ast, SqlStatementKind,
+    classify_statement, datafusion_statement_dml_target_table_names,
+    validate_supported_datafusion_statement_ast, validate_supported_statement_ast,
+    SqlStatementKind,
 };
 pub(crate) use context::{
     CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext, SqlJsonReader,
