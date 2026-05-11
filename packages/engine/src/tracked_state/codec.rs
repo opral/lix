@@ -2,6 +2,7 @@ use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::commit_store::ChangeLocator;
 use crate::entity_identity::EntityIdentity;
+use crate::json_store::JsonRef;
 use crate::tracked_state::types::{
     TrackedStateDeltaEntry, TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey,
     TrackedStateKeyRef, TRACKED_STATE_HASH_BYTES,
@@ -9,7 +10,7 @@ use crate::tracked_state::types::{
 use crate::LixError;
 
 const NODE_VERSION: u8 = 2;
-const VALUE_VERSION: u8 = 5;
+const VALUE_VERSION: u8 = 6;
 const VALUE_DELETED_FLAG: u8 = 0b1000_0000;
 const VALUE_VERSION_MASK: u8 = 0b0111_1111;
 const DELTA_PACK_VERSION: u8 = 1;
@@ -227,6 +228,8 @@ pub(crate) fn encode_value(value: &TrackedStateIndexValue) -> Vec<u8> {
     encode_value_ref(TrackedStateIndexValueRef {
         change_locator: value.change_locator.as_ref(),
         deleted: value.deleted,
+        snapshot_ref: value.snapshot_ref.as_ref(),
+        metadata_ref: value.metadata_ref.as_ref(),
         created_at: &value.created_at,
         updated_at: &value.updated_at,
     })
@@ -241,6 +244,8 @@ pub(crate) fn encode_value_ref(value: TrackedStateIndexValueRef<'_>) -> Vec<u8> 
     push_sized_bytes(&mut out, value.change_locator.change_id.as_bytes());
     push_sized_bytes(&mut out, value.created_at.as_bytes());
     push_sized_bytes(&mut out, value.updated_at.as_bytes());
+    push_optional_json_ref(&mut out, value.snapshot_ref);
+    push_optional_json_ref(&mut out, value.metadata_ref);
     out
 }
 
@@ -252,6 +257,8 @@ pub(crate) fn encoded_value_len(value: &TrackedStateIndexValue) -> usize {
         + sized_bytes_len(value.change_locator.change_id.as_bytes())
         + sized_bytes_len(value.created_at.as_bytes())
         + sized_bytes_len(value.updated_at.as_bytes())
+        + optional_json_ref_len(value.snapshot_ref.as_ref())
+        + optional_json_ref_len(value.metadata_ref.as_ref())
 }
 
 pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateIndexValue, LixError> {
@@ -319,6 +326,8 @@ fn decode_value_after_header(
     let change_id = read_sized_string(bytes, &mut cursor, "change_id")?;
     let created_at = read_sized_string(bytes, &mut cursor, "created_at")?;
     let updated_at = read_sized_string(bytes, &mut cursor, "updated_at")?;
+    let snapshot_ref = read_optional_json_ref(bytes, &mut cursor, "snapshot_ref")?;
+    let metadata_ref = read_optional_json_ref(bytes, &mut cursor, "metadata_ref")?;
     if cursor != bytes.len() {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -333,6 +342,8 @@ fn decode_value_after_header(
             change_id,
         },
         deleted,
+        snapshot_ref,
+        metadata_ref,
         created_at,
         updated_at,
     })
@@ -350,6 +361,8 @@ pub(crate) fn encode_delta_pack(entries: &[TrackedStateDeltaEntry]) -> Result<Ve
             &encode_value_ref(TrackedStateIndexValueRef {
                 change_locator: entry.value.change_locator.as_ref(),
                 deleted: entry.value.deleted,
+                snapshot_ref: entry.value.snapshot_ref.as_ref(),
+                metadata_ref: entry.value.metadata_ref.as_ref(),
                 created_at: &entry.value.created_at,
                 updated_at: &entry.value.updated_at,
             }),
@@ -672,6 +685,21 @@ fn push_sized_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+fn push_optional_json_ref(out: &mut Vec<u8>, json_ref: Option<&JsonRef>) {
+    match json_ref {
+        Some(json_ref) => {
+            out.push(1);
+            out.extend_from_slice(json_ref.as_hash_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+#[cfg(test)]
+fn optional_json_ref_len(json_ref: Option<&JsonRef>) -> usize {
+    1 + json_ref.map_or(0, |_| TRACKED_STATE_HASH_BYTES)
+}
+
 fn push_u32(out: &mut Vec<u8>, value: usize) {
     out.extend_from_slice(&(value as u32).to_be_bytes());
 }
@@ -735,6 +763,23 @@ fn read_fixed_hash(
     out.copy_from_slice(slice);
     *cursor = end;
     Ok(out)
+}
+
+fn read_optional_json_ref(
+    bytes: &[u8],
+    cursor: &mut usize,
+    field_name: &str,
+) -> Result<Option<JsonRef>, LixError> {
+    match read_u8(bytes, cursor, field_name)? {
+        0 => Ok(None),
+        1 => Ok(Some(JsonRef::from_hash_bytes(read_fixed_hash(
+            bytes, cursor, field_name,
+        )?))),
+        other => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("tracked-state tree field '{field_name}' has invalid JSON ref tag {other}"),
+        )),
+    }
 }
 
 fn read_u8(bytes: &[u8], cursor: &mut usize, field_name: &str) -> Result<u8, LixError> {
@@ -881,6 +926,8 @@ mod tests {
                 change_id: "change".to_string(),
             },
             deleted: false,
+            snapshot_ref: Some(JsonRef::from_hash_bytes([1; 32])),
+            metadata_ref: Some(JsonRef::from_hash_bytes([2; 32])),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
         };
@@ -899,6 +946,8 @@ mod tests {
                 change_id: "other-change".to_string(),
             },
             deleted: true,
+            snapshot_ref: None,
+            metadata_ref: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
         };
@@ -917,6 +966,8 @@ mod tests {
                 change_id: "change".to_string(),
             },
             deleted: false,
+            snapshot_ref: None,
+            metadata_ref: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
         };
@@ -946,6 +997,8 @@ mod tests {
                     change_id: "change".to_string(),
                 },
                 deleted: false,
+                snapshot_ref: None,
+                metadata_ref: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
             },
@@ -957,6 +1010,8 @@ mod tests {
                     change_id: "change-2".to_string(),
                 },
                 deleted: true,
+                snapshot_ref: Some(JsonRef::from_hash_bytes([3; 32])),
+                metadata_ref: None,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
             },
@@ -968,6 +1023,8 @@ mod tests {
                     change_id: "change-3".to_string(),
                 },
                 deleted: false,
+                snapshot_ref: None,
+                metadata_ref: Some(JsonRef::from_hash_bytes([4; 32])),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
             },

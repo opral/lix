@@ -140,9 +140,7 @@ where
         let projection = crate::tracked_state::TrackedMaterializationProjection::from_columns(
             &request.projection.columns,
         );
-        let mut rows =
-            materialize_index_entries(&mut self.store, &self.commit_store, rows, &projection)
-                .await?;
+        let mut rows = materialize_index_entries(&mut self.store, rows, &projection).await?;
         if !request.filter.include_tombstones {
             rows.retain(|row| !row.deleted);
         }
@@ -177,7 +175,6 @@ where
         }
         let materialized = materialize_index_entries(
             &mut self.store,
-            &self.commit_store,
             entries,
             &crate::tracked_state::TrackedMaterializationProjection::full(),
         )
@@ -278,7 +275,6 @@ where
     ) -> Result<MaterializedTrackedStateRow, LixError> {
         let mut rows = materialize_index_entries(
             &mut self.store,
-            &self.commit_store,
             vec![(key, value)],
             &crate::tracked_state::TrackedMaterializationProjection::full(),
         )
@@ -732,6 +728,16 @@ where
             let value = crate::tracked_state::types::TrackedStateIndexValueRef {
                 change_locator: delta.locator,
                 deleted: delta.change.snapshot_ref.is_none(),
+                snapshot_ref: delta.change.snapshot_ref,
+                metadata_ref: delta.change.metadata_ref,
+                created_at: delta.created_at,
+                updated_at: delta.updated_at,
+            };
+            let header_value = crate::tracked_state::types::TrackedStateIndexValueRef {
+                change_locator: delta.locator,
+                deleted: delta.change.snapshot_ref.is_none(),
+                snapshot_ref: None,
+                metadata_ref: None,
                 created_at: delta.created_at,
                 updated_at: delta.updated_at,
             };
@@ -741,7 +747,7 @@ where
             ));
             by_file_mutations.push(TrackedStateMutation::put_encoded(
                 ByFileIndex::encode_key_ref(key),
-                ByFileIndex::encode_header_value_ref(value),
+                ByFileIndex::encode_header_value_ref(header_value),
             ));
         }
         let result = self
@@ -814,6 +820,8 @@ fn delta_entries_from_refs(deltas: &[TrackedStateDeltaRef<'_>]) -> Vec<TrackedSt
                     change_id: delta.locator.change_id.to_string(),
                 },
                 deleted: delta.change.snapshot_ref.is_none(),
+                snapshot_ref: delta.change.snapshot_ref.copied(),
+                metadata_ref: delta.change.metadata_ref.copied(),
                 created_at: delta.created_at.to_string(),
                 updated_at: delta.updated_at.to_string(),
             },

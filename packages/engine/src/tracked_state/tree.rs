@@ -3186,6 +3186,9 @@ mod tests {
                 change_id: change_id.to_string(),
             },
             deleted: snapshot_content.is_none(),
+            snapshot_ref: snapshot_content
+                .map(|content| crate::json_store::JsonRef::for_content(content.as_bytes())),
+            metadata_ref: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }
