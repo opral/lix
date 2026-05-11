@@ -278,6 +278,47 @@ Initial `optimization9_sql2` diagnostic rows after rebase:
 | `e2e_parameterized`  | `update_one_by_pk/1k`      | 7.5761-9.0774 ms | 4.1165-4.7877 ms |
 | `e2e_parameterized`  | `delete_one_by_pk/1k`      | 7.4651-8.2425 ms | 4.4257-5.1296 ms |
 
+Hetzner CX33 baseline rerun on 2026-05-11:
+
+```text
+Machine: Hetzner CX33
+Host: ubuntu-32gb-hil-1
+CPU: 8 vCPU, AMD EPYC-Milan Processor, KVM
+Kernel: Linux 6.8.0-90-generic x86_64
+Commit: 9ff4f9cb
+Command: cargo bench -p lix_engine --features storage-benches --bench optimization9_sql2
+```
+
+Hetzner CX33 isolated 1k smoke CRUD rows:
+
+| operation               |       Lix SQLite |      Lix RocksDB |
+| ----------------------- | ---------------: | ---------------: |
+| `insert_all_rows`       | 70.105-71.910 ms | 67.767-68.316 ms |
+| `select_all_path_value` | 17.530-17.943 ms | 13.421-13.936 ms |
+| `select_one_by_pk`      | 6.6463-6.9219 ms | 2.9247-3.0022 ms |
+| `update_all_values`     | 34.429-35.507 ms | 25.341-25.724 ms |
+| `update_one_by_pk`      | 10.367-10.581 ms | 6.3116-6.4393 ms |
+| `delete_all_rows`       | 35.935-36.724 ms | 26.690-27.071 ms |
+| `delete_one_by_pk`      | 10.616-10.778 ms | 6.4811-6.6185 ms |
+
+Hetzner CX33 `optimization9_sql2` diagnostic rows:
+
+| group                | operation                  |       Lix SQLite |      Lix RocksDB |
+| -------------------- | -------------------------- | ---------------: | ---------------: |
+| `planning_only`      | `select_all_path_value/1k` | 5.7264-5.8371 ms | 2.1837-2.3126 ms |
+| `planning_only`      | `select_one_by_pk/1k`      | 5.3823-5.5152 ms | 2.2103-2.2705 ms |
+| `planning_only`      | `insert_500_values/1k`     | 14.105-14.283 ms | 12.987-13.275 ms |
+| `planning_only`      | `update_all_values/1k`     | 6.3326-6.4489 ms | 2.7961-2.8708 ms |
+| `planning_only`      | `delete_all_rows/1k`       | 6.2279-7.0361 ms | 2.6768-2.7504 ms |
+| `execute_preplanned` | `select_all_path_value/1k` | 11.515-11.711 ms | 11.964-12.364 ms |
+| `execute_preplanned` | `select_one_by_pk/1k`      | 1.5469-1.5784 ms | 1.6215-1.6790 ms |
+| `e2e_literal`        | `select_one_by_pk/1k`      | 6.3640-6.4680 ms | 2.9476-2.9911 ms |
+| `e2e_literal`        | `update_one_by_pk/1k`      | 9.9933-10.128 ms | 6.1048-6.2638 ms |
+| `e2e_literal`        | `delete_one_by_pk/1k`      | 10.509-11.015 ms | 6.4548-6.6268 ms |
+| `e2e_parameterized`  | `select_one_by_pk/1k`      | 6.5033-6.6564 ms | 3.1192-3.2197 ms |
+| `e2e_parameterized`  | `update_one_by_pk/1k`      | 10.169-11.111 ms | 6.4063-6.6222 ms |
+| `e2e_parameterized`  | `delete_one_by_pk/1k`      | 10.407-10.631 ms | 6.4029-6.5440 ms |
+
 Interpretation:
 
 ```text
