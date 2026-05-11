@@ -173,7 +173,7 @@ pub(crate) async fn stage_tracked_root_from_materialized(
     );
     tracked_state
         .writer(&mut *transaction, &mut writes)
-        .stage_delta(commit_id, parent_commit_id, deltas)
+        .stage_delta(commit_id, parent_commit_id, &deltas)
         .await?;
     writes.apply(&mut *transaction).await.map(|_| ())
 }

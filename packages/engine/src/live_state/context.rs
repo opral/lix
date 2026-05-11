@@ -783,7 +783,7 @@ mod tests {
                 .collect::<Vec<_>>();
             TrackedStateContext::new()
                 .writer(&mut *store, writes)
-                .stage_delta(&commit_id, parent_commit_id.as_deref(), deltas)
+                .stage_delta(&commit_id, parent_commit_id.as_deref(), &deltas)
                 .await?;
         }
         Ok(())
@@ -1704,7 +1704,7 @@ mod tests {
                 .expect("first parent commit should stage");
             TrackedStateContext::new()
                 .writer(&mut seed_transaction.as_mut(), &mut writes)
-                .stage_delta("parent-left", None, std::iter::empty())
+                .stage_delta("parent-left", None, &[])
                 .await
                 .expect("first parent root should exist");
         }

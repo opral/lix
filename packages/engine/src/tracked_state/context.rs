@@ -680,17 +680,13 @@ where
     S: StorageReader + ?Sized,
 {
     /// Stages one tracked-state projection delta for `commit_id`.
-    pub(crate) async fn stage_delta<'a, I>(
+    pub(crate) async fn stage_delta(
         &mut self,
         commit_id: &str,
         _parent_commit_id: Option<&str>,
-        deltas: I,
-    ) -> Result<TrackedStateWriteReport, LixError>
-    where
-        I: IntoIterator<Item = TrackedStateDeltaRef<'a>>,
-    {
-        let deltas = deltas.into_iter().collect::<Vec<_>>();
-        storage::stage_delta_pack_refs(self.writes, commit_id, &deltas)?;
+        deltas: &[TrackedStateDeltaRef<'_>],
+    ) -> Result<TrackedStateWriteReport, LixError> {
+        storage::stage_delta_pack_refs(self.writes, commit_id, deltas)?;
         Ok(TrackedStateWriteReport {
             commit_id: commit_id.to_string(),
             changed_rows: deltas.len(),

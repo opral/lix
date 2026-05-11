@@ -243,7 +243,7 @@ pub(crate) async fn initialize(
             .collect::<Vec<_>>();
         let mut writer = tracked_state.writer(transaction.as_mut(), &mut writes);
         writer
-            .stage_delta(&receipt.initial_commit_id, None, deltas)
+            .stage_delta(&receipt.initial_commit_id, None, &deltas)
             .await?;
     }
 
