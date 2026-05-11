@@ -63,19 +63,35 @@ where
     S: crate::storage::StorageReader,
 {
     let scan_request = scan_request_for_diff(request);
-    let mut entries = Vec::new();
-    for tree_entry in reader
+    let tree_entries = reader
         .diff_tree_entries_at_commits(left_commit_id, right_commit_id, &scan_request)
-        .await?
-    {
-        let before = match tree_entry.before {
-            Some((key, value)) => Some(reader.materialize_tree_value(key, value).await?),
-            None => None,
-        };
-        let after = match tree_entry.after {
-            Some((key, value)) => Some(reader.materialize_tree_value(key, value).await?),
-            None => None,
-        };
+        .await?;
+    let mut before_entries = Vec::new();
+    let mut after_entries = Vec::new();
+    let mut pending_entries = Vec::with_capacity(tree_entries.len());
+    for tree_entry in tree_entries {
+        let before_index = tree_entry.before.map(|entry| {
+            let index = before_entries.len();
+            before_entries.push(entry);
+            index
+        });
+        let after_index = tree_entry.after.map(|entry| {
+            let index = after_entries.len();
+            after_entries.push(entry);
+            index
+        });
+        pending_entries.push(PendingDiffEntry {
+            before_index,
+            after_index,
+        });
+    }
+
+    let before_rows = reader.materialize_tree_values(before_entries).await?;
+    let after_rows = reader.materialize_tree_values(after_entries).await?;
+    let mut entries = Vec::new();
+    for pending_entry in pending_entries {
+        let before = materialized_row_at(pending_entry.before_index, &before_rows)?;
+        let after = materialized_row_at(pending_entry.after_index, &after_rows)?;
         let identity = match before.as_ref().or(after.as_ref()) {
             Some(row) => TrackedStateDiffIdentity::from_row(row)?,
             None => continue,
@@ -87,6 +103,26 @@ where
     }
 
     Ok(TrackedStateDiff { entries })
+}
+
+fn materialized_row_at(
+    index: Option<usize>,
+    rows: &[MaterializedTrackedStateRow],
+) -> Result<Option<MaterializedTrackedStateRow>, LixError> {
+    let Some(index) = index else {
+        return Ok(None);
+    };
+    rows.get(index).cloned().map(Some).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state diff materialization returned fewer rows than planned",
+        )
+    })
+}
+
+struct PendingDiffEntry {
+    before_index: Option<usize>,
+    after_index: Option<usize>,
 }
 
 fn scan_request_for_diff(request: &TrackedStateDiffRequest) -> TrackedStateTreeScanRequest {
@@ -375,6 +411,133 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn diff_commits_between_delta_parent_and_child_reports_suffix_rows() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
+        let tracked_state = TrackedStateContext::new();
+        let mut tx = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        write_root_for_test(
+            tx.as_mut(),
+            &tracked_state,
+            "parent",
+            None,
+            &[
+                row_with_value("entity-a", None, "parent-a", "before"),
+                row_with_value("entity-b", None, "parent-b", "same"),
+            ],
+        )
+        .await
+        .expect("parent should write");
+        write_root_for_test(
+            tx.as_mut(),
+            &tracked_state,
+            "child",
+            Some("parent"),
+            &[row_with_value("entity-a", None, "child-a", "after")],
+        )
+        .await
+        .expect("child should write");
+        tx.commit().await.expect("transaction should commit");
+
+        let diff = tracked_state
+            .reader(storage)
+            .diff_commits("parent", "child", &TrackedStateDiffRequest::default())
+            .await
+            .expect("diff should load");
+
+        assert_eq!(
+            kinds(&diff),
+            vec![("entity-a".to_string(), TrackedStateDiffKind::Modified)]
+        );
+        assert_eq!(
+            diff.entries[0]
+                .before
+                .as_ref()
+                .and_then(|row| row.snapshot_content.as_deref()),
+            Some("{\"value\":\"before\"}")
+        );
+        assert_eq!(
+            diff.entries[0]
+                .after
+                .as_ref()
+                .and_then(|row| row.snapshot_content.as_deref()),
+            Some("{\"value\":\"after\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_commits_between_delta_child_and_parent_reports_reverse_suffix_rows() {
+        let (storage, tracked_state) = seed_parent_child_delta(
+            &[
+                row_with_value("entity-a", None, "parent-a", "before"),
+                row_with_value("entity-b", None, "parent-b", "same"),
+            ],
+            &[row_with_value("entity-a", None, "child-a", "after")],
+        )
+        .await;
+
+        let diff = tracked_state
+            .reader(storage)
+            .diff_commits("child", "parent", &TrackedStateDiffRequest::default())
+            .await
+            .expect("diff should load");
+
+        assert_eq!(
+            kinds(&diff),
+            vec![("entity-a".to_string(), TrackedStateDiffKind::Modified)]
+        );
+        assert_eq!(
+            diff.entries[0]
+                .before
+                .as_ref()
+                .and_then(|row| row.snapshot_content.as_deref()),
+            Some("{\"value\":\"after\"}")
+        );
+        assert_eq!(
+            diff.entries[0]
+                .after
+                .as_ref()
+                .and_then(|row| row.snapshot_content.as_deref()),
+            Some("{\"value\":\"before\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_commits_between_delta_parent_and_child_preserves_suffix_tombstones() {
+        let (storage, tracked_state) = seed_parent_child_delta(
+            &[
+                row_with_value("entity-a", None, "parent-a", "before"),
+                row_with_value("entity-b", None, "parent-b", "same"),
+            ],
+            &[tombstone("entity-a", None, "child-delete")],
+        )
+        .await;
+
+        let diff = tracked_state
+            .reader(storage)
+            .diff_commits("parent", "child", &TrackedStateDiffRequest::default())
+            .await
+            .expect("diff should load");
+
+        assert_eq!(
+            kinds(&diff),
+            vec![("entity-a".to_string(), TrackedStateDiffKind::Removed)]
+        );
+        assert!(diff.entries[0].before_is_live());
+        assert!(!diff.entries[0].after_is_live());
+        assert_eq!(
+            diff.entries[0]
+                .after
+                .as_ref()
+                .map(|row| row.change_id.as_str()),
+            Some("child-delete")
+        );
+    }
+
     async fn diff(
         storage: StorageContext,
         tracked_state: &TrackedStateContext,
@@ -403,6 +566,33 @@ mod tests {
         write_root_for_test(tx.as_mut(), &tracked_state, "right", None, right_rows)
             .await
             .expect("right root should write");
+        tx.commit().await.expect("transaction should commit");
+        (storage, tracked_state)
+    }
+
+    async fn seed_parent_child_delta(
+        parent_rows: &[MaterializedTrackedStateRow],
+        child_rows: &[MaterializedTrackedStateRow],
+    ) -> (StorageContext, TrackedStateContext) {
+        let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
+        let tracked_state = TrackedStateContext::new();
+        let mut tx = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        write_root_for_test(tx.as_mut(), &tracked_state, "parent", None, parent_rows)
+            .await
+            .expect("parent should write");
+        write_root_for_test(
+            tx.as_mut(),
+            &tracked_state,
+            "child",
+            Some("parent"),
+            child_rows,
+        )
+        .await
+        .expect("child should write");
         tx.commit().await.expect("transaction should commit");
         (storage, tracked_state)
     }
