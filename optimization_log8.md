@@ -1567,3 +1567,107 @@ Next optimization should return to budget-moving read/write costs: either the
 primary tracked-tree write path for full-root materialization, or row
 materialization/allocation in exact and scan reads.
 ```
+
+## Optimization 7: Skip JSON Planning for Header-Only Materialization
+
+Date: 2026-05-10
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Added a no-JSON fast path to tracked-state materialization. When a requested
+projection omits both `snapshot_content` and `metadata`,
+`materialize_index_entries` now directly maps tree entries into
+`MaterializedTrackedStateRow` values with payload columns omitted.
+
+This skips work that cannot affect the result for key-only and header-only
+projections:
+
+- no per-row payload plan allocation;
+- no `json_refs` / `json_ref_localities` vectors;
+- no pack-locality grouping map;
+- no empty JSON-store load path.
+
+Header semantics are still preserved. Identity fields come from the tracked
+key, and `deleted`, timestamps, `change_id`, and `commit_id` come from the
+tracked value. Tombstone filtering still uses `row.deleted`, not
+`snapshot_content`.
+
+No storage layout change.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                       | after median | criterion status |
+| ----------------------------------------- | -----------: | ---------------- |
+| `sqlite/scan_keys_only/1k`                |    2.4932 ms | -6.0%, within noise threshold |
+| `sqlite/scan_headers_only/1k`             |    2.5955 ms | no change |
+| `sqlite/scan_full_rows/1k`                |    3.7797 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k`  |    3.7925 ms | improved, likely noisy control |
+| `rocksdb/scan_keys_only/1k`               |    1.5304 ms | no change |
+| `rocksdb/scan_headers_only/1k`            |    1.5769 ms | no change |
+| `rocksdb/scan_full_rows/1k`               |    2.7634 ms | no change |
+| `rocksdb/prefix_scan_schema_file_null/1k` |    2.6894 ms | improved, likely noisy control |
+
+The structural improvement is real for projections without payload columns, but
+Criterion does not show a strong win on the 1k smoke fixture. Full-row scans are
+included as controls because they still use the JSON hydration path.
+
+### Storage
+
+No storage change.
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: infallible helper returned Result only to fit collect. Fixed by returning
+MaterializedTrackedStateRow directly and wrapping once at the call site.
+
+Recommendation: keep. This is an executor-style projection fast path: when no
+payload columns are requested, skip payload planning entirely.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine projected_scans_do_not_materialize_snapshot_when_snapshot_content_is_omitted --features storage-benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a narrow projection fast path.
+
+Primary axis: key/header scans. Structural win: no-payload projections now
+avoid payload planning rather than constructing empty JSON work and discovering
+there is nothing to load.
+
+Timing: modest/noisy on the current 1k fixture. This does not solve the
+remaining full-row scan or exact-get gap, but it removes unnecessary executor
+work for projected scans and keeps the read path moving toward column-aware
+materialization.
+
+No temporary shim.
+
+Next optimization should target full payload materialization or exact get_many:
+the remaining expensive rows still hydrate JSON and build full
+MaterializedTrackedStateRow objects.
+```

@@ -21,6 +21,13 @@ pub(crate) async fn materialize_index_entries<S>(
 where
     S: StorageReader,
 {
+    if !projection.snapshot_content && !projection.metadata {
+        return Ok(entries
+            .into_iter()
+            .map(materialize_entry_without_json)
+            .collect());
+    }
+
     let mut row_plans = Vec::with_capacity(entries.len());
     let mut json_refs = Vec::new();
     let mut json_ref_localities = Vec::new();
@@ -61,6 +68,23 @@ where
         .into_iter()
         .map(|plan| materialize_row_plan(plan, &json_refs, &mut json_values))
         .collect()
+}
+
+fn materialize_entry_without_json(
+    (key, value): (TrackedStateKey, TrackedStateIndexValue),
+) -> MaterializedTrackedStateRow {
+    MaterializedTrackedStateRow {
+        entity_id: key.entity_id,
+        schema_key: key.schema_key,
+        file_id: key.file_id,
+        snapshot_content: None,
+        metadata: None,
+        deleted: value.deleted,
+        created_at: value.created_at,
+        updated_at: value.updated_at,
+        change_id: value.change_locator.change_id,
+        commit_id: value.change_locator.source_commit_id,
+    }
 }
 
 struct MaterializedTrackedStateRowPlan {
