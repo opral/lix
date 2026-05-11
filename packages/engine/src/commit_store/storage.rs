@@ -44,7 +44,7 @@ pub(crate) fn stage_commit(
             crate::commit_store::codec::encode_change_pack(
                 commit.id,
                 SINGLE_PACK_ID,
-                authored_changes.iter().copied(),
+                &authored_changes,
             )?,
         );
         for (source_ordinal, change) in authored_changes.iter().enumerate() {

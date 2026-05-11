@@ -1980,3 +1980,87 @@ Next optimization needs a bigger write-side cut, likely in commit_store staging,
 JSON pack staging, or the transaction write-set path, because delta-pack
 encoding itself is no longer cloning the tracked projection rows first.
 ```
+
+## Optimization 11: Encode Change Packs From Existing Slices
+
+Date: 2026-05-10
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Changed `commit_store::codec::encode_change_pack` to accept
+`&[ChangeRef<'_>]` instead of a generic iterator that it immediately collected
+into a temporary `Vec`.
+
+The production caller already has authored changes in a `Vec`, so the encoder
+can read the count from the slice and encode refs directly in order. This
+removes one temporary collection from the commit-store write path.
+
+No storage format change.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates)/1k'
+```
+
+Result: passed.
+
+| row                                       | after median | criterion status |
+| ----------------------------------------- | -----------: | ---------------- |
+| `sqlite/write_root_all_rows/1k`           |    6.0937 ms | no change |
+| `sqlite/write_delta_10pct_updates/1k`     |    2.5978 ms | no change |
+| `rocksdb/write_root_all_rows/1k`          |    5.4208 ms | no change |
+| `rocksdb/write_delta_10pct_updates/1k`    |    1.3267 ms | no change |
+
+### Storage
+
+No storage change.
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+Recommendation: keep the code, but do not present it as a standalone
+budget-moving win. It is a clean write-path allocation cleanup with no measured
+Criterion win.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine commit_store:: --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a small encoder allocation cleanup.
+
+Primary axis: commit-store write packing. Structural win: encode from the
+already-shaped authored-change slice instead of materializing a second vector
+just to know the count.
+
+Timing: Criterion-neutral. This is not a budget-moving optimization by itself,
+but it composes with the borrowed tracked delta-pack encoder and keeps the
+write path moving away from temporary owned collections.
+
+No temporary shim.
+
+Next optimization needs a larger cut in JSON pack staging or transaction
+write-set application; the obvious per-row encoder clones in tracked and
+commit-store delta packing have now been reduced.
+```
