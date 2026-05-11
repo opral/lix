@@ -32,10 +32,11 @@ where
     let mut json_refs = Vec::new();
     let mut json_ref_localities = Vec::new();
     for (key, value) in entries {
+        let row_index = row_plans.len();
         let snapshot_ref_index = projected_json_ref_index(
             projection.snapshot_content,
             value.snapshot_ref,
-            &value.change_locator.source_commit_id,
+            row_index,
             value.change_locator.source_pack_id,
             &mut json_refs,
             &mut json_ref_localities,
@@ -43,7 +44,7 @@ where
         let metadata_ref_index = projected_json_ref_index(
             projection.metadata,
             value.metadata_ref,
-            &value.change_locator.source_commit_id,
+            row_index,
             value.change_locator.source_pack_id,
             &mut json_refs,
             &mut json_ref_localities,
@@ -63,7 +64,7 @@ where
     }
 
     let mut json_values =
-        load_projection_json_values(store, &json_refs, &json_ref_localities).await?;
+        load_projection_json_values(store, &json_refs, &json_ref_localities, &row_plans).await?;
     row_plans
         .into_iter()
         .map(|plan| materialize_row_plan(plan, &json_refs, &mut json_values))
@@ -103,30 +104,36 @@ struct MaterializedTrackedStateRowPlan {
 fn projected_json_ref_index(
     include: bool,
     json_ref: Option<JsonRef>,
-    commit_id: &str,
+    row_index: usize,
     pack_id: u32,
     json_refs: &mut Vec<JsonRef>,
-    json_ref_localities: &mut Vec<(String, u32)>,
+    json_ref_localities: &mut Vec<JsonRefLocality>,
 ) -> Option<usize> {
     if !include {
         return None;
     }
     let index = json_refs.len();
     json_refs.push(json_ref?);
-    json_ref_localities.push((commit_id.to_string(), pack_id));
+    json_ref_localities.push(JsonRefLocality { row_index, pack_id });
     Some(index)
+}
+
+struct JsonRefLocality {
+    row_index: usize,
+    pack_id: u32,
 }
 
 async fn load_projection_json_values<S>(
     store: &mut S,
     json_refs: &[JsonRef],
-    json_ref_localities: &[(String, u32)],
+    json_ref_localities: &[JsonRefLocality],
+    row_plans: &[MaterializedTrackedStateRowPlan],
 ) -> Result<Vec<Option<Vec<u8>>>, LixError>
 where
     S: StorageReader,
 {
     let mut json_values = vec![None; json_refs.len()];
-    let mut refs_by_pack = BTreeMap::<(String, u32), Vec<(usize, JsonRef)>>::new();
+    let mut refs_by_pack = BTreeMap::<(&str, u32), Vec<(usize, JsonRef)>>::new();
     for (index, json_ref) in json_refs.iter().copied().enumerate() {
         let locality = json_ref_localities.get(index).ok_or_else(|| {
             LixError::new(
@@ -134,8 +141,14 @@ where
                 "tracked_state materialization lost JSON locality index",
             )
         })?;
+        let row_plan = row_plans.get(locality.row_index).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state materialization lost JSON row locality index",
+            )
+        })?;
         refs_by_pack
-            .entry(locality.clone())
+            .entry((row_plan.commit_id.as_str(), locality.pack_id))
             .or_default()
             .push((index, json_ref));
     }

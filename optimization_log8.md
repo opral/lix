@@ -1671,3 +1671,99 @@ Next optimization should target full payload materialization or exact get_many:
 the remaining expensive rows still hydrate JSON and build full
 MaterializedTrackedStateRow objects.
 ```
+
+## Optimization 8: Store JSON Locality as Row-Plan Indexes
+
+Date: 2026-05-10
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Changed full tracked-state payload materialization to keep JSON ref locality as
+compact row-plan indexes instead of cloning commit ids per projected JSON ref.
+
+Before this change, `materialize_index_entries` stored
+`json_ref_localities: Vec<(String, u32)>`. Each projected `snapshot_content` or
+`metadata` ref cloned `value.change_locator.source_commit_id` just so
+`load_projection_json_values` could group refs by commit pack.
+
+Row plans already own the same `commit_id`. The locality vector now stores a
+small `JsonRefLocality { row_index, pack_id }`, and the grouping step borrows
+`row_plans[row_index].commit_id.as_str()` while loading JSON values.
+
+No storage/API behavior change.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                       | after median | criterion status |
+| ----------------------------------------- | -----------: | ---------------- |
+| `sqlite/get_many_exact_keys/1k`           |    3.9197 ms | no change |
+| `sqlite/scan_full_rows/1k`                |    3.8695 ms | no change |
+| `sqlite/prefix_scan_schema/1k`            |    3.7669 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k`  |    3.7631 ms | no change |
+| `rocksdb/get_many_exact_keys/1k`          |    3.0397 ms | no change |
+| `rocksdb/scan_full_rows/1k`               |    2.7001 ms | no change |
+| `rocksdb/prefix_scan_schema/1k`           |    2.7920 ms | no change |
+| `rocksdb/prefix_scan_schema_file_null/1k` |    2.6921 ms | no change |
+
+SQLite exact gets moved lower in this sample than the previous committed log,
+but Criterion still reports no change. Treat this as an allocation cleanup, not
+a proven runtime win.
+
+### Storage
+
+No storage change.
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: parallel arrays plus row_plans are correct but coupled; use a small
+JsonRefLocality struct to make the invariant clearer. Fixed.
+
+Recommendation: keep. Locality is now an index into already-owned row-plan data
+rather than repeated commit-id allocation.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a small allocation cleanup in the payload materialization path.
+
+Primary axis: full-row materialization allocation pressure. Structural win:
+JSON locality now uses compact indexes into existing row-plan ownership, which
+matches the broader direction of carrying offsets/indexes beside payload
+metadata instead of duplicating identifying strings.
+
+Timing: Criterion-neutral on the 1k fixture. This is not enough to close the
+remaining <= 1.5x exact/full read gap.
+
+No temporary shim.
+
+Next optimization still needs a larger cut in JSON hydration or row
+construction. The obvious remaining cost is that full reads still allocate a
+MaterializedTrackedStateRow per row and convert every JSON payload to String.
+```
