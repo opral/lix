@@ -1414,3 +1414,156 @@ avoiding full row object construction where callers only need counts or using a
 more borrowed/streamed row materialization path without changing benchmark
 semantics.
 ```
+
+## Optimization 6: Make By-File Roots a Concrete-File Partial Index
+
+Date: 2026-05-10
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Changed the tracked-state by-file secondary tree into an explicit partial
+index for concrete `file_id` values only.
+
+`ByFileIndex::should_use` now returns true only when every file filter is a
+concrete `NullableKeyFilter::Value(_)`. Null-only and mixed null/concrete scans
+use the primary tracked tree, whose key layout covers both null and concrete
+file ids.
+
+`stage_projection_root` now writes the primary root for every projected commit
+but stages a by-file root only when needed:
+
+- no parent by-file root and no concrete-file deltas: do not stage a by-file
+  root;
+- parent by-file root and no concrete-file deltas: inherit the parent by-file
+  root with zero chunk puts;
+- concrete-file deltas: apply only those deltas to the by-file root.
+
+This matches the physical predicate of the secondary index with the planner
+predicate that is allowed to use it. It also avoids carrying null-file entries
+in a secondary tree that the planner never uses for null-file filters.
+
+Added regression coverage for:
+
+- null-file rows not staging a by-file root;
+- a null-only parent plus concrete-file child scanned with mixed
+  `[Null, Value(file)]` filters, which must use the primary tree and return
+  both inherited null rows and concrete child rows.
+
+### Benchmarks
+
+Focused command before the final concrete-only cleanup:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|prefix_scan_schema_file_null|scan_full_rows)/1k'
+```
+
+Result: passed.
+
+| row                                             | after median | criterion status |
+| ----------------------------------------------- | -----------: | ---------------- |
+| `raw_sqlite/write_root_all_rows/1k`             |    2.9524 ms | noisy baseline |
+| `raw_sqlite/scan_full_rows/1k`                  |    1.2119 ms | reference |
+| `raw_sqlite/prefix_scan_schema_file_null/1k`    |    1.4604 ms | reference |
+| `sqlite/write_root_all_rows/1k`                 |    6.2808 ms | no change |
+| `sqlite/scan_full_rows/1k`                      |    3.8271 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k`        |    4.0401 ms | no change |
+| `rocksdb/write_root_all_rows/1k`                |    5.4735 ms | no change |
+| `rocksdb/scan_full_rows/1k`                     |    2.7509 ms | no change |
+| `rocksdb/prefix_scan_schema_file_null/1k`       |    2.7411 ms | no change |
+
+This is not a runtime win for the current JSON-pointer smoke rows.
+`write_root_all_rows` uses delta staging rather than projection-root staging,
+and the benchmark rows have `file_id = None`.
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+Final repeated 1k storage rows:
+
+| row                                     | bytes | bytes/row | status |
+| --------------------------------------- | ----: | --------: | ------ |
+| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
+| Lix SQLite / inserted                   | 1112216 | 1112.2 | unchanged |
+| Lix SQLite / after create_version       | 1124576 | 1124.6 | unchanged |
+| Lix SQLite / after fast-forward merge   | 5324328 | 5324.3 | unchanged from Optimization 4/5 shape |
+| Lix SQLite / after divergent merge      | 5652176 | 5652.2 | unchanged from Optimization 4/5 shape |
+| Lix RocksDB / inserted                  | 1028557 | 1028.6 | unchanged |
+| Lix RocksDB / after create_version      | 1030457 | 1030.5 | unchanged |
+| Lix RocksDB / after fast-forward merge  | 1195234 | 1195.2 | unchanged |
+| Lix RocksDB / after divergent merge     | 1576587 | 1576.6 | effectively unchanged |
+
+An earlier storage sample before the concrete-only write cleanup showed lower
+SQLite merge-state bytes, but repeated final runs returned to the prior
+committed SQLite shape. Treat this optimization as storage-neutral for the
+current JSON-pointer accounting fixture.
+
+### Review Loop
+
+Reviewer pass 1:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: scan_request_from_tracked still looked more general than the all-concrete
+planner contract. Fixed with debug assertion and Value-only mapping.
+LOW: add the mixed Null + Value regression case. Fixed.
+LOW: once a by-file root exists, null-file rows were still indexed. Fixed by
+making by-file writes concrete-file-only and inheriting unchanged roots.
+
+Recommendation: keep.
+```
+
+Reviewer pass 2:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: encode_key_ref could still encode file_id = None. Fixed with a debug
+assertion at the helper boundary.
+
+Recommendation: keep. The result is a coherent partial secondary index:
+concrete-only on writes, concrete-only on reads, with safe parent-root
+inheritance.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|prefix_scan_schema_file_null|scan_full_rows)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a physical-layout cleanup, not as a budget-moving benchmark win.
+
+Primary axis: secondary-index shape. Structural win: by-file roots now behave
+like a partial secondary index whose physical contents and planner predicate
+agree. This prevents null-file rows from being copied into a secondary tree that
+cannot answer null-file scans safely, and it removes the old missing-root
+empty-result behavior for projected reads.
+
+Timing/storage: neutral on the current JSON-pointer fixture. This does not move
+the remaining <= 1.5x runtime target or the SQLite merge-state storage issue.
+
+No temporary shim.
+
+Next optimization should return to budget-moving read/write costs: either the
+primary tracked-tree write path for full-root materialization, or row
+materialization/allocation in exact and scan reads.
+```
