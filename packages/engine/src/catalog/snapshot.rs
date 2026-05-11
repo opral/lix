@@ -11,34 +11,36 @@ use crate::schema::{compile_lix_schema, validate_schema_amendment, SchemaKey};
 use crate::LixError;
 
 #[derive(Default)]
-pub(crate) struct SchemaCatalog {
-    entries: Vec<SchemaCatalogEntry>,
+pub(crate) struct CatalogSnapshot {
+    entries: Vec<CatalogEntry>,
     plans: Vec<SchemaPlan>,
     by_key: BTreeMap<SchemaCatalogKey, SchemaPlanId>,
     by_identity: BTreeMap<DomainSchemaIdentity, SchemaPlanId>,
-    fingerprint: SchemaCatalogFingerprint,
+    delete_references_by_target: BTreeMap<SchemaCatalogKey, Vec<DeleteReferencePlan>>,
+    state_delete_references: Vec<StateDeleteReferencePlan>,
+    fingerprint: CatalogFingerprint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SchemaCatalogEntry {
+struct CatalogEntry {
     identity: DomainSchemaIdentity,
     key: SchemaCatalogKey,
     schema: JsonValue,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct SchemaCatalogFingerprint(String);
+pub(crate) struct CatalogFingerprint(String);
 
-impl std::fmt::Debug for SchemaCatalog {
+impl std::fmt::Debug for CatalogSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SchemaCatalog")
+        f.debug_struct("CatalogSnapshot")
             .field("plan_count", &self.plans.len())
             .field("keys", &self.by_key.keys().collect::<Vec<_>>())
             .finish()
     }
 }
 
-impl SchemaCatalog {
+impl CatalogSnapshot {
     #[cfg(test)]
     pub(crate) fn from_visible_schemas(visible_schemas: &[JsonValue]) -> Result<Self, LixError> {
         let mut catalog = Self::default();
@@ -58,7 +60,7 @@ impl SchemaCatalog {
     pub(crate) fn from_schema_facts(facts: &[SchemaCatalogFact]) -> Result<Self, LixError> {
         let entries = facts
             .iter()
-            .map(|fact| SchemaCatalogEntry {
+            .map(|fact| CatalogEntry {
                 identity: fact.identity.clone(),
                 key: fact.catalog_key.clone(),
                 schema: fact.schema.clone(),
@@ -68,7 +70,7 @@ impl SchemaCatalog {
     }
 
     #[cfg(test)]
-    pub(crate) fn fingerprint(&self) -> &SchemaCatalogFingerprint {
+    pub(crate) fn fingerprint(&self) -> &CatalogFingerprint {
         &self.fingerprint
     }
 
@@ -94,7 +96,7 @@ impl SchemaCatalog {
         Ok(self.by_identity.get(&identity).copied().unwrap_or(plan_id))
     }
 
-    fn from_entries(entries: Vec<SchemaCatalogEntry>) -> Result<Self, LixError> {
+    fn from_entries(entries: Vec<CatalogEntry>) -> Result<Self, LixError> {
         let mut catalog = Self::default();
         for entry in entries {
             catalog.remember_schema_identity(entry.identity, entry.key, entry.schema)?;
@@ -139,7 +141,7 @@ impl SchemaCatalog {
         let plan_id = SchemaPlanId(self.entries.len() as u32);
         self.by_key.insert(key.clone(), plan_id);
         self.by_identity.insert(identity.clone(), plan_id);
-        self.entries.push(SchemaCatalogEntry {
+        self.entries.push(CatalogEntry {
             identity,
             key,
             schema,
@@ -166,11 +168,37 @@ impl SchemaCatalog {
             })
             .collect::<Result<Vec<_>, _>>()?;
         self.plans = plans;
+        self.rebuild_delete_plans();
         self.fingerprint = self.compute_fingerprint()?;
         Ok(())
     }
 
-    fn compute_fingerprint(&self) -> Result<SchemaCatalogFingerprint, LixError> {
+    fn rebuild_delete_plans(&mut self) {
+        let mut delete_references_by_target =
+            BTreeMap::<SchemaCatalogKey, Vec<DeleteReferencePlan>>::new();
+        let mut state_delete_references = Vec::<StateDeleteReferencePlan>::new();
+        for source_plan in &self.plans {
+            for foreign_key in &source_plan.foreign_keys {
+                delete_references_by_target
+                    .entry(foreign_key.referenced_schema.clone())
+                    .or_default()
+                    .push(DeleteReferencePlan {
+                        source_key: source_plan.key.clone(),
+                        foreign_key: foreign_key.clone(),
+                    });
+            }
+            for foreign_key in &source_plan.state_foreign_keys {
+                state_delete_references.push(StateDeleteReferencePlan {
+                    source_key: source_plan.key.clone(),
+                    foreign_key: foreign_key.clone(),
+                });
+            }
+        }
+        self.delete_references_by_target = delete_references_by_target;
+        self.state_delete_references = state_delete_references;
+    }
+
+    fn compute_fingerprint(&self) -> Result<CatalogFingerprint, LixError> {
         let mut hasher = blake3::Hasher::new();
         let mut entries = self.entries.iter().collect::<Vec<_>>();
         entries.sort_by(|left, right| left.identity.cmp(&right.identity));
@@ -185,9 +213,7 @@ impl SchemaCatalog {
             })?;
             hash_fingerprint_part(&mut hasher, &canonical_schema);
         }
-        Ok(SchemaCatalogFingerprint(
-            hasher.finalize().to_hex().to_string(),
-        ))
+        Ok(CatalogFingerprint(hasher.finalize().to_hex().to_string()))
     }
 
     #[cfg(test)]
@@ -215,6 +241,20 @@ impl SchemaCatalog {
         let plan_id = *self.by_key.get(&key)?;
         let plan = self.plan(plan_id)?;
         Some((plan_id, plan))
+    }
+
+    pub(crate) fn delete_plan_for_key(&self, schema_key: &str) -> DeleteValidationPlan<'_> {
+        let key = SchemaCatalogKey {
+            schema_key: schema_key.to_string(),
+        };
+        DeleteValidationPlan {
+            foreign_key_references: self
+                .delete_references_by_target
+                .get(&key)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            state_foreign_key_references: self.state_delete_references.as_slice(),
+        }
     }
 }
 
@@ -375,13 +415,37 @@ pub(crate) struct ForeignKeyPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeleteReferencePlan {
+    pub(crate) source_key: SchemaCatalogKey,
+    pub(crate) foreign_key: ForeignKeyPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct StateDeleteReferencePlan {
+    pub(crate) source_key: SchemaCatalogKey,
+    pub(crate) foreign_key: StateForeignKeyPlan,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeleteValidationPlan<'a> {
+    pub(crate) foreign_key_references: &'a [DeleteReferencePlan],
+    pub(crate) state_foreign_key_references: &'a [StateDeleteReferencePlan],
+}
+
+impl DeleteValidationPlan<'_> {
+    pub(crate) fn has_committed_checks(self) -> bool {
+        !self.foreign_key_references.is_empty() || !self.state_foreign_key_references.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct UnboundForeignKeyPlan {
     local_properties: PointerGroup,
     referenced_schema: SchemaCatalogKey,
     referenced_properties: PointerGroup,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct StateForeignKeyPlan {
     /// Slot [0] in `x-lix-state-foreign-keys`: local pointer to the target entity_id.
     pub(crate) entity_id_property: Vec<String>,
@@ -872,7 +936,7 @@ mod tests {
             schema_json("example_schema"),
         );
 
-        let error = SchemaCatalog::from_schema_facts(&[tracked, untracked])
+        let error = CatalogSnapshot::from_schema_facts(&[tracked, untracked])
             .expect_err("same schema key in two reachable domains is ambiguous");
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
@@ -881,7 +945,7 @@ mod tests {
 
     #[test]
     fn insert_schema_for_domain_is_atomic_when_binding_fails() {
-        let mut catalog = SchemaCatalog::from_schema_facts(&[SchemaCatalogFact::new(
+        let mut catalog = CatalogSnapshot::from_schema_facts(&[SchemaCatalogFact::new(
             Domain::schema_catalog("main", false),
             SchemaKey::new("base_schema"),
             schema_json("base_schema"),
@@ -917,12 +981,84 @@ mod tests {
             child_schema_json("child_schema", "parent_schema"),
         );
 
-        let parent_first = SchemaCatalog::from_schema_facts(&[parent.clone(), child.clone()])
+        let parent_first = CatalogSnapshot::from_schema_facts(&[parent.clone(), child.clone()])
             .expect("parent-first facts should bind");
-        let child_first = SchemaCatalog::from_schema_facts(&[child, parent])
+        let child_first = CatalogSnapshot::from_schema_facts(&[child, parent])
             .expect("child-first facts should bind as the same domain snapshot");
 
         assert_eq!(parent_first.fingerprint(), child_first.fingerprint());
+    }
+
+    #[test]
+    fn delete_plan_has_no_committed_checks_for_unreferenced_schema() {
+        let catalog = CatalogSnapshot::from_schema_facts(&[SchemaCatalogFact::new(
+            Domain::schema_catalog("main", false),
+            SchemaKey::new("standalone_schema"),
+            schema_json("standalone_schema"),
+        )])
+        .expect("catalog should bind");
+
+        let delete_plan = catalog.delete_plan_for_key("standalone_schema");
+
+        assert!(!delete_plan.has_committed_checks());
+        assert!(delete_plan.foreign_key_references.is_empty());
+        assert!(delete_plan.state_foreign_key_references.is_empty());
+    }
+
+    #[test]
+    fn delete_plan_indexes_foreign_keys_by_referenced_schema() {
+        let parent = SchemaCatalogFact::new(
+            Domain::schema_catalog("main", false),
+            SchemaKey::new("parent_schema"),
+            schema_json("parent_schema"),
+        );
+        let child = SchemaCatalogFact::new(
+            Domain::schema_catalog("main", false),
+            SchemaKey::new("child_schema"),
+            child_schema_json("child_schema", "parent_schema"),
+        );
+        let catalog =
+            CatalogSnapshot::from_schema_facts(&[parent, child]).expect("catalog should bind");
+
+        let parent_delete_plan = catalog.delete_plan_for_key("parent_schema");
+        let child_delete_plan = catalog.delete_plan_for_key("child_schema");
+
+        assert!(parent_delete_plan.has_committed_checks());
+        assert_eq!(parent_delete_plan.foreign_key_references.len(), 1);
+        assert_eq!(
+            parent_delete_plan.foreign_key_references[0]
+                .source_key
+                .schema_key,
+            "child_schema"
+        );
+        assert!(!child_delete_plan.has_committed_checks());
+    }
+
+    #[test]
+    fn delete_plan_conservatively_applies_state_foreign_keys_to_every_schema() {
+        let target = SchemaCatalogFact::new(
+            Domain::schema_catalog("main", false),
+            SchemaKey::new("target_schema"),
+            schema_json("target_schema"),
+        );
+        let source = SchemaCatalogFact::new(
+            Domain::schema_catalog("main", false),
+            SchemaKey::new("state_fk_schema"),
+            state_fk_schema_json("state_fk_schema"),
+        );
+        let catalog =
+            CatalogSnapshot::from_schema_facts(&[target, source]).expect("catalog should bind");
+
+        let target_delete_plan = catalog.delete_plan_for_key("target_schema");
+
+        assert!(target_delete_plan.has_committed_checks());
+        assert_eq!(target_delete_plan.state_foreign_key_references.len(), 1);
+        assert_eq!(
+            target_delete_plan.state_foreign_key_references[0]
+                .source_key
+                .schema_key,
+            "state_fk_schema"
+        );
     }
 
     fn schema_json(schema_key: &str) -> JsonValue {
@@ -955,6 +1091,23 @@ mod tests {
                 "parent_id": { "type": "string" }
             },
             "required": ["id", "parent_id"],
+            "additionalProperties": false
+        })
+    }
+
+    fn state_fk_schema_json(schema_key: &str) -> JsonValue {
+        json!({
+            "x-lix-key": schema_key,
+            "x-lix-primary-key": ["/id"],
+            "x-lix-state-foreign-keys": [["/target_id", "/target_schema", "/target_file"]],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "target_id": { "type": "string" },
+                "target_schema": { "type": "string" },
+                "target_file": { "type": ["string", "null"] }
+            },
+            "required": ["id", "target_id", "target_schema", "target_file"],
             "additionalProperties": false
         })
     }

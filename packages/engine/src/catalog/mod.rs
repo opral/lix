@@ -1,8 +1,10 @@
-mod catalog;
 mod context;
+mod schema;
+mod snapshot;
 
-pub(crate) use catalog::{
-    ForeignKeyPlan, SchemaCatalog, SchemaCatalogFact, SchemaCatalogKey, SchemaPlan, SchemaPlanId,
+pub(crate) use context::CatalogContext;
+pub(crate) use schema::{
+    ForeignKeyPlan, SchemaCatalogFact, SchemaCatalogKey, SchemaPlan, SchemaPlanId,
     StateForeignKeyPlan,
 };
-pub(crate) use context::SchemaCatalogContext;
+pub(crate) use snapshot::{CatalogSnapshot, StateDeleteReferencePlan};

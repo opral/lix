@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::binary_cas::BinaryCasContext;
-use crate::catalog::SchemaCatalogContext;
+use crate::catalog::CatalogContext;
 use crate::commit_graph::CommitGraphContext;
 use crate::commit_store::CommitStoreContext;
 use crate::entity_identity::EntityIdentity;
@@ -24,7 +24,7 @@ pub struct Engine {
     version_ctx: Arc<VersionContext>,
     binary_cas: Arc<BinaryCasContext>,
     commit_store: Arc<CommitStoreContext>,
-    schema_catalog_context: Arc<SchemaCatalogContext>,
+    catalog_context: Arc<CatalogContext>,
 }
 
 impl Engine {
@@ -80,7 +80,7 @@ impl Engine {
             tracked_state,
             live_state,
             version_ctx,
-            schema_catalog_context: Arc::new(SchemaCatalogContext::new()),
+            catalog_context: Arc::new(CatalogContext::new()),
         })
     }
 
@@ -127,7 +127,7 @@ impl Engine {
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
-            Arc::clone(&self.schema_catalog_context),
+            Arc::clone(&self.catalog_context),
         )
         .await
     }
@@ -140,7 +140,7 @@ impl Engine {
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
-            Arc::clone(&self.schema_catalog_context),
+            Arc::clone(&self.catalog_context),
         )
         .await
     }

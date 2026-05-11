@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value as JsonValue;
 
 use crate::catalog::{
-    ForeignKeyPlan, SchemaCatalog, SchemaCatalogKey, SchemaPlan, StateForeignKeyPlan,
+    CatalogSnapshot, ForeignKeyPlan, SchemaCatalogKey, SchemaPlan, StateDeleteReferencePlan,
+    StateForeignKeyPlan,
 };
 use crate::common::format_json_pointer;
 #[cfg(test)]
@@ -47,14 +48,14 @@ const MAX_DIRECTORY_PARENT_DEPTH: usize = 1024;
 /// state, or binary CAS writes are flushed.
 pub(crate) struct TransactionValidationInput<'a> {
     staged_writes: &'a PreparedWriteValidationSet<'a>,
-    schema_catalog: &'a SchemaCatalog,
+    schema_catalog: &'a CatalogSnapshot,
     live_state: &'a dyn LiveStateReader,
 }
 
 impl<'a> TransactionValidationInput<'a> {
     pub(crate) fn new(
         staged_writes: &'a PreparedWriteValidationSet<'a>,
-        schema_catalog: &'a SchemaCatalog,
+        schema_catalog: &'a CatalogSnapshot,
         live_state: &'a dyn LiveStateReader,
     ) -> Self {
         Self {
@@ -71,7 +72,7 @@ impl<'a> TransactionValidationInput<'a> {
         live_state: &'a dyn LiveStateReader,
     ) -> Self {
         let catalog = Box::leak(Box::new(
-            SchemaCatalog::from_visible_schemas(visible_schemas)
+            CatalogSnapshot::from_visible_schemas(visible_schemas)
                 .expect("test schema catalog should build"),
         ));
         let validation_set = Box::leak(Box::new(staged_writes.validation_set_for_tests()));
@@ -1090,7 +1091,7 @@ impl PendingSchemaDomains {
 }
 
 fn schema_plan_for_row<'a>(
-    schema_catalog: &'a SchemaCatalog,
+    schema_catalog: &'a CatalogSnapshot,
     pending_schema_domains: &PendingSchemaDomains,
     row: PreparedValidationRow<'_>,
 ) -> Result<&'a SchemaPlan, LixError> {
@@ -1515,7 +1516,7 @@ enum PendingForeignKeyReferenceTarget {
 }
 
 fn validate_pending_delete_restrictions(
-    schema_catalog: &SchemaCatalog,
+    schema_catalog: &CatalogSnapshot,
     pending_constraints: &PendingConstraintIndexes,
 ) -> Result<(), LixError> {
     for tombstone in &pending_constraints.tombstones {
@@ -1606,36 +1607,53 @@ fn pending_foreign_key_reference_target_description(
 
 async fn validate_committed_delete_restrictions(
     input: &TransactionValidationInput<'_>,
-    schema_catalog: &SchemaCatalog,
+    schema_catalog: &CatalogSnapshot,
     pending_constraints: &PendingConstraintIndexes,
 ) -> Result<(), LixError> {
+    let mut state_batches =
+        BTreeMap::<StateDeleteRestrictionBatchKey, Vec<DomainRowIdentity>>::new();
     for tombstone in &pending_constraints.tombstones {
-        for source_plan in schema_catalog.plans() {
-            for foreign_key in &source_plan.foreign_keys {
-                if foreign_key.referenced_schema.schema_key == tombstone.identity.schema_key() {
-                    validate_committed_normal_delete_restriction(
-                        input.live_state,
-                        pending_constraints,
-                        tombstone,
-                        &source_plan.key,
-                        foreign_key,
-                    )
-                    .await?;
-                }
-            }
-            for foreign_key in &source_plan.state_foreign_keys {
-                validate_committed_state_surface_delete_restriction(
-                    input.live_state,
-                    pending_constraints,
-                    tombstone,
-                    &source_plan.key,
-                    foreign_key,
-                )
-                .await?;
+        let delete_plan = schema_catalog.delete_plan_for_key(tombstone.identity.schema_key());
+        if !delete_plan.has_committed_checks() {
+            continue;
+        }
+        for reference in delete_plan.foreign_key_references {
+            validate_committed_normal_delete_restriction(
+                input.live_state,
+                pending_constraints,
+                tombstone,
+                &reference.source_key,
+                &reference.foreign_key,
+            )
+            .await?;
+        }
+        for reference in delete_plan.state_foreign_key_references {
+            for source_domain in tombstone.identity.domain().fk_source_domains_for_target() {
+                state_batches
+                    .entry(StateDeleteRestrictionBatchKey {
+                        source_key: reference.source_key.clone(),
+                        source_domain: source_domain.with_file_scope(DomainFileScope::Any),
+                        foreign_key: reference.clone(),
+                    })
+                    .or_default()
+                    .push(tombstone.identity.clone());
             }
         }
     }
+    validate_committed_state_surface_delete_restriction_batches(
+        input.live_state,
+        pending_constraints,
+        state_batches,
+    )
+    .await?;
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct StateDeleteRestrictionBatchKey {
+    source_key: SchemaCatalogKey,
+    source_domain: Domain,
+    foreign_key: StateDeleteReferencePlan,
 }
 
 async fn validate_file_descriptor_delete_restrictions(
@@ -1733,19 +1751,16 @@ async fn validate_committed_normal_delete_restriction(
     Ok(())
 }
 
-async fn validate_committed_state_surface_delete_restriction(
+async fn validate_committed_state_surface_delete_restriction_batches(
     live_state: &dyn LiveStateReader,
     pending_constraints: &PendingConstraintIndexes,
-    tombstone: &PendingTombstone,
-    source_key: &SchemaCatalogKey,
-    foreign_key: &StateForeignKeyPlan,
+    batches: BTreeMap<StateDeleteRestrictionBatchKey, Vec<DomainRowIdentity>>,
 ) -> Result<(), LixError> {
-    for source_domain in tombstone.identity.domain().fk_source_domains_for_target() {
-        let source_domain = source_domain.with_file_scope(DomainFileScope::Any);
+    for (batch, tombstones) in batches {
         let rows = scan_committed_constraint_rows(
             live_state,
-            &source_domain,
-            vec![source_key.schema_key.clone()],
+            &batch.source_domain,
+            vec![batch.source_key.schema_key.clone()],
             Vec::new(),
             false,
         )
@@ -1759,18 +1774,23 @@ async fn validate_committed_state_surface_delete_restriction(
                 continue;
             };
             let snapshot = parse_committed_snapshot(&row, snapshot_content)?;
-            let target_identity =
-                state_surface_target_identity(Domain::for_live_row(&row), foreign_key, &snapshot)?;
-            if target_identity
-                .reachable_target_identities()
-                .contains(&tombstone.identity)
-            {
-                return Err(committed_delete_restriction_error(
-                    &tombstone.identity,
-                    &row,
-                    &foreign_key.local_properties(),
-                )?);
-            }
+            let target_identity = state_surface_target_identity(
+                Domain::for_live_row(&row),
+                &batch.foreign_key.foreign_key,
+                &snapshot,
+            )?;
+            let Some(tombstone) = tombstones.iter().find(|tombstone| {
+                target_identity
+                    .reachable_target_identities()
+                    .contains(*tombstone)
+            }) else {
+                continue;
+            };
+            return Err(committed_delete_restriction_error(
+                tombstone,
+                &row,
+                &batch.foreign_key.foreign_key.local_properties(),
+            )?);
         }
     }
     Ok(())
@@ -2364,7 +2384,7 @@ fn primary_key_identity_error(
 }
 
 fn validate_foreign_key_definition(
-    catalog: &SchemaCatalog,
+    catalog: &CatalogSnapshot,
     source_key: &SchemaCatalogKey,
     source_schema: &JsonValue,
     foreign_key: &ForeignKeyPlan,
@@ -2503,7 +2523,7 @@ fn referenced_properties_are_keyed(
         .any(|unique_group| unique_group == referenced_properties)
 }
 
-fn validate_foreign_key_definitions(catalog: &SchemaCatalog) -> Result<(), LixError> {
+fn validate_foreign_key_definitions(catalog: &CatalogSnapshot) -> Result<(), LixError> {
     for plan in catalog.plans() {
         for foreign_key in &plan.foreign_keys {
             validate_foreign_key_definition(catalog, &plan.key, plan.schema.as_ref(), foreign_key)?;
@@ -2601,7 +2621,7 @@ mod tests {
             _ => vec![schema],
         };
         let catalog = Box::leak(Box::new(
-            SchemaCatalog::from_visible_schemas(&visible_schemas)
+            CatalogSnapshot::from_visible_schemas(&visible_schemas)
                 .expect("test schema plan catalog should build"),
         ));
         catalog
@@ -2646,7 +2666,7 @@ mod tests {
 
     fn catalog_from_transaction_input<'a>(
         input: &'a TransactionValidationInput<'a>,
-    ) -> Result<&'a SchemaCatalog, LixError> {
+    ) -> Result<&'a CatalogSnapshot, LixError> {
         validate_foreign_key_definitions(input.schema_catalog)?;
         Ok(input.schema_catalog)
     }
@@ -2654,7 +2674,7 @@ mod tests {
     fn catalog_from_transaction_parts(
         staged_writes: &PreparedWriteSet,
         visible_schemas: &[JsonValue],
-    ) -> Result<SchemaCatalog, LixError> {
+    ) -> Result<CatalogSnapshot, LixError> {
         let catalog = catalog_from_transaction_parts_unchecked(staged_writes, visible_schemas)?;
         let mut pending_keys =
             BTreeMap::<SchemaCatalogKey, crate::entity_identity::EntityIdentity>::new();
@@ -2700,8 +2720,8 @@ mod tests {
     fn catalog_from_transaction_parts_unchecked(
         staged_writes: &PreparedWriteSet,
         visible_schemas: &[JsonValue],
-    ) -> Result<SchemaCatalog, LixError> {
-        let mut catalog = SchemaCatalog::from_visible_schemas(visible_schemas)?;
+    ) -> Result<CatalogSnapshot, LixError> {
+        let mut catalog = CatalogSnapshot::from_visible_schemas(visible_schemas)?;
         for row in staged_writes
             .validation_rows()
             .filter(|row| row.schema_key() == REGISTERED_SCHEMA_KEY)

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::catalog::{SchemaCatalog, SchemaPlan, SchemaPlanId};
+use crate::catalog::{CatalogSnapshot, SchemaPlan, SchemaPlanId};
 use crate::common::format_json_pointer;
 use crate::common::normalize_path_segment;
 use crate::domain::Domain;
@@ -40,7 +40,7 @@ pub(crate) struct NormalizedTransactionWriteRow {
 /// normalization has produced the final identity.
 pub(crate) fn normalize_transaction_write_row(
     mut row: TransactionWriteRow,
-    schema_catalog: &mut SchemaCatalog,
+    schema_catalog: &mut CatalogSnapshot,
     functions: FunctionProviderHandle,
 ) -> Result<NormalizedTransactionWriteRow, LixError> {
     validate_transaction_write_row_schema_identity(&row)?;
@@ -276,7 +276,7 @@ fn entity_id_derivation_error(
 pub(crate) fn remember_pending_registered_schema(
     snapshot: Option<&JsonValue>,
     domain: Domain,
-    schema_catalog: &mut SchemaCatalog,
+    schema_catalog: &mut CatalogSnapshot,
 ) -> Result<(), LixError> {
     let Some(snapshot) = snapshot else {
         return Err(LixError::new(
@@ -701,7 +701,7 @@ mod tests {
             .value()
     }
 
-    fn catalog_with(schemas: Vec<JsonValue>) -> SchemaCatalog {
+    fn catalog_with(schemas: Vec<JsonValue>) -> CatalogSnapshot {
         let mut visible_schemas = schemas;
         if visible_schemas.iter().any(|schema| {
             schema.get("x-lix-key").and_then(JsonValue::as_str) == Some(FILE_DESCRIPTOR_SCHEMA_KEY)
@@ -711,7 +711,7 @@ mod tests {
         }) {
             visible_schemas.push(builtin_schema(DIRECTORY_DESCRIPTOR_SCHEMA_KEY));
         }
-        SchemaCatalog::from_visible_schemas(&visible_schemas).expect("catalog")
+        CatalogSnapshot::from_visible_schemas(&visible_schemas).expect("catalog")
     }
 
     fn builtin_schema(schema_key: &str) -> JsonValue {

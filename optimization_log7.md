@@ -274,8 +274,7 @@ the scan/read primitives.
 The E2E CRUD rows show the current pressure from the typed-table surface:
 inserts are hundreds of milliseconds at 1000 rows and bulk deletes are seconds,
 with much steeper 100-to-1000 growth than raw SQLite. Single-row PK operations
-are now measured as one row selected, updated, or deleted from a populated
-table.
+are measured as one row selected, updated, or deleted from a populated table.
 
 create_version is already bounded enough to use as a guardrail, but merge/diff
 is also seconds for only 10% changed rows over a 1000-row JSON-pointer state.
@@ -312,4 +311,78 @@ Storage scoreboard:
 
 Decision:
   Keep, revert, or follow-up.
+```
+
+## Optimization 1: Batched Committed State-FK Delete Validation
+
+Change:
+
+```text
+Group committed state-surface FK delete checks by source schema/domain and
+scan the source rows once per group instead of once per tombstone.
+```
+
+Commands:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_crud -- 'json_pointer_crud/raw_sqlite/baseline|json_pointer_crud/raw_sqlite/smoke|json_pointer_crud/lix_sqlite/baseline|json_pointer_crud/lix_sqlite/smoke|json_pointer_crud/lix_rocksdb/baseline|json_pointer_crud/lix_rocksdb/smoke'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_crud -- 'json_pointer_crud/raw_storage_sqlite/baseline|json_pointer_crud/raw_storage_sqlite/smoke|json_pointer_crud/raw_storage_rocksdb/baseline|json_pointer_crud/raw_storage_rocksdb/smoke'
+cargo test -p lix_engine --features storage-benches --test json_pointer_crud_storage -- --ignored --nocapture --test-threads=1
+```
+
+Raw Storage API scoreboard:
+
+| operation                          | SQLite 100 | SQLite 1k | SQLite x | RocksDB 100 | RocksDB 1k | RocksDB x |
+| ---------------------------------- | ---------: | --------: | -------: | ----------: | ---------: | --------: |
+| `write_root_all_rows`              |  2.6462 ms | 6.5703 ms |    2.48x |   3.5919 ms |  6.5048 ms |     1.81x |
+| `get_many_exact_keys`              |  1.5251 ms | 4.5971 ms |    3.01x |   1.1383 ms |  3.9691 ms |     3.49x |
+| `get_many_missing_keys`            |   877.1 us | 2.7680 ms |    3.16x |    521.3 us |  1.5815 ms |     3.03x |
+| `exists_many_exact_keys`           |  1.6827 ms | 4.8231 ms |    2.87x |   1.1503 ms |  5.8704 ms |     5.10x |
+| `scan_keys_only`                   |   964.5 us | 3.4420 ms |    3.57x |    650.7 us |  3.4885 ms |     5.36x |
+| `scan_headers_only`                |   875.2 us | 3.1618 ms |    3.61x |    651.9 us |  3.1302 ms |     4.80x |
+| `scan_full_rows`                   |  1.3692 ms | 5.3299 ms |    3.89x |   1.1031 ms |  5.5565 ms |     5.04x |
+| `prefix_scan_schema`               |  1.3468 ms | 5.0666 ms |    3.76x |   1.1146 ms |  5.5296 ms |     4.96x |
+| `prefix_scan_schema_file_null`     |  1.3722 ms | 8.2142 ms |    5.99x |   1.1041 ms |  4.8788 ms |     4.42x |
+| `write_delta_10pct_updates`        |  1.0960 ms | 3.5204 ms |    3.21x |    584.8 us |  2.2813 ms |     3.90x |
+| `write_tombstone_10pct_deletes`    |   866.7 us | 3.2042 ms |    3.70x |    851.8 us |  1.4712 ms |     1.73x |
+| `changed_keys_update_10pct`        |  2.4239 ms | 82.554 ms |   34.06x |   2.0819 ms |  64.202 ms |    30.84x |
+| `changed_keys_delta_chain_10x1pct` |  1.5810 ms | 12.378 ms |    7.83x |   1.2480 ms |  8.6607 ms |     6.94x |
+| `materialize_delta_chain_10x1pct`  |  1.1211 ms | 6.4255 ms |    5.73x |    728.2 us |  2.7755 ms |     3.81x |
+
+E2E workflow scoreboard:
+
+| axis         | operation                                  | raw SQLite 100 | raw SQLite 1k | raw x | Lix SQLite 100 | Lix SQLite 1k | Lix SQLite x | Lix RocksDB 100 | Lix RocksDB 1k | Lix RocksDB x |
+| ------------ | ------------------------------------------ | -------------: | ------------: | ----: | -------------: | ------------: | -----------: | --------------: | -------------: | ------------: |
+| CRUD         | `insert_all_rows`                          |      1.6556 ms |     2.8391 ms | 1.71x |      19.763 ms |     376.49 ms |       19.05x |       20.686 ms |      310.38 ms |        15.00x |
+| CRUD         | `select_all_path_value`                    |      0.9165 ms |     1.5530 ms | 1.69x |      5.4193 ms |     12.881 ms |        2.38x |       7.0629 ms |      11.096 ms |         1.57x |
+| CRUD         | `select_one_by_pk`                         |      0.8185 ms |     1.6028 ms | 1.96x |      2.0424 ms |     5.9130 ms |        2.90x |       2.2091 ms |      3.6054 ms |         1.63x |
+| CRUD         | `update_all_values`                        |      0.9650 ms |     1.8194 ms | 1.89x |      7.9570 ms |     32.141 ms |        4.04x |       7.5921 ms |      21.915 ms |         2.89x |
+| CRUD         | `update_one_by_pk`                         |      0.8041 ms |     1.1965 ms | 1.49x |      4.4163 ms |     10.185 ms |        2.31x |       3.5553 ms |      7.6278 ms |         2.15x |
+| CRUD         | `delete_all_rows`                          |      0.8595 ms |     1.2117 ms | 1.41x |      8.3845 ms |     32.180 ms |        3.84x |       8.1399 ms |      23.674 ms |         2.91x |
+| CRUD         | `delete_one_by_pk`                         |      0.7526 ms |     1.4439 ms | 1.92x |      3.5757 ms |     10.669 ms |        2.98x |       3.6691 ms |      8.2295 ms |         2.24x |
+| Branch       | `create_version`                           |            n/a |           n/a |   n/a |      3.4980 ms |     8.0771 ms |        2.31x |       4.5554 ms |      5.5557 ms |         1.22x |
+| Merge / diff | `merge_version_fast_forward_10pct_updates` |            n/a |           n/a |   n/a |      47.167 ms |     987.99 ms |       20.95x |       44.720 ms |      953.19 ms |        21.31x |
+| Merge / diff | `merge_version_divergent_10pct_updates`    |            n/a |           n/a |   n/a |      77.340 ms |      2.0947 s |       27.08x |       110.32 ms |       2.7013 s |        24.49x |
+
+Storage scoreboard:
+
+| backend / workflow                     | 100 bytes | 100 bytes/row |  1k bytes | 1k bytes/row | bytes x |
+| -------------------------------------- | --------: | ------------: | --------: | -----------: | ------: |
+| raw SQLite / inserted                  |   936,584 |       9,365.8 | 1,692,456 |      1,692.5 |   1.81x |
+| Lix SQLite / inserted                  |   337,656 |       3,376.6 | 1,075,136 |      1,075.1 |   3.18x |
+| Lix SQLite / after create_version      |   345,896 |       3,459.0 | 1,087,496 |      1,087.5 |   3.14x |
+| Lix SQLite / after fast-forward merge  |   593,096 |       5,931.0 | 5,287,488 |      5,287.5 |   8.92x |
+| Lix SQLite / after divergent merge     | 1,272,896 |      12,729.0 | 5,615,168 |      5,615.2 |   4.41x |
+| Lix RocksDB / inserted                 |   280,077 |       2,800.8 |   993,888 |        993.9 |   3.55x |
+| Lix RocksDB / after create_version     |   281,943 |       2,819.4 |   995,754 |        995.8 |   3.53x |
+| Lix RocksDB / after fast-forward merge |   298,593 |       2,985.9 | 1,160,310 |      1,160.3 |   3.89x |
+| Lix RocksDB / after divergent merge    |   337,030 |       3,370.3 | 1,528,244 |      1,528.2 |   4.53x |
+
+Result:
+
+```text
+delete_all_rows/1k improved from 2.4630 s to 32.180 ms on Lix SQLite and
+from 1.7949 s to 23.674 ms on Lix RocksDB. The profile bottleneck moved away
+from repeated committed state-FK source scans; inserts and merge/diff remain
+the dominant physical-layout targets.
 ```

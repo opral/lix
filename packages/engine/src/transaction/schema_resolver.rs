@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::catalog::{SchemaCatalog, SchemaCatalogContext, SchemaCatalogFact};
+use crate::catalog::{CatalogContext, CatalogSnapshot, SchemaCatalogFact};
 use crate::domain::Domain;
 use crate::live_state::{
     LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
@@ -13,17 +13,17 @@ use crate::transaction::staging::PreparedStateRowOverlay;
 use crate::LixError;
 
 pub(crate) struct TransactionSchemaResolver {
-    context: Arc<SchemaCatalogContext>,
-    catalogs_by_domain: BTreeMap<Domain, SchemaCatalogEntry>,
+    context: Arc<CatalogContext>,
+    catalogs_by_domain: BTreeMap<Domain, CatalogEntry>,
 }
 
-enum SchemaCatalogEntry {
+enum CatalogEntry {
     SchemaFacts(Vec<SchemaCatalogFact>),
-    Catalog(SchemaCatalog),
+    Catalog(CatalogSnapshot),
 }
 
 impl TransactionSchemaResolver {
-    pub(crate) fn new(context: Arc<SchemaCatalogContext>) -> Self {
+    pub(crate) fn new(context: Arc<CatalogContext>) -> Self {
         Self {
             context,
             catalogs_by_domain: BTreeMap::new(),
@@ -53,13 +53,13 @@ impl TransactionSchemaResolver {
                     .await?
             };
             self.catalogs_by_domain
-                .insert(domain.clone(), SchemaCatalogEntry::SchemaFacts(facts));
+                .insert(domain.clone(), CatalogEntry::SchemaFacts(facts));
         }
 
         let should_materialize = self
             .catalogs_by_domain
             .get(&domain)
-            .is_some_and(|entry| matches!(entry, SchemaCatalogEntry::SchemaFacts(_)));
+            .is_some_and(|entry| matches!(entry, CatalogEntry::SchemaFacts(_)));
         if should_materialize {
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_transaction_schema_catalog_load();
@@ -67,12 +67,12 @@ impl TransactionSchemaResolver {
                 .catalogs_by_domain
                 .remove(&domain)
                 .expect("schema catalog entry should exist after load");
-            let SchemaCatalogEntry::SchemaFacts(facts) = entry else {
+            let CatalogEntry::SchemaFacts(facts) = entry else {
                 unreachable!("catalog entry was checked as schema facts");
             };
-            let catalog = SchemaCatalog::from_schema_facts(&facts)?;
+            let catalog = CatalogSnapshot::from_schema_facts(&facts)?;
             self.catalogs_by_domain
-                .insert(domain, SchemaCatalogEntry::Catalog(catalog));
+                .insert(domain, CatalogEntry::Catalog(catalog));
         }
         Ok(())
     }
@@ -82,7 +82,7 @@ impl TransactionSchemaResolver {
         live_state: &dyn LiveStateReader,
         staged: &PreparedStateRowOverlay,
         domain: &Domain,
-    ) -> Result<&mut SchemaCatalog, LixError> {
+    ) -> Result<&mut CatalogSnapshot, LixError> {
         self.load_catalog_for_domain(live_state, Some(staged), domain)
             .await?;
         let domain = domain.schema_catalog_domain();
@@ -91,8 +91,8 @@ impl TransactionSchemaResolver {
             .get_mut(&domain)
             .expect("catalog cache should contain requested version")
         {
-            SchemaCatalogEntry::Catalog(catalog) => Ok(catalog),
-            SchemaCatalogEntry::SchemaFacts(_) => {
+            CatalogEntry::Catalog(catalog) => Ok(catalog),
+            CatalogEntry::SchemaFacts(_) => {
                 unreachable!("schema catalog should be materialized before mutable access")
             }
         }
@@ -102,7 +102,7 @@ impl TransactionSchemaResolver {
         &mut self,
         live_state: &dyn LiveStateReader,
         domain: &Domain,
-    ) -> Result<&SchemaCatalog, LixError> {
+    ) -> Result<&CatalogSnapshot, LixError> {
         self.load_catalog_for_domain(live_state, None, domain)
             .await?;
         let domain = domain.schema_catalog_domain();
@@ -111,8 +111,8 @@ impl TransactionSchemaResolver {
             .get(&domain)
             .expect("catalog cache should contain requested version")
         {
-            SchemaCatalogEntry::Catalog(catalog) => Ok(catalog),
-            SchemaCatalogEntry::SchemaFacts(_) => {
+            CatalogEntry::Catalog(catalog) => Ok(catalog),
+            CatalogEntry::SchemaFacts(_) => {
                 unreachable!("schema catalog should be materialized before validation access")
             }
         }
@@ -121,7 +121,7 @@ impl TransactionSchemaResolver {
     pub(crate) fn remember_schema_facts(&mut self, domain: &Domain, facts: Vec<SchemaCatalogFact>) {
         self.catalogs_by_domain.insert(
             domain.schema_catalog_domain(),
-            SchemaCatalogEntry::SchemaFacts(facts),
+            CatalogEntry::SchemaFacts(facts),
         );
     }
 }
