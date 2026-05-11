@@ -2308,6 +2308,125 @@ treated as a small supporting optimization rather than a budget-moving step.
 No storage format change. No temporary shim.
 ```
 
+## Optimization 28: Encode change-pack entries in place
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+`commit_store::codec::encode_change_pack` now writes each authored change
+directly into its length-prefixed pack entry:
+
+- Extracted `write_change_ref(&mut Vec<u8>, ChangeRef)` from
+  `encode_change_ref`.
+- `encode_change_ref` still returns standalone `LXCH2` bytes by writing into a
+  fresh `Vec`.
+- `encode_change_pack` now reserves the 4-byte little-endian section length,
+  writes the `LXCH2` change bytes directly into the pack buffer, and backfills
+  the length.
+- Removed the old temporary `encode_change_ref(change)?` plus `write_bytes`
+  copy inside the pack loop.
+
+Added a unit test asserting that the bytes inside one change-pack entry are
+exactly the same as the standalone `encode_change_ref` bytes.
+
+### Benchmarks
+
+Focused write command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+Result: passed.
+
+Representative medians:
+
+| row                                             | median | criterion status |
+| ----------------------------------------------- | -----: | ---------------- |
+| `raw_sqlite/write_root_all_rows/1k`             | 2.4908 ms | reference/no change |
+| `raw_sqlite/write_delta_10pct_updates/1k`       | 1.2818 ms | reference/no change |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k`   | 1.2797 ms | reference/no change |
+| `sqlite/write_root_all_rows/1k`                 | 4.7754 ms | no change, lower median |
+| `sqlite/write_delta_10pct_updates/1k`           | 1.9721 ms | no change |
+| `sqlite/write_tombstone_10pct_deletes/1k`       | 1.7907 ms | no change |
+| `rocksdb/write_root_all_rows/1k`                | 4.3187 ms | no change, lower median |
+| `rocksdb/write_delta_10pct_updates/1k`          | 935.37 us | no change |
+| `rocksdb/write_tombstone_10pct_deletes/1k`      | 789.37 us | no change |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed. The change-pack wire format is unchanged.
+
+1k rows:
+
+| row                                     | bytes | bytes/row |
+| --------------------------------------- | ----: | --------: |
+| raw SQLite / inserted                   | 1692456 | 1692.5 |
+| Lix SQLite / inserted                   | 996856 | 996.9 |
+| Lix SQLite / after create_version       | 1013336 | 1013.3 |
+| Lix SQLite / after fast-forward merge   | 5201424 | 5201.4 |
+| Lix SQLite / after divergent merge      | 5348880 | 5348.9 |
+| Lix RocksDB / inserted                  | 912032 | 912.0 |
+| Lix RocksDB / after create_version      | 913889 | 913.9 |
+| Lix RocksDB / after fast-forward merge  | 1073314 | 1073.3 |
+| Lix RocksDB / after divergent merge     | 1442792 | 1442.8 |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+The reviewer confirmed that the pack still writes a length-prefixed LXCH2
+payload for each change, that decode still reads the same entry bytes, and that
+partial mutation on error is not exposed because encode_change_pack and
+encode_change_ref both build into fresh local Vecs. Recommendation: keep.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine commit_store::codec:: --features storage-benches
+cargo test -p lix_engine commit_store:: --features storage-benches
+cargo test -p lix_engine transaction::commit:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a write-side commit-pack allocation cleanup.
+
+The physical win is removing one temporary Vec allocation and one copy for each
+authored change encoded into a commit-store change pack. It is the same shape
+as the earlier direct delta-pack and direct commit-change row work: encode into
+the final pack buffer instead of building nested row blobs only to copy them.
+
+Timing is a modest median improvement for root writes on both Lix backends, but
+Criterion did not mark it statistically significant. This is kept because it
+removes real per-row hot-path work while preserving the byte format and storage
+footprint.
+
+No storage format change. No temporary shim.
+```
+
 ## Optimization 27: Decode delta-pack sections without temporary copies
 
 Date: 2026-05-11
