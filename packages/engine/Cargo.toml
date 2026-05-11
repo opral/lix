@@ -31,6 +31,12 @@ harness = false
 required-features = ["storage-benches"]
 
 [[bench]]
+name = "optimization9_sql2"
+path = "benches/optimization9_sql2/main.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
 name = "json_pointer_physical"
 path = "benches/json_pointer_physical/main.rs"
 harness = false

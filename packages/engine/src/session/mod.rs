@@ -11,6 +11,8 @@ mod context;
 mod create_version;
 mod execute;
 mod merge;
+#[cfg(feature = "storage-benches")]
+pub mod optimization9_sql2_bench;
 mod switch_version;
 
 pub use context::SessionContext;
