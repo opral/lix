@@ -2308,6 +2308,150 @@ treated as a small supporting optimization rather than a budget-moving step.
 No storage format change. No temporary shim.
 ```
 
+## Optimization 27: Decode delta-pack sections without temporary copies
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+`tracked_state::codec::decode_delta_pack` now parses each sized delta key and
+value section directly from the pack byte slice:
+
+- Replaced `read_sized_bytes(...)?` followed by borrowing the temporary `Vec`
+  with `read_sized_slice(...)?`.
+- Kept the existing `decode_delta_key` and `decode_delta_value` parsers, so the
+  section format, cursor advancement, truncation checks, and trailing-byte
+  validation are unchanged.
+
+This removes two heap allocations and two payload copies per delta-pack row on
+unmaterialized tracked-state reads.
+
+### Benchmarks
+
+Focused scan command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys)/1k'
+```
+
+Result: passed.
+
+Representative medians:
+
+| row                                             | median | criterion status |
+| ----------------------------------------------- | -----: | ---------------- |
+| `sqlite/get_many_exact_keys/1k`                 | 2.9171 ms | no change |
+| `sqlite/scan_keys_only/1k`                      | 1.8631 ms | no change |
+| `sqlite/scan_headers_only/1k`                   | 1.7398 ms | improved |
+| `sqlite/scan_full_rows/1k`                      | 2.3693 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k`        | 2.3791 ms | no change |
+| `rocksdb/get_many_exact_keys/1k`                | 1.9810 ms | no change |
+| `rocksdb/scan_keys_only/1k`                     | 849.54 us | no change |
+| `rocksdb/scan_headers_only/1k`                  | 840.90 us | no change |
+| `rocksdb/scan_full_rows/1k`                     | 1.3687 ms | improved |
+| `rocksdb/prefix_scan_schema_file_null/1k`       | 1.3407 ms | no change |
+
+Broad scan/write guardrail command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed. Raw SQLite reference rows were noisy in this run, but Lix write
+rows were neutral, SQLite scan medians stayed in the improved band, and RocksDB
+tombstone writes improved.
+
+Follow-up scan rerun:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                             | rerun median | criterion status |
+| ----------------------------------------------- | -----------: | ---------------- |
+| `sqlite/scan_headers_only/1k`                   | 1.7979 ms | no change |
+| `sqlite/scan_full_rows/1k`                      | 2.3657 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k`        | 2.3208 ms | no change |
+| `rocksdb/scan_headers_only/1k`                  | 817.34 us | improved |
+| `rocksdb/scan_full_rows/1k`                     | 1.3446 ms | improved |
+| `rocksdb/prefix_scan_schema_file_null/1k`       | 1.3315 ms | no change |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed. No format or write-path storage change.
+
+1k rows:
+
+| row                                     | bytes | bytes/row |
+| --------------------------------------- | ----: | --------: |
+| raw SQLite / inserted                   | 1692456 | 1692.5 |
+| Lix SQLite / inserted                   | 996856 | 996.9 |
+| Lix SQLite / after create_version       | 1013336 | 1013.3 |
+| Lix SQLite / after fast-forward merge   | 5205520 | 5205.5 |
+| Lix SQLite / after divergent merge      | 5369360 | 5369.4 |
+| Lix RocksDB / inserted                  | 912032 | 912.0 |
+| Lix RocksDB / after create_version      | 913889 | 913.9 |
+| Lix RocksDB / after fast-forward merge  | 1073314 | 1073.3 |
+| Lix RocksDB / after divergent merge     | 1442794 | 1442.8 |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+The reviewer confirmed that read_sized_slice preserves the same overflow and
+truncation checks, the nested key/value decoders still reject trailing bytes,
+and the borrowed slices only live for the duration of parsing. Recommendation:
+keep as a clean read-side allocation cut.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo test -p lix_engine tracked_state::codec:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a read-side delta-pack decode cleanup.
+
+The physical win is small but real: unmaterialized tracked-state reads no
+longer copy every encoded delta key and value section before decoding owned
+rows from them. This reduces heap traffic without changing the pack format or
+corruption behavior.
+
+Timing is noisy but favorable enough to keep. SQLite header scans showed a
+significant improvement in the focused run and stayed in the lower band on
+rerun. RocksDB header/full scans improved significantly on rerun. Writes and
+storage bytes are neutral because the encoded bytes are unchanged.
+
+No storage format change. No temporary shim.
+```
+
 ## Optimization 26: Probe delta-pack existence without loading blobs
 
 ### Hypothesis
