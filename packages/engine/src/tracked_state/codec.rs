@@ -10,12 +10,14 @@ use crate::tracked_state::types::{
 use crate::LixError;
 
 const NODE_VERSION: u8 = 2;
-const VALUE_VERSION: u8 = 6;
+const VALUE_VERSION: u8 = 7;
 const VALUE_DELETED_FLAG: u8 = 0b1000_0000;
 const VALUE_VERSION_MASK: u8 = 0b0111_1111;
 const DELTA_PACK_VERSION: u8 = 3;
 const DELTA_LOCATOR_SAME_COMMIT: u8 = 0;
 const DELTA_LOCATOR_FULL: u8 = 1;
+const TIMESTAMP_UPDATED_SAME: u8 = 0;
+const TIMESTAMP_UPDATED_DISTINCT: u8 = 1;
 const NODE_KIND_LEAF: u8 = 1;
 const NODE_KIND_INTERNAL: u8 = 2;
 const WEIBULL_K: i32 = 4;
@@ -298,8 +300,7 @@ fn append_value_ref(out: &mut Vec<u8>, value: TrackedStateIndexValueRef<'_>) {
     out.extend_from_slice(&value.change_locator.source_pack_id.to_be_bytes());
     out.extend_from_slice(&value.change_locator.source_ordinal.to_be_bytes());
     push_sized_bytes(out, value.change_locator.change_id.as_bytes());
-    push_sized_bytes(out, value.created_at.as_bytes());
-    push_sized_bytes(out, value.updated_at.as_bytes());
+    push_timestamp_pair(out, value.created_at, value.updated_at);
     push_optional_json_ref(out, value.snapshot_ref);
     push_optional_json_ref(out, value.metadata_ref);
 }
@@ -310,8 +311,7 @@ pub(crate) fn encoded_value_len(value: &TrackedStateIndexValue) -> usize {
         + 4
         + 4
         + sized_bytes_len(value.change_locator.change_id.as_bytes())
-        + sized_bytes_len(value.created_at.as_bytes())
-        + sized_bytes_len(value.updated_at.as_bytes())
+        + timestamp_pair_len(&value.created_at, &value.updated_at)
         + optional_json_ref_len(value.snapshot_ref.as_ref())
         + optional_json_ref_len(value.metadata_ref.as_ref())
 }
@@ -379,8 +379,7 @@ fn decode_value_after_header(
             )
         })?;
     let change_id = read_sized_string(bytes, &mut cursor, "change_id")?;
-    let created_at = read_sized_string(bytes, &mut cursor, "created_at")?;
-    let updated_at = read_sized_string(bytes, &mut cursor, "updated_at")?;
+    let (created_at, updated_at) = read_timestamp_pair(bytes, &mut cursor)?;
     let snapshot_ref = read_optional_json_ref(bytes, &mut cursor, "snapshot_ref")?;
     let metadata_ref = read_optional_json_ref(bytes, &mut cursor, "metadata_ref")?;
     if cursor != bytes.len() {
@@ -502,8 +501,7 @@ fn append_delta_value_ref(
     out.extend_from_slice(&value.change_locator.source_pack_id.to_be_bytes());
     out.extend_from_slice(&value.change_locator.source_ordinal.to_be_bytes());
     push_sized_bytes(out, value.change_locator.change_id.as_bytes());
-    push_sized_bytes(out, value.created_at.as_bytes());
-    push_sized_bytes(out, value.updated_at.as_bytes());
+    push_timestamp_pair(out, value.created_at, value.updated_at);
     push_optional_json_ref(out, value.snapshot_ref);
     push_optional_json_ref(out, value.metadata_ref);
 }
@@ -627,8 +625,7 @@ fn decode_delta_value(
             )
         })?;
     let change_id = read_sized_string(bytes, &mut cursor, "change_id")?;
-    let created_at = read_sized_string(bytes, &mut cursor, "created_at")?;
-    let updated_at = read_sized_string(bytes, &mut cursor, "updated_at")?;
+    let (created_at, updated_at) = read_timestamp_pair(bytes, &mut cursor)?;
     let snapshot_ref = read_optional_json_ref(bytes, &mut cursor, "snapshot_ref")?;
     let metadata_ref = read_optional_json_ref(bytes, &mut cursor, "metadata_ref")?;
     if cursor != bytes.len() {
@@ -943,6 +940,42 @@ fn optional_json_ref_len(json_ref: Option<&JsonRef>) -> usize {
     1 + json_ref.map_or(0, |_| TRACKED_STATE_HASH_BYTES)
 }
 
+fn push_timestamp_pair(out: &mut Vec<u8>, created_at: &str, updated_at: &str) {
+    push_sized_bytes(out, created_at.as_bytes());
+    if updated_at == created_at {
+        out.push(TIMESTAMP_UPDATED_SAME);
+    } else {
+        out.push(TIMESTAMP_UPDATED_DISTINCT);
+        push_sized_bytes(out, updated_at.as_bytes());
+    }
+}
+
+#[cfg(test)]
+fn timestamp_pair_len(created_at: &str, updated_at: &str) -> usize {
+    sized_bytes_len(created_at.as_bytes())
+        + 1
+        + if updated_at == created_at {
+            0
+        } else {
+            sized_bytes_len(updated_at.as_bytes())
+        }
+}
+
+fn read_timestamp_pair(bytes: &[u8], cursor: &mut usize) -> Result<(String, String), LixError> {
+    let created_at = read_sized_string(bytes, cursor, "created_at")?;
+    let updated_at = match read_u8(bytes, cursor, "updated_at tag")? {
+        TIMESTAMP_UPDATED_SAME => created_at.clone(),
+        TIMESTAMP_UPDATED_DISTINCT => read_sized_string(bytes, cursor, "updated_at")?,
+        other => {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("tracked-state timestamp pair has invalid updated_at tag {other}"),
+            ))
+        }
+    };
+    Ok((created_at, updated_at))
+}
+
 fn push_u32(out: &mut Vec<u8>, value: usize) {
     out.extend_from_slice(&(value as u32).to_be_bytes());
 }
@@ -1197,6 +1230,37 @@ mod tests {
 
         let encoded = encode_value(&value);
         assert_eq!(decode_value(&encoded).expect("value"), value);
+    }
+
+    #[test]
+    fn value_codec_compacts_matching_timestamps() {
+        let mut compact = TrackedStateIndexValue {
+            change_locator: ChangeLocator {
+                source_commit_id: "commit".to_string(),
+                source_pack_id: 0,
+                source_ordinal: 1,
+                change_id: "change".to_string(),
+            },
+            deleted: false,
+            snapshot_ref: None,
+            metadata_ref: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let compact_len = encode_value(&compact).len();
+        assert_eq!(
+            decode_value(&encode_value(&compact)).expect("value"),
+            compact
+        );
+
+        compact.updated_at = "2026-01-02T00:00:00Z".to_string();
+        let distinct_len = encode_value(&compact).len();
+
+        assert!(compact_len < distinct_len);
+        assert_eq!(
+            distinct_len - compact_len,
+            sized_bytes_len(compact.updated_at.as_bytes())
+        );
     }
 
     #[test]
