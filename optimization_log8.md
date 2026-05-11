@@ -2189,3 +2189,121 @@ Next optimization should keep attacking write_root_all_rows, likely below the
 generic StorageWriteSet/backend batch application or by reducing JSON payload
 encoding work before commit-pack staging.
 ```
+
+## Optimization 13: Use fixed JSON hash lookup keys and single-pack projection loads
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Changed JSON-store read lookup tables from ordered `Vec<u8>` keys to fixed
+`[u8; 32]` hash keys:
+
+- `JsonRef::as_hash_array()` exposes the existing hash without conversion.
+- `load_json_bytes_many_in_scope` deduplicates requested refs with
+  `HashMap<[u8; 32], usize>` while preserving first-seen backend get order in
+  the side vectors.
+- `load_from_packs` matches decoded pack entries with
+  `HashMap<[u8; 32], usize>` instead of allocating hash `Vec`s.
+
+Added a tracked-state materialization fast path for the common root-read case
+where all projected JSON refs are local to one `(commit_id, pack_id)`. The fast
+path calls `json_store.load_bytes_many` once with the original `json_refs`
+slice and returns values directly in request order. Mixed-pack reads keep the
+previous grouped fallback.
+
+The shortcut checks that JSON refs and locality indexes remain in lockstep
+before selecting the fast path. Added unit coverage for same-pack duplicate
+slots and mixed-pack rejection.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows)/1k'
+```
+
+Result: passed.
+
+| row                                             | before median | after median | criterion status |
+| ----------------------------------------------- | ------------: | -----------: | ---------------- |
+| `raw_sqlite/get_many_exact_keys/1k`             |     2.0599 ms |    2.0580 ms | reference |
+| `raw_sqlite/scan_full_rows/1k`                  |     1.1594 ms |    1.1722 ms | reference |
+| `sqlite/get_many_exact_keys/1k`                 |     3.9323 ms |    3.8132 ms | no change |
+| `sqlite/scan_full_rows/1k`                      |     3.6356 ms |    3.5962 ms | no change |
+| `rocksdb/get_many_exact_keys/1k`                |     2.9911 ms |    2.8464 ms | no change |
+| `rocksdb/scan_full_rows/1k`                     |     2.5176 ms |    2.3906 ms | within noise threshold |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                     | bytes | bytes/row | status |
+| --------------------------------------- | ----: | --------: | ------ |
+| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
+| Lix SQLite / inserted                   | 1112216 | 1112.2 | unchanged |
+| Lix SQLite / after create_version       | 1124576 | 1124.6 | unchanged |
+| Lix SQLite / after fast-forward merge   | 5303776 | 5303.8 | accounting noise, lower than previous |
+| Lix SQLite / after divergent merge      | 5721904 | 5721.9 | accounting noise, higher than previous |
+| Lix RocksDB / inserted                  | 1028557 | 1028.6 | unchanged |
+| Lix RocksDB / after create_version      | 1030457 | 1030.5 | unchanged |
+| Lix RocksDB / after fast-forward merge  | 1195234 | 1195.2 | unchanged |
+| Lix RocksDB / after divergent merge     | 1576588 | 1576.6 | unchanged |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: add an explicit json_refs/localities length check before the fast path;
+add focused single-pack shortcut coverage. Fixed.
+
+Recommendation: keep. This is a clean read-side allocation/comparison cut with
+no storage-format change. Fixed hash keys are lookup-only and do not affect
+request/backend/result ordering.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine json_store:: --features storage-benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo test -p lix_engine tracked_state::materialization:: --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a modest read-side locality cleanup.
+
+Primary axis: exact-key and full-row reads. The structural win is removing
+avoidable heap-key/order-map work from fixed-hash JSON lookup and avoiding
+tracked-state grouping allocations when all projected payloads are in one
+commit-local pack.
+
+Timing: medians moved in the intended direction for both Lix backends on the
+targeted read rows. Only RocksDB scan showed a statistically visible movement,
+and Criterion classified it within the noise threshold, so this should be
+treated as a small supporting optimization rather than a budget-moving step.
+
+No storage format change. No temporary shim.
+```
