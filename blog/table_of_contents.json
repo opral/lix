@@ -1,5 +1,10 @@
 [
   {
+    "path": "./005-april-2026-update/index.md",
+    "slug": "april-2026-update",
+    "authors": ["samuelstroschein"]
+  },
+  {
     "path": "./004-march-2026-update/index.md",
     "slug": "march-2026-update",
     "authors": ["samuelstroschein"]
