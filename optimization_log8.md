@@ -2308,6 +2308,157 @@ treated as a small supporting optimization rather than a budget-moving step.
 No storage format change. No temporary shim.
 ```
 
+## Optimization 26: Probe delta-pack existence without loading blobs
+
+### Hypothesis
+
+Unmaterialized tracked commits are served from delta packs until a projection
+root exists. The scan planner only needs to know whether each first-parent
+commit has a delta pack, but it was calling `load_delta_pack`, which fetched and
+decoded the whole pack before the result-producing path fetched and decoded it
+again. This violates the same locality rule used by storage engines: use an
+index/key-existence probe to plan, and only read the value blob when the plan
+needs row data.
+
+### Change
+
+- Added `tracked_state::storage::delta_pack_exists`.
+- Implemented it with `StorageReader::exists_many` against the delta-pack
+  namespace/key, so it does not fetch delta-pack bytes.
+- Replaced the planning-time `load_delta_pack(...).is_some()` in
+  `delta_commit_ids_since_projection_root` with the key-only existence probe.
+- Kept all result-producing paths on `load_delta_pack`, so corrupt or
+  identity-mismatched packs still fail before scans, diffs, point reads, or
+  existence checks return results.
+
+### Benchmarks
+
+Focused read command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|exists_many_exact_keys)/1k'
+```
+
+Result: passed.
+
+Representative rerun medians:
+
+| row                                                   | median | criterion status |
+| ----------------------------------------------------- | -----: | ---------------- |
+| `raw_sqlite/scan_keys_only/1k`                        | 1.1162 ms | reference |
+| `raw_sqlite/scan_headers_only/1k`                     | 1.1543 ms | reference |
+| `raw_sqlite/scan_full_rows/1k`                        | 1.2260 ms | reference |
+| `raw_sqlite/prefix_scan_schema_file_null/1k`          | 1.5672 ms | noisy reference |
+| `sqlite/get_many_exact_keys/1k`                       | 2.9404 ms | no change |
+| `sqlite/exists_many_exact_keys/1k`                    | 1.9841 ms | no change |
+| `sqlite/scan_keys_only/1k`                            | 1.8194 ms | no change, lower median |
+| `sqlite/scan_headers_only/1k`                         | 1.8309 ms | no change |
+| `sqlite/scan_full_rows/1k`                            | 2.3452 ms | no change, lower median |
+| `sqlite/prefix_scan_schema_file_null/1k`              | 2.3869 ms | no change, lower median |
+| `rocksdb/get_many_exact_keys/1k`                      | 2.0017 ms | no change |
+| `rocksdb/exists_many_exact_keys/1k`                   | 1.1156 ms | no change |
+| `rocksdb/scan_keys_only/1k`                           | 835.73 us | no change, lower median |
+| `rocksdb/scan_headers_only/1k`                        | 878.24 us | improved |
+| `rocksdb/scan_full_rows/1k`                           | 1.4314 ms | no change |
+| `rocksdb/prefix_scan_schema_file_null/1k`             | 1.3956 ms | within noise threshold |
+
+Broad scan/write guardrail command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+Notable medians from the broad run:
+
+| row                                             | median | criterion status |
+| ----------------------------------------------- | -----: | ---------------- |
+| `sqlite/write_root_all_rows/1k`                 | 5.2065 ms | no change |
+| `sqlite/write_delta_10pct_updates/1k`           | 1.9378 ms | improved |
+| `sqlite/write_tombstone_10pct_deletes/1k`       | 1.8930 ms | within noise threshold |
+| `sqlite/scan_keys_only/1k`                      | 1.8567 ms | no change |
+| `sqlite/scan_headers_only/1k`                   | 1.7894 ms | no change |
+| `sqlite/scan_full_rows/1k`                      | 2.4152 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k`        | 2.4417 ms | no change |
+| `rocksdb/scan_keys_only/1k`                     | 914.58 us | improved |
+| `rocksdb/scan_full_rows/1k`                     | 1.4490 ms | improved |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed. No format or write-path storage change.
+
+1k rows:
+
+| row                                     | bytes | bytes/row |
+| --------------------------------------- | ----: | --------: |
+| raw SQLite / inserted                   | 1692456 | 1692.5 |
+| Lix SQLite / inserted                   | 996856 | 996.9 |
+| Lix SQLite / after create_version       | 1013336 | 1013.3 |
+| Lix SQLite / after fast-forward merge   | 5205520 | 5205.5 |
+| Lix SQLite / after divergent merge      | 5361192 | 5361.2 |
+| Lix RocksDB / inserted                  | 912032 | 912.0 |
+| Lix RocksDB / after create_version      | 913889 | 913.9 |
+| Lix RocksDB / after fast-forward merge  | 1073314 | 1073.3 |
+| Lix RocksDB / after divergent merge     | 1442794 | 1442.8 |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+Initial review:
+HIGH: none.
+MEDIUM: delta_pack_exists used get_values, so it avoided decode CPU but still
+fetched the blob. Use StorageReader::exists_many as a true key-only probe.
+
+Follow-up review:
+HIGH: none.
+MEDIUM: none.
+The prior MEDIUM is resolved. delta_pack_exists now uses StorageReader::exists_many
+against the delta-pack namespace/key. Result-producing paths still load and
+decode packs, so corrupt or identity-mismatched packs still fail before results
+are produced.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo test -p lix_engine tracked_state::context:: --features storage-benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|exists_many_exact_keys)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a read-path physical access optimization.
+
+The structural win is precise: first-parent planning now asks the backend for
+key existence instead of fetching a delta-pack value blob it will decode later.
+This follows the reference-system pattern of separating metadata/index probes
+from value materialization.
+
+The strongest observed impact is on unmaterialized single-delta scans, where
+SQLite scan medians moved from the post-Optimization-25 range of roughly
+1.94-2.69 ms down to roughly 1.82-2.39 ms in focused runs, and RocksDB scan
+medians moved below or near the raw SQLite reference for key/header scans.
+
+This does not change storage format, write layout, or corruption semantics for
+visible reads. It does not close the remaining full-row SQLite gap by itself.
+```
+
 ## Optimization 25: Dictionary-code delta-pack key prefixes
 
 ### Hypothesis
