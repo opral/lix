@@ -117,7 +117,7 @@ pub(crate) async fn build_write_session(
     Ok(session)
 }
 
-fn new_sql_session_context() -> SessionContext {
+pub(crate) fn new_sql_session_context() -> SessionContext {
     SessionContext::new_with_config(
         SessionConfig::new()
             .with_information_schema(true)

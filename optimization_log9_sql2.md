@@ -471,3 +471,115 @@ Outside-SQL2 follow-up:
 Decision:
   Keep, revert, or follow-up.
 ```
+
+## Optimization 1: Reuse Parsed DataFusion Statement For Write Planning
+
+Commit:
+  uncommitted on 80f4f68a
+
+Target operation:
+  logical planning for optimization9_sql2/planning_only/lix_sqlite/insert_500_values/1k
+
+Profile before:
+  command:
+    perf record --output=/tmp/sql2-insert-plan.perf.data -F 499 -g --call-graph dwarf target/release/deps/optimization9_sql2-bd3fa4efccf19070 --bench 'optimization9_sql2/planning_only/lix_sqlite/insert_500_values/1k' --profile-time 8
+    perf report --stdio --quiet --no-inline --input=/tmp/sql2-insert-plan.perf.data --no-call-graph --sort=symbol --percent-limit=1
+  top SQL2 stacks:
+    sqlparser::tokenizer::Tokenizer::tokenize_quoted_string: 17.10% self
+    sqlparser parser/tokenizer helpers collectively appeared below that hotspot
+  non-SQL2 stacks:
+    _int_malloc: 7.35%, __memmove_avx_unaligned_erms: 6.55%, malloc: 2.31%
+  conclusion:
+    SQL2 write planning parsed the same INSERT text multiple times: once for Lix AST validation/history target extraction and again through DataFusion planning. Large literal INSERT statements spend significant time tokenizing quoted JSON strings, so the duplicate parse is a first-order logical planning bottleneck.
+
+Change:
+  create_write_logical_plan now parses once into DataFusion's Statement with the SQL session parser, validates supported Lix SQL against that AST, extracts read-only history DML targets from the same AST, and passes the same Statement to SessionState::statement_to_plan.
+  The cheap parse/validate/read-only phase now runs before write provider registration. The write session is built only after parse and policy checks succeed.
+  DML target extraction normalizes unquoted identifiers to lowercase while preserving quoted identifiers, matching DataFusion's identifier normalization rule.
+  Added coverage for read-only history DML through lowercase, uppercase, schema-qualified uppercase, and EXPLAIN-wrapped DELETE targets.
+  Read planning remains on the previous path, so this optimization is scoped to SQL2 write planning.
+
+  Best-practice references:
+    DataFusion exposes and uses the parse-once lower-level flow: sql_to_statement followed by statement_to_plan (artifact/datafusion/datafusion/core/src/execution/session_state.rs).
+    DataFusion normalizes unquoted identifiers before planning (artifact/datafusion/datafusion/sql/src/planner.rs and artifact/datafusion/datafusion/sql/src/utils.rs).
+    SpiceAI intercepts parsed statements before planning for DataFusion integration work (artifact/spiceai/crates/runtime/src/datafusion/planner/mod.rs).
+    Turso's standalone DB flow parses SQL into AST before translation/codegen (artifact/turso/docs/manual.md).
+
+  Semantic invariant preserved:
+    Statement support checks, history-view read-only enforcement, and DataFusion logical planning all inspect the same parsed statement. Unsupported DataFusion extension statements are still rejected before planning.
+
+Results:
+  Focused planning rows after review fixes:
+    optimization9_sql2/planning_only/lix_sqlite/insert_500_values/1k:
+      [7.5696 ms 7.7067 ms 7.9807 ms]
+      vs logged baseline [14.105 ms 14.283 ms], about 44-46% faster.
+    optimization9_sql2/planning_only/lix_sqlite/update_all_values/1k:
+      [6.5332 ms 6.6237 ms 6.7164 ms], neutral vs logged baseline [6.3326 ms 6.4489 ms].
+    optimization9_sql2/planning_only/lix_sqlite/delete_all_rows/1k:
+      [6.3737 ms 6.4816 ms 6.6179 ms], neutral vs logged baseline [6.2279 ms 7.0361 ms].
+
+  Smoke CRUD guardrail after review fixes:
+    Lix SQLite:
+      insert_all_rows: [59.787 ms 60.000 ms 60.251 ms], faster than baseline [70.105 ms 71.910 ms]
+      select_all_path_value: [16.936 ms 17.095 ms 17.266 ms], neutral/faster than baseline [17.530 ms 17.943 ms]
+      select_one_by_pk: [6.4369 ms 6.5101 ms 6.5946 ms], neutral/faster than baseline [6.6463 ms 6.9219 ms]
+      update_all_values: [33.796 ms 34.192 ms 34.606 ms], neutral/faster than baseline [34.429 ms 35.507 ms]
+      update_one_by_pk: [10.334 ms 10.408 ms 10.480 ms], neutral vs baseline [10.367 ms 10.581 ms]
+      delete_all_rows: [34.715 ms 34.957 ms 35.215 ms], neutral/faster than baseline [35.935 ms 36.724 ms]
+      delete_one_by_pk: [10.624 ms 10.686 ms 10.751 ms], neutral vs baseline [10.616 ms 10.778 ms]
+    Lix RocksDB:
+      insert_all_rows: [59.644 ms 60.006 ms 60.461 ms], faster than baseline [67.767 ms 68.316 ms]
+      select_all_path_value: [13.053 ms 13.142 ms 13.238 ms], neutral/faster than baseline [13.421 ms 13.936 ms]
+      select_one_by_pk: [2.9783 ms 2.9920 ms 3.0078 ms], neutral vs baseline [2.9247 ms 3.0022 ms]
+      update_all_values: [25.567 ms 25.748 ms 25.948 ms], neutral vs baseline [25.341 ms 25.724 ms]
+      update_one_by_pk: [6.3481 ms 6.4059 ms 6.4673 ms], neutral vs baseline [6.3116 ms 6.4393 ms]
+      delete_all_rows: [27.078 ms 27.294 ms 27.545 ms], neutral vs baseline [26.690 ms 27.071 ms]
+      delete_one_by_pk: [6.4115 ms 6.4388 ms 6.4659 ms], neutral/faster than baseline [6.4811 ms 6.6185 ms]
+
+Post-change profile:
+  command:
+    perf record --output=/tmp/sql2-insert-plan-after.perf.data -F 499 -g --call-graph dwarf target/release/deps/optimization9_sql2-bd3fa4efccf19070 --bench 'optimization9_sql2/planning_only/lix_sqlite/insert_500_values/1k' --profile-time 8
+    perf report --stdio --quiet --no-inline --input=/tmp/sql2-insert-plan-after.perf.data --no-call-graph --sort=symbol --percent-limit=1
+  result:
+    sqlparser::tokenizer::Tokenizer::tokenize_quoted_string dropped from 17.10% to 8.53% self. This profiler percentage is diagnostic evidence that the targeted duplicate-parse hot stack was reduced; it is not the keep threshold.
+    The keep threshold is benchmark speedup: insert_500_values planning improved by about 44-46%, and the corresponding SQLite smoke insert row improved by about 14-17%, both above the required >=10% speed improvement.
+    Remaining top entries are allocator/memory movement or broadly distributed DataFusion/schema work.
+
+Review:
+  First review reported no HIGH findings and two MEDIUM findings:
+    normalize unquoted DML target identifiers consistently with DataFusion;
+    parse/validate before write session/provider construction.
+  Both MEDIUM findings were implemented.
+  Second review reported no HIGH or MEDIUM findings.
+
+Guardrails:
+  Benchmark remains isolated to optimization9_sql2 fixture/schema files.
+  SQL2 and code-structure tests pass:
+    cargo test -p lix_engine execute_sql_rejects_writes_to_history_views_before_planning --features storage-benches
+    cargo test -p lix_engine sql2 --features storage-benches
+
+Outside-SQL2 follow-up:
+  SessionContext::execute still performs a separate pre-SQL2 classification parse in packages/engine/src/session/execute.rs before dispatching to create_write_logical_plan. This is outside the SQL2-only implementation scope and should be addressed separately if end-to-end parse elimination is desired.
+
+Decision:
+  Keep.
+
+Completion audit:
+  Additional post-change logical-planning profiles were used as diagnostics after verifying the benchmark speedup. They check whether the optimization exposed another dominant planning stack, but the keep/revert decision remains based on >=10% benchmark speed improvement:
+    insert_500_values/1k:
+      sqlparser::tokenizer::Tokenizer::tokenize_quoted_string: 8.53%
+      _int_malloc: 8.01%
+    select_all_path_value/1k:
+      _int_malloc: 6.24%
+      malloc: 2.78%
+      DataFusion simplification symbols below 1%
+    select_one_by_pk/1k:
+      _int_malloc: 6.43%
+      malloc: 2.36%
+      DataFusion simplification symbols below 1%
+    delete_all_rows/1k:
+      _int_malloc: 7.38%
+      malloc: 2.30%
+      DataFusion simplification symbols below 1%
+
+  The previous insert-planning SQL tokenizer hot stack was reduced, and the benchmark speedup exceeds the required >=10% improvement. The remaining visible costs are allocator/general DataFusion work spread across the logical-planning profiles.

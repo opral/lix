@@ -4,6 +4,7 @@ use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
 use datafusion::common::{ParamValues, ScalarValue};
 use datafusion::logical_expr::{Expr, LogicalPlan, WriteOp};
 use datafusion::prelude::SessionContext;
+use datafusion::sql::parser::Statement as DataFusionStatement;
 use serde_json::{json, Value as JsonValue};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -12,7 +13,7 @@ use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
 use super::predicate_typecheck::validate_json_predicate_expr_with_dfschema;
 use super::result_metadata::{field_is_json, LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY};
-use super::session::{build_read_session, build_write_session};
+use super::session::{build_read_session, build_write_session, new_sql_session_context};
 use super::write_normalization::{
     is_binary_type, lix_file_data_type_lix_error, logical_expr_is_binary_or_null,
 };
@@ -85,14 +86,11 @@ pub(crate) async fn create_write_logical_plan(
     ctx: &mut dyn SqlWriteExecutionContext,
     sql: &str,
 ) -> Result<SqlLogicalPlan, LixError> {
-    super::validate_supported_statement_ast(sql)?;
-    reject_read_only_history_view_dml(sql, &ctx.list_visible_schemas()?)?;
+    let statement = parse_datafusion_statement(sql)?;
+    super::validate_supported_datafusion_statement_ast(&statement)?;
+    reject_read_only_history_view_dml_from_statement(&statement, &ctx.list_visible_schemas()?)?;
     let session = build_write_session(ctx).await?;
-    let plan = session
-        .state()
-        .create_logical_plan(sql)
-        .await
-        .map_err(datafusion_error_to_lix_error)?;
+    let plan = create_logical_plan_from_statement(&session, statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
     let strict_binary_params = validate_strict_lix_file_data_writes(&plan)?;
@@ -105,6 +103,26 @@ pub(crate) async fn create_write_logical_plan(
         notices: Vec::new(),
         strict_binary_params,
     })
+}
+
+fn parse_datafusion_statement(sql: &str) -> Result<DataFusionStatement, LixError> {
+    let session = new_sql_session_context();
+    let dialect = session.state().config_options().sql_parser.dialect;
+    session
+        .state()
+        .sql_to_statement(sql, &dialect)
+        .map_err(datafusion_error_to_lix_error)
+}
+
+async fn create_logical_plan_from_statement(
+    session: &SessionContext,
+    statement: DataFusionStatement,
+) -> Result<LogicalPlan, LixError> {
+    session
+        .state()
+        .statement_to_plan(statement)
+        .await
+        .map_err(datafusion_error_to_lix_error)
 }
 
 fn validate_json_predicates_in_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
@@ -347,11 +365,11 @@ fn sorted_parameter_names(parameter_names: &HashSet<String>) -> Vec<String> {
     names
 }
 
-fn reject_read_only_history_view_dml(
-    sql: &str,
+fn reject_read_only_history_view_dml_from_statement(
+    statement: &DataFusionStatement,
     visible_schemas: &[JsonValue],
 ) -> Result<(), LixError> {
-    let target_names = super::dml_target_table_names(sql)?;
+    let target_names = super::datafusion_statement_dml_target_table_names(statement);
     for target_name in target_names {
         if is_history_view_name(&target_name, visible_schemas)? {
             return Err(read_only_history_view_error(&target_name));
@@ -1819,6 +1837,37 @@ mod tests {
             path_filtered_result.notices()[0].code,
             "LIX_HISTORY_NON_IDENTITY_FILTER"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_rejects_writes_to_history_views_before_planning() {
+        for sql in [
+            "DELETE FROM lix_state_history",
+            "DELETE FROM LIX_STATE_HISTORY",
+            "DELETE FROM main.LIX_STATE_HISTORY",
+            "EXPLAIN DELETE FROM lix_state_history",
+        ] {
+            let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+            let live_state = Arc::new(DummyLiveStateReader);
+            let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+            let mut ctx = DummySqlWriteExecutionContext {
+                active_version_id: "version-a",
+                blob_reader,
+                live_state,
+                staged_writes,
+                schema_definitions: vec![],
+            };
+
+            let error = execute_write_sql(&mut ctx, sql, &[])
+                .await
+                .expect_err("history views are read-only");
+
+            assert_eq!(error.code, LixError::CODE_READ_ONLY, "{sql}");
+            assert_eq!(
+                error.message, "DML cannot write read-only history view 'lix_state_history'",
+                "{sql}"
+            );
+        }
     }
 
     #[tokio::test]
