@@ -13,7 +13,7 @@ const NODE_VERSION: u8 = 2;
 const VALUE_VERSION: u8 = 6;
 const VALUE_DELETED_FLAG: u8 = 0b1000_0000;
 const VALUE_VERSION_MASK: u8 = 0b0111_1111;
-const DELTA_PACK_VERSION: u8 = 2;
+const DELTA_PACK_VERSION: u8 = 3;
 const DELTA_LOCATOR_SAME_COMMIT: u8 = 0;
 const DELTA_LOCATOR_FULL: u8 = 1;
 const NODE_KIND_LEAF: u8 = 1;
@@ -21,6 +21,18 @@ const NODE_KIND_INTERNAL: u8 = 2;
 const WEIBULL_K: i32 = 4;
 const ENTITY_IDENTITY_END: u8 = 0;
 const ENTITY_IDENTITY_STRING: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeltaKeyPrefixRef<'a> {
+    schema_key: &'a str,
+    file_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeltaKeyPrefix {
+    schema_key: String,
+    file_id: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EncodedLeafEntry {
@@ -182,6 +194,39 @@ fn append_key_ref(out: &mut Vec<u8>, key: TrackedStateKeyRef<'_>) {
         None => out.push(0),
     }
     push_entity_identity(out, key.entity_id);
+}
+
+fn append_key_prefix_ref(out: &mut Vec<u8>, prefix: DeltaKeyPrefixRef<'_>) {
+    push_sized_bytes(out, prefix.schema_key.as_bytes());
+    match prefix.file_id {
+        Some(file_id) => {
+            out.push(1);
+            push_sized_bytes(out, file_id.as_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+fn decode_key_prefix(bytes: &[u8], cursor: &mut usize) -> Result<DeltaKeyPrefix, LixError> {
+    let schema_key = read_sized_string(bytes, cursor, "delta key prefix schema_key")?;
+    let file_id = match read_u8(bytes, cursor, "delta key prefix file_id presence")? {
+        0 => None,
+        1 => Some(read_sized_string(
+            bytes,
+            cursor,
+            "delta key prefix file_id",
+        )?),
+        other => {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("tracked-state delta key prefix has invalid file_id presence byte {other}"),
+            ))
+        }
+    };
+    Ok(DeltaKeyPrefix {
+        schema_key,
+        file_id,
+    })
 }
 
 pub(crate) fn encode_schema_key_prefix(schema_key: &str) -> Vec<u8> {
@@ -367,11 +412,18 @@ pub(crate) fn encode_delta_pack_refs(
     out.extend_from_slice(b"LXTD");
     out.push(DELTA_PACK_VERSION);
     push_sized_bytes(&mut out, commit_id.as_bytes());
+    let (key_prefixes, delta_prefix_indexes) = delta_key_prefixes(deltas);
+    push_u32(&mut out, key_prefixes.len());
+    for prefix in &key_prefixes {
+        append_key_prefix_ref(&mut out, *prefix);
+    }
     push_u32(&mut out, deltas.len());
-    for delta in deltas {
+    for (delta, prefix_index) in deltas.iter().zip(delta_prefix_indexes) {
         push_sized_section(&mut out, |out| {
-            append_key_ref(
+            append_delta_key_ref(
                 out,
+                &key_prefixes,
+                prefix_index,
                 TrackedStateKeyRef {
                     schema_key: delta.change.schema_key,
                     file_id: delta.change.file_id,
@@ -395,6 +447,44 @@ pub(crate) fn encode_delta_pack_refs(
         });
     }
     Ok(out)
+}
+
+fn delta_key_prefixes<'a>(
+    deltas: &'a [TrackedStateDeltaRef<'a>],
+) -> (Vec<DeltaKeyPrefixRef<'a>>, Vec<usize>) {
+    let mut prefixes = Vec::new();
+    let mut delta_prefix_indexes = Vec::with_capacity(deltas.len());
+    for delta in deltas {
+        let prefix = DeltaKeyPrefixRef {
+            schema_key: delta.change.schema_key,
+            file_id: delta.change.file_id,
+        };
+        let prefix_index = match prefixes.iter().position(|candidate| *candidate == prefix) {
+            Some(prefix_index) => prefix_index,
+            None => {
+                let prefix_index = prefixes.len();
+                prefixes.push(prefix);
+                prefix_index
+            }
+        };
+        delta_prefix_indexes.push(prefix_index);
+    }
+    (prefixes, delta_prefix_indexes)
+}
+
+fn append_delta_key_ref(
+    out: &mut Vec<u8>,
+    prefixes: &[DeltaKeyPrefixRef<'_>],
+    prefix_index: usize,
+    key: TrackedStateKeyRef<'_>,
+) {
+    let prefix = DeltaKeyPrefixRef {
+        schema_key: key.schema_key,
+        file_id: key.file_id,
+    };
+    debug_assert_eq!(prefixes.get(prefix_index), Some(&prefix));
+    push_u32(out, prefix_index);
+    push_entity_identity(out, key.entity_id);
 }
 
 fn append_delta_value_ref(
@@ -452,10 +542,18 @@ pub(crate) fn decode_delta_pack(
         ));
     }
     let commit_id = read_sized_string(bytes, &mut cursor, "delta pack commit_id")?;
+    let prefix_count = read_u32(bytes, &mut cursor, "delta key prefix count")?;
+    let mut key_prefixes = Vec::with_capacity(prefix_count);
+    for _ in 0..prefix_count {
+        key_prefixes.push(decode_key_prefix(bytes, &mut cursor)?);
+    }
     let count = read_u32(bytes, &mut cursor, "delta pack entry count")?;
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
-        let key = decode_key(&read_sized_bytes(bytes, &mut cursor, "delta key")?)?;
+        let key = decode_delta_key(
+            &read_sized_bytes(bytes, &mut cursor, "delta key")?,
+            &key_prefixes,
+        )?;
         let value = decode_delta_value(
             &read_sized_bytes(bytes, &mut cursor, "delta value")?,
             &commit_id,
@@ -469,6 +567,32 @@ pub(crate) fn decode_delta_pack(
         ));
     }
     Ok((commit_id, entries))
+}
+
+fn decode_delta_key(
+    bytes: &[u8],
+    prefixes: &[DeltaKeyPrefix],
+) -> Result<TrackedStateKey, LixError> {
+    let mut cursor = 0usize;
+    let prefix_index = read_u32(bytes, &mut cursor, "delta key prefix index")?;
+    let prefix = prefixes.get(prefix_index).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("tracked-state delta key prefix index {prefix_index} is out of bounds"),
+        )
+    })?;
+    let entity_id = read_entity_identity(bytes, &mut cursor)?;
+    if cursor != bytes.len() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state delta key decode found trailing bytes",
+        ));
+    }
+    Ok(TrackedStateKey {
+        schema_key: prefix.schema_key.clone(),
+        file_id: prefix.file_id.clone(),
+        entity_id,
+    })
 }
 
 fn decode_delta_value(
@@ -1161,6 +1285,18 @@ mod tests {
         )
         .expect("delta pack should encode");
 
+        let mut cursor = 5usize;
+        assert_eq!(
+            read_sized_string(&encoded, &mut cursor, "delta pack commit_id")
+                .expect("commit id should decode"),
+            "commit-a"
+        );
+        assert_eq!(
+            read_u32(&encoded, &mut cursor, "delta key prefix count")
+                .expect("prefix count should decode"),
+            2
+        );
+
         let (decoded_commit_id, decoded) =
             decode_delta_pack(&encoded).expect("delta pack should decode");
 
@@ -1210,6 +1346,25 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn delta_key_decoder_rejects_out_of_bounds_prefix_index() {
+        let mut encoded_key = Vec::new();
+        push_u32(&mut encoded_key, 1);
+
+        let err = decode_delta_key(
+            &encoded_key,
+            &[DeltaKeyPrefix {
+                schema_key: "schema".to_string(),
+                file_id: None,
+            }],
+        )
+        .expect_err("out-of-bounds prefix index should reject");
+
+        assert!(err
+            .to_string()
+            .contains("tracked-state delta key prefix index 1 is out of bounds"));
     }
 
     #[test]
