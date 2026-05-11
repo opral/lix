@@ -19,19 +19,19 @@ impl ByFileIndex {
                 .filter
                 .file_ids
                 .iter()
-                .all(|filter| !matches!(filter, NullableKeyFilter::Any))
+                .all(|filter| matches!(filter, NullableKeyFilter::Value(_)))
     }
 
     pub(crate) fn scan_request_from_tracked(
         request: &TrackedStateScanRequest,
     ) -> TrackedStateTreeScanRequest {
+        debug_assert!(Self::should_use(request));
         let schema_keys = request
             .filter
             .file_ids
             .iter()
             .filter_map(|filter| match filter {
-                NullableKeyFilter::Any => None,
-                NullableKeyFilter::Null => Some(NULL_COMPONENT.to_string()),
+                NullableKeyFilter::Any | NullableKeyFilter::Null => None,
                 NullableKeyFilter::Value(file_id) => Some(value_component(file_id)),
             })
             .collect();
@@ -52,6 +52,7 @@ impl ByFileIndex {
     }
 
     pub(crate) fn encode_key_ref(row: TrackedStateKeyRef<'_>) -> Vec<u8> {
+        debug_assert!(row.file_id.is_some());
         let schema_key = component(row.file_id);
         encode_tracked_key_ref(TrackedStateKeyRef {
             schema_key: &schema_key,
