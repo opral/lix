@@ -8,7 +8,7 @@ use crate::tracked_state::types::{
 };
 use crate::LixError;
 
-const NODE_VERSION: u8 = 1;
+const NODE_VERSION: u8 = 2;
 const VALUE_VERSION: u8 = 5;
 const VALUE_DELETED_FLAG: u8 = 0b1000_0000;
 const VALUE_VERSION_MASK: u8 = 0b0111_1111;
@@ -80,6 +80,12 @@ pub(crate) enum DecodedNode {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) enum DecodedNodeRef<'a> {
+    Leaf(DecodedLeafNodeRef<'a>),
+    Internal(DecodedInternalNode),
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct DecodedLeafNode {
     entries: Vec<EncodedLeafEntry>,
 }
@@ -87,6 +93,50 @@ pub(crate) struct DecodedLeafNode {
 impl DecodedLeafNode {
     pub(crate) fn entries(&self) -> &[EncodedLeafEntry] {
         &self.entries
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DecodedLeafNodeRef<'a> {
+    bytes: &'a [u8],
+    payload_start: usize,
+    offsets: Vec<usize>,
+}
+
+impl<'a> DecodedLeafNodeRef<'a> {
+    pub(crate) fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    pub(crate) fn entry(&self, index: usize) -> Result<Option<EncodedLeafEntryRef<'a>>, LixError> {
+        if index >= self.len() {
+            return Ok(None);
+        }
+        let start = self.payload_start + self.offsets[index];
+        let end = self.payload_start + self.offsets[index + 1];
+        let record = self.bytes.get(start..end).ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state leaf offset points outside node payload",
+            )
+        })?;
+        let mut cursor = 0usize;
+        let key = read_sized_slice(record, &mut cursor, "leaf key")?;
+        let value = read_sized_slice(record, &mut cursor, "leaf value")?;
+        if cursor != record.len() {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state leaf entry decode found trailing bytes",
+            ));
+        }
+        Ok(Some(EncodedLeafEntryRef { key, value }))
+    }
+
+    pub(crate) fn key(&self, index: usize) -> Result<Option<&'a [u8]>, LixError> {
+        let Some(entry) = self.entry(index)? else {
+            return Ok(None);
+        };
+        Ok(Some(entry.key))
     }
 }
 
@@ -328,10 +378,19 @@ pub(crate) fn encode_leaf_node_refs(entries: &[EncodedLeafEntryRef<'_>]) -> Vec<
     out.push(NODE_KIND_LEAF);
     out.push(NODE_VERSION);
     push_u32(&mut out, entries.len());
+
+    let mut offsets = Vec::with_capacity(entries.len().saturating_add(1));
+    let mut payload = Vec::new();
+    offsets.push(0usize);
     for entry in entries {
-        push_sized_bytes(&mut out, entry.key);
-        push_sized_bytes(&mut out, entry.value);
+        push_sized_bytes(&mut payload, entry.key);
+        push_sized_bytes(&mut payload, entry.value);
+        offsets.push(payload.len());
     }
+    for offset in offsets {
+        push_u32(&mut out, offset);
+    }
+    out.extend_from_slice(&payload);
     out
 }
 
@@ -358,6 +417,28 @@ pub(crate) fn encode_internal_node_refs(children: &[ChildSummaryRef<'_>]) -> Vec
 }
 
 pub(crate) fn decode_node(bytes: &[u8]) -> Result<DecodedNode, LixError> {
+    match decode_node_ref(bytes)? {
+        DecodedNodeRef::Leaf(leaf) => {
+            let mut entries = Vec::with_capacity(leaf.len());
+            for index in 0..leaf.len() {
+                let entry = leaf.entry(index)?.ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "tracked-state leaf entry disappeared during owned decode",
+                    )
+                })?;
+                entries.push(EncodedLeafEntry {
+                    key: entry.key.to_vec(),
+                    value: entry.value.to_vec(),
+                });
+            }
+            Ok(DecodedNode::Leaf(DecodedLeafNode { entries }))
+        }
+        DecodedNodeRef::Internal(internal) => Ok(DecodedNode::Internal(internal)),
+    }
+}
+
+pub(crate) fn decode_node_ref(bytes: &[u8]) -> Result<DecodedNodeRef<'_>, LixError> {
     let mut cursor = 0usize;
     let kind = read_u8(bytes, &mut cursor, "node kind")?;
     let version = read_u8(bytes, &mut cursor, "node version")?;
@@ -370,14 +451,8 @@ pub(crate) fn decode_node(bytes: &[u8]) -> Result<DecodedNode, LixError> {
     let count = read_u32(bytes, &mut cursor, "entry count")?;
     let node = match kind {
         NODE_KIND_LEAF => {
-            let mut entries = Vec::with_capacity(count);
-            for _ in 0..count {
-                entries.push(EncodedLeafEntry {
-                    key: read_sized_bytes(bytes, &mut cursor, "leaf key")?,
-                    value: read_sized_bytes(bytes, &mut cursor, "leaf value")?,
-                });
-            }
-            DecodedNode::Leaf(DecodedLeafNode { entries })
+            let leaf = decode_leaf_node_ref_after_count(bytes, &mut cursor, count)?;
+            DecodedNodeRef::Leaf(leaf)
         }
         NODE_KIND_INTERNAL => {
             let mut children = Vec::with_capacity(count);
@@ -393,7 +468,7 @@ pub(crate) fn decode_node(bytes: &[u8]) -> Result<DecodedNode, LixError> {
                     subtree_count,
                 });
             }
-            DecodedNode::Internal(DecodedInternalNode { children })
+            DecodedNodeRef::Internal(DecodedInternalNode { children })
         }
         other => {
             return Err(LixError::new(
@@ -409,6 +484,50 @@ pub(crate) fn decode_node(bytes: &[u8]) -> Result<DecodedNode, LixError> {
         ));
     }
     Ok(node)
+}
+
+fn decode_leaf_node_ref_after_count<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    count: usize,
+) -> Result<DecodedLeafNodeRef<'a>, LixError> {
+    let mut offsets = Vec::with_capacity(count.saturating_add(1));
+    for _ in 0..=count {
+        offsets.push(read_u32(bytes, cursor, "leaf entry offset")?);
+    }
+    if offsets.first().copied() != Some(0) {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state leaf offset table must start at zero",
+        ));
+    }
+    for window in offsets.windows(2) {
+        if window[0] > window[1] {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "tracked-state leaf offsets must be monotonic",
+            ));
+        }
+    }
+    let payload_len = bytes.len().checked_sub(*cursor).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state leaf payload start is past node end",
+        )
+    })?;
+    if offsets.last().copied().unwrap_or_default() != payload_len {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state leaf offset table does not cover full payload",
+        ));
+    }
+    let payload_start = *cursor;
+    *cursor = bytes.len();
+    Ok(DecodedLeafNodeRef {
+        bytes,
+        payload_start,
+        offsets,
+    })
 }
 
 pub(crate) fn child_summary_from_node(
@@ -539,6 +658,14 @@ fn read_sized_bytes(
     cursor: &mut usize,
     field_name: &str,
 ) -> Result<Vec<u8>, LixError> {
+    read_sized_slice(bytes, cursor, field_name).map(<[u8]>::to_vec)
+}
+
+fn read_sized_slice<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    field_name: &str,
+) -> Result<&'a [u8], LixError> {
     let len = read_u32(bytes, cursor, field_name)?;
     let end = cursor.checked_add(len).ok_or_else(|| {
         LixError::new(
@@ -553,7 +680,7 @@ fn read_sized_bytes(
         )
     })?;
     *cursor = end;
-    Ok(slice.to_vec())
+    Ok(slice)
 }
 
 fn read_fixed_hash(
@@ -785,6 +912,92 @@ mod tests {
         for value in values {
             assert_eq!(encoded_value_len(&value), encode_value(&value).len());
         }
+    }
+
+    #[test]
+    fn leaf_node_codec_uses_indexable_offset_table() {
+        let entries = vec![
+            EncodedLeafEntry {
+                key: b"alpha".to_vec(),
+                value: b"one".to_vec(),
+            },
+            EncodedLeafEntry {
+                key: b"bravo".to_vec(),
+                value: b"two-two".to_vec(),
+            },
+        ];
+
+        let encoded = encode_leaf_node(&entries);
+        assert_eq!(encoded[0], NODE_KIND_LEAF);
+        assert_eq!(encoded[1], NODE_VERSION);
+        assert_eq!(&encoded[2..6], 2u32.to_be_bytes().as_slice());
+        assert_eq!(&encoded[6..10], 0u32.to_be_bytes().as_slice());
+
+        let DecodedNodeRef::Leaf(leaf) = decode_node_ref(&encoded).expect("leaf ref") else {
+            panic!("expected leaf node");
+        };
+        assert_eq!(leaf.len(), 2);
+        assert_eq!(leaf.key(1).expect("second key"), Some(b"bravo".as_slice()));
+        let second = leaf
+            .entry(1)
+            .expect("second entry")
+            .expect("second entry exists");
+        assert_eq!(second.key, b"bravo");
+        assert_eq!(second.value, b"two-two");
+
+        let DecodedNode::Leaf(owned) = decode_node(&encoded).expect("owned leaf") else {
+            panic!("expected owned leaf node");
+        };
+        assert_eq!(owned.entries(), entries.as_slice());
+    }
+
+    #[test]
+    fn leaf_node_codec_roundtrips_empty_leaf() {
+        let encoded = encode_leaf_node(&[]);
+        assert_eq!(encoded.len(), 10);
+
+        let DecodedNodeRef::Leaf(leaf) = decode_node_ref(&encoded).expect("leaf ref") else {
+            panic!("expected leaf node");
+        };
+        assert_eq!(leaf.len(), 0);
+        assert!(leaf.entry(0).expect("missing entry").is_none());
+    }
+
+    #[test]
+    fn leaf_node_codec_rejects_malformed_offsets() {
+        let entries = vec![
+            EncodedLeafEntry {
+                key: b"alpha".to_vec(),
+                value: b"one".to_vec(),
+            },
+            EncodedLeafEntry {
+                key: b"bravo".to_vec(),
+                value: b"two".to_vec(),
+            },
+        ];
+        let encoded = encode_leaf_node(&entries);
+
+        let mut non_zero_first = encoded.clone();
+        non_zero_first[6..10].copy_from_slice(&1u32.to_be_bytes());
+        assert!(decode_node_ref(&non_zero_first)
+            .expect_err("non-zero first offset should reject")
+            .to_string()
+            .contains("offset table must start at zero"));
+
+        let mut non_monotonic = encoded.clone();
+        non_monotonic[10..14].copy_from_slice(&100u32.to_be_bytes());
+        assert!(decode_node_ref(&non_monotonic)
+            .expect_err("non-monotonic offsets should reject")
+            .to_string()
+            .contains("offsets must be monotonic"));
+
+        let mut short_coverage = encoded;
+        let payload_len = short_coverage.len() - 18;
+        short_coverage[14..18].copy_from_slice(&((payload_len - 1) as u32).to_be_bytes());
+        assert!(decode_node_ref(&short_coverage)
+            .expect_err("short offset coverage should reject")
+            .to_string()
+            .contains("offset table does not cover full payload"));
     }
 
     #[test]
