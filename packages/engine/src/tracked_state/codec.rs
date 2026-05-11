@@ -245,6 +245,31 @@ pub(crate) fn decode_key(bytes: &[u8]) -> Result<TrackedStateKey, LixError> {
     })
 }
 
+/// Decodes a key after the caller has already proven the schema/file prefix.
+///
+/// This is for scan paths that have matched an encoded prefix range and only
+/// need to materialize the entity suffix plus the known projection fields.
+pub(crate) fn decode_key_with_trusted_prefix(
+    bytes: &[u8],
+    schema_key: &str,
+    file_id: Option<&str>,
+    prefix_len: usize,
+) -> Result<TrackedStateKey, LixError> {
+    let mut cursor = prefix_len;
+    let entity_id = read_entity_identity(bytes, &mut cursor)?;
+    if cursor != bytes.len() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state tree key decode found trailing bytes",
+        ));
+    }
+    Ok(TrackedStateKey {
+        schema_key: schema_key.to_string(),
+        file_id: file_id.map(str::to_string),
+        entity_id,
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn encode_value(value: &TrackedStateIndexValue) -> Vec<u8> {
     encode_value_ref(TrackedStateIndexValueRef {
@@ -1375,6 +1400,25 @@ mod tests {
         let encoded = encode_key(&key);
 
         assert_eq!(decode_key(&encoded).expect("key should decode"), key);
+    }
+
+    #[test]
+    fn key_codec_decodes_entity_suffix_with_trusted_prefix() {
+        let key = TrackedStateKey {
+            schema_key: "schema".to_string(),
+            file_id: Some("file".to_string()),
+            entity_id: EntityIdentity {
+                parts: vec!["namespace".to_string(), "id".to_string()],
+            },
+        };
+        let encoded = encode_key(&key);
+        let prefix = encode_schema_file_prefix("schema", Some("file"));
+
+        assert_eq!(
+            decode_key_with_trusted_prefix(&encoded, "schema", Some("file"), prefix.len())
+                .expect("key suffix should decode"),
+            key
+        );
     }
 
     #[test]
