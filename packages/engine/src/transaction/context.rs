@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobHash};
-use crate::catalog::SchemaCatalogContext;
+use crate::catalog::CatalogContext;
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
 use crate::commit_store::CommitStoreContext;
 use crate::domain::Domain;
@@ -76,7 +76,7 @@ impl Transaction {
         binary_cas: Arc<BinaryCasContext>,
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
-        schema_catalog_context: Arc<SchemaCatalogContext>,
+        catalog_context: Arc<CatalogContext>,
     ) -> Result<OpenTransaction, LixError> {
         let mut storage_transaction = storage.begin_write_transaction().await?;
         let setup_result = async {
@@ -94,13 +94,13 @@ impl Transaction {
             let functions = runtime_functions.provider();
             let visible_schemas = {
                 let visible_live_state = live_state.reader(storage_transaction.as_mut());
-                schema_catalog_context
+                catalog_context
                     .schema_jsons_for_sql_read_planning(&visible_live_state, &active_version_id)
                     .await?
             };
             let schema_facts = {
                 let visible_live_state = live_state.reader(storage_transaction.as_mut());
-                schema_catalog_context
+                catalog_context
                     .schema_facts_for_domain(
                         &visible_live_state,
                         &Domain::schema_catalog(active_version_id.clone(), true),
@@ -124,7 +124,7 @@ impl Transaction {
                     return Err(error);
                 }
             };
-        let mut schema_resolver = TransactionSchemaResolver::new(schema_catalog_context);
+        let mut schema_resolver = TransactionSchemaResolver::new(catalog_context);
         schema_resolver.remember_schema_facts(
             &Domain::schema_catalog(active_version_id.clone(), true),
             schema_facts,
@@ -590,7 +590,7 @@ fn prepare_state_row(
 fn remember_adopted_registered_schema(
     domain: Domain,
     snapshot_content: Option<&str>,
-    catalog: &mut crate::catalog::SchemaCatalog,
+    catalog: &mut crate::catalog::CatalogSnapshot,
 ) -> Result<(), LixError> {
     let snapshot = snapshot_content
         .map(|value| {
@@ -673,7 +673,7 @@ pub(crate) async fn open_transaction(
     binary_cas: Arc<BinaryCasContext>,
     commit_store: Arc<CommitStoreContext>,
     version_ctx: Arc<VersionContext>,
-    schema_catalog_context: Arc<SchemaCatalogContext>,
+    catalog_context: Arc<CatalogContext>,
 ) -> Result<OpenTransaction, LixError> {
     Transaction::open(
         mode,
@@ -683,7 +683,7 @@ pub(crate) async fn open_transaction(
         binary_cas,
         commit_store,
         version_ctx,
-        schema_catalog_context,
+        catalog_context,
     )
     .await
 }
@@ -923,7 +923,7 @@ mod tests {
         let changelog = Arc::new(CommitStoreContext::new());
         let commit_store = Arc::new(CommitStoreContext::new());
         let version_ctx = Arc::new(VersionContext::new(Arc::new(UntrackedStateContext::new())));
-        let schema_catalog_context = Arc::new(SchemaCatalogContext::new());
+        let catalog_context = Arc::new(CatalogContext::new());
         let opened = open_transaction(
             &SessionMode::Pinned {
                 version_id: GLOBAL_VERSION_ID.to_string(),
@@ -934,7 +934,7 @@ mod tests {
             Arc::clone(&binary_cas),
             Arc::clone(&commit_store),
             Arc::clone(&version_ctx),
-            Arc::clone(&schema_catalog_context),
+            Arc::clone(&catalog_context),
         )
         .await
         .expect("transaction should open");
@@ -1062,7 +1062,7 @@ mod tests {
         let changelog = Arc::new(CommitStoreContext::new());
         let commit_store = Arc::new(CommitStoreContext::new());
         let version_ctx = Arc::new(VersionContext::new(Arc::new(UntrackedStateContext::new())));
-        let schema_catalog_context = Arc::new(SchemaCatalogContext::new());
+        let catalog_context = Arc::new(CatalogContext::new());
         let opened = open_transaction(
             &SessionMode::Pinned {
                 version_id: GLOBAL_VERSION_ID.to_string(),
@@ -1073,7 +1073,7 @@ mod tests {
             Arc::clone(&binary_cas),
             Arc::clone(&commit_store),
             Arc::clone(&version_ctx),
-            Arc::clone(&schema_catalog_context),
+            Arc::clone(&catalog_context),
         )
         .await
         .expect("transaction should open");
@@ -1394,7 +1394,7 @@ mod tests {
         let changelog = Arc::new(CommitStoreContext::new());
         let commit_store = Arc::new(CommitStoreContext::new());
         let version_ctx = Arc::new(VersionContext::new(Arc::new(UntrackedStateContext::new())));
-        let schema_catalog_context = Arc::new(SchemaCatalogContext::new());
+        let catalog_context = Arc::new(CatalogContext::new());
         let opened = open_transaction(
             &SessionMode::Pinned {
                 version_id: GLOBAL_VERSION_ID.to_string(),
@@ -1405,7 +1405,7 @@ mod tests {
             Arc::clone(&binary_cas),
             Arc::clone(&commit_store),
             Arc::clone(&version_ctx),
-            schema_catalog_context,
+            catalog_context,
         )
         .await
         .expect("transaction should open");

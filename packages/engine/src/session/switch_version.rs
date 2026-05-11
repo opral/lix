@@ -74,7 +74,7 @@ impl SessionContext {
             Arc::clone(&self.binary_cas),
             Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
-            Arc::clone(&self.schema_catalog_context),
+            Arc::clone(&self.catalog_context),
             self.closed_flag(),
         );
         Ok((
