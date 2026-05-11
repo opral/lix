@@ -69,6 +69,14 @@ pub(crate) fn encode_json_str(json: &str) -> Result<EncodedJson<'_>, LixError> {
     encode_json_for_storage(json)
 }
 
+pub(crate) fn encode_json_str_with_ref(
+    json: &str,
+    json_ref: JsonRef,
+) -> Result<EncodedJson<'_>, LixError> {
+    debug_assert_eq!(JsonRef::for_content(json.as_bytes()), json_ref);
+    encode_json_for_storage_with_ref(json, json_ref)
+}
+
 pub(crate) fn encode_direct_json_payload(encoded_json: &EncodedJson<'_>) -> Vec<u8> {
     encode_stored_json_payload(encoded_json)
 }

@@ -2307,3 +2307,144 @@ treated as a small supporting optimization rather than a budget-moving step.
 
 No storage format change. No temporary shim.
 ```
+
+## Optimization 14: Reuse trusted JSON refs during payload staging
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Threaded precomputed JSON refs through JSON-store staging for callers that
+already own the normalized JSON/ref invariant:
+
+- `NormalizedJsonRef` now has private fields and two constructors:
+  `new(normalized)` for ordinary callers and
+  `trusted_prehashed(normalized, json_ref)` for the explicit trusted path.
+- `JsonStoreWriter::stage_batch` uses the supplied trusted ref to encode JSON
+  without hashing the payload again, falling back to the existing hashing path
+  for normal callers.
+- Transaction commit passes `StageJson` refs for snapshot/metadata payloads.
+  `StageJson` computes the ref from the same normalized string during
+  transaction staging.
+- The physical storage benchmark root writer pairs payload strings with refs
+  from the already-built `Change` records so the benchmark no longer pays the
+  same duplicate hash.
+
+Added direct JSON-store coverage for staging a trusted prehashed commit-pack
+payload, verifying the returned ref and hydrated bytes.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+Result: passed.
+
+| row                                             | after median | criterion status |
+| ----------------------------------------------- | -----------: | ---------------- |
+| `raw_sqlite/write_root_all_rows/1k`             |    2.3853 ms | reference |
+| `raw_sqlite/write_delta_10pct_updates/1k`       |    1.2667 ms | reference |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k`   |    1.2330 ms | reference |
+| `sqlite/write_root_all_rows/1k`                 |    5.4166 ms | improved |
+| `sqlite/write_delta_10pct_updates/1k`           |    2.5490 ms | no change |
+| `sqlite/write_tombstone_10pct_deletes/1k`       |    2.6059 ms | improved |
+| `rocksdb/write_root_all_rows/1k`                |    4.8746 ms | improved |
+| `rocksdb/write_delta_10pct_updates/1k`          |    1.2758 ms | no change |
+| `rocksdb/write_tombstone_10pct_deletes/1k`      |    1.2795 ms | noisy guardrail |
+
+Rerun command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+Result: passed.
+
+| row                                             | rerun median | criterion status |
+| ----------------------------------------------- | -----------: | ---------------- |
+| `sqlite/write_root_all_rows/1k`                 |    5.3105 ms | no change, lower median |
+| `sqlite/write_delta_10pct_updates/1k`           |    2.5652 ms | no change |
+| `sqlite/write_tombstone_10pct_deletes/1k`       |    2.4195 ms | no change |
+| `rocksdb/write_root_all_rows/1k`                |    4.7479 ms | no change, lower median |
+| `rocksdb/write_delta_10pct_updates/1k`          |    1.2128 ms | no change |
+| `rocksdb/write_tombstone_10pct_deletes/1k`      |    1.2283 ms | improved |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                     | bytes | bytes/row | status |
+| --------------------------------------- | ----: | --------: | ------ |
+| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
+| Lix SQLite / inserted                   | 1112216 | 1112.2 | unchanged |
+| Lix SQLite / after create_version       | 1124576 | 1124.6 | unchanged |
+| Lix SQLite / after fast-forward merge   | 5324328 | 5324.3 | unchanged |
+| Lix SQLite / after divergent merge      | 5652176 | 5652.2 | unchanged |
+| Lix RocksDB / inserted                  | 1028557 | 1028.6 | unchanged |
+| Lix RocksDB / after create_version      | 1030457 | 1030.5 | unchanged |
+| Lix RocksDB / after fast-forward merge  | 1195234 | 1195.2 | unchanged |
+| Lix RocksDB / after divergent merge     | 1576587 | 1576.6 | unchanged |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+Initial review:
+HIGH: none.
+MEDIUM: supplied-ref path was correctness-critical but only protected by
+debug_assert; make the trusted prehashed path harder to construct accidentally.
+LOW: add direct json-store coverage and avoid pretending init eliminates a hash.
+
+Follow-up review:
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+The prior MEDIUM is resolved by private NormalizedJsonRef fields plus explicit
+new/trusted_prehashed constructors. The intended production caller passes
+StageJson normalized bytes and the ref computed from those same bytes.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine json_store:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine transaction::commit:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a root-write optimization.
+
+Primary axis: write_root_all_rows. The structural win removes a duplicate
+BLAKE3 hash over normalized JSON payloads at the JSON-store staging boundary
+when transaction staging has already computed the content ref.
+
+Timing: both SQLite and RocksDB root writes moved down, with Criterion
+improvements in the first focused run and lower medians on rerun. Delta and
+tombstone rows are treated as guardrails; their medians were neutral to better
+on rerun.
+
+No storage format change. No temporary shim.
+```

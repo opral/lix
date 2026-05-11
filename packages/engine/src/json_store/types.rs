@@ -66,14 +66,40 @@ impl JsonRef {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NormalizedJsonRef<'a> {
-    pub(crate) normalized: &'a str,
+    normalized: &'a str,
+    trusted_json_ref: Option<JsonRef>,
+}
+
+impl<'a> NormalizedJsonRef<'a> {
+    pub(crate) fn new(normalized: &'a str) -> Self {
+        Self {
+            normalized,
+            trusted_json_ref: None,
+        }
+    }
+
+    /// Uses a caller-owned invariant that `json_ref` was computed from
+    /// `normalized`. This avoids rehashing JSON already normalized by the
+    /// transaction staging boundary.
+    pub(crate) fn trusted_prehashed(normalized: &'a str, json_ref: JsonRef) -> Self {
+        Self {
+            normalized,
+            trusted_json_ref: Some(json_ref),
+        }
+    }
+
+    pub(crate) fn normalized(&self) -> &'a str {
+        self.normalized
+    }
+
+    pub(crate) fn trusted_json_ref(&self) -> Option<JsonRef> {
+        self.trusted_json_ref
+    }
 }
 
 impl<'a> From<&'a NormalizedJson> for NormalizedJsonRef<'a> {
     fn from(value: &'a NormalizedJson) -> Self {
-        Self {
-            normalized: value.as_str(),
-        }
+        Self::new(value.as_str())
     }
 }
 

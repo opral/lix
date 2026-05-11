@@ -198,9 +198,9 @@ pub(crate) async fn initialize(
             commit_id: &plan.commit.id,
             pack_id: 0,
         },
-        plan.changes.iter().map(|change| NormalizedJsonRef {
-            normalized: change.snapshot_content.as_str(),
-        }),
+        plan.changes
+            .iter()
+            .map(|change| NormalizedJsonRef::new(change.snapshot_content.as_str())),
     )?;
 
     let staged_commit = {

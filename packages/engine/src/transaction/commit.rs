@@ -209,9 +209,7 @@ fn json_payloads_from_state_row(
     row.snapshot
         .iter()
         .chain(row.metadata.iter())
-        .map(|json| NormalizedJsonRef {
-            normalized: json.normalized.as_ref(),
-        })
+        .map(|json| NormalizedJsonRef::trusted_prehashed(json.normalized.as_ref(), json.json_ref))
 }
 
 async fn existing_untracked_overlay_delete_identities<'a>(
@@ -944,9 +942,7 @@ mod tests {
                 .stage_batch(
                     &mut writes,
                     JsonWritePlacementRef::OutOfBand,
-                    [NormalizedJsonRef {
-                        normalized: mode_snapshot.as_str(),
-                    }],
+                    [NormalizedJsonRef::new(mode_snapshot.as_str())],
                 )
                 .expect("deterministic mode snapshot should stage");
             let row = crate::untracked_state::UntrackedStateRow {
