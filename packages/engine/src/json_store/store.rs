@@ -41,6 +41,12 @@ enum JsonHashCheck {
     Verify,
 }
 
+enum OrderedSinglePackProbe {
+    Hit(Vec<Option<Vec<u8>>>),
+    MissPresent(Vec<u8>),
+    MissAbsent,
+}
+
 fn raw_json_ref_for_content(json: &str) -> JsonRef {
     JsonRef::from_hash(blake3::hash(json.as_bytes()))
 }
@@ -237,6 +243,21 @@ async fn load_json_bytes_many_in_scope_with_hash_check(
         return Ok(Vec::new());
     }
 
+    let ordered_single_pack_probe = if let JsonReadScopeRef::CommitPacks {
+        commit_id,
+        pack_ids: [pack_id],
+    } = scope
+    {
+        let probe =
+            load_ordered_single_pack(store, json_refs, commit_id, *pack_id, hash_check).await?;
+        if let OrderedSinglePackProbe::Hit(values) = probe {
+            return Ok(values);
+        }
+        Some(probe)
+    } else {
+        None
+    };
+
     let mut unique_keys = Vec::new();
     let mut unique_refs = Vec::new();
     let mut key_indexes = HashMap::<[u8; 32], usize>::new();
@@ -262,6 +283,19 @@ async fn load_json_bytes_many_in_scope_with_hash_check(
 
     let mut unique_values = match scope {
         JsonReadScopeRef::OutOfBand => vec![None; unique_refs.len()],
+        JsonReadScopeRef::CommitPacks {
+            commit_id,
+            pack_ids: [pack_id],
+        } => match &ordered_single_pack_probe {
+            Some(OrderedSinglePackProbe::MissPresent(stored_pack)) => {
+                load_from_single_pack_bytes(stored_pack, &unique_refs, hash_check)?
+            }
+            Some(OrderedSinglePackProbe::MissAbsent) => vec![None; unique_refs.len()],
+            _ => {
+                let pack_ids = [*pack_id];
+                load_from_packs(store, &unique_refs, commit_id, &pack_ids, hash_check).await?
+            }
+        },
         JsonReadScopeRef::CommitPacks {
             commit_id,
             pack_ids,
@@ -348,6 +382,66 @@ fn json_values_in_request_order(
         .into_iter()
         .map(|index| unique_values[index].clone())
         .collect()
+}
+
+async fn load_ordered_single_pack(
+    store: &mut impl StorageReader,
+    requested_refs: &[JsonRef],
+    commit_id: &str,
+    pack_id: u32,
+    hash_check: JsonHashCheck,
+) -> Result<OrderedSinglePackProbe, LixError> {
+    let result = store
+        .get_values(KvGetRequest {
+            groups: vec![KvGetGroup {
+                namespace: JSON_PACK_NAMESPACE.to_string(),
+                keys: vec![pack_key(commit_id, pack_id)],
+            }],
+        })
+        .await?;
+    let group = result.groups.into_iter().next().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "json_store ordered pack load returned no result group",
+        )
+    })?;
+    if group.len() != 1 {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "json_store ordered pack load returned {} values for 1 requested pack",
+                group.len()
+            ),
+        ));
+    }
+    let Some(stored_pack) = group.value(0).flatten() else {
+        return Ok(OrderedSinglePackProbe::MissAbsent);
+    };
+    let mut values = vec![None; requested_refs.len()];
+    if load_json_pack_values_in_request_order(stored_pack, hash_check, requested_refs, &mut values)?
+    {
+        Ok(OrderedSinglePackProbe::Hit(values))
+    } else {
+        Ok(OrderedSinglePackProbe::MissPresent(stored_pack.to_vec()))
+    }
+}
+
+fn load_from_single_pack_bytes(
+    stored_pack: &[u8],
+    unique_refs: &[JsonRef],
+    hash_check: JsonHashCheck,
+) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+    let mut values = vec![None; unique_refs.len()];
+    if load_json_pack_values_in_request_order(stored_pack, hash_check, unique_refs, &mut values)? {
+        return Ok(values);
+    }
+    let wanted = unique_refs
+        .iter()
+        .enumerate()
+        .map(|(index, json_ref)| (*json_ref.as_hash_array(), index))
+        .collect::<HashMap<_, _>>();
+    load_json_pack_values(stored_pack, hash_check, &wanted, &mut values)?;
+    Ok(values)
 }
 
 async fn load_from_packs(
@@ -955,5 +1049,50 @@ mod tests {
                 Some(first.data.as_ref().to_vec()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn ordered_pack_probe_falls_back_to_direct_rows() {
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let packed = encode_json("{\"value\":\"packed\"}").expect("packed json should encode");
+        let direct = encode_json("{\"value\":\"direct\"}").expect("direct json should encode");
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            JSON_PACK_NAMESPACE,
+            pack_key("commit-a", 0),
+            encode_json_pack(&[&packed]).expect("pack should encode"),
+        );
+        writes.put(
+            JSON_NAMESPACE,
+            direct.json_ref.as_hash_bytes().to_vec(),
+            encode_stored_json_payload(&direct),
+        );
+        writes
+            .apply(&mut transaction.as_mut())
+            .await
+            .expect("json rows should store");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let pack_ids = [0];
+        let mut store = storage.clone();
+        let values = load_json_bytes_many_in_scope(
+            &mut store,
+            &[direct.json_ref],
+            JsonReadScopeRef::CommitPacks {
+                commit_id: "commit-a",
+                pack_ids: &pack_ids,
+            },
+        )
+        .await
+        .expect("mismatched ordered pack probe should fall back to direct rows");
+        assert_eq!(values, vec![Some(direct.data.as_ref().to_vec())]);
     }
 }
