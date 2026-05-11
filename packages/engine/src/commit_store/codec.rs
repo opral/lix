@@ -119,18 +119,17 @@ pub(crate) fn decode_change(bytes: &[u8]) -> Result<Change, LixError> {
     })
 }
 
-pub(crate) fn encode_change_pack<'a>(
+pub(crate) fn encode_change_pack(
     commit_id: &str,
     pack_id: u32,
-    changes: impl IntoIterator<Item = ChangeRef<'a>>,
+    changes: &[ChangeRef<'_>],
 ) -> Result<Vec<u8>, LixError> {
-    let changes = changes.into_iter().collect::<Vec<_>>();
     let mut bytes = Vec::new();
     bytes.extend_from_slice(CHANGE_PACK_MAGIC);
     write_str(&mut bytes, commit_id)?;
     bytes.extend_from_slice(&pack_id.to_le_bytes());
     write_len(&mut bytes, changes.len(), "change pack changes")?;
-    for change in changes {
+    for change in changes.iter().copied() {
         write_bytes(&mut bytes, &encode_change_ref(change)?)?;
     }
     Ok(bytes)
