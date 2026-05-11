@@ -3947,7 +3947,7 @@ async fn write_tracked_root(
         .map(tracked_bench_change_from_materialized)
         .collect::<Result<Vec<_>, _>>()?;
     let payloads = tracked_bench_json_payloads(rows, &changes);
-    JsonStoreContext::new().writer().stage_batch(
+    let json_report = JsonStoreContext::new().writer().stage_batch_report(
         &mut writes,
         JsonWritePlacementRef::CommitPack {
             commit_id,
@@ -3994,7 +3994,16 @@ async fn write_tracked_root(
     );
     context
         .writer(&mut transaction.as_mut(), &mut writes)
-        .stage_delta(commit_id, parent_commit_id, &deltas)
+        .stage_delta_with_json_pack_indexes(
+            commit_id,
+            parent_commit_id,
+            &deltas,
+            crate::tracked_state::DeltaJsonPackIndexesRef {
+                commit_id,
+                pack_id: 0,
+                indexes: &json_report.pack_indexes,
+            },
+        )
         .await?;
     writes.apply(&mut transaction.as_mut()).await?;
     transaction.commit().await

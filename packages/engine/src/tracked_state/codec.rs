@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::commit_store::ChangeLocator;
@@ -13,9 +15,14 @@ const NODE_VERSION: u8 = 2;
 const VALUE_VERSION: u8 = 7;
 const VALUE_DELETED_FLAG: u8 = 0b1000_0000;
 const VALUE_VERSION_MASK: u8 = 0b0111_1111;
-const DELTA_PACK_VERSION: u8 = 6;
+const DELTA_PACK_VERSION: u8 = 7;
 const DELTA_LOCATOR_SAME_COMMIT: u8 = 0;
 const DELTA_LOCATOR_FULL: u8 = 1;
+const DELTA_JSON_REFS_INLINE: u8 = 0;
+const DELTA_JSON_REFS_MIXED_PACK_INDEX: u8 = 1;
+const DELTA_JSON_REF_NONE: u8 = 0;
+const DELTA_JSON_REF_PACK_INDEX: u8 = 1;
+const DELTA_JSON_REF_INLINE: u8 = 2;
 const DELTA_CHANGE_ID_FULL: u8 = 0;
 const DELTA_CHANGE_ID_COMMIT_SUFFIX: u8 = 1;
 const TIMESTAMP_UPDATED_SAME: u8 = 0;
@@ -401,6 +408,15 @@ pub(crate) fn encode_delta_pack_refs(
     commit_id: &str,
     deltas: &[TrackedStateDeltaRef<'_>],
 ) -> Result<Vec<u8>, LixError> {
+    encode_delta_pack_refs_with_json_pack_indexes(commit_id, deltas, None)
+}
+
+pub(crate) fn encode_delta_pack_refs_with_json_pack_indexes(
+    commit_id: &str,
+    deltas: &[TrackedStateDeltaRef<'_>],
+    json_pack_indexes: Option<&HashMap<[u8; TRACKED_STATE_HASH_BYTES], usize>>,
+) -> Result<Vec<u8>, LixError> {
+    let json_pack_indexes = json_pack_indexes.filter(|indexes| !indexes.is_empty());
     let mut out = Vec::new();
     out.extend_from_slice(b"LXTD");
     out.push(DELTA_PACK_VERSION);
@@ -411,6 +427,11 @@ pub(crate) fn encode_delta_pack_refs(
         append_delta_key_prefix_ref(&mut out, *prefix)?;
     }
     push_var_u32(&mut out, deltas.len(), "delta pack entry count")?;
+    out.push(if json_pack_indexes.is_some() {
+        DELTA_JSON_REFS_MIXED_PACK_INDEX
+    } else {
+        DELTA_JSON_REFS_INLINE
+    });
     for (delta, prefix_index) in deltas.iter().zip(delta_prefix_indexes) {
         append_delta_key_ref(
             &mut out,
@@ -425,6 +446,7 @@ pub(crate) fn encode_delta_pack_refs(
         append_delta_value_ref(
             &mut out,
             commit_id,
+            json_pack_indexes,
             TrackedStateIndexValueRef {
                 change_locator: delta.locator,
                 deleted: delta.change.snapshot_ref.is_none(),
@@ -521,6 +543,7 @@ fn append_delta_key_ref(
 fn append_delta_value_ref(
     out: &mut Vec<u8>,
     pack_commit_id: &str,
+    json_pack_indexes: Option<&HashMap<[u8; TRACKED_STATE_HASH_BYTES], usize>>,
     value: TrackedStateIndexValueRef<'_>,
 ) -> Result<(), LixError> {
     out.push(VALUE_VERSION | if value.deleted { VALUE_DELETED_FLAG } else { 0 });
@@ -550,13 +573,22 @@ fn append_delta_value_ref(
         value.change_locator.change_id,
     )?;
     push_var_timestamp_pair(out, value.created_at, value.updated_at)?;
-    push_optional_json_ref(out, value.snapshot_ref);
-    push_optional_json_ref(out, value.metadata_ref);
+    match json_pack_indexes {
+        Some(indexes) => {
+            push_mixed_optional_json_ref(out, indexes, value.snapshot_ref)?;
+            push_mixed_optional_json_ref(out, indexes, value.metadata_ref)?;
+        }
+        None => {
+            push_optional_json_ref(out, value.snapshot_ref);
+            push_optional_json_ref(out, value.metadata_ref);
+        }
+    }
     Ok(())
 }
 
 pub(crate) fn decode_delta_pack(
     bytes: &[u8],
+    pack_json_refs: Option<&[JsonRef]>,
 ) -> Result<(String, Vec<TrackedStateDeltaEntry>), LixError> {
     let mut cursor = 0usize;
     let magic = bytes.get(0..4).ok_or_else(|| {
@@ -586,10 +618,11 @@ pub(crate) fn decode_delta_pack(
         key_prefixes.push(decode_delta_key_prefix(bytes, &mut cursor)?);
     }
     let count = read_var_u32(bytes, &mut cursor, "delta pack entry count")?;
+    let json_ref_mode = decode_delta_json_ref_mode(bytes, &mut cursor, pack_json_refs)?;
     let mut entries = Vec::new();
     for _ in 0..count {
         let key = decode_delta_key(bytes, &mut cursor, &key_prefixes)?;
-        let value = decode_delta_value(bytes, &mut cursor, &commit_id)?;
+        let value = decode_delta_value(bytes, &mut cursor, &commit_id, &json_ref_mode)?;
         entries.push(TrackedStateDeltaEntry { key, value });
     }
     if cursor != bytes.len() {
@@ -599,6 +632,44 @@ pub(crate) fn decode_delta_pack(
         ));
     }
     Ok((commit_id, entries))
+}
+
+pub(crate) fn delta_pack_uses_json_pack_indexes(bytes: &[u8]) -> Result<bool, LixError> {
+    let mut cursor = 0usize;
+    let magic = bytes.get(0..4).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state delta pack is truncated before magic",
+        )
+    })?;
+    if magic != b"LXTD" {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked-state delta pack has invalid magic",
+        ));
+    }
+    cursor += 4;
+    let version = read_u8(bytes, &mut cursor, "delta pack version")?;
+    if version != DELTA_PACK_VERSION {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("unsupported tracked-state delta pack version {version}"),
+        ));
+    }
+    let _commit_id = read_var_sized_string(bytes, &mut cursor, "delta pack commit_id")?;
+    let prefix_count = read_var_u32(bytes, &mut cursor, "delta key prefix count")?;
+    for _ in 0..prefix_count {
+        let _ = decode_delta_key_prefix(bytes, &mut cursor)?;
+    }
+    let _count = read_var_u32(bytes, &mut cursor, "delta pack entry count")?;
+    match read_u8(bytes, &mut cursor, "delta JSON ref mode")? {
+        DELTA_JSON_REFS_INLINE => Ok(false),
+        DELTA_JSON_REFS_MIXED_PACK_INDEX => Ok(true),
+        other => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("tracked-state delta pack has invalid JSON ref mode {other}"),
+        )),
+    }
 }
 
 fn decode_delta_key(
@@ -621,10 +692,39 @@ fn decode_delta_key(
     })
 }
 
+enum DeltaJsonRefDecodeMode<'a> {
+    Inline,
+    MixedPackIndex(&'a [JsonRef]),
+}
+
+fn decode_delta_json_ref_mode<'a>(
+    bytes: &[u8],
+    cursor: &mut usize,
+    pack_json_refs: Option<&'a [JsonRef]>,
+) -> Result<DeltaJsonRefDecodeMode<'a>, LixError> {
+    match read_u8(bytes, cursor, "delta JSON ref mode")? {
+        DELTA_JSON_REFS_INLINE => Ok(DeltaJsonRefDecodeMode::Inline),
+        DELTA_JSON_REFS_MIXED_PACK_INDEX => {
+            let refs = pack_json_refs.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked-state delta pack needs JSON pack refs but none were provided",
+                )
+            })?;
+            Ok(DeltaJsonRefDecodeMode::MixedPackIndex(refs))
+        }
+        other => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("tracked-state delta pack has invalid JSON ref mode {other}"),
+        )),
+    }
+}
+
 fn decode_delta_value(
     bytes: &[u8],
     cursor: &mut usize,
     pack_commit_id: &str,
+    json_ref_mode: &DeltaJsonRefDecodeMode<'_>,
 ) -> Result<TrackedStateIndexValue, LixError> {
     let value_header = read_u8(bytes, cursor, "delta value header")?;
     let deleted = decode_value_header(value_header)?;
@@ -654,8 +754,16 @@ fn decode_delta_value(
         })?;
     let change_id = read_var_delta_change_id(bytes, cursor, &source_commit_id)?;
     let (created_at, updated_at) = read_var_timestamp_pair(bytes, cursor)?;
-    let snapshot_ref = read_optional_json_ref(bytes, cursor, "snapshot_ref")?;
-    let metadata_ref = read_optional_json_ref(bytes, cursor, "metadata_ref")?;
+    let (snapshot_ref, metadata_ref) = match json_ref_mode {
+        DeltaJsonRefDecodeMode::Inline => (
+            read_optional_json_ref(bytes, cursor, "snapshot_ref")?,
+            read_optional_json_ref(bytes, cursor, "metadata_ref")?,
+        ),
+        DeltaJsonRefDecodeMode::MixedPackIndex(refs) => (
+            read_mixed_optional_json_ref(bytes, cursor, refs, "snapshot_ref")?,
+            read_mixed_optional_json_ref(bytes, cursor, refs, "metadata_ref")?,
+        ),
+    };
     Ok(TrackedStateIndexValue {
         change_locator: ChangeLocator {
             source_commit_id,
@@ -1000,6 +1108,25 @@ fn push_optional_json_ref(out: &mut Vec<u8>, json_ref: Option<&JsonRef>) {
     }
 }
 
+fn push_mixed_optional_json_ref(
+    out: &mut Vec<u8>,
+    indexes: &HashMap<[u8; TRACKED_STATE_HASH_BYTES], usize>,
+    json_ref: Option<&JsonRef>,
+) -> Result<(), LixError> {
+    let Some(json_ref) = json_ref else {
+        out.push(DELTA_JSON_REF_NONE);
+        return Ok(());
+    };
+    if let Some(index) = indexes.get(json_ref.as_hash_array()).copied() {
+        out.push(DELTA_JSON_REF_PACK_INDEX);
+        push_var_u32(out, index, "json ref pack index")
+    } else {
+        out.push(DELTA_JSON_REF_INLINE);
+        out.extend_from_slice(json_ref.as_hash_bytes());
+        Ok(())
+    }
+}
+
 fn push_var_delta_change_id(
     out: &mut Vec<u8>,
     source_commit_id: &str,
@@ -1231,6 +1358,34 @@ fn read_optional_json_ref(
         1 => Ok(Some(JsonRef::from_hash_bytes(read_fixed_hash(
             bytes, cursor, field_name,
         )?))),
+        other => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("tracked-state tree field '{field_name}' has invalid JSON ref tag {other}"),
+        )),
+    }
+}
+
+fn read_mixed_optional_json_ref(
+    bytes: &[u8],
+    cursor: &mut usize,
+    refs: &[JsonRef],
+    field_name: &str,
+) -> Result<Option<JsonRef>, LixError> {
+    match read_u8(bytes, cursor, field_name)? {
+        DELTA_JSON_REF_NONE => Ok(None),
+        DELTA_JSON_REF_PACK_INDEX => {
+            let index = read_var_u32(bytes, cursor, field_name)?;
+            refs.get(index).copied().map(Some).ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("tracked-state delta JSON ref index {index} is out of bounds"),
+                )
+            })
+        }
+        DELTA_JSON_REF_INLINE => {
+            let hash = read_fixed_hash(bytes, cursor, field_name)?;
+            Ok(Some(JsonRef::from_hash_bytes(hash)))
+        }
         other => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!("tracked-state tree field '{field_name}' has invalid JSON ref tag {other}"),
@@ -1590,7 +1745,7 @@ mod tests {
         );
 
         let (decoded_commit_id, decoded) =
-            decode_delta_pack(&encoded).expect("delta pack should decode");
+            decode_delta_pack(&encoded, None).expect("delta pack should decode");
 
         assert_eq!(decoded_commit_id, "commit-a");
         assert_eq!(
@@ -1641,6 +1796,72 @@ mod tests {
     }
 
     #[test]
+    fn delta_pack_ref_encoder_roundtrips_mixed_json_pack_indexes() {
+        let entity_id = EntityIdentity::single("entity-a");
+        let snapshot_ref = JsonRef::from_hash_bytes([1; 32]);
+        let metadata_ref = JsonRef::from_hash_bytes([2; 32]);
+        let change = crate::commit_store::ChangeRef {
+            id: "commit-a:change-live",
+            entity_id: &entity_id,
+            schema_key: "schema",
+            file_id: Some("file-a"),
+            snapshot_ref: Some(&snapshot_ref),
+            metadata_ref: Some(&metadata_ref),
+            created_at: "2026-01-01T00:00:00Z",
+        };
+        let locator = crate::commit_store::ChangeLocatorRef {
+            source_commit_id: "commit-a",
+            source_pack_id: 0,
+            source_ordinal: 0,
+            change_id: "commit-a:change-live",
+        };
+        let delta = TrackedStateDeltaRef {
+            change,
+            locator,
+            created_at: "2026-01-01T00:00:00Z",
+            updated_at: "2026-01-01T00:00:00Z",
+        };
+        let mut pack_indexes = HashMap::new();
+        pack_indexes.insert(*snapshot_ref.as_hash_array(), 1);
+        let pack_refs = vec![JsonRef::from_hash_bytes([9; 32]), snapshot_ref];
+
+        let inline = encode_delta_pack_refs("commit-a", &[delta]).expect("inline delta pack");
+        assert!(!delta_pack_uses_json_pack_indexes(&inline).expect("inline mode should peek"));
+        let empty_indexes = HashMap::new();
+        let empty_index_pack = encode_delta_pack_refs_with_json_pack_indexes(
+            "commit-a",
+            &[delta],
+            Some(&empty_indexes),
+        )
+        .expect("empty-index delta pack");
+        assert_eq!(empty_index_pack, inline);
+        assert!(!delta_pack_uses_json_pack_indexes(&empty_index_pack)
+            .expect("empty index mode should peek"));
+        decode_delta_pack(&empty_index_pack, None).expect("empty index pack should decode inline");
+
+        let mixed = encode_delta_pack_refs_with_json_pack_indexes(
+            "commit-a",
+            &[delta],
+            Some(&pack_indexes),
+        )
+        .expect("mixed delta pack");
+        assert!(delta_pack_uses_json_pack_indexes(&mixed).expect("mixed mode should peek"));
+
+        assert!(
+            mixed.len() < inline.len(),
+            "pack-index refs should be smaller than inline refs"
+        );
+        assert!(decode_delta_pack(&mixed, None)
+            .expect_err("mixed refs require JSON pack refs")
+            .to_string()
+            .contains("needs JSON pack refs"));
+        let (_, decoded) =
+            decode_delta_pack(&mixed, Some(&pack_refs)).expect("mixed delta pack should decode");
+        assert_eq!(decoded[0].value.snapshot_ref, Some(snapshot_ref));
+        assert_eq!(decoded[0].value.metadata_ref, Some(metadata_ref));
+    }
+
+    #[test]
     fn delta_pack_stream_decoder_rejects_trailing_entry_bytes() {
         let entity_id = EntityIdentity::single("entity");
         let change = crate::commit_store::ChangeRef {
@@ -1681,7 +1902,8 @@ mod tests {
             decode_delta_key_prefix(&encoded, &mut cursor).expect("delta key prefix should decode");
         encoded[cursor] = 0;
 
-        let error = decode_delta_pack(&encoded).expect_err("trailing entry bytes should reject");
+        let error =
+            decode_delta_pack(&encoded, None).expect_err("trailing entry bytes should reject");
         assert!(
             error.to_string().contains("trailing bytes"),
             "error should mention trailing bytes: {error}"
@@ -1695,7 +1917,7 @@ mod tests {
         encoded.push(DELTA_PACK_VERSION);
         encoded.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x80]);
 
-        let error = decode_delta_pack(&encoded).expect_err("overlong varint should reject");
+        let error = decode_delta_pack(&encoded, None).expect_err("overlong varint should reject");
         assert!(
             error.to_string().contains("varint exceeds u32"),
             "error should mention overlong varint: {error}"
@@ -1709,7 +1931,7 @@ mod tests {
         encoded.push(DELTA_PACK_VERSION);
         encoded.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x1f]);
 
-        let error = decode_delta_pack(&encoded).expect_err("too-large varint should reject");
+        let error = decode_delta_pack(&encoded, None).expect_err("too-large varint should reject");
         assert!(
             error.to_string().contains("varint exceeds u32"),
             "error should mention oversized varint: {error}"
@@ -1723,7 +1945,8 @@ mod tests {
         encoded.push(DELTA_PACK_VERSION);
         encoded.extend_from_slice(&[0x80, 0x00]);
 
-        let error = decode_delta_pack(&encoded).expect_err("non-canonical varint should reject");
+        let error =
+            decode_delta_pack(&encoded, None).expect_err("non-canonical varint should reject");
         assert!(
             error.to_string().contains("non-canonical varint"),
             "error should mention non-canonical varint: {error}"

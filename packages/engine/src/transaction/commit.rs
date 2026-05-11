@@ -84,7 +84,7 @@ pub(crate) async fn commit_prepared_writes(
     )
     .await?;
 
-    stage_prepared_json_payloads(
+    let json_pack_indexes_by_commit = stage_prepared_json_payloads(
         &mut json_writer,
         &mut writes,
         &state_rows,
@@ -134,6 +134,7 @@ pub(crate) async fn commit_prepared_writes(
             adopted_index.tracked_row_indices_by_commit,
             tracked_roots,
             staged_commits,
+            json_pack_indexes_by_commit,
         )
         .await?;
     }
@@ -158,7 +159,8 @@ fn stage_prepared_json_payloads(
     tracked_row_indices_by_commit: &BTreeMap<String, Vec<RowIndex>>,
     staged_commits: &BTreeMap<String, StagedCommitStoreCommit>,
     untracked_row_indices: &[RowIndex],
-) -> Result<(), LixError> {
+) -> Result<BTreeMap<String, BTreeMap<u32, std::collections::HashMap<[u8; 32], usize>>>, LixError> {
+    let mut pack_indexes_by_commit = BTreeMap::new();
     for (commit_id, row_indices) in tracked_row_indices_by_commit {
         let staged_commit = staged_commits.get(commit_id).ok_or_else(|| {
             LixError::new(
@@ -184,13 +186,17 @@ fn stage_prepared_json_payloads(
                 .push(row_index);
         }
         for (pack_id, pack_row_indices) in row_indices_by_pack {
-            json_writer.stage_batch(
+            let report = json_writer.stage_batch_report(
                 writes,
                 JsonWritePlacementRef::CommitPack { commit_id, pack_id },
                 pack_row_indices
                     .iter()
                     .flat_map(|&row_index| json_payloads_from_state_row(&state_rows[row_index])),
             )?;
+            pack_indexes_by_commit
+                .entry(commit_id.clone())
+                .or_insert_with(BTreeMap::new)
+                .insert(pack_id, report.pack_indexes);
         }
     }
     json_writer.stage_batch(
@@ -200,7 +206,7 @@ fn stage_prepared_json_payloads(
             .iter()
             .flat_map(|&row_index| json_payloads_from_state_row(&state_rows[row_index])),
     )?;
-    Ok(())
+    Ok(pack_indexes_by_commit)
 }
 
 fn json_payloads_from_state_row(
@@ -372,6 +378,10 @@ async fn stage_tracked_roots(
     mut adopted_row_indices_by_commit: BTreeMap<String, Vec<AdoptedRowIndex>>,
     tracked_roots: Vec<PendingTrackedRoot>,
     mut staged_commits: BTreeMap<String, StagedCommitStoreCommit>,
+    json_pack_indexes_by_commit: BTreeMap<
+        String,
+        BTreeMap<u32, std::collections::HashMap<[u8; 32], usize>>,
+    >,
 ) -> Result<(), LixError> {
     let tracked_state = TrackedStateContext::new();
     let mut writer = tracked_state.writer(transaction, writes);
@@ -468,9 +478,27 @@ async fn stage_tracked_roots(
                     },
                 ),
         );
-        writer
-            .stage_delta(&root.commit_id, root.parent_commit_id.as_deref(), &deltas)
-            .await?;
+        if let Some(indexes) = json_pack_indexes_by_commit
+            .get(&root.commit_id)
+            .and_then(|packs| packs.get(&0))
+        {
+            writer
+                .stage_delta_with_json_pack_indexes(
+                    &root.commit_id,
+                    root.parent_commit_id.as_deref(),
+                    &deltas,
+                    crate::tracked_state::DeltaJsonPackIndexesRef {
+                        commit_id: &root.commit_id,
+                        pack_id: 0,
+                        indexes,
+                    },
+                )
+                .await?;
+        } else {
+            writer
+                .stage_delta(&root.commit_id, root.parent_commit_id.as_deref(), &deltas)
+                .await?;
+        }
     }
     if !tracked_row_indices_by_commit.is_empty() || !adopted_row_indices_by_commit.is_empty() {
         let mut commit_ids = tracked_row_indices_by_commit

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::json_store::store as json_store;
 use crate::storage::{KvGetGroup, KvGetRequest, StorageReader, StorageWriteSet};
 use crate::tracked_state::codec::PendingChunkWrite;
 use crate::tracked_state::types::{
@@ -92,16 +93,46 @@ pub(crate) async fn load_delta_pack(
     store: &mut (impl StorageReader + ?Sized),
     commit_id: &str,
 ) -> Result<Option<Vec<TrackedStateDeltaEntry>>, LixError> {
-    let Some(bytes) = get_one(
-        store,
-        TRACKED_STATE_DELTA_PACK_NAMESPACE,
-        commit_id.as_bytes().to_vec(),
-    )
-    .await?
-    else {
+    let result = store
+        .get_values(KvGetRequest {
+            groups: vec![
+                KvGetGroup {
+                    namespace: TRACKED_STATE_DELTA_PACK_NAMESPACE.to_string(),
+                    keys: vec![commit_id.as_bytes().to_vec()],
+                },
+                KvGetGroup {
+                    namespace: json_store::JSON_PACK_NAMESPACE.to_string(),
+                    keys: vec![json_store::pack_key(commit_id, 0)],
+                },
+            ],
+        })
+        .await?;
+    let mut groups = result.groups.into_iter();
+    let delta_group = groups.next().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked-state delta pack load returned no delta result group",
+        )
+    })?;
+    let json_pack_group = groups.next().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked-state delta pack load returned no JSON pack result group",
+        )
+    })?;
+    let Some(bytes) = delta_group.single_value_owned() else {
         return Ok(None);
     };
-    let (stored_commit_id, entries) = crate::tracked_state::codec::decode_delta_pack(&bytes)?;
+    let pack_refs = if crate::tracked_state::codec::delta_pack_uses_json_pack_indexes(&bytes)? {
+        json_pack_group
+            .single_value_owned()
+            .map(|bytes| json_store::decode_json_pack_refs(&bytes))
+            .transpose()?
+    } else {
+        None
+    };
+    let (stored_commit_id, entries) =
+        crate::tracked_state::codec::decode_delta_pack(&bytes, pack_refs.as_deref())?;
     if stored_commit_id != commit_id {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -148,6 +179,51 @@ pub(crate) fn stage_delta_pack_refs(
         TRACKED_STATE_DELTA_PACK_NAMESPACE,
         commit_id.as_bytes().to_vec(),
         crate::tracked_state::codec::encode_delta_pack_refs(commit_id, deltas)?,
+    );
+    Ok(())
+}
+
+pub(crate) struct DeltaJsonPackIndexesRef<'a> {
+    pub(crate) commit_id: &'a str,
+    pub(crate) pack_id: u32,
+    pub(crate) indexes: &'a std::collections::HashMap<[u8; TRACKED_STATE_HASH_BYTES], usize>,
+}
+
+pub(crate) fn stage_delta_pack_refs_with_json_pack_indexes(
+    writes: &mut StorageWriteSet,
+    commit_id: &str,
+    deltas: &[TrackedStateDeltaRef<'_>],
+    json_pack_indexes: DeltaJsonPackIndexesRef<'_>,
+) -> Result<(), LixError> {
+    if json_pack_indexes.commit_id != commit_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked-state delta JSON pack indexes for '{}' cannot encode delta pack '{}'",
+                json_pack_indexes.commit_id, commit_id
+            ),
+        ));
+    }
+    if json_pack_indexes.pack_id != 0 {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked-state delta JSON pack indexes only support pack 0, got pack {}",
+                json_pack_indexes.pack_id
+            ),
+        ));
+    }
+    if json_pack_indexes.indexes.is_empty() {
+        return stage_delta_pack_refs(writes, commit_id, deltas);
+    }
+    writes.put(
+        TRACKED_STATE_DELTA_PACK_NAMESPACE,
+        commit_id.as_bytes().to_vec(),
+        crate::tracked_state::codec::encode_delta_pack_refs_with_json_pack_indexes(
+            commit_id,
+            deltas,
+            Some(json_pack_indexes.indexes),
+        )?,
     );
     Ok(())
 }
