@@ -1875,3 +1875,108 @@ still decodes entire JSON packs for the requested refs, and tracked exact reads
 still construct full rows even when callers only check presence in the current
 bench harness.
 ```
+
+## Optimization 10: Encode Delta Packs From Borrowed Deltas
+
+Date: 2026-05-10
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Changed normal tracked-state delta staging to encode delta packs directly from
+borrowed `TrackedStateDeltaRef` values.
+
+Before this change, `TrackedStateWriter::stage_delta` cloned every borrowed
+delta into owned `TrackedStateDeltaEntry` objects, including schema/file/entity
+identity, source commit/change ids, and timestamp strings. It then immediately
+encoded those owned entries into the delta pack.
+
+The write path now uses:
+
+- `codec::encode_delta_pack_refs`;
+- `storage::stage_delta_pack_refs`;
+- `TrackedStateWriter::stage_delta` calling the borrowed staging path directly.
+
+The old owned-entry encode/stage helper and `delta_entries_from_refs` were
+removed. Decode still materializes owned `TrackedStateDeltaEntry` values because
+readers need owned entries after loading a persisted pack.
+
+No delta-pack format change: the encoder still writes the same `LXTD`
+magic/version/count and uses the same tracked key/value encoders.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+Result: passed.
+
+| row                                             | after median | criterion status |
+| ----------------------------------------------- | -----------: | ---------------- |
+| `sqlite/write_root_all_rows/1k`                 |    6.2844 ms | no change |
+| `sqlite/write_delta_10pct_updates/1k`           |    2.6592 ms | no change, noisy guardrail |
+| `sqlite/write_tombstone_10pct_deletes/1k`       |    2.3671 ms | no change, noisy guardrail |
+| `rocksdb/write_root_all_rows/1k`                |    5.3605 ms | no change |
+| `rocksdb/write_delta_10pct_updates/1k`          |    1.3421 ms | no change, noisy guardrail |
+| `rocksdb/write_tombstone_10pct_deletes/1k`      |    1.2464 ms | no change |
+
+Root-write medians moved lower than several previous samples, especially
+RocksDB, but Criterion still reports no change. Treat this as a production
+write-path allocation cleanup, not a proven target-closing win.
+
+### Storage
+
+No storage change.
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: remove stale #[allow(dead_code)] from TrackedStateDeltaRef. Fixed.
+LOW: add direct delta-pack codec regression coverage for the borrowed encoder.
+Fixed with delta_pack_ref_encoder_roundtrips_entries.
+
+Recommendation: keep. This is a clean production write-path allocation cut and
+removes an artificial owned staging API.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine delta_pack_ref_encoder_roundtrips_entries --features storage-benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a borrowed-write cleanup.
+
+Primary axis: root and delta writes. Structural win: normal tracked-state
+commits no longer allocate a full owned delta-entry layer just to encode the
+same bytes into a delta pack. This follows the same shape used by reference
+systems that encode from stable in-memory views and materialize owned records
+only when reading back from storage.
+
+Timing: Criterion-neutral on the 1k fixture. This does not close the remaining
+write_root_all_rows budget gap, but it removes an obvious allocation layer from
+the production write path without changing storage semantics.
+
+No temporary shim.
+
+Next optimization needs a bigger write-side cut, likely in commit_store staging,
+JSON pack staging, or the transaction write-set path, because delta-pack
+encoding itself is no longer cloning the tracked projection rows first.
+```

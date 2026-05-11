@@ -52,7 +52,6 @@ pub(crate) struct TrackedStateKeyRef<'a> {
 
 /// Zero-copy tracked-state projection delta prepared from commit_store facts.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub(crate) struct TrackedStateDeltaRef<'a> {
     pub(crate) change: ChangeRef<'a>,
     pub(crate) locator: ChangeLocatorRef<'a>,

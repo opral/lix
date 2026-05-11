@@ -4,8 +4,8 @@ use crate::commit_store::ChangeLocator;
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
 use crate::tracked_state::types::{
-    TrackedStateDeltaEntry, TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey,
-    TrackedStateKeyRef, TRACKED_STATE_HASH_BYTES,
+    TrackedStateDeltaEntry, TrackedStateDeltaRef, TrackedStateIndexValue,
+    TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TRACKED_STATE_HASH_BYTES,
 };
 use crate::LixError;
 
@@ -349,22 +349,31 @@ fn decode_value_after_header(
     })
 }
 
-pub(crate) fn encode_delta_pack(entries: &[TrackedStateDeltaEntry]) -> Result<Vec<u8>, LixError> {
+pub(crate) fn encode_delta_pack_refs(
+    deltas: &[TrackedStateDeltaRef<'_>],
+) -> Result<Vec<u8>, LixError> {
     let mut out = Vec::new();
     out.extend_from_slice(b"LXTD");
     out.push(DELTA_PACK_VERSION);
-    push_u32(&mut out, entries.len());
-    for entry in entries {
-        push_sized_bytes(&mut out, &encode_key(&entry.key));
+    push_u32(&mut out, deltas.len());
+    for delta in deltas {
+        push_sized_bytes(
+            &mut out,
+            &encode_key_ref(TrackedStateKeyRef {
+                schema_key: delta.change.schema_key,
+                file_id: delta.change.file_id,
+                entity_id: delta.change.entity_id,
+            }),
+        );
         push_sized_bytes(
             &mut out,
             &encode_value_ref(TrackedStateIndexValueRef {
-                change_locator: entry.value.change_locator.as_ref(),
-                deleted: entry.value.deleted,
-                snapshot_ref: entry.value.snapshot_ref.as_ref(),
-                metadata_ref: entry.value.metadata_ref.as_ref(),
-                created_at: &entry.value.created_at,
-                updated_at: &entry.value.updated_at,
+                change_locator: delta.locator,
+                deleted: delta.change.snapshot_ref.is_none(),
+                snapshot_ref: delta.change.snapshot_ref,
+                metadata_ref: delta.change.metadata_ref,
+                created_at: delta.created_at,
+                updated_at: delta.updated_at,
             }),
         );
     }
@@ -984,6 +993,108 @@ mod tests {
             .expect_err("unsupported version should reject")
             .to_string()
             .contains("unsupported tracked-state tree value version"));
+    }
+
+    #[test]
+    fn delta_pack_ref_encoder_roundtrips_entries() {
+        let entity_id = EntityIdentity {
+            parts: vec!["entity-a".to_string()],
+        };
+        let snapshot_ref = JsonRef::from_hash_bytes([1; 32]);
+        let metadata_ref = JsonRef::from_hash_bytes([2; 32]);
+        let live_change = crate::commit_store::ChangeRef {
+            id: "change-live",
+            entity_id: &entity_id,
+            schema_key: "schema",
+            file_id: Some("file-a"),
+            snapshot_ref: Some(&snapshot_ref),
+            metadata_ref: Some(&metadata_ref),
+            created_at: "2026-01-01T00:00:00Z",
+        };
+        let tombstone_change = crate::commit_store::ChangeRef {
+            id: "change-deleted",
+            entity_id: &entity_id,
+            schema_key: "schema",
+            file_id: None,
+            snapshot_ref: None,
+            metadata_ref: None,
+            created_at: "2026-01-01T00:00:00Z",
+        };
+        let live_locator = crate::commit_store::ChangeLocatorRef {
+            source_commit_id: "commit-a",
+            source_pack_id: 3,
+            source_ordinal: 5,
+            change_id: "change-live",
+        };
+        let tombstone_locator = crate::commit_store::ChangeLocatorRef {
+            source_commit_id: "commit-a",
+            source_pack_id: 3,
+            source_ordinal: 6,
+            change_id: "change-deleted",
+        };
+        let encoded = encode_delta_pack_refs(&[
+            TrackedStateDeltaRef {
+                change: live_change,
+                locator: live_locator,
+                created_at: "2026-01-01T00:00:00Z",
+                updated_at: "2026-01-02T00:00:00Z",
+            },
+            TrackedStateDeltaRef {
+                change: tombstone_change,
+                locator: tombstone_locator,
+                created_at: "2026-01-03T00:00:00Z",
+                updated_at: "2026-01-04T00:00:00Z",
+            },
+        ])
+        .expect("delta pack should encode");
+
+        let decoded = decode_delta_pack(&encoded).expect("delta pack should decode");
+
+        assert_eq!(
+            decoded,
+            vec![
+                TrackedStateDeltaEntry {
+                    key: TrackedStateKey {
+                        schema_key: "schema".to_string(),
+                        file_id: Some("file-a".to_string()),
+                        entity_id: entity_id.clone(),
+                    },
+                    value: TrackedStateIndexValue {
+                        change_locator: ChangeLocator {
+                            source_commit_id: "commit-a".to_string(),
+                            source_pack_id: 3,
+                            source_ordinal: 5,
+                            change_id: "change-live".to_string(),
+                        },
+                        deleted: false,
+                        snapshot_ref: Some(snapshot_ref),
+                        metadata_ref: Some(metadata_ref),
+                        created_at: "2026-01-01T00:00:00Z".to_string(),
+                        updated_at: "2026-01-02T00:00:00Z".to_string(),
+                    },
+                },
+                TrackedStateDeltaEntry {
+                    key: TrackedStateKey {
+                        schema_key: "schema".to_string(),
+                        file_id: None,
+                        entity_id,
+                    },
+                    value: TrackedStateIndexValue {
+                        change_locator: ChangeLocator {
+                            source_commit_id: "commit-a".to_string(),
+                            source_pack_id: 3,
+                            source_ordinal: 6,
+                            change_id: "change-deleted".to_string(),
+                        },
+                        deleted: true,
+                        snapshot_ref: None,
+                        metadata_ref: None,
+                        created_at: "2026-01-03T00:00:00Z".to_string(),
+                        updated_at: "2026-01-04T00:00:00Z".to_string(),
+                    },
+                },
+            ]
+        );
     }
 
     #[test]

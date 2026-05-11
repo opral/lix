@@ -10,8 +10,8 @@ use crate::tracked_state::merge::{self, TrackedStateMergePlan};
 use crate::tracked_state::storage;
 use crate::tracked_state::tree::TrackedStateTree;
 use crate::tracked_state::types::{
-    TrackedStateDeltaEntry, TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef,
-    TrackedStateMutation, TrackedStateTreeDiffEntry, TrackedStateTreeScanRequest,
+    TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef, TrackedStateMutation,
+    TrackedStateTreeDiffEntry, TrackedStateTreeScanRequest,
 };
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateRowRequest,
@@ -690,11 +690,10 @@ where
         I: IntoIterator<Item = TrackedStateDeltaRef<'a>>,
     {
         let deltas = deltas.into_iter().collect::<Vec<_>>();
-        let entries = delta_entries_from_refs(&deltas);
-        storage::stage_delta_pack(self.writes, commit_id, &entries)?;
+        storage::stage_delta_pack_refs(self.writes, commit_id, &deltas)?;
         Ok(TrackedStateWriteReport {
             commit_id: commit_id.to_string(),
-            changed_rows: entries.len(),
+            changed_rows: deltas.len(),
             primary_chunk_puts: 0,
             by_file_chunk_puts: 0,
         })
@@ -819,32 +818,6 @@ pub(crate) struct TrackedStateWriteReport {
     pub(crate) changed_rows: usize,
     pub(crate) primary_chunk_puts: usize,
     pub(crate) by_file_chunk_puts: usize,
-}
-
-fn delta_entries_from_refs(deltas: &[TrackedStateDeltaRef<'_>]) -> Vec<TrackedStateDeltaEntry> {
-    deltas
-        .iter()
-        .map(|delta| TrackedStateDeltaEntry {
-            key: TrackedStateKey {
-                schema_key: delta.change.schema_key.to_string(),
-                file_id: delta.change.file_id.map(ToString::to_string),
-                entity_id: delta.change.entity_id.clone(),
-            },
-            value: TrackedStateIndexValue {
-                change_locator: crate::commit_store::ChangeLocator {
-                    source_commit_id: delta.locator.source_commit_id.to_string(),
-                    source_pack_id: delta.locator.source_pack_id,
-                    source_ordinal: delta.locator.source_ordinal,
-                    change_id: delta.locator.change_id.to_string(),
-                },
-                deleted: delta.change.snapshot_ref.is_none(),
-                snapshot_ref: delta.change.snapshot_ref.copied(),
-                metadata_ref: delta.change.metadata_ref.copied(),
-                created_at: delta.created_at.to_string(),
-                updated_at: delta.updated_at.to_string(),
-            },
-        })
-        .collect()
 }
 
 fn missing_commit_error(commit_id: &str) -> LixError {
