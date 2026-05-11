@@ -2308,6 +2308,136 @@ treated as a small supporting optimization rather than a budget-moving step.
 No storage format change. No temporary shim.
 ```
 
+## Optimization 32: Varint change-pack local fields
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Changed the unshipped commit-store change-pack format from `LXCP2` to `LXCP3`.
+
+`LXCP3` keeps the same logical fields and explicit pack structure, but encodes
+pack-local lengths, counts, and indexes as checked u32 varints instead of fixed
+u32 fields:
+
+- commit id length
+- shape count
+- shape `schema_key` and optional `file_id` lengths
+- change count
+- per-change id length
+- entity-identity part count and part lengths
+- shape index
+- created-at length
+
+Standalone commit (`LXCM1`), standalone change (`LXCH2`), and membership-pack
+(`LXMP1`) encodings are unchanged. There is no backwards shim because the
+format has not shipped.
+
+Added decode coverage for overlong varints, values above `u32::MAX`, and
+non-canonical encodings such as `80 00`.
+
+### Storage
+
+Command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| state | before | after | delta |
+| --- | ---: | ---: | ---: |
+| raw SQLite inserted | 1,692,456 | 1,692,456 | 0 |
+| Lix SQLite inserted | 939,176 | 922,696 | -16,480 |
+| Lix SQLite create_version | 951,536 | 935,056 | -16,480 |
+| Lix SQLite fast-forward | 5,152,296 | 5,123,600 | -28,696 |
+| Lix SQLite divergent | 5,320,304 | 5,308,064 | -12,240 |
+| Lix RocksDB inserted | 851,910 | 836,566 | -15,344 |
+| Lix RocksDB create_version | 853,721 | 838,350 | -15,371 |
+| Lix RocksDB fast-forward | 1,009,345 | 991,281 | -18,064 |
+| Lix RocksDB divergent | 1,368,580 | 1,345,089 | -23,491 |
+
+### Timing
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|exists_many_exact_keys)/1k'
+```
+
+Result: passed.
+
+Representative medians:
+
+| row | median | criterion status |
+| --- | ---: | --- |
+| `raw_sqlite/write_root_all_rows/1k` | 2.3938 ms | no change |
+| `raw_sqlite/get_many_exact_keys/1k` | 2.0500 ms | no change |
+| `raw_sqlite/exists_many_exact_keys/1k` | 2.0326 ms | no change |
+| `raw_sqlite/scan_full_rows/1k` | 1.1694 ms | no change |
+| `raw_sqlite/prefix_scan_schema_file_null/1k` | 1.1635 ms | no change |
+| `raw_sqlite/write_delta_10pct_updates/1k` | 1.2193 ms | no change |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k` | 1.2057 ms | no change |
+| `sqlite/write_root_all_rows/1k` | 4.5170 ms | no change |
+| `sqlite/get_many_exact_keys/1k` | 2.8695 ms | no change |
+| `sqlite/exists_many_exact_keys/1k` | 1.8988 ms | no change |
+| `sqlite/scan_full_rows/1k` | 2.2094 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k` | 2.2438 ms | no change |
+| `sqlite/write_delta_10pct_updates/1k` | 1.7065 ms | no change |
+| `sqlite/write_tombstone_10pct_deletes/1k` | 1.6626 ms | no change |
+| `rocksdb/write_root_all_rows/1k` | 3.9725 ms | improved |
+| `rocksdb/get_many_exact_keys/1k` | 2.0688 ms | no change |
+| `rocksdb/exists_many_exact_keys/1k` | 1.0354 ms | no change |
+| `rocksdb/scan_full_rows/1k` | 1.4142 ms | no change |
+| `rocksdb/prefix_scan_schema_file_null/1k` | 1.3397 ms | no change |
+| `rocksdb/write_delta_10pct_updates/1k` | 736.65 us | no change |
+| `rocksdb/write_tombstone_10pct_deletes/1k` | 735.43 us | no change |
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo test -p lix_engine commit_store::codec:: --features storage-benches
+cargo test -p lix_engine commit_store:: --features storage-benches
+cargo test -p lix_engine transaction::commit:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|exists_many_exact_keys)/1k'
+```
+
+All commands passed.
+
+Reviewer loop:
+
+- First pass: HIGH none, MEDIUM found a malformed 5-byte varint could exceed
+  `u32::MAX` without being rejected; LOW requested canonical varint rejection.
+- Fixed `read_var_usize` to reject fifth-byte continuation and high payload
+  bits, and to reject non-canonical zero-extended encodings.
+- Added regressions for overlong, too-large, and non-canonical varints.
+- Second pass: HIGH none, MEDIUM none, LOW none.
+
+### Interpretation
+
+```text
+Keep as a compact change-pack layout cleanup.
+
+Primary axis: storage bytes. Change packs are commit-local bounded blobs whose
+per-row shape indexes and string lengths are usually tiny; fixed u32 metadata
+was pure overhead. Varints are limited to u32, canonical, and malformed packs
+reject before allocation-heavy paths can trust the decoded value.
+
+Timing: focused physical write/read/scan rows showed no detected Lix
+regressions. The only statistically visible Lix movement was a RocksDB root
+write improvement in the final run.
+
+No backwards shim.
+```
+
 ## Optimization 31: Narrow JSON pack directory fields
 
 Date: 2026-05-11
