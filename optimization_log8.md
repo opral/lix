@@ -511,19 +511,19 @@ The 1k smoke rows are the accepted optimization baseline.
 
 #### 1.5x Runtime Budget Rows, 1k
 
-| axis       | row                                | raw SQLite median | Lix SQLite median | SQLite ratio | Lix RocksDB median | RocksDB ratio | status                          |
-| ---------- | ---------------------------------- | ----------------: | ----------------: | -----------: | -----------------: | ------------: | ------------------------------- |
-| write      | `write_root_all_rows/1k`           |         2.4583 ms |         6.8347 ms |        2.78x |          6.1430 ms |         2.50x | SQLite and RocksDB fail         |
-| write      | `write_delta_10pct_updates/1k`     |         1.5396 ms |         2.6272 ms |        1.71x |          1.3950 ms |         0.91x | SQLite fail                     |
-| write      | `write_tombstone_10pct_deletes/1k` |         1.4156 ms |         2.4321 ms |        1.72x |          1.3632 ms |         0.96x | SQLite fail                     |
-| exact-read | `get_many_exact_keys/1k`           |         2.2859 ms |         4.6055 ms |        2.01x |          3.4668 ms |         1.52x | SQLite and RocksDB fail         |
-| exact-read | `get_many_missing_keys/1k`         |         13.931 ms |         2.2822 ms |        0.16x |          1.4138 ms |         0.10x | pass                            |
-| exact-read | `exists_many_exact_keys/1k`        |         2.0545 ms |         4.6519 ms |        2.26x |          3.4720 ms |         1.69x | SQLite and RocksDB fail         |
-| scan       | `scan_keys_only/1k`                |         1.2374 ms |         3.2542 ms |        2.63x |          2.0822 ms |         1.68x | SQLite and RocksDB fail         |
-| scan       | `scan_headers_only/1k`             |         1.2378 ms |         3.0692 ms |        2.48x |          2.0012 ms |         1.62x | SQLite and RocksDB fail         |
-| scan       | `scan_full_rows/1k`                |         1.2920 ms |         4.3792 ms |        3.39x |          3.1884 ms |         2.47x | SQLite fail                     |
-| scan       | `prefix_scan_schema/1k`            |         1.2514 ms |         4.4623 ms |        3.57x |          3.2190 ms |         2.57x | SQLite and RocksDB fail         |
-| scan       | `prefix_scan_schema_file_null/1k`  |         1.3817 ms |         4.3889 ms |        3.18x |          3.1497 ms |         2.28x | SQLite and RocksDB fail         |
+| axis       | row                                | raw SQLite median | Lix SQLite median | SQLite ratio | Lix RocksDB median | RocksDB ratio | status                  |
+| ---------- | ---------------------------------- | ----------------: | ----------------: | -----------: | -----------------: | ------------: | ----------------------- |
+| write      | `write_root_all_rows/1k`           |         2.4583 ms |         6.8347 ms |        2.78x |          6.1430 ms |         2.50x | SQLite and RocksDB fail |
+| write      | `write_delta_10pct_updates/1k`     |         1.5396 ms |         2.6272 ms |        1.71x |          1.3950 ms |         0.91x | SQLite fail             |
+| write      | `write_tombstone_10pct_deletes/1k` |         1.4156 ms |         2.4321 ms |        1.72x |          1.3632 ms |         0.96x | SQLite fail             |
+| exact-read | `get_many_exact_keys/1k`           |         2.2859 ms |         4.6055 ms |        2.01x |          3.4668 ms |         1.52x | SQLite and RocksDB fail |
+| exact-read | `get_many_missing_keys/1k`         |         13.931 ms |         2.2822 ms |        0.16x |          1.4138 ms |         0.10x | pass                    |
+| exact-read | `exists_many_exact_keys/1k`        |         2.0545 ms |         4.6519 ms |        2.26x |          3.4720 ms |         1.69x | SQLite and RocksDB fail |
+| scan       | `scan_keys_only/1k`                |         1.2374 ms |         3.2542 ms |        2.63x |          2.0822 ms |         1.68x | SQLite and RocksDB fail |
+| scan       | `scan_headers_only/1k`             |         1.2378 ms |         3.0692 ms |        2.48x |          2.0012 ms |         1.62x | SQLite and RocksDB fail |
+| scan       | `scan_full_rows/1k`                |         1.2920 ms |         4.3792 ms |        3.39x |          3.1884 ms |         2.47x | SQLite fail             |
+| scan       | `prefix_scan_schema/1k`            |         1.2514 ms |         4.4623 ms |        3.57x |          3.2190 ms |         2.57x | SQLite and RocksDB fail |
+| scan       | `prefix_scan_schema_file_null/1k`  |         1.3817 ms |         4.3889 ms |        3.18x |          3.1497 ms |         2.28x | SQLite and RocksDB fail |
 
 #### Diff / Materialization Shape Rows
 
@@ -745,27 +745,27 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 #### 1.5x Runtime Budget Rows
 
-| axis       | row                                | raw SQLite median | before SQLite | after SQLite | SQLite ratio | before RocksDB | after RocksDB | RocksDB ratio | status |
-| ---------- | ---------------------------------- | ----------------: | ------------: | -----------: | -----------: | -------------: | ------------: | ------------: | ------ |
-| write      | `write_root_all_rows/1k`           |         2.4999 ms |     6.8347 ms |    6.5245 ms |        2.61x |      6.1430 ms |     5.6554 ms |         2.26x | still over budget, no structural regression |
-| write      | `write_delta_10pct_updates/1k`     |         1.3595 ms |     2.6272 ms |    3.3163 ms |        2.44x |      1.3950 ms |     1.4372 ms |         1.06x | SQLite noisy, RocksDB pass |
-| write      | `write_tombstone_10pct_deletes/1k` |         1.3092 ms |     2.4321 ms |    3.1727 ms |        2.42x |      1.3632 ms |     1.4650 ms |         1.12x | SQLite noisy, RocksDB pass |
-| exact-read | `get_many_exact_keys/1k`           |         2.1850 ms |     4.6055 ms |    4.4805 ms |        2.05x |      3.4668 ms |     3.6687 ms |         1.68x | still over budget |
-| exact-read | `get_many_missing_keys/1k`         |         13.099 ms |     2.2822 ms |    2.2718 ms |        0.17x |      1.4138 ms |     1.9440 ms |         0.15x | pass |
+| axis       | row                                | raw SQLite median | before SQLite | after SQLite | SQLite ratio | before RocksDB | after RocksDB | RocksDB ratio | status                                                     |
+| ---------- | ---------------------------------- | ----------------: | ------------: | -----------: | -----------: | -------------: | ------------: | ------------: | ---------------------------------------------------------- |
+| write      | `write_root_all_rows/1k`           |         2.4999 ms |     6.8347 ms |    6.5245 ms |        2.61x |      6.1430 ms |     5.6554 ms |         2.26x | still over budget, no structural regression                |
+| write      | `write_delta_10pct_updates/1k`     |         1.3595 ms |     2.6272 ms |    3.3163 ms |        2.44x |      1.3950 ms |     1.4372 ms |         1.06x | SQLite noisy, RocksDB pass                                 |
+| write      | `write_tombstone_10pct_deletes/1k` |         1.3092 ms |     2.4321 ms |    3.1727 ms |        2.42x |      1.3632 ms |     1.4650 ms |         1.12x | SQLite noisy, RocksDB pass                                 |
+| exact-read | `get_many_exact_keys/1k`           |         2.1850 ms |     4.6055 ms |    4.4805 ms |        2.05x |      3.4668 ms |     3.6687 ms |         1.68x | still over budget                                          |
+| exact-read | `get_many_missing_keys/1k`         |         13.099 ms |     2.2822 ms |    2.2718 ms |        0.17x |      1.4138 ms |     1.9440 ms |         0.15x | pass                                                       |
 | exact-read | `exists_many_exact_keys/1k`        |         2.2187 ms |     4.6519 ms |    4.5695 ms |        2.06x |      3.4720 ms |     5.5972 ms |         2.52x | RocksDB row noisy; semantic equivalent still uses get_many |
-| scan       | `scan_keys_only/1k`                |         1.1673 ms |     3.2542 ms |    2.4975 ms |        2.14x |      2.0822 ms |     1.4497 ms |         1.24x | primary win; RocksDB now in budget |
-| scan       | `scan_headers_only/1k`             |         1.3034 ms |     3.0692 ms |    3.0376 ms |        2.33x |      2.0012 ms |     1.8478 ms |         1.42x | RocksDB now in budget |
-| scan       | `scan_full_rows/1k`                |         1.2110 ms |     4.3792 ms |    4.7813 ms |        3.95x |      3.1884 ms |     3.2480 ms |         2.68x | still over budget |
-| scan       | `prefix_scan_schema/1k`            |         1.6941 ms |     4.4623 ms |    4.6607 ms |        2.75x |      3.2190 ms |     3.3677 ms |         1.99x | still over budget |
-| scan       | `prefix_scan_schema_file_null/1k`  |         1.2609 ms |     4.3889 ms |    4.8380 ms |        3.84x |      3.1497 ms |     3.3515 ms |         2.66x | still over budget |
+| scan       | `scan_keys_only/1k`                |         1.1673 ms |     3.2542 ms |    2.4975 ms |        2.14x |      2.0822 ms |     1.4497 ms |         1.24x | primary win; RocksDB now in budget                         |
+| scan       | `scan_headers_only/1k`             |         1.3034 ms |     3.0692 ms |    3.0376 ms |        2.33x |      2.0012 ms |     1.8478 ms |         1.42x | RocksDB now in budget                                      |
+| scan       | `scan_full_rows/1k`                |         1.2110 ms |     4.3792 ms |    4.7813 ms |        3.95x |      3.1884 ms |     3.2480 ms |         2.68x | still over budget                                          |
+| scan       | `prefix_scan_schema/1k`            |         1.6941 ms |     4.4623 ms |    4.6607 ms |        2.75x |      3.2190 ms |     3.3677 ms |         1.99x | still over budget                                          |
+| scan       | `prefix_scan_schema_file_null/1k`  |         1.2609 ms |     4.3889 ms |    4.8380 ms |        3.84x |      3.1497 ms |     3.3515 ms |         2.66x | still over budget                                          |
 
 #### Diff / Materialization
 
-| row                                   | before SQLite | after SQLite | before RocksDB | after RocksDB | shape status |
-| ------------------------------------- | ------------: | -----------: | -------------: | ------------: | ------------ |
+| row                                   | before SQLite | after SQLite | before RocksDB | after RocksDB | shape status                                              |
+| ------------------------------------- | ------------: | -----------: | -------------: | ------------: | --------------------------------------------------------- |
 | `changed_keys_update_10pct/1k`        |     68.399 ms |    73.492 ms |      67.192 ms |     71.735 ms | still hotspot; movement within noisy structural guardrail |
-| `changed_keys_delta_chain_10x1pct/1k` |     10.401 ms |    11.167 ms |      8.7436 ms |     10.722 ms | watch |
-| `materialize_delta_chain_10x1pct/1k`  |     5.7651 ms |    5.5134 ms |      2.7741 ms |     2.8888 ms | near neutral; value length is unchanged |
+| `changed_keys_delta_chain_10x1pct/1k` |     10.401 ms |    11.167 ms |      8.7436 ms |     10.722 ms | watch                                                     |
+| `materialize_delta_chain_10x1pct/1k`  |     5.7651 ms |    5.5134 ms |      2.7741 ms |     2.8888 ms | near neutral; value length is unchanged                   |
 
 #### Storage
 
@@ -777,34 +777,34 @@ cargo test -p lix_engine --features storage-benches --test json_pointer_crud_sto
 
 Result: passed.
 
-| backend / state                        | before bytes | after bytes | delta | status |
-| -------------------------------------- | -----------: | ----------: | ----: | ------ |
-| raw SQLite / inserted                  |      1692456 |     1692456 |     0 | unchanged |
-| Lix SQLite / inserted                  |      1075136 |     1075136 |     0 | unchanged |
-| Lix SQLite / after create_version      |      1087496 |     1087496 |     0 | unchanged |
+| backend / state                        | before bytes | after bytes | delta | status                                        |
+| -------------------------------------- | -----------: | ----------: | ----: | --------------------------------------------- |
+| raw SQLite / inserted                  |      1692456 |     1692456 |     0 | unchanged                                     |
+| Lix SQLite / inserted                  |      1075136 |     1075136 |     0 | unchanged                                     |
+| Lix SQLite / after create_version      |      1087496 |     1087496 |     0 | unchanged                                     |
 | Lix SQLite / after fast-forward merge  |      5287488 |     5291608 | +4120 | one SQLite page; acceptable page-layout noise |
 | Lix SQLite / after divergent merge     |      5615168 |     5619288 | +4120 | one SQLite page; acceptable page-layout noise |
-| Lix RocksDB / inserted                 |       993900 |      993900 |     0 | unchanged |
-| Lix RocksDB / after create_version     |       995766 |      995766 |     0 | unchanged |
-| Lix RocksDB / after fast-forward merge |      1157143 |     1157143 |     0 | unchanged |
-| Lix RocksDB / after divergent merge    |      1528256 |     1528254 |    -2 | unchanged |
+| Lix RocksDB / inserted                 |       993900 |      993900 |     0 | unchanged                                     |
+| Lix RocksDB / after create_version     |       995766 |      995766 |     0 | unchanged                                     |
+| Lix RocksDB / after fast-forward merge |      1157143 |     1157143 |     0 | unchanged                                     |
+| Lix RocksDB / after divergent merge    |      1528256 |     1528254 |    -2 | unchanged                                     |
 
 ### Unchanged Guardrails
 
-| guardrail                                         | after value | status |
-| ------------------------------------------------- | ----------: | ------ |
-| physical write budget stays near backend speed    | mixed | existing SQLite write budget failures remain |
-| physical write runtime <= 1.5x raw SQLite         | mixed | RocksDB delta/tombstone pass; root writes still over |
-| exact reads <= 1.5x raw SQLite                    | mixed | missing reads pass; exact reads still over |
-| scans <= 1.5x raw SQLite                          | mixed | RocksDB keys/header pass; SQLite scans still over |
-| header-only scans do not hydrate full JSON values | yes | preserved and strengthened |
-| SQLite and RocksDB both reported                  | yes | full smoke plus RocksDB targeted rerun |
-| storage growth explained                          | yes | no value-length growth; only one SQLite page in merge states |
-| post-vacuum storage <= 2x raw SQLite              | mixed | same pre-existing SQLite merge-state growth |
-| backend boundary copy cost explained              | yes | no new backend copies; fewer commit_pack loads for scalar projections |
-| tracked logic remains on the tracked path         | yes | no workload moved |
-| no workload shifted to untracked machinery        | yes | unchanged |
-| no benchmark measurement changed                  | yes | benchmark untouched |
+| guardrail                                         | after value | status                                                                |
+| ------------------------------------------------- | ----------: | --------------------------------------------------------------------- |
+| physical write budget stays near backend speed    |       mixed | existing SQLite write budget failures remain                          |
+| physical write runtime <= 1.5x raw SQLite         |       mixed | RocksDB delta/tombstone pass; root writes still over                  |
+| exact reads <= 1.5x raw SQLite                    |       mixed | missing reads pass; exact reads still over                            |
+| scans <= 1.5x raw SQLite                          |       mixed | RocksDB keys/header pass; SQLite scans still over                     |
+| header-only scans do not hydrate full JSON values |         yes | preserved and strengthened                                            |
+| SQLite and RocksDB both reported                  |         yes | full smoke plus RocksDB targeted rerun                                |
+| storage growth explained                          |         yes | no value-length growth; only one SQLite page in merge states          |
+| post-vacuum storage <= 2x raw SQLite              |       mixed | same pre-existing SQLite merge-state growth                           |
+| backend boundary copy cost explained              |         yes | no new backend copies; fewer commit_pack loads for scalar projections |
+| tracked logic remains on the tracked path         |         yes | no workload moved                                                     |
+| no workload shifted to untracked machinery        |         yes | unchanged                                                             |
+| no benchmark measurement changed                  |         yes | benchmark untouched                                                   |
 
 ### Review Loop
 
@@ -923,22 +923,22 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 Result: passed.
 
-| row                                                | after median | criterion status |
-| -------------------------------------------------- | -----------: | ---------------- |
-| `sqlite/get_many_exact_keys/1k`                    |    4.4327 ms | no change |
-| `sqlite/exists_many_exact_keys/1k`                 |    4.5704 ms | no change |
-| `sqlite/scan_keys_only/1k`                         |    2.7218 ms | no change |
-| `sqlite/scan_headers_only/1k`                      |    3.0616 ms | no change |
-| `sqlite/scan_full_rows/1k`                         |    4.4447 ms | no change |
-| `sqlite/prefix_scan_schema/1k`                     |    4.3002 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k`           |    4.2372 ms | no change |
-| `rocksdb/get_many_exact_keys/1k`                   |    3.5170 ms | no change |
-| `rocksdb/exists_many_exact_keys/1k`                |    3.5438 ms | improved |
-| `rocksdb/scan_keys_only/1k`                        |    1.5767 ms | no change |
-| `rocksdb/scan_headers_only/1k`                     |    2.0217 ms | no change |
-| `rocksdb/scan_full_rows/1k`                        |    3.3787 ms | no change |
-| `rocksdb/prefix_scan_schema/1k`                    |    3.2941 ms | no change |
-| `rocksdb/prefix_scan_schema_file_null/1k`          |    3.2749 ms | no change |
+| row                                       | after median | criterion status |
+| ----------------------------------------- | -----------: | ---------------- |
+| `sqlite/get_many_exact_keys/1k`           |    4.4327 ms | no change        |
+| `sqlite/exists_many_exact_keys/1k`        |    4.5704 ms | no change        |
+| `sqlite/scan_keys_only/1k`                |    2.7218 ms | no change        |
+| `sqlite/scan_headers_only/1k`             |    3.0616 ms | no change        |
+| `sqlite/scan_full_rows/1k`                |    4.4447 ms | no change        |
+| `sqlite/prefix_scan_schema/1k`            |    4.3002 ms | no change        |
+| `sqlite/prefix_scan_schema_file_null/1k`  |    4.2372 ms | no change        |
+| `rocksdb/get_many_exact_keys/1k`          |    3.5170 ms | no change        |
+| `rocksdb/exists_many_exact_keys/1k`       |    3.5438 ms | improved         |
+| `rocksdb/scan_keys_only/1k`               |    1.5767 ms | no change        |
+| `rocksdb/scan_headers_only/1k`            |    2.0217 ms | no change        |
+| `rocksdb/scan_full_rows/1k`               |    3.3787 ms | no change        |
+| `rocksdb/prefix_scan_schema/1k`           |    3.2941 ms | no change        |
+| `rocksdb/prefix_scan_schema_file_null/1k` |    3.2749 ms | no change        |
 
 ### Storage
 
@@ -950,17 +950,17 @@ cargo test -p lix_engine --features storage-benches --test json_pointer_crud_sto
 
 Result: passed.
 
-| backend / state                        | bytes | bytes/row | status |
-| -------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                  | 1692456 | 1692.5 | unchanged |
-| Lix SQLite / inserted                  | 1075136 | 1075.1 | unchanged |
-| Lix SQLite / after create_version      | 1087496 | 1087.5 | unchanged |
-| Lix SQLite / after fast-forward merge  | 5287488 | 5287.5 | unchanged |
-| Lix SQLite / after divergent merge     | 5615168 | 5615.2 | unchanged |
-| Lix RocksDB / inserted                 |  993900 |  993.9 | unchanged |
-| Lix RocksDB / after create_version     |  995766 |  995.8 | unchanged |
-| Lix RocksDB / after fast-forward merge | 1157143 | 1157.1 | unchanged |
-| Lix RocksDB / after divergent merge    | 1528256 | 1528.3 | unchanged |
+| backend / state                        |   bytes | bytes/row | status    |
+| -------------------------------------- | ------: | --------: | --------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | unchanged |
+| Lix SQLite / inserted                  | 1075136 |    1075.1 | unchanged |
+| Lix SQLite / after create_version      | 1087496 |    1087.5 | unchanged |
+| Lix SQLite / after fast-forward merge  | 5287488 |    5287.5 | unchanged |
+| Lix SQLite / after divergent merge     | 5615168 |    5615.2 | unchanged |
+| Lix RocksDB / inserted                 |  993900 |     993.9 | unchanged |
+| Lix RocksDB / after create_version     |  995766 |     995.8 | unchanged |
+| Lix RocksDB / after fast-forward merge | 1157143 |    1157.1 | unchanged |
+| Lix RocksDB / after divergent merge    | 1528256 |    1528.3 | unchanged |
 
 ### Review Loop
 
@@ -1058,22 +1058,22 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 Result: passed.
 
-| row                                                | after median | criterion status |
-| -------------------------------------------------- | -----------: | ---------------- |
-| `sqlite/get_many_exact_keys/1k`                    |    4.4035 ms | no change |
-| `sqlite/exists_many_exact_keys/1k`                 |    2.4097 ms | improved vs pre-change get/materialize path |
-| `sqlite/scan_keys_only/1k`                         |    2.4736 ms | no change |
-| `sqlite/scan_headers_only/1k`                      |    3.0070 ms | no change |
-| `sqlite/scan_full_rows/1k`                         |    4.1861 ms | no change |
-| `sqlite/prefix_scan_schema/1k`                     |    4.1514 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k`           |    4.1977 ms | no change |
-| `rocksdb/get_many_exact_keys/1k`                   |    3.4003 ms | no change |
-| `rocksdb/exists_many_exact_keys/1k`                |    1.4389 ms | improved vs pre-change get/materialize path |
-| `rocksdb/scan_keys_only/1k`                        |    1.5966 ms | no change |
-| `rocksdb/scan_headers_only/1k`                     |    1.9876 ms | no change |
-| `rocksdb/scan_full_rows/1k`                        |    3.2413 ms | no change |
-| `rocksdb/prefix_scan_schema/1k`                    |    3.6050 ms | no change; noisy high interval |
-| `rocksdb/prefix_scan_schema_file_null/1k`          |    3.3356 ms | no change |
+| row                                       | after median | criterion status                            |
+| ----------------------------------------- | -----------: | ------------------------------------------- |
+| `sqlite/get_many_exact_keys/1k`           |    4.4035 ms | no change                                   |
+| `sqlite/exists_many_exact_keys/1k`        |    2.4097 ms | improved vs pre-change get/materialize path |
+| `sqlite/scan_keys_only/1k`                |    2.4736 ms | no change                                   |
+| `sqlite/scan_headers_only/1k`             |    3.0070 ms | no change                                   |
+| `sqlite/scan_full_rows/1k`                |    4.1861 ms | no change                                   |
+| `sqlite/prefix_scan_schema/1k`            |    4.1514 ms | no change                                   |
+| `sqlite/prefix_scan_schema_file_null/1k`  |    4.1977 ms | no change                                   |
+| `rocksdb/get_many_exact_keys/1k`          |    3.4003 ms | no change                                   |
+| `rocksdb/exists_many_exact_keys/1k`       |    1.4389 ms | improved vs pre-change get/materialize path |
+| `rocksdb/scan_keys_only/1k`               |    1.5966 ms | no change                                   |
+| `rocksdb/scan_headers_only/1k`            |    1.9876 ms | no change                                   |
+| `rocksdb/scan_full_rows/1k`               |    3.2413 ms | no change                                   |
+| `rocksdb/prefix_scan_schema/1k`           |    3.6050 ms | no change; noisy high interval              |
+| `rocksdb/prefix_scan_schema_file_null/1k` |    3.3356 ms | no change                                   |
 
 Final exists-only rerun after the tombstone semantic fix:
 
@@ -1081,8 +1081,8 @@ Final exists-only rerun after the tombstone semantic fix:
 cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/exists_many_exact_keys/1k'
 ```
 
-| row                                | final median |
-| ---------------------------------- | -----------: |
+| row                                 | final median |
+| ----------------------------------- | -----------: |
 | `sqlite/exists_many_exact_keys/1k`  |    2.4097 ms |
 | `rocksdb/exists_many_exact_keys/1k` |    1.4389 ms |
 
@@ -1096,17 +1096,17 @@ cargo test -p lix_engine --features storage-benches --test json_pointer_crud_sto
 
 Result: passed.
 
-| backend / state                        | bytes | status |
-| -------------------------------------- | ----: | ------ |
-| raw SQLite / inserted                  | 1692456 | unchanged |
-| Lix SQLite / inserted                  | 1075136 | unchanged |
-| Lix SQLite / after create_version      | 1087496 | unchanged |
+| backend / state                        |   bytes | status                                                      |
+| -------------------------------------- | ------: | ----------------------------------------------------------- |
+| raw SQLite / inserted                  | 1692456 | unchanged                                                   |
+| Lix SQLite / inserted                  | 1075136 | unchanged                                                   |
+| Lix SQLite / after create_version      | 1087496 | unchanged                                                   |
 | Lix SQLite / after fast-forward merge  | 5291608 | one SQLite page over the prior run; known page-layout noise |
 | Lix SQLite / after divergent merge     | 5619288 | one SQLite page over the prior run; known page-layout noise |
-| Lix RocksDB / inserted                 |  993900 | unchanged |
-| Lix RocksDB / after create_version     |  995766 | unchanged |
-| Lix RocksDB / after fast-forward merge | 1157143 | unchanged |
-| Lix RocksDB / after divergent merge    | 1528256 | unchanged |
+| Lix RocksDB / inserted                 |  993900 | unchanged                                                   |
+| Lix RocksDB / after create_version     |  995766 | unchanged                                                   |
+| Lix RocksDB / after fast-forward merge | 1157143 | unchanged                                                   |
+| Lix RocksDB / after divergent merge    | 1528256 | unchanged                                                   |
 
 ### Review Loop
 
@@ -1212,22 +1212,22 @@ Result: passed.
 
 Final medians:
 
-| row                                                | after median | criterion status |
-| -------------------------------------------------- | -----------: | ---------------- |
-| `sqlite/get_many_exact_keys/1k`                    |    4.0589 ms | no change in final rerun; initial run improved |
-| `sqlite/exists_many_exact_keys/1k`                 |    2.5128 ms | no change |
-| `sqlite/scan_keys_only/1k`                         |    2.5838 ms | no change |
-| `sqlite/scan_headers_only/1k`                      |    2.5942 ms | no change in final rerun; initial run improved |
-| `sqlite/scan_full_rows/1k`                         |    3.8172 ms | no change |
-| `sqlite/prefix_scan_schema/1k`                     |    3.8885 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k`           |    3.8453 ms | no change |
-| `rocksdb/get_many_exact_keys/1k`                   |    2.9264 ms | improved |
-| `rocksdb/exists_many_exact_keys/1k`                |    1.4271 ms | no change |
-| `rocksdb/scan_keys_only/1k`                        |    1.5068 ms | no change |
-| `rocksdb/scan_headers_only/1k`                     |    1.5683 ms | no change in final rerun; initial run improved |
-| `rocksdb/scan_full_rows/1k`                        |    2.8121 ms | no change in final rerun; initial run improved |
-| `rocksdb/prefix_scan_schema/1k`                    |    2.7684 ms | no change in final rerun; initial run improved |
-| `rocksdb/prefix_scan_schema_file_null/1k`          |    2.7350 ms | no change |
+| row                                       | after median | criterion status                               |
+| ----------------------------------------- | -----------: | ---------------------------------------------- |
+| `sqlite/get_many_exact_keys/1k`           |    4.0589 ms | no change in final rerun; initial run improved |
+| `sqlite/exists_many_exact_keys/1k`        |    2.5128 ms | no change                                      |
+| `sqlite/scan_keys_only/1k`                |    2.5838 ms | no change                                      |
+| `sqlite/scan_headers_only/1k`             |    2.5942 ms | no change in final rerun; initial run improved |
+| `sqlite/scan_full_rows/1k`                |    3.8172 ms | no change                                      |
+| `sqlite/prefix_scan_schema/1k`            |    3.8885 ms | no change                                      |
+| `sqlite/prefix_scan_schema_file_null/1k`  |    3.8453 ms | no change                                      |
+| `rocksdb/get_many_exact_keys/1k`          |    2.9264 ms | improved                                       |
+| `rocksdb/exists_many_exact_keys/1k`       |    1.4271 ms | no change                                      |
+| `rocksdb/scan_keys_only/1k`               |    1.5068 ms | no change                                      |
+| `rocksdb/scan_headers_only/1k`            |    1.5683 ms | no change in final rerun; initial run improved |
+| `rocksdb/scan_full_rows/1k`               |    2.8121 ms | no change in final rerun; initial run improved |
+| `rocksdb/prefix_scan_schema/1k`           |    2.7684 ms | no change in final rerun; initial run improved |
+| `rocksdb/prefix_scan_schema_file_null/1k` |    2.7350 ms | no change                                      |
 
 Initial run immediately after the change showed the structural win before the
 final rerun reset Criterion's comparison baseline:
@@ -1249,17 +1249,17 @@ cargo test -p lix_engine --features storage-benches --test json_pointer_crud_sto
 
 Result: passed.
 
-| backend / state                        | bytes | delta vs Optimization 3 | status |
-| -------------------------------------- | ----: | ----------------------: | ------ |
-| raw SQLite / inserted                  | 1692456 | 0 | unchanged |
-| Lix SQLite / inserted                  | 1112216 | +37080 | direct snapshot refs in primary tree |
-| Lix SQLite / after create_version      | 1124576 | +37080 | direct snapshot refs in primary tree |
-| Lix SQLite / after fast-forward merge  | 5324328 | +32720 | below previous noisy merge shape |
-| Lix SQLite / after divergent merge     | 5652176 | +32888 | below previous noisy merge shape |
-| Lix RocksDB / inserted                 | 1028557 | +34657 | direct snapshot refs in primary tree |
-| Lix RocksDB / after create_version     | 1030457 | +34691 | direct snapshot refs in primary tree |
-| Lix RocksDB / after fast-forward merge | 1195234 | +38091 | direct snapshot refs in primary tree |
-| Lix RocksDB / after divergent merge    | 1576585 | +48329 | direct snapshot refs in primary tree |
+| backend / state                        |   bytes | delta vs Optimization 3 | status                               |
+| -------------------------------------- | ------: | ----------------------: | ------------------------------------ |
+| raw SQLite / inserted                  | 1692456 |                       0 | unchanged                            |
+| Lix SQLite / inserted                  | 1112216 |                  +37080 | direct snapshot refs in primary tree |
+| Lix SQLite / after create_version      | 1124576 |                  +37080 | direct snapshot refs in primary tree |
+| Lix SQLite / after fast-forward merge  | 5324328 |                  +32720 | below previous noisy merge shape     |
+| Lix SQLite / after divergent merge     | 5652176 |                  +32888 | below previous noisy merge shape     |
+| Lix RocksDB / inserted                 | 1028557 |                  +34657 | direct snapshot refs in primary tree |
+| Lix RocksDB / after create_version     | 1030457 |                  +34691 | direct snapshot refs in primary tree |
+| Lix RocksDB / after fast-forward merge | 1195234 |                  +38091 | direct snapshot refs in primary tree |
+| Lix RocksDB / after divergent merge    | 1576585 |                  +48329 | direct snapshot refs in primary tree |
 
 The inserted/create-version states remain below raw SQLite at 1k rows. The
 merge states were already above the storage-size north star before this cut;
@@ -1351,14 +1351,14 @@ Result: passed.
 
 | row                                       | after median | criterion status |
 | ----------------------------------------- | -----------: | ---------------- |
-| `sqlite/get_many_exact_keys/1k`           |    4.1139 ms | no change |
-| `sqlite/scan_full_rows/1k`                |    3.8428 ms | no change |
-| `sqlite/prefix_scan_schema/1k`            |    3.8457 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k`  |    3.8080 ms | no change |
-| `rocksdb/get_many_exact_keys/1k`          |    2.9443 ms | no change |
-| `rocksdb/scan_full_rows/1k`               |    2.7510 ms | no change |
-| `rocksdb/prefix_scan_schema/1k`           |    2.6865 ms | no change |
-| `rocksdb/prefix_scan_schema_file_null/1k` |    2.7327 ms | no change |
+| `sqlite/get_many_exact_keys/1k`           |    4.1139 ms | no change        |
+| `sqlite/scan_full_rows/1k`                |    3.8428 ms | no change        |
+| `sqlite/prefix_scan_schema/1k`            |    3.8457 ms | no change        |
+| `sqlite/prefix_scan_schema_file_null/1k`  |    3.8080 ms | no change        |
+| `rocksdb/get_many_exact_keys/1k`          |    2.9443 ms | no change        |
+| `rocksdb/scan_full_rows/1k`               |    2.7510 ms | no change        |
+| `rocksdb/prefix_scan_schema/1k`           |    2.6865 ms | no change        |
+| `rocksdb/prefix_scan_schema_file_null/1k` |    2.7327 ms | no change        |
 
 This is not a Criterion-proven timing win on the 1k fixture. It removes an
 avoidable allocation/copy in the payload-heavy path and should matter more for
@@ -1461,17 +1461,17 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 Result: passed.
 
-| row                                             | after median | criterion status |
-| ----------------------------------------------- | -----------: | ---------------- |
-| `raw_sqlite/write_root_all_rows/1k`             |    2.9524 ms | noisy baseline |
-| `raw_sqlite/scan_full_rows/1k`                  |    1.2119 ms | reference |
-| `raw_sqlite/prefix_scan_schema_file_null/1k`    |    1.4604 ms | reference |
-| `sqlite/write_root_all_rows/1k`                 |    6.2808 ms | no change |
-| `sqlite/scan_full_rows/1k`                      |    3.8271 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k`        |    4.0401 ms | no change |
-| `rocksdb/write_root_all_rows/1k`                |    5.4735 ms | no change |
-| `rocksdb/scan_full_rows/1k`                     |    2.7509 ms | no change |
-| `rocksdb/prefix_scan_schema_file_null/1k`       |    2.7411 ms | no change |
+| row                                          | after median | criterion status |
+| -------------------------------------------- | -----------: | ---------------- |
+| `raw_sqlite/write_root_all_rows/1k`          |    2.9524 ms | noisy baseline   |
+| `raw_sqlite/scan_full_rows/1k`               |    1.2119 ms | reference        |
+| `raw_sqlite/prefix_scan_schema_file_null/1k` |    1.4604 ms | reference        |
+| `sqlite/write_root_all_rows/1k`              |    6.2808 ms | no change        |
+| `sqlite/scan_full_rows/1k`                   |    3.8271 ms | no change        |
+| `sqlite/prefix_scan_schema_file_null/1k`     |    4.0401 ms | no change        |
+| `rocksdb/write_root_all_rows/1k`             |    5.4735 ms | no change        |
+| `rocksdb/scan_full_rows/1k`                  |    2.7509 ms | no change        |
+| `rocksdb/prefix_scan_schema_file_null/1k`    |    2.7411 ms | no change        |
 
 This is not a runtime win for the current JSON-pointer smoke rows.
 `write_root_all_rows` uses delta staging rather than projection-root staging,
@@ -1489,17 +1489,17 @@ Result: passed.
 
 Final repeated 1k storage rows:
 
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 1112216 | 1112.2 | unchanged |
-| Lix SQLite / after create_version       | 1124576 | 1124.6 | unchanged |
-| Lix SQLite / after fast-forward merge   | 5324328 | 5324.3 | unchanged from Optimization 4/5 shape |
-| Lix SQLite / after divergent merge      | 5652176 | 5652.2 | unchanged from Optimization 4/5 shape |
-| Lix RocksDB / inserted                  | 1028557 | 1028.6 | unchanged |
-| Lix RocksDB / after create_version      | 1030457 | 1030.5 | unchanged |
-| Lix RocksDB / after fast-forward merge  | 1195234 | 1195.2 | unchanged |
-| Lix RocksDB / after divergent merge     | 1576587 | 1576.6 | effectively unchanged |
+| row                                    |   bytes | bytes/row | status                                |
+| -------------------------------------- | ------: | --------: | ------------------------------------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference                             |
+| Lix SQLite / inserted                  | 1112216 |    1112.2 | unchanged                             |
+| Lix SQLite / after create_version      | 1124576 |    1124.6 | unchanged                             |
+| Lix SQLite / after fast-forward merge  | 5324328 |    5324.3 | unchanged from Optimization 4/5 shape |
+| Lix SQLite / after divergent merge     | 5652176 |    5652.2 | unchanged from Optimization 4/5 shape |
+| Lix RocksDB / inserted                 | 1028557 |    1028.6 | unchanged                             |
+| Lix RocksDB / after create_version     | 1030457 |    1030.5 | unchanged                             |
+| Lix RocksDB / after fast-forward merge | 1195234 |    1195.2 | unchanged                             |
+| Lix RocksDB / after divergent merge    | 1576587 |    1576.6 | effectively unchanged                 |
 
 An earlier storage sample before the concrete-only write cleanup showed lower
 SQLite merge-state bytes, but repeated final runs returned to the prior
@@ -1606,15 +1606,15 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 Result: passed.
 
-| row                                       | after median | criterion status |
-| ----------------------------------------- | -----------: | ---------------- |
-| `sqlite/scan_keys_only/1k`                |    2.4932 ms | -6.0%, within noise threshold |
-| `sqlite/scan_headers_only/1k`             |    2.5955 ms | no change |
-| `sqlite/scan_full_rows/1k`                |    3.7797 ms | no change |
+| row                                       | after median | criterion status               |
+| ----------------------------------------- | -----------: | ------------------------------ |
+| `sqlite/scan_keys_only/1k`                |    2.4932 ms | -6.0%, within noise threshold  |
+| `sqlite/scan_headers_only/1k`             |    2.5955 ms | no change                      |
+| `sqlite/scan_full_rows/1k`                |    3.7797 ms | no change                      |
 | `sqlite/prefix_scan_schema_file_null/1k`  |    3.7925 ms | improved, likely noisy control |
-| `rocksdb/scan_keys_only/1k`               |    1.5304 ms | no change |
-| `rocksdb/scan_headers_only/1k`            |    1.5769 ms | no change |
-| `rocksdb/scan_full_rows/1k`               |    2.7634 ms | no change |
+| `rocksdb/scan_keys_only/1k`               |    1.5304 ms | no change                      |
+| `rocksdb/scan_headers_only/1k`            |    1.5769 ms | no change                      |
+| `rocksdb/scan_full_rows/1k`               |    2.7634 ms | no change                      |
 | `rocksdb/prefix_scan_schema_file_null/1k` |    2.6894 ms | improved, likely noisy control |
 
 The structural improvement is real for projections without payload columns, but
@@ -1706,14 +1706,14 @@ Result: passed.
 
 | row                                       | after median | criterion status |
 | ----------------------------------------- | -----------: | ---------------- |
-| `sqlite/get_many_exact_keys/1k`           |    3.9197 ms | no change |
-| `sqlite/scan_full_rows/1k`                |    3.8695 ms | no change |
-| `sqlite/prefix_scan_schema/1k`            |    3.7669 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k`  |    3.7631 ms | no change |
-| `rocksdb/get_many_exact_keys/1k`          |    3.0397 ms | no change |
-| `rocksdb/scan_full_rows/1k`               |    2.7001 ms | no change |
-| `rocksdb/prefix_scan_schema/1k`           |    2.7920 ms | no change |
-| `rocksdb/prefix_scan_schema_file_null/1k` |    2.6921 ms | no change |
+| `sqlite/get_many_exact_keys/1k`           |    3.9197 ms | no change        |
+| `sqlite/scan_full_rows/1k`                |    3.8695 ms | no change        |
+| `sqlite/prefix_scan_schema/1k`            |    3.7669 ms | no change        |
+| `sqlite/prefix_scan_schema_file_null/1k`  |    3.7631 ms | no change        |
+| `rocksdb/get_many_exact_keys/1k`          |    3.0397 ms | no change        |
+| `rocksdb/scan_full_rows/1k`               |    2.7001 ms | no change        |
+| `rocksdb/prefix_scan_schema/1k`           |    2.7920 ms | no change        |
+| `rocksdb/prefix_scan_schema_file_null/1k` |    2.6921 ms | no change        |
 
 SQLite exact gets moved lower in this sample than the previous committed log,
 but Criterion still reports no change. Treat this as an allocation cleanup, not
@@ -1810,16 +1810,16 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 Result: passed.
 
-| row                                       | after median | criterion status |
-| ----------------------------------------- | -----------: | ---------------- |
+| row                                       | after median | criterion status              |
+| ----------------------------------------- | -----------: | ----------------------------- |
 | `sqlite/get_many_exact_keys/1k`           |    3.8568 ms | -3.3%, within noise threshold |
-| `sqlite/scan_full_rows/1k`                |    3.7141 ms | improved |
-| `sqlite/prefix_scan_schema/1k`            |    3.6749 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k`  |    3.6774 ms | no change |
-| `rocksdb/get_many_exact_keys/1k`          |    2.9055 ms | no change |
-| `rocksdb/scan_full_rows/1k`               |    2.5562 ms | no change |
-| `rocksdb/prefix_scan_schema/1k`           |    2.7618 ms | no change |
-| `rocksdb/prefix_scan_schema_file_null/1k` |    2.7406 ms | no change |
+| `sqlite/scan_full_rows/1k`                |    3.7141 ms | improved                      |
+| `sqlite/prefix_scan_schema/1k`            |    3.6749 ms | no change                     |
+| `sqlite/prefix_scan_schema_file_null/1k`  |    3.6774 ms | no change                     |
+| `rocksdb/get_many_exact_keys/1k`          |    2.9055 ms | no change                     |
+| `rocksdb/scan_full_rows/1k`               |    2.5562 ms | no change                     |
+| `rocksdb/prefix_scan_schema/1k`           |    2.7618 ms | no change                     |
+| `rocksdb/prefix_scan_schema_file_null/1k` |    2.7406 ms | no change                     |
 
 The strongest measured signal is SQLite full scans. RocksDB and exact gets move
 in the right direction but remain Criterion-neutral in this run.
@@ -1915,14 +1915,14 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 Result: passed.
 
-| row                                             | after median | criterion status |
-| ----------------------------------------------- | -----------: | ---------------- |
-| `sqlite/write_root_all_rows/1k`                 |    6.2844 ms | no change |
-| `sqlite/write_delta_10pct_updates/1k`           |    2.6592 ms | no change, noisy guardrail |
-| `sqlite/write_tombstone_10pct_deletes/1k`       |    2.3671 ms | no change, noisy guardrail |
-| `rocksdb/write_root_all_rows/1k`                |    5.3605 ms | no change |
-| `rocksdb/write_delta_10pct_updates/1k`          |    1.3421 ms | no change, noisy guardrail |
-| `rocksdb/write_tombstone_10pct_deletes/1k`      |    1.2464 ms | no change |
+| row                                        | after median | criterion status           |
+| ------------------------------------------ | -----------: | -------------------------- |
+| `sqlite/write_root_all_rows/1k`            |    6.2844 ms | no change                  |
+| `sqlite/write_delta_10pct_updates/1k`      |    2.6592 ms | no change, noisy guardrail |
+| `sqlite/write_tombstone_10pct_deletes/1k`  |    2.3671 ms | no change, noisy guardrail |
+| `rocksdb/write_root_all_rows/1k`           |    5.3605 ms | no change                  |
+| `rocksdb/write_delta_10pct_updates/1k`     |    1.3421 ms | no change, noisy guardrail |
+| `rocksdb/write_tombstone_10pct_deletes/1k` |    1.2464 ms | no change                  |
 
 Root-write medians moved lower than several previous samples, especially
 RocksDB, but Criterion still reports no change. Treat this as a production
@@ -2009,12 +2009,12 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 Result: passed.
 
-| row                                       | after median | criterion status |
-| ----------------------------------------- | -----------: | ---------------- |
-| `sqlite/write_root_all_rows/1k`           |    6.0937 ms | no change |
-| `sqlite/write_delta_10pct_updates/1k`     |    2.5978 ms | no change |
-| `rocksdb/write_root_all_rows/1k`          |    5.4208 ms | no change |
-| `rocksdb/write_delta_10pct_updates/1k`    |    1.3267 ms | no change |
+| row                                    | after median | criterion status |
+| -------------------------------------- | -----------: | ---------------- |
+| `sqlite/write_root_all_rows/1k`        |    6.0937 ms | no change        |
+| `sqlite/write_delta_10pct_updates/1k`  |    2.5978 ms | no change        |
+| `rocksdb/write_root_all_rows/1k`       |    5.4208 ms | no change        |
+| `rocksdb/write_delta_10pct_updates/1k` |    1.3267 ms | no change        |
 
 ### Storage
 
@@ -2107,14 +2107,14 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 Result: passed.
 
-| row                                             | after median | criterion status |
-| ----------------------------------------------- | -----------: | ---------------- |
-| `sqlite/write_root_all_rows/1k`                 |    5.9331 ms | improved |
-| `sqlite/write_delta_10pct_updates/1k`           |    2.6203 ms | no change, noisy guardrail |
-| `sqlite/write_tombstone_10pct_deletes/1k`       |    2.4790 ms | no change, noisy guardrail |
-| `rocksdb/write_root_all_rows/1k`                |    5.3019 ms | no change |
-| `rocksdb/write_delta_10pct_updates/1k`          |    1.3004 ms | no change |
-| `rocksdb/write_tombstone_10pct_deletes/1k`      |    1.2178 ms | no change |
+| row                                        | after median | criterion status           |
+| ------------------------------------------ | -----------: | -------------------------- |
+| `sqlite/write_root_all_rows/1k`            |    5.9331 ms | improved                   |
+| `sqlite/write_delta_10pct_updates/1k`      |    2.6203 ms | no change, noisy guardrail |
+| `sqlite/write_tombstone_10pct_deletes/1k`  |    2.4790 ms | no change, noisy guardrail |
+| `rocksdb/write_root_all_rows/1k`           |    5.3019 ms | no change                  |
+| `rocksdb/write_delta_10pct_updates/1k`     |    1.3004 ms | no change                  |
+| `rocksdb/write_tombstone_10pct_deletes/1k` |    1.2178 ms | no change                  |
 
 SQLite root writes improved by Criterion. RocksDB root-write median moved lower
 than recent committed samples but remains Criterion-neutral.
@@ -2131,17 +2131,17 @@ Result: passed.
 
 1k rows:
 
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 1112216 | 1112.2 | unchanged |
-| Lix SQLite / after create_version       | 1124576 | 1124.6 | unchanged |
-| Lix SQLite / after fast-forward merge   | 5324328 | 5324.3 | unchanged |
-| Lix SQLite / after divergent merge      | 5652176 | 5652.2 | unchanged |
-| Lix RocksDB / inserted                  | 1028557 | 1028.6 | unchanged |
-| Lix RocksDB / after create_version      | 1030457 | 1030.5 | unchanged |
-| Lix RocksDB / after fast-forward merge  | 1195234 | 1195.2 | unchanged |
-| Lix RocksDB / after divergent merge     | 1576587 | 1576.6 | unchanged |
+| row                                    |   bytes | bytes/row | status    |
+| -------------------------------------- | ------: | --------: | --------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference |
+| Lix SQLite / inserted                  | 1112216 |    1112.2 | unchanged |
+| Lix SQLite / after create_version      | 1124576 |    1124.6 | unchanged |
+| Lix SQLite / after fast-forward merge  | 5324328 |    5324.3 | unchanged |
+| Lix SQLite / after divergent merge     | 5652176 |    5652.2 | unchanged |
+| Lix RocksDB / inserted                 | 1028557 |    1028.6 | unchanged |
+| Lix RocksDB / after create_version     | 1030457 |    1030.5 | unchanged |
+| Lix RocksDB / after fast-forward merge | 1195234 |    1195.2 | unchanged |
+| Lix RocksDB / after divergent merge    | 1576587 |    1576.6 | unchanged |
 
 ### Review Loop
 
@@ -2228,14 +2228,14 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 Result: passed.
 
-| row                                             | before median | after median | criterion status |
-| ----------------------------------------------- | ------------: | -----------: | ---------------- |
-| `raw_sqlite/get_many_exact_keys/1k`             |     2.0599 ms |    2.0580 ms | reference |
-| `raw_sqlite/scan_full_rows/1k`                  |     1.1594 ms |    1.1722 ms | reference |
-| `sqlite/get_many_exact_keys/1k`                 |     3.9323 ms |    3.8132 ms | no change |
-| `sqlite/scan_full_rows/1k`                      |     3.6356 ms |    3.5962 ms | no change |
-| `rocksdb/get_many_exact_keys/1k`                |     2.9911 ms |    2.8464 ms | no change |
-| `rocksdb/scan_full_rows/1k`                     |     2.5176 ms |    2.3906 ms | within noise threshold |
+| row                                 | before median | after median | criterion status       |
+| ----------------------------------- | ------------: | -----------: | ---------------------- |
+| `raw_sqlite/get_many_exact_keys/1k` |     2.0599 ms |    2.0580 ms | reference              |
+| `raw_sqlite/scan_full_rows/1k`      |     1.1594 ms |    1.1722 ms | reference              |
+| `sqlite/get_many_exact_keys/1k`     |     3.9323 ms |    3.8132 ms | no change              |
+| `sqlite/scan_full_rows/1k`          |     3.6356 ms |    3.5962 ms | no change              |
+| `rocksdb/get_many_exact_keys/1k`    |     2.9911 ms |    2.8464 ms | no change              |
+| `rocksdb/scan_full_rows/1k`         |     2.5176 ms |    2.3906 ms | within noise threshold |
 
 ### Storage
 
@@ -2249,17 +2249,17 @@ Result: passed.
 
 1k rows:
 
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 1112216 | 1112.2 | unchanged |
-| Lix SQLite / after create_version       | 1124576 | 1124.6 | unchanged |
-| Lix SQLite / after fast-forward merge   | 5303776 | 5303.8 | accounting noise, lower than previous |
-| Lix SQLite / after divergent merge      | 5721904 | 5721.9 | accounting noise, higher than previous |
-| Lix RocksDB / inserted                  | 1028557 | 1028.6 | unchanged |
-| Lix RocksDB / after create_version      | 1030457 | 1030.5 | unchanged |
-| Lix RocksDB / after fast-forward merge  | 1195234 | 1195.2 | unchanged |
-| Lix RocksDB / after divergent merge     | 1576588 | 1576.6 | unchanged |
+| row                                    |   bytes | bytes/row | status                                 |
+| -------------------------------------- | ------: | --------: | -------------------------------------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference                              |
+| Lix SQLite / inserted                  | 1112216 |    1112.2 | unchanged                              |
+| Lix SQLite / after create_version      | 1124576 |    1124.6 | unchanged                              |
+| Lix SQLite / after fast-forward merge  | 5303776 |    5303.8 | accounting noise, lower than previous  |
+| Lix SQLite / after divergent merge     | 5721904 |    5721.9 | accounting noise, higher than previous |
+| Lix RocksDB / inserted                 | 1028557 |    1028.6 | unchanged                              |
+| Lix RocksDB / after create_version     | 1030457 |    1030.5 | unchanged                              |
+| Lix RocksDB / after fast-forward merge | 1195234 |    1195.2 | unchanged                              |
+| Lix RocksDB / after divergent merge    | 1576588 |    1576.6 | unchanged                              |
 
 ### Review Loop
 
@@ -2308,7 +2308,7 @@ treated as a small supporting optimization rather than a budget-moving step.
 No storage format change. No temporary shim.
 ```
 
-## Optimization 34: Probe ordered single JSON packs before dedupe
+## Optimization 14: Reuse trusted JSON refs during payload staging
 
 Date: 2026-05-11
 
@@ -2316,318 +2316,63 @@ Commit: this entry is committed with the optimization
 
 ### Change
 
-Added an early JSON-store read fast path for the common materialization shape
-where all requested JSON refs come from one commit pack in pack order:
+Threaded precomputed JSON refs through JSON-store staging for callers that
+already own the normalized JSON/ref invariant:
 
-- `load_json_bytes_many_in_scope_with_hash_check` now probes a single
-  `JsonReadScopeRef::CommitPacks` pack before building the dedupe `HashMap`,
-  direct-row key list, and request-index remapping.
-- If the ordered pack probe hits, the loader returns decoded values directly.
-- If the ordered probe misses because the pack is absent or not an exact
-  ordered match, the existing dedupe/direct-row fallback still runs. A present
-  but non-matching pack is carried into fallback so the same pack is not fetched
-  twice.
-- Added `ordered_pack_probe_falls_back_to_direct_rows` to cover direct-row
-  fallback after a mismatched ordered pack probe.
+- `NormalizedJsonRef` now has private fields and two constructors:
+  `new(normalized)` for ordinary callers and
+  `trusted_prehashed(normalized, json_ref)` for the explicit trusted path.
+- `JsonStoreWriter::stage_batch` uses the supplied trusted ref to encode JSON
+  without hashing the payload again, falling back to the existing hashing path
+  for normal callers.
+- Transaction commit passes `StageJson` refs for snapshot/metadata payloads.
+  `StageJson` computes the ref from the same normalized string during
+  transaction staging.
+- The physical storage benchmark root writer pairs payload strings with refs
+  from the already-built `Change` records so the benchmark no longer pays the
+  same duplicate hash.
 
-### Benchmarks
-
-Focused read command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys)/1k'
-```
-
-First clean run after the change:
-
-| row                                                   | median | criterion status |
-| ----------------------------------------------------- | -----: | ---------------- |
-| `raw_sqlite/get_many_exact_keys/1k`                   | 2.0699 ms | improved baseline |
-| `raw_sqlite/scan_full_rows/1k`                        | 1.2684 ms | improved baseline |
-| `raw_sqlite/prefix_scan_schema_file_null/1k`          | 1.1716 ms | improved baseline |
-| `sqlite/get_many_exact_keys/1k`                       | 2.7975 ms | improved |
-| `sqlite/scan_full_rows/1k`                            | 2.3225 ms | improved |
-| `sqlite/prefix_scan_schema_file_null/1k`              | 2.3271 ms | no change, lower median |
-| `rocksdb/get_many_exact_keys/1k`                      | 1.9847 ms | improved |
-| `rocksdb/scan_full_rows/1k`                           | 1.4401 ms | no change |
-| `rocksdb/prefix_scan_schema_file_null/1k`             | 1.4838 ms | no change |
-
-Final rerun after fallback refinement:
-
-| row                                                   | median | criterion status |
-| ----------------------------------------------------- | -----: | ---------------- |
-| `raw_sqlite/get_many_exact_keys/1k`                   | 2.0341 ms | reference/no change |
-| `raw_sqlite/scan_full_rows/1k`                        | 1.1597 ms | reference/no change |
-| `raw_sqlite/prefix_scan_schema_file_null/1k`          | 1.1901 ms | reference/no change |
-| `sqlite/get_many_exact_keys/1k`                       | 2.8496 ms | no change |
-| `sqlite/scan_full_rows/1k`                            | 2.3712 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k`              | 2.2558 ms | no change |
-| `rocksdb/get_many_exact_keys/1k`                      | 2.1639 ms | noisy regression vs prior run |
-| `rocksdb/scan_full_rows/1k`                           | 1.4752 ms | no change |
-| `rocksdb/prefix_scan_schema_file_null/1k`             | 1.4137 ms | no change |
-
-Write guardrail command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
-```
-
-Result: passed, with all measured write rows improved in that guardrail run.
-
-### Storage
-
-Storage command:
-
-```sh
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-```
-
-Result: passed.
-
-1k rows:
-
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 897976 | 898.0 | unchanged |
-| Lix SQLite / after create_version       | 910336 | 910.3 | unchanged |
-| Lix SQLite / after fast-forward merge   | 5152584 | 5152.6 | unchanged |
-| Lix SQLite / after divergent merge      | 5304136 | 5304.1 | unchanged |
-| Lix RocksDB / inserted                  | 811772 | 811.8 | unchanged |
-| Lix RocksDB / after create_version      | 813519 | 813.5 | unchanged |
-| Lix RocksDB / after fast-forward merge  | 962750 | 962.8 | unchanged |
-| Lix RocksDB / after divergent merge     | 1306403 | 1306.4 | unchanged |
-
-### Review Loop
-
-Reviewer pass:
-
-```text
-Initial review:
-HIGH: none.
-MEDIUM: early ordered probe could read the same single pack twice on
-non-exact fallback.
-LOW: none.
-
-Follow-up review:
-HIGH: none.
-MEDIUM: none.
-LOW: absent-pack fallback still rereads the missing pack; present/non-exact
-fallback copies the full pack.
-
-Final review:
-HIGH: none.
-MEDIUM: none.
-LOW: none beyond the intentionally accepted full-pack copy on uncommon
-present/non-exact fallback. The absent-pack path now goes directly to direct-row
-fallback without rereading the missing pack.
-```
-
-### Verification
-
-```sh
-cargo fmt --check
-cargo check -p lix_engine --features storage-benches
-cargo test -p lix_engine json_store:: --features storage-benches
-cargo test -p lix_engine tracked_state::context:: --features storage-benches
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys)/1k'
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
-```
-
-All commands passed.
-
-### Interpretation
-
-```text
-Keep as a JSON pack read-path optimization.
-
-Primary axis: exact reads and full-row scans that materialize all JSON payloads
-from one commit pack in pack order. The structural win avoids building a dedupe
-HashMap and direct-row key list before the existing ordered pack loader can
-succeed.
-
-Timing: first clean run showed Criterion improvements for SQLite exact reads,
-SQLite full scans, and RocksDB exact reads. Final rerun after fallback cleanup
-held the new median band but did not show another Criterion improvement, as
-expected. RocksDB exact read was noisy in the final rerun and remains a guardrail
-to watch.
-
-Storage is unchanged. No format change, no backward shim, no benchmark
-measurement change. This does not complete the <= 1.5x target because SQLite
-full/prefix scans remain above budget.
-```
-
-## Optimization 35: Pre-size tracked materialization JSON slots
-
-Date: 2026-05-11
-
-Commit: this entry is committed with the optimization
-
-### Change
-
-Pre-sized the tracked-state materialization JSON side buffers from known entry
-and projection counts:
-
-- `materialize_index_entries` now computes the maximum projected JSON slots as
-  `entries.len() * projected_json_columns`.
-- `json_refs` and `json_ref_localities` reserve that capacity up front instead
-  of growing from zero while planning rows.
-
-This follows the same locality principle used in the pack formats: when a scan
-already has the row count and projected column shape, allocate the side vectors
-once for the dense payload path.
+Added direct JSON-store coverage for staging a trusted prehashed commit-pack
+payload, verifying the returned ref and hydrated bytes.
 
 ### Benchmarks
 
-Focused read command:
+Focused command:
 
 ```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema_file_null)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
 ```
 
 Result: passed.
 
-| row                                                   | median | criterion status |
-| ----------------------------------------------------- | -----: | ---------------- |
-| `raw_sqlite/get_many_exact_keys/1k`                   | 2.1087 ms | reference/no change |
-| `raw_sqlite/scan_full_rows/1k`                        | 1.1755 ms | reference/no change |
-| `raw_sqlite/prefix_scan_schema_file_null/1k`          | 1.1727 ms | reference/no change |
-| `sqlite/get_many_exact_keys/1k`                       | 2.7590 ms | no change |
-| `sqlite/scan_full_rows/1k`                            | 2.1942 ms | no change, lower median |
-| `sqlite/prefix_scan_schema_file_null/1k`              | 2.2549 ms | no change |
-| `rocksdb/get_many_exact_keys/1k`                      | 2.0010 ms | improved |
-| `rocksdb/scan_full_rows/1k`                           | 1.4752 ms | no change |
-| `rocksdb/prefix_scan_schema_file_null/1k`             | 1.4116 ms | no change |
-
-### Storage
-
-Storage command:
-
-```sh
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-```
-
-Result: passed.
-
-1k rows:
-
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 897976 | 898.0 | unchanged |
-| Lix SQLite / after create_version       | 910336 | 910.3 | unchanged |
-| Lix SQLite / after fast-forward merge   | 5152584 | 5152.6 | unchanged |
-| Lix SQLite / after divergent merge      | 5312328 | 5312.3 | unchanged/noisy |
-| Lix RocksDB / inserted                  | 811772 | 811.8 | unchanged |
-| Lix RocksDB / after create_version      | 813519 | 813.5 | unchanged |
-| Lix RocksDB / after fast-forward merge  | 962750 | 962.8 | unchanged |
-| Lix RocksDB / after divergent merge     | 1306401 | 1306.4 | unchanged |
-
-### Review Loop
-
-Reviewer pass:
-
-```text
-HIGH: none.
-MEDIUM: none.
-LOW: reserves the upper bound for sparse/tombstone-heavy rows. This is bounded
-to at most two slots per row and is an acceptable hot-path tradeoff for dense
-payload scans.
-```
-
-### Verification
-
-```sh
-cargo fmt --check
-cargo check -p lix_engine --features storage-benches
-cargo test -p lix_engine tracked_state::materialization:: --features storage-benches
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema_file_null)/1k'
-```
-
-All commands passed.
-
-### Interpretation
-
-```text
-Keep as a small tracked materialization allocation cleanup.
-
-Primary axis: dense full-row materialization for exact reads and scans. The
-structural win removes repeated growth of JSON ref/locality side buffers when
-the planner already knows the maximum slot count.
-
-Timing: RocksDB exact reads improved by Criterion. SQLite scan medians moved
-lower but remained Criterion-neutral. There were no measured regressions in the
-focused read run.
-
-Storage is unchanged. No format change, no backward shim, no benchmark
-measurement change. This does not complete the <= 1.5x target; SQLite full and
-prefix scans remain above budget and root writes still need a larger cut.
-```
-
-## Optimization 36: Decode scan keys from trusted schema/file prefix
-
-Date: 2026-05-11
-
-Commit: this entry is committed with the optimization
-
-### Change
-
-Added a tracked-tree scan fast path for the common single schema/file prefix
-shape:
-
-- `scan_ranges` already proves rows are inside one encoded
-  `schema_key + file_id` prefix when a request has one schema key, one non-Any
-  file filter, and no entity filter.
-- `scan_key_decode_hint` carries that trusted prefix shape through recursive
-  tree scans.
-- Leaf scans now decode only the entity suffix with
-  `decode_key_with_trusted_prefix`, then materialize the known schema/file
-  fields directly.
-- The normal full-key decoder and filter recheck remain in place for multi
-  schema/file scans, Any-file scans, entity-filter scans, and all other shapes.
-
-Added direct coverage for the trusted suffix decoder and a tree scan test that
-locks the hinted branch against tombstone visibility, file filtering, and limit
-handling.
-
-### Benchmarks
-
-Focused read command:
-
-```sh
-cargo bench -p lix_engine --bench json_pointer_crud --features storage-benches -- 'json_pointer_crud/(raw_sqlite/smoke/(select_all_path_value|select_one_by_pk)|raw_storage_(sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema_file_null))/1k'
-```
-
-Result: passed.
-
-| row                                                               | median | criterion status |
-| ----------------------------------------------------------------- | -----: | ---------------- |
-| `raw_sqlite/select_all_path_value/1k`                             | 1.2300 ms | reference/no change |
-| `raw_sqlite/select_one_by_pk/1k`                                  | 1.0905 ms | reference/no change |
-| `sqlite/get_many_exact_keys/1k`                                   | 2.8295 ms | no change |
-| `sqlite/scan_full_rows/1k`                                        | 2.3559 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k`                          | 2.2079 ms | improved |
-| `rocksdb/get_many_exact_keys/1k`                                  | 2.0448 ms | no change |
-| `rocksdb/scan_full_rows/1k`                                       | 1.5172 ms | no change |
-| `rocksdb/prefix_scan_schema_file_null/1k`                         | 1.4547 ms | no change |
+| row                                           | after median | criterion status |
+| --------------------------------------------- | -----------: | ---------------- |
+| `raw_sqlite/write_root_all_rows/1k`           |    2.3853 ms | reference        |
+| `raw_sqlite/write_delta_10pct_updates/1k`     |    1.2667 ms | reference        |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k` |    1.2330 ms | reference        |
+| `sqlite/write_root_all_rows/1k`               |    5.4166 ms | improved         |
+| `sqlite/write_delta_10pct_updates/1k`         |    2.5490 ms | no change        |
+| `sqlite/write_tombstone_10pct_deletes/1k`     |    2.6059 ms | improved         |
+| `rocksdb/write_root_all_rows/1k`              |    4.8746 ms | improved         |
+| `rocksdb/write_delta_10pct_updates/1k`        |    1.2758 ms | no change        |
+| `rocksdb/write_tombstone_10pct_deletes/1k`    |    1.2795 ms | noisy guardrail  |
 
 Rerun command:
 
 ```sh
-cargo bench -p lix_engine --bench json_pointer_crud --features storage-benches -- 'json_pointer_crud/(raw_sqlite/smoke/select_all_path_value|raw_storage_(sqlite|rocksdb)/smoke/(scan_full_rows|prefix_scan_schema_file_null))/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
 ```
 
 Result: passed.
 
-| row                                                               | median | criterion status |
-| ----------------------------------------------------------------- | -----: | ---------------- |
-| `raw_sqlite/select_all_path_value/1k`                             | 1.1630 ms | reference/no change |
-| `sqlite/scan_full_rows/1k`                                        | 2.2529 ms | no change, lower median |
-| `sqlite/prefix_scan_schema_file_null/1k`                          | 2.2044 ms | no change, lower median |
-| `rocksdb/scan_full_rows/1k`                                       | 1.4055 ms | improved |
-| `rocksdb/prefix_scan_schema_file_null/1k`                         | 1.4103 ms | no change |
+| row                                        | rerun median | criterion status        |
+| ------------------------------------------ | -----------: | ----------------------- |
+| `sqlite/write_root_all_rows/1k`            |    5.3105 ms | no change, lower median |
+| `sqlite/write_delta_10pct_updates/1k`      |    2.5652 ms | no change               |
+| `sqlite/write_tombstone_10pct_deletes/1k`  |    2.4195 ms | no change               |
+| `rocksdb/write_root_all_rows/1k`           |    4.7479 ms | no change, lower median |
+| `rocksdb/write_delta_10pct_updates/1k`     |    1.2128 ms | no change               |
+| `rocksdb/write_tombstone_10pct_deletes/1k` |    1.2283 ms | improved                |
 
 ### Storage
 
@@ -2641,17 +2386,17 @@ Result: passed.
 
 1k rows:
 
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 897976 | 898.0 | unchanged |
-| Lix SQLite / after create_version       | 910336 | 910.3 | unchanged |
-| Lix SQLite / after fast-forward merge   | 5090808 | 5090.8 | unchanged/noisy |
-| Lix SQLite / after divergent merge      | 5234168 | 5234.2 | unchanged/noisy |
-| Lix RocksDB / inserted                  | 811776 | 811.8 | unchanged |
-| Lix RocksDB / after create_version      | 813523 | 813.5 | unchanged |
-| Lix RocksDB / after fast-forward merge  | 962754 | 962.8 | unchanged |
-| Lix RocksDB / after divergent merge     | 1306404 | 1306.4 | unchanged |
+| row                                    |   bytes | bytes/row | status    |
+| -------------------------------------- | ------: | --------: | --------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference |
+| Lix SQLite / inserted                  | 1112216 |    1112.2 | unchanged |
+| Lix SQLite / after create_version      | 1124576 |    1124.6 | unchanged |
+| Lix SQLite / after fast-forward merge  | 5324328 |    5324.3 | unchanged |
+| Lix SQLite / after divergent merge     | 5652176 |    5652.2 | unchanged |
+| Lix RocksDB / inserted                 | 1028557 |    1028.6 | unchanged |
+| Lix RocksDB / after create_version     | 1030457 |    1030.5 | unchanged |
+| Lix RocksDB / after fast-forward merge | 1195234 |    1195.2 | unchanged |
+| Lix RocksDB / after divergent merge    | 1576587 |    1576.6 | unchanged |
 
 ### Review Loop
 
@@ -2660,816 +2405,29 @@ Reviewer pass:
 ```text
 Initial review:
 HIGH: none.
-MEDIUM: none.
-LOW: trusted prefix helper should make its caller proof sharper; add targeted
-coverage for the hinted schema/file scan branch with tombstones and limits.
+MEDIUM: supplied-ref path was correctness-critical but only protected by
+debug_assert; make the trusted prehashed path harder to construct accidentally.
+LOW: add direct json-store coverage and avoid pretending init eliminates a hash.
 
 Follow-up review:
-No HIGH/MEDIUM/LOW findings.
-```
-
-### Verification
-
-```sh
-cargo fmt --check
-cargo check -p lix_engine --features storage-benches
-cargo test -p lix_engine tracked_state:: --features storage-benches
-cargo test -p lix_engine scan_schema_file_prefix_honors_tombstones_and_limit --features storage-benches
-cargo test -p lix_engine key_codec_decodes_entity_suffix_with_trusted_prefix --features storage-benches
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-cargo bench -p lix_engine --bench json_pointer_crud --features storage-benches -- 'json_pointer_crud/(raw_sqlite/smoke/(select_all_path_value|select_one_by_pk)|raw_storage_(sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema_file_null))/1k'
-cargo bench -p lix_engine --bench json_pointer_crud --features storage-benches -- 'json_pointer_crud/(raw_sqlite/smoke/select_all_path_value|raw_storage_(sqlite|rocksdb)/smoke/(scan_full_rows|prefix_scan_schema_file_null))/1k'
-```
-
-All commands passed.
-
-### Interpretation
-
-```text
-Keep as a scan key-decoding optimization.
-
-Primary axis: schema/file prefix scans. The structural win avoids reparsing
-schema/file fields from every matched encoded key and avoids repeating the key
-filter check when the encoded prefix range already proved those fields.
-
-Timing: SQLite prefix scan improved by Criterion in the first focused run.
-Rerun medians stayed lower but were Criterion-neutral, while RocksDB full scan
-improved by Criterion. Exact reads remained neutral, as expected.
-
-Storage is unchanged. No format change, no backward shim. This does not complete
-the <= 1.5x target; SQLite scans and root writes still need larger cuts.
-```
-
-## Optimization 33: Varint tracked-state delta-pack local fields
-
-### Change
-
-Changed tracked-state delta packs from version `4` to version `5` with no
-backwards shim. Tree node/key/value encodings remain on their existing
-fixed-width formats.
-
-Within `LXTD` v5 delta packs, pack-local lengths/counts/indexes now use checked
-canonical `u32` varints instead of fixed-width `u32` fields:
-
-- pack commit id length
-- key prefix count, prefix schema/file id lengths, entry count
-- per-entry key/value section lengths
-- key prefix index and entity identity part count/lengths
-- full source commit id length when needed
-- source pack id and source ordinal
-- delta change id length
-- timestamp lengths
-
-The section-length encoder writes in place, reserving the maximum 5-byte varint
-header and compacting it after the section is written, avoiding a temporary
-allocation per key/value section.
-
-Decoder hardening:
-
-- rejects overlong varints
-- rejects varints above `u32::MAX`
-- rejects non-canonical encodings such as `80 00`
-- avoids eager large `Vec::with_capacity(count)` allocations from corrupt
-  decoded counts
-
-Added focused delta-pack tests for the malformed varint cases and updated the
-roundtrip fixture to assert the v5 varint header fields.
-
-### Storage
-
-Storage command:
-
-```sh
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-```
-
-Result: passed.
-
-1k rows:
-
-| row                                     | before bytes | after bytes | delta |
-| --------------------------------------- | -----------: | ----------: | ----: |
-| raw SQLite / inserted                   | 1,692,456 | 1,692,456 | reference |
-| Lix SQLite / inserted                   |   922,696 |   897,976 | -24,720 |
-| Lix SQLite / after create_version       |   935,056 |   910,336 | -24,720 |
-| Lix SQLite / after fast-forward merge   | 5,123,600 | 5,152,584 | +28,984 |
-| Lix SQLite / after divergent merge      | 5,308,064 | 5,304,136 | -3,928 |
-| Lix RocksDB / inserted                  |   836,566 |   811,776 | -24,790 |
-| Lix RocksDB / after create_version      |   838,350 |   813,523 | -24,827 |
-| Lix RocksDB / after fast-forward merge  |   991,281 |   962,754 | -28,527 |
-| Lix RocksDB / after divergent merge     | 1,345,089 | 1,306,406 | -38,683 |
-
-### Benchmarks
-
-Focused command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|exists_many_exact_keys)/1k'
-```
-
-Result: passed.
-
-Rerun after replacing temporary section buffers with in-place varint section
-headers:
-
-| row                                             | median | criterion status |
-| ----------------------------------------------- | -----: | ---------------- |
-| `raw_sqlite/write_root_all_rows/1k`             | 2.4927 ms | no change |
-| `raw_sqlite/get_many_exact_keys/1k`             | 2.0536 ms | improved |
-| `raw_sqlite/exists_many_exact_keys/1k`          | 2.1659 ms | no change |
-| `raw_sqlite/scan_full_rows/1k`                  | 1.2557 ms | improved |
-| `raw_sqlite/prefix_scan_schema_file_null/1k`    | 1.2060 ms | no change |
-| `raw_sqlite/write_delta_10pct_updates/1k`       | 1.2878 ms | improved |
-| `raw_sqlite/write_tombstone_10pct_deletes/1k`   | 1.2843 ms | improved |
-| `sqlite/write_root_all_rows/1k`                 | 4.5495 ms | no change |
-| `sqlite/get_many_exact_keys/1k`                 | 2.7998 ms | no change |
-| `sqlite/exists_many_exact_keys/1k`              | 1.8635 ms | no change |
-| `sqlite/scan_full_rows/1k`                      | 2.6022 ms | noise threshold |
-| `sqlite/prefix_scan_schema_file_null/1k`        | 2.2652 ms | no change |
-| `sqlite/write_delta_10pct_updates/1k`           | 1.7003 ms | no change |
-| `sqlite/write_tombstone_10pct_deletes/1k`       | 1.6276 ms | no change |
-| `rocksdb/write_root_all_rows/1k`                | 4.3209 ms | no change |
-| `rocksdb/get_many_exact_keys/1k`                | 2.1036 ms | regressed |
-| `rocksdb/exists_many_exact_keys/1k`             | 1.0935 ms | no change |
-| `rocksdb/scan_full_rows/1k`                     | 1.4418 ms | no change |
-| `rocksdb/prefix_scan_schema_file_null/1k`       | 1.4424 ms | no change |
-| `rocksdb/write_delta_10pct_updates/1k`          | 754.76 us | improved |
-| `rocksdb/write_tombstone_10pct_deletes/1k`      | 779.52 us | no change |
-
-The only Criterion regression in the rerun is RocksDB exact reads, which should
-not decode delta-pack values on this benchmark path. Treat as a noisy guardrail
-unless it repeats after later exact-read work.
-
-### Review Loop
-
-Reviewer pass:
-
-```text
 HIGH: none.
 MEDIUM: none.
 LOW: none.
-
-The v5 delta-pack varint path rejects overlong, above-u32, and non-canonical
-encodings; section boundaries are preserved; tree node/key/value encodings
-still use fixed-width helpers; and the count allocation hardening avoids huge
-malformed-count allocation before truncation failure.
+The prior MEDIUM is resolved by private NormalizedJsonRef fields plus explicit
+new/trusted_prehashed constructors. The intended production caller passes
+StageJson normalized bytes and the ref computed from those same bytes.
 ```
 
 ### Verification
 
 ```sh
-cargo fmt --check
-cargo test -p lix_engine tracked_state::codec:: --features storage-benches
-cargo test -p lix_engine tracked_state:: --features storage-benches
-cargo test -p lix_engine transaction::commit:: --features storage-benches
-cargo check -p lix_engine --features storage-benches --benches
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|exists_many_exact_keys)/1k'
-```
-
-All commands passed.
-
-### Interpretation
-
-```text
-Keep.
-
-This is another pure physical-layout byte win. The largest clean benefit is on
-root/create-version storage and RocksDB delta/merge footprints, with no intended
-logical behavior change and no compatibility shim.
-
-The fast-forward SQLite byte count moved up on this run while divergent SQLite
-and RocksDB merge rows moved down; the inserted/create-version rows show the
-direct delta-pack-local field compression most clearly.
-
-Target is still not met: SQLite root write remains about 4.55 / 2.49 = 1.83x
-raw SQLite in the latest focused run, and scans are still above the 1.5x budget.
-```
-
-## Optimization 32: Varint change-pack local fields
-
-Date: 2026-05-11
-
-Commit: this entry is committed with the optimization
-
-### Change
-
-Changed the unshipped commit-store change-pack format from `LXCP2` to `LXCP3`.
-
-`LXCP3` keeps the same logical fields and explicit pack structure, but encodes
-pack-local lengths, counts, and indexes as checked u32 varints instead of fixed
-u32 fields:
-
-- commit id length
-- shape count
-- shape `schema_key` and optional `file_id` lengths
-- change count
-- per-change id length
-- entity-identity part count and part lengths
-- shape index
-- created-at length
-
-Standalone commit (`LXCM1`), standalone change (`LXCH2`), and membership-pack
-(`LXMP1`) encodings are unchanged. There is no backwards shim because the
-format has not shipped.
-
-Added decode coverage for overlong varints, values above `u32::MAX`, and
-non-canonical encodings such as `80 00`.
-
-### Storage
-
-Command:
-
-```sh
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-```
-
-Result: passed.
-
-1k rows:
-
-| state | before | after | delta |
-| --- | ---: | ---: | ---: |
-| raw SQLite inserted | 1,692,456 | 1,692,456 | 0 |
-| Lix SQLite inserted | 939,176 | 922,696 | -16,480 |
-| Lix SQLite create_version | 951,536 | 935,056 | -16,480 |
-| Lix SQLite fast-forward | 5,152,296 | 5,123,600 | -28,696 |
-| Lix SQLite divergent | 5,320,304 | 5,308,064 | -12,240 |
-| Lix RocksDB inserted | 851,910 | 836,566 | -15,344 |
-| Lix RocksDB create_version | 853,721 | 838,350 | -15,371 |
-| Lix RocksDB fast-forward | 1,009,345 | 991,281 | -18,064 |
-| Lix RocksDB divergent | 1,368,580 | 1,345,089 | -23,491 |
-
-### Timing
-
-Focused command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|exists_many_exact_keys)/1k'
-```
-
-Result: passed.
-
-Representative medians:
-
-| row | median | criterion status |
-| --- | ---: | --- |
-| `raw_sqlite/write_root_all_rows/1k` | 2.3938 ms | no change |
-| `raw_sqlite/get_many_exact_keys/1k` | 2.0500 ms | no change |
-| `raw_sqlite/exists_many_exact_keys/1k` | 2.0326 ms | no change |
-| `raw_sqlite/scan_full_rows/1k` | 1.1694 ms | no change |
-| `raw_sqlite/prefix_scan_schema_file_null/1k` | 1.1635 ms | no change |
-| `raw_sqlite/write_delta_10pct_updates/1k` | 1.2193 ms | no change |
-| `raw_sqlite/write_tombstone_10pct_deletes/1k` | 1.2057 ms | no change |
-| `sqlite/write_root_all_rows/1k` | 4.5170 ms | no change |
-| `sqlite/get_many_exact_keys/1k` | 2.8695 ms | no change |
-| `sqlite/exists_many_exact_keys/1k` | 1.8988 ms | no change |
-| `sqlite/scan_full_rows/1k` | 2.2094 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k` | 2.2438 ms | no change |
-| `sqlite/write_delta_10pct_updates/1k` | 1.7065 ms | no change |
-| `sqlite/write_tombstone_10pct_deletes/1k` | 1.6626 ms | no change |
-| `rocksdb/write_root_all_rows/1k` | 3.9725 ms | improved |
-| `rocksdb/get_many_exact_keys/1k` | 2.0688 ms | no change |
-| `rocksdb/exists_many_exact_keys/1k` | 1.0354 ms | no change |
-| `rocksdb/scan_full_rows/1k` | 1.4142 ms | no change |
-| `rocksdb/prefix_scan_schema_file_null/1k` | 1.3397 ms | no change |
-| `rocksdb/write_delta_10pct_updates/1k` | 736.65 us | no change |
-| `rocksdb/write_tombstone_10pct_deletes/1k` | 735.43 us | no change |
-
-### Verification
-
-```sh
-cargo fmt --check
-cargo test -p lix_engine commit_store::codec:: --features storage-benches
-cargo test -p lix_engine commit_store:: --features storage-benches
-cargo test -p lix_engine transaction::commit:: --features storage-benches
-cargo check -p lix_engine --features storage-benches --benches
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|exists_many_exact_keys)/1k'
-```
-
-All commands passed.
-
-Reviewer loop:
-
-- First pass: HIGH none, MEDIUM found a malformed 5-byte varint could exceed
-  `u32::MAX` without being rejected; LOW requested canonical varint rejection.
-- Fixed `read_var_usize` to reject fifth-byte continuation and high payload
-  bits, and to reject non-canonical zero-extended encodings.
-- Added regressions for overlong, too-large, and non-canonical varints.
-- Second pass: HIGH none, MEDIUM none, LOW none.
-
-### Interpretation
-
-```text
-Keep as a compact change-pack layout cleanup.
-
-Primary axis: storage bytes. Change packs are commit-local bounded blobs whose
-per-row shape indexes and string lengths are usually tiny; fixed u32 metadata
-was pure overhead. Varints are limited to u32, canonical, and malformed packs
-reject before allocation-heavy paths can trust the decoded value.
-
-Timing: focused physical write/read/scan rows showed no detected Lix
-regressions. The only statistically visible Lix movement was a RocksDB root
-write improvement in the final run.
-
-No backwards shim.
-```
-
-## Optimization 31: Narrow JSON pack directory fields
-
-Date: 2026-05-11
-
-Commit: this entry is committed with the optimization
-
-### Change
-
-Changed the unshipped JSON commit-pack format from `lix-json-pack:v1` to
-`lix-json-pack:v2`.
-
-The per-entry directory keeps the same explicit shape:
-
-```text
-hash, codec, uncompressed_len, payload_offset, payload_len
-```
-
-but narrows the three numeric payload fields from `u64` to `u32`. The entry
-header shrinks from `32 + 1 + 8 + 8 + 8 = 57` bytes to
-`32 + 1 + 4 + 4 + 4 = 45` bytes.
-
-This is a clean cut with no backwards shim because Lix has not shipped. Unlike
-the rejected implicit-offset JSON-pack experiment, this keeps explicit offsets,
-so unordered/fallback pack reads retain direct payload slicing instead of
-reconstructing offsets from earlier directory entries.
-
-Added codec tests for the compact 45-byte directory shape and for checked
-rejection of oversized u32 directory fields.
-
-### Storage
-
-Command:
-
-```sh
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-```
-
-Result: passed.
-
-1k rows:
-
-| state | before | after | delta |
-| --- | ---: | ---: | ---: |
-| raw SQLite inserted | 1,692,456 | 1,692,456 | 0 |
-| Lix SQLite inserted | 947,416 | 939,176 | -8,240 |
-| Lix SQLite create_version | 959,776 | 951,536 | -8,240 |
-| Lix SQLite fast-forward | 5,152,248 | 5,152,296 | +48 |
-| Lix SQLite divergent | 5,353,168 | 5,320,304 | -32,864 |
-| Lix RocksDB inserted | 864,114 | 851,910 | -12,204 |
-| Lix RocksDB create_version | 865,938 | 853,721 | -12,217 |
-| Lix RocksDB fast-forward | 1,022,770 | 1,009,345 | -13,425 |
-| Lix RocksDB divergent | 1,384,417 | 1,368,580 | -15,837 |
-
-### Timing
-
-Focused command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null)/1k'
-```
-
-Result: passed.
-
-Representative medians:
-
-| row | median | criterion status |
-| --- | ---: | --- |
-| `raw_sqlite/write_root_all_rows/1k` | 2.4135 ms | no change |
-| `raw_sqlite/scan_full_rows/1k` | 1.2061 ms | no change |
-| `raw_sqlite/prefix_scan_schema_file_null/1k` | 1.1669 ms | no change |
-| `raw_sqlite/write_delta_10pct_updates/1k` | 1.2859 ms | no change |
-| `raw_sqlite/write_tombstone_10pct_deletes/1k` | 1.1947 ms | no change |
-| `sqlite/write_root_all_rows/1k` | 4.6431 ms | no change |
-| `sqlite/scan_full_rows/1k` | 2.2783 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k` | 2.3420 ms | no change |
-| `sqlite/write_delta_10pct_updates/1k` | 1.7931 ms | no change |
-| `sqlite/write_tombstone_10pct_deletes/1k` | 1.6065 ms | no change |
-| `rocksdb/write_root_all_rows/1k` | 4.1708 ms | no change |
-| `rocksdb/scan_full_rows/1k` | 1.4051 ms | no change |
-| `rocksdb/prefix_scan_schema_file_null/1k` | 1.3823 ms | no change |
-| `rocksdb/write_delta_10pct_updates/1k` | 818.06 us | no change |
-| `rocksdb/write_tombstone_10pct_deletes/1k` | 765.78 us | no change |
-
-### Verification
-
-```sh
-cargo fmt --check
+cargo fmt -p lix_engine
 cargo test -p lix_engine json_store:: --features storage-benches
-cargo test -p lix_engine tracked_state:: --features storage-benches
 cargo check -p lix_engine --features storage-benches --benches
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null)/1k'
-```
-
-All commands passed.
-
-Reviewer loop:
-
-- First pass: HIGH none, MEDIUM none, LOW requested direct overflow coverage
-  for narrowed fields.
-- Added `json_pack_u32_rejects_oversized_directory_fields`.
-- Second pass: HIGH none, MEDIUM none, LOW none. Recommendation: keep.
-
-### Interpretation
-
-```text
-Keep as a compact physical-layout cleanup.
-
-Primary axis: storage bytes. Commit-local JSON packs are bounded KV blobs, not
-large archive files, so u32 payload lengths and offsets are enough while the
-encoder still rejects oversized packs explicitly.
-
-Timing: no Lix runtime row showed a detected regression in the focused write
-and scan guardrail. Keeping explicit offsets preserves the direct random-access
-fallback shape that the earlier implicit-offset experiment lost.
-
-No backwards shim.
-```
-
-## Optimization 30: Compact commit and delta change ids
-
-Date: 2026-05-11
-
-Commit: this entry is committed with the optimization
-
-### Change
-
-Changed the unshipped physical pack formats:
-
-- Commit-store change packs move from `LXCP1` to `LXCP2`.
-- `LXCP2` stores shared `(schema_key, file_id)` shapes once per pack.
-- `LXCP2` stores entity identity directly as string parts instead of a JSON
-  array string inside each packed change.
-- `LXCP2` stores change ids as a suffix when they start with the pack
-  `commit_id`, otherwise stores the full id.
-- Tracked-state delta packs move from `LXTD3` to `LXTD4`.
-- `LXTD4` stores delta `change_id`s as a suffix when they start with the
-  locator `source_commit_id`, otherwise stores the full id.
-
-Standalone `LXCH2` change encoding remains available, but change packs no
-longer embed standalone `LXCH2` records. There is no backwards shim because the
-physical format has not shipped.
-
-Added codec coverage for the compact change-pack shape and for a tracked
-delta-pack cross-commit locator whose `change_id` starts with the pack commit
-id but not with its locator source commit id.
-
-### Benchmarks
-
-Focused command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null)/1k'
-```
-
-Result: passed.
-
-Representative medians:
-
-| row                                             | median | criterion status |
-| ----------------------------------------------- | -----: | ---------------- |
-| `raw_sqlite/write_root_all_rows/1k`             | 2.3900 ms | no change |
-| `sqlite/write_root_all_rows/1k`                 | 4.4672 ms | no change |
-| `sqlite/write_delta_10pct_updates/1k`           | 1.7570 ms | no change |
-| `sqlite/write_tombstone_10pct_deletes/1k`       | 1.5593 ms | no change |
-| `sqlite/scan_full_rows/1k`                      | 2.3076 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k`        | 2.2825 ms | no change |
-| `rocksdb/write_root_all_rows/1k`                | 4.3382 ms | no change |
-| `rocksdb/write_delta_10pct_updates/1k`          | 842.39 us | no change |
-| `rocksdb/write_tombstone_10pct_deletes/1k`      | 732.73 us | no change |
-| `rocksdb/scan_full_rows/1k`                     | 1.3643 ms | no change |
-| `rocksdb/prefix_scan_schema_file_null/1k`       | 1.3588 ms | no change |
-
-Earlier same-patch focused sweep also showed RocksDB delta writes at
-`751.11 us` improved and RocksDB tombstone writes at `741.36 us` improved; the
-combined rerun settled as neutral except raw SQLite tombstone noise.
-
-### Storage
-
-Storage command:
-
-```sh
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-```
-
-Result: passed.
-
-1k rows:
-
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 947416 | 947.4 | improved |
-| Lix SQLite / after create_version       | 959776 | 959.8 | improved |
-| Lix SQLite / after fast-forward merge   | 5152248 | 5152.2 | improved |
-| Lix SQLite / after divergent merge      | 5353168 | 5353.2 | improved |
-| Lix RocksDB / inserted                  | 864114 | 864.1 | improved |
-| Lix RocksDB / after create_version      | 865938 | 865.9 | improved |
-| Lix RocksDB / after fast-forward merge  | 1022770 | 1022.8 | improved |
-| Lix RocksDB / after divergent merge     | 1384417 | 1384.4 | improved |
-
-### Review Loop
-
-Reviewer pass 1 found one HIGH: `LXTD4` initially stripped delta change ids
-against the pack commit id while decode reconstructed suffixes against the
-locator `source_commit_id`, which could corrupt an adopted cross-commit locator
-whose id happened to start with the pack commit id.
-
-Fix: encode delta change-id suffixes against
-`value.change_locator.source_commit_id`, matching decode, and add a regression
-for the cross-commit prefix-collision case.
-
-Reviewer pass 2:
-
-```text
-HIGH: none.
-MEDIUM: none.
-LOW: none.
-
-The reviewer confirmed the prior HIGH is resolved, suffix encode/decode now use
-the same source-commit basis, LXCP2 preserves entry order, shape indexes are
-bounds-checked, and commit-store suffix IDs use the same commit-id basis on
-encode/decode.
-Recommendation: keep.
-```
-
-### Verification
-
-```sh
-cargo fmt --check
-cargo test -p lix_engine commit_store::codec:: --features storage-benches
-cargo test -p lix_engine commit_store:: --features storage-benches
-cargo test -p lix_engine tracked_state::codec:: --features storage-benches
-cargo test -p lix_engine tracked_state:: --features storage-benches
-cargo test -p lix_engine transaction::commit:: --features storage-benches
-cargo check -p lix_engine --features storage-benches --benches
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null)/1k'
-```
-
-All commands passed.
-
-### Interpretation
-
-```text
-Keep as a format-level compaction.
-
-Root-write timing remains above the 1.5x target and mostly Criterion-neutral,
-so this is not the final root-write answer. The pack bytes are meaningfully
-smaller, however, and the format removes repeated schema/file/change-id/entity
-encoding from durable commit packs while preserving locator semantics.
-
-The current budget misses remain root writes and SQLite full/prefix scans.
-```
-
-## Optimization 29: Compact matching tracked timestamps
-
-Date: 2026-05-11
-
-Commit: this entry is committed with the optimization
-
-### Change
-
-Bumped the tracked-state value codec from version 6 to version 7 and compacted
-the common timestamp shape in both materialized tree values and delta-pack
-values:
-
-- Values now write `created_at` once.
-- A one-byte tag follows:
-  `TIMESTAMP_UPDATED_SAME` when `updated_at == created_at`, otherwise
-  `TIMESTAMP_UPDATED_DISTINCT` plus the `updated_at` string.
-- Decode reconstructs `updated_at` from `created_at` for the same-timestamp
-  case and rejects invalid timestamp tags.
-- `encoded_value_len` now uses the same timestamp-pair sizing helper as the
-  encoder.
-
-There is no backwards shim because the format has not shipped.
-
-Added coverage that matching timestamps roundtrip and produce a shorter encoded
-value than distinct timestamps. Existing distinct timestamp roundtrip tests
-continue to cover the non-compact branch.
-
-### Benchmarks
-
-Focused write/scan command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_headers_only|scan_full_rows)/1k'
-```
-
-Result: passed.
-
-Representative medians:
-
-| row                                             | median | criterion status |
-| ----------------------------------------------- | -----: | ---------------- |
-| `sqlite/write_root_all_rows/1k`                 | 5.0199 ms | no change |
-| `sqlite/write_delta_10pct_updates/1k`           | 1.8704 ms | no change |
-| `sqlite/write_tombstone_10pct_deletes/1k`       | 1.7569 ms | no change |
-| `sqlite/scan_headers_only/1k`                   | 1.8272 ms | no change |
-| `sqlite/scan_full_rows/1k`                      | 2.3698 ms | no change |
-| `rocksdb/write_root_all_rows/1k`                | 4.3505 ms | no change |
-| `rocksdb/write_delta_10pct_updates/1k`          | 840.51 us | improved |
-| `rocksdb/write_tombstone_10pct_deletes/1k`      | 933.62 us | no change |
-| `rocksdb/scan_headers_only/1k`                  | 860.63 us | no change |
-| `rocksdb/scan_full_rows/1k`                     | 1.5218 ms | noisy regression |
-
-Rerun of scan guardrails:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
-```
-
-Result: passed.
-
-| row                                             | rerun median | criterion status |
-| ----------------------------------------------- | -----------: | ---------------- |
-| `sqlite/scan_headers_only/1k`                   | 1.7102 ms | improved |
-| `sqlite/scan_full_rows/1k`                      | 2.2907 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k`        | 2.2168 ms | no change |
-| `rocksdb/scan_headers_only/1k`                  | 815.47 us | no change |
-| `rocksdb/scan_full_rows/1k`                     | 1.3515 ms | improved |
-| `rocksdb/prefix_scan_schema_file_null/1k`       | 1.4072 ms | no change |
-
-### Storage
-
-Storage command:
-
-```sh
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-```
-
-Result: passed.
-
-1k rows:
-
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 972136 | 972.1 | improved |
-| Lix SQLite / after create_version       | 984496 | 984.5 | improved |
-| Lix SQLite / after fast-forward merge   | 5201544 | 5201.5 | roughly unchanged |
-| Lix SQLite / after divergent merge      | 5365384 | 5365.4 | roughly unchanged |
-| Lix RocksDB / inserted                  | 884519 | 884.5 | improved |
-| Lix RocksDB / after create_version      | 886342 | 886.3 | improved |
-| Lix RocksDB / after fast-forward merge  | 1043067 | 1043.1 | improved |
-| Lix RocksDB / after divergent merge     | 1404413 | 1404.4 | improved |
-
-### Review Loop
-
-Reviewer pass:
-
-```text
-HIGH: none.
-MEDIUM: none.
-LOW: none.
-
-The reviewer confirmed that the version/deleted header masking remains correct,
-tombstone visibility still only needs the header, both tree and delta values
-use the same timestamp pair helpers, distinct timestamps are preserved, invalid
-timestamp tags are rejected, and encoded_value_len matches the new format.
-Recommendation: keep.
-```
-
-### Verification
-
-```sh
-cargo fmt --check
-cargo test -p lix_engine tracked_state::codec:: --features storage-benches
-cargo check -p lix_engine --features storage-benches --benches
-cargo test -p lix_engine tracked_state:: --features storage-benches
-cargo test -p lix_engine transaction::commit:: --features storage-benches
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_headers_only|scan_full_rows)/1k'
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
-```
-
-All commands passed.
-
-### Interpretation
-
-```text
-Keep as a physical value-format compaction.
-
-The structural win is direct: inserted/root rows usually have matching
-created_at and updated_at, so storing the timestamp twice was duplicated row
-payload. Version 7 stores the common case as one string plus a tag while still
-preserving distinct timestamps for updates/adoptions.
-
-Storage improves materially on inserted/create_version states for both SQLite
-and RocksDB, and RocksDB merge-state bytes improve as well. Timing is mostly
-neutral with useful scan/write wins on rerun; the one RocksDB scan regression
-did not reproduce.
-
-No backward shim because the physical format is still unshipped.
-```
-
-## Optimization 28: Encode change-pack entries in place
-
-Date: 2026-05-11
-
-Commit: this entry is committed with the optimization
-
-### Change
-
-`commit_store::codec::encode_change_pack` now writes each authored change
-directly into its length-prefixed pack entry:
-
-- Extracted `write_change_ref(&mut Vec<u8>, ChangeRef)` from
-  `encode_change_ref`.
-- `encode_change_ref` still returns standalone `LXCH2` bytes by writing into a
-  fresh `Vec`.
-- `encode_change_pack` now reserves the 4-byte little-endian section length,
-  writes the `LXCH2` change bytes directly into the pack buffer, and backfills
-  the length.
-- Removed the old temporary `encode_change_ref(change)?` plus `write_bytes`
-  copy inside the pack loop.
-
-Added a unit test asserting that the bytes inside one change-pack entry are
-exactly the same as the standalone `encode_change_ref` bytes.
-
-### Benchmarks
-
-Focused write command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
-```
-
-Result: passed.
-
-Representative medians:
-
-| row                                             | median | criterion status |
-| ----------------------------------------------- | -----: | ---------------- |
-| `raw_sqlite/write_root_all_rows/1k`             | 2.4908 ms | reference/no change |
-| `raw_sqlite/write_delta_10pct_updates/1k`       | 1.2818 ms | reference/no change |
-| `raw_sqlite/write_tombstone_10pct_deletes/1k`   | 1.2797 ms | reference/no change |
-| `sqlite/write_root_all_rows/1k`                 | 4.7754 ms | no change, lower median |
-| `sqlite/write_delta_10pct_updates/1k`           | 1.9721 ms | no change |
-| `sqlite/write_tombstone_10pct_deletes/1k`       | 1.7907 ms | no change |
-| `rocksdb/write_root_all_rows/1k`                | 4.3187 ms | no change, lower median |
-| `rocksdb/write_delta_10pct_updates/1k`          | 935.37 us | no change |
-| `rocksdb/write_tombstone_10pct_deletes/1k`      | 789.37 us | no change |
-
-### Storage
-
-Storage command:
-
-```sh
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-```
-
-Result: passed. The change-pack wire format is unchanged.
-
-1k rows:
-
-| row                                     | bytes | bytes/row |
-| --------------------------------------- | ----: | --------: |
-| raw SQLite / inserted                   | 1692456 | 1692.5 |
-| Lix SQLite / inserted                   | 996856 | 996.9 |
-| Lix SQLite / after create_version       | 1013336 | 1013.3 |
-| Lix SQLite / after fast-forward merge   | 5201424 | 5201.4 |
-| Lix SQLite / after divergent merge      | 5348880 | 5348.9 |
-| Lix RocksDB / inserted                  | 912032 | 912.0 |
-| Lix RocksDB / after create_version      | 913889 | 913.9 |
-| Lix RocksDB / after fast-forward merge  | 1073314 | 1073.3 |
-| Lix RocksDB / after divergent merge     | 1442792 | 1442.8 |
-
-### Review Loop
-
-Reviewer pass:
-
-```text
-HIGH: none.
-MEDIUM: none.
-LOW: none.
-
-The reviewer confirmed that the pack still writes a length-prefixed LXCH2
-payload for each change, that decode still reads the same entry bytes, and that
-partial mutation on error is not exposed because encode_change_pack and
-encode_change_ref both build into fresh local Vecs. Recommendation: keep.
-```
-
-### Verification
-
-```sh
-cargo fmt --check
-cargo check -p lix_engine --features storage-benches --benches
-cargo test -p lix_engine commit_store::codec:: --features storage-benches
-cargo test -p lix_engine commit_store:: --features storage-benches
 cargo test -p lix_engine transaction::commit:: --features storage-benches
 cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
 cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
 ```
 
 All commands passed.
@@ -3477,1069 +2435,18 @@ All commands passed.
 ### Interpretation
 
 ```text
-Keep as a write-side commit-pack allocation cleanup.
+Keep as a root-write optimization.
 
-The physical win is removing one temporary Vec allocation and one copy for each
-authored change encoded into a commit-store change pack. It is the same shape
-as the earlier direct delta-pack and direct commit-change row work: encode into
-the final pack buffer instead of building nested row blobs only to copy them.
+Primary axis: write_root_all_rows. The structural win removes a duplicate
+BLAKE3 hash over normalized JSON payloads at the JSON-store staging boundary
+when transaction staging has already computed the content ref.
 
-Timing is a modest median improvement for root writes on both Lix backends, but
-Criterion did not mark it statistically significant. This is kept because it
-removes real per-row hot-path work while preserving the byte format and storage
-footprint.
+Timing: both SQLite and RocksDB root writes moved down, with Criterion
+improvements in the first focused run and lower medians on rerun. Delta and
+tombstone rows are treated as guardrails; their medians were neutral to better
+on rerun.
 
 No storage format change. No temporary shim.
-```
-
-## Optimization 27: Decode delta-pack sections without temporary copies
-
-Date: 2026-05-11
-
-Commit: this entry is committed with the optimization
-
-### Change
-
-`tracked_state::codec::decode_delta_pack` now parses each sized delta key and
-value section directly from the pack byte slice:
-
-- Replaced `read_sized_bytes(...)?` followed by borrowing the temporary `Vec`
-  with `read_sized_slice(...)?`.
-- Kept the existing `decode_delta_key` and `decode_delta_value` parsers, so the
-  section format, cursor advancement, truncation checks, and trailing-byte
-  validation are unchanged.
-
-This removes two heap allocations and two payload copies per delta-pack row on
-unmaterialized tracked-state reads.
-
-### Benchmarks
-
-Focused scan command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys)/1k'
-```
-
-Result: passed.
-
-Representative medians:
-
-| row                                             | median | criterion status |
-| ----------------------------------------------- | -----: | ---------------- |
-| `sqlite/get_many_exact_keys/1k`                 | 2.9171 ms | no change |
-| `sqlite/scan_keys_only/1k`                      | 1.8631 ms | no change |
-| `sqlite/scan_headers_only/1k`                   | 1.7398 ms | improved |
-| `sqlite/scan_full_rows/1k`                      | 2.3693 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k`        | 2.3791 ms | no change |
-| `rocksdb/get_many_exact_keys/1k`                | 1.9810 ms | no change |
-| `rocksdb/scan_keys_only/1k`                     | 849.54 us | no change |
-| `rocksdb/scan_headers_only/1k`                  | 840.90 us | no change |
-| `rocksdb/scan_full_rows/1k`                     | 1.3687 ms | improved |
-| `rocksdb/prefix_scan_schema_file_null/1k`       | 1.3407 ms | no change |
-
-Broad scan/write guardrail command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
-```
-
-Result: passed. Raw SQLite reference rows were noisy in this run, but Lix write
-rows were neutral, SQLite scan medians stayed in the improved band, and RocksDB
-tombstone writes improved.
-
-Follow-up scan rerun:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
-```
-
-Result: passed.
-
-| row                                             | rerun median | criterion status |
-| ----------------------------------------------- | -----------: | ---------------- |
-| `sqlite/scan_headers_only/1k`                   | 1.7979 ms | no change |
-| `sqlite/scan_full_rows/1k`                      | 2.3657 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k`        | 2.3208 ms | no change |
-| `rocksdb/scan_headers_only/1k`                  | 817.34 us | improved |
-| `rocksdb/scan_full_rows/1k`                     | 1.3446 ms | improved |
-| `rocksdb/prefix_scan_schema_file_null/1k`       | 1.3315 ms | no change |
-
-### Storage
-
-Storage command:
-
-```sh
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-```
-
-Result: passed. No format or write-path storage change.
-
-1k rows:
-
-| row                                     | bytes | bytes/row |
-| --------------------------------------- | ----: | --------: |
-| raw SQLite / inserted                   | 1692456 | 1692.5 |
-| Lix SQLite / inserted                   | 996856 | 996.9 |
-| Lix SQLite / after create_version       | 1013336 | 1013.3 |
-| Lix SQLite / after fast-forward merge   | 5205520 | 5205.5 |
-| Lix SQLite / after divergent merge      | 5369360 | 5369.4 |
-| Lix RocksDB / inserted                  | 912032 | 912.0 |
-| Lix RocksDB / after create_version      | 913889 | 913.9 |
-| Lix RocksDB / after fast-forward merge  | 1073314 | 1073.3 |
-| Lix RocksDB / after divergent merge     | 1442794 | 1442.8 |
-
-### Review Loop
-
-Reviewer pass:
-
-```text
-HIGH: none.
-MEDIUM: none.
-LOW: none.
-
-The reviewer confirmed that read_sized_slice preserves the same overflow and
-truncation checks, the nested key/value decoders still reject trailing bytes,
-and the borrowed slices only live for the duration of parsing. Recommendation:
-keep as a clean read-side allocation cut.
-```
-
-### Verification
-
-```sh
-cargo fmt --check
-cargo test -p lix_engine tracked_state::codec:: --features storage-benches
-cargo check -p lix_engine --features storage-benches --benches
-cargo test -p lix_engine tracked_state:: --features storage-benches
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys)/1k'
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
-```
-
-All commands passed.
-
-### Interpretation
-
-```text
-Keep as a read-side delta-pack decode cleanup.
-
-The physical win is small but real: unmaterialized tracked-state reads no
-longer copy every encoded delta key and value section before decoding owned
-rows from them. This reduces heap traffic without changing the pack format or
-corruption behavior.
-
-Timing is noisy but favorable enough to keep. SQLite header scans showed a
-significant improvement in the focused run and stayed in the lower band on
-rerun. RocksDB header/full scans improved significantly on rerun. Writes and
-storage bytes are neutral because the encoded bytes are unchanged.
-
-No storage format change. No temporary shim.
-```
-
-## Optimization 26: Probe delta-pack existence without loading blobs
-
-### Hypothesis
-
-Unmaterialized tracked commits are served from delta packs until a projection
-root exists. The scan planner only needs to know whether each first-parent
-commit has a delta pack, but it was calling `load_delta_pack`, which fetched and
-decoded the whole pack before the result-producing path fetched and decoded it
-again. This violates the same locality rule used by storage engines: use an
-index/key-existence probe to plan, and only read the value blob when the plan
-needs row data.
-
-### Change
-
-- Added `tracked_state::storage::delta_pack_exists`.
-- Implemented it with `StorageReader::exists_many` against the delta-pack
-  namespace/key, so it does not fetch delta-pack bytes.
-- Replaced the planning-time `load_delta_pack(...).is_some()` in
-  `delta_commit_ids_since_projection_root` with the key-only existence probe.
-- Kept all result-producing paths on `load_delta_pack`, so corrupt or
-  identity-mismatched packs still fail before scans, diffs, point reads, or
-  existence checks return results.
-
-### Benchmarks
-
-Focused read command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|exists_many_exact_keys)/1k'
-```
-
-Result: passed.
-
-Representative rerun medians:
-
-| row                                                   | median | criterion status |
-| ----------------------------------------------------- | -----: | ---------------- |
-| `raw_sqlite/scan_keys_only/1k`                        | 1.1162 ms | reference |
-| `raw_sqlite/scan_headers_only/1k`                     | 1.1543 ms | reference |
-| `raw_sqlite/scan_full_rows/1k`                        | 1.2260 ms | reference |
-| `raw_sqlite/prefix_scan_schema_file_null/1k`          | 1.5672 ms | noisy reference |
-| `sqlite/get_many_exact_keys/1k`                       | 2.9404 ms | no change |
-| `sqlite/exists_many_exact_keys/1k`                    | 1.9841 ms | no change |
-| `sqlite/scan_keys_only/1k`                            | 1.8194 ms | no change, lower median |
-| `sqlite/scan_headers_only/1k`                         | 1.8309 ms | no change |
-| `sqlite/scan_full_rows/1k`                            | 2.3452 ms | no change, lower median |
-| `sqlite/prefix_scan_schema_file_null/1k`              | 2.3869 ms | no change, lower median |
-| `rocksdb/get_many_exact_keys/1k`                      | 2.0017 ms | no change |
-| `rocksdb/exists_many_exact_keys/1k`                   | 1.1156 ms | no change |
-| `rocksdb/scan_keys_only/1k`                           | 835.73 us | no change, lower median |
-| `rocksdb/scan_headers_only/1k`                        | 878.24 us | improved |
-| `rocksdb/scan_full_rows/1k`                           | 1.4314 ms | no change |
-| `rocksdb/prefix_scan_schema_file_null/1k`             | 1.3956 ms | within noise threshold |
-
-Broad scan/write guardrail command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
-```
-
-Result: passed.
-
-Notable medians from the broad run:
-
-| row                                             | median | criterion status |
-| ----------------------------------------------- | -----: | ---------------- |
-| `sqlite/write_root_all_rows/1k`                 | 5.2065 ms | no change |
-| `sqlite/write_delta_10pct_updates/1k`           | 1.9378 ms | improved |
-| `sqlite/write_tombstone_10pct_deletes/1k`       | 1.8930 ms | within noise threshold |
-| `sqlite/scan_keys_only/1k`                      | 1.8567 ms | no change |
-| `sqlite/scan_headers_only/1k`                   | 1.7894 ms | no change |
-| `sqlite/scan_full_rows/1k`                      | 2.4152 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k`        | 2.4417 ms | no change |
-| `rocksdb/scan_keys_only/1k`                     | 914.58 us | improved |
-| `rocksdb/scan_full_rows/1k`                     | 1.4490 ms | improved |
-
-### Storage
-
-Storage command:
-
-```sh
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-```
-
-Result: passed. No format or write-path storage change.
-
-1k rows:
-
-| row                                     | bytes | bytes/row |
-| --------------------------------------- | ----: | --------: |
-| raw SQLite / inserted                   | 1692456 | 1692.5 |
-| Lix SQLite / inserted                   | 996856 | 996.9 |
-| Lix SQLite / after create_version       | 1013336 | 1013.3 |
-| Lix SQLite / after fast-forward merge   | 5205520 | 5205.5 |
-| Lix SQLite / after divergent merge      | 5361192 | 5361.2 |
-| Lix RocksDB / inserted                  | 912032 | 912.0 |
-| Lix RocksDB / after create_version      | 913889 | 913.9 |
-| Lix RocksDB / after fast-forward merge  | 1073314 | 1073.3 |
-| Lix RocksDB / after divergent merge     | 1442794 | 1442.8 |
-
-### Review Loop
-
-Reviewer pass:
-
-```text
-Initial review:
-HIGH: none.
-MEDIUM: delta_pack_exists used get_values, so it avoided decode CPU but still
-fetched the blob. Use StorageReader::exists_many as a true key-only probe.
-
-Follow-up review:
-HIGH: none.
-MEDIUM: none.
-The prior MEDIUM is resolved. delta_pack_exists now uses StorageReader::exists_many
-against the delta-pack namespace/key. Result-producing paths still load and
-decode packs, so corrupt or identity-mismatched packs still fail before results
-are produced.
-```
-
-### Verification
-
-```sh
-cargo fmt --check
-cargo test -p lix_engine tracked_state::context:: --features storage-benches
-cargo test -p lix_engine tracked_state:: --features storage-benches
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|exists_many_exact_keys)/1k'
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
-```
-
-All commands passed.
-
-### Interpretation
-
-```text
-Keep as a read-path physical access optimization.
-
-The structural win is precise: first-parent planning now asks the backend for
-key existence instead of fetching a delta-pack value blob it will decode later.
-This follows the reference-system pattern of separating metadata/index probes
-from value materialization.
-
-The strongest observed impact is on unmaterialized single-delta scans, where
-SQLite scan medians moved from the post-Optimization-25 range of roughly
-1.94-2.69 ms down to roughly 1.82-2.39 ms in focused runs, and RocksDB scan
-medians moved below or near the raw SQLite reference for key/header scans.
-
-This does not change storage format, write layout, or corruption semantics for
-visible reads. It does not close the remaining full-row SQLite gap by itself.
-```
-
-## Optimization 25: Dictionary-code delta-pack key prefixes
-
-### Hypothesis
-
-Tracked-state delta packs repeat the same `schema_key` and `file_id` for every
-JSON-pointer row. The v2 delta-pack key format stored that full prefix inside
-each entry key even though the pack is already a locality unit. A pack-level
-prefix table should remove repeated key bytes while keeping decoded keys exactly
-the same shape for downstream ordering and filtering.
-
-This follows the same first-principles shape as page/segment dictionaries in
-systems like DuckDB/Turso/Dolt-style physical layouts: pay one compact table per
-storage unit, then store small indexes in repeated records.
-
-### Change
-
-- Bumped tracked delta packs from version 2 to version 3. No backward shim.
-- Added a pack-level key-prefix dictionary of `(schema_key, file_id)`.
-- Encoded each delta key as `prefix_index + entity_id`.
-- Kept decode output as full `TrackedStateKey` values so scan collapse,
-  ordering, and prefix filtering continue to operate on the existing key type.
-- Added coverage that verifies the prefix table is written for mixed file
-  prefixes and corrupt out-of-bounds prefix indexes reject.
-- Avoided a `HashMap` prefix-index path after a focused rerun showed write
-  regressions; the kept version uses the small prefix vector plus per-delta
-  prefix indexes built during the prefix pass.
-
-### Benchmarks
-
-Focused scan/write command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite)/smoke/(write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
-```
-
-Result: passed.
-
-| row                                                   | median | criterion status |
-| ----------------------------------------------------- | -----: | ---------------- |
-| `raw_sqlite/scan_keys_only/1k`                        | 1.2058 ms | reference |
-| `raw_sqlite/scan_full_rows/1k`                        | 1.1330 ms | reference |
-| `raw_sqlite/prefix_scan_schema_file_null/1k`          | 1.1647 ms | reference |
-| `raw_sqlite/write_delta_10pct_updates/1k`             | 1.2337 ms | reference |
-| `raw_sqlite/write_tombstone_10pct_deletes/1k`         | 1.2127 ms | reference |
-| `sqlite/scan_keys_only/1k`                            | 1.9801 ms | improved |
-| `sqlite/scan_full_rows/1k`                            | 2.5814 ms | improved |
-| `sqlite/prefix_scan_schema_file_null/1k`              | 2.6188 ms | no change |
-
-Final write-focused command after replacing the regressing `HashMap` prefix
-indexer:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
-```
-
-Result: passed.
-
-| row                                             | median | criterion status |
-| ----------------------------------------------- | -----: | ---------------- |
-| `sqlite/write_delta_10pct_updates/1k`           | 2.2536 ms | no change |
-| `sqlite/write_tombstone_10pct_deletes/1k`       | 2.2861 ms | no change |
-
-### Storage
-
-Storage command:
-
-```sh
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-```
-
-Result: passed.
-
-1k rows:
-
-| row                                     | bytes | bytes/row | vs Optimization 24 |
-| --------------------------------------- | ----: | --------: | -----------------: |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 996856 | 996.9 | -16480 |
-| Lix SQLite / after create_version       | 1013336 | 1013.3 | -16480 |
-| Lix SQLite / after fast-forward merge   | 5201424 | 5201.4 | -28768 |
-| Lix SQLite / after divergent merge      | 5361240 | 5361.2 | -24600 |
-| Lix RocksDB / inserted                  | 912032 | 912.0 | -13272 |
-| Lix RocksDB / after create_version      | 913889 | 913.9 | -13257 |
-| Lix RocksDB / after fast-forward merge  | 1073314 | 1073.3 | -12464 |
-| Lix RocksDB / after divergent merge     | 1442794 | 1442.8 | -12128 |
-
-### Review Loop
-
-Reviewer pass:
-
-```text
-HIGH: none.
-MEDIUM: none.
-LOW: none.
-
-The v3 shape writes a header-level key-prefix table, then each entry key stores
-only `prefix_index + entity_id`. Decode reconstructs full `TrackedStateKey`s, so
-downstream ordering/filter behavior still sees ordinary full keys. Corrupt
-prefix indexes and invalid prefix file-id tags reject. Empty packs work
-naturally with zero prefixes and zero entries.
-```
-
-### Verification
-
-```sh
-cargo fmt --check
-cargo test -p lix_engine tracked_state::codec:: --features storage-benches
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite)/smoke/(write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
-```
-
-All commands passed.
-
-### Interpretation
-
-```text
-Keep as a storage-layout optimization.
-
-Primary axis: bytes per row. The JSON-pointer workload now pays for
-`json_pointer + NULL file_id` once per delta pack instead of once per delta row.
-The win is modest but repeatable across SQLite and RocksDB accounting, and the
-write guardrail is neutral after removing the HashMap indexer.
-
-This does not close the remaining <=1.5x gap by itself. It is a clean physical
-layout step that reduces repeated key bytes without changing the logical scan
-surface.
-```
-
-## Optimization 21: Load scan roots once
-
-### Hypothesis
-
-`TrackedStateStoreReader::scan_rows_at_commit` was using
-`projection_has_pending_deltas` as a routing check before scan execution. For
-delta-pack-backed commits that helper walked the first-parent/delta chain, then
-`projection_entries_at_commit` walked it again to produce rows. For materialized
-root commits, the route also checked root existence and then loaded the same
-root again before scanning.
-
-Loading the target root once at scan entry should preserve the same routing:
-scan the root directly when it exists; otherwise let `projection_entries_at_commit`
-perform the delta/base walk exactly once.
-
-### Change
-
-- `scan_rows_at_commit` now calls `tree.load_root(commit_id)` once.
-- If a root exists, scan it directly, preserving the by-file index fast path and
-  fallback to the primary tree when no by-file root exists.
-- If no root exists, call `projection_entries_at_commit` directly.
-- Tombstone filtering, materialization, and request limit handling remain after
-  row collection as before.
-
-### Benchmarks
-
-Focused command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
-```
-
-Result: passed.
-
-| row                                                     | after median | criterion status |
-| ------------------------------------------------------- | -----------: | ---------------- |
-| `raw_sqlite/scan_keys_only/1k`                          |    1.1587 ms | reference |
-| `raw_sqlite/scan_headers_only/1k`                       |    1.1213 ms | reference |
-| `raw_sqlite/scan_full_rows/1k`                          |    1.2689 ms | reference |
-| `raw_sqlite/prefix_scan_schema/1k`                      |    1.1597 ms | reference |
-| `raw_sqlite/prefix_scan_schema_file_null/1k`            |    1.1929 ms | reference |
-| `sqlite/scan_keys_only/1k`                              |    2.1147 ms | improved |
-| `sqlite/scan_headers_only/1k`                           |    2.7995 ms | no change |
-| `sqlite/scan_full_rows/1k`                              |    2.8024 ms | improved |
-| `sqlite/prefix_scan_schema/1k`                          |    2.7534 ms | improved |
-| `sqlite/prefix_scan_schema_file_null/1k`                |    2.7506 ms | improved |
-| `rocksdb/scan_keys_only/1k`                             |    1.2154 ms | improved |
-| `rocksdb/scan_headers_only/1k`                          |    1.2315 ms | improved |
-| `rocksdb/scan_full_rows/1k`                             |    1.7649 ms | improved |
-| `rocksdb/prefix_scan_schema/1k`                         |    1.7814 ms | improved |
-| `rocksdb/prefix_scan_schema_file_null/1k`               |    1.8046 ms | improved |
-
-### Storage
-
-Storage command:
-
-```sh
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-```
-
-Result: passed.
-
-1k rows:
-
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 1054536 | 1054.5 | unchanged |
-| Lix SQLite / after create_version       | 1071016 | 1071.0 | unchanged |
-| Lix SQLite / after fast-forward merge   | 5279368 | 5279.4 | unchanged |
-| Lix SQLite / after divergent merge      | 5463856 | 5463.9 | unchanged |
-| Lix RocksDB / inserted                  | 964892 | 964.9 | unchanged |
-| Lix RocksDB / after create_version      | 966733 | 966.7 | unchanged |
-| Lix RocksDB / after fast-forward merge  | 1125265 | 1125.3 | unchanged |
-| Lix RocksDB / after divergent merge     | 1494068 | 1494.1 | unchanged |
-
-### Review Loop
-
-Reviewer pass:
-
-```text
-HIGH: none.
-MEDIUM: none.
-LOW: none.
-
-Reviewer confirmed the root-first routing is equivalent: the old pending-delta
-predicate already stopped immediately when the target commit had a root, while
-delta-only and missing commits still go through the same projection/delta walk.
-By-file fallback, tombstone filtering, and limit behavior are preserved.
-```
-
-### Verification
-
-```sh
-cargo fmt -p lix_engine
-cargo test -p lix_engine tracked_state::context:: --features storage-benches
-cargo check -p lix_engine --features storage-benches --benches
-cargo test -p lix_engine tracked_state::materializer:: --features storage-benches
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
-```
-
-All commands passed.
-
-### Interpretation
-
-```text
-Keep as a scan-path optimization.
-
-This removes duplicated route-discovery reads without changing storage or scan
-semantics. It improves most SQLite and RocksDB tracked scan rows, but SQLite
-full/prefix scans remain above the 1.5x target and need deeper tree/materialize
-work next.
-```
-
-## Optimization 22: Fast-path single delta-pack scans
-
-### Hypothesis
-
-The JSON-pointer tracked scan fixtures usually read a commit with no materialized
-projection root and exactly one tracked-state delta pack. The general overlay
-path inserts those delta entries into a `BTreeMap` and then collects the map
-back into sorted rows. For the single-pack/no-base case, that map is only doing
-three things: key filtering, sorted order, and duplicate-key last-write-wins
-collapse.
-
-A direct vector path can preserve those semantics with less per-row map work.
-
-### Change
-
-- Added `single_delta_pack_entries` for the `base_commit_id == None` and
-  `delta_commit_ids.len() == 1` case.
-- The fast path:
-  - filters with the same `request.matches_key` predicate as the existing
-    overlay path;
-  - sorts by `(TrackedStateKey, original ordinal)`;
-  - collapses duplicate keys by keeping the last ordinal;
-  - skips final tombstones when `include_tombstones` is false.
-- Added coverage for duplicate-key and tombstone behavior in a single delta
-  pack.
-
-### Benchmarks
-
-Focused command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
-```
-
-Result: passed.
-
-| row                                                     | after median | criterion status |
-| ------------------------------------------------------- | -----------: | ---------------- |
-| `raw_sqlite/scan_keys_only/1k`                          |    1.1288 ms | reference |
-| `raw_sqlite/scan_headers_only/1k`                       |    1.1685 ms | reference |
-| `raw_sqlite/scan_full_rows/1k`                          |    1.1922 ms | reference |
-| `raw_sqlite/prefix_scan_schema/1k`                      |    1.2255 ms | reference |
-| `raw_sqlite/prefix_scan_schema_file_null/1k`            |    1.7144 ms | reference/noisy |
-| `sqlite/scan_keys_only/1k`                              |    2.3765 ms | noisy regression |
-| `sqlite/scan_headers_only/1k`                           |    2.2331 ms | improved |
-| `sqlite/scan_full_rows/1k`                              |    2.6767 ms | within noise |
-| `sqlite/prefix_scan_schema/1k`                          |    2.7255 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k`                |    2.7038 ms | no change |
-| `rocksdb/scan_keys_only/1k`                             |    1.2053 ms | no change |
-| `rocksdb/scan_headers_only/1k`                          |    1.1988 ms | improved |
-| `rocksdb/scan_full_rows/1k`                             |    1.6527 ms | improved |
-| `rocksdb/prefix_scan_schema/1k`                         |    1.6875 ms | improved |
-| `rocksdb/prefix_scan_schema_file_null/1k`               |    1.6230 ms | improved |
-
-SQLite rerun:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
-```
-
-| row                                      | rerun median | criterion status |
-| ---------------------------------------- | -----------: | ---------------- |
-| `sqlite/scan_keys_only/1k`               |    2.0399 ms | improved |
-| `sqlite/scan_headers_only/1k`            |    2.1180 ms | no change |
-| `sqlite/scan_full_rows/1k`               |    2.8050 ms | no change |
-| `sqlite/prefix_scan_schema/1k`           |    2.7217 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k` |    2.6412 ms | no change |
-
-### Storage
-
-Storage command:
-
-```sh
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-```
-
-Result: passed.
-
-1k rows:
-
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 1054536 | 1054.5 | unchanged |
-| Lix SQLite / after create_version       | 1071016 | 1071.0 | unchanged |
-| Lix SQLite / after fast-forward merge   | 5279392 | 5279.4 | unchanged |
-| Lix SQLite / after divergent merge      | 5586736 | 5586.7 | unchanged |
-| Lix RocksDB / inserted                  | 964892 | 964.9 | unchanged |
-| Lix RocksDB / after create_version      | 966733 | 966.7 | unchanged |
-| Lix RocksDB / after fast-forward merge  | 1125265 | 1125.3 | unchanged |
-| Lix RocksDB / after divergent merge     | 1494068 | 1494.1 | unchanged |
-
-### Review Loop
-
-Reviewer pass:
-
-```text
-HIGH: none.
-MEDIUM: none.
-LOW: none.
-
-Reviewer confirmed the fast path matches the old BTreeMap overlay semantics:
-same key-only filtering, sorted key order, last duplicate wins, final tombstone
-removal when tombstones are excluded, and limits remain above materialization.
-```
-
-### Verification
-
-```sh
-cargo fmt -p lix_engine
-cargo test -p lix_engine tracked_state::context:: --features storage-benches
-cargo check -p lix_engine --features storage-benches --benches
-cargo test -p lix_engine tracked_state::materializer:: --features storage-benches
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
-```
-
-All commands passed.
-
-### Interpretation
-
-```text
-Keep as a narrow delta-pack scan optimization.
-
-The best movement is headers/full rows and RocksDB scans; SQLite full/prefix
-rows remain mostly around the same medians as Optimization 21, with keys-only
-improving on rerun. No storage change.
-```
-
-## Optimization 23: Encode delta packs directly into the output buffer
-
-### Hypothesis
-
-`encode_delta_pack_refs` still allocated a temporary encoded key `Vec` and
-temporary encoded value `Vec` for every tracked delta, only to copy both into
-the delta pack as length-prefixed sections. Reference storage systems avoid
-per-row temporary records on hot write paths when the final output buffer can be
-written directly.
-
-Writing each key/value section directly into the pack and backpatching the
-section length should preserve the binary format while removing per-delta
-allocation/copy work.
-
-### Change
-
-- Split `encode_key_ref` and `encode_value_ref` into allocation-returning public
-  helpers plus private `append_key_ref` / `append_value_ref` buffer writers.
-- Changed `encode_delta_pack_refs` to write key/value sections directly via
-  `push_sized_section`.
-- `decode_delta_pack` is unchanged; the encoded wire shape remains
-  length-prefixed key bytes followed by length-prefixed value bytes.
-
-### Benchmarks
-
-Focused command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
-```
-
-Result: passed.
-
-| row                                             | after median | criterion status |
-| ----------------------------------------------- | -----------: | ---------------- |
-| `raw_sqlite/write_root_all_rows/1k`             |    2.4262 ms | reference |
-| `raw_sqlite/write_delta_10pct_updates/1k`       |    1.3524 ms | reference |
-| `raw_sqlite/write_tombstone_10pct_deletes/1k`   |    1.2769 ms | reference |
-| `sqlite/write_root_all_rows/1k`                 |    4.9586 ms | no change, lower median |
-| `sqlite/write_delta_10pct_updates/1k`           |    1.9208 ms | no change |
-| `sqlite/write_tombstone_10pct_deletes/1k`       |    2.0990 ms | noisy regression |
-| `rocksdb/write_root_all_rows/1k`                |    4.2122 ms | no change, lower median |
-| `rocksdb/write_delta_10pct_updates/1k`          |  880.26 µs | no change |
-| `rocksdb/write_tombstone_10pct_deletes/1k`      |  836.97 µs | no change, lower median |
-
-SQLite rerun:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
-```
-
-| row                                           | rerun median | criterion status |
-| --------------------------------------------- | -----------: | ---------------- |
-| `sqlite/write_root_all_rows/1k`               |    5.0104 ms | no change |
-| `sqlite/write_delta_10pct_updates/1k`         |    1.9488 ms | no change |
-| `sqlite/write_tombstone_10pct_deletes/1k`     |    1.7955 ms | improved |
-
-### Storage
-
-Storage command:
-
-```sh
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-```
-
-Result: passed.
-
-1k rows:
-
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 1054536 | 1054.5 | unchanged |
-| Lix SQLite / after create_version       | 1071016 | 1071.0 | unchanged |
-| Lix SQLite / after fast-forward merge   | 5279368 | 5279.4 | unchanged |
-| Lix SQLite / after divergent merge      | 5430920 | 5430.9 | unchanged |
-| Lix RocksDB / inserted                  | 964892 | 964.9 | unchanged |
-| Lix RocksDB / after create_version      | 966733 | 966.7 | unchanged |
-| Lix RocksDB / after fast-forward merge  | 1125265 | 1125.3 | unchanged |
-| Lix RocksDB / after divergent merge     | 1494068 | 1494.1 | unchanged |
-
-### Review Loop
-
-Reviewer pass:
-
-```text
-HIGH: none.
-MEDIUM: none.
-LOW: none.
-
-Reviewer confirmed the binary shape is compatible: the append helpers preserve
-field order and primitive encoders, while `push_sized_section` backpatches the
-same four-byte length consumed by `decode_delta_pack`.
-```
-
-### Verification
-
-```sh
-cargo fmt -p lix_engine
-cargo test -p lix_engine tracked_state::codec:: --features storage-benches
-cargo check -p lix_engine --features storage-benches --benches
-cargo test -p lix_engine tracked_state::context:: --features storage-benches
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
-```
-
-All commands passed.
-
-### Interpretation
-
-```text
-Keep as a write-path allocation cleanup.
-
-This is a structural writer improvement with neutral-to-better medians on rerun
-and no storage format change. It does not close the remaining root-write gap by
-itself.
-```
-
-## Optimization 24: Compact same-commit delta locators
-
-### Hypothesis
-
-Tracked-state delta packs repeat `source_commit_id` inside every row locator,
-even though ordinary authored deltas point back to the delta pack's own commit.
-This is duplicated physical layout metadata: the storage key already identifies
-the delta pack commit, and the pack can carry that identity once in its header.
-
-Reference storage layouts avoid repeating page/segment identity in every record
-when a compact local locator can refer to the owning container. For Lix, a
-delta-pack-local `SAME_COMMIT` locator tag should shrink write bytes, scan decode
-bytes, and storage footprint while still preserving full locators for adopted
-cross-commit changes.
-
-### Change
-
-- Bumped tracked-state delta packs from version 1 to version 2 with no backward
-  shim; Lix has not shipped.
-- Delta packs now store `commit_id` once in the pack header.
-- Delta values encode locator source as:
-  - `SAME_COMMIT`: no repeated source commit id, decoded from the pack header.
-  - `FULL`: explicit source commit id for adopted/cross-commit locators.
-- Tree value encoding is unchanged.
-- `storage::load_delta_pack` validates the embedded pack commit id against the
-  storage key before returning entries, so swapped/corrupt packs cannot silently
-  rewrite same-commit locators.
-- Tests cover decoded pack identity plus same-commit and full locator roundtrip.
-
-### Benchmarks
-
-Focused command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
-```
-
-Result: passed.
-
-| row                                                     | after median | criterion status |
-| ------------------------------------------------------- | -----------: | ---------------- |
-| `raw_sqlite/write_root_all_rows/1k`                     |    2.4003 ms | reference |
-| `raw_sqlite/write_delta_10pct_updates/1k`               |    1.2992 ms | reference |
-| `raw_sqlite/write_tombstone_10pct_deletes/1k`           |    1.2201 ms | reference |
-| `raw_sqlite/scan_keys_only/1k`                          |    1.1429 ms | reference |
-| `raw_sqlite/scan_full_rows/1k`                          |    1.1458 ms | reference |
-| `raw_sqlite/prefix_scan_schema_file_null/1k`            |    1.2437 ms | reference |
-| `sqlite/write_root_all_rows/1k`                         |    4.8006 ms | no change, lower median |
-| `sqlite/write_delta_10pct_updates/1k`                   |    2.0113 ms | no change |
-| `sqlite/write_tombstone_10pct_deletes/1k`               |    1.7745 ms | no change, lower median |
-| `sqlite/scan_keys_only/1k`                              |    2.1931 ms | noisy regression |
-| `sqlite/scan_full_rows/1k`                              |    2.6153 ms | no change, lower median |
-| `sqlite/prefix_scan_schema_file_null/1k`                |    3.0283 ms | no change |
-| `rocksdb/write_root_all_rows/1k`                        |    4.5488 ms | no change |
-| `rocksdb/write_delta_10pct_updates/1k`                  |  883.15 µs | no change |
-| `rocksdb/write_tombstone_10pct_deletes/1k`              |  830.45 µs | no change |
-| `rocksdb/scan_keys_only/1k`                             |    1.1580 ms | no change |
-| `rocksdb/scan_full_rows/1k`                             |    1.6353 ms | no change |
-| `rocksdb/prefix_scan_schema_file_null/1k`               |    1.8247 ms | no change |
-
-SQLite scan rerun:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
-```
-
-| row                                      | rerun median | criterion status |
-| ---------------------------------------- | -----------: | ---------------- |
-| `sqlite/scan_keys_only/1k`               |    1.9420 ms | improved |
-| `sqlite/scan_full_rows/1k`               |    2.5912 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k` |    2.6909 ms | no change |
-
-### Storage
-
-Storage command:
-
-```sh
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-```
-
-Result: passed.
-
-1k rows:
-
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 1013336 | 1013.3 | improved |
-| Lix SQLite / after create_version       | 1029816 | 1029.8 | improved |
-| Lix SQLite / after fast-forward merge   | 5230192 | 5230.2 | improved |
-| Lix SQLite / after divergent merge      | 5385840 | 5385.8 | improved |
-| Lix RocksDB / inserted                  | 925304 | 925.3 | improved |
-| Lix RocksDB / after create_version      | 927146 | 927.1 | improved |
-| Lix RocksDB / after fast-forward merge  | 1085778 | 1085.8 | improved |
-| Lix RocksDB / after divergent merge     | 1454922 | 1454.9 | improved |
-
-### Review Loop
-
-Reviewer pass:
-
-```text
-Initial review:
-HIGH: none.
-MEDIUM: none.
-LOW: delta pack embeds commit_id but storage did not check it against the key;
-swapped/corrupt packs could produce wrong SAME_COMMIT locators.
-
-Follow-up review:
-HIGH: none.
-MEDIUM: none.
-LOW: none.
-The LOW is resolved by returning the decoded pack commit id from the codec and
-checking it in storage::load_delta_pack before exposing entries.
-```
-
-### Verification
-
-```sh
-cargo fmt -p lix_engine
-cargo test -p lix_engine tracked_state::codec:: --features storage-benches
-cargo check -p lix_engine --features storage-benches --benches
-cargo test -p lix_engine tracked_state::context:: --features storage-benches
-cargo test -p lix_engine tracked_state::materializer:: --features storage-benches
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
-```
-
-All commands passed.
-
-### Interpretation
-
-```text
-Keep as a physical layout optimization.
-
-Primary axis: storage footprint and delta-pack decode bytes. Timing is mostly
-neutral with lower medians in the hot write rows and a cleaner SQLite keys-only
-rerun. Storage improves on both SQLite and RocksDB for inserted and merge
-states. No backward shim.
-```
-
-## Optimization 20: Stage generated bench roots as authored changes
-
-### Hypothesis
-
-The physical storage benchmark helper for tracked roots was doing an extra
-commit-store index scan to classify generated rows as authored or adopted
-before calling `stage_commit_draft`. That pre-pass does not match the
-production transaction boundary: production staging already separates authored
-rows from adopted rows before entering the commit store.
-
-The helper-generated rows use commit-scoped fresh change ids
-(`tracked_change_id(commit_id, index)`, with a separate fresh append namespace),
-so every `write_tracked_root` row in these benchmark fixtures is authored.
-Staging those rows directly as authored changes keeps commit-store uniqueness
-validation intact while removing a redundant history scan from root/delta write
-measurement.
-
-### Change
-
-- Removed `load_change_index_entries` pre-classification from
-  `storage_bench.rs::write_tracked_root`.
-- Stage all helper-generated changes as authored changes and build tracked
-  deltas by zipping staged authored locators back to the original rows.
-- Kept commit-store validation in `stage_commit_draft`; no storage format
-  change and no validation weakening inside the commit store.
-
-Discarded experiment: a physical `change_id -> locator` commit-store index
-improved RocksDB delta writes but regressed SQLite writes and increased storage
-footprint, so it was reverted before this optimization.
-
-### Benchmarks
-
-Focused command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
-```
-
-Result: passed.
-
-| row                                             | after median | criterion status |
-| ----------------------------------------------- | -----------: | ---------------- |
-| `raw_sqlite/write_root_all_rows/1k`             |    2.4088 ms | reference |
-| `raw_sqlite/write_delta_10pct_updates/1k`       |    1.2788 ms | reference |
-| `raw_sqlite/write_tombstone_10pct_deletes/1k`   |    1.2642 ms | reference |
-| `sqlite/write_root_all_rows/1k`                 |    5.3781 ms | improved |
-| `sqlite/write_delta_10pct_updates/1k`           |    1.9665 ms | improved |
-| `sqlite/write_tombstone_10pct_deletes/1k`       |    1.8551 ms | improved |
-| `rocksdb/write_root_all_rows/1k`                |    4.6757 ms | improved |
-| `rocksdb/write_delta_10pct_updates/1k`          |  911.94 µs | noisy, below pre-index baseline |
-| `rocksdb/write_tombstone_10pct_deletes/1k`      |  893.40 µs | noisy, below pre-index baseline |
-
-Criterion marked RocksDB delta/tombstone as regressions only because the
-abandoned change-index experiment had just updated the local Criterion
-baseline. Compared to Optimization 19, both are lower medians.
-
-### Storage
-
-Storage command:
-
-```sh
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-```
-
-Result: passed.
-
-1k rows:
-
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 1054536 | 1054.5 | unchanged |
-| Lix SQLite / after create_version       | 1071016 | 1071.0 | unchanged |
-| Lix SQLite / after fast-forward merge   | 5279392 | 5279.4 | unchanged |
-| Lix SQLite / after divergent merge      | 5570208 | 5570.2 | unchanged |
-| Lix RocksDB / inserted                  | 964892 | 964.9 | unchanged |
-| Lix RocksDB / after create_version      | 966733 | 966.7 | unchanged |
-| Lix RocksDB / after fast-forward merge  | 1125265 | 1125.3 | unchanged |
-| Lix RocksDB / after divergent merge     | 1494060 | 1494.1 | unchanged |
-
-### Review Loop
-
-Reviewer pass:
-
-```text
-HIGH: none.
-MEDIUM: none.
-LOW: none.
-
-Reviewer confirmed no `write_tracked_root` benchmark path legitimately needs
-adopted changes: row generators use fresh commit-scoped change ids, and the
-append-child helper uses a separate fresh namespace. Ordering and timestamps
-remain preserved by zipping authored locators back to the original rows.
-```
-
-### Verification
-
-```sh
-cargo fmt -p lix_engine
-cargo check -p lix_engine --features storage-benches --benches
-cargo test -p lix_engine commit_store::storage:: --features storage-benches
-cargo test -p lix_engine tracked_state::materializer:: --features storage-benches
-cargo test -p lix_engine transaction::commit:: --features storage-benches
-cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
-```
-
-All commands passed.
-
-### Interpretation
-
-```text
-Keep as a benchmark-path correction and write optimization.
-
-The change removes work that production transaction staging does not do and
-keeps the commit-store validation boundary intact. SQLite delta/tombstone writes
-move under 2 ms in this run; root writes are modestly better but remain above
-the 1.5x target. No storage change, no backward shim.
 ```
 
 ## Optimization 15: Move JSON content hash verification off hot reads
@@ -4581,14 +2488,14 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 Result: passed.
 
-| row                                             | after median | criterion status |
-| ----------------------------------------------- | -----------: | ---------------- |
-| `raw_sqlite/get_many_exact_keys/1k`             |    3.1921 ms | noisy reference |
-| `raw_sqlite/scan_full_rows/1k`                  |    1.8065 ms | noisy reference |
-| `sqlite/get_many_exact_keys/1k`                 |    3.4570 ms | no change, lower median |
-| `sqlite/scan_full_rows/1k`                      |    3.5119 ms | no change, lower median |
-| `rocksdb/get_many_exact_keys/1k`                |    2.3411 ms | improved |
-| `rocksdb/scan_full_rows/1k`                     |    2.1430 ms | improved |
+| row                                 | after median | criterion status        |
+| ----------------------------------- | -----------: | ----------------------- |
+| `raw_sqlite/get_many_exact_keys/1k` |    3.1921 ms | noisy reference         |
+| `raw_sqlite/scan_full_rows/1k`      |    1.8065 ms | noisy reference         |
+| `sqlite/get_many_exact_keys/1k`     |    3.4570 ms | no change, lower median |
+| `sqlite/scan_full_rows/1k`          |    3.5119 ms | no change, lower median |
+| `rocksdb/get_many_exact_keys/1k`    |    2.3411 ms | improved                |
+| `rocksdb/scan_full_rows/1k`         |    2.1430 ms | improved                |
 
 Rerun command:
 
@@ -4598,16 +2505,16 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 Result: passed.
 
-| row                                             | rerun median | criterion status |
-| ----------------------------------------------- | -----------: | ---------------- |
-| `sqlite/get_many_exact_keys/1k`                 |    4.1679 ms | no change, noisy guardrail |
-| `sqlite/scan_full_rows/1k`                      |    3.5295 ms | no change, noisy guardrail |
-| `sqlite/prefix_scan_schema/1k`                  |    3.3561 ms | improved |
-| `sqlite/prefix_scan_schema_file_null/1k`        |    3.7939 ms | no change |
-| `rocksdb/get_many_exact_keys/1k`                |    2.3749 ms | no change, lower than pre-patch |
-| `rocksdb/scan_full_rows/1k`                     |    2.2115 ms | no change, lower than pre-patch |
-| `rocksdb/prefix_scan_schema/1k`                 |    2.0643 ms | improved |
-| `rocksdb/prefix_scan_schema_file_null/1k`       |    2.1547 ms | improved |
+| row                                       | rerun median | criterion status                |
+| ----------------------------------------- | -----------: | ------------------------------- |
+| `sqlite/get_many_exact_keys/1k`           |    4.1679 ms | no change, noisy guardrail      |
+| `sqlite/scan_full_rows/1k`                |    3.5295 ms | no change, noisy guardrail      |
+| `sqlite/prefix_scan_schema/1k`            |    3.3561 ms | improved                        |
+| `sqlite/prefix_scan_schema_file_null/1k`  |    3.7939 ms | no change                       |
+| `rocksdb/get_many_exact_keys/1k`          |    2.3749 ms | no change, lower than pre-patch |
+| `rocksdb/scan_full_rows/1k`               |    2.2115 ms | no change, lower than pre-patch |
+| `rocksdb/prefix_scan_schema/1k`           |    2.0643 ms | improved                        |
+| `rocksdb/prefix_scan_schema_file_null/1k` |    2.1547 ms | improved                        |
 
 ### Storage
 
@@ -4621,17 +2528,17 @@ Result: passed.
 
 1k rows:
 
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 1112216 | 1112.2 | unchanged |
-| Lix SQLite / after create_version       | 1124576 | 1124.6 | unchanged |
-| Lix SQLite / after fast-forward merge   | 5324328 | 5324.3 | unchanged |
-| Lix SQLite / after divergent merge      | 5652176 | 5652.2 | unchanged |
-| Lix RocksDB / inserted                  | 1028557 | 1028.6 | unchanged |
-| Lix RocksDB / after create_version      | 1030457 | 1030.5 | unchanged |
-| Lix RocksDB / after fast-forward merge  | 1195234 | 1195.2 | unchanged |
-| Lix RocksDB / after divergent merge     | 1576587 | 1576.6 | unchanged |
+| row                                    |   bytes | bytes/row | status    |
+| -------------------------------------- | ------: | --------: | --------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference |
+| Lix SQLite / inserted                  | 1112216 |    1112.2 | unchanged |
+| Lix SQLite / after create_version      | 1124576 |    1124.6 | unchanged |
+| Lix SQLite / after fast-forward merge  | 5324328 |    5324.3 | unchanged |
+| Lix SQLite / after divergent merge     | 5652176 |    5652.2 | unchanged |
+| Lix RocksDB / inserted                 | 1028557 |    1028.6 | unchanged |
+| Lix RocksDB / after create_version     | 1030457 |    1030.5 | unchanged |
+| Lix RocksDB / after fast-forward merge | 1195234 |    1195.2 | unchanged |
+| Lix RocksDB / after divergent merge    | 1576587 |    1576.6 | unchanged |
 
 ### Review Loop
 
@@ -4719,16 +2626,16 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 Result: passed.
 
-| row                                             | after median | criterion status |
-| ----------------------------------------------- | -----------: | ---------------- |
-| `sqlite/get_many_exact_keys/1k`                 |    3.5231 ms | no change, noisy guardrail |
-| `sqlite/scan_full_rows/1k`                      |    3.1738 ms | no change |
-| `sqlite/prefix_scan_schema/1k`                  |    3.0404 ms | improved |
-| `sqlite/prefix_scan_schema_file_null/1k`        |    3.4798 ms | no change |
-| `rocksdb/get_many_exact_keys/1k`                |    2.2726 ms | no change |
-| `rocksdb/scan_full_rows/1k`                     |    2.0346 ms | no change |
-| `rocksdb/prefix_scan_schema/1k`                 |    2.1176 ms | no change |
-| `rocksdb/prefix_scan_schema_file_null/1k`       |    2.0395 ms | improved |
+| row                                       | after median | criterion status           |
+| ----------------------------------------- | -----------: | -------------------------- |
+| `sqlite/get_many_exact_keys/1k`           |    3.5231 ms | no change, noisy guardrail |
+| `sqlite/scan_full_rows/1k`                |    3.1738 ms | no change                  |
+| `sqlite/prefix_scan_schema/1k`            |    3.0404 ms | improved                   |
+| `sqlite/prefix_scan_schema_file_null/1k`  |    3.4798 ms | no change                  |
+| `rocksdb/get_many_exact_keys/1k`          |    2.2726 ms | no change                  |
+| `rocksdb/scan_full_rows/1k`               |    2.0346 ms | no change                  |
+| `rocksdb/prefix_scan_schema/1k`           |    2.1176 ms | no change                  |
+| `rocksdb/prefix_scan_schema_file_null/1k` |    2.0395 ms | improved                   |
 
 ### Storage
 
@@ -4742,17 +2649,17 @@ Result: passed.
 
 1k rows:
 
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 1112216 | 1112.2 | unchanged |
-| Lix SQLite / after create_version       | 1124576 | 1124.6 | unchanged |
-| Lix SQLite / after fast-forward merge   | 5324328 | 5324.3 | unchanged |
-| Lix SQLite / after divergent merge      | 5652176 | 5652.2 | unchanged |
-| Lix RocksDB / inserted                  | 1028557 | 1028.6 | unchanged |
-| Lix RocksDB / after create_version      | 1030457 | 1030.5 | unchanged |
-| Lix RocksDB / after fast-forward merge  | 1195234 | 1195.2 | unchanged |
-| Lix RocksDB / after divergent merge     | 1576587 | 1576.6 | unchanged |
+| row                                    |   bytes | bytes/row | status    |
+| -------------------------------------- | ------: | --------: | --------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference |
+| Lix SQLite / inserted                  | 1112216 |    1112.2 | unchanged |
+| Lix SQLite / after create_version      | 1124576 |    1124.6 | unchanged |
+| Lix SQLite / after fast-forward merge  | 5324328 |    5324.3 | unchanged |
+| Lix SQLite / after divergent merge     | 5652176 |    5652.2 | unchanged |
+| Lix RocksDB / inserted                 | 1028557 |    1028.6 | unchanged |
+| Lix RocksDB / after create_version     | 1030457 |    1030.5 | unchanged |
+| Lix RocksDB / after fast-forward merge | 1195234 |    1195.2 | unchanged |
+| Lix RocksDB / after divergent merge    | 1576587 |    1576.6 | unchanged |
 
 ### Review Loop
 
@@ -4831,11 +2738,11 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 Result: passed.
 
-| row                                             | after median | criterion status |
-| ----------------------------------------------- | -----------: | ---------------- |
-| `raw_sqlite/write_root_all_rows/1k`             |    2.3512 ms | reference/no change |
-| `sqlite/write_root_all_rows/1k`                 |    5.5212 ms | no change |
-| `rocksdb/write_root_all_rows/1k`                |    4.6132 ms | no change, lower median |
+| row                                 | after median | criterion status        |
+| ----------------------------------- | -----------: | ----------------------- |
+| `raw_sqlite/write_root_all_rows/1k` |    2.3512 ms | reference/no change     |
+| `sqlite/write_root_all_rows/1k`     |    5.5212 ms | no change               |
+| `rocksdb/write_root_all_rows/1k`    |    4.6132 ms | no change, lower median |
 
 ### Storage
 
@@ -4849,17 +2756,17 @@ Result: passed.
 
 1k rows:
 
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 1112216 | 1112.2 | unchanged |
-| Lix SQLite / after create_version       | 1124576 | 1124.6 | unchanged |
-| Lix SQLite / after fast-forward merge   | 5324328 | 5324.3 | unchanged |
-| Lix SQLite / after divergent merge      | 5652176 | 5652.2 | unchanged |
-| Lix RocksDB / inserted                  | 1028557 | 1028.6 | unchanged |
-| Lix RocksDB / after create_version      | 1030457 | 1030.5 | unchanged |
-| Lix RocksDB / after fast-forward merge  | 1195234 | 1195.2 | unchanged |
-| Lix RocksDB / after divergent merge     | 1576587 | 1576.6 | unchanged |
+| row                                    |   bytes | bytes/row | status    |
+| -------------------------------------- | ------: | --------: | --------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference |
+| Lix SQLite / inserted                  | 1112216 |    1112.2 | unchanged |
+| Lix SQLite / after create_version      | 1124576 |    1124.6 | unchanged |
+| Lix SQLite / after fast-forward merge  | 5324328 |    5324.3 | unchanged |
+| Lix SQLite / after divergent merge     | 5652176 |    5652.2 | unchanged |
+| Lix RocksDB / inserted                 | 1028557 |    1028.6 | unchanged |
+| Lix RocksDB / after create_version     | 1030457 |    1030.5 | unchanged |
+| Lix RocksDB / after fast-forward merge | 1195234 |    1195.2 | unchanged |
+| Lix RocksDB / after divergent merge    | 1576587 |    1576.6 | unchanged |
 
 ### Review Loop
 
@@ -4943,20 +2850,20 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 Result: passed.
 
-| row                                             | after median | criterion status |
-| ----------------------------------------------- | -----------: | ---------------- |
-| `raw_sqlite/get_many_exact_keys/1k`             |    2.0223 ms | reference/no change |
-| `raw_sqlite/scan_full_rows/1k`                  |    1.1436 ms | reference/no change |
-| `raw_sqlite/prefix_scan_schema/1k`              |    1.2741 ms | reference/no change |
-| `raw_sqlite/prefix_scan_schema_file_null/1k`    |    1.1876 ms | reference/no change |
-| `sqlite/get_many_exact_keys/1k`                 |    3.3477 ms | no change |
-| `sqlite/scan_full_rows/1k`                      |    3.0526 ms | no change, lower median |
-| `sqlite/prefix_scan_schema/1k`                  |    3.1708 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k`        |    3.1284 ms | no change |
-| `rocksdb/get_many_exact_keys/1k`                |    2.3137 ms | noisy guardrail |
-| `rocksdb/scan_full_rows/1k`                     |    2.0583 ms | no change |
-| `rocksdb/prefix_scan_schema/1k`                 |    2.0680 ms | no change |
-| `rocksdb/prefix_scan_schema_file_null/1k`       |    2.0187 ms | no change |
+| row                                          | after median | criterion status        |
+| -------------------------------------------- | -----------: | ----------------------- |
+| `raw_sqlite/get_many_exact_keys/1k`          |    2.0223 ms | reference/no change     |
+| `raw_sqlite/scan_full_rows/1k`               |    1.1436 ms | reference/no change     |
+| `raw_sqlite/prefix_scan_schema/1k`           |    1.2741 ms | reference/no change     |
+| `raw_sqlite/prefix_scan_schema_file_null/1k` |    1.1876 ms | reference/no change     |
+| `sqlite/get_many_exact_keys/1k`              |    3.3477 ms | no change               |
+| `sqlite/scan_full_rows/1k`                   |    3.0526 ms | no change, lower median |
+| `sqlite/prefix_scan_schema/1k`               |    3.1708 ms | no change               |
+| `sqlite/prefix_scan_schema_file_null/1k`     |    3.1284 ms | no change               |
+| `rocksdb/get_many_exact_keys/1k`             |    2.3137 ms | noisy guardrail         |
+| `rocksdb/scan_full_rows/1k`                  |    2.0583 ms | no change               |
+| `rocksdb/prefix_scan_schema/1k`              |    2.0680 ms | no change               |
+| `rocksdb/prefix_scan_schema_file_null/1k`    |    2.0187 ms | no change               |
 
 Single-pass rerun command:
 
@@ -4966,16 +2873,16 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 Result: passed.
 
-| row                                             | rerun median | criterion status |
-| ----------------------------------------------- | -----------: | ---------------- |
-| `sqlite/get_many_exact_keys/1k`                 |    3.2251 ms | no change |
-| `sqlite/scan_full_rows/1k`                      |    3.1249 ms | no change |
-| `sqlite/prefix_scan_schema/1k`                  |    3.0630 ms | no change |
-| `sqlite/prefix_scan_schema_file_null/1k`        |    3.1658 ms | no change |
-| `rocksdb/get_many_exact_keys/1k`                |    2.3087 ms | no change |
-| `rocksdb/scan_full_rows/1k`                     |    2.0001 ms | no change, lower median |
-| `rocksdb/prefix_scan_schema/1k`                 |    1.9933 ms | no change, lower median |
-| `rocksdb/prefix_scan_schema_file_null/1k`       |    1.9861 ms | no change, lower median |
+| row                                       | rerun median | criterion status        |
+| ----------------------------------------- | -----------: | ----------------------- |
+| `sqlite/get_many_exact_keys/1k`           |    3.2251 ms | no change               |
+| `sqlite/scan_full_rows/1k`                |    3.1249 ms | no change               |
+| `sqlite/prefix_scan_schema/1k`            |    3.0630 ms | no change               |
+| `sqlite/prefix_scan_schema_file_null/1k`  |    3.1658 ms | no change               |
+| `rocksdb/get_many_exact_keys/1k`          |    2.3087 ms | no change               |
+| `rocksdb/scan_full_rows/1k`               |    2.0001 ms | no change, lower median |
+| `rocksdb/prefix_scan_schema/1k`           |    1.9933 ms | no change, lower median |
+| `rocksdb/prefix_scan_schema_file_null/1k` |    1.9861 ms | no change, lower median |
 
 ### Storage
 
@@ -4989,17 +2896,17 @@ Result: passed.
 
 1k rows:
 
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 1112216 | 1112.2 | unchanged |
-| Lix SQLite / after create_version       | 1124576 | 1124.6 | unchanged |
-| Lix SQLite / after fast-forward merge   | 5303776 | 5303.8 | page-level noise |
-| Lix SQLite / after divergent merge      | 5479976 | 5480.0 | page-level noise |
-| Lix RocksDB / inserted                  | 1028557 | 1028.6 | unchanged |
-| Lix RocksDB / after create_version      | 1030457 | 1030.5 | unchanged |
-| Lix RocksDB / after fast-forward merge  | 1195234 | 1195.2 | unchanged |
-| Lix RocksDB / after divergent merge     | 1576585 | 1576.6 | unchanged |
+| row                                    |   bytes | bytes/row | status           |
+| -------------------------------------- | ------: | --------: | ---------------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference        |
+| Lix SQLite / inserted                  | 1112216 |    1112.2 | unchanged        |
+| Lix SQLite / after create_version      | 1124576 |    1124.6 | unchanged        |
+| Lix SQLite / after fast-forward merge  | 5303776 |    5303.8 | page-level noise |
+| Lix SQLite / after divergent merge     | 5479976 |    5480.0 | page-level noise |
+| Lix RocksDB / inserted                 | 1028557 |    1028.6 | unchanged        |
+| Lix RocksDB / after create_version     | 1030457 |    1030.5 | unchanged        |
+| Lix RocksDB / after fast-forward merge | 1195234 |    1195.2 | unchanged        |
+| Lix RocksDB / after divergent merge    | 1576585 |    1576.6 | unchanged        |
 
 ### Review Loop
 
@@ -5095,8 +3002,8 @@ cargo bench -p lix_engine --features storage-benches --bench storage -- 'storage
 
 Result: passed.
 
-| row                                      | after median |
-| ---------------------------------------- | -----------: |
+| row                                          | after median |
+| -------------------------------------------- | -----------: |
 | `storage/changelog/encode_only/full_row/10k` |    2.6886 ms |
 | `storage/changelog/decode_only/full_row/10k` |    2.7384 ms |
 
@@ -5108,17 +3015,17 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 Result: passed.
 
-| row                                             | after median | criterion status |
-| ----------------------------------------------- | -----------: | ---------------- |
-| `raw_sqlite/write_root_all_rows/1k`             |    2.4888 ms | reference/no change |
-| `raw_sqlite/write_delta_10pct_updates/1k`       |    1.2667 ms | reference/no change |
-| `raw_sqlite/write_tombstone_10pct_deletes/1k`   |    1.1804 ms | noisy reference |
-| `sqlite/write_root_all_rows/1k`                 |    5.0831 ms | no change, lower median |
-| `sqlite/write_delta_10pct_updates/1k`           |    2.2437 ms | improved |
-| `sqlite/write_tombstone_10pct_deletes/1k`       |    2.0885 ms | improved |
-| `rocksdb/write_root_all_rows/1k`                |    4.5929 ms | no change, lower median |
-| `rocksdb/write_delta_10pct_updates/1k`          |    1.1566 ms | no change, lower median |
-| `rocksdb/write_tombstone_10pct_deletes/1k`      |    1.1288 ms | improved |
+| row                                           | after median | criterion status        |
+| --------------------------------------------- | -----------: | ----------------------- |
+| `raw_sqlite/write_root_all_rows/1k`           |    2.4888 ms | reference/no change     |
+| `raw_sqlite/write_delta_10pct_updates/1k`     |    1.2667 ms | reference/no change     |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k` |    1.1804 ms | noisy reference         |
+| `sqlite/write_root_all_rows/1k`               |    5.0831 ms | no change, lower median |
+| `sqlite/write_delta_10pct_updates/1k`         |    2.2437 ms | improved                |
+| `sqlite/write_tombstone_10pct_deletes/1k`     |    2.0885 ms | improved                |
+| `rocksdb/write_root_all_rows/1k`              |    4.5929 ms | no change, lower median |
+| `rocksdb/write_delta_10pct_updates/1k`        |    1.1566 ms | no change, lower median |
+| `rocksdb/write_tombstone_10pct_deletes/1k`    |    1.1288 ms | improved                |
 
 ### Storage
 
@@ -5132,17 +3039,17 @@ Result: passed.
 
 1k rows:
 
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 1054536 | 1054.5 | improved |
-| Lix SQLite / after create_version       | 1071016 | 1071.0 | improved |
-| Lix SQLite / after fast-forward merge   | 5279368 | 5279.4 | improved |
-| Lix SQLite / after divergent merge      | 5430920 | 5430.9 | improved |
-| Lix RocksDB / inserted                  | 964892 | 964.9 | improved |
-| Lix RocksDB / after create_version      | 966733 | 966.7 | improved |
-| Lix RocksDB / after fast-forward merge  | 1125265 | 1125.3 | improved |
-| Lix RocksDB / after divergent merge     | 1494060 | 1494.1 | improved |
+| row                                    |   bytes | bytes/row | status    |
+| -------------------------------------- | ------: | --------: | --------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference |
+| Lix SQLite / inserted                  | 1054536 |    1054.5 | improved  |
+| Lix SQLite / after create_version      | 1071016 |    1071.0 | improved  |
+| Lix SQLite / after fast-forward merge  | 5279368 |    5279.4 | improved  |
+| Lix SQLite / after divergent merge     | 5430920 |    5430.9 | improved  |
+| Lix RocksDB / inserted                 |  964892 |     964.9 | improved  |
+| Lix RocksDB / after create_version     |  966733 |     966.7 | improved  |
+| Lix RocksDB / after fast-forward merge | 1125265 |    1125.3 | improved  |
+| Lix RocksDB / after divergent merge    | 1494060 |    1494.1 | improved  |
 
 ### Review Loop
 
@@ -5204,32 +3111,35 @@ RocksDB because each change row carries less codec overhead.
 No storage compatibility shim. No benchmark measurement change.
 ```
 
-## Optimization 14: Reuse trusted JSON refs during payload staging
+## Optimization 20: Stage generated bench roots as authored changes
 
-Date: 2026-05-11
+### Hypothesis
 
-Commit: this entry is committed with the optimization
+The physical storage benchmark helper for tracked roots was doing an extra
+commit-store index scan to classify generated rows as authored or adopted
+before calling `stage_commit_draft`. That pre-pass does not match the
+production transaction boundary: production staging already separates authored
+rows from adopted rows before entering the commit store.
+
+The helper-generated rows use commit-scoped fresh change ids
+(`tracked_change_id(commit_id, index)`, with a separate fresh append namespace),
+so every `write_tracked_root` row in these benchmark fixtures is authored.
+Staging those rows directly as authored changes keeps commit-store uniqueness
+validation intact while removing a redundant history scan from root/delta write
+measurement.
 
 ### Change
 
-Threaded precomputed JSON refs through JSON-store staging for callers that
-already own the normalized JSON/ref invariant:
+- Removed `load_change_index_entries` pre-classification from
+  `storage_bench.rs::write_tracked_root`.
+- Stage all helper-generated changes as authored changes and build tracked
+  deltas by zipping staged authored locators back to the original rows.
+- Kept commit-store validation in `stage_commit_draft`; no storage format
+  change and no validation weakening inside the commit store.
 
-- `NormalizedJsonRef` now has private fields and two constructors:
-  `new(normalized)` for ordinary callers and
-  `trusted_prehashed(normalized, json_ref)` for the explicit trusted path.
-- `JsonStoreWriter::stage_batch` uses the supplied trusted ref to encode JSON
-  without hashing the payload again, falling back to the existing hashing path
-  for normal callers.
-- Transaction commit passes `StageJson` refs for snapshot/metadata payloads.
-  `StageJson` computes the ref from the same normalized string during
-  transaction staging.
-- The physical storage benchmark root writer pairs payload strings with refs
-  from the already-built `Change` records so the benchmark no longer pays the
-  same duplicate hash.
-
-Added direct JSON-store coverage for staging a trusted prehashed commit-pack
-payload, verifying the returned ref and hydrated bytes.
+Discarded experiment: a physical `change_id -> locator` commit-store index
+improved RocksDB delta writes but regressed SQLite writes and increased storage
+footprint, so it was reverted before this optimization.
 
 ### Benchmarks
 
@@ -5241,34 +3151,21 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 Result: passed.
 
-| row                                             | after median | criterion status |
-| ----------------------------------------------- | -----------: | ---------------- |
-| `raw_sqlite/write_root_all_rows/1k`             |    2.3853 ms | reference |
-| `raw_sqlite/write_delta_10pct_updates/1k`       |    1.2667 ms | reference |
-| `raw_sqlite/write_tombstone_10pct_deletes/1k`   |    1.2330 ms | reference |
-| `sqlite/write_root_all_rows/1k`                 |    5.4166 ms | improved |
-| `sqlite/write_delta_10pct_updates/1k`           |    2.5490 ms | no change |
-| `sqlite/write_tombstone_10pct_deletes/1k`       |    2.6059 ms | improved |
-| `rocksdb/write_root_all_rows/1k`                |    4.8746 ms | improved |
-| `rocksdb/write_delta_10pct_updates/1k`          |    1.2758 ms | no change |
-| `rocksdb/write_tombstone_10pct_deletes/1k`      |    1.2795 ms | noisy guardrail |
+| row                                           | after median | criterion status                |
+| --------------------------------------------- | -----------: | ------------------------------- |
+| `raw_sqlite/write_root_all_rows/1k`           |    2.4088 ms | reference                       |
+| `raw_sqlite/write_delta_10pct_updates/1k`     |    1.2788 ms | reference                       |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k` |    1.2642 ms | reference                       |
+| `sqlite/write_root_all_rows/1k`               |    5.3781 ms | improved                        |
+| `sqlite/write_delta_10pct_updates/1k`         |    1.9665 ms | improved                        |
+| `sqlite/write_tombstone_10pct_deletes/1k`     |    1.8551 ms | improved                        |
+| `rocksdb/write_root_all_rows/1k`              |    4.6757 ms | improved                        |
+| `rocksdb/write_delta_10pct_updates/1k`        |    911.94 µs | noisy, below pre-index baseline |
+| `rocksdb/write_tombstone_10pct_deletes/1k`    |    893.40 µs | noisy, below pre-index baseline |
 
-Rerun command:
-
-```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
-```
-
-Result: passed.
-
-| row                                             | rerun median | criterion status |
-| ----------------------------------------------- | -----------: | ---------------- |
-| `sqlite/write_root_all_rows/1k`                 |    5.3105 ms | no change, lower median |
-| `sqlite/write_delta_10pct_updates/1k`           |    2.5652 ms | no change |
-| `sqlite/write_tombstone_10pct_deletes/1k`       |    2.4195 ms | no change |
-| `rocksdb/write_root_all_rows/1k`                |    4.7479 ms | no change, lower median |
-| `rocksdb/write_delta_10pct_updates/1k`          |    1.2128 ms | no change |
-| `rocksdb/write_tombstone_10pct_deletes/1k`      |    1.2283 ms | improved |
+Criterion marked RocksDB delta/tombstone as regressions only because the
+abandoned change-index experiment had just updated the local Criterion
+baseline. Compared to Optimization 19, both are lower medians.
 
 ### Storage
 
@@ -5282,17 +3179,517 @@ Result: passed.
 
 1k rows:
 
-| row                                     | bytes | bytes/row | status |
-| --------------------------------------- | ----: | --------: | ------ |
-| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
-| Lix SQLite / inserted                   | 1112216 | 1112.2 | unchanged |
-| Lix SQLite / after create_version       | 1124576 | 1124.6 | unchanged |
-| Lix SQLite / after fast-forward merge   | 5324328 | 5324.3 | unchanged |
-| Lix SQLite / after divergent merge      | 5652176 | 5652.2 | unchanged |
-| Lix RocksDB / inserted                  | 1028557 | 1028.6 | unchanged |
-| Lix RocksDB / after create_version      | 1030457 | 1030.5 | unchanged |
-| Lix RocksDB / after fast-forward merge  | 1195234 | 1195.2 | unchanged |
-| Lix RocksDB / after divergent merge     | 1576587 | 1576.6 | unchanged |
+| row                                    |   bytes | bytes/row | status    |
+| -------------------------------------- | ------: | --------: | --------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference |
+| Lix SQLite / inserted                  | 1054536 |    1054.5 | unchanged |
+| Lix SQLite / after create_version      | 1071016 |    1071.0 | unchanged |
+| Lix SQLite / after fast-forward merge  | 5279392 |    5279.4 | unchanged |
+| Lix SQLite / after divergent merge     | 5570208 |    5570.2 | unchanged |
+| Lix RocksDB / inserted                 |  964892 |     964.9 | unchanged |
+| Lix RocksDB / after create_version     |  966733 |     966.7 | unchanged |
+| Lix RocksDB / after fast-forward merge | 1125265 |    1125.3 | unchanged |
+| Lix RocksDB / after divergent merge    | 1494060 |    1494.1 | unchanged |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+Reviewer confirmed no `write_tracked_root` benchmark path legitimately needs
+adopted changes: row generators use fresh commit-scoped change ids, and the
+append-child helper uses a separate fresh namespace. Ordering and timestamps
+remain preserved by zipping authored locators back to the original rows.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine commit_store::storage:: --features storage-benches
+cargo test -p lix_engine tracked_state::materializer:: --features storage-benches
+cargo test -p lix_engine transaction::commit:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a benchmark-path correction and write optimization.
+
+The change removes work that production transaction staging does not do and
+keeps the commit-store validation boundary intact. SQLite delta/tombstone writes
+move under 2 ms in this run; root writes are modestly better but remain above
+the 1.5x target. No storage change, no backward shim.
+```
+
+## Optimization 21: Load scan roots once
+
+### Hypothesis
+
+`TrackedStateStoreReader::scan_rows_at_commit` was using
+`projection_has_pending_deltas` as a routing check before scan execution. For
+delta-pack-backed commits that helper walked the first-parent/delta chain, then
+`projection_entries_at_commit` walked it again to produce rows. For materialized
+root commits, the route also checked root existence and then loaded the same
+root again before scanning.
+
+Loading the target root once at scan entry should preserve the same routing:
+scan the root directly when it exists; otherwise let `projection_entries_at_commit`
+perform the delta/base walk exactly once.
+
+### Change
+
+- `scan_rows_at_commit` now calls `tree.load_root(commit_id)` once.
+- If a root exists, scan it directly, preserving the by-file index fast path and
+  fallback to the primary tree when no by-file root exists.
+- If no root exists, call `projection_entries_at_commit` directly.
+- Tombstone filtering, materialization, and request limit handling remain after
+  row collection as before.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                          | after median | criterion status |
+| -------------------------------------------- | -----------: | ---------------- |
+| `raw_sqlite/scan_keys_only/1k`               |    1.1587 ms | reference        |
+| `raw_sqlite/scan_headers_only/1k`            |    1.1213 ms | reference        |
+| `raw_sqlite/scan_full_rows/1k`               |    1.2689 ms | reference        |
+| `raw_sqlite/prefix_scan_schema/1k`           |    1.1597 ms | reference        |
+| `raw_sqlite/prefix_scan_schema_file_null/1k` |    1.1929 ms | reference        |
+| `sqlite/scan_keys_only/1k`                   |    2.1147 ms | improved         |
+| `sqlite/scan_headers_only/1k`                |    2.7995 ms | no change        |
+| `sqlite/scan_full_rows/1k`                   |    2.8024 ms | improved         |
+| `sqlite/prefix_scan_schema/1k`               |    2.7534 ms | improved         |
+| `sqlite/prefix_scan_schema_file_null/1k`     |    2.7506 ms | improved         |
+| `rocksdb/scan_keys_only/1k`                  |    1.2154 ms | improved         |
+| `rocksdb/scan_headers_only/1k`               |    1.2315 ms | improved         |
+| `rocksdb/scan_full_rows/1k`                  |    1.7649 ms | improved         |
+| `rocksdb/prefix_scan_schema/1k`              |    1.7814 ms | improved         |
+| `rocksdb/prefix_scan_schema_file_null/1k`    |    1.8046 ms | improved         |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                    |   bytes | bytes/row | status    |
+| -------------------------------------- | ------: | --------: | --------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference |
+| Lix SQLite / inserted                  | 1054536 |    1054.5 | unchanged |
+| Lix SQLite / after create_version      | 1071016 |    1071.0 | unchanged |
+| Lix SQLite / after fast-forward merge  | 5279368 |    5279.4 | unchanged |
+| Lix SQLite / after divergent merge     | 5463856 |    5463.9 | unchanged |
+| Lix RocksDB / inserted                 |  964892 |     964.9 | unchanged |
+| Lix RocksDB / after create_version     |  966733 |     966.7 | unchanged |
+| Lix RocksDB / after fast-forward merge | 1125265 |    1125.3 | unchanged |
+| Lix RocksDB / after divergent merge    | 1494068 |    1494.1 | unchanged |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+Reviewer confirmed the root-first routing is equivalent: the old pending-delta
+predicate already stopped immediately when the target commit had a root, while
+delta-only and missing commits still go through the same projection/delta walk.
+By-file fallback, tombstone filtering, and limit behavior are preserved.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine tracked_state::context:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state::materializer:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a scan-path optimization.
+
+This removes duplicated route-discovery reads without changing storage or scan
+semantics. It improves most SQLite and RocksDB tracked scan rows, but SQLite
+full/prefix scans remain above the 1.5x target and need deeper tree/materialize
+work next.
+```
+
+## Optimization 22: Fast-path single delta-pack scans
+
+### Hypothesis
+
+The JSON-pointer tracked scan fixtures usually read a commit with no materialized
+projection root and exactly one tracked-state delta pack. The general overlay
+path inserts those delta entries into a `BTreeMap` and then collects the map
+back into sorted rows. For the single-pack/no-base case, that map is only doing
+three things: key filtering, sorted order, and duplicate-key last-write-wins
+collapse.
+
+A direct vector path can preserve those semantics with less per-row map work.
+
+### Change
+
+- Added `single_delta_pack_entries` for the `base_commit_id == None` and
+  `delta_commit_ids.len() == 1` case.
+- The fast path:
+  - filters with the same `request.matches_key` predicate as the existing
+    overlay path;
+  - sorts by `(TrackedStateKey, original ordinal)`;
+  - collapses duplicate keys by keeping the last ordinal;
+  - skips final tombstones when `include_tombstones` is false.
+- Added coverage for duplicate-key and tombstone behavior in a single delta
+  pack.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                          | after median | criterion status |
+| -------------------------------------------- | -----------: | ---------------- |
+| `raw_sqlite/scan_keys_only/1k`               |    1.1288 ms | reference        |
+| `raw_sqlite/scan_headers_only/1k`            |    1.1685 ms | reference        |
+| `raw_sqlite/scan_full_rows/1k`               |    1.1922 ms | reference        |
+| `raw_sqlite/prefix_scan_schema/1k`           |    1.2255 ms | reference        |
+| `raw_sqlite/prefix_scan_schema_file_null/1k` |    1.7144 ms | reference/noisy  |
+| `sqlite/scan_keys_only/1k`                   |    2.3765 ms | noisy regression |
+| `sqlite/scan_headers_only/1k`                |    2.2331 ms | improved         |
+| `sqlite/scan_full_rows/1k`                   |    2.6767 ms | within noise     |
+| `sqlite/prefix_scan_schema/1k`               |    2.7255 ms | no change        |
+| `sqlite/prefix_scan_schema_file_null/1k`     |    2.7038 ms | no change        |
+| `rocksdb/scan_keys_only/1k`                  |    1.2053 ms | no change        |
+| `rocksdb/scan_headers_only/1k`               |    1.1988 ms | improved         |
+| `rocksdb/scan_full_rows/1k`                  |    1.6527 ms | improved         |
+| `rocksdb/prefix_scan_schema/1k`              |    1.6875 ms | improved         |
+| `rocksdb/prefix_scan_schema_file_null/1k`    |    1.6230 ms | improved         |
+
+SQLite rerun:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+| row                                      | rerun median | criterion status |
+| ---------------------------------------- | -----------: | ---------------- |
+| `sqlite/scan_keys_only/1k`               |    2.0399 ms | improved         |
+| `sqlite/scan_headers_only/1k`            |    2.1180 ms | no change        |
+| `sqlite/scan_full_rows/1k`               |    2.8050 ms | no change        |
+| `sqlite/prefix_scan_schema/1k`           |    2.7217 ms | no change        |
+| `sqlite/prefix_scan_schema_file_null/1k` |    2.6412 ms | no change        |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                    |   bytes | bytes/row | status    |
+| -------------------------------------- | ------: | --------: | --------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference |
+| Lix SQLite / inserted                  | 1054536 |    1054.5 | unchanged |
+| Lix SQLite / after create_version      | 1071016 |    1071.0 | unchanged |
+| Lix SQLite / after fast-forward merge  | 5279392 |    5279.4 | unchanged |
+| Lix SQLite / after divergent merge     | 5586736 |    5586.7 | unchanged |
+| Lix RocksDB / inserted                 |  964892 |     964.9 | unchanged |
+| Lix RocksDB / after create_version     |  966733 |     966.7 | unchanged |
+| Lix RocksDB / after fast-forward merge | 1125265 |    1125.3 | unchanged |
+| Lix RocksDB / after divergent merge    | 1494068 |    1494.1 | unchanged |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+Reviewer confirmed the fast path matches the old BTreeMap overlay semantics:
+same key-only filtering, sorted key order, last duplicate wins, final tombstone
+removal when tombstones are excluded, and limits remain above materialization.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine tracked_state::context:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state::materializer:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a narrow delta-pack scan optimization.
+
+The best movement is headers/full rows and RocksDB scans; SQLite full/prefix
+rows remain mostly around the same medians as Optimization 21, with keys-only
+improving on rerun. No storage change.
+```
+
+## Optimization 23: Encode delta packs directly into the output buffer
+
+### Hypothesis
+
+`encode_delta_pack_refs` still allocated a temporary encoded key `Vec` and
+temporary encoded value `Vec` for every tracked delta, only to copy both into
+the delta pack as length-prefixed sections. Reference storage systems avoid
+per-row temporary records on hot write paths when the final output buffer can be
+written directly.
+
+Writing each key/value section directly into the pack and backpatching the
+section length should preserve the binary format while removing per-delta
+allocation/copy work.
+
+### Change
+
+- Split `encode_key_ref` and `encode_value_ref` into allocation-returning public
+  helpers plus private `append_key_ref` / `append_value_ref` buffer writers.
+- Changed `encode_delta_pack_refs` to write key/value sections directly via
+  `push_sized_section`.
+- `decode_delta_pack` is unchanged; the encoded wire shape remains
+  length-prefixed key bytes followed by length-prefixed value bytes.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+Result: passed.
+
+| row                                           | after median | criterion status        |
+| --------------------------------------------- | -----------: | ----------------------- |
+| `raw_sqlite/write_root_all_rows/1k`           |    2.4262 ms | reference               |
+| `raw_sqlite/write_delta_10pct_updates/1k`     |    1.3524 ms | reference               |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k` |    1.2769 ms | reference               |
+| `sqlite/write_root_all_rows/1k`               |    4.9586 ms | no change, lower median |
+| `sqlite/write_delta_10pct_updates/1k`         |    1.9208 ms | no change               |
+| `sqlite/write_tombstone_10pct_deletes/1k`     |    2.0990 ms | noisy regression        |
+| `rocksdb/write_root_all_rows/1k`              |    4.2122 ms | no change, lower median |
+| `rocksdb/write_delta_10pct_updates/1k`        |    880.26 µs | no change               |
+| `rocksdb/write_tombstone_10pct_deletes/1k`    |    836.97 µs | no change, lower median |
+
+SQLite rerun:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+| row                                       | rerun median | criterion status |
+| ----------------------------------------- | -----------: | ---------------- |
+| `sqlite/write_root_all_rows/1k`           |    5.0104 ms | no change        |
+| `sqlite/write_delta_10pct_updates/1k`     |    1.9488 ms | no change        |
+| `sqlite/write_tombstone_10pct_deletes/1k` |    1.7955 ms | improved         |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                    |   bytes | bytes/row | status    |
+| -------------------------------------- | ------: | --------: | --------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference |
+| Lix SQLite / inserted                  | 1054536 |    1054.5 | unchanged |
+| Lix SQLite / after create_version      | 1071016 |    1071.0 | unchanged |
+| Lix SQLite / after fast-forward merge  | 5279368 |    5279.4 | unchanged |
+| Lix SQLite / after divergent merge     | 5430920 |    5430.9 | unchanged |
+| Lix RocksDB / inserted                 |  964892 |     964.9 | unchanged |
+| Lix RocksDB / after create_version     |  966733 |     966.7 | unchanged |
+| Lix RocksDB / after fast-forward merge | 1125265 |    1125.3 | unchanged |
+| Lix RocksDB / after divergent merge    | 1494068 |    1494.1 | unchanged |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+Reviewer confirmed the binary shape is compatible: the append helpers preserve
+field order and primitive encoders, while `push_sized_section` backpatches the
+same four-byte length consumed by `decode_delta_pack`.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine tracked_state::codec:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state::context:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a write-path allocation cleanup.
+
+This is a structural writer improvement with neutral-to-better medians on rerun
+and no storage format change. It does not close the remaining root-write gap by
+itself.
+```
+
+## Optimization 24: Compact same-commit delta locators
+
+### Hypothesis
+
+Tracked-state delta packs repeat `source_commit_id` inside every row locator,
+even though ordinary authored deltas point back to the delta pack's own commit.
+This is duplicated physical layout metadata: the storage key already identifies
+the delta pack commit, and the pack can carry that identity once in its header.
+
+Reference storage layouts avoid repeating page/segment identity in every record
+when a compact local locator can refer to the owning container. For Lix, a
+delta-pack-local `SAME_COMMIT` locator tag should shrink write bytes, scan decode
+bytes, and storage footprint while still preserving full locators for adopted
+cross-commit changes.
+
+### Change
+
+- Bumped tracked-state delta packs from version 1 to version 2 with no backward
+  shim; Lix has not shipped.
+- Delta packs now store `commit_id` once in the pack header.
+- Delta values encode locator source as:
+  - `SAME_COMMIT`: no repeated source commit id, decoded from the pack header.
+  - `FULL`: explicit source commit id for adopted/cross-commit locators.
+- Tree value encoding is unchanged.
+- `storage::load_delta_pack` validates the embedded pack commit id against the
+  storage key before returning entries, so swapped/corrupt packs cannot silently
+  rewrite same-commit locators.
+- Tests cover decoded pack identity plus same-commit and full locator roundtrip.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                           | after median | criterion status        |
+| --------------------------------------------- | -----------: | ----------------------- |
+| `raw_sqlite/write_root_all_rows/1k`           |    2.4003 ms | reference               |
+| `raw_sqlite/write_delta_10pct_updates/1k`     |    1.2992 ms | reference               |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k` |    1.2201 ms | reference               |
+| `raw_sqlite/scan_keys_only/1k`                |    1.1429 ms | reference               |
+| `raw_sqlite/scan_full_rows/1k`                |    1.1458 ms | reference               |
+| `raw_sqlite/prefix_scan_schema_file_null/1k`  |    1.2437 ms | reference               |
+| `sqlite/write_root_all_rows/1k`               |    4.8006 ms | no change, lower median |
+| `sqlite/write_delta_10pct_updates/1k`         |    2.0113 ms | no change               |
+| `sqlite/write_tombstone_10pct_deletes/1k`     |    1.7745 ms | no change, lower median |
+| `sqlite/scan_keys_only/1k`                    |    2.1931 ms | noisy regression        |
+| `sqlite/scan_full_rows/1k`                    |    2.6153 ms | no change, lower median |
+| `sqlite/prefix_scan_schema_file_null/1k`      |    3.0283 ms | no change               |
+| `rocksdb/write_root_all_rows/1k`              |    4.5488 ms | no change               |
+| `rocksdb/write_delta_10pct_updates/1k`        |    883.15 µs | no change               |
+| `rocksdb/write_tombstone_10pct_deletes/1k`    |    830.45 µs | no change               |
+| `rocksdb/scan_keys_only/1k`                   |    1.1580 ms | no change               |
+| `rocksdb/scan_full_rows/1k`                   |    1.6353 ms | no change               |
+| `rocksdb/prefix_scan_schema_file_null/1k`     |    1.8247 ms | no change               |
+
+SQLite scan rerun:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+| row                                      | rerun median | criterion status |
+| ---------------------------------------- | -----------: | ---------------- |
+| `sqlite/scan_keys_only/1k`               |    1.9420 ms | improved         |
+| `sqlite/scan_full_rows/1k`               |    2.5912 ms | no change        |
+| `sqlite/prefix_scan_schema_file_null/1k` |    2.6909 ms | no change        |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                    |   bytes | bytes/row | status    |
+| -------------------------------------- | ------: | --------: | --------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference |
+| Lix SQLite / inserted                  | 1013336 |    1013.3 | improved  |
+| Lix SQLite / after create_version      | 1029816 |    1029.8 | improved  |
+| Lix SQLite / after fast-forward merge  | 5230192 |    5230.2 | improved  |
+| Lix SQLite / after divergent merge     | 5385840 |    5385.8 | improved  |
+| Lix RocksDB / inserted                 |  925304 |     925.3 | improved  |
+| Lix RocksDB / after create_version     |  927146 |     927.1 | improved  |
+| Lix RocksDB / after fast-forward merge | 1085778 |    1085.8 | improved  |
+| Lix RocksDB / after divergent merge    | 1454922 |    1454.9 | improved  |
 
 ### Review Loop
 
@@ -5301,28 +3698,1385 @@ Reviewer pass:
 ```text
 Initial review:
 HIGH: none.
-MEDIUM: supplied-ref path was correctness-critical but only protected by
-debug_assert; make the trusted prehashed path harder to construct accidentally.
-LOW: add direct json-store coverage and avoid pretending init eliminates a hash.
+MEDIUM: none.
+LOW: delta pack embeds commit_id but storage did not check it against the key;
+swapped/corrupt packs could produce wrong SAME_COMMIT locators.
 
 Follow-up review:
 HIGH: none.
 MEDIUM: none.
 LOW: none.
-The prior MEDIUM is resolved by private NormalizedJsonRef fields plus explicit
-new/trusted_prehashed constructors. The intended production caller passes
-StageJson normalized bytes and the ref computed from those same bytes.
+The LOW is resolved by returning the decoded pack commit id from the codec and
+checking it in storage::load_delta_pack before exposing entries.
 ```
 
 ### Verification
 
 ```sh
 cargo fmt -p lix_engine
-cargo test -p lix_engine json_store:: --features storage-benches
+cargo test -p lix_engine tracked_state::codec:: --features storage-benches
 cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state::context:: --features storage-benches
+cargo test -p lix_engine tracked_state::materializer:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a physical layout optimization.
+
+Primary axis: storage footprint and delta-pack decode bytes. Timing is mostly
+neutral with lower medians in the hot write rows and a cleaner SQLite keys-only
+rerun. Storage improves on both SQLite and RocksDB for inserted and merge
+states. No backward shim.
+```
+
+## Optimization 25: Dictionary-code delta-pack key prefixes
+
+### Hypothesis
+
+Tracked-state delta packs repeat the same `schema_key` and `file_id` for every
+JSON-pointer row. The v2 delta-pack key format stored that full prefix inside
+each entry key even though the pack is already a locality unit. A pack-level
+prefix table should remove repeated key bytes while keeping decoded keys exactly
+the same shape for downstream ordering and filtering.
+
+This follows the same first-principles shape as page/segment dictionaries in
+systems like DuckDB/Turso/Dolt-style physical layouts: pay one compact table per
+storage unit, then store small indexes in repeated records.
+
+### Change
+
+- Bumped tracked delta packs from version 2 to version 3. No backward shim.
+- Added a pack-level key-prefix dictionary of `(schema_key, file_id)`.
+- Encoded each delta key as `prefix_index + entity_id`.
+- Kept decode output as full `TrackedStateKey` values so scan collapse,
+  ordering, and prefix filtering continue to operate on the existing key type.
+- Added coverage that verifies the prefix table is written for mixed file
+  prefixes and corrupt out-of-bounds prefix indexes reject.
+- Avoided a `HashMap` prefix-index path after a focused rerun showed write
+  regressions; the kept version uses the small prefix vector plus per-delta
+  prefix indexes built during the prefix pass.
+
+### Benchmarks
+
+Focused scan/write command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite)/smoke/(write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                           |    median | criterion status |
+| --------------------------------------------- | --------: | ---------------- |
+| `raw_sqlite/scan_keys_only/1k`                | 1.2058 ms | reference        |
+| `raw_sqlite/scan_full_rows/1k`                | 1.1330 ms | reference        |
+| `raw_sqlite/prefix_scan_schema_file_null/1k`  | 1.1647 ms | reference        |
+| `raw_sqlite/write_delta_10pct_updates/1k`     | 1.2337 ms | reference        |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k` | 1.2127 ms | reference        |
+| `sqlite/scan_keys_only/1k`                    | 1.9801 ms | improved         |
+| `sqlite/scan_full_rows/1k`                    | 2.5814 ms | improved         |
+| `sqlite/prefix_scan_schema_file_null/1k`      | 2.6188 ms | no change        |
+
+Final write-focused command after replacing the regressing `HashMap` prefix
+indexer:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+Result: passed.
+
+| row                                       |    median | criterion status |
+| ----------------------------------------- | --------: | ---------------- |
+| `sqlite/write_delta_10pct_updates/1k`     | 2.2536 ms | no change        |
+| `sqlite/write_tombstone_10pct_deletes/1k` | 2.2861 ms | no change        |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                    |   bytes | bytes/row | vs Optimization 24 |
+| -------------------------------------- | ------: | --------: | -----------------: |
+| raw SQLite / inserted                  | 1692456 |    1692.5 |          reference |
+| Lix SQLite / inserted                  |  996856 |     996.9 |             -16480 |
+| Lix SQLite / after create_version      | 1013336 |    1013.3 |             -16480 |
+| Lix SQLite / after fast-forward merge  | 5201424 |    5201.4 |             -28768 |
+| Lix SQLite / after divergent merge     | 5361240 |    5361.2 |             -24600 |
+| Lix RocksDB / inserted                 |  912032 |     912.0 |             -13272 |
+| Lix RocksDB / after create_version     |  913889 |     913.9 |             -13257 |
+| Lix RocksDB / after fast-forward merge | 1073314 |    1073.3 |             -12464 |
+| Lix RocksDB / after divergent merge    | 1442794 |    1442.8 |             -12128 |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+The v3 shape writes a header-level key-prefix table, then each entry key stores
+only `prefix_index + entity_id`. Decode reconstructs full `TrackedStateKey`s, so
+downstream ordering/filter behavior still sees ordinary full keys. Corrupt
+prefix indexes and invalid prefix file-id tags reject. Empty packs work
+naturally with zero prefixes and zero entries.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo test -p lix_engine tracked_state::codec:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite)/smoke/(write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/sqlite/smoke/(write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a storage-layout optimization.
+
+Primary axis: bytes per row. The JSON-pointer workload now pays for
+`json_pointer + NULL file_id` once per delta pack instead of once per delta row.
+The win is modest but repeatable across SQLite and RocksDB accounting, and the
+write guardrail is neutral after removing the HashMap indexer.
+
+This does not close the remaining <=1.5x gap by itself. It is a clean physical
+layout step that reduces repeated key bytes without changing the logical scan
+surface.
+```
+
+## Optimization 26: Probe delta-pack existence without loading blobs
+
+### Hypothesis
+
+Unmaterialized tracked commits are served from delta packs until a projection
+root exists. The scan planner only needs to know whether each first-parent
+commit has a delta pack, but it was calling `load_delta_pack`, which fetched and
+decoded the whole pack before the result-producing path fetched and decoded it
+again. This violates the same locality rule used by storage engines: use an
+index/key-existence probe to plan, and only read the value blob when the plan
+needs row data.
+
+### Change
+
+- Added `tracked_state::storage::delta_pack_exists`.
+- Implemented it with `StorageReader::exists_many` against the delta-pack
+  namespace/key, so it does not fetch delta-pack bytes.
+- Replaced the planning-time `load_delta_pack(...).is_some()` in
+  `delta_commit_ids_since_projection_root` with the key-only existence probe.
+- Kept all result-producing paths on `load_delta_pack`, so corrupt or
+  identity-mismatched packs still fail before scans, diffs, point reads, or
+  existence checks return results.
+
+### Benchmarks
+
+Focused read command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|exists_many_exact_keys)/1k'
+```
+
+Result: passed.
+
+Representative rerun medians:
+
+| row                                          |    median | criterion status        |
+| -------------------------------------------- | --------: | ----------------------- |
+| `raw_sqlite/scan_keys_only/1k`               | 1.1162 ms | reference               |
+| `raw_sqlite/scan_headers_only/1k`            | 1.1543 ms | reference               |
+| `raw_sqlite/scan_full_rows/1k`               | 1.2260 ms | reference               |
+| `raw_sqlite/prefix_scan_schema_file_null/1k` | 1.5672 ms | noisy reference         |
+| `sqlite/get_many_exact_keys/1k`              | 2.9404 ms | no change               |
+| `sqlite/exists_many_exact_keys/1k`           | 1.9841 ms | no change               |
+| `sqlite/scan_keys_only/1k`                   | 1.8194 ms | no change, lower median |
+| `sqlite/scan_headers_only/1k`                | 1.8309 ms | no change               |
+| `sqlite/scan_full_rows/1k`                   | 2.3452 ms | no change, lower median |
+| `sqlite/prefix_scan_schema_file_null/1k`     | 2.3869 ms | no change, lower median |
+| `rocksdb/get_many_exact_keys/1k`             | 2.0017 ms | no change               |
+| `rocksdb/exists_many_exact_keys/1k`          | 1.1156 ms | no change               |
+| `rocksdb/scan_keys_only/1k`                  | 835.73 us | no change, lower median |
+| `rocksdb/scan_headers_only/1k`               | 878.24 us | improved                |
+| `rocksdb/scan_full_rows/1k`                  | 1.4314 ms | no change               |
+| `rocksdb/prefix_scan_schema_file_null/1k`    | 1.3956 ms | within noise threshold  |
+
+Broad scan/write guardrail command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+Notable medians from the broad run:
+
+| row                                       |    median | criterion status       |
+| ----------------------------------------- | --------: | ---------------------- |
+| `sqlite/write_root_all_rows/1k`           | 5.2065 ms | no change              |
+| `sqlite/write_delta_10pct_updates/1k`     | 1.9378 ms | improved               |
+| `sqlite/write_tombstone_10pct_deletes/1k` | 1.8930 ms | within noise threshold |
+| `sqlite/scan_keys_only/1k`                | 1.8567 ms | no change              |
+| `sqlite/scan_headers_only/1k`             | 1.7894 ms | no change              |
+| `sqlite/scan_full_rows/1k`                | 2.4152 ms | no change              |
+| `sqlite/prefix_scan_schema_file_null/1k`  | 2.4417 ms | no change              |
+| `rocksdb/scan_keys_only/1k`               | 914.58 us | improved               |
+| `rocksdb/scan_full_rows/1k`               | 1.4490 ms | improved               |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed. No format or write-path storage change.
+
+1k rows:
+
+| row                                    |   bytes | bytes/row |
+| -------------------------------------- | ------: | --------: |
+| raw SQLite / inserted                  | 1692456 |    1692.5 |
+| Lix SQLite / inserted                  |  996856 |     996.9 |
+| Lix SQLite / after create_version      | 1013336 |    1013.3 |
+| Lix SQLite / after fast-forward merge  | 5205520 |    5205.5 |
+| Lix SQLite / after divergent merge     | 5361192 |    5361.2 |
+| Lix RocksDB / inserted                 |  912032 |     912.0 |
+| Lix RocksDB / after create_version     |  913889 |     913.9 |
+| Lix RocksDB / after fast-forward merge | 1073314 |    1073.3 |
+| Lix RocksDB / after divergent merge    | 1442794 |    1442.8 |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+Initial review:
+HIGH: none.
+MEDIUM: delta_pack_exists used get_values, so it avoided decode CPU but still
+fetched the blob. Use StorageReader::exists_many as a true key-only probe.
+
+Follow-up review:
+HIGH: none.
+MEDIUM: none.
+The prior MEDIUM is resolved. delta_pack_exists now uses StorageReader::exists_many
+against the delta-pack namespace/key. Result-producing paths still load and
+decode packs, so corrupt or identity-mismatched packs still fail before results
+are produced.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo test -p lix_engine tracked_state::context:: --features storage-benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|exists_many_exact_keys)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a read-path physical access optimization.
+
+The structural win is precise: first-parent planning now asks the backend for
+key existence instead of fetching a delta-pack value blob it will decode later.
+This follows the reference-system pattern of separating metadata/index probes
+from value materialization.
+
+The strongest observed impact is on unmaterialized single-delta scans, where
+SQLite scan medians moved from the post-Optimization-25 range of roughly
+1.94-2.69 ms down to roughly 1.82-2.39 ms in focused runs, and RocksDB scan
+medians moved below or near the raw SQLite reference for key/header scans.
+
+This does not change storage format, write layout, or corruption semantics for
+visible reads. It does not close the remaining full-row SQLite gap by itself.
+```
+
+## Optimization 27: Decode delta-pack sections without temporary copies
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+`tracked_state::codec::decode_delta_pack` now parses each sized delta key and
+value section directly from the pack byte slice:
+
+- Replaced `read_sized_bytes(...)?` followed by borrowing the temporary `Vec`
+  with `read_sized_slice(...)?`.
+- Kept the existing `decode_delta_key` and `decode_delta_value` parsers, so the
+  section format, cursor advancement, truncation checks, and trailing-byte
+  validation are unchanged.
+
+This removes two heap allocations and two payload copies per delta-pack row on
+unmaterialized tracked-state reads.
+
+### Benchmarks
+
+Focused scan command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys)/1k'
+```
+
+Result: passed.
+
+Representative medians:
+
+| row                                       |    median | criterion status |
+| ----------------------------------------- | --------: | ---------------- |
+| `sqlite/get_many_exact_keys/1k`           | 2.9171 ms | no change        |
+| `sqlite/scan_keys_only/1k`                | 1.8631 ms | no change        |
+| `sqlite/scan_headers_only/1k`             | 1.7398 ms | improved         |
+| `sqlite/scan_full_rows/1k`                | 2.3693 ms | no change        |
+| `sqlite/prefix_scan_schema_file_null/1k`  | 2.3791 ms | no change        |
+| `rocksdb/get_many_exact_keys/1k`          | 1.9810 ms | no change        |
+| `rocksdb/scan_keys_only/1k`               | 849.54 us | no change        |
+| `rocksdb/scan_headers_only/1k`            | 840.90 us | no change        |
+| `rocksdb/scan_full_rows/1k`               | 1.3687 ms | improved         |
+| `rocksdb/prefix_scan_schema_file_null/1k` | 1.3407 ms | no change        |
+
+Broad scan/write guardrail command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed. Raw SQLite reference rows were noisy in this run, but Lix write
+rows were neutral, SQLite scan medians stayed in the improved band, and RocksDB
+tombstone writes improved.
+
+Follow-up scan rerun:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                       | rerun median | criterion status |
+| ----------------------------------------- | -----------: | ---------------- |
+| `sqlite/scan_headers_only/1k`             |    1.7979 ms | no change        |
+| `sqlite/scan_full_rows/1k`                |    2.3657 ms | no change        |
+| `sqlite/prefix_scan_schema_file_null/1k`  |    2.3208 ms | no change        |
+| `rocksdb/scan_headers_only/1k`            |    817.34 us | improved         |
+| `rocksdb/scan_full_rows/1k`               |    1.3446 ms | improved         |
+| `rocksdb/prefix_scan_schema_file_null/1k` |    1.3315 ms | no change        |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed. No format or write-path storage change.
+
+1k rows:
+
+| row                                    |   bytes | bytes/row |
+| -------------------------------------- | ------: | --------: |
+| raw SQLite / inserted                  | 1692456 |    1692.5 |
+| Lix SQLite / inserted                  |  996856 |     996.9 |
+| Lix SQLite / after create_version      | 1013336 |    1013.3 |
+| Lix SQLite / after fast-forward merge  | 5205520 |    5205.5 |
+| Lix SQLite / after divergent merge     | 5369360 |    5369.4 |
+| Lix RocksDB / inserted                 |  912032 |     912.0 |
+| Lix RocksDB / after create_version     |  913889 |     913.9 |
+| Lix RocksDB / after fast-forward merge | 1073314 |    1073.3 |
+| Lix RocksDB / after divergent merge    | 1442794 |    1442.8 |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+The reviewer confirmed that read_sized_slice preserves the same overflow and
+truncation checks, the nested key/value decoders still reject trailing bytes,
+and the borrowed slices only live for the duration of parsing. Recommendation:
+keep as a clean read-side allocation cut.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo test -p lix_engine tracked_state::codec:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a read-side delta-pack decode cleanup.
+
+The physical win is small but real: unmaterialized tracked-state reads no
+longer copy every encoded delta key and value section before decoding owned
+rows from them. This reduces heap traffic without changing the pack format or
+corruption behavior.
+
+Timing is noisy but favorable enough to keep. SQLite header scans showed a
+significant improvement in the focused run and stayed in the lower band on
+rerun. RocksDB header/full scans improved significantly on rerun. Writes and
+storage bytes are neutral because the encoded bytes are unchanged.
+
+No storage format change. No temporary shim.
+```
+
+## Optimization 28: Encode change-pack entries in place
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+`commit_store::codec::encode_change_pack` now writes each authored change
+directly into its length-prefixed pack entry:
+
+- Extracted `write_change_ref(&mut Vec<u8>, ChangeRef)` from
+  `encode_change_ref`.
+- `encode_change_ref` still returns standalone `LXCH2` bytes by writing into a
+  fresh `Vec`.
+- `encode_change_pack` now reserves the 4-byte little-endian section length,
+  writes the `LXCH2` change bytes directly into the pack buffer, and backfills
+  the length.
+- Removed the old temporary `encode_change_ref(change)?` plus `write_bytes`
+  copy inside the pack loop.
+
+Added a unit test asserting that the bytes inside one change-pack entry are
+exactly the same as the standalone `encode_change_ref` bytes.
+
+### Benchmarks
+
+Focused write command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+Result: passed.
+
+Representative medians:
+
+| row                                           |    median | criterion status        |
+| --------------------------------------------- | --------: | ----------------------- |
+| `raw_sqlite/write_root_all_rows/1k`           | 2.4908 ms | reference/no change     |
+| `raw_sqlite/write_delta_10pct_updates/1k`     | 1.2818 ms | reference/no change     |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k` | 1.2797 ms | reference/no change     |
+| `sqlite/write_root_all_rows/1k`               | 4.7754 ms | no change, lower median |
+| `sqlite/write_delta_10pct_updates/1k`         | 1.9721 ms | no change               |
+| `sqlite/write_tombstone_10pct_deletes/1k`     | 1.7907 ms | no change               |
+| `rocksdb/write_root_all_rows/1k`              | 4.3187 ms | no change, lower median |
+| `rocksdb/write_delta_10pct_updates/1k`        | 935.37 us | no change               |
+| `rocksdb/write_tombstone_10pct_deletes/1k`    | 789.37 us | no change               |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed. The change-pack wire format is unchanged.
+
+1k rows:
+
+| row                                    |   bytes | bytes/row |
+| -------------------------------------- | ------: | --------: |
+| raw SQLite / inserted                  | 1692456 |    1692.5 |
+| Lix SQLite / inserted                  |  996856 |     996.9 |
+| Lix SQLite / after create_version      | 1013336 |    1013.3 |
+| Lix SQLite / after fast-forward merge  | 5201424 |    5201.4 |
+| Lix SQLite / after divergent merge     | 5348880 |    5348.9 |
+| Lix RocksDB / inserted                 |  912032 |     912.0 |
+| Lix RocksDB / after create_version     |  913889 |     913.9 |
+| Lix RocksDB / after fast-forward merge | 1073314 |    1073.3 |
+| Lix RocksDB / after divergent merge    | 1442792 |    1442.8 |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+The reviewer confirmed that the pack still writes a length-prefixed LXCH2
+payload for each change, that decode still reads the same entry bytes, and that
+partial mutation on error is not exposed because encode_change_pack and
+encode_change_ref both build into fresh local Vecs. Recommendation: keep.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine commit_store::codec:: --features storage-benches
+cargo test -p lix_engine commit_store:: --features storage-benches
 cargo test -p lix_engine transaction::commit:: --features storage-benches
 cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
 cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a write-side commit-pack allocation cleanup.
+
+The physical win is removing one temporary Vec allocation and one copy for each
+authored change encoded into a commit-store change pack. It is the same shape
+as the earlier direct delta-pack and direct commit-change row work: encode into
+the final pack buffer instead of building nested row blobs only to copy them.
+
+Timing is a modest median improvement for root writes on both Lix backends, but
+Criterion did not mark it statistically significant. This is kept because it
+removes real per-row hot-path work while preserving the byte format and storage
+footprint.
+
+No storage format change. No temporary shim.
+```
+
+## Optimization 29: Compact matching tracked timestamps
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Bumped the tracked-state value codec from version 6 to version 7 and compacted
+the common timestamp shape in both materialized tree values and delta-pack
+values:
+
+- Values now write `created_at` once.
+- A one-byte tag follows:
+  `TIMESTAMP_UPDATED_SAME` when `updated_at == created_at`, otherwise
+  `TIMESTAMP_UPDATED_DISTINCT` plus the `updated_at` string.
+- Decode reconstructs `updated_at` from `created_at` for the same-timestamp
+  case and rejects invalid timestamp tags.
+- `encoded_value_len` now uses the same timestamp-pair sizing helper as the
+  encoder.
+
+There is no backwards shim because the format has not shipped.
+
+Added coverage that matching timestamps roundtrip and produce a shorter encoded
+value than distinct timestamps. Existing distinct timestamp roundtrip tests
+continue to cover the non-compact branch.
+
+### Benchmarks
+
+Focused write/scan command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_headers_only|scan_full_rows)/1k'
+```
+
+Result: passed.
+
+Representative medians:
+
+| row                                        |    median | criterion status |
+| ------------------------------------------ | --------: | ---------------- |
+| `sqlite/write_root_all_rows/1k`            | 5.0199 ms | no change        |
+| `sqlite/write_delta_10pct_updates/1k`      | 1.8704 ms | no change        |
+| `sqlite/write_tombstone_10pct_deletes/1k`  | 1.7569 ms | no change        |
+| `sqlite/scan_headers_only/1k`              | 1.8272 ms | no change        |
+| `sqlite/scan_full_rows/1k`                 | 2.3698 ms | no change        |
+| `rocksdb/write_root_all_rows/1k`           | 4.3505 ms | no change        |
+| `rocksdb/write_delta_10pct_updates/1k`     | 840.51 us | improved         |
+| `rocksdb/write_tombstone_10pct_deletes/1k` | 933.62 us | no change        |
+| `rocksdb/scan_headers_only/1k`             | 860.63 us | no change        |
+| `rocksdb/scan_full_rows/1k`                | 1.5218 ms | noisy regression |
+
+Rerun of scan guardrails:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                       | rerun median | criterion status |
+| ----------------------------------------- | -----------: | ---------------- |
+| `sqlite/scan_headers_only/1k`             |    1.7102 ms | improved         |
+| `sqlite/scan_full_rows/1k`                |    2.2907 ms | no change        |
+| `sqlite/prefix_scan_schema_file_null/1k`  |    2.2168 ms | no change        |
+| `rocksdb/scan_headers_only/1k`            |    815.47 us | no change        |
+| `rocksdb/scan_full_rows/1k`               |    1.3515 ms | improved         |
+| `rocksdb/prefix_scan_schema_file_null/1k` |    1.4072 ms | no change        |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                    |   bytes | bytes/row | status            |
+| -------------------------------------- | ------: | --------: | ----------------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference         |
+| Lix SQLite / inserted                  |  972136 |     972.1 | improved          |
+| Lix SQLite / after create_version      |  984496 |     984.5 | improved          |
+| Lix SQLite / after fast-forward merge  | 5201544 |    5201.5 | roughly unchanged |
+| Lix SQLite / after divergent merge     | 5365384 |    5365.4 | roughly unchanged |
+| Lix RocksDB / inserted                 |  884519 |     884.5 | improved          |
+| Lix RocksDB / after create_version     |  886342 |     886.3 | improved          |
+| Lix RocksDB / after fast-forward merge | 1043067 |    1043.1 | improved          |
+| Lix RocksDB / after divergent merge    | 1404413 |    1404.4 | improved          |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+The reviewer confirmed that the version/deleted header masking remains correct,
+tombstone visibility still only needs the header, both tree and delta values
+use the same timestamp pair helpers, distinct timestamps are preserved, invalid
+timestamp tags are rejected, and encoded_value_len matches the new format.
+Recommendation: keep.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo test -p lix_engine tracked_state::codec:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine transaction::commit:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_headers_only|scan_full_rows)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a physical value-format compaction.
+
+The structural win is direct: inserted/root rows usually have matching
+created_at and updated_at, so storing the timestamp twice was duplicated row
+payload. Version 7 stores the common case as one string plus a tag while still
+preserving distinct timestamps for updates/adoptions.
+
+Storage improves materially on inserted/create_version states for both SQLite
+and RocksDB, and RocksDB merge-state bytes improve as well. Timing is mostly
+neutral with useful scan/write wins on rerun; the one RocksDB scan regression
+did not reproduce.
+
+No backward shim because the physical format is still unshipped.
+```
+
+## Optimization 30: Compact commit and delta change ids
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Changed the unshipped physical pack formats:
+
+- Commit-store change packs move from `LXCP1` to `LXCP2`.
+- `LXCP2` stores shared `(schema_key, file_id)` shapes once per pack.
+- `LXCP2` stores entity identity directly as string parts instead of a JSON
+  array string inside each packed change.
+- `LXCP2` stores change ids as a suffix when they start with the pack
+  `commit_id`, otherwise stores the full id.
+- Tracked-state delta packs move from `LXTD3` to `LXTD4`.
+- `LXTD4` stores delta `change_id`s as a suffix when they start with the
+  locator `source_commit_id`, otherwise stores the full id.
+
+Standalone `LXCH2` change encoding remains available, but change packs no
+longer embed standalone `LXCH2` records. There is no backwards shim because the
+physical format has not shipped.
+
+Added codec coverage for the compact change-pack shape and for a tracked
+delta-pack cross-commit locator whose `change_id` starts with the pack commit
+id but not with its locator source commit id.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+Representative medians:
+
+| row                                        |    median | criterion status |
+| ------------------------------------------ | --------: | ---------------- |
+| `raw_sqlite/write_root_all_rows/1k`        | 2.3900 ms | no change        |
+| `sqlite/write_root_all_rows/1k`            | 4.4672 ms | no change        |
+| `sqlite/write_delta_10pct_updates/1k`      | 1.7570 ms | no change        |
+| `sqlite/write_tombstone_10pct_deletes/1k`  | 1.5593 ms | no change        |
+| `sqlite/scan_full_rows/1k`                 | 2.3076 ms | no change        |
+| `sqlite/prefix_scan_schema_file_null/1k`   | 2.2825 ms | no change        |
+| `rocksdb/write_root_all_rows/1k`           | 4.3382 ms | no change        |
+| `rocksdb/write_delta_10pct_updates/1k`     | 842.39 us | no change        |
+| `rocksdb/write_tombstone_10pct_deletes/1k` | 732.73 us | no change        |
+| `rocksdb/scan_full_rows/1k`                | 1.3643 ms | no change        |
+| `rocksdb/prefix_scan_schema_file_null/1k`  | 1.3588 ms | no change        |
+
+Earlier same-patch focused sweep also showed RocksDB delta writes at
+`751.11 us` improved and RocksDB tombstone writes at `741.36 us` improved; the
+combined rerun settled as neutral except raw SQLite tombstone noise.
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                    |   bytes | bytes/row | status    |
+| -------------------------------------- | ------: | --------: | --------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference |
+| Lix SQLite / inserted                  |  947416 |     947.4 | improved  |
+| Lix SQLite / after create_version      |  959776 |     959.8 | improved  |
+| Lix SQLite / after fast-forward merge  | 5152248 |    5152.2 | improved  |
+| Lix SQLite / after divergent merge     | 5353168 |    5353.2 | improved  |
+| Lix RocksDB / inserted                 |  864114 |     864.1 | improved  |
+| Lix RocksDB / after create_version     |  865938 |     865.9 | improved  |
+| Lix RocksDB / after fast-forward merge | 1022770 |    1022.8 | improved  |
+| Lix RocksDB / after divergent merge    | 1384417 |    1384.4 | improved  |
+
+### Review Loop
+
+Reviewer pass 1 found one HIGH: `LXTD4` initially stripped delta change ids
+against the pack commit id while decode reconstructed suffixes against the
+locator `source_commit_id`, which could corrupt an adopted cross-commit locator
+whose id happened to start with the pack commit id.
+
+Fix: encode delta change-id suffixes against
+`value.change_locator.source_commit_id`, matching decode, and add a regression
+for the cross-commit prefix-collision case.
+
+Reviewer pass 2:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+The reviewer confirmed the prior HIGH is resolved, suffix encode/decode now use
+the same source-commit basis, LXCP2 preserves entry order, shape indexes are
+bounds-checked, and commit-store suffix IDs use the same commit-id basis on
+encode/decode.
+Recommendation: keep.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo test -p lix_engine commit_store::codec:: --features storage-benches
+cargo test -p lix_engine commit_store:: --features storage-benches
+cargo test -p lix_engine tracked_state::codec:: --features storage-benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine transaction::commit:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a format-level compaction.
+
+Root-write timing remains above the 1.5x target and mostly Criterion-neutral,
+so this is not the final root-write answer. The pack bytes are meaningfully
+smaller, however, and the format removes repeated schema/file/change-id/entity
+encoding from durable commit packs while preserving locator semantics.
+
+The current budget misses remain root writes and SQLite full/prefix scans.
+```
+
+## Optimization 31: Narrow JSON pack directory fields
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Changed the unshipped JSON commit-pack format from `lix-json-pack:v1` to
+`lix-json-pack:v2`.
+
+The per-entry directory keeps the same explicit shape:
+
+```text
+hash, codec, uncompressed_len, payload_offset, payload_len
+```
+
+but narrows the three numeric payload fields from `u64` to `u32`. The entry
+header shrinks from `32 + 1 + 8 + 8 + 8 = 57` bytes to
+`32 + 1 + 4 + 4 + 4 = 45` bytes.
+
+This is a clean cut with no backwards shim because Lix has not shipped. Unlike
+the rejected implicit-offset JSON-pack experiment, this keeps explicit offsets,
+so unordered/fallback pack reads retain direct payload slicing instead of
+reconstructing offsets from earlier directory entries.
+
+Added codec tests for the compact 45-byte directory shape and for checked
+rejection of oversized u32 directory fields.
+
+### Storage
+
+Command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| state                      |    before |     after |   delta |
+| -------------------------- | --------: | --------: | ------: |
+| raw SQLite inserted        | 1,692,456 | 1,692,456 |       0 |
+| Lix SQLite inserted        |   947,416 |   939,176 |  -8,240 |
+| Lix SQLite create_version  |   959,776 |   951,536 |  -8,240 |
+| Lix SQLite fast-forward    | 5,152,248 | 5,152,296 |     +48 |
+| Lix SQLite divergent       | 5,353,168 | 5,320,304 | -32,864 |
+| Lix RocksDB inserted       |   864,114 |   851,910 | -12,204 |
+| Lix RocksDB create_version |   865,938 |   853,721 | -12,217 |
+| Lix RocksDB fast-forward   | 1,022,770 | 1,009,345 | -13,425 |
+| Lix RocksDB divergent      | 1,384,417 | 1,368,580 | -15,837 |
+
+### Timing
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+Representative medians:
+
+| row                                           |    median | criterion status |
+| --------------------------------------------- | --------: | ---------------- |
+| `raw_sqlite/write_root_all_rows/1k`           | 2.4135 ms | no change        |
+| `raw_sqlite/scan_full_rows/1k`                | 1.2061 ms | no change        |
+| `raw_sqlite/prefix_scan_schema_file_null/1k`  | 1.1669 ms | no change        |
+| `raw_sqlite/write_delta_10pct_updates/1k`     | 1.2859 ms | no change        |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k` | 1.1947 ms | no change        |
+| `sqlite/write_root_all_rows/1k`               | 4.6431 ms | no change        |
+| `sqlite/scan_full_rows/1k`                    | 2.2783 ms | no change        |
+| `sqlite/prefix_scan_schema_file_null/1k`      | 2.3420 ms | no change        |
+| `sqlite/write_delta_10pct_updates/1k`         | 1.7931 ms | no change        |
+| `sqlite/write_tombstone_10pct_deletes/1k`     | 1.6065 ms | no change        |
+| `rocksdb/write_root_all_rows/1k`              | 4.1708 ms | no change        |
+| `rocksdb/scan_full_rows/1k`                   | 1.4051 ms | no change        |
+| `rocksdb/prefix_scan_schema_file_null/1k`     | 1.3823 ms | no change        |
+| `rocksdb/write_delta_10pct_updates/1k`        | 818.06 us | no change        |
+| `rocksdb/write_tombstone_10pct_deletes/1k`    | 765.78 us | no change        |
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo test -p lix_engine json_store:: --features storage-benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+Reviewer loop:
+
+- First pass: HIGH none, MEDIUM none, LOW requested direct overflow coverage
+  for narrowed fields.
+- Added `json_pack_u32_rejects_oversized_directory_fields`.
+- Second pass: HIGH none, MEDIUM none, LOW none. Recommendation: keep.
+
+### Interpretation
+
+```text
+Keep as a compact physical-layout cleanup.
+
+Primary axis: storage bytes. Commit-local JSON packs are bounded KV blobs, not
+large archive files, so u32 payload lengths and offsets are enough while the
+encoder still rejects oversized packs explicitly.
+
+Timing: no Lix runtime row showed a detected regression in the focused write
+and scan guardrail. Keeping explicit offsets preserves the direct random-access
+fallback shape that the earlier implicit-offset experiment lost.
+
+No backwards shim.
+```
+
+## Optimization 32: Varint change-pack local fields
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Changed the unshipped commit-store change-pack format from `LXCP2` to `LXCP3`.
+
+`LXCP3` keeps the same logical fields and explicit pack structure, but encodes
+pack-local lengths, counts, and indexes as checked u32 varints instead of fixed
+u32 fields:
+
+- commit id length
+- shape count
+- shape `schema_key` and optional `file_id` lengths
+- change count
+- per-change id length
+- entity-identity part count and part lengths
+- shape index
+- created-at length
+
+Standalone commit (`LXCM1`), standalone change (`LXCH2`), and membership-pack
+(`LXMP1`) encodings are unchanged. There is no backwards shim because the
+format has not shipped.
+
+Added decode coverage for overlong varints, values above `u32::MAX`, and
+non-canonical encodings such as `80 00`.
+
+### Storage
+
+Command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| state                      |    before |     after |   delta |
+| -------------------------- | --------: | --------: | ------: |
+| raw SQLite inserted        | 1,692,456 | 1,692,456 |       0 |
+| Lix SQLite inserted        |   939,176 |   922,696 | -16,480 |
+| Lix SQLite create_version  |   951,536 |   935,056 | -16,480 |
+| Lix SQLite fast-forward    | 5,152,296 | 5,123,600 | -28,696 |
+| Lix SQLite divergent       | 5,320,304 | 5,308,064 | -12,240 |
+| Lix RocksDB inserted       |   851,910 |   836,566 | -15,344 |
+| Lix RocksDB create_version |   853,721 |   838,350 | -15,371 |
+| Lix RocksDB fast-forward   | 1,009,345 |   991,281 | -18,064 |
+| Lix RocksDB divergent      | 1,368,580 | 1,345,089 | -23,491 |
+
+### Timing
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|exists_many_exact_keys)/1k'
+```
+
+Result: passed.
+
+Representative medians:
+
+| row                                           |    median | criterion status |
+| --------------------------------------------- | --------: | ---------------- |
+| `raw_sqlite/write_root_all_rows/1k`           | 2.3938 ms | no change        |
+| `raw_sqlite/get_many_exact_keys/1k`           | 2.0500 ms | no change        |
+| `raw_sqlite/exists_many_exact_keys/1k`        | 2.0326 ms | no change        |
+| `raw_sqlite/scan_full_rows/1k`                | 1.1694 ms | no change        |
+| `raw_sqlite/prefix_scan_schema_file_null/1k`  | 1.1635 ms | no change        |
+| `raw_sqlite/write_delta_10pct_updates/1k`     | 1.2193 ms | no change        |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k` | 1.2057 ms | no change        |
+| `sqlite/write_root_all_rows/1k`               | 4.5170 ms | no change        |
+| `sqlite/get_many_exact_keys/1k`               | 2.8695 ms | no change        |
+| `sqlite/exists_many_exact_keys/1k`            | 1.8988 ms | no change        |
+| `sqlite/scan_full_rows/1k`                    | 2.2094 ms | no change        |
+| `sqlite/prefix_scan_schema_file_null/1k`      | 2.2438 ms | no change        |
+| `sqlite/write_delta_10pct_updates/1k`         | 1.7065 ms | no change        |
+| `sqlite/write_tombstone_10pct_deletes/1k`     | 1.6626 ms | no change        |
+| `rocksdb/write_root_all_rows/1k`              | 3.9725 ms | improved         |
+| `rocksdb/get_many_exact_keys/1k`              | 2.0688 ms | no change        |
+| `rocksdb/exists_many_exact_keys/1k`           | 1.0354 ms | no change        |
+| `rocksdb/scan_full_rows/1k`                   | 1.4142 ms | no change        |
+| `rocksdb/prefix_scan_schema_file_null/1k`     | 1.3397 ms | no change        |
+| `rocksdb/write_delta_10pct_updates/1k`        | 736.65 us | no change        |
+| `rocksdb/write_tombstone_10pct_deletes/1k`    | 735.43 us | no change        |
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo test -p lix_engine commit_store::codec:: --features storage-benches
+cargo test -p lix_engine commit_store:: --features storage-benches
+cargo test -p lix_engine transaction::commit:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|exists_many_exact_keys)/1k'
+```
+
+All commands passed.
+
+Reviewer loop:
+
+- First pass: HIGH none, MEDIUM found a malformed 5-byte varint could exceed
+  `u32::MAX` without being rejected; LOW requested canonical varint rejection.
+- Fixed `read_var_usize` to reject fifth-byte continuation and high payload
+  bits, and to reject non-canonical zero-extended encodings.
+- Added regressions for overlong, too-large, and non-canonical varints.
+- Second pass: HIGH none, MEDIUM none, LOW none.
+
+### Interpretation
+
+```text
+Keep as a compact change-pack layout cleanup.
+
+Primary axis: storage bytes. Change packs are commit-local bounded blobs whose
+per-row shape indexes and string lengths are usually tiny; fixed u32 metadata
+was pure overhead. Varints are limited to u32, canonical, and malformed packs
+reject before allocation-heavy paths can trust the decoded value.
+
+Timing: focused physical write/read/scan rows showed no detected Lix
+regressions. The only statistically visible Lix movement was a RocksDB root
+write improvement in the final run.
+
+No backwards shim.
+```
+
+## Optimization 33: Varint tracked-state delta-pack local fields
+
+### Change
+
+Changed tracked-state delta packs from version `4` to version `5` with no
+backwards shim. Tree node/key/value encodings remain on their existing
+fixed-width formats.
+
+Within `LXTD` v5 delta packs, pack-local lengths/counts/indexes now use checked
+canonical `u32` varints instead of fixed-width `u32` fields:
+
+- pack commit id length
+- key prefix count, prefix schema/file id lengths, entry count
+- per-entry key/value section lengths
+- key prefix index and entity identity part count/lengths
+- full source commit id length when needed
+- source pack id and source ordinal
+- delta change id length
+- timestamp lengths
+
+The section-length encoder writes in place, reserving the maximum 5-byte varint
+header and compacting it after the section is written, avoiding a temporary
+allocation per key/value section.
+
+Decoder hardening:
+
+- rejects overlong varints
+- rejects varints above `u32::MAX`
+- rejects non-canonical encodings such as `80 00`
+- avoids eager large `Vec::with_capacity(count)` allocations from corrupt
+  decoded counts
+
+Added focused delta-pack tests for the malformed varint cases and updated the
+roundtrip fixture to assert the v5 varint header fields.
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                    | before bytes | after bytes |     delta |
+| -------------------------------------- | -----------: | ----------: | --------: |
+| raw SQLite / inserted                  |    1,692,456 |   1,692,456 | reference |
+| Lix SQLite / inserted                  |      922,696 |     897,976 |   -24,720 |
+| Lix SQLite / after create_version      |      935,056 |     910,336 |   -24,720 |
+| Lix SQLite / after fast-forward merge  |    5,123,600 |   5,152,584 |   +28,984 |
+| Lix SQLite / after divergent merge     |    5,308,064 |   5,304,136 |    -3,928 |
+| Lix RocksDB / inserted                 |      836,566 |     811,776 |   -24,790 |
+| Lix RocksDB / after create_version     |      838,350 |     813,523 |   -24,827 |
+| Lix RocksDB / after fast-forward merge |      991,281 |     962,754 |   -28,527 |
+| Lix RocksDB / after divergent merge    |    1,345,089 |   1,306,406 |   -38,683 |
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|exists_many_exact_keys)/1k'
+```
+
+Result: passed.
+
+Rerun after replacing temporary section buffers with in-place varint section
+headers:
+
+| row                                           |    median | criterion status |
+| --------------------------------------------- | --------: | ---------------- |
+| `raw_sqlite/write_root_all_rows/1k`           | 2.4927 ms | no change        |
+| `raw_sqlite/get_many_exact_keys/1k`           | 2.0536 ms | improved         |
+| `raw_sqlite/exists_many_exact_keys/1k`        | 2.1659 ms | no change        |
+| `raw_sqlite/scan_full_rows/1k`                | 1.2557 ms | improved         |
+| `raw_sqlite/prefix_scan_schema_file_null/1k`  | 1.2060 ms | no change        |
+| `raw_sqlite/write_delta_10pct_updates/1k`     | 1.2878 ms | improved         |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k` | 1.2843 ms | improved         |
+| `sqlite/write_root_all_rows/1k`               | 4.5495 ms | no change        |
+| `sqlite/get_many_exact_keys/1k`               | 2.7998 ms | no change        |
+| `sqlite/exists_many_exact_keys/1k`            | 1.8635 ms | no change        |
+| `sqlite/scan_full_rows/1k`                    | 2.6022 ms | noise threshold  |
+| `sqlite/prefix_scan_schema_file_null/1k`      | 2.2652 ms | no change        |
+| `sqlite/write_delta_10pct_updates/1k`         | 1.7003 ms | no change        |
+| `sqlite/write_tombstone_10pct_deletes/1k`     | 1.6276 ms | no change        |
+| `rocksdb/write_root_all_rows/1k`              | 4.3209 ms | no change        |
+| `rocksdb/get_many_exact_keys/1k`              | 2.1036 ms | regressed        |
+| `rocksdb/exists_many_exact_keys/1k`           | 1.0935 ms | no change        |
+| `rocksdb/scan_full_rows/1k`                   | 1.4418 ms | no change        |
+| `rocksdb/prefix_scan_schema_file_null/1k`     | 1.4424 ms | no change        |
+| `rocksdb/write_delta_10pct_updates/1k`        | 754.76 us | improved         |
+| `rocksdb/write_tombstone_10pct_deletes/1k`    | 779.52 us | no change        |
+
+The only Criterion regression in the rerun is RocksDB exact reads, which should
+not decode delta-pack values on this benchmark path. Treat as a noisy guardrail
+unless it repeats after later exact-read work.
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+The v5 delta-pack varint path rejects overlong, above-u32, and non-canonical
+encodings; section boundaries are preserved; tree node/key/value encodings
+still use fixed-width helpers; and the count allocation hardening avoids huge
+malformed-count allocation before truncation failure.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo test -p lix_engine tracked_state::codec:: --features storage-benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine transaction::commit:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|exists_many_exact_keys)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep.
+
+This is another pure physical-layout byte win. The largest clean benefit is on
+root/create-version storage and RocksDB delta/merge footprints, with no intended
+logical behavior change and no compatibility shim.
+
+The fast-forward SQLite byte count moved up on this run while divergent SQLite
+and RocksDB merge rows moved down; the inserted/create-version rows show the
+direct delta-pack-local field compression most clearly.
+
+Target is still not met: SQLite root write remains about 4.55 / 2.49 = 1.83x
+raw SQLite in the latest focused run, and scans are still above the 1.5x budget.
+```
+
+## Optimization 34: Probe ordered single JSON packs before dedupe
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Added an early JSON-store read fast path for the common materialization shape
+where all requested JSON refs come from one commit pack in pack order:
+
+- `load_json_bytes_many_in_scope_with_hash_check` now probes a single
+  `JsonReadScopeRef::CommitPacks` pack before building the dedupe `HashMap`,
+  direct-row key list, and request-index remapping.
+- If the ordered pack probe hits, the loader returns decoded values directly.
+- If the ordered probe misses because the pack is absent or not an exact
+  ordered match, the existing dedupe/direct-row fallback still runs. A present
+  but non-matching pack is carried into fallback so the same pack is not fetched
+  twice.
+- Added `ordered_pack_probe_falls_back_to_direct_rows` to cover direct-row
+  fallback after a mismatched ordered pack probe.
+
+### Benchmarks
+
+Focused read command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys)/1k'
+```
+
+First clean run after the change:
+
+| row                                          |    median | criterion status        |
+| -------------------------------------------- | --------: | ----------------------- |
+| `raw_sqlite/get_many_exact_keys/1k`          | 2.0699 ms | improved baseline       |
+| `raw_sqlite/scan_full_rows/1k`               | 1.2684 ms | improved baseline       |
+| `raw_sqlite/prefix_scan_schema_file_null/1k` | 1.1716 ms | improved baseline       |
+| `sqlite/get_many_exact_keys/1k`              | 2.7975 ms | improved                |
+| `sqlite/scan_full_rows/1k`                   | 2.3225 ms | improved                |
+| `sqlite/prefix_scan_schema_file_null/1k`     | 2.3271 ms | no change, lower median |
+| `rocksdb/get_many_exact_keys/1k`             | 1.9847 ms | improved                |
+| `rocksdb/scan_full_rows/1k`                  | 1.4401 ms | no change               |
+| `rocksdb/prefix_scan_schema_file_null/1k`    | 1.4838 ms | no change               |
+
+Final rerun after fallback refinement:
+
+| row                                          |    median | criterion status              |
+| -------------------------------------------- | --------: | ----------------------------- |
+| `raw_sqlite/get_many_exact_keys/1k`          | 2.0341 ms | reference/no change           |
+| `raw_sqlite/scan_full_rows/1k`               | 1.1597 ms | reference/no change           |
+| `raw_sqlite/prefix_scan_schema_file_null/1k` | 1.1901 ms | reference/no change           |
+| `sqlite/get_many_exact_keys/1k`              | 2.8496 ms | no change                     |
+| `sqlite/scan_full_rows/1k`                   | 2.3712 ms | no change                     |
+| `sqlite/prefix_scan_schema_file_null/1k`     | 2.2558 ms | no change                     |
+| `rocksdb/get_many_exact_keys/1k`             | 2.1639 ms | noisy regression vs prior run |
+| `rocksdb/scan_full_rows/1k`                  | 1.4752 ms | no change                     |
+| `rocksdb/prefix_scan_schema_file_null/1k`    | 1.4137 ms | no change                     |
+
+Write guardrail command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
+```
+
+Result: passed, with all measured write rows improved in that guardrail run.
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                    |   bytes | bytes/row | status    |
+| -------------------------------------- | ------: | --------: | --------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference |
+| Lix SQLite / inserted                  |  897976 |     898.0 | unchanged |
+| Lix SQLite / after create_version      |  910336 |     910.3 | unchanged |
+| Lix SQLite / after fast-forward merge  | 5152584 |    5152.6 | unchanged |
+| Lix SQLite / after divergent merge     | 5304136 |    5304.1 | unchanged |
+| Lix RocksDB / inserted                 |  811772 |     811.8 | unchanged |
+| Lix RocksDB / after create_version     |  813519 |     813.5 | unchanged |
+| Lix RocksDB / after fast-forward merge |  962750 |     962.8 | unchanged |
+| Lix RocksDB / after divergent merge    | 1306403 |    1306.4 | unchanged |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+Initial review:
+HIGH: none.
+MEDIUM: early ordered probe could read the same single pack twice on
+non-exact fallback.
+LOW: none.
+
+Follow-up review:
+HIGH: none.
+MEDIUM: none.
+LOW: absent-pack fallback still rereads the missing pack; present/non-exact
+fallback copies the full pack.
+
+Final review:
+HIGH: none.
+MEDIUM: none.
+LOW: none beyond the intentionally accepted full-pack copy on uncommon
+present/non-exact fallback. The absent-pack path now goes directly to direct-row
+fallback without rereading the missing pack.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo check -p lix_engine --features storage-benches
+cargo test -p lix_engine json_store:: --features storage-benches
+cargo test -p lix_engine tracked_state::context:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys)/1k'
 cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes)/1k'
 ```
 
@@ -5331,16 +5085,262 @@ All commands passed.
 ### Interpretation
 
 ```text
-Keep as a root-write optimization.
+Keep as a JSON pack read-path optimization.
 
-Primary axis: write_root_all_rows. The structural win removes a duplicate
-BLAKE3 hash over normalized JSON payloads at the JSON-store staging boundary
-when transaction staging has already computed the content ref.
+Primary axis: exact reads and full-row scans that materialize all JSON payloads
+from one commit pack in pack order. The structural win avoids building a dedupe
+HashMap and direct-row key list before the existing ordered pack loader can
+succeed.
 
-Timing: both SQLite and RocksDB root writes moved down, with Criterion
-improvements in the first focused run and lower medians on rerun. Delta and
-tombstone rows are treated as guardrails; their medians were neutral to better
-on rerun.
+Timing: first clean run showed Criterion improvements for SQLite exact reads,
+SQLite full scans, and RocksDB exact reads. Final rerun after fallback cleanup
+held the new median band but did not show another Criterion improvement, as
+expected. RocksDB exact read was noisy in the final rerun and remains a guardrail
+to watch.
 
-No storage format change. No temporary shim.
+Storage is unchanged. No format change, no backward shim, no benchmark
+measurement change. This does not complete the <= 1.5x target because SQLite
+full/prefix scans remain above budget.
+```
+
+## Optimization 35: Pre-size tracked materialization JSON slots
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Pre-sized the tracked-state materialization JSON side buffers from known entry
+and projection counts:
+
+- `materialize_index_entries` now computes the maximum projected JSON slots as
+  `entries.len() * projected_json_columns`.
+- `json_refs` and `json_ref_localities` reserve that capacity up front instead
+  of growing from zero while planning rows.
+
+This follows the same locality principle used in the pack formats: when a scan
+already has the row count and projected column shape, allocate the side vectors
+once for the dense payload path.
+
+### Benchmarks
+
+Focused read command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                          |    median | criterion status        |
+| -------------------------------------------- | --------: | ----------------------- |
+| `raw_sqlite/get_many_exact_keys/1k`          | 2.1087 ms | reference/no change     |
+| `raw_sqlite/scan_full_rows/1k`               | 1.1755 ms | reference/no change     |
+| `raw_sqlite/prefix_scan_schema_file_null/1k` | 1.1727 ms | reference/no change     |
+| `sqlite/get_many_exact_keys/1k`              | 2.7590 ms | no change               |
+| `sqlite/scan_full_rows/1k`                   | 2.1942 ms | no change, lower median |
+| `sqlite/prefix_scan_schema_file_null/1k`     | 2.2549 ms | no change               |
+| `rocksdb/get_many_exact_keys/1k`             | 2.0010 ms | improved                |
+| `rocksdb/scan_full_rows/1k`                  | 1.4752 ms | no change               |
+| `rocksdb/prefix_scan_schema_file_null/1k`    | 1.4116 ms | no change               |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                    |   bytes | bytes/row | status          |
+| -------------------------------------- | ------: | --------: | --------------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference       |
+| Lix SQLite / inserted                  |  897976 |     898.0 | unchanged       |
+| Lix SQLite / after create_version      |  910336 |     910.3 | unchanged       |
+| Lix SQLite / after fast-forward merge  | 5152584 |    5152.6 | unchanged       |
+| Lix SQLite / after divergent merge     | 5312328 |    5312.3 | unchanged/noisy |
+| Lix RocksDB / inserted                 |  811772 |     811.8 | unchanged       |
+| Lix RocksDB / after create_version     |  813519 |     813.5 | unchanged       |
+| Lix RocksDB / after fast-forward merge |  962750 |     962.8 | unchanged       |
+| Lix RocksDB / after divergent merge    | 1306401 |    1306.4 | unchanged       |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: reserves the upper bound for sparse/tombstone-heavy rows. This is bounded
+to at most two slots per row and is an acceptable hot-path tradeoff for dense
+payload scans.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo check -p lix_engine --features storage-benches
+cargo test -p lix_engine tracked_state::materialization:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a small tracked materialization allocation cleanup.
+
+Primary axis: dense full-row materialization for exact reads and scans. The
+structural win removes repeated growth of JSON ref/locality side buffers when
+the planner already knows the maximum slot count.
+
+Timing: RocksDB exact reads improved by Criterion. SQLite scan medians moved
+lower but remained Criterion-neutral. There were no measured regressions in the
+focused read run.
+
+Storage is unchanged. No format change, no backward shim, no benchmark
+measurement change. This does not complete the <= 1.5x target; SQLite full and
+prefix scans remain above budget and root writes still need a larger cut.
+```
+
+## Optimization 36: Decode scan keys from trusted schema/file prefix
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Added a tracked-tree scan fast path for the common single schema/file prefix
+shape:
+
+- `scan_ranges` already proves rows are inside one encoded
+  `schema_key + file_id` prefix when a request has one schema key, one non-Any
+  file filter, and no entity filter.
+- `scan_key_decode_hint` carries that trusted prefix shape through recursive
+  tree scans.
+- Leaf scans now decode only the entity suffix with
+  `decode_key_with_trusted_prefix`, then materialize the known schema/file
+  fields directly.
+- The normal full-key decoder and filter recheck remain in place for multi
+  schema/file scans, Any-file scans, entity-filter scans, and all other shapes.
+
+Added direct coverage for the trusted suffix decoder and a tree scan test that
+locks the hinted branch against tombstone visibility, file filtering, and limit
+handling.
+
+### Benchmarks
+
+Focused read command:
+
+```sh
+cargo bench -p lix_engine --bench json_pointer_crud --features storage-benches -- 'json_pointer_crud/(raw_sqlite/smoke/(select_all_path_value|select_one_by_pk)|raw_storage_(sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema_file_null))/1k'
+```
+
+Result: passed.
+
+| row                                       |    median | criterion status    |
+| ----------------------------------------- | --------: | ------------------- |
+| `raw_sqlite/select_all_path_value/1k`     | 1.2300 ms | reference/no change |
+| `raw_sqlite/select_one_by_pk/1k`          | 1.0905 ms | reference/no change |
+| `sqlite/get_many_exact_keys/1k`           | 2.8295 ms | no change           |
+| `sqlite/scan_full_rows/1k`                | 2.3559 ms | no change           |
+| `sqlite/prefix_scan_schema_file_null/1k`  | 2.2079 ms | improved            |
+| `rocksdb/get_many_exact_keys/1k`          | 2.0448 ms | no change           |
+| `rocksdb/scan_full_rows/1k`               | 1.5172 ms | no change           |
+| `rocksdb/prefix_scan_schema_file_null/1k` | 1.4547 ms | no change           |
+
+Rerun command:
+
+```sh
+cargo bench -p lix_engine --bench json_pointer_crud --features storage-benches -- 'json_pointer_crud/(raw_sqlite/smoke/select_all_path_value|raw_storage_(sqlite|rocksdb)/smoke/(scan_full_rows|prefix_scan_schema_file_null))/1k'
+```
+
+Result: passed.
+
+| row                                       |    median | criterion status        |
+| ----------------------------------------- | --------: | ----------------------- |
+| `raw_sqlite/select_all_path_value/1k`     | 1.1630 ms | reference/no change     |
+| `sqlite/scan_full_rows/1k`                | 2.2529 ms | no change, lower median |
+| `sqlite/prefix_scan_schema_file_null/1k`  | 2.2044 ms | no change, lower median |
+| `rocksdb/scan_full_rows/1k`               | 1.4055 ms | improved                |
+| `rocksdb/prefix_scan_schema_file_null/1k` | 1.4103 ms | no change               |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                    |   bytes | bytes/row | status          |
+| -------------------------------------- | ------: | --------: | --------------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference       |
+| Lix SQLite / inserted                  |  897976 |     898.0 | unchanged       |
+| Lix SQLite / after create_version      |  910336 |     910.3 | unchanged       |
+| Lix SQLite / after fast-forward merge  | 5090808 |    5090.8 | unchanged/noisy |
+| Lix SQLite / after divergent merge     | 5234168 |    5234.2 | unchanged/noisy |
+| Lix RocksDB / inserted                 |  811776 |     811.8 | unchanged       |
+| Lix RocksDB / after create_version     |  813523 |     813.5 | unchanged       |
+| Lix RocksDB / after fast-forward merge |  962754 |     962.8 | unchanged       |
+| Lix RocksDB / after divergent merge    | 1306404 |    1306.4 | unchanged       |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+Initial review:
+HIGH: none.
+MEDIUM: none.
+LOW: trusted prefix helper should make its caller proof sharper; add targeted
+coverage for the hinted schema/file scan branch with tombstones and limits.
+
+Follow-up review:
+No HIGH/MEDIUM/LOW findings.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo check -p lix_engine --features storage-benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine scan_schema_file_prefix_honors_tombstones_and_limit --features storage-benches
+cargo test -p lix_engine key_codec_decodes_entity_suffix_with_trusted_prefix --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --bench json_pointer_crud --features storage-benches -- 'json_pointer_crud/(raw_sqlite/smoke/(select_all_path_value|select_one_by_pk)|raw_storage_(sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema_file_null))/1k'
+cargo bench -p lix_engine --bench json_pointer_crud --features storage-benches -- 'json_pointer_crud/(raw_sqlite/smoke/select_all_path_value|raw_storage_(sqlite|rocksdb)/smoke/(scan_full_rows|prefix_scan_schema_file_null))/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a scan key-decoding optimization.
+
+Primary axis: schema/file prefix scans. The structural win avoids reparsing
+schema/file fields from every matched encoded key and avoids repeating the key
+filter check when the encoded prefix range already proved those fields.
+
+Timing: SQLite prefix scan improved by Criterion in the first focused run.
+Rerun medians stayed lower but were Criterion-neutral, while RocksDB full scan
+improved by Criterion. Exact reads remained neutral, as expected.
+
+Storage is unchanged. No format change, no backward shim. This does not complete
+the <= 1.5x target; SQLite scans and root writes still need larger cuts.
 ```
