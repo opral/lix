@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::storage::{KvGetGroup, KvGetRequest, StorageReader, StorageWriteSet};
 use crate::tracked_state::codec::PendingChunkWrite;
 use crate::tracked_state::types::{
-    TrackedStateDeltaEntry, TrackedStateRootId, TRACKED_STATE_HASH_BYTES,
+    TrackedStateDeltaEntry, TrackedStateDeltaRef, TrackedStateRootId, TRACKED_STATE_HASH_BYTES,
 };
 use crate::LixError;
 
@@ -104,15 +104,15 @@ pub(crate) async fn load_delta_pack(
     crate::tracked_state::codec::decode_delta_pack(&bytes).map(Some)
 }
 
-pub(crate) fn stage_delta_pack(
+pub(crate) fn stage_delta_pack_refs(
     writes: &mut StorageWriteSet,
     commit_id: &str,
-    entries: &[TrackedStateDeltaEntry],
+    deltas: &[TrackedStateDeltaRef<'_>],
 ) -> Result<(), LixError> {
     writes.put(
         TRACKED_STATE_DELTA_PACK_NAMESPACE,
         commit_id.as_bytes().to_vec(),
-        crate::tracked_state::codec::encode_delta_pack(entries)?,
+        crate::tracked_state::codec::encode_delta_pack_refs(deltas)?,
     );
     Ok(())
 }
