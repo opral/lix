@@ -73,6 +73,7 @@ pub(crate) struct TrackedStateDeltaEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateIndexValue {
     pub(crate) change_locator: ChangeLocator,
+    pub(crate) deleted: bool,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
 }
@@ -81,6 +82,7 @@ pub(crate) struct TrackedStateIndexValue {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TrackedStateIndexValueRef<'a> {
     pub(crate) change_locator: ChangeLocatorRef<'a>,
+    pub(crate) deleted: bool,
     pub(crate) created_at: &'a str,
     pub(crate) updated_at: &'a str,
 }
@@ -164,7 +166,6 @@ pub(crate) struct TrackedStateTreeScanRequest {
     pub(crate) schema_keys: Vec<String>,
     pub(crate) entity_ids: Vec<EntityIdentity>,
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
-    pub(crate) include_tombstones: bool,
     pub(crate) limit: Option<usize>,
 }
 

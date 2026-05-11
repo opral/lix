@@ -8,12 +8,11 @@ use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::LixError;
 use std::collections::BTreeMap;
 
-/// Materializes tracked-state index entries from commit_store packs.
+/// Materializes tracked-state index entries.
 ///
-/// The durable tracked_state value carries only a commit_store locator plus a
-/// projection-local `updated_at` cache. Snapshot refs, metadata refs,
-/// tombstone state, change id, and source commit id are hydrated at this read
-/// boundary from grouped commit_store pack loads.
+/// The durable tracked_state value is authoritative for scalar projection
+/// fields. Snapshot and metadata payloads are hydrated from grouped commit_store
+/// pack loads only when the requested projection needs those JSON refs.
 pub(crate) async fn materialize_index_entries<S>(
     store: &mut S,
     commit_store: &CommitStoreContext,
@@ -23,78 +22,86 @@ pub(crate) async fn materialize_index_entries<S>(
 where
     S: StorageReader,
 {
+    let needs_commit_pack = projection.snapshot_content || projection.metadata;
     let mut packs = BTreeMap::new();
-    for (_, value) in &entries {
-        let key = (
-            value.change_locator.source_commit_id.clone(),
-            value.change_locator.source_pack_id,
-        );
-        if packs.contains_key(&key) {
-            continue;
+    if needs_commit_pack {
+        for (_, value) in &entries {
+            let key = (
+                value.change_locator.source_commit_id.clone(),
+                value.change_locator.source_pack_id,
+            );
+            if packs.contains_key(&key) {
+                continue;
+            }
+            let Some(changes) = commit_store
+                .reader(&mut *store)
+                .load_change_pack(&key.0, key.1)
+                .await?
+            else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked_state locator references missing change pack ({}, {})",
+                        key.0, key.1
+                    ),
+                ));
+            };
+            packs.insert(key, changes);
         }
-        let Some(changes) = commit_store
-            .reader(&mut *store)
-            .load_change_pack(&key.0, key.1)
-            .await?
-        else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "tracked_state locator references missing change pack ({}, {})",
-                    key.0, key.1
-                ),
-            ));
-        };
-        packs.insert(key, changes);
     }
 
     let mut row_plans = Vec::with_capacity(entries.len());
     let mut json_refs = Vec::new();
     let mut json_ref_localities = Vec::new();
     for (key, value) in entries {
-        let pack_key = (
-            value.change_locator.source_commit_id.clone(),
-            value.change_locator.source_pack_id,
-        );
-        let changes = packs.get(&pack_key).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked_state materialization lost a loaded commit_store pack",
-            )
-        })?;
-        let change = changes
-            .get(
-                usize::try_from(value.change_locator.source_ordinal).map_err(|_| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "tracked_state locator ordinal does not fit usize",
-                    )
-                })?,
-            )
-            .ok_or_else(|| {
+        let change = if needs_commit_pack {
+            let pack_key = (
+                value.change_locator.source_commit_id.clone(),
+                value.change_locator.source_pack_id,
+            );
+            let changes = packs.get(&pack_key).ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked_state locator for '{}' points past pack ({}, {})",
-                        value.change_locator.change_id,
-                        value.change_locator.source_commit_id,
-                        value.change_locator.source_pack_id
-                    ),
+                    "tracked_state materialization lost a loaded commit_store pack",
                 )
             })?;
-        if change.id != value.change_locator.change_id {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "tracked_state locator expected '{}' but found '{}'",
-                    value.change_locator.change_id, change.id
-                ),
-            ));
-        }
+            let change = changes
+                .get(
+                    usize::try_from(value.change_locator.source_ordinal).map_err(|_| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "tracked_state locator ordinal does not fit usize",
+                        )
+                    })?,
+                )
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "tracked_state locator for '{}' points past pack ({}, {})",
+                            value.change_locator.change_id,
+                            value.change_locator.source_commit_id,
+                            value.change_locator.source_pack_id
+                        ),
+                    )
+                })?;
+            if change.id != value.change_locator.change_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked_state locator expected '{}' but found '{}'",
+                        value.change_locator.change_id, change.id
+                    ),
+                ));
+            }
+            Some(change)
+        } else {
+            None
+        };
 
         let snapshot_ref_index = projected_json_ref_index(
             projection.snapshot_content,
-            change.snapshot_ref,
+            change.and_then(|change| change.snapshot_ref),
             &value.change_locator.source_commit_id,
             value.change_locator.source_pack_id,
             &mut json_refs,
@@ -102,7 +109,7 @@ where
         );
         let metadata_ref_index = projected_json_ref_index(
             projection.metadata,
-            change.metadata_ref,
+            change.and_then(|change| change.metadata_ref),
             &value.change_locator.source_commit_id,
             value.change_locator.source_pack_id,
             &mut json_refs,
@@ -112,10 +119,10 @@ where
             entity_id: key.entity_id,
             schema_key: key.schema_key,
             file_id: key.file_id,
-            deleted: change.snapshot_ref.is_none(),
+            deleted: value.deleted,
             created_at: value.created_at,
             updated_at: value.updated_at,
-            change_id: change.id.clone(),
+            change_id: value.change_locator.change_id,
             commit_id: value.change_locator.source_commit_id,
             snapshot_ref_index,
             metadata_ref_index,
