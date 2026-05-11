@@ -4,9 +4,11 @@ Goal: nail the physical layout Lix uses for tracked logic:
 `packages/engine/src/tracked_state`, `packages/engine/src/commit_store`, and
 the backend/storage APIs they require.
 
-Lix has not shipped. This log should prefer the best-shaped physical API and
-layout over compatibility shims. If a change keeps a backwards shim, the entry
-must explicitly call that out and justify why it is temporary.
+Lix has not shipped. Optimize for the best-shaped physical API, storage layout,
+and abstraction boundaries now. Prefer clean refactors over bolt-on fixes,
+adapter layers, compatibility shims, or special cases. If a change keeps a
+backwards shim, the entry must explicitly call that out and justify why it is
+temporary.
 
 The preferred refactor mode is:
 
@@ -20,19 +22,32 @@ temporarily non-compiling if the entry is clearly marked as a physical-layout
 cutover step and the next step is compiler-driven migration. Do not hide old
 behavior behind adapter layers just to keep call sites compiling.
 
+The desired end state is good abstractions, not a faster pile of special-case
+paths. If the current abstraction is the bottleneck, replace it cleanly.
+
 North-star target:
 
 ```text
-10k logical writes through the tracked-state/commit-store path should complete
-in less than 100ms end-to-end.
+Large logical write batches through the tracked-state/commit-store path should
+leave enough time budget for the logical layer above storage.
 ```
 
 Physical storage budget:
 
 ```text
-The storage layer should leave budget for the logical layer:
-  target: <= 30-50ms for 10k physical writes
-  hard review trigger: > 3x raw SQLite for equivalent writes, exact reads, or scans
+For 1k-operation physical rows, Lix SQLite and Lix RocksDB should be <= 1.5x
+raw SQLite for equivalent writes, exact reads, and scans.
+
+Raw SQLite is not a bare-metal KV baseline: it still goes through SQL statement
+execution, cursor/seek machinery, and SELECT/INSERT/UPDATE/DELETE paths. Lix
+physical rows use direct storage access, so exceeding this budget means Lix is
+likely paying avoidable layout, packing, materialization, batching, or backend
+abstraction costs.
+
+For storage size, post-vacuum Lix bytes/row should be <= 2x post-vacuum raw
+SQLite bytes/row for equivalent tracked storage states. Extra bytes beyond that
+must be explained by durable tracked history, commit facts, merge/conflict
+facts, or retained delta structure before a size-sensitive change is kept.
 ```
 
 This log is not for SQL-provider ergonomics. SQL and CRUD benchmarks may point
@@ -60,7 +75,7 @@ Setup changes for this log:
 - Added the `json_pointer_physical` bench target to
   `packages/engine/Cargo.toml`.
 - Added a raw SQLite reference group inside the physical benchmark so the
-  `3x SQLite` budget has a measured baseline.
+  SQLite-relative budgets have a measured baseline.
 - Kept the existing JSON-pointer storage fixture test as the bytes-on-disk
   guardrail.
 
@@ -99,9 +114,10 @@ log unless the physical rows are already inside budget and the remaining time
 is clearly above storage.
 ```
 
-Tracked logic stays tracked. Do not move benchmarks, fixtures, changed-key
-logic, commit-store logic, or tracked-state behavior from tracked to untracked
-code to improve numbers.
+Tracked logic is the product path and the default mode in Lix. Optimizations
+must make tracked logic faster; they must not avoid tracked machinery by moving
+workloads, benchmarks, fixtures, changed-key logic, commit-store logic, or
+tracked-state behavior into untracked code.
 
 ## Refactor Policy
 
@@ -109,10 +125,13 @@ Allowed:
 
 ```text
 change the storage/backend API when the current API forces bad physical layout;
+add or reshape backend/storage APIs, including namespacing-oriented APIs, when
+  the shape materially improves both SQLite and RocksDB;
 change tracked_state and commit_store layouts when the new layout is cleaner;
 break old call sites and let the compiler drive the migration;
 delete legacy abstractions that only exist to preserve pre-ship compatibility;
-replace one-off fixes with a shared abstraction when the problem is systemic.
+replace one-off fixes with a shared abstraction when the problem is systemic;
+remove bolt-on fast paths once the clean abstraction covers the same behavior.
 ```
 
 Required when changing storage/backend APIs:
@@ -121,6 +140,8 @@ Required when changing storage/backend APIs:
 state the physical problem the old API caused;
 show how SQLite and RocksDB can both implement the new shape without hidden
   per-key loops or full-value hydration;
+show that both SQLite and RocksDB improve materially, or explain why the API
+  change is still required for a later shared layout win;
 preserve transaction atomicity, durability, and hash/integrity checks;
 prefer batched, streaming, prefix/range, and projection-aware operations;
 avoid copy-heavy boundaries unless the entry explicitly measures and accepts
@@ -136,7 +157,10 @@ SQLite-only wins that silently regress RocksDB;
 RocksDB-only wins that silently regress SQLite;
 benchmark rewrites that change what is being measured;
 workarounds scoped only to the current hot row when the abstraction is wrong;
-moving tracked logic or benchmarks into untracked paths;
+bolt-on fast paths that leave the bad abstraction in place;
+adapter layers whose main purpose is avoiding the clean refactor;
+moving tracked logic, benchmarks, or benchmark workload into untracked paths;
+shifting cost out of tracked_state/commit_store to avoid tracked machinery;
 forcing full materialization to avoid designing the right index/layout;
 backwards shims unless the entry explicitly marks and justifies them.
 ```
@@ -152,7 +176,8 @@ packages/engine/benches/json_pointer_physical/main.rs
 Command:
 
 ```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- baseline
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- smoke
 ```
 
 Groups:
@@ -160,32 +185,29 @@ Groups:
 ```text
 json_pointer_physical/raw_sqlite/baseline
 json_pointer_physical/raw_sqlite/smoke
-json_pointer_physical/raw_sqlite/scale
 json_pointer_physical/sqlite/baseline
 json_pointer_physical/sqlite/smoke
-json_pointer_physical/sqlite/scale
 json_pointer_physical/rocksdb/baseline
 json_pointer_physical/rocksdb/smoke
-json_pointer_physical/rocksdb/scale
 ```
 
 Rows:
 
 ```text
-write_root_all_rows/{100,1k,10k}
-get_many_exact_keys/{100,1k,10k}
-get_many_missing_keys/{100,1k,10k}
-exists_many_exact_keys/{100,1k,10k}
-scan_keys_only/{100,1k,10k}
-scan_headers_only/{100,1k,10k}
-scan_full_rows/{100,1k,10k}
-prefix_scan_schema/{100,1k,10k}
-prefix_scan_schema_file_null/{100,1k,10k}
-write_delta_10pct_updates/{100,1k,10k}
-write_tombstone_10pct_deletes/{100,1k,10k}
-changed_keys_update_10pct/{100,1k,10k}
-changed_keys_delta_chain_10x1pct/{100,1k,10k}
-materialize_delta_chain_10x1pct/{100,1k,10k}
+write_root_all_rows/{100,1k}
+get_many_exact_keys/{100,1k}
+get_many_missing_keys/{100,1k}
+exists_many_exact_keys/{100,1k}
+scan_keys_only/{100,1k}
+scan_headers_only/{100,1k}
+scan_full_rows/{100,1k}
+prefix_scan_schema/{100,1k}
+prefix_scan_schema_file_null/{100,1k}
+write_delta_10pct_updates/{100,1k}
+write_tombstone_10pct_deletes/{100,1k}
+changed_keys_update_10pct/{100,1k}
+changed_keys_delta_chain_10x1pct/{100,1k}
+materialize_delta_chain_10x1pct/{100,1k}
 ```
 
 Fixture:
@@ -199,7 +221,6 @@ file_id: NULL
 sizes:
   baseline = 100 rows
   smoke = 1,000 rows
-  scale = 10,000 rows
 ```
 
 Why this fixture:
@@ -207,6 +228,15 @@ Why this fixture:
 ```text
 It mirrors plugin-json-v2 output: many small entities, stable path identities,
 container rows, leaf rows, and realistic nested JSON values.
+```
+
+Benchmark-surface intent:
+
+```text
+This benchmark surface should stabilize the physical layout before logical-layer
+optimization begins. New physical rows should be added only when logical work
+reveals a genuinely new tracked access pattern, not to move the goalposts for
+an existing optimization.
 ```
 
 ## Raw SQLite Reference
@@ -234,7 +264,7 @@ Reference interpretation:
 
 ```text
 Rows near raw SQLite are close to backend speed.
-Rows above 3x raw SQLite are likely dominated by Lix packing, projection,
+Rows above 1.5x raw SQLite are likely dominated by Lix packing, projection,
 materialization, hashing, diff semantics, or backend abstraction overhead.
 ```
 
@@ -272,7 +302,7 @@ costs such as unbatched IO, accidental full-value hydration, extra copies across
 the backend boundary, or backend-specific behavior that another supported
 backend cannot implement well.
 
-### 3x SQLite Budget
+### 1.5x SQLite Runtime Budget
 
 This is an envelope, not an average. Passing writes does not compensate for
 failing reads, and passing reads does not compensate for failing writes.
@@ -280,38 +310,38 @@ failing reads, and passing reads does not compensate for failing writes.
 Write rows:
 
 ```text
-compare json_pointer_physical/{sqlite,rocksdb}/scale/write_root_all_rows/10k
-  to json_pointer_physical/raw_sqlite/scale/write_root_all_rows/10k
-compare json_pointer_physical/{sqlite,rocksdb}/scale/write_delta_10pct_updates/10k
-  to json_pointer_physical/raw_sqlite/scale/write_delta_10pct_updates/10k
-compare json_pointer_physical/{sqlite,rocksdb}/scale/write_tombstone_10pct_deletes/10k
-  to json_pointer_physical/raw_sqlite/scale/write_tombstone_10pct_deletes/10k
+compare json_pointer_physical/{sqlite,rocksdb}/smoke/write_root_all_rows/1k
+  to json_pointer_physical/raw_sqlite/smoke/write_root_all_rows/1k
+compare json_pointer_physical/{sqlite,rocksdb}/smoke/write_delta_10pct_updates/1k
+  to json_pointer_physical/raw_sqlite/smoke/write_delta_10pct_updates/1k
+compare json_pointer_physical/{sqlite,rocksdb}/smoke/write_tombstone_10pct_deletes/1k
+  to json_pointer_physical/raw_sqlite/smoke/write_tombstone_10pct_deletes/1k
 ```
 
 Exact-read rows:
 
 ```text
-compare json_pointer_physical/{sqlite,rocksdb}/scale/get_many_exact_keys/10k
-  to json_pointer_physical/raw_sqlite/scale/get_many_exact_keys/10k
-compare json_pointer_physical/{sqlite,rocksdb}/scale/get_many_missing_keys/10k
-  to json_pointer_physical/raw_sqlite/scale/get_many_missing_keys/10k
-compare json_pointer_physical/{sqlite,rocksdb}/scale/exists_many_exact_keys/10k
-  to json_pointer_physical/raw_sqlite/scale/exists_many_exact_keys/10k
+compare json_pointer_physical/{sqlite,rocksdb}/smoke/get_many_exact_keys/1k
+  to json_pointer_physical/raw_sqlite/smoke/get_many_exact_keys/1k
+compare json_pointer_physical/{sqlite,rocksdb}/smoke/get_many_missing_keys/1k
+  to json_pointer_physical/raw_sqlite/smoke/get_many_missing_keys/1k
+compare json_pointer_physical/{sqlite,rocksdb}/smoke/exists_many_exact_keys/1k
+  to json_pointer_physical/raw_sqlite/smoke/exists_many_exact_keys/1k
 ```
 
 Scan rows:
 
 ```text
-compare json_pointer_physical/{sqlite,rocksdb}/scale/scan_keys_only/10k
-  to json_pointer_physical/raw_sqlite/scale/scan_keys_only/10k
-compare json_pointer_physical/{sqlite,rocksdb}/scale/scan_headers_only/10k
-  to json_pointer_physical/raw_sqlite/scale/scan_headers_only/10k
-compare json_pointer_physical/{sqlite,rocksdb}/scale/scan_full_rows/10k
-  to json_pointer_physical/raw_sqlite/scale/scan_full_rows/10k
-compare json_pointer_physical/{sqlite,rocksdb}/scale/prefix_scan_schema/10k
-  to json_pointer_physical/raw_sqlite/scale/prefix_scan_schema/10k
-compare json_pointer_physical/{sqlite,rocksdb}/scale/prefix_scan_schema_file_null/10k
-  to json_pointer_physical/raw_sqlite/scale/prefix_scan_schema_file_null/10k
+compare json_pointer_physical/{sqlite,rocksdb}/smoke/scan_keys_only/1k
+  to json_pointer_physical/raw_sqlite/smoke/scan_keys_only/1k
+compare json_pointer_physical/{sqlite,rocksdb}/smoke/scan_headers_only/1k
+  to json_pointer_physical/raw_sqlite/smoke/scan_headers_only/1k
+compare json_pointer_physical/{sqlite,rocksdb}/smoke/scan_full_rows/1k
+  to json_pointer_physical/raw_sqlite/smoke/scan_full_rows/1k
+compare json_pointer_physical/{sqlite,rocksdb}/smoke/prefix_scan_schema/1k
+  to json_pointer_physical/raw_sqlite/smoke/prefix_scan_schema/1k
+compare json_pointer_physical/{sqlite,rocksdb}/smoke/prefix_scan_schema_file_null/1k
+  to json_pointer_physical/raw_sqlite/smoke/prefix_scan_schema_file_null/1k
 ```
 
 Changed-key and delta-chain rows do not have a clean raw SQLite equivalent.
@@ -337,19 +367,21 @@ materialize_delta_chain_10x1pct:
 
 5-15% slower:
   acceptable only with a clear primary-axis win, a structural explanation, and
-  no crossed 3x budget.
+  no crossed 1.5x runtime budget.
 
 > 15% slower:
   fail unless explicitly accepted as a layout tradeoff.
 
-No change may make an axis that passes the 3x budget start failing it.
+No change may make an axis that passes the 1.5x runtime budget start failing it.
 ```
 
 Storage guardrail:
 
 ```text
-Bytes after inserted/create_version/fast-forward/divergent merge must remain
-explainable. A speedup that causes unexplained storage growth is not kept.
+Post-vacuum bytes after inserted/create_version/fast-forward/divergent merge
+should stay <= 2x post-vacuum raw SQLite bytes/row for equivalent tracked
+storage states. Extra bytes must remain explainable. A speedup that causes
+unexplained storage growth is not kept.
 ```
 
 ## Storage Fixture Guardrail
@@ -377,26 +409,33 @@ Lix RocksDB / after divergent merge
 ## Agent Rules
 
 1. Optimize physical layout and backend APIs, not SQL surface shape.
-2. Prefer clean, compiler-driven refactors over backwards shims. If a shim is
-   kept, flag it.
+2. Prefer clean, compiler-driven refactors and good abstractions over bolt-on
+   fixes, adapter layers, or backwards shims. If a shim is kept, flag it.
 3. Optimize one primary axis at a time and report guardrails for the other
    axes.
 4. Compare against raw SQLite where there is an equivalent row.
 5. Report SQLite and RocksDB physical rows before keeping backend-sensitive
    changes.
 6. Prefer explicit batched APIs over hidden loops of single-key operations.
-7. Do not improve one backend by silently regressing the other.
-8. Do not change benchmark measurements to make a change look better.
-9. Do not move tracked logic, fixtures, or benchmarks into untracked paths.
-10. Do not improve writes by forcing broad projection-root materialization
+7. Backend/storage API changes are allowed when they materially improve both
+   SQLite and RocksDB, including namespacing-oriented APIs.
+8. Do not improve one backend by silently regressing the other.
+9. Do not change benchmark measurements to make a change look better.
+10. Do not move tracked logic, fixtures, benchmarks, or benchmark workload into
+    untracked paths. Optimize tracked logic itself.
+11. Do not shift cost out of tracked_state/commit_store to bypass tracked
+    machinery.
+12. Do not keep bolt-on fast paths when a clean abstraction should replace the
+    old shape.
+13. Do not improve writes by forcing broad projection-root materialization
     unless the entry is explicitly a materialization-policy experiment.
-11. Do not make key/header-only scans hydrate full JSON values.
-12. Do not introduce avoidable copies at the backend boundary without measuring
+14. Do not make key/header-only scans hydrate full JSON values.
+15. Do not introduce avoidable copies at the backend boundary without measuring
     and justifying them.
-13. Do not remove hash verification, transaction atomicity, or durability
+16. Do not remove hash verification, transaction atomicity, or durability
     semantics to win a benchmark.
-14. Document rejected experiments if they teach something about the cost model.
-15. Append one compact entry per optimization.
+17. Document rejected experiments if they teach something about the cost model.
+18. Append one compact entry per optimization.
 
 ## Baseline
 
@@ -417,19 +456,18 @@ cargo bench -p lix_engine --features storage-benches --bench json_pointer_physic
 
 Result: passed.
 
-Not yet run:
+Accepted baseline run:
 
-```text
-Full json_pointer_physical baseline.
-10k scale rows for the 3x SQLite budget.
-json_pointer_crud_storage fixture guardrail.
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- baseline
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- smoke
+cargo test -p lix_engine --features storage-benches --test json_pointer_crud_storage -- --ignored --nocapture --test-threads=1
 ```
 
-Reason:
+Result:
 
 ```text
-This entry establishes the benchmark surface first. The next entry should run
-and paste the full baseline before the first optimization is kept.
+passed
 ```
 
 ### Raw SQLite / Lix Smoke Check
@@ -452,9 +490,9 @@ Interpretation:
 The benchmark wiring works and the raw SQLite reference group appears beside
 the Lix physical backends.
 
-At 100 rows, exact reads are inside the 3x SQLite envelope for both backends.
+At 100 rows, exact reads are near the runtime envelope for both backends.
 This is only a smoke check. It is not the accepted baseline for optimization.
-The accepted baseline must use the 1k smoke and 10k scale rows.
+The accepted baseline must include the 1k smoke rows.
 ```
 
 ### Required Baseline Command
@@ -462,51 +500,52 @@ The accepted baseline must use the 1k smoke and 10k scale rows.
 Before the first optimization entry, run:
 
 ```sh
-cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- baseline
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- smoke
 cargo test -p lix_engine --features storage-benches --test json_pointer_crud_storage -- --ignored --nocapture --test-threads=1
 ```
 
-### Baseline Scoreboard Template
+### Baseline Scoreboard
 
-Fill this section after the full baseline run.
+The 1k smoke rows are the accepted optimization baseline.
 
-#### 3x Budget Rows, 10k
+#### 1.5x Runtime Budget Rows, 1k
 
-| axis       | row                                 | raw SQLite median | Lix SQLite median | SQLite ratio | Lix RocksDB median | RocksDB ratio | status |
-| ---------- | ----------------------------------- | ----------------: | ----------------: | -----------: | -----------------: | ------------: | ------ |
-| write      | `write_root_all_rows/10k`           |                   |                   |              |                    |               |        |
-| write      | `write_delta_10pct_updates/10k`     |                   |                   |              |                    |               |        |
-| write      | `write_tombstone_10pct_deletes/10k` |                   |                   |              |                    |               |        |
-| exact-read | `get_many_exact_keys/10k`           |                   |                   |              |                    |               |        |
-| exact-read | `get_many_missing_keys/10k`         |                   |                   |              |                    |               |        |
-| exact-read | `exists_many_exact_keys/10k`        |                   |                   |              |                    |               |        |
-| scan       | `scan_keys_only/10k`                |                   |                   |              |                    |               |        |
-| scan       | `scan_headers_only/10k`             |                   |                   |              |                    |               |        |
-| scan       | `scan_full_rows/10k`                |                   |                   |              |                    |               |        |
-| scan       | `prefix_scan_schema/10k`            |                   |                   |              |                    |               |        |
-| scan       | `prefix_scan_schema_file_null/10k`  |                   |                   |              |                    |               |        |
+| axis       | row                                | raw SQLite median | Lix SQLite median | SQLite ratio | Lix RocksDB median | RocksDB ratio | status                          |
+| ---------- | ---------------------------------- | ----------------: | ----------------: | -----------: | -----------------: | ------------: | ------------------------------- |
+| write      | `write_root_all_rows/1k`           |         2.4583 ms |         6.8347 ms |        2.78x |          6.1430 ms |         2.50x | SQLite and RocksDB fail         |
+| write      | `write_delta_10pct_updates/1k`     |         1.5396 ms |         2.6272 ms |        1.71x |          1.3950 ms |         0.91x | SQLite fail                     |
+| write      | `write_tombstone_10pct_deletes/1k` |         1.4156 ms |         2.4321 ms |        1.72x |          1.3632 ms |         0.96x | SQLite fail                     |
+| exact-read | `get_many_exact_keys/1k`           |         2.2859 ms |         4.6055 ms |        2.01x |          3.4668 ms |         1.52x | SQLite and RocksDB fail         |
+| exact-read | `get_many_missing_keys/1k`         |         13.931 ms |         2.2822 ms |        0.16x |          1.4138 ms |         0.10x | pass                            |
+| exact-read | `exists_many_exact_keys/1k`        |         2.0545 ms |         4.6519 ms |        2.26x |          3.4720 ms |         1.69x | SQLite and RocksDB fail         |
+| scan       | `scan_keys_only/1k`                |         1.2374 ms |         3.2542 ms |        2.63x |          2.0822 ms |         1.68x | SQLite and RocksDB fail         |
+| scan       | `scan_headers_only/1k`             |         1.2378 ms |         3.0692 ms |        2.48x |          2.0012 ms |         1.62x | SQLite and RocksDB fail         |
+| scan       | `scan_full_rows/1k`                |         1.2920 ms |         4.3792 ms |        3.39x |          3.1884 ms |         2.47x | SQLite fail                     |
+| scan       | `prefix_scan_schema/1k`            |         1.2514 ms |         4.4623 ms |        3.57x |          3.2190 ms |         2.57x | SQLite and RocksDB fail         |
+| scan       | `prefix_scan_schema_file_null/1k`  |         1.3817 ms |         4.3889 ms |        3.18x |          3.1497 ms |         2.28x | SQLite and RocksDB fail         |
 
 #### Diff / Materialization Shape Rows
 
-| row                                    | Lix SQLite median | Lix RocksDB median | expected shape                           | status |
-| -------------------------------------- | ----------------: | -----------------: | ---------------------------------------- | ------ |
-| `changed_keys_update_10pct/10k`        |                   |                    | scales with changed keys                 |        |
-| `changed_keys_delta_chain_10x1pct/10k` |                   |                    | scales with changed keys and chain depth |        |
-| `materialize_delta_chain_10x1pct/10k`  |                   |                    | avoids unrelated delta-pack decoding     |        |
+| row                                   | Lix SQLite median | Lix RocksDB median | expected shape                           | status  |
+| ------------------------------------- | ----------------: | -----------------: | ---------------------------------------- | ------- |
+| `changed_keys_update_10pct/1k`        |         68.399 ms |          67.192 ms | scales with changed keys                 | hotspot |
+| `changed_keys_delta_chain_10x1pct/1k` |         10.401 ms |          8.7436 ms | scales with changed keys and chain depth | watch   |
+| `materialize_delta_chain_10x1pct/1k`  |         5.7651 ms |          2.7741 ms | avoids unrelated delta-pack decoding     | watch   |
 
 #### Storage Fixture
 
-| backend / state                        | bytes on disk | bytes/row | status |
-| -------------------------------------- | ------------: | --------: | ------ |
-| raw SQLite / inserted                  |               |           |        |
-| Lix SQLite / inserted                  |               |           |        |
-| Lix SQLite / after create_version      |               |           |        |
-| Lix SQLite / after fast-forward merge  |               |           |        |
-| Lix SQLite / after divergent merge     |               |           |        |
-| Lix RocksDB / inserted                 |               |           |        |
-| Lix RocksDB / after create_version     |               |           |        |
-| Lix RocksDB / after fast-forward merge |               |           |        |
-| Lix RocksDB / after divergent merge    |               |           |        |
+| backend / state                        | bytes on disk | bytes/row | status                                                  |
+| -------------------------------------- | ------------: | --------: | ------------------------------------------------------- |
+| raw SQLite / inserted                  |       1692456 |    1692.5 | baseline                                                |
+| Lix SQLite / inserted                  |       1075136 |    1075.1 | baseline                                                |
+| Lix SQLite / after create_version      |       1087496 |    1087.5 | baseline                                                |
+| Lix SQLite / after fast-forward merge  |       5287488 |    5287.5 | growth to explain before keeping size-sensitive changes |
+| Lix SQLite / after divergent merge     |       5615168 |    5615.2 | growth to explain before keeping size-sensitive changes |
+| Lix RocksDB / inserted                 |        993900 |     993.9 | baseline                                                |
+| Lix RocksDB / after create_version     |        995766 |     995.8 | baseline                                                |
+| Lix RocksDB / after fast-forward merge |       1157143 |    1157.1 | baseline                                                |
+| Lix RocksDB / after divergent merge    |       1528256 |    1528.3 | baseline                                                |
 
 ## Entries
 
@@ -567,29 +606,29 @@ Does this create or remove copies across the backend boundary?
 Compare against the log8 baseline and, if different, the immediately previous
 kept entry.
 
-#### 3x Budget Rows
+#### 1.5x Runtime Budget Rows
 
-| axis       | row                                 | raw SQLite median | before median | after median | ratio after/raw | delta | status |
-| ---------- | ----------------------------------- | ----------------: | ------------: | -----------: | --------------: | ----: | ------ |
-| write      | `write_root_all_rows/10k`           |                   |               |              |                 |       |        |
-| write      | `write_delta_10pct_updates/10k`     |                   |               |              |                 |       |        |
-| write      | `write_tombstone_10pct_deletes/10k` |                   |               |              |                 |       |        |
-| exact-read | `get_many_exact_keys/10k`           |                   |               |              |                 |       |        |
-| exact-read | `get_many_missing_keys/10k`         |                   |               |              |                 |       |        |
-| exact-read | `exists_many_exact_keys/10k`        |                   |               |              |                 |       |        |
-| scan       | `scan_keys_only/10k`                |                   |               |              |                 |       |        |
-| scan       | `scan_headers_only/10k`             |                   |               |              |                 |       |        |
-| scan       | `scan_full_rows/10k`                |                   |               |              |                 |       |        |
-| scan       | `prefix_scan_schema/10k`            |                   |               |              |                 |       |        |
-| scan       | `prefix_scan_schema_file_null/10k`  |                   |               |              |                 |       |        |
+| axis       | row                                | raw SQLite median | before median | after median | ratio after/raw | delta | status |
+| ---------- | ---------------------------------- | ----------------: | ------------: | -----------: | --------------: | ----: | ------ |
+| write      | `write_root_all_rows/1k`           |                   |               |              |                 |       |        |
+| write      | `write_delta_10pct_updates/1k`     |                   |               |              |                 |       |        |
+| write      | `write_tombstone_10pct_deletes/1k` |                   |               |              |                 |       |        |
+| exact-read | `get_many_exact_keys/1k`           |                   |               |              |                 |       |        |
+| exact-read | `get_many_missing_keys/1k`         |                   |               |              |                 |       |        |
+| exact-read | `exists_many_exact_keys/1k`        |                   |               |              |                 |       |        |
+| scan       | `scan_keys_only/1k`                |                   |               |              |                 |       |        |
+| scan       | `scan_headers_only/1k`             |                   |               |              |                 |       |        |
+| scan       | `scan_full_rows/1k`                |                   |               |              |                 |       |        |
+| scan       | `prefix_scan_schema/1k`            |                   |               |              |                 |       |        |
+| scan       | `prefix_scan_schema_file_null/1k`  |                   |               |              |                 |       |        |
 
 #### Diff / Materialization
 
-| row                                    | before median | after median | delta | shape status |
-| -------------------------------------- | ------------: | -----------: | ----: | ------------ |
-| `changed_keys_update_10pct/10k`        |               |              |       |              |
-| `changed_keys_delta_chain_10x1pct/10k` |               |              |       |              |
-| `materialize_delta_chain_10x1pct/10k`  |               |              |       |              |
+| row                                   | before median | after median | delta | shape status |
+| ------------------------------------- | ------------: | -----------: | ----: | ------------ |
+| `changed_keys_update_10pct/1k`        |               |              |       |              |
+| `changed_keys_delta_chain_10x1pct/1k` |               |              |       |              |
+| `materialize_delta_chain_10x1pct/1k`  |               |              |       |              |
 
 #### Storage
 
@@ -613,15 +652,17 @@ List guardrails that were not meaningfully impacted. Do not leave this blank.
 
 | guardrail                                         | after value | status |
 | ------------------------------------------------- | ----------: | ------ |
-| 10k physical write budget <= 30-50ms target       |             |        |
-| 10k physical write hard review <= 3x raw SQLite   |             |        |
-| exact reads <= 3x raw SQLite                      |             |        |
-| scans <= 3x raw SQLite                            |             |        |
+| physical write budget stays near backend speed    |             |        |
+| physical write runtime <= 1.5x raw SQLite         |             |        |
+| exact reads <= 1.5x raw SQLite                    |             |        |
+| scans <= 1.5x raw SQLite                          |             |        |
 | header-only scans do not hydrate full JSON values |             |        |
 | SQLite and RocksDB both reported                  |             |        |
 | storage growth explained                          |             |        |
+| post-vacuum storage <= 2x raw SQLite              |             |        |
 | backend boundary copy cost explained              |             |        |
-| no tracked logic moved to untracked paths         |             |        |
+| tracked logic remains on the tracked path         |             |        |
+| no workload shifted to untracked machinery        |             |        |
 | no benchmark measurement changed                  |             |        |
 
 ### Interpretation
