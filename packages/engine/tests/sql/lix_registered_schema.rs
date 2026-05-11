@@ -163,7 +163,7 @@ simulation_test!(
             .await
             .expect_err("system schema keys should not be user-registerable");
 
-        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         assert!(
             error.message.contains("system schema"),
             "unexpected error: {error:?}"
@@ -231,9 +231,11 @@ simulation_test!(lix_registered_schema_delete_is_rejected, |sim| async move {
         .await
         .expect_err("schema deletion is not supported yet");
 
-    assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+    assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
     assert!(
-        error.message.contains("schema deletion is not supported"),
+        error
+            .message
+            .contains("delete lix_registered_schema is not supported"),
         "unexpected error: {error:?}"
     );
 });

@@ -78,12 +78,10 @@ simulation_test!(lix_json_get_rejects_jsonpath_strings, |sim| async move {
         .await
         .expect_err("JSONPath-looking strings should fail loudly");
 
-    assert_eq!(error.code, LixError::CODE_INVALID_JSON_PATH);
+    assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
     assert!(
-        error
-            .hint()
-            .is_some_and(|hint| hint.contains("lix_json_get_text")),
-        "expected path segment hint: {error}"
+        error.message.contains("uses variadic path segments"),
+        "expected path segment diagnostic: {error}"
     );
 });
 
@@ -229,6 +227,6 @@ simulation_test!(
             .await
             .expect_err("bare text lixcol_entity_id delete should fail before matching rows");
 
-        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
     }
 );

@@ -50,12 +50,12 @@ impl VersionBinding {
         }
     }
 
-    pub(crate) fn require_active_version_id(&self, operation: &str) -> Result<String, LixError> {
+    pub(crate) fn require_active_version_id(&self, action: &str) -> Result<String, LixError> {
         match self {
             Self::Active { version_id } => Ok(version_id.clone()),
             Self::Explicit => Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                format!("{operation} is only supported for active-version SQL surfaces"),
+                format!("{action} is only supported for active-version SQL surfaces"),
             )),
         }
     }
@@ -65,7 +65,7 @@ pub(crate) fn resolve_write_version_scope(
     explicit_global: Option<bool>,
     explicit_version_id: Option<String>,
     fallback_version_id: Option<&str>,
-    operation: &str,
+    action: &str,
     surface: &str,
 ) -> Result<WriteVersionScope, DataFusionError> {
     if explicit_global == Some(true) {
@@ -86,7 +86,7 @@ pub(crate) fn resolve_write_version_scope(
     let version_id = explicit_version_id
         .or_else(|| fallback_version_id.map(ToOwned::to_owned))
         .ok_or_else(|| {
-            DataFusionError::Execution(format!("{operation} requires lixcol_version_id"))
+            DataFusionError::Execution(format!("{action} requires lixcol_version_id"))
         })?;
     if explicit_global == Some(false) && version_id == GLOBAL_VERSION_ID {
         return Err(DataFusionError::Execution(format!(

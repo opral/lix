@@ -949,12 +949,12 @@ fn with_origin(
 }
 
 fn lix_version_origin(
-    operation: TransactionWriteOperation,
+    action: TransactionWriteOperation,
     version_id: &str,
 ) -> TransactionWriteOrigin {
     TransactionWriteOrigin {
         surface: "lix_version".to_string(),
-        operation,
+        operation: action,
         primary_key: Some(LogicalPrimaryKey {
             columns: vec!["id".to_string()],
             values: vec![version_id.to_string()],
@@ -1028,11 +1028,11 @@ fn required_string_value(
     batch: &RecordBatch,
     row_index: usize,
     column_name: &str,
-    operation: &str,
+    action: &str,
 ) -> Result<String> {
-    optional_string_value(batch, row_index, column_name, operation)?.ok_or_else(|| {
+    optional_string_value(batch, row_index, column_name, action)?.ok_or_else(|| {
         DataFusionError::Execution(format!(
-            "{operation} lix_version requires non-null text column '{column_name}'"
+            "{action} lix_version requires non-null text column '{column_name}'"
         ))
     })
 }
@@ -1041,7 +1041,7 @@ fn optional_string_value(
     batch: &RecordBatch,
     row_index: usize,
     column_name: &str,
-    operation: &str,
+    action: &str,
 ) -> Result<Option<String>> {
     match optional_scalar_value(batch, row_index, column_name)? {
         None
@@ -1053,7 +1053,7 @@ fn optional_string_value(
         | Some(ScalarValue::Utf8View(Some(value)))
         | Some(ScalarValue::LargeUtf8(Some(value))) => Ok(Some(value)),
         Some(other) => Err(DataFusionError::Execution(format!(
-            "{operation} lix_version expected text-compatible column '{column_name}', got {other:?}"
+            "{action} lix_version expected text-compatible column '{column_name}', got {other:?}"
         ))),
     }
 }
@@ -1062,11 +1062,11 @@ fn required_bool_value(
     batch: &RecordBatch,
     row_index: usize,
     column_name: &str,
-    operation: &str,
+    action: &str,
 ) -> Result<bool> {
-    optional_bool_value(batch, row_index, column_name, operation)?.ok_or_else(|| {
+    optional_bool_value(batch, row_index, column_name, action)?.ok_or_else(|| {
         DataFusionError::Execution(format!(
-            "{operation} lix_version requires non-null boolean column '{column_name}'"
+            "{action} lix_version requires non-null boolean column '{column_name}'"
         ))
     })
 }
@@ -1075,13 +1075,13 @@ fn optional_bool_value(
     batch: &RecordBatch,
     row_index: usize,
     column_name: &str,
-    operation: &str,
+    action: &str,
 ) -> Result<Option<bool>> {
     match optional_scalar_value(batch, row_index, column_name)? {
         None | Some(ScalarValue::Null) | Some(ScalarValue::Boolean(None)) => Ok(None),
         Some(ScalarValue::Boolean(Some(value))) => Ok(Some(value)),
         Some(other) => Err(DataFusionError::Execution(format!(
-            "{operation} lix_version expected boolean column '{column_name}', got {other:?}"
+            "{action} lix_version expected boolean column '{column_name}', got {other:?}"
         ))),
     }
 }

@@ -13,10 +13,7 @@ macro_rules! canonical_identity_type {
         impl $name {
             pub fn new(value: impl Into<String>) -> Result<Self, LixError> {
                 let value = value.into();
-                if value.is_empty() {
-                    return Err(LixError::unknown(format!("{} must be non-empty", $label)));
-                }
-                Ok(Self(value))
+                validate_non_empty_identity_value($label, value).map(Self)
             }
 
             pub fn as_str(&self) -> &str {
@@ -114,6 +111,20 @@ canonical_identity_type!(FileId, "file_id");
 canonical_identity_type!(VersionId, "version_id");
 canonical_identity_type!(CanonicalSchemaKey, "schema_key");
 canonical_identity_type!(CanonicalPluginKey, "plugin_key");
+
+pub(crate) fn validate_non_empty_identity_value(
+    label: &str,
+    value: impl Into<String>,
+) -> Result<String, LixError> {
+    let value = value.into();
+    if value.is_empty() {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!("{label} must be non-empty"),
+        ));
+    }
+    Ok(value)
+}
 
 pub(crate) fn json_pointer_get<'a>(
     value: &'a serde_json::Value,

@@ -471,7 +471,7 @@ simulation_test!(
             )
             .await
             .expect_err("version ref commit_id should reference an existing commit");
-        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+        assert_eq!(error.code, LixError::CODE_VERSION_NOT_FOUND);
 
         assert_eq!(
             count_rows(

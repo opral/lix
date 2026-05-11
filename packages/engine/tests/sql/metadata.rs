@@ -298,9 +298,11 @@ fn assert_invalid_metadata_error(error: LixError) {
     assert!(
         matches!(
             error.code.as_str(),
-            "LIX_ERROR_INVALID_JSON" | LixError::CODE_SCHEMA_VALIDATION
+            "LIX_ERROR_INVALID_JSON"
+                | LixError::CODE_SCHEMA_VALIDATION
+                | LixError::CODE_INVALID_PARAM
         ),
-        "expected invalid JSON/schema validation error, got {error:?}"
+        "expected invalid metadata public error, got {error:?}"
     );
     assert!(
         error.message.contains("metadata") && error.message.contains("JSON"),

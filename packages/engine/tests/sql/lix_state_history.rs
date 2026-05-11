@@ -264,8 +264,8 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data, hidden) \
-                 VALUES ('history-file-a', '/history/a.txt', X'61', false)",
+                "INSERT INTO lix_file (id, path, data) \
+                 VALUES ('history-file-a', '/history/a.txt', X'61')",
                 &[],
             )
             .await

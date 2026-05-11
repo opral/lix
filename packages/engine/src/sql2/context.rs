@@ -223,12 +223,12 @@ impl WriteAccess {
 
     pub(crate) fn require_write(
         &self,
-        operation: &str,
+        action: &str,
     ) -> Result<SqlWriteContext, datafusion::error::DataFusionError> {
         match self {
             Self::Write { ctx } => Ok(ctx.clone()),
             Self::ReadOnly => Err(datafusion::error::DataFusionError::Execution(format!(
-                "{operation} requires a write transaction"
+                "{action} requires a write transaction"
             ))),
         }
     }

@@ -1,5 +1,8 @@
 use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
-use crate::version::{version_descriptor_stage_row, version_ref_stage_row, VersionRefReader};
+use crate::version::{
+    version_descriptor_stage_row, version_ref_stage_row, VersionLifecycle, VersionOperation,
+    VersionReferenceRole,
+};
 use crate::LixError;
 
 use super::context::SessionContext;
@@ -41,20 +44,25 @@ impl SessionContext {
                     .id
                     .unwrap_or_else(|| transaction.functions().call_uuid_v7());
                 let source_head = if let Some(from_commit_id) = options.from_commit_id {
+                    let mut commit_graph = transaction.commit_graph_reader();
+                    VersionLifecycle::require_existing_commit(
+                        &mut commit_graph,
+                        &from_commit_id,
+                        VersionOperation::CreateVersion,
+                        VersionReferenceRole::CommitSource,
+                    )
+                    .await?;
                     from_commit_id
                 } else {
                     let active_version_id = transaction.active_version_id().to_string();
                     let reader = transaction.version_ref_reader();
-                    reader
-                        .load_head_commit_id(&active_version_id)
+                    VersionLifecycle::new(&reader)
+                        .require_existing_commit_id(
+                            &active_version_id,
+                            VersionOperation::CreateVersion,
+                            VersionReferenceRole::Source,
+                        )
                         .await?
-                        .ok_or_else(|| {
-                            LixError::version_not_found(
-                                active_version_id.clone(),
-                                "create_version",
-                                "source",
-                            )
-                        })?
                 };
 
                 transaction
