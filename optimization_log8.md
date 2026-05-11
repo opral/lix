@@ -1767,3 +1767,111 @@ Next optimization still needs a larger cut in JSON hydration or row
 construction. The obvious remaining cost is that full reads still allocate a
 MaterializedTrackedStateRow per row and convert every JSON payload to String.
 ```
+
+## Optimization 9: Return Unique JSON Batch Payloads Without Cloning
+
+Date: 2026-05-10
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Changed `json_store::load_json_bytes_many_in_scope` to avoid cloning loaded
+JSON payload bytes when the request contains no duplicate refs.
+
+The loader already deduplicates requested refs into `unique_values`. Before
+this change it always rebuilt the result with:
+
+```text
+requested_indexes.map(|index| unique_values[index].clone())
+```
+
+That cloned every loaded `Vec<u8>` even when every ref was unique and
+`unique_values` was already in request order. Full tracked reads then consumed
+the cloned bytes into `String`, leaving the original decoded payload copy
+unused.
+
+The loader now tracks whether any duplicate ref was seen:
+
+- no duplicates: return `unique_values` directly;
+- duplicates: keep the old clone-to-request-order behavior so repeated refs
+  still produce repeated result slots.
+
+This applies to both commit-pack and out-of-band JSON scopes. Missing refs keep
+their `None` slots in either path.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                       | after median | criterion status |
+| ----------------------------------------- | -----------: | ---------------- |
+| `sqlite/get_many_exact_keys/1k`           |    3.8568 ms | -3.3%, within noise threshold |
+| `sqlite/scan_full_rows/1k`                |    3.7141 ms | improved |
+| `sqlite/prefix_scan_schema/1k`            |    3.6749 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k`  |    3.6774 ms | no change |
+| `rocksdb/get_many_exact_keys/1k`          |    2.9055 ms | no change |
+| `rocksdb/scan_full_rows/1k`               |    2.5562 ms | no change |
+| `rocksdb/prefix_scan_schema/1k`           |    2.7618 ms | no change |
+| `rocksdb/prefix_scan_schema_file_null/1k` |    2.7406 ms | no change |
+
+The strongest measured signal is SQLite full scans. RocksDB and exact gets move
+in the right direction but remain Criterion-neutral in this run.
+
+### Storage
+
+No storage change.
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: json_values_in_request_order depends on the has_duplicate_refs flag.
+Fixed with debug assertions that the no-duplicate path has request indexes
+0..len and the same length as unique_values.
+
+Recommendation: keep. This is a real structural copy cut in the payload path,
+and the SQLite scan_full_rows improvement is plausible.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine json_store::store::tests::json_batch_load_roundtrips_in_request_order --features storage-benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a payload-copy reduction.
+
+Primary axis: full-row materialization. Structural win: unique JSON batch loads
+now transfer ownership of decoded payload bytes directly to the caller instead
+of cloning them back into request order. This pairs with tracked materialization
+consuming those bytes with String::from_utf8.
+
+Timing: SQLite full scans improved in the focused run; other full/exact rows
+remain noisy but generally moved lower. The <= 1.5x target is still not met.
+
+No temporary shim.
+
+Next optimization should look below row materialization again: load_from_packs
+still decodes entire JSON packs for the requested refs, and tracked exact reads
+still construct full rows even when callers only check presence in the current
+bench harness.
+```

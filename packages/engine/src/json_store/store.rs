@@ -176,10 +176,14 @@ pub(crate) async fn load_json_bytes_many_in_scope(
     let mut unique_refs = Vec::new();
     let mut key_indexes = BTreeMap::<Vec<u8>, usize>::new();
     let mut requested_indexes = Vec::with_capacity(json_refs.len());
+    let mut has_duplicate_refs = false;
     for json_ref in json_refs {
         let key = json_ref.as_hash_bytes().to_vec();
         let index = match key_indexes.get(&key) {
-            Some(index) => *index,
+            Some(index) => {
+                has_duplicate_refs = true;
+                *index
+            }
             None => {
                 let index = unique_keys.len();
                 key_indexes.insert(key.clone(), index);
@@ -205,10 +209,11 @@ pub(crate) async fn load_json_bytes_many_in_scope(
         .filter_map(|(index, value)| value.is_none().then_some(index))
         .collect::<Vec<_>>();
     if missing.is_empty() {
-        return Ok(requested_indexes
-            .into_iter()
-            .map(|index| unique_values[index].clone())
-            .collect());
+        return Ok(json_values_in_request_order(
+            unique_values,
+            requested_indexes,
+            has_duplicate_refs,
+        ));
     }
 
     let result = store
@@ -252,10 +257,31 @@ pub(crate) async fn load_json_bytes_many_in_scope(
         )?);
     }
 
-    Ok(requested_indexes
+    Ok(json_values_in_request_order(
+        unique_values,
+        requested_indexes,
+        has_duplicate_refs,
+    ))
+}
+
+fn json_values_in_request_order(
+    unique_values: Vec<Option<Vec<u8>>>,
+    requested_indexes: Vec<usize>,
+    has_duplicate_refs: bool,
+) -> Vec<Option<Vec<u8>>> {
+    if !has_duplicate_refs {
+        debug_assert_eq!(requested_indexes.len(), unique_values.len());
+        debug_assert!(requested_indexes
+            .iter()
+            .copied()
+            .enumerate()
+            .all(|(request_index, unique_index)| request_index == unique_index));
+        return unique_values;
+    }
+    requested_indexes
         .into_iter()
         .map(|index| unique_values[index].clone())
-        .collect())
+        .collect()
 }
 
 async fn load_from_packs(
