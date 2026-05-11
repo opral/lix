@@ -113,6 +113,32 @@ pub(crate) async fn load_delta_pack(
     Ok(Some(entries))
 }
 
+pub(crate) async fn delta_pack_exists(
+    store: &mut (impl StorageReader + ?Sized),
+    commit_id: &str,
+) -> Result<bool, LixError> {
+    let result = store
+        .exists_many(KvGetRequest {
+            groups: vec![KvGetGroup {
+                namespace: TRACKED_STATE_DELTA_PACK_NAMESPACE.to_string(),
+                keys: vec![commit_id.as_bytes().to_vec()],
+            }],
+        })
+        .await?;
+    let group = result.groups.into_iter().next().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked-state delta pack existence check returned no result group",
+        )
+    })?;
+    group.exists.into_iter().next().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked-state delta pack existence check returned no result",
+        )
+    })
+}
+
 pub(crate) fn stage_delta_pack_refs(
     writes: &mut StorageWriteSet,
     commit_id: &str,

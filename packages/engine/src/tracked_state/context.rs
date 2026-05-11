@@ -590,10 +590,7 @@ where
             {
                 break;
             }
-            if storage::load_delta_pack(&mut self.store, &current_id)
-                .await?
-                .is_some()
-            {
+            if storage::delta_pack_exists(&mut self.store, &current_id).await? {
                 out.push(current_id.clone());
             }
             let commit = self
