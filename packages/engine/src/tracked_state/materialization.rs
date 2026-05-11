@@ -1,4 +1,3 @@
-use crate::commit_store::CommitStoreContext;
 use crate::entity_identity::EntityIdentity;
 use crate::json_store::JsonRef;
 use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonStoreContext};
@@ -11,97 +10,24 @@ use std::collections::BTreeMap;
 /// Materializes tracked-state index entries.
 ///
 /// The durable tracked_state value is authoritative for scalar projection
-/// fields. Snapshot and metadata payloads are hydrated from grouped commit_store
-/// pack loads only when the requested projection needs those JSON refs.
+/// fields and stores the JSON refs needed for payload projections. Snapshot and
+/// metadata bytes are hydrated from grouped json_store loads only when the
+/// requested projection needs them.
 pub(crate) async fn materialize_index_entries<S>(
     store: &mut S,
-    commit_store: &CommitStoreContext,
     entries: Vec<(TrackedStateKey, TrackedStateIndexValue)>,
     projection: &TrackedMaterializationProjection,
 ) -> Result<Vec<MaterializedTrackedStateRow>, LixError>
 where
     S: StorageReader,
 {
-    let needs_commit_pack = projection.snapshot_content || projection.metadata;
-    let mut packs = BTreeMap::new();
-    if needs_commit_pack {
-        for (_, value) in &entries {
-            let key = (
-                value.change_locator.source_commit_id.clone(),
-                value.change_locator.source_pack_id,
-            );
-            if packs.contains_key(&key) {
-                continue;
-            }
-            let Some(changes) = commit_store
-                .reader(&mut *store)
-                .load_change_pack(&key.0, key.1)
-                .await?
-            else {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked_state locator references missing change pack ({}, {})",
-                        key.0, key.1
-                    ),
-                ));
-            };
-            packs.insert(key, changes);
-        }
-    }
-
     let mut row_plans = Vec::with_capacity(entries.len());
     let mut json_refs = Vec::new();
     let mut json_ref_localities = Vec::new();
     for (key, value) in entries {
-        let change = if needs_commit_pack {
-            let pack_key = (
-                value.change_locator.source_commit_id.clone(),
-                value.change_locator.source_pack_id,
-            );
-            let changes = packs.get(&pack_key).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state materialization lost a loaded commit_store pack",
-                )
-            })?;
-            let change = changes
-                .get(
-                    usize::try_from(value.change_locator.source_ordinal).map_err(|_| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            "tracked_state locator ordinal does not fit usize",
-                        )
-                    })?,
-                )
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "tracked_state locator for '{}' points past pack ({}, {})",
-                            value.change_locator.change_id,
-                            value.change_locator.source_commit_id,
-                            value.change_locator.source_pack_id
-                        ),
-                    )
-                })?;
-            if change.id != value.change_locator.change_id {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked_state locator expected '{}' but found '{}'",
-                        value.change_locator.change_id, change.id
-                    ),
-                ));
-            }
-            Some(change)
-        } else {
-            None
-        };
-
         let snapshot_ref_index = projected_json_ref_index(
             projection.snapshot_content,
-            change.and_then(|change| change.snapshot_ref),
+            value.snapshot_ref,
             &value.change_locator.source_commit_id,
             value.change_locator.source_pack_id,
             &mut json_refs,
@@ -109,7 +35,7 @@ where
         );
         let metadata_ref_index = projected_json_ref_index(
             projection.metadata,
-            change.and_then(|change| change.metadata_ref),
+            value.metadata_ref,
             &value.change_locator.source_commit_id,
             value.change_locator.source_pack_id,
             &mut json_refs,

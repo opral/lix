@@ -1,5 +1,6 @@
 use crate::commit_store::{ChangeLocator, ChangeLocatorRef, ChangeRef};
 use crate::entity_identity::EntityIdentity;
+use crate::json_store::JsonRef;
 use crate::{LixError, NullableKeyFilter};
 
 pub(crate) const TRACKED_STATE_HASH_BYTES: usize = 32;
@@ -74,6 +75,8 @@ pub(crate) struct TrackedStateDeltaEntry {
 pub(crate) struct TrackedStateIndexValue {
     pub(crate) change_locator: ChangeLocator,
     pub(crate) deleted: bool,
+    pub(crate) snapshot_ref: Option<JsonRef>,
+    pub(crate) metadata_ref: Option<JsonRef>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
 }
@@ -83,6 +86,8 @@ pub(crate) struct TrackedStateIndexValue {
 pub(crate) struct TrackedStateIndexValueRef<'a> {
     pub(crate) change_locator: ChangeLocatorRef<'a>,
     pub(crate) deleted: bool,
+    pub(crate) snapshot_ref: Option<&'a JsonRef>,
+    pub(crate) metadata_ref: Option<&'a JsonRef>,
     pub(crate) created_at: &'a str,
     pub(crate) updated_at: &'a str,
 }

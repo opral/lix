@@ -1165,3 +1165,156 @@ still decodes full locator/timestamp strings and materializes full rows even
 when the caller only needs the JSON payload, so the remaining budget is likely
 in value decode and commit/json materialization grouping.
 ```
+
+## Optimization 4: Store JSON Refs In Primary Tracked Values
+
+Date: 2026-05-10
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Changed the primary tracked-state value format from locator-only payload
+metadata to locator plus direct `snapshot_ref` / `metadata_ref` fields.
+`VALUE_VERSION` was bumped and no backward decode shim was kept.
+
+Before this cut, full materialization decoded tracked values, grouped commit
+store change-pack loads by `(source_commit_id, source_pack_id)`, decoded the
+referenced change just to recover its JSON refs, then grouped JSON loads. The
+tracked value is already the durable projection boundary, and both staging and
+root materialization already have the JSON refs at write time, so the extra
+commit-pack lookup was record-local metadata indirection.
+
+After this cut:
+
+- primary tracked values encode optional `snapshot_ref` and `metadata_ref`;
+- delta packs carry those refs too, so pending-delta reads can materialize
+  payloads without commit-pack lookups;
+- by-file header-index values intentionally encode `None` refs so the secondary
+  header index stays lean;
+- by-file scans that need payloads still fetch primary tracked values before
+  materializing;
+- `materialize_index_entries` no longer takes `CommitStoreContext`.
+
+This follows the same physical principle as page/tuple formats in the reference
+systems: record-local metadata needed to materialize a tuple should live with
+the tuple/index entry, not require an unrelated side lookup.
+
+### Benchmarks
+
+Standard focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(get_many_exact_keys|exists_many_exact_keys|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+Final medians:
+
+| row                                                | after median | criterion status |
+| -------------------------------------------------- | -----------: | ---------------- |
+| `sqlite/get_many_exact_keys/1k`                    |    4.0589 ms | no change in final rerun; initial run improved |
+| `sqlite/exists_many_exact_keys/1k`                 |    2.5128 ms | no change |
+| `sqlite/scan_keys_only/1k`                         |    2.5838 ms | no change |
+| `sqlite/scan_headers_only/1k`                      |    2.5942 ms | no change in final rerun; initial run improved |
+| `sqlite/scan_full_rows/1k`                         |    3.8172 ms | no change |
+| `sqlite/prefix_scan_schema/1k`                     |    3.8885 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k`           |    3.8453 ms | no change |
+| `rocksdb/get_many_exact_keys/1k`                   |    2.9264 ms | improved |
+| `rocksdb/exists_many_exact_keys/1k`                |    1.4271 ms | no change |
+| `rocksdb/scan_keys_only/1k`                        |    1.5068 ms | no change |
+| `rocksdb/scan_headers_only/1k`                     |    1.5683 ms | no change in final rerun; initial run improved |
+| `rocksdb/scan_full_rows/1k`                        |    2.8121 ms | no change in final rerun; initial run improved |
+| `rocksdb/prefix_scan_schema/1k`                    |    2.7684 ms | no change in final rerun; initial run improved |
+| `rocksdb/prefix_scan_schema_file_null/1k`          |    2.7350 ms | no change |
+
+Initial run immediately after the change showed the structural win before the
+final rerun reset Criterion's comparison baseline:
+
+```text
+sqlite/get_many_exact_keys: 4.0738 ms, improved
+rocksdb/get_many_exact_keys: 3.1168 ms, improved
+rocksdb/scan_full_rows: 2.8681 ms, improved
+rocksdb/prefix_scan_schema: 2.7909 ms, improved
+```
+
+### Storage
+
+Storage fixture command:
+
+```sh
+cargo test -p lix_engine --features storage-benches --test json_pointer_crud_storage -- --ignored --nocapture --test-threads=1
+```
+
+Result: passed.
+
+| backend / state                        | bytes | delta vs Optimization 3 | status |
+| -------------------------------------- | ----: | ----------------------: | ------ |
+| raw SQLite / inserted                  | 1692456 | 0 | unchanged |
+| Lix SQLite / inserted                  | 1112216 | +37080 | direct snapshot refs in primary tree |
+| Lix SQLite / after create_version      | 1124576 | +37080 | direct snapshot refs in primary tree |
+| Lix SQLite / after fast-forward merge  | 5324328 | +32720 | below previous noisy merge shape |
+| Lix SQLite / after divergent merge     | 5652176 | +32888 | below previous noisy merge shape |
+| Lix RocksDB / inserted                 | 1028557 | +34657 | direct snapshot refs in primary tree |
+| Lix RocksDB / after create_version     | 1030457 | +34691 | direct snapshot refs in primary tree |
+| Lix RocksDB / after fast-forward merge | 1195234 | +38091 | direct snapshot refs in primary tree |
+| Lix RocksDB / after divergent merge    | 1576585 | +48329 | direct snapshot refs in primary tree |
+
+The inserted/create-version states remain below raw SQLite at 1k rows. The
+merge states were already above the storage-size north star before this cut;
+the additional bytes are explained by durable payload refs that remove a
+commit-pack read from exact/full materialization.
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: materialization.rs still described commit_store pack loads. Fixed the
+comment to describe direct tracked JSON refs and grouped json_store loads.
+```
+
+### Verification
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine --features storage-benches --test json_pointer_crud_storage -- --ignored --nocapture --test-threads=1
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null|scan_headers_only|scan_keys_only)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(get_many_exact_keys|exists_many_exact_keys|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep.
+
+Primary axis: exact/full materialization. Structural win: payload refs now live
+at the tracked projection boundary, so materialization avoids loading and
+decoding commit_store change packs just to recover record-local JSON refs.
+
+Timing win: exact gets improved on both backends; RocksDB full/prefix scans
+also moved materially in the initial run. The final standard rerun still shows
+lower medians than Optimization 3 for exact/full rows, even when Criterion
+reports some rows as no-change because the comparison baseline had already
+included this cut.
+
+Storage tradeoff: roughly 35-37 KB extra at 1k inserted rows, with inserted and
+create_version states still below raw SQLite. By-file header index values stay
+lean by omitting payload refs, so the cost is restricted to primary tracked
+values and delta packs.
+
+No temporary shim.
+
+Next optimization should attack the remaining exact read overhead inside
+tracked value/key materialization: the read path still allocates full
+TrackedStateKey/TrackedStateIndexValue/MaterializedTrackedStateRow objects
+even for fixed-shape JSON-pointer reads, and SQLite full reads remain above the
+1.5x target.
+```
