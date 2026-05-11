@@ -138,7 +138,7 @@ pub(crate) async fn stage_tracked_root_from_materialized(
     }
     let staged = commit_store
         .writer(&mut *transaction, &mut writes)
-        .stage_commit_draft(commit, authored_changes.clone(), adopted_changes.clone())
+        .stage_tracked_commit_draft(commit, authored_changes.clone(), adopted_changes.clone())
         .await?;
     let mut deltas = Vec::with_capacity(changes.len());
     deltas.extend(
