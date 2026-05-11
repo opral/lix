@@ -46,6 +46,7 @@ impl ByFileIndex {
             schema_keys,
             entity_ids: request.filter.entity_ids.clone(),
             file_ids,
+            include_tombstones: request.filter.include_tombstones,
             limit: None,
         }
     }

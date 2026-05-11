@@ -161,16 +161,36 @@ impl TrackedStateMutation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateTreeScanRequest {
     pub(crate) schema_keys: Vec<String>,
     pub(crate) entity_ids: Vec<EntityIdentity>,
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
+    pub(crate) include_tombstones: bool,
     pub(crate) limit: Option<usize>,
 }
 
+impl Default for TrackedStateTreeScanRequest {
+    fn default() -> Self {
+        Self {
+            schema_keys: Vec::new(),
+            entity_ids: Vec::new(),
+            file_ids: Vec::new(),
+            include_tombstones: true,
+            limit: None,
+        }
+    }
+}
+
 impl TrackedStateTreeScanRequest {
-    pub(crate) fn matches(&self, key: &TrackedStateKey, _value: &TrackedStateIndexValue) -> bool {
+    pub(crate) fn matches(&self, key: &TrackedStateKey, value: &TrackedStateIndexValue) -> bool {
+        if !self.include_tombstones && value.deleted {
+            return false;
+        }
+        self.matches_key(key)
+    }
+
+    pub(crate) fn matches_key(&self, key: &TrackedStateKey) -> bool {
         if !self.schema_keys.is_empty() && !self.schema_keys.contains(&key.schema_key) {
             return false;
         }
