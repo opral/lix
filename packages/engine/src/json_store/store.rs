@@ -21,6 +21,15 @@ struct StoredJsonPayload<'a> {
     data: &'a [u8],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonHashCheck {
+    /// Hot reads trust the local storage layer and pack directory. Content
+    /// hashes are computed at write time; exhaustive verification belongs in
+    /// explicit integrity-check/fsck callers rather than every row scan.
+    TrustedHotRead,
+    Verify,
+}
+
 fn raw_json_ref_for_content(json: &str) -> JsonRef {
     JsonRef::from_hash(blake3::hash(json.as_bytes()))
 }
@@ -168,13 +177,37 @@ async fn load_json_bytes_direct(
     };
     let stored_payload = decode_stored_json_payload(&bytes)?;
     let _ = store;
-    decode_json_payload(json_ref, stored_payload).map(Some)
+    decode_json_payload(json_ref, stored_payload, JsonHashCheck::TrustedHotRead).map(Some)
 }
 
 pub(crate) async fn load_json_bytes_many_in_scope(
     store: &mut impl StorageReader,
     json_refs: &[JsonRef],
     scope: JsonReadScopeRef<'_>,
+) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+    load_json_bytes_many_in_scope_with_hash_check(
+        store,
+        json_refs,
+        scope,
+        JsonHashCheck::TrustedHotRead,
+    )
+    .await
+}
+
+pub(crate) async fn verify_json_bytes_many_in_scope(
+    store: &mut impl StorageReader,
+    json_refs: &[JsonRef],
+    scope: JsonReadScopeRef<'_>,
+) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+    load_json_bytes_many_in_scope_with_hash_check(store, json_refs, scope, JsonHashCheck::Verify)
+        .await
+}
+
+async fn load_json_bytes_many_in_scope_with_hash_check(
+    store: &mut impl StorageReader,
+    json_refs: &[JsonRef],
+    scope: JsonReadScopeRef<'_>,
+    hash_check: JsonHashCheck,
 ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
     if json_refs.is_empty() {
         return Ok(Vec::new());
@@ -208,7 +241,7 @@ pub(crate) async fn load_json_bytes_many_in_scope(
         JsonReadScopeRef::CommitPacks {
             commit_id,
             pack_ids,
-        } => load_from_packs(store, &unique_refs, commit_id, pack_ids).await?,
+        } => load_from_packs(store, &unique_refs, commit_id, pack_ids, hash_check).await?,
     };
 
     let missing = unique_values
@@ -262,6 +295,7 @@ pub(crate) async fn load_json_bytes_many_in_scope(
         unique_values[unique_index] = Some(decode_json_payload(
             &unique_refs[unique_index],
             stored_payload,
+            hash_check,
         )?);
     }
 
@@ -297,6 +331,7 @@ async fn load_from_packs(
     unique_refs: &[JsonRef],
     commit_id: &str,
     pack_ids: &[u32],
+    hash_check: JsonHashCheck,
 ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
     let mut values = vec![None; unique_refs.len()];
     if pack_ids.is_empty() || unique_refs.is_empty() {
@@ -326,7 +361,7 @@ async fn load_from_packs(
         )
     })?;
     for stored_pack in group.values_iter().flatten() {
-        for (json_ref, value) in decode_json_pack(stored_pack)? {
+        for (json_ref, value) in decode_json_pack(stored_pack, hash_check)? {
             if let Some(&index) = wanted.get(json_ref.as_hash_array()) {
                 values[index] = Some(value);
             }
@@ -393,6 +428,7 @@ fn read_json_codec(byte: u8) -> Result<JsonCodec, LixError> {
 fn decode_json_payload(
     json_ref: &JsonRef,
     stored_payload: StoredJsonPayload<'_>,
+    hash_check: JsonHashCheck,
 ) -> Result<Vec<u8>, LixError> {
     let data = match stored_payload.codec {
         JsonCodec::Raw => Ok(stored_payload.data.to_vec()),
@@ -413,17 +449,22 @@ fn decode_json_payload(
             ),
         ));
     }
-    let actual_hash = blake3::hash(&data);
-    if actual_hash.as_bytes() != json_ref.as_hash_bytes() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("json ref '{}' hash mismatch", json_ref.to_hex()),
-        ));
+    if hash_check == JsonHashCheck::Verify {
+        let actual_hash = blake3::hash(&data);
+        if actual_hash.as_bytes() != json_ref.as_hash_bytes() {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("json ref '{}' hash mismatch", json_ref.to_hex()),
+            ));
+        }
     }
     Ok(data)
 }
 
-fn decode_json_pack(bytes: &[u8]) -> Result<Vec<(JsonRef, Vec<u8>)>, LixError> {
+fn decode_json_pack(
+    bytes: &[u8],
+    hash_check: JsonHashCheck,
+) -> Result<Vec<(JsonRef, Vec<u8>)>, LixError> {
     if bytes.len() < STORED_JSON_PACK_MAGIC.len() + 4 {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -515,7 +556,7 @@ fn decode_json_pack(bytes: &[u8]) -> Result<Vec<(JsonRef, Vec<u8>)>, LixError> {
             uncompressed_len,
             data: &bytes[data_start..data_end],
         };
-        let value = decode_json_payload(&json_ref, payload)?;
+        let value = decode_json_payload(&json_ref, payload, hash_check)?;
         out.push((json_ref, value));
     }
     Ok(out)
@@ -610,6 +651,55 @@ mod tests {
                 Some(first.data.as_ref().to_vec()),
                 Some(second.data.as_ref().to_vec()),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_batch_load_rejects_hash_mismatch() {
+        let storage = StorageContext::new(Arc::new(UnitTestBackend::new()));
+        let requested_ref = JsonRef::for_content(br#"{"value":"requested"}"#);
+        let stored = encode_json("{\"value\":\"different\"}").expect("stored json should encode");
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            JSON_NAMESPACE,
+            requested_ref.as_hash_bytes().to_vec(),
+            encode_stored_json_payload(&stored),
+        );
+        writes
+            .apply(&mut transaction.as_mut())
+            .await
+            .expect("json should store");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let mut store = storage.clone();
+        let trusted = load_json_bytes_many_in_scope(
+            &mut store,
+            &[requested_ref],
+            JsonReadScopeRef::OutOfBand,
+        )
+        .await
+        .expect("trusted hot read should not hash-check");
+        assert_eq!(trusted, vec![Some(stored.data.as_ref().to_vec())]);
+
+        let mut store = storage.clone();
+        let error = verify_json_bytes_many_in_scope(
+            &mut store,
+            &[requested_ref],
+            JsonReadScopeRef::OutOfBand,
+        )
+        .await
+        .expect_err("verified read should reject mismatched content address");
+        assert!(
+            error.to_string().contains("hash mismatch"),
+            "error should mention hash mismatch: {error}"
         );
     }
 }
