@@ -2308,6 +2308,148 @@ treated as a small supporting optimization rather than a budget-moving step.
 No storage format change. No temporary shim.
 ```
 
+## Optimization 29: Compact matching tracked timestamps
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Bumped the tracked-state value codec from version 6 to version 7 and compacted
+the common timestamp shape in both materialized tree values and delta-pack
+values:
+
+- Values now write `created_at` once.
+- A one-byte tag follows:
+  `TIMESTAMP_UPDATED_SAME` when `updated_at == created_at`, otherwise
+  `TIMESTAMP_UPDATED_DISTINCT` plus the `updated_at` string.
+- Decode reconstructs `updated_at` from `created_at` for the same-timestamp
+  case and rejects invalid timestamp tags.
+- `encoded_value_len` now uses the same timestamp-pair sizing helper as the
+  encoder.
+
+There is no backwards shim because the format has not shipped.
+
+Added coverage that matching timestamps roundtrip and produce a shorter encoded
+value than distinct timestamps. Existing distinct timestamp roundtrip tests
+continue to cover the non-compact branch.
+
+### Benchmarks
+
+Focused write/scan command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_headers_only|scan_full_rows)/1k'
+```
+
+Result: passed.
+
+Representative medians:
+
+| row                                             | median | criterion status |
+| ----------------------------------------------- | -----: | ---------------- |
+| `sqlite/write_root_all_rows/1k`                 | 5.0199 ms | no change |
+| `sqlite/write_delta_10pct_updates/1k`           | 1.8704 ms | no change |
+| `sqlite/write_tombstone_10pct_deletes/1k`       | 1.7569 ms | no change |
+| `sqlite/scan_headers_only/1k`                   | 1.8272 ms | no change |
+| `sqlite/scan_full_rows/1k`                      | 2.3698 ms | no change |
+| `rocksdb/write_root_all_rows/1k`                | 4.3505 ms | no change |
+| `rocksdb/write_delta_10pct_updates/1k`          | 840.51 us | improved |
+| `rocksdb/write_tombstone_10pct_deletes/1k`      | 933.62 us | no change |
+| `rocksdb/scan_headers_only/1k`                  | 860.63 us | no change |
+| `rocksdb/scan_full_rows/1k`                     | 1.5218 ms | noisy regression |
+
+Rerun of scan guardrails:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                             | rerun median | criterion status |
+| ----------------------------------------------- | -----------: | ---------------- |
+| `sqlite/scan_headers_only/1k`                   | 1.7102 ms | improved |
+| `sqlite/scan_full_rows/1k`                      | 2.2907 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k`        | 2.2168 ms | no change |
+| `rocksdb/scan_headers_only/1k`                  | 815.47 us | no change |
+| `rocksdb/scan_full_rows/1k`                     | 1.3515 ms | improved |
+| `rocksdb/prefix_scan_schema_file_null/1k`       | 1.4072 ms | no change |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                     | bytes | bytes/row | status |
+| --------------------------------------- | ----: | --------: | ------ |
+| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
+| Lix SQLite / inserted                   | 972136 | 972.1 | improved |
+| Lix SQLite / after create_version       | 984496 | 984.5 | improved |
+| Lix SQLite / after fast-forward merge   | 5201544 | 5201.5 | roughly unchanged |
+| Lix SQLite / after divergent merge      | 5365384 | 5365.4 | roughly unchanged |
+| Lix RocksDB / inserted                  | 884519 | 884.5 | improved |
+| Lix RocksDB / after create_version      | 886342 | 886.3 | improved |
+| Lix RocksDB / after fast-forward merge  | 1043067 | 1043.1 | improved |
+| Lix RocksDB / after divergent merge     | 1404413 | 1404.4 | improved |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+The reviewer confirmed that the version/deleted header masking remains correct,
+tombstone visibility still only needs the header, both tree and delta values
+use the same timestamp pair helpers, distinct timestamps are preserved, invalid
+timestamp tags are rejected, and encoded_value_len matches the new format.
+Recommendation: keep.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo test -p lix_engine tracked_state::codec:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine transaction::commit:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_headers_only|scan_full_rows)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(scan_headers_only|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a physical value-format compaction.
+
+The structural win is direct: inserted/root rows usually have matching
+created_at and updated_at, so storing the timestamp twice was duplicated row
+payload. Version 7 stores the common case as one string plus a tag while still
+preserving distinct timestamps for updates/adoptions.
+
+Storage improves materially on inserted/create_version states for both SQLite
+and RocksDB, and RocksDB merge-state bytes improve as well. Timing is mostly
+neutral with useful scan/write wins on rerun; the one RocksDB scan regression
+did not reproduce.
+
+No backward shim because the physical format is still unshipped.
+```
+
 ## Optimization 28: Encode change-pack entries in place
 
 Date: 2026-05-11
