@@ -2308,6 +2308,142 @@ treated as a small supporting optimization rather than a budget-moving step.
 No storage format change. No temporary shim.
 ```
 
+## Optimization 30: Compact commit and delta change ids
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Changed the unshipped physical pack formats:
+
+- Commit-store change packs move from `LXCP1` to `LXCP2`.
+- `LXCP2` stores shared `(schema_key, file_id)` shapes once per pack.
+- `LXCP2` stores entity identity directly as string parts instead of a JSON
+  array string inside each packed change.
+- `LXCP2` stores change ids as a suffix when they start with the pack
+  `commit_id`, otherwise stores the full id.
+- Tracked-state delta packs move from `LXTD3` to `LXTD4`.
+- `LXTD4` stores delta `change_id`s as a suffix when they start with the
+  locator `source_commit_id`, otherwise stores the full id.
+
+Standalone `LXCH2` change encoding remains available, but change packs no
+longer embed standalone `LXCH2` records. There is no backwards shim because the
+physical format has not shipped.
+
+Added codec coverage for the compact change-pack shape and for a tracked
+delta-pack cross-commit locator whose `change_id` starts with the pack commit
+id but not with its locator source commit id.
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+Representative medians:
+
+| row                                             | median | criterion status |
+| ----------------------------------------------- | -----: | ---------------- |
+| `raw_sqlite/write_root_all_rows/1k`             | 2.3900 ms | no change |
+| `sqlite/write_root_all_rows/1k`                 | 4.4672 ms | no change |
+| `sqlite/write_delta_10pct_updates/1k`           | 1.7570 ms | no change |
+| `sqlite/write_tombstone_10pct_deletes/1k`       | 1.5593 ms | no change |
+| `sqlite/scan_full_rows/1k`                      | 2.3076 ms | no change |
+| `sqlite/prefix_scan_schema_file_null/1k`        | 2.2825 ms | no change |
+| `rocksdb/write_root_all_rows/1k`                | 4.3382 ms | no change |
+| `rocksdb/write_delta_10pct_updates/1k`          | 842.39 us | no change |
+| `rocksdb/write_tombstone_10pct_deletes/1k`      | 732.73 us | no change |
+| `rocksdb/scan_full_rows/1k`                     | 1.3643 ms | no change |
+| `rocksdb/prefix_scan_schema_file_null/1k`       | 1.3588 ms | no change |
+
+Earlier same-patch focused sweep also showed RocksDB delta writes at
+`751.11 us` improved and RocksDB tombstone writes at `741.36 us` improved; the
+combined rerun settled as neutral except raw SQLite tombstone noise.
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                     | bytes | bytes/row | status |
+| --------------------------------------- | ----: | --------: | ------ |
+| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
+| Lix SQLite / inserted                   | 947416 | 947.4 | improved |
+| Lix SQLite / after create_version       | 959776 | 959.8 | improved |
+| Lix SQLite / after fast-forward merge   | 5152248 | 5152.2 | improved |
+| Lix SQLite / after divergent merge      | 5353168 | 5353.2 | improved |
+| Lix RocksDB / inserted                  | 864114 | 864.1 | improved |
+| Lix RocksDB / after create_version      | 865938 | 865.9 | improved |
+| Lix RocksDB / after fast-forward merge  | 1022770 | 1022.8 | improved |
+| Lix RocksDB / after divergent merge     | 1384417 | 1384.4 | improved |
+
+### Review Loop
+
+Reviewer pass 1 found one HIGH: `LXTD4` initially stripped delta change ids
+against the pack commit id while decode reconstructed suffixes against the
+locator `source_commit_id`, which could corrupt an adopted cross-commit locator
+whose id happened to start with the pack commit id.
+
+Fix: encode delta change-id suffixes against
+`value.change_locator.source_commit_id`, matching decode, and add a regression
+for the cross-commit prefix-collision case.
+
+Reviewer pass 2:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+The reviewer confirmed the prior HIGH is resolved, suffix encode/decode now use
+the same source-commit basis, LXCP2 preserves entry order, shape indexes are
+bounds-checked, and commit-store suffix IDs use the same commit-id basis on
+encode/decode.
+Recommendation: keep.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo test -p lix_engine commit_store::codec:: --features storage-benches
+cargo test -p lix_engine commit_store:: --features storage-benches
+cargo test -p lix_engine tracked_state::codec:: --features storage-benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine transaction::commit:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a format-level compaction.
+
+Root-write timing remains above the 1.5x target and mostly Criterion-neutral,
+so this is not the final root-write answer. The pack bytes are meaningfully
+smaller, however, and the format removes repeated schema/file/change-id/entity
+encoding from durable commit packs while preserving locator semantics.
+
+The current budget misses remain root writes and SQLite full/prefix scans.
+```
+
 ## Optimization 29: Compact matching tracked timestamps
 
 Date: 2026-05-11
