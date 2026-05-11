@@ -166,16 +166,20 @@ pub(crate) fn encode_key(key: &TrackedStateKey) -> Vec<u8> {
 
 pub(crate) fn encode_key_ref(key: TrackedStateKeyRef<'_>) -> Vec<u8> {
     let mut out = Vec::new();
-    push_sized_bytes(&mut out, key.schema_key.as_bytes());
+    append_key_ref(&mut out, key);
+    out
+}
+
+fn append_key_ref(out: &mut Vec<u8>, key: TrackedStateKeyRef<'_>) {
+    push_sized_bytes(out, key.schema_key.as_bytes());
     match key.file_id {
         Some(file_id) => {
             out.push(1);
-            push_sized_bytes(&mut out, file_id.as_bytes());
+            push_sized_bytes(out, file_id.as_bytes());
         }
         None => out.push(0),
     }
-    push_entity_identity(&mut out, key.entity_id);
-    out
+    push_entity_identity(out, key.entity_id);
 }
 
 pub(crate) fn encode_schema_key_prefix(schema_key: &str) -> Vec<u8> {
@@ -237,16 +241,20 @@ pub(crate) fn encode_value(value: &TrackedStateIndexValue) -> Vec<u8> {
 
 pub(crate) fn encode_value_ref(value: TrackedStateIndexValueRef<'_>) -> Vec<u8> {
     let mut out = Vec::new();
+    append_value_ref(&mut out, value);
+    out
+}
+
+fn append_value_ref(out: &mut Vec<u8>, value: TrackedStateIndexValueRef<'_>) {
     out.push(VALUE_VERSION | if value.deleted { VALUE_DELETED_FLAG } else { 0 });
-    push_sized_bytes(&mut out, value.change_locator.source_commit_id.as_bytes());
+    push_sized_bytes(out, value.change_locator.source_commit_id.as_bytes());
     out.extend_from_slice(&value.change_locator.source_pack_id.to_be_bytes());
     out.extend_from_slice(&value.change_locator.source_ordinal.to_be_bytes());
-    push_sized_bytes(&mut out, value.change_locator.change_id.as_bytes());
-    push_sized_bytes(&mut out, value.created_at.as_bytes());
-    push_sized_bytes(&mut out, value.updated_at.as_bytes());
-    push_optional_json_ref(&mut out, value.snapshot_ref);
-    push_optional_json_ref(&mut out, value.metadata_ref);
-    out
+    push_sized_bytes(out, value.change_locator.change_id.as_bytes());
+    push_sized_bytes(out, value.created_at.as_bytes());
+    push_sized_bytes(out, value.updated_at.as_bytes());
+    push_optional_json_ref(out, value.snapshot_ref);
+    push_optional_json_ref(out, value.metadata_ref);
 }
 
 #[cfg(test)]
@@ -357,27 +365,40 @@ pub(crate) fn encode_delta_pack_refs(
     out.push(DELTA_PACK_VERSION);
     push_u32(&mut out, deltas.len());
     for delta in deltas {
-        push_sized_bytes(
-            &mut out,
-            &encode_key_ref(TrackedStateKeyRef {
-                schema_key: delta.change.schema_key,
-                file_id: delta.change.file_id,
-                entity_id: delta.change.entity_id,
-            }),
-        );
-        push_sized_bytes(
-            &mut out,
-            &encode_value_ref(TrackedStateIndexValueRef {
-                change_locator: delta.locator,
-                deleted: delta.change.snapshot_ref.is_none(),
-                snapshot_ref: delta.change.snapshot_ref,
-                metadata_ref: delta.change.metadata_ref,
-                created_at: delta.created_at,
-                updated_at: delta.updated_at,
-            }),
-        );
+        push_sized_section(&mut out, |out| {
+            append_key_ref(
+                out,
+                TrackedStateKeyRef {
+                    schema_key: delta.change.schema_key,
+                    file_id: delta.change.file_id,
+                    entity_id: delta.change.entity_id,
+                },
+            );
+        });
+        push_sized_section(&mut out, |out| {
+            append_value_ref(
+                out,
+                TrackedStateIndexValueRef {
+                    change_locator: delta.locator,
+                    deleted: delta.change.snapshot_ref.is_none(),
+                    snapshot_ref: delta.change.snapshot_ref,
+                    metadata_ref: delta.change.metadata_ref,
+                    created_at: delta.created_at,
+                    updated_at: delta.updated_at,
+                },
+            );
+        });
     }
     Ok(out)
+}
+
+fn push_sized_section(out: &mut Vec<u8>, write: impl FnOnce(&mut Vec<u8>)) {
+    let len_offset = out.len();
+    push_u32(out, 0);
+    let content_start = out.len();
+    write(out);
+    let len = out.len() - content_start;
+    out[len_offset..len_offset + 4].copy_from_slice(&(len as u32).to_be_bytes());
 }
 
 pub(crate) fn decode_delta_pack(bytes: &[u8]) -> Result<Vec<TrackedStateDeltaEntry>, LixError> {
