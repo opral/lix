@@ -2308,6 +2308,152 @@ treated as a small supporting optimization rather than a budget-moving step.
 No storage format change. No temporary shim.
 ```
 
+## Optimization 33: Varint tracked-state delta-pack local fields
+
+### Change
+
+Changed tracked-state delta packs from version `4` to version `5` with no
+backwards shim. Tree node/key/value encodings remain on their existing
+fixed-width formats.
+
+Within `LXTD` v5 delta packs, pack-local lengths/counts/indexes now use checked
+canonical `u32` varints instead of fixed-width `u32` fields:
+
+- pack commit id length
+- key prefix count, prefix schema/file id lengths, entry count
+- per-entry key/value section lengths
+- key prefix index and entity identity part count/lengths
+- full source commit id length when needed
+- source pack id and source ordinal
+- delta change id length
+- timestamp lengths
+
+The section-length encoder writes in place, reserving the maximum 5-byte varint
+header and compacting it after the section is written, avoiding a temporary
+allocation per key/value section.
+
+Decoder hardening:
+
+- rejects overlong varints
+- rejects varints above `u32::MAX`
+- rejects non-canonical encodings such as `80 00`
+- avoids eager large `Vec::with_capacity(count)` allocations from corrupt
+  decoded counts
+
+Added focused delta-pack tests for the malformed varint cases and updated the
+roundtrip fixture to assert the v5 varint header fields.
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                     | before bytes | after bytes | delta |
+| --------------------------------------- | -----------: | ----------: | ----: |
+| raw SQLite / inserted                   | 1,692,456 | 1,692,456 | reference |
+| Lix SQLite / inserted                   |   922,696 |   897,976 | -24,720 |
+| Lix SQLite / after create_version       |   935,056 |   910,336 | -24,720 |
+| Lix SQLite / after fast-forward merge   | 5,123,600 | 5,152,584 | +28,984 |
+| Lix SQLite / after divergent merge      | 5,308,064 | 5,304,136 | -3,928 |
+| Lix RocksDB / inserted                  |   836,566 |   811,776 | -24,790 |
+| Lix RocksDB / after create_version      |   838,350 |   813,523 | -24,827 |
+| Lix RocksDB / after fast-forward merge  |   991,281 |   962,754 | -28,527 |
+| Lix RocksDB / after divergent merge     | 1,345,089 | 1,306,406 | -38,683 |
+
+### Benchmarks
+
+Focused command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|exists_many_exact_keys)/1k'
+```
+
+Result: passed.
+
+Rerun after replacing temporary section buffers with in-place varint section
+headers:
+
+| row                                             | median | criterion status |
+| ----------------------------------------------- | -----: | ---------------- |
+| `raw_sqlite/write_root_all_rows/1k`             | 2.4927 ms | no change |
+| `raw_sqlite/get_many_exact_keys/1k`             | 2.0536 ms | improved |
+| `raw_sqlite/exists_many_exact_keys/1k`          | 2.1659 ms | no change |
+| `raw_sqlite/scan_full_rows/1k`                  | 1.2557 ms | improved |
+| `raw_sqlite/prefix_scan_schema_file_null/1k`    | 1.2060 ms | no change |
+| `raw_sqlite/write_delta_10pct_updates/1k`       | 1.2878 ms | improved |
+| `raw_sqlite/write_tombstone_10pct_deletes/1k`   | 1.2843 ms | improved |
+| `sqlite/write_root_all_rows/1k`                 | 4.5495 ms | no change |
+| `sqlite/get_many_exact_keys/1k`                 | 2.7998 ms | no change |
+| `sqlite/exists_many_exact_keys/1k`              | 1.8635 ms | no change |
+| `sqlite/scan_full_rows/1k`                      | 2.6022 ms | noise threshold |
+| `sqlite/prefix_scan_schema_file_null/1k`        | 2.2652 ms | no change |
+| `sqlite/write_delta_10pct_updates/1k`           | 1.7003 ms | no change |
+| `sqlite/write_tombstone_10pct_deletes/1k`       | 1.6276 ms | no change |
+| `rocksdb/write_root_all_rows/1k`                | 4.3209 ms | no change |
+| `rocksdb/get_many_exact_keys/1k`                | 2.1036 ms | regressed |
+| `rocksdb/exists_many_exact_keys/1k`             | 1.0935 ms | no change |
+| `rocksdb/scan_full_rows/1k`                     | 1.4418 ms | no change |
+| `rocksdb/prefix_scan_schema_file_null/1k`       | 1.4424 ms | no change |
+| `rocksdb/write_delta_10pct_updates/1k`          | 754.76 us | improved |
+| `rocksdb/write_tombstone_10pct_deletes/1k`      | 779.52 us | no change |
+
+The only Criterion regression in the rerun is RocksDB exact reads, which should
+not decode delta-pack values on this benchmark path. Treat as a noisy guardrail
+unless it repeats after later exact-read work.
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+
+The v5 delta-pack varint path rejects overlong, above-u32, and non-canonical
+encodings; section boundaries are preserved; tree node/key/value encodings
+still use fixed-width helpers; and the count allocation hardening avoids huge
+malformed-count allocation before truncation failure.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo test -p lix_engine tracked_state::codec:: --features storage-benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine transaction::commit:: --features storage-benches
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_full_rows|prefix_scan_schema_file_null|get_many_exact_keys|exists_many_exact_keys)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep.
+
+This is another pure physical-layout byte win. The largest clean benefit is on
+root/create-version storage and RocksDB delta/merge footprints, with no intended
+logical behavior change and no compatibility shim.
+
+The fast-forward SQLite byte count moved up on this run while divergent SQLite
+and RocksDB merge rows moved down; the inserted/create-version rows show the
+direct delta-pack-local field compression most clearly.
+
+Target is still not met: SQLite root write remains about 4.55 / 2.49 = 1.83x
+raw SQLite in the latest focused run, and scans are still above the 1.5x budget.
+```
+
 ## Optimization 32: Varint change-pack local fields
 
 Date: 2026-05-11
