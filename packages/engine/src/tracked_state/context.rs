@@ -234,6 +234,13 @@ where
             return Ok(entries);
         }
 
+        if let Some(entries) = self
+            .diff_pending_delta_suffix(left_commit_id, right_commit_id, request)
+            .await?
+        {
+            return Ok(entries);
+        }
+
         let left = self
             .projection_entries_at_commit(left_commit_id, request)
             .await?
@@ -264,23 +271,111 @@ where
         Ok(entries)
     }
 
-    pub(crate) async fn materialize_tree_value(
+    async fn diff_pending_delta_suffix(
         &mut self,
-        key: TrackedStateKey,
-        value: TrackedStateIndexValue,
-    ) -> Result<MaterializedTrackedStateRow, LixError> {
-        let mut rows = materialize_index_entries(
+        left_commit_id: &str,
+        right_commit_id: &str,
+        request: &TrackedStateTreeScanRequest,
+    ) -> Result<Option<Vec<TrackedStateTreeDiffEntry>>, LixError> {
+        let left_delta_ids = self
+            .delta_commit_ids_since_projection_root(left_commit_id)
+            .await?;
+        let right_delta_ids = self
+            .delta_commit_ids_since_projection_root(right_commit_id)
+            .await?;
+        let left_base_commit_id = self
+            .projection_base_commit_id(left_commit_id, &left_delta_ids)
+            .await?;
+        let right_base_commit_id = self
+            .projection_base_commit_id(right_commit_id, &right_delta_ids)
+            .await?;
+        if left_base_commit_id != right_base_commit_id {
+            return Ok(None);
+        }
+
+        if right_delta_ids.starts_with(&left_delta_ids) {
+            let suffix = &right_delta_ids[left_delta_ids.len()..];
+            return self
+                .diff_pending_delta_suffix_from_base(left_commit_id, suffix, request, true)
+                .await
+                .map(Some);
+        }
+
+        if left_delta_ids.starts_with(&right_delta_ids) {
+            let suffix = &left_delta_ids[right_delta_ids.len()..];
+            return self
+                .diff_pending_delta_suffix_from_base(right_commit_id, suffix, request, false)
+                .await
+                .map(Some);
+        }
+
+        Ok(None)
+    }
+
+    async fn diff_pending_delta_suffix_from_base(
+        &mut self,
+        base_commit_id: &str,
+        suffix_commit_ids: &[String],
+        request: &TrackedStateTreeScanRequest,
+        suffix_is_after: bool,
+    ) -> Result<Vec<TrackedStateTreeDiffEntry>, LixError> {
+        if suffix_commit_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut changed = BTreeMap::<TrackedStateKey, TrackedStateIndexValue>::new();
+        for commit_id in suffix_commit_ids {
+            let Some(delta_entries) = storage::load_delta_pack(&mut self.store, commit_id).await?
+            else {
+                continue;
+            };
+            for delta in delta_entries {
+                if request.matches_key(&delta.key) {
+                    changed.insert(delta.key, delta.value);
+                }
+            }
+        }
+
+        if changed.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let keys = changed.keys().cloned().collect::<Vec<_>>();
+        let base_values = self
+            .projection_values_at_commit_for_keys(base_commit_id, &keys)
+            .await?;
+        let entries = keys
+            .into_iter()
+            .zip(base_values)
+            .filter_map(|(key, base_value)| {
+                let changed_value = changed.get(&key).cloned();
+                let (before_value, after_value) = if suffix_is_after {
+                    (base_value, changed_value)
+                } else {
+                    (changed_value, base_value)
+                };
+                if before_value == after_value {
+                    return None;
+                }
+                Some(TrackedStateTreeDiffEntry {
+                    before: before_value.map(|value| (key.clone(), value)),
+                    after: after_value.map(|value| (key, value)),
+                })
+            })
+            .collect();
+        Ok(entries)
+    }
+
+    pub(crate) async fn materialize_tree_values(
+        &mut self,
+        entries: Vec<(TrackedStateKey, TrackedStateIndexValue)>,
+    ) -> Result<Vec<MaterializedTrackedStateRow>, LixError> {
+        materialize_index_entries(
             &mut self.store,
-            vec![(key, value)],
+            entries,
             &crate::tracked_state::TrackedMaterializationProjection::full(),
         )
-        .await?;
-        rows.pop().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked_state materialization returned no row for one index entry",
-            )
-        })
+        .await
     }
 
     async fn scan_rows_at_commit_by_file_index(

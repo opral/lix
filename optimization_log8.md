@@ -5344,3 +5344,141 @@ improved by Criterion. Exact reads remained neutral, as expected.
 Storage is unchanged. No format change, no backward shim. This does not complete
 the <= 1.5x target; SQLite scans and root writes still need larger cuts.
 ```
+
+## Optimization 37: Diff pending delta suffixes by changed keys
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Added a changed-key fast path for pending tracked-state delta chains:
+
+- `diff_tree_entries_at_commits` now detects when the two commits share the
+  same projection base and one pending-delta chain is a prefix of the other.
+- For that prefix/suffix shape, the reader loads only the suffix delta packs,
+  collapses touched keys in chain order, fetches base values for those keys with
+  the existing keyed projection lookup, and emits diff entries for those keys.
+- Divergent chains, different projection bases, and projection-root-only diffs
+  keep using the existing full diff paths.
+- Diff row materialization is batched by side: all `before` rows and all `after`
+  rows are hydrated through grouped `materialize_tree_values` calls instead of
+  one row at a time.
+- Added focused coverage for parent-to-child suffix diffs, child-to-parent
+  reverse suffix diffs, and suffix tombstone preservation.
+
+This follows the Dolt/Sapling-style rule from the reference systems: diff work
+should scale with changed keys and delta depth, not with the full materialized
+state when ancestry proves a delta suffix relation.
+
+### Benchmarks
+
+Primary changed-key command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(changed_keys_update_10pct|changed_keys_delta_chain_10x1pct)/1k'
+```
+
+First post-patch run:
+
+| row                                                               |   median | criterion status |
+| ----------------------------------------------------------------- | -------: | ---------------- |
+| `sqlite/changed_keys_update_10pct/1k`                             | 2.6094 ms | improved -96.469% |
+| `sqlite/changed_keys_delta_chain_10x1pct/1k`                      | 3.3063 ms | improved -72.997% |
+| `rocksdb/changed_keys_update_10pct/1k`                            | 1.8167 ms | improved -97.460% |
+| `rocksdb/changed_keys_delta_chain_10x1pct/1k`                     | 1.4175 ms | improved -86.437% |
+
+Final rerun after review LOW fixes:
+
+| row                                                               |   median | interpretation |
+| ----------------------------------------------------------------- | -------: | -------------- |
+| `sqlite/changed_keys_update_10pct/1k`                             | 3.8562 ms | still massively below the pre-patch ~68 ms baseline |
+| `sqlite/changed_keys_delta_chain_10x1pct/1k`                      | 4.6675 ms | still materially below the pre-patch ~10 ms baseline |
+| `rocksdb/changed_keys_update_10pct/1k`                            | 2.1797 ms | still massively below the pre-patch ~67 ms baseline |
+| `rocksdb/changed_keys_delta_chain_10x1pct/1k`                     | 1.7321 ms | still materially below the pre-patch ~8.7 ms baseline |
+
+Read/write guardrail command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed as a guardrail. The rerun reported no Criterion regressions for
+exact reads or scans. Medians were noisy and raw SQLite also moved, consistent
+with the change being isolated to diff planning/materialization.
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                    |   bytes | bytes/row | status          |
+| -------------------------------------- | ------: | --------: | --------------- |
+| raw SQLite / inserted                  | 1692456 |    1692.5 | reference       |
+| Lix SQLite / inserted                  |  897976 |     898.0 | unchanged       |
+| Lix SQLite / after create_version      |  910336 |     910.3 | unchanged       |
+| Lix SQLite / after fast-forward merge  | 5152584 |    5152.6 | unchanged       |
+| Lix SQLite / after divergent merge     | 5304136 |    5304.1 | unchanged/noisy |
+| Lix RocksDB / inserted                 |  811760 |     811.8 | unchanged       |
+| Lix RocksDB / after create_version     |  813507 |     813.5 | unchanged       |
+| Lix RocksDB / after fast-forward merge |  962738 |     962.7 | unchanged       |
+| Lix RocksDB / after divergent merge    | 1306390 |    1306.4 | unchanged       |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+Initial review:
+HIGH: none.
+MEDIUM: none.
+LOW: preserve the planned/materialized row-count invariant instead of using
+get(index).cloned(); add direct reverse-suffix and tombstone suffix coverage.
+
+Follow-up review:
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo check -p lix_engine --features storage-benches
+cargo test -p lix_engine tracked_state::diff:: --features storage-benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(sqlite|rocksdb)/smoke/(changed_keys_update_10pct|changed_keys_delta_chain_10x1pct)/1k'
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a changed-key physical-layout optimization.
+
+Primary axis: diff/changed-key discovery. The structural win avoids rebuilding
+both full pending states when commit ancestry proves that one side is the other
+plus a suffix of delta packs. Work now scales with touched suffix keys for the
+common base->child and base->delta-chain cases.
+
+Timing: the first post-patch run showed 72-97% Criterion improvements across
+SQLite and RocksDB changed-key rows. The final rerun was noisier and slower than
+the first post-patch run, but still far below the pre-patch tens-of-milliseconds
+baseline.
+
+Storage is unchanged. No format change, no backward shim, and no benchmark
+measurement change. This does not complete the <= 1.5x target; SQLite scans and
+root writes still need larger structural cuts.
+```
