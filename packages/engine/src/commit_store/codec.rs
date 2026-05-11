@@ -7,8 +7,10 @@ use crate::LixError;
 
 const COMMIT_MAGIC: &[u8; 5] = b"LXCM1";
 const CHANGE_MAGIC: &[u8; 5] = b"LXCH2";
-const CHANGE_PACK_MAGIC: &[u8; 5] = b"LXCP1";
+const CHANGE_PACK_MAGIC: &[u8; 5] = b"LXCP2";
 const MEMBERSHIP_PACK_MAGIC: &[u8; 5] = b"LXMP1";
+const CHANGE_ID_FULL: u8 = 0;
+const CHANGE_ID_COMMIT_SUFFIX: u8 = 1;
 
 pub(crate) fn encode_commit_ref(commit: StoredCommitRef<'_>) -> Result<Vec<u8>, LixError> {
     let mut bytes = Vec::new();
@@ -107,11 +109,20 @@ pub(crate) fn encode_change_pack(
     bytes.extend_from_slice(CHANGE_PACK_MAGIC);
     write_str(&mut bytes, commit_id)?;
     bytes.extend_from_slice(&pack_id.to_le_bytes());
+    let (shapes, change_shape_indexes) = change_shapes(changes);
+    write_len(&mut bytes, shapes.len(), "change pack shapes")?;
+    for shape in &shapes {
+        write_str(&mut bytes, shape.schema_key)?;
+        write_optional_str(&mut bytes, shape.file_id)?;
+    }
     write_len(&mut bytes, changes.len(), "change pack changes")?;
-    for change in changes.iter().copied() {
-        write_sized_section(&mut bytes, "change", |bytes| {
-            write_change_ref(bytes, change)
-        })?;
+    for (change, shape_index) in changes.iter().copied().zip(change_shape_indexes) {
+        write_change_id(&mut bytes, commit_id, change.id)?;
+        write_entity_identity(&mut bytes, change.entity_id)?;
+        write_len(&mut bytes, shape_index, "change shape index")?;
+        write_optional_json_ref(&mut bytes, change.snapshot_ref);
+        write_optional_json_ref(&mut bytes, change.metadata_ref);
+        write_str(&mut bytes, change.created_at)?;
     }
     Ok(bytes)
 }
@@ -121,13 +132,74 @@ pub(crate) fn decode_change_pack(bytes: &[u8]) -> Result<(String, u32, Vec<Chang
     cursor.expect_magic(CHANGE_PACK_MAGIC, "change pack")?;
     let commit_id = cursor.read_string("commit_id")?;
     let pack_id = cursor.read_u32("pack_id")?;
+    let shape_count = cursor.read_u32("shape_count")? as usize;
+    let mut shapes = Vec::with_capacity(shape_count);
+    for _ in 0..shape_count {
+        shapes.push(ChangeShape {
+            schema_key: cursor.read_string("schema_key")?,
+            file_id: cursor.read_optional_string("file_id")?,
+        });
+    }
     let change_count = cursor.read_u32("change_count")? as usize;
     let mut changes = Vec::with_capacity(change_count);
     for _ in 0..change_count {
-        changes.push(decode_change(cursor.read_bytes("change")?)?);
+        let id = cursor.read_change_id(&commit_id)?;
+        let entity_id = cursor.read_entity_identity()?;
+        let shape_index = cursor.read_u32("shape_index")? as usize;
+        let shape = shapes.get(shape_index).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("failed to decode commit-store change pack: shape index {shape_index} is out of bounds"),
+            )
+        })?;
+        let snapshot_ref = cursor.read_optional_json_ref("snapshot_ref")?;
+        let metadata_ref = cursor.read_optional_json_ref("metadata_ref")?;
+        let created_at = cursor.read_string("created_at")?;
+        changes.push(Change {
+            id,
+            entity_id,
+            schema_key: shape.schema_key.clone(),
+            file_id: shape.file_id.clone(),
+            snapshot_ref,
+            metadata_ref,
+            created_at,
+        });
     }
     cursor.expect_end("change pack")?;
     Ok((commit_id, pack_id, changes))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChangeShapeRef<'a> {
+    schema_key: &'a str,
+    file_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChangeShape {
+    schema_key: String,
+    file_id: Option<String>,
+}
+
+fn change_shapes<'a>(changes: &'a [ChangeRef<'a>]) -> (Vec<ChangeShapeRef<'a>>, Vec<usize>) {
+    let mut shapes = Vec::new();
+    let mut shape_indexes = Vec::with_capacity(changes.len());
+    for change in changes {
+        let shape = ChangeShapeRef {
+            schema_key: change.schema_key,
+            file_id: change.file_id,
+        };
+        let shape_index = match shapes.iter().position(|candidate| *candidate == shape) {
+            Some(shape_index) => shape_index,
+            None => {
+                let shape_index = shapes.len();
+                shapes.push(shape);
+                shape_index
+            }
+        };
+        shape_indexes.push(shape_index);
+    }
+    (shapes, shape_indexes)
 }
 
 pub(crate) fn encode_membership_pack<'a>(
@@ -212,26 +284,6 @@ fn write_optional_json_ref(bytes: &mut Vec<u8>, value: Option<&JsonRef>) {
     }
 }
 
-fn write_sized_section(
-    bytes: &mut Vec<u8>,
-    field: &str,
-    write: impl FnOnce(&mut Vec<u8>) -> Result<(), LixError>,
-) -> Result<(), LixError> {
-    let len_offset = bytes.len();
-    bytes.extend_from_slice(&0_u32.to_le_bytes());
-    let content_start = bytes.len();
-    write(bytes)?;
-    let len = bytes.len() - content_start;
-    let len = u32::try_from(len).map_err(|_| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("commit-store {field} exceeds u32 length"),
-        )
-    })?;
-    bytes[len_offset..len_offset + 4].copy_from_slice(&len.to_le_bytes());
-    Ok(())
-}
-
 fn write_len(bytes: &mut Vec<u8>, len: usize, field: &str) -> Result<(), LixError> {
     let len = u32::try_from(len).map_err(|_| {
         LixError::new(
@@ -240,6 +292,28 @@ fn write_len(bytes: &mut Vec<u8>, len: usize, field: &str) -> Result<(), LixErro
         )
     })?;
     bytes.extend_from_slice(&len.to_le_bytes());
+    Ok(())
+}
+
+fn write_change_id(bytes: &mut Vec<u8>, commit_id: &str, change_id: &str) -> Result<(), LixError> {
+    if let Some(suffix) = change_id.strip_prefix(commit_id) {
+        bytes.push(CHANGE_ID_COMMIT_SUFFIX);
+        write_str(bytes, suffix)
+    } else {
+        bytes.push(CHANGE_ID_FULL);
+        write_str(bytes, change_id)
+    }
+}
+
+fn write_entity_identity(bytes: &mut Vec<u8>, identity: &EntityIdentity) -> Result<(), LixError> {
+    write_len(
+        bytes,
+        identity.parts.len(),
+        "commit-store entity identity parts",
+    )?;
+    for part in &identity.parts {
+        write_str(bytes, part)?;
+    }
     Ok(())
 }
 
@@ -352,24 +426,6 @@ impl<'a> ByteCursor<'a> {
         }
     }
 
-    fn read_bytes(&mut self, field: &str) -> Result<&'a [u8], LixError> {
-        let len = self.read_u32(field)? as usize;
-        let end = self.offset.checked_add(len).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("failed to decode commit-store field `{field}`: length overflow"),
-            )
-        })?;
-        let bytes = self.bytes.get(self.offset..end).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("failed to decode commit-store field `{field}`: truncated bytes"),
-            )
-        })?;
-        self.offset = end;
-        Ok(bytes)
-    }
-
     fn read_u8(&mut self, field: &str) -> Result<u8, LixError> {
         let byte = self.bytes.get(self.offset).copied().ok_or_else(|| {
             LixError::new(
@@ -400,6 +456,34 @@ impl<'a> ByteCursor<'a> {
                 .try_into()
                 .expect("slice length was checked before u32 decode"),
         ))
+    }
+
+    fn read_change_id(&mut self, commit_id: &str) -> Result<String, LixError> {
+        let tag = self.read_u8("change_id tag")?;
+        let value = self.read_string("change_id")?;
+        match tag {
+            CHANGE_ID_FULL => Ok(value),
+            CHANGE_ID_COMMIT_SUFFIX => Ok(format!("{commit_id}{value}")),
+            tag => Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("failed to decode commit-store field `change_id`: invalid tag {tag}"),
+            )),
+        }
+    }
+
+    fn read_entity_identity(&mut self) -> Result<EntityIdentity, LixError> {
+        let count = self.read_u32("entity identity part count")? as usize;
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            parts.push(self.read_string("entity identity part")?);
+        }
+        if parts.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to decode commit-store entity identity: empty identity",
+            ));
+        }
+        Ok(EntityIdentity { parts })
     }
 
     fn expect_end(&self, label: &str) -> Result<(), LixError> {
@@ -472,30 +556,58 @@ mod tests {
     }
 
     #[test]
-    fn change_pack_entry_bytes_match_standalone_change_encoding() {
-        let change = Change {
-            id: "change-1".to_string(),
-            entity_id: EntityIdentity::single("entity-1"),
-            schema_key: "test_schema".to_string(),
-            file_id: Some("file-1".to_string()),
-            snapshot_ref: Some(JsonRef::from_hash_bytes([1; 32])),
-            metadata_ref: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-        };
+    fn change_pack_compacts_shared_shape_and_commit_id_prefix() {
+        let changes = [
+            Change {
+                id: "commit-1:change-1".to_string(),
+                entity_id: EntityIdentity::single("entity-1"),
+                schema_key: "test_schema".to_string(),
+                file_id: Some("file-1".to_string()),
+                snapshot_ref: Some(JsonRef::from_hash_bytes([1; 32])),
+                metadata_ref: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+            Change {
+                id: "external-change".to_string(),
+                entity_id: EntityIdentity::single("entity-2"),
+                schema_key: "test_schema".to_string(),
+                file_id: Some("file-1".to_string()),
+                snapshot_ref: None,
+                metadata_ref: Some(JsonRef::from_hash_bytes([2; 32])),
+                created_at: "2026-01-02T00:00:00Z".to_string(),
+            },
+        ];
 
-        let encoded_change = encode_change_ref(change.as_ref()).expect("change should encode");
-        let encoded_pack =
-            encode_change_pack("commit-1", 0, &[change.as_ref()]).expect("pack should encode");
-        let mut cursor = ByteCursor::new(&encoded_pack);
+        let encoded = encode_change_pack(
+            "commit-1",
+            7,
+            &changes.iter().map(Change::as_ref).collect::<Vec<_>>(),
+        )
+        .expect("pack should encode");
+        let (commit_id, pack_id, decoded) =
+            decode_change_pack(&encoded).expect("pack should decode");
+
+        assert_eq!(commit_id, "commit-1");
+        assert_eq!(pack_id, 7);
+        assert_eq!(decoded, changes);
+
+        let mut cursor = ByteCursor::new(&encoded);
         cursor
             .expect_magic(CHANGE_PACK_MAGIC, "change pack")
             .unwrap();
         assert_eq!(cursor.read_string("commit_id").unwrap(), "commit-1");
-        assert_eq!(cursor.read_u32("pack_id").unwrap(), 0);
-        assert_eq!(cursor.read_u32("change_count").unwrap(), 1);
-
-        assert_eq!(cursor.read_bytes("change").unwrap(), encoded_change);
-        cursor.expect_end("change pack").unwrap();
+        assert_eq!(cursor.read_u32("pack_id").unwrap(), 7);
+        assert_eq!(cursor.read_u32("shape_count").unwrap(), 1);
+        assert_eq!(cursor.read_string("schema_key").unwrap(), "test_schema");
+        assert_eq!(
+            cursor.read_optional_string("file_id").unwrap().as_deref(),
+            Some("file-1")
+        );
+        assert_eq!(cursor.read_u32("change_count").unwrap(), 2);
+        assert_eq!(
+            cursor.read_u8("change_id tag").unwrap(),
+            CHANGE_ID_COMMIT_SUFFIX
+        );
     }
 
     #[test]

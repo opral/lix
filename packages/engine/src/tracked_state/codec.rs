@@ -13,9 +13,11 @@ const NODE_VERSION: u8 = 2;
 const VALUE_VERSION: u8 = 7;
 const VALUE_DELETED_FLAG: u8 = 0b1000_0000;
 const VALUE_VERSION_MASK: u8 = 0b0111_1111;
-const DELTA_PACK_VERSION: u8 = 3;
+const DELTA_PACK_VERSION: u8 = 4;
 const DELTA_LOCATOR_SAME_COMMIT: u8 = 0;
 const DELTA_LOCATOR_FULL: u8 = 1;
+const DELTA_CHANGE_ID_FULL: u8 = 0;
+const DELTA_CHANGE_ID_COMMIT_SUFFIX: u8 = 1;
 const TIMESTAMP_UPDATED_SAME: u8 = 0;
 const TIMESTAMP_UPDATED_DISTINCT: u8 = 1;
 const NODE_KIND_LEAF: u8 = 1;
@@ -500,7 +502,11 @@ fn append_delta_value_ref(
     }
     out.extend_from_slice(&value.change_locator.source_pack_id.to_be_bytes());
     out.extend_from_slice(&value.change_locator.source_ordinal.to_be_bytes());
-    push_sized_bytes(out, value.change_locator.change_id.as_bytes());
+    push_delta_change_id(
+        out,
+        value.change_locator.source_commit_id,
+        value.change_locator.change_id,
+    );
     push_timestamp_pair(out, value.created_at, value.updated_at);
     push_optional_json_ref(out, value.snapshot_ref);
     push_optional_json_ref(out, value.metadata_ref);
@@ -624,7 +630,7 @@ fn decode_delta_value(
                 "tracked-state source_ordinal exceeds u32",
             )
         })?;
-    let change_id = read_sized_string(bytes, &mut cursor, "change_id")?;
+    let change_id = read_delta_change_id(bytes, &mut cursor, &source_commit_id)?;
     let (created_at, updated_at) = read_timestamp_pair(bytes, &mut cursor)?;
     let snapshot_ref = read_optional_json_ref(bytes, &mut cursor, "snapshot_ref")?;
     let metadata_ref = read_optional_json_ref(bytes, &mut cursor, "metadata_ref")?;
@@ -932,6 +938,33 @@ fn push_optional_json_ref(out: &mut Vec<u8>, json_ref: Option<&JsonRef>) {
             out.extend_from_slice(json_ref.as_hash_bytes());
         }
         None => out.push(0),
+    }
+}
+
+fn push_delta_change_id(out: &mut Vec<u8>, source_commit_id: &str, change_id: &str) {
+    if let Some(suffix) = change_id.strip_prefix(source_commit_id) {
+        out.push(DELTA_CHANGE_ID_COMMIT_SUFFIX);
+        push_sized_bytes(out, suffix.as_bytes());
+    } else {
+        out.push(DELTA_CHANGE_ID_FULL);
+        push_sized_bytes(out, change_id.as_bytes());
+    }
+}
+
+fn read_delta_change_id(
+    bytes: &[u8],
+    cursor: &mut usize,
+    source_commit_id: &str,
+) -> Result<String, LixError> {
+    let tag = read_u8(bytes, cursor, "delta change_id tag")?;
+    let value = read_sized_string(bytes, cursor, "change_id")?;
+    match tag {
+        DELTA_CHANGE_ID_FULL => Ok(value),
+        DELTA_CHANGE_ID_COMMIT_SUFFIX => Ok(format!("{source_commit_id}{value}")),
+        other => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("tracked-state delta value has invalid change_id tag {other}"),
+        )),
     }
 }
 
@@ -1301,7 +1334,7 @@ mod tests {
         let snapshot_ref = JsonRef::from_hash_bytes([1; 32]);
         let metadata_ref = JsonRef::from_hash_bytes([2; 32]);
         let live_change = crate::commit_store::ChangeRef {
-            id: "change-live",
+            id: "commit-a:change-live",
             entity_id: &entity_id,
             schema_key: "schema",
             file_id: Some("file-a"),
@@ -1322,13 +1355,13 @@ mod tests {
             source_commit_id: "commit-a",
             source_pack_id: 3,
             source_ordinal: 5,
-            change_id: "change-live",
+            change_id: "commit-a:change-live",
         };
         let tombstone_locator = crate::commit_store::ChangeLocatorRef {
             source_commit_id: "source-commit",
             source_pack_id: 3,
             source_ordinal: 6,
-            change_id: "change-deleted",
+            change_id: "commit-a:borrowed",
         };
         let encoded = encode_delta_pack_refs(
             "commit-a",
@@ -1379,7 +1412,7 @@ mod tests {
                             source_commit_id: "commit-a".to_string(),
                             source_pack_id: 3,
                             source_ordinal: 5,
-                            change_id: "change-live".to_string(),
+                            change_id: "commit-a:change-live".to_string(),
                         },
                         deleted: false,
                         snapshot_ref: Some(snapshot_ref),
@@ -1399,7 +1432,7 @@ mod tests {
                             source_commit_id: "source-commit".to_string(),
                             source_pack_id: 3,
                             source_ordinal: 6,
-                            change_id: "change-deleted".to_string(),
+                            change_id: "commit-a:borrowed".to_string(),
                         },
                         deleted: true,
                         snapshot_ref: None,
