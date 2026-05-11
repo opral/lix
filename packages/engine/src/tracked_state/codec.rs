@@ -551,11 +551,11 @@ pub(crate) fn decode_delta_pack(
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         let key = decode_delta_key(
-            &read_sized_bytes(bytes, &mut cursor, "delta key")?,
+            read_sized_slice(bytes, &mut cursor, "delta key")?,
             &key_prefixes,
         )?;
         let value = decode_delta_value(
-            &read_sized_bytes(bytes, &mut cursor, "delta value")?,
+            read_sized_slice(bytes, &mut cursor, "delta value")?,
             &commit_id,
         )?;
         entries.push(TrackedStateDeltaEntry { key, value });
