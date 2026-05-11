@@ -3974,65 +3974,23 @@ async fn write_tracked_root(
             .unwrap_or("1970-01-01T00:00:00.000Z"),
     };
     let commit_store = CommitStoreContext::new();
-    let change_ids = changes
-        .iter()
-        .map(|change| change.id.clone())
-        .collect::<Vec<_>>();
-    let existing_changes = commit_store
-        .reader(&mut transaction.as_mut())
-        .load_change_index_entries(&change_ids)
-        .await?;
-    let mut authored_changes = Vec::new();
-    let mut authored_created_at = Vec::new();
-    let mut authored_updated_at = Vec::new();
-    let mut adopted_changes = Vec::new();
-    let mut adopted_created_at = Vec::new();
-    let mut adopted_updated_at = Vec::new();
-    for ((change, row), existing) in changes.iter().zip(rows).zip(existing_changes) {
-        if existing.is_some() {
-            adopted_changes.push(change.as_ref());
-            adopted_created_at.push(row.created_at.as_str());
-            adopted_updated_at.push(row.updated_at.as_str());
-        } else {
-            authored_changes.push(change.as_ref());
-            authored_created_at.push(row.created_at.as_str());
-            authored_updated_at.push(row.updated_at.as_str());
-        }
-    }
+    let authored_changes = changes.iter().map(Change::as_ref).collect::<Vec<_>>();
     let staged = commit_store
         .writer(&mut transaction.as_mut(), &mut writes)
-        .stage_commit_draft(commit, authored_changes.clone(), adopted_changes.clone())
+        .stage_commit_draft(commit, authored_changes.clone(), Vec::new())
         .await?;
     let mut deltas = Vec::with_capacity(changes.len());
     deltas.extend(
         authored_changes
             .iter()
             .zip(&staged.authored_locators)
-            .zip(authored_created_at)
-            .zip(authored_updated_at)
-            .map(
-                |(((change, locator), created_at), updated_at)| TrackedStateDeltaRef {
-                    change: *change,
-                    locator: locator.as_ref(),
-                    created_at,
-                    updated_at,
-                },
-            ),
-    );
-    deltas.extend(
-        adopted_changes
-            .iter()
-            .zip(&staged.adopted_locators)
-            .zip(adopted_created_at)
-            .zip(adopted_updated_at)
-            .map(
-                |(((change, locator), created_at), updated_at)| TrackedStateDeltaRef {
-                    change: *change,
-                    locator: locator.as_ref(),
-                    created_at,
-                    updated_at,
-                },
-            ),
+            .zip(rows)
+            .map(|((change, locator), row)| TrackedStateDeltaRef {
+                change: *change,
+                locator: locator.as_ref(),
+                created_at: row.created_at.as_str(),
+                updated_at: row.updated_at.as_str(),
+            }),
     );
     context
         .writer(&mut transaction.as_mut(), &mut writes)
