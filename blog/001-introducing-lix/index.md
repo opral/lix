@@ -87,7 +87,7 @@ That means audit trails, rollbacks, and “blame” become simple queries:
 ```sql
 SELECT *
 FROM state_history
-WHERE entity_id = lix_json('["settings.theme"]')
+WHERE entity_id = 'settings.theme'
 ORDER BY depth ASC;
 ```
 
