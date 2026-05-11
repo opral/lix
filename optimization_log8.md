@@ -2458,6 +2458,114 @@ measurement change. This does not complete the <= 1.5x target because SQLite
 full/prefix scans remain above budget.
 ```
 
+## Optimization 35: Pre-size tracked materialization JSON slots
+
+Date: 2026-05-11
+
+Commit: this entry is committed with the optimization
+
+### Change
+
+Pre-sized the tracked-state materialization JSON side buffers from known entry
+and projection counts:
+
+- `materialize_index_entries` now computes the maximum projected JSON slots as
+  `entries.len() * projected_json_columns`.
+- `json_refs` and `json_ref_localities` reserve that capacity up front instead
+  of growing from zero while planning rows.
+
+This follows the same locality principle used in the pack formats: when a scan
+already has the row count and projected column shape, allocate the side vectors
+once for the dense payload path.
+
+### Benchmarks
+
+Focused read command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+Result: passed.
+
+| row                                                   | median | criterion status |
+| ----------------------------------------------------- | -----: | ---------------- |
+| `raw_sqlite/get_many_exact_keys/1k`                   | 2.1087 ms | reference/no change |
+| `raw_sqlite/scan_full_rows/1k`                        | 1.1755 ms | reference/no change |
+| `raw_sqlite/prefix_scan_schema_file_null/1k`          | 1.1727 ms | reference/no change |
+| `sqlite/get_many_exact_keys/1k`                       | 2.7590 ms | no change |
+| `sqlite/scan_full_rows/1k`                            | 2.1942 ms | no change, lower median |
+| `sqlite/prefix_scan_schema_file_null/1k`              | 2.2549 ms | no change |
+| `rocksdb/get_many_exact_keys/1k`                      | 2.0010 ms | improved |
+| `rocksdb/scan_full_rows/1k`                           | 1.4752 ms | no change |
+| `rocksdb/prefix_scan_schema_file_null/1k`             | 1.4116 ms | no change |
+
+### Storage
+
+Storage command:
+
+```sh
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+```
+
+Result: passed.
+
+1k rows:
+
+| row                                     | bytes | bytes/row | status |
+| --------------------------------------- | ----: | --------: | ------ |
+| raw SQLite / inserted                   | 1692456 | 1692.5 | reference |
+| Lix SQLite / inserted                   | 897976 | 898.0 | unchanged |
+| Lix SQLite / after create_version       | 910336 | 910.3 | unchanged |
+| Lix SQLite / after fast-forward merge   | 5152584 | 5152.6 | unchanged |
+| Lix SQLite / after divergent merge      | 5312328 | 5312.3 | unchanged/noisy |
+| Lix RocksDB / inserted                  | 811772 | 811.8 | unchanged |
+| Lix RocksDB / after create_version      | 813519 | 813.5 | unchanged |
+| Lix RocksDB / after fast-forward merge  | 962750 | 962.8 | unchanged |
+| Lix RocksDB / after divergent merge     | 1306401 | 1306.4 | unchanged |
+
+### Review Loop
+
+Reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: reserves the upper bound for sparse/tombstone-heavy rows. This is bounded
+to at most two slots per row and is an acceptable hot-path tradeoff for dense
+payload scans.
+```
+
+### Verification
+
+```sh
+cargo fmt --check
+cargo check -p lix_engine --features storage-benches
+cargo test -p lix_engine tracked_state::materialization:: --features storage-benches
+cargo test -p lix_engine json_pointer_crud_storage_accounting --features storage-benches -- --ignored --nocapture
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/(raw_sqlite|sqlite|rocksdb)/smoke/(get_many_exact_keys|scan_full_rows|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep as a small tracked materialization allocation cleanup.
+
+Primary axis: dense full-row materialization for exact reads and scans. The
+structural win removes repeated growth of JSON ref/locality side buffers when
+the planner already knows the maximum slot count.
+
+Timing: RocksDB exact reads improved by Criterion. SQLite scan medians moved
+lower but remained Criterion-neutral. There were no measured regressions in the
+focused read run.
+
+Storage is unchanged. No format change, no backward shim, no benchmark
+measurement change. This does not complete the <= 1.5x target; SQLite full and
+prefix scans remain above budget and root writes still need a larger cut.
+```
+
 ## Optimization 33: Varint tracked-state delta-pack local fields
 
 ### Change

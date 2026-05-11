@@ -28,9 +28,12 @@ where
             .collect());
     }
 
+    let json_slots_per_row =
+        usize::from(projection.snapshot_content) + usize::from(projection.metadata);
+    let json_ref_capacity = entries.len().saturating_mul(json_slots_per_row);
     let mut row_plans = Vec::with_capacity(entries.len());
-    let mut json_refs = Vec::new();
-    let mut json_ref_localities = Vec::new();
+    let mut json_refs = Vec::with_capacity(json_ref_capacity);
+    let mut json_ref_localities = Vec::with_capacity(json_ref_capacity);
     for (key, value) in entries {
         let row_index = row_plans.len();
         let snapshot_ref_index = projected_json_ref_index(
