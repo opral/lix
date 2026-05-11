@@ -289,7 +289,11 @@ both backends, not just through CRUD timings.
 
 ## Entry Template
 
-Use one entry per kept layout or access-path change.
+Use one entry per kept layout or access-path change. Every kept optimization
+must run the full baseline + smoke scoreboard for raw storage, E2E workflows,
+and storage accounting. Do not record only the row that the optimization was
+expected to improve; the point of the log is to catch regressions and tradeoffs
+across the whole tracked-state workflow.
 
 ```text
 ## Optimization N: <short name>
@@ -300,14 +304,14 @@ Hypothesis:
   What physical layout or access-path change is being tested?
 
 Raw Storage API scoreboard:
-  Include the impacted raw storage rows for SQLite and RocksDB.
+  Include all raw storage rows for SQLite and RocksDB at 100 and 1k.
 
 E2E Workflow scoreboard:
-  Include the impacted CRUD, create_version, and merge_version rows.
+  Include all CRUD, create_version, and merge_version rows at 100 and 1k.
   Include raw SQLite reference where the operation has one.
 
 Storage scoreboard:
-  Include workflow storage rows for raw SQLite, Lix SQLite, and Lix RocksDB.
+  Include all workflow storage rows for raw SQLite, Lix SQLite, and Lix RocksDB.
 
 Decision:
   Keep, revert, or follow-up.
@@ -385,4 +389,88 @@ delete_all_rows/1k improved from 2.4630 s to 32.180 ms on Lix SQLite and
 from 1.7949 s to 23.674 ms on Lix RocksDB. The profile bottleneck moved away
 from repeated committed state-FK source scans; inserts and merge/diff remain
 the dominant physical-layout targets.
+```
+
+## Optimization 2: Batched Committed Insert Identity Validation
+
+Commit: uncommitted on current branch
+
+Hypothesis:
+
+```text
+INSERT spends most of its time checking whether each staged identity already
+exists in committed live state. Batch those checks by exact domain/schema and
+scan the committed rows once per group instead of once per inserted row.
+```
+
+Change:
+
+```text
+Build the pending staged identity set once, group committed insert identity
+checks by `(Domain, schema_key)`, scan committed rows once per group with the
+full entity-id batch, and test the returned rows in memory.
+```
+
+Raw Storage API scoreboard:
+
+| operation                          | SQLite 100 | SQLite 1k | SQLite x | RocksDB 100 | RocksDB 1k | RocksDB x |
+| ---------------------------------- | ---------: | --------: | -------: | ----------: | ---------: | --------: |
+| `write_root_all_rows`              |  2.8488 ms | 6.8410 ms |    2.40x |   4.0790 ms |  6.9094 ms |     1.69x |
+| `get_many_exact_keys`              |  1.5314 ms | 4.7728 ms |    3.12x |   1.3573 ms |  4.3056 ms |     3.17x |
+| `get_many_missing_keys`            |   835.3 us | 2.5124 ms |    3.01x |    846.8 us |  1.6843 ms |     1.99x |
+| `exists_many_exact_keys`           |  1.4762 ms | 4.7909 ms |    3.25x |   1.5038 ms |  4.3722 ms |     2.91x |
+| `scan_keys_only`                   |   976.9 us | 3.1554 ms |    3.23x |    881.8 us |  2.4408 ms |     2.77x |
+| `scan_headers_only`                |  1.1819 ms | 3.7566 ms |    3.18x |   1.1618 ms |  2.4719 ms |     2.13x |
+| `scan_full_rows`                   |  2.0658 ms | 5.9674 ms |    2.89x |   1.3391 ms |  4.6009 ms |     3.44x |
+| `prefix_scan_schema`               |  1.5120 ms | 5.4635 ms |    3.61x |   1.5115 ms |  3.8891 ms |     2.57x |
+| `prefix_scan_schema_file_null`     |  1.6492 ms | 4.7101 ms |    2.86x |   1.6867 ms |  3.9062 ms |     2.32x |
+| `write_delta_10pct_updates`        |  1.3705 ms | 3.2507 ms |    2.37x |    782.8 us |  1.9059 ms |     2.43x |
+| `write_tombstone_10pct_deletes`    |  1.2939 ms | 3.0927 ms |    2.39x |    884.6 us |  1.8954 ms |     2.14x |
+| `changed_keys_update_10pct`        |  2.8615 ms | 78.074 ms |   27.28x |   2.2180 ms |  71.918 ms |    32.42x |
+| `changed_keys_delta_chain_10x1pct` |  1.7743 ms | 13.054 ms |    7.36x |   1.5709 ms |  9.6579 ms |     6.15x |
+| `materialize_delta_chain_10x1pct`  |  1.6561 ms | 6.2290 ms |    3.76x |    903.8 us |  3.2262 ms |     3.57x |
+
+E2E workflow scoreboard:
+
+| axis         | operation                                  | raw SQLite 100 | raw SQLite 1k | raw x | Lix SQLite 100 | Lix SQLite 1k | Lix SQLite x | Lix RocksDB 100 | Lix RocksDB 1k | Lix RocksDB x |
+| ------------ | ------------------------------------------ | -------------: | ------------: | ----: | -------------: | ------------: | -----------: | --------------: | -------------: | ------------: |
+| CRUD         | `insert_all_rows`                          |      1.4727 ms |     2.9440 ms | 2.00x |      14.928 ms |     61.763 ms |        4.14x |       15.420 ms |      56.365 ms |         3.66x |
+| CRUD         | `select_all_path_value`                    |       795.3 us |     1.5314 ms | 1.93x |      5.4509 ms |     13.638 ms |        2.50x |       5.2695 ms |      12.294 ms |         2.33x |
+| CRUD         | `select_one_by_pk`                         |       778.4 us |     1.9265 ms | 2.47x |      2.0537 ms |     6.4010 ms |        3.12x |       2.2049 ms |      4.3261 ms |         1.96x |
+| CRUD         | `update_all_values`                        |       829.4 us |     1.8155 ms | 2.19x |      8.4927 ms |     31.990 ms |        3.77x |       8.1311 ms |      22.828 ms |         2.81x |
+| CRUD         | `update_one_by_pk`                         |       914.5 us |     1.4295 ms | 1.56x |      4.0395 ms |     10.550 ms |        2.61x |       4.2523 ms |      7.2002 ms |         1.69x |
+| CRUD         | `delete_all_rows`                          |       874.4 us |     1.4128 ms | 1.62x |      8.9559 ms |     36.544 ms |        4.08x |       8.5542 ms |      26.154 ms |         3.06x |
+| CRUD         | `delete_one_by_pk`                         |       871.7 us |     1.3901 ms | 1.59x |      3.9506 ms |     12.560 ms |        3.18x |       3.8824 ms |      8.3111 ms |         2.14x |
+| Branch       | `create_version`                           |            n/a |           n/a |   n/a |      3.8345 ms |     9.7628 ms |        2.55x |       3.6737 ms |      5.6426 ms |         1.54x |
+| Merge / diff | `merge_version_fast_forward_10pct_updates` |            n/a |           n/a |   n/a |      50.797 ms |      1.2370 s |       24.35x |       41.834 ms |      962.60 ms |        23.01x |
+| Merge / diff | `merge_version_divergent_10pct_updates`    |            n/a |           n/a |   n/a |      80.102 ms |      2.4801 s |       30.96x |       81.443 ms |       1.9468 s |        23.90x |
+
+Storage scoreboard:
+
+| backend / workflow                     | 100 bytes | 100 bytes/row |  1k bytes | 1k bytes/row | bytes x |
+| -------------------------------------- | --------: | ------------: | --------: | -----------: | ------: |
+| raw SQLite / inserted                  |   936,584 |       9,365.8 | 1,692,456 |      1,692.5 |   1.81x |
+| Lix SQLite / inserted                  |   337,656 |       3,376.6 | 1,075,136 |      1,075.1 |   3.18x |
+| Lix SQLite / after create_version      |   345,896 |       3,459.0 | 1,087,496 |      1,087.5 |   3.14x |
+| Lix SQLite / after fast-forward merge  |   588,976 |       5,889.8 | 5,291,608 |      5,291.6 |   8.98x |
+| Lix SQLite / after divergent merge     | 1,268,776 |      12,687.8 | 5,619,288 |      5,619.3 |   4.43x |
+| Lix RocksDB / inserted                 |   280,077 |       2,800.8 |   993,888 |        993.9 |   3.55x |
+| Lix RocksDB / after create_version     |   281,943 |       2,819.4 |   995,754 |        995.8 |   3.53x |
+| Lix RocksDB / after fast-forward merge |   298,593 |       2,985.9 | 1,157,131 |      1,157.1 |   3.88x |
+| Lix RocksDB / after divergent merge    |   337,030 |       3,370.3 | 1,528,244 |      1,528.2 |   4.53x |
+
+Result:
+
+```text
+insert_all_rows/1k improved from 376.49 ms to 61.763 ms on Lix SQLite and
+from 310.38 ms to 56.365 ms on Lix RocksDB. Raw Storage API timings and storage
+accounting stay within expected run-to-run noise because the change is above
+the storage primitive layer. Merge/diff remains the dominant 1k workflow cost.
+```
+
+Decision:
+
+```text
+Keep. This removes an accidental per-row committed-state lookup from bulk
+inserts without changing the validation semantics.
 ```
