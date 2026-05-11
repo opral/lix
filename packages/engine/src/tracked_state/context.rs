@@ -183,21 +183,6 @@ where
         Ok(rows)
     }
 
-    pub(crate) async fn rows_exist_at_commit(
-        &mut self,
-        commit_id: &str,
-        requests: &[TrackedStateRowRequest],
-    ) -> Result<Vec<bool>, LixError> {
-        if requests.is_empty() {
-            return Ok(Vec::new());
-        }
-        let keys = requests
-            .iter()
-            .map(tracked_key_from_request)
-            .collect::<Result<Vec<_>, _>>()?;
-        self.projection_keys_exist_at_commit(commit_id, &keys).await
-    }
-
     pub(crate) async fn diff_commits(
         &mut self,
         left_commit_id: &str,
@@ -578,60 +563,6 @@ where
         self.apply_delta_packs_to_entries_for_keys(&delta_commit_ids, &key_filter, &mut entries)
             .await?;
         Ok(keys.iter().map(|key| entries.get(key).cloned()).collect())
-    }
-
-    async fn projection_keys_exist_at_commit(
-        &mut self,
-        commit_id: &str,
-        keys: &[TrackedStateKey],
-    ) -> Result<Vec<bool>, LixError> {
-        let delta_commit_ids = self
-            .delta_commit_ids_since_projection_root(commit_id)
-            .await?;
-        let base_commit_id = self
-            .projection_base_commit_id(commit_id, &delta_commit_ids)
-            .await?;
-        let mut existing = if let Some(base_commit_id) = base_commit_id {
-            let root_id = self
-                .tree
-                .load_root(&mut self.store, &base_commit_id)
-                .await?
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "tracked_state projection base root '{base_commit_id}' disappeared"
-                        ),
-                    )
-                })?;
-            self.tree
-                .exists_many(&mut self.store, &root_id, keys)
-                .await?
-        } else {
-            vec![false; keys.len()]
-        };
-
-        if !delta_commit_ids.is_empty() {
-            let key_indexes = keys
-                .iter()
-                .enumerate()
-                .map(|(index, key)| (key.clone(), index))
-                .collect::<BTreeMap<_, _>>();
-            for commit_id in delta_commit_ids {
-                let Some(delta_entries) =
-                    storage::load_delta_pack(&mut self.store, &commit_id).await?
-                else {
-                    continue;
-                };
-                for delta in delta_entries {
-                    if let Some(index) = key_indexes.get(&delta.key) {
-                        existing[*index] = !delta.value.deleted;
-                    }
-                }
-            }
-        }
-
-        Ok(existing)
     }
 
     async fn projection_base_commit_id(
@@ -1511,20 +1442,6 @@ mod tests {
             .expect("child scan should apply pending tombstone over base root");
 
         assert!(rows.is_empty(), "pending tombstone must hide base row");
-
-        let exists = tracked_state
-            .reader(storage.clone())
-            .rows_exist_at_commit(
-                "child",
-                &[TrackedStateRowRequest {
-                    schema_key: base.schema_key.clone(),
-                    entity_id: base.entity_id.clone(),
-                    file_id: NullableKeyFilter::Null,
-                }],
-            )
-            .await
-            .expect("exists_many should apply pending tombstone over base root");
-        assert_eq!(exists, vec![false]);
     }
 
     #[tokio::test]

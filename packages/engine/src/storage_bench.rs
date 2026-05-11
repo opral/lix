@@ -2202,31 +2202,6 @@ pub async fn json_pointer_tracked_state_get_many_missing_prepared(
     Ok(report(fixture.rows.len(), verified_rows, Duration::ZERO))
 }
 
-pub async fn json_pointer_tracked_state_exists_many_prepared(
-    backend: &Arc<dyn Backend + Send + Sync>,
-    fixture: &JsonPointerTrackedStateReadFixture,
-) -> Result<StorageBenchReport, LixError> {
-    let mut reader = fixture
-        .context
-        .reader(StorageContext::new(Arc::clone(backend)));
-    let requests = fixture
-        .rows
-        .iter()
-        .map(|row| TrackedStateRowRequest {
-            schema_key: "json_pointer".to_string(),
-            entity_id: EntityIdentity::single(row.path.as_str()),
-            file_id: NullableKeyFilter::Null,
-        })
-        .collect::<Vec<_>>();
-    let verified_rows = reader
-        .rows_exist_at_commit(&fixture.commit_id, &requests)
-        .await?
-        .into_iter()
-        .filter(|exists| *exists)
-        .count();
-    Ok(report(fixture.rows.len(), verified_rows, Duration::ZERO))
-}
-
 pub async fn json_pointer_tracked_state_scan_keys_only_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &JsonPointerTrackedStateReadFixture,

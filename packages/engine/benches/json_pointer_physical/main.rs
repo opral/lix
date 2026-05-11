@@ -275,27 +275,6 @@ fn bench_physical(
             },
         );
 
-        group.bench_function(
-            format!("exists_many_exact_keys/{}", row_label(row_count)),
-            |b| {
-                b.iter_batched(
-                    || prepare_physical_read(runtime, profile, &storage_rows),
-                    |(backend, fixture)| {
-                        black_box(
-                            runtime
-                                .block_on(
-                                    storage_bench::json_pointer_tracked_state_exists_many_prepared(
-                                        &backend, &fixture,
-                                    ),
-                                )
-                                .expect("json_pointer physical exists_many"),
-                        )
-                    },
-                    BatchSize::LargeInput,
-                )
-            },
-        );
-
         group.bench_function(format!("scan_keys_only/{}", row_label(row_count)), |b| {
             b.iter_batched(
                 || prepare_physical_read(runtime, profile, &storage_rows),
