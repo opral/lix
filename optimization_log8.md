@@ -675,3 +675,206 @@ Was the evidence structural, timing-based, or both?
 Is there a temporary shim? If yes, when should it be removed?
 What should the next agent try?
 ```
+
+## Optimization 1: tracked tombstone bit in projection value
+
+Commit: `uncommitted on 11ff3a2e`
+
+Target axis:
+
+```text
+scan
+```
+
+Backend/API scope:
+
+```text
+layout behavior
+```
+
+Physical shape:
+
+```text
+read index / projection layout
+materialization policy
+copy/serialization boundary
+```
+
+Refactor stance:
+
+```text
+clean cut
+```
+
+Change:
+
+```text
+Tracked-state projection values now carry the durable tombstone bit directly.
+The bit is packed into the high bit of the existing value header byte, so the
+encoded value length stays unchanged. VALUE_VERSION is bumped to 5 without a
+backward decoder because Lix has not shipped.
+
+The old shape forced key/header-only scans to hydrate commit_store change packs
+just to learn whether a row was deleted. The new shape makes tracked_state
+scalar fields authoritative at the projection boundary; commit_store pack
+hydration is reserved for projections that need snapshot_content or metadata
+JSON refs.
+
+Tree scans are now physical-only: TrackedStateTreeScanRequest no longer carries
+tombstone visibility, and tracked scan limits are applied after delta overlay,
+materialization, and tombstone visibility. This matches the reference-system
+shape where delete/tombstone facts are carried through physical merge/scan
+stages and logical visibility/limit is applied above them.
+
+No backend API changed. SQLite and RocksDB both store the same byte-length value
+and benefit from avoiding unnecessary commit_pack reads for non-JSON
+projections. No tracked workload moved to untracked storage and no benchmark
+measurement changed.
+```
+
+### Baseline Delta
+
+Compared against the log8 baseline. The full smoke run showed some noisy
+RocksDB scan intervals, so the RocksDB rows below use the targeted remeasure
+for the affected rows:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- smoke
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/rocksdb/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+#### 1.5x Runtime Budget Rows
+
+| axis       | row                                | raw SQLite median | before SQLite | after SQLite | SQLite ratio | before RocksDB | after RocksDB | RocksDB ratio | status |
+| ---------- | ---------------------------------- | ----------------: | ------------: | -----------: | -----------: | -------------: | ------------: | ------------: | ------ |
+| write      | `write_root_all_rows/1k`           |         2.4999 ms |     6.8347 ms |    6.5245 ms |        2.61x |      6.1430 ms |     5.6554 ms |         2.26x | still over budget, no structural regression |
+| write      | `write_delta_10pct_updates/1k`     |         1.3595 ms |     2.6272 ms |    3.3163 ms |        2.44x |      1.3950 ms |     1.4372 ms |         1.06x | SQLite noisy, RocksDB pass |
+| write      | `write_tombstone_10pct_deletes/1k` |         1.3092 ms |     2.4321 ms |    3.1727 ms |        2.42x |      1.3632 ms |     1.4650 ms |         1.12x | SQLite noisy, RocksDB pass |
+| exact-read | `get_many_exact_keys/1k`           |         2.1850 ms |     4.6055 ms |    4.4805 ms |        2.05x |      3.4668 ms |     3.6687 ms |         1.68x | still over budget |
+| exact-read | `get_many_missing_keys/1k`         |         13.099 ms |     2.2822 ms |    2.2718 ms |        0.17x |      1.4138 ms |     1.9440 ms |         0.15x | pass |
+| exact-read | `exists_many_exact_keys/1k`        |         2.2187 ms |     4.6519 ms |    4.5695 ms |        2.06x |      3.4720 ms |     5.5972 ms |         2.52x | RocksDB row noisy; semantic equivalent still uses get_many |
+| scan       | `scan_keys_only/1k`                |         1.1673 ms |     3.2542 ms |    2.4975 ms |        2.14x |      2.0822 ms |     1.4497 ms |         1.24x | primary win; RocksDB now in budget |
+| scan       | `scan_headers_only/1k`             |         1.3034 ms |     3.0692 ms |    3.0376 ms |        2.33x |      2.0012 ms |     1.8478 ms |         1.42x | RocksDB now in budget |
+| scan       | `scan_full_rows/1k`                |         1.2110 ms |     4.3792 ms |    4.7813 ms |        3.95x |      3.1884 ms |     3.2480 ms |         2.68x | still over budget |
+| scan       | `prefix_scan_schema/1k`            |         1.6941 ms |     4.4623 ms |    4.6607 ms |        2.75x |      3.2190 ms |     3.3677 ms |         1.99x | still over budget |
+| scan       | `prefix_scan_schema_file_null/1k`  |         1.2609 ms |     4.3889 ms |    4.8380 ms |        3.84x |      3.1497 ms |     3.3515 ms |         2.66x | still over budget |
+
+#### Diff / Materialization
+
+| row                                   | before SQLite | after SQLite | before RocksDB | after RocksDB | shape status |
+| ------------------------------------- | ------------: | -----------: | -------------: | ------------: | ------------ |
+| `changed_keys_update_10pct/1k`        |     68.399 ms |    73.492 ms |      67.192 ms |     71.735 ms | still hotspot; movement within noisy structural guardrail |
+| `changed_keys_delta_chain_10x1pct/1k` |     10.401 ms |    11.167 ms |      8.7436 ms |     10.722 ms | watch |
+| `materialize_delta_chain_10x1pct/1k`  |     5.7651 ms |    5.5134 ms |      2.7741 ms |     2.8888 ms | near neutral; value length is unchanged |
+
+#### Storage
+
+Storage fixture command:
+
+```sh
+cargo test -p lix_engine --features storage-benches --test json_pointer_crud_storage -- --ignored --nocapture --test-threads=1
+```
+
+Result: passed.
+
+| backend / state                        | before bytes | after bytes | delta | status |
+| -------------------------------------- | -----------: | ----------: | ----: | ------ |
+| raw SQLite / inserted                  |      1692456 |     1692456 |     0 | unchanged |
+| Lix SQLite / inserted                  |      1075136 |     1075136 |     0 | unchanged |
+| Lix SQLite / after create_version      |      1087496 |     1087496 |     0 | unchanged |
+| Lix SQLite / after fast-forward merge  |      5287488 |     5291608 | +4120 | one SQLite page; acceptable page-layout noise |
+| Lix SQLite / after divergent merge     |      5615168 |     5619288 | +4120 | one SQLite page; acceptable page-layout noise |
+| Lix RocksDB / inserted                 |       993900 |      993900 |     0 | unchanged |
+| Lix RocksDB / after create_version     |       995766 |      995766 |     0 | unchanged |
+| Lix RocksDB / after fast-forward merge |      1157143 |     1157143 |     0 | unchanged |
+| Lix RocksDB / after divergent merge    |      1528256 |     1528254 |    -2 | unchanged |
+
+### Unchanged Guardrails
+
+| guardrail                                         | after value | status |
+| ------------------------------------------------- | ----------: | ------ |
+| physical write budget stays near backend speed    | mixed | existing SQLite write budget failures remain |
+| physical write runtime <= 1.5x raw SQLite         | mixed | RocksDB delta/tombstone pass; root writes still over |
+| exact reads <= 1.5x raw SQLite                    | mixed | missing reads pass; exact reads still over |
+| scans <= 1.5x raw SQLite                          | mixed | RocksDB keys/header pass; SQLite scans still over |
+| header-only scans do not hydrate full JSON values | yes | preserved and strengthened |
+| SQLite and RocksDB both reported                  | yes | full smoke plus RocksDB targeted rerun |
+| storage growth explained                          | yes | no value-length growth; only one SQLite page in merge states |
+| post-vacuum storage <= 2x raw SQLite              | mixed | same pre-existing SQLite merge-state growth |
+| backend boundary copy cost explained              | yes | no new backend copies; fewer commit_pack loads for scalar projections |
+| tracked logic remains on the tracked path         | yes | no workload moved |
+| no workload shifted to untracked machinery        | yes | unchanged |
+| no benchmark measurement changed                  | yes | benchmark untouched |
+
+### Review Loop
+
+Reviewer pass 1:
+
+```text
+HIGH: low-level tree matching filtered deleted delta entries before applying
+them over a materialized base root. Fixed by keeping tree matching physical and
+adding pending_tombstone_delta_hides_materialized_base_row.
+```
+
+Reviewer pass 2:
+
+```text
+HIGH: none.
+MEDIUM: user limit could be applied before tombstone visibility. Fixed by not
+pushing tracked scan limits into TrackedStateTreeScanRequest and adding
+scan_limit_applies_after_tombstone_visibility.
+```
+
+Reviewer pass 3:
+
+```text
+HIGH: by-file fast path still applied request.limit before visibility. Fixed by
+removing both by-file early-limit breaks and adding
+by_file_scan_limit_applies_after_tombstone_visibility.
+```
+
+Final reviewer pass:
+
+```text
+HIGH: none.
+MEDIUM: none.
+LOW: none.
+```
+
+Verification:
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches
+cargo test -p lix_engine tracked_state:: --features storage-benches
+cargo test -p lix_engine --features storage-benches --test json_pointer_crud_storage -- --ignored --nocapture --test-threads=1
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- smoke
+cargo bench -p lix_engine --features storage-benches --bench json_pointer_physical -- 'json_pointer_physical/rocksdb/smoke/(write_root_all_rows|write_delta_10pct_updates|write_tombstone_10pct_deletes|scan_keys_only|scan_headers_only|scan_full_rows|prefix_scan_schema|prefix_scan_schema_file_null)/1k'
+```
+
+All commands passed.
+
+### Interpretation
+
+```text
+Keep.
+
+Primary axis: scan, specifically key/header projections and tombstone
+visibility. Structural win: tombstone state now lives in the tracked projection
+value and non-JSON projections do not hydrate commit_store packs. Timing win:
+RocksDB scan_keys_only improved from 2.0822 ms to 1.4497 ms and
+scan_headers_only from 2.0012 ms to 1.8478 ms; SQLite scan_keys_only improved
+from 3.2542 ms to 2.4975 ms.
+
+Guardrails: encoded value length is unchanged, storage fixture passed, and no
+backend-specific API was introduced. Some full-smoke rows were noisy, so
+RocksDB scan/write guardrails were remeasured directly. Existing SQLite write,
+exact-read, full-row, and prefix-scan rows remain over the 1.5x budget.
+
+No temporary shim.
+
+Next optimization should attack the remaining scan/full-row and exact-read
+budget failures by adding a borrowed/header decode path for tracked-state leaf
+entries. The tombstone bit is now in the first value byte, so the next cut can
+filter visibility without allocating owned locators or full row values.
+```

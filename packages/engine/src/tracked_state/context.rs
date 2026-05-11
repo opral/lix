@@ -321,9 +321,6 @@ where
                 .get_many(&mut self.store, primary_root_id, &primary_keys)
                 .await?;
             for (primary_key, value) in primary_keys.into_iter().zip(primary_values) {
-                if request.limit.is_some_and(|limit| rows.len() >= limit) {
-                    break;
-                }
                 let Some(value) = value else {
                     continue;
                 };
@@ -336,9 +333,6 @@ where
         }
 
         for (index_key, index_value) in index_rows {
-            if request.limit.is_some_and(|limit| rows.len() >= limit) {
-                break;
-            }
             let Some(primary_key) = ByFileIndex::primary_key_from_index_key(index_key) else {
                 continue;
             };
@@ -662,6 +656,7 @@ where
             };
             let value = crate::tracked_state::types::TrackedStateIndexValueRef {
                 change_locator: delta.locator,
+                deleted: delta.change.snapshot_ref.is_none(),
                 created_at: delta.created_at,
                 updated_at: delta.updated_at,
             };
@@ -743,6 +738,7 @@ fn delta_entries_from_refs(deltas: &[TrackedStateDeltaRef<'_>]) -> Vec<TrackedSt
                     source_ordinal: delta.locator.source_ordinal,
                     change_id: delta.locator.change_id.to_string(),
                 },
+                deleted: delta.change.snapshot_ref.is_none(),
                 created_at: delta.created_at.to_string(),
                 updated_at: delta.updated_at.to_string(),
             },
@@ -764,8 +760,10 @@ fn tree_scan_request_from_tracked(
         schema_keys: request.filter.schema_keys.clone(),
         entity_ids: request.filter.entity_ids.clone(),
         file_ids: request.filter.file_ids.clone(),
-        include_tombstones: request.filter.include_tombstones,
-        limit: request.limit,
+        // User limits belong above delta overlay and tombstone visibility.
+        // Pushing them into the physical tree can stop on rows that are later
+        // hidden, returning too few live rows.
+        limit: None,
     }
 }
 
@@ -1109,6 +1107,181 @@ mod tests {
                 .as_single_string_owned()
                 .expect("entity id"),
             "entity-live"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_tombstone_delta_hides_materialized_base_row() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
+        let tracked_state = TrackedStateContext::new();
+        let base = row("entity-a", "change-base", "base");
+        let delete = tombstone("entity-a", "change-delete", "child");
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("base transaction should open");
+        write_root_for_test(
+            transaction.as_mut(),
+            &tracked_state,
+            "base",
+            None,
+            std::slice::from_ref(&base),
+        )
+        .await
+        .expect("base delta should write");
+        transaction.commit().await.expect("base should commit");
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("materialize transaction should open");
+        let mut writes = StorageWriteSet::new();
+        tracked_state
+            .materializer(
+                transaction.as_mut(),
+                &mut writes,
+                &CommitStoreContext::new(),
+            )
+            .materialize_root_at("base")
+            .await
+            .expect("base projection root should materialize");
+        writes
+            .apply(transaction.as_mut())
+            .await
+            .expect("base root writes should apply");
+        transaction
+            .commit()
+            .await
+            .expect("materialized base should commit");
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("child transaction should open");
+        write_root_for_test(
+            transaction.as_mut(),
+            &tracked_state,
+            "child",
+            Some("base"),
+            std::slice::from_ref(&delete),
+        )
+        .await
+        .expect("child tombstone delta should write");
+        transaction.commit().await.expect("child should commit");
+
+        let rows = tracked_state
+            .reader(storage.clone())
+            .scan_rows_at_commit("child", &TrackedStateScanRequest::default())
+            .await
+            .expect("child scan should apply pending tombstone over base root");
+
+        assert!(rows.is_empty(), "pending tombstone must hide base row");
+    }
+
+    #[tokio::test]
+    async fn scan_limit_applies_after_tombstone_visibility() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
+        let tracked_state = TrackedStateContext::new();
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        write_root_for_test(
+            transaction.as_mut(),
+            &tracked_state,
+            "commit-1",
+            None,
+            &[
+                tombstone("entity-a", "change-delete", "commit-1"),
+                row("entity-b", "change-live", "commit-1"),
+            ],
+        )
+        .await
+        .expect("root should write");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let rows = tracked_state
+            .reader(storage.clone())
+            .scan_rows_at_commit(
+                "commit-1",
+                &TrackedStateScanRequest {
+                    limit: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("limited scan should apply visibility before limit");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]
+                .entity_id
+                .as_single_string_owned()
+                .expect("entity id"),
+            "entity-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn by_file_scan_limit_applies_after_tombstone_visibility() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
+        let tracked_state = TrackedStateContext::new();
+        let mut deleted = tombstone("entity-a", "change-delete", "commit-1");
+        deleted.file_id = Some("file-a.json".to_string());
+        let mut live = row("entity-b", "change-live", "commit-1");
+        live.file_id = Some("file-a.json".to_string());
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        write_root_for_test(
+            transaction.as_mut(),
+            &tracked_state,
+            "commit-1",
+            None,
+            &[deleted, live],
+        )
+        .await
+        .expect("root should write");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let rows = tracked_state
+            .reader(storage.clone())
+            .scan_rows_at_commit(
+                "commit-1",
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
+                        ..Default::default()
+                    },
+                    projection: crate::tracked_state::TrackedStateProjection {
+                        columns: vec!["entity_id".to_string()],
+                    },
+                    limit: Some(1),
+                },
+            )
+            .await
+            .expect("limited by-file scan should apply visibility before limit");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]
+                .entity_id
+                .as_single_string_owned()
+                .expect("entity id"),
+            "entity-b"
         );
     }
 

@@ -9,7 +9,9 @@ use crate::tracked_state::types::{
 use crate::LixError;
 
 const NODE_VERSION: u8 = 1;
-const VALUE_VERSION: u8 = 4;
+const VALUE_VERSION: u8 = 5;
+const VALUE_DELETED_FLAG: u8 = 0b1000_0000;
+const VALUE_VERSION_MASK: u8 = 0b0111_1111;
 const DELTA_PACK_VERSION: u8 = 1;
 const NODE_KIND_LEAF: u8 = 1;
 const NODE_KIND_INTERNAL: u8 = 2;
@@ -174,6 +176,7 @@ pub(crate) fn decode_key(bytes: &[u8]) -> Result<TrackedStateKey, LixError> {
 pub(crate) fn encode_value(value: &TrackedStateIndexValue) -> Vec<u8> {
     encode_value_ref(TrackedStateIndexValueRef {
         change_locator: value.change_locator.as_ref(),
+        deleted: value.deleted,
         created_at: &value.created_at,
         updated_at: &value.updated_at,
     })
@@ -181,7 +184,7 @@ pub(crate) fn encode_value(value: &TrackedStateIndexValue) -> Vec<u8> {
 
 pub(crate) fn encode_value_ref(value: TrackedStateIndexValueRef<'_>) -> Vec<u8> {
     let mut out = Vec::new();
-    out.push(VALUE_VERSION);
+    out.push(VALUE_VERSION | if value.deleted { VALUE_DELETED_FLAG } else { 0 });
     push_sized_bytes(&mut out, value.change_locator.source_commit_id.as_bytes());
     out.extend_from_slice(&value.change_locator.source_pack_id.to_be_bytes());
     out.extend_from_slice(&value.change_locator.source_ordinal.to_be_bytes());
@@ -203,7 +206,9 @@ pub(crate) fn encoded_value_len(value: &TrackedStateIndexValue) -> usize {
 
 pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateIndexValue, LixError> {
     let mut cursor = 0usize;
-    let version = read_u8(bytes, &mut cursor, "value version")?;
+    let value_header = read_u8(bytes, &mut cursor, "value header")?;
+    let version = value_header & VALUE_VERSION_MASK;
+    let deleted = value_header & VALUE_DELETED_FLAG != 0;
     if version != VALUE_VERSION {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -241,6 +246,7 @@ pub(crate) fn decode_value(bytes: &[u8]) -> Result<TrackedStateIndexValue, LixEr
             source_ordinal,
             change_id,
         },
+        deleted,
         created_at,
         updated_at,
     })
@@ -257,6 +263,7 @@ pub(crate) fn encode_delta_pack(entries: &[TrackedStateDeltaEntry]) -> Result<Ve
             &mut out,
             &encode_value_ref(TrackedStateIndexValueRef {
                 change_locator: entry.value.change_locator.as_ref(),
+                deleted: entry.value.deleted,
                 created_at: &entry.value.created_at,
                 updated_at: &entry.value.updated_at,
             }),
@@ -710,6 +717,7 @@ mod tests {
                 source_ordinal: 11,
                 change_id: "change".to_string(),
             },
+            deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
         };
@@ -727,6 +735,7 @@ mod tests {
                 source_ordinal: 1,
                 change_id: "other-change".to_string(),
             },
+            deleted: true,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-02T00:00:00Z".to_string(),
         };
@@ -745,6 +754,7 @@ mod tests {
                     source_ordinal: 0,
                     change_id: "change".to_string(),
                 },
+                deleted: false,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
             },
@@ -755,6 +765,7 @@ mod tests {
                     source_ordinal: 2,
                     change_id: "change-2".to_string(),
                 },
+                deleted: true,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
             },
@@ -765,6 +776,7 @@ mod tests {
                     source_ordinal: 8,
                     change_id: "change-3".to_string(),
                 },
+                deleted: false,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 updated_at: "2026-01-02T00:00:00Z".to_string(),
             },

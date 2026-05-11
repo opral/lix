@@ -2987,6 +2987,7 @@ mod tests {
                 source_ordinal,
                 change_id: change_id.to_string(),
             },
+            deleted: snapshot_content.is_none(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }
