@@ -1487,3 +1487,81 @@ the sizing helper duplicates key framing rules, so a focused unit test now
 asserts encoded key capacity exactly matches encoded length for null-file,
 file-id, tuple identity, and varint-boundary component shapes.
 ```
+
+## Optimization 14: Fused Untracked Scan Materialization
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+read scan CPU/allocation and selective-filter hydration I/O
+```
+
+Change:
+
+```text
+Untracked scans now decode, filter, limit, and materialize in one pass instead
+of first collecting every canonical row or identity into an intermediate Vec.
+Unfiltered scans push LIMIT into the backend scan request. Selective full-row
+filters with version/entity predicates or a LIMIT use key-first filtering and
+hydrate only matching values; broad schema/file filters keep the single entry
+scan because the CRUD all-match workload measured 29-45% slower with forced
+key-first hydration.
+```
+
+This follows the same pushdown principle used by the artifact databases:
+DataFusion/SpiceAI plans push projection/filter/limit work as close to
+`TableScan` as possible, while scan implementations avoid materializing
+intermediate row shapes unless they reduce downstream work.
+
+Verification:
+
+```sh
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine untracked_state --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/(smoke|real_workload)/select_all_rows/(1k|10k)'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/select_keys_only/1k'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/real_workload/select_keys_only/10k'
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+```
+
+Smoke timing scoreboard:
+
+| backend | operation | after timing | criterion change |
+| --- | --- | ---: | ---: |
+| Lix SQLite | `select_all_rows` | 4.5361-4.7843 ms | no change in final rerun |
+| Lix SQLite | `select_keys_only` | 3.9784-4.0757 ms | -8.4525% to -4.1087% |
+| Lix RocksDB | `select_all_rows` | 1.4993-1.5245 ms | no change in final rerun |
+| Lix RocksDB | `select_keys_only` | 1.0759-1.0957 ms | -6.9517% to -3.6168% |
+
+Real-workload timing scoreboard:
+
+| backend | operation | after timing | criterion change |
+| --- | --- | ---: | ---: |
+| Lix SQLite | `select_all_rows` | 11.519-11.637 ms | noisy final rerun; earlier fused run showed 10.836-11.049 ms |
+| Lix SQLite | `select_keys_only` | 7.0505-7.1594 ms | -17.109% to -15.229% |
+| Lix RocksDB | `select_all_rows` | 10.371-10.578 ms | -5.1995% to -2.0906% |
+| Lix RocksDB | `select_keys_only` | 7.2173-7.4856 ms | -8.1440% to -4.0246% |
+
+Logical I/O scoreboard:
+
+| workload | backend | operation | io ops | io bytes/row | note |
+| --- | --- | --- | ---: | ---: | --- |
+| smoke/1k | Lix SQLite | `select_all_rows` | 1 | 926.29 | broad filter keeps one entry scan |
+| smoke/1k | Lix SQLite | `select_keys_only` | 1 | 81.20 | key-only scan |
+| smoke/1k | Lix RocksDB | `select_all_rows` | 1 | 926.29 | broad filter keeps one entry scan |
+| smoke/1k | Lix RocksDB | `select_keys_only` | 1 | 81.20 | key-only scan |
+
+Review:
+
+```text
+Initial sub-agent review reported HIGH on `limit = Some(0)` returning one row
+after the fused loop, and MEDIUM on filtered full-row scans still hydrating
+values before identity filtering. The patch now returns early for zero limits,
+adds focused zero-limit coverage, and adds a key-first hydration path for
+selective full-row filters while preserving the faster single entry scan for
+broad schema/file filters. Re-review reported HIGH None and MEDIUM None. LOW
+feedback led to a namespace invariant check, a selectivity-gate comment, and a
+filtered full-scan limit/order test.
+```

@@ -16,36 +16,166 @@ pub(crate) async fn scan_rows(
     store: &mut impl StorageReader,
     request: &UntrackedStateScanRequest,
 ) -> Result<Vec<MaterializedUntrackedStateRow>, LixError> {
+    if request.limit == Some(0) {
+        return Ok(Vec::new());
+    }
     if projection_is_identity_only(&request.projection.columns) {
         return scan_identity_rows(store, request).await;
     }
 
-    let mut rows = scan_all_canonical_rows(store).await?;
-    rows.retain(|row| row_matches_scan(row, request));
-    if let Some(limit) = request.limit {
-        rows.truncate(limit);
+    if should_load_filtered_rows_by_key(request) {
+        return scan_filtered_rows_by_key(store, request).await;
     }
+
+    scan_unfiltered_rows(store, request).await
+}
+
+async fn scan_unfiltered_rows(
+    store: &mut impl StorageReader,
+    request: &UntrackedStateScanRequest,
+) -> Result<Vec<MaterializedUntrackedStateRow>, LixError> {
+    let limit = request.limit.unwrap_or(usize::MAX);
+    let backend_limit = if has_identity_filters(request) {
+        usize::MAX
+    } else {
+        limit
+    };
+    let page = store
+        .scan_entries(KvScanRequest {
+            namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
+            range: KvScanRange::prefix(Vec::new()),
+            after: None,
+            limit: backend_limit,
+        })
+        .await?;
     let projection = UntrackedMaterializationProjection::from_columns(&request.projection.columns);
-    let mut materialized = Vec::with_capacity(rows.len());
-    for row in rows {
-        materialized.push(crate::untracked_state::materialize_row(row, &projection)?);
+    let mut materialized = Vec::with_capacity(page.len().min(limit));
+    for (key, value) in page.keys.iter().zip(page.values.iter()) {
+        let identity = decode_untracked_state_row_key(key)?;
+        let row = crate::untracked_state::codec::decode_row_value(value, identity)?;
+        if row_matches_scan(&row, request) {
+            materialized.push(crate::untracked_state::materialize_row(row, &projection)?);
+            if materialized.len() == limit {
+                break;
+            }
+        }
     }
     Ok(materialized)
+}
+
+async fn scan_filtered_rows_by_key(
+    store: &mut impl StorageReader,
+    request: &UntrackedStateScanRequest,
+) -> Result<Vec<MaterializedUntrackedStateRow>, LixError> {
+    let candidates = scan_matching_identities(store, request).await?;
+    let projection = UntrackedMaterializationProjection::from_columns(&request.projection.columns);
+    let mut rows = Vec::with_capacity(candidates.len());
+    for chunk in candidates.chunks(LOAD_ROWS_BATCH_SIZE) {
+        let result = store
+            .get_values(KvGetRequest {
+                groups: vec![KvGetGroup {
+                    namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
+                    keys: chunk.iter().map(|(_, key)| key.clone()).collect(),
+                }],
+            })
+            .await?;
+        let group = result.groups.into_iter().next().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "filtered untracked row load returned no result group",
+            )
+        })?;
+        if group.namespace() != UNTRACKED_STATE_ROW_NAMESPACE {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "filtered untracked row load returned namespace `{}` instead of `{}`",
+                    group.namespace(),
+                    UNTRACKED_STATE_ROW_NAMESPACE
+                ),
+            ));
+        }
+        if group.len() != chunk.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "filtered untracked row load returned {} results for {} requested keys",
+                    group.len(),
+                    chunk.len()
+                ),
+            ));
+        }
+        for ((identity, _), bytes) in chunk.iter().zip(group.values_iter()) {
+            let Some(bytes) = bytes else {
+                continue;
+            };
+            let row = crate::untracked_state::codec::decode_row_value(bytes, identity.clone())?;
+            rows.push(crate::untracked_state::materialize_row(row, &projection)?);
+        }
+    }
+    Ok(rows)
 }
 
 async fn scan_identity_rows(
     store: &mut impl StorageReader,
     request: &UntrackedStateScanRequest,
 ) -> Result<Vec<MaterializedUntrackedStateRow>, LixError> {
-    let mut identities = scan_all_identities(store).await?;
-    identities.retain(|identity| identity_matches_scan(identity, request));
-    if let Some(limit) = request.limit {
-        identities.truncate(limit);
+    let limit = if has_identity_filters(request) {
+        usize::MAX
+    } else {
+        request.limit.unwrap_or(usize::MAX)
+    };
+    let page = store
+        .scan_keys(KvScanRequest {
+            namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
+            range: KvScanRange::prefix(Vec::new()),
+            after: None,
+            limit,
+        })
+        .await?;
+    let output_limit = request.limit.unwrap_or(usize::MAX);
+    let mut rows = Vec::with_capacity(page.keys.len().min(output_limit));
+    for key in page.keys.iter() {
+        let identity = decode_untracked_state_row_key(key)?;
+        if identity_matches_scan(&identity, request) {
+            rows.push(materialize_identity_row(identity)?);
+            if rows.len() == output_limit {
+                break;
+            }
+        }
     }
-    identities
-        .into_iter()
-        .map(materialize_identity_row)
-        .collect::<Result<Vec<_>, _>>()
+    Ok(rows)
+}
+
+async fn scan_matching_identities(
+    store: &mut impl StorageReader,
+    request: &UntrackedStateScanRequest,
+) -> Result<Vec<(UntrackedStateIdentity, Vec<u8>)>, LixError> {
+    let limit = if has_identity_filters(request) {
+        usize::MAX
+    } else {
+        request.limit.unwrap_or(usize::MAX)
+    };
+    let page = store
+        .scan_keys(KvScanRequest {
+            namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
+            range: KvScanRange::prefix(Vec::new()),
+            after: None,
+            limit,
+        })
+        .await?;
+    let output_limit = request.limit.unwrap_or(usize::MAX);
+    let mut rows = Vec::with_capacity(page.keys.len().min(output_limit));
+    for key in page.keys.iter() {
+        let identity = decode_untracked_state_row_key(key)?;
+        if identity_matches_scan(&identity, request) {
+            rows.push((identity, key.to_vec()));
+            if rows.len() == output_limit {
+                break;
+            }
+        }
+    }
+    Ok(rows)
 }
 
 pub(crate) async fn load_rows(
@@ -250,44 +380,6 @@ pub(crate) fn stage_delete_all_rows(writes: &mut StorageWriteSet) {
     );
 }
 
-async fn scan_all_canonical_rows(
-    store: &mut impl StorageReader,
-) -> Result<Vec<UntrackedStateRow>, LixError> {
-    let page = store
-        .scan_entries(KvScanRequest {
-            namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
-            range: KvScanRange::prefix(Vec::new()),
-            after: None,
-            limit: usize::MAX,
-        })
-        .await?;
-    page.keys
-        .iter()
-        .zip(page.values.iter())
-        .map(|(key, value)| {
-            let identity = decode_untracked_state_row_key(key)?;
-            crate::untracked_state::codec::decode_row_value(value, identity)
-        })
-        .collect()
-}
-
-async fn scan_all_identities(
-    store: &mut impl StorageReader,
-) -> Result<Vec<UntrackedStateIdentity>, LixError> {
-    let page = store
-        .scan_keys(KvScanRequest {
-            namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
-            range: KvScanRange::prefix(Vec::new()),
-            after: None,
-            limit: usize::MAX,
-        })
-        .await?;
-    page.keys
-        .iter()
-        .map(|key| decode_untracked_state_row_key(key))
-        .collect()
-}
-
 fn projection_is_identity_only(columns: &[String]) -> bool {
     !columns.is_empty()
         && columns.iter().all(|column| {
@@ -335,6 +427,21 @@ fn identity_matches_scan(
         && (request.filter.version_ids.is_empty()
             || request.filter.version_ids.contains(&identity.version_id))
         && nullable_matches_filters(&identity.file_id, &request.filter.file_ids)
+}
+
+fn has_identity_filters(request: &UntrackedStateScanRequest) -> bool {
+    !request.filter.schema_keys.is_empty()
+        || !request.filter.entity_ids.is_empty()
+        || !request.filter.version_ids.is_empty()
+        || !request.filter.file_ids.is_empty()
+}
+
+fn should_load_filtered_rows_by_key(request: &UntrackedStateScanRequest) -> bool {
+    // Key-first hydration helps selective filters, but broad schema/file scans
+    // can be all-match workloads where a single entry scan is materially faster.
+    request.limit.is_some()
+        || !request.filter.entity_ids.is_empty()
+        || !request.filter.version_ids.is_empty()
 }
 
 fn nullable_matches_filters(value: &Option<String>, filters: &[NullableKeyFilter<String>]) -> bool {
@@ -718,6 +825,95 @@ mod tests {
         assert_eq!(
             rows[0].entity_id,
             crate::entity_identity::EntityIdentity::single("version-ui")
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_limit_zero_returns_no_rows() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
+        let context = UntrackedStateContext::new();
+        let row = untracked_row("version-a", "lix_key_value", "version-ui");
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        write_materialized_rows_to_store(&context, transaction.as_mut(), &[row]).await;
+        transaction.commit().await.expect("commit should succeed");
+
+        let full_rows = {
+            let mut reader = context.reader(storage.clone());
+            reader
+                .scan_rows(&UntrackedStateScanRequest {
+                    limit: Some(0),
+                    ..Default::default()
+                })
+                .await
+        }
+        .expect("full scan should succeed");
+        assert!(full_rows.is_empty());
+
+        let identity_rows = {
+            let mut reader = context.reader(storage.clone());
+            reader
+                .scan_rows(&UntrackedStateScanRequest {
+                    projection: crate::untracked_state::UntrackedStateProjection {
+                        columns: vec!["entity_id".to_string()],
+                    },
+                    limit: Some(0),
+                    ..Default::default()
+                })
+                .await
+        }
+        .expect("identity scan should succeed");
+        assert!(identity_rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn filtered_full_scan_limit_preserves_key_order() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
+        let context = UntrackedStateContext::new();
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        write_materialized_rows_to_store(
+            &context,
+            transaction.as_mut(),
+            &[
+                untracked_row("version-a", "lix_key_value", "b"),
+                untracked_row("version-a", "lix_key_value", "a"),
+                untracked_row("version-a", "lix_key_value", "c"),
+                untracked_row("version-b", "lix_key_value", "d"),
+            ],
+        )
+        .await;
+        transaction.commit().await.expect("commit should succeed");
+
+        let rows = {
+            let mut reader = context.reader(storage.clone());
+            reader
+                .scan_rows(&UntrackedStateScanRequest {
+                    filter: crate::untracked_state::UntrackedStateFilter {
+                        version_ids: vec!["version-a".to_string()],
+                        ..Default::default()
+                    },
+                    limit: Some(2),
+                    ..Default::default()
+                })
+                .await
+        }
+        .expect("filtered scan should succeed");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].entity_id,
+            crate::entity_identity::EntityIdentity::single("a")
+        );
+        assert_eq!(
+            rows[1].entity_id,
+            crate::entity_identity::EntityIdentity::single("b")
         );
     }
 
