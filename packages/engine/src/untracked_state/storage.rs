@@ -14,6 +14,10 @@ pub(crate) async fn scan_rows(
     store: &mut impl StorageReader,
     request: &UntrackedStateScanRequest,
 ) -> Result<Vec<MaterializedUntrackedStateRow>, LixError> {
+    if projection_is_identity_only(&request.projection.columns) {
+        return scan_identity_rows(store, request).await;
+    }
+
     let mut rows = scan_all_canonical_rows(store).await?;
     rows.retain(|row| row_matches_scan(row, request));
     if let Some(limit) = request.limit {
@@ -25,6 +29,21 @@ pub(crate) async fn scan_rows(
         materialized.push(crate::untracked_state::materialize_row(row, &projection)?);
     }
     Ok(materialized)
+}
+
+async fn scan_identity_rows(
+    store: &mut impl StorageReader,
+    request: &UntrackedStateScanRequest,
+) -> Result<Vec<MaterializedUntrackedStateRow>, LixError> {
+    let mut identities = scan_all_identities(store).await?;
+    identities.retain(|identity| identity_matches_scan(identity, request));
+    if let Some(limit) = request.limit {
+        identities.truncate(limit);
+    }
+    identities
+        .into_iter()
+        .map(materialize_identity_row)
+        .collect::<Result<Vec<_>, _>>()
 }
 
 pub(crate) async fn load_rows(
@@ -242,6 +261,50 @@ async fn scan_all_canonical_rows(
         .collect()
 }
 
+async fn scan_all_identities(
+    store: &mut impl StorageReader,
+) -> Result<Vec<UntrackedStateIdentity>, LixError> {
+    let page = store
+        .scan_keys(KvScanRequest {
+            namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
+            range: KvScanRange::prefix(Vec::new()),
+            after: None,
+            limit: usize::MAX,
+        })
+        .await?;
+    page.keys
+        .iter()
+        .map(|key| decode_untracked_state_row_key(key))
+        .collect()
+}
+
+fn projection_is_identity_only(columns: &[String]) -> bool {
+    !columns.is_empty()
+        && columns.iter().all(|column| {
+            matches!(
+                column.as_str(),
+                "entity_id" | "schema_key" | "file_id" | "version_id"
+            )
+        })
+}
+
+fn materialize_identity_row(
+    identity: UntrackedStateIdentity,
+) -> Result<MaterializedUntrackedStateRow, LixError> {
+    Ok(MaterializedUntrackedStateRow {
+        entity_id: identity.entity_id,
+        schema_key: identity.schema_key,
+        file_id: identity.file_id,
+        snapshot_content: None,
+        metadata: None,
+        deleted: false,
+        created_at: String::new(),
+        updated_at: String::new(),
+        global: false,
+        version_id: identity.version_id,
+    })
+}
+
 fn row_matches_scan(row: &UntrackedStateRow, request: &UntrackedStateScanRequest) -> bool {
     (request.filter.schema_keys.is_empty() || request.filter.schema_keys.contains(&row.schema_key))
         && (request.filter.entity_ids.is_empty()
@@ -249,6 +312,19 @@ fn row_matches_scan(row: &UntrackedStateRow, request: &UntrackedStateScanRequest
         && (request.filter.version_ids.is_empty()
             || request.filter.version_ids.contains(&row.version_id))
         && nullable_matches_filters(&row.file_id, &request.filter.file_ids)
+}
+
+fn identity_matches_scan(
+    identity: &UntrackedStateIdentity,
+    request: &UntrackedStateScanRequest,
+) -> bool {
+    (request.filter.schema_keys.is_empty()
+        || request.filter.schema_keys.contains(&identity.schema_key))
+        && (request.filter.entity_ids.is_empty()
+            || request.filter.entity_ids.contains(&identity.entity_id))
+        && (request.filter.version_ids.is_empty()
+            || request.filter.version_ids.contains(&identity.version_id))
+        && nullable_matches_filters(&identity.file_id, &request.filter.file_ids)
 }
 
 fn nullable_matches_filters(value: &Option<String>, filters: &[NullableKeyFilter<String>]) -> bool {
@@ -582,9 +658,9 @@ mod tests {
         assert_eq!(rows[0].schema_key, row.schema_key);
         assert_eq!(rows[0].version_id, row.version_id);
         assert_eq!(rows[0].file_id, row.file_id);
-        assert!(rows[0].global);
-        assert_eq!(rows[0].created_at, row.created_at);
-        assert_eq!(rows[0].updated_at, row.updated_at);
+        assert!(!rows[0].global);
+        assert_eq!(rows[0].created_at, "");
+        assert_eq!(rows[0].updated_at, "");
         assert_eq!(rows[0].snapshot_content, None);
 
         let full_rows = {
