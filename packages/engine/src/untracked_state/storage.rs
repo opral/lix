@@ -8,17 +8,12 @@ use crate::untracked_state::{
 use crate::{LixError, NullableKeyFilter};
 
 pub(super) const UNTRACKED_STATE_ROW_NAMESPACE: &str = "untracked_state.row";
-const UNTRACKED_STATE_IDENTITY_INDEX_NAMESPACE: &str = "untracked_state.identity_index";
 const LOAD_ROWS_BATCH_SIZE: usize = 512;
 
 pub(crate) async fn scan_rows(
     store: &mut impl StorageReader,
     request: &UntrackedStateScanRequest,
 ) -> Result<Vec<MaterializedUntrackedStateRow>, LixError> {
-    if can_scan_from_keys(request) {
-        return scan_identity_rows_from_keys(store, request).await;
-    }
-
     let mut rows = scan_all_canonical_rows(store).await?;
     rows.retain(|row| row_matches_scan(row, request));
     if let Some(limit) = request.limit {
@@ -30,37 +25,6 @@ pub(crate) async fn scan_rows(
         materialized.push(crate::untracked_state::materialize_row(row, &projection)?);
     }
     Ok(materialized)
-}
-
-async fn scan_identity_rows_from_keys(
-    store: &mut impl StorageReader,
-    request: &UntrackedStateScanRequest,
-) -> Result<Vec<MaterializedUntrackedStateRow>, LixError> {
-    let mut rows = Vec::new();
-    for prefix in scan_key_prefixes(request) {
-        let page = store
-            .scan_entries(KvScanRequest {
-                namespace: UNTRACKED_STATE_IDENTITY_INDEX_NAMESPACE.to_string(),
-                range: KvScanRange::prefix(prefix),
-                after: None,
-                limit: usize::MAX,
-            })
-            .await?;
-        for (key, value) in page.keys.iter().zip(page.values.iter()) {
-            rows.push((
-                decode_untracked_state_row_key(key)?,
-                decode_identity_index_value(value)?,
-            ));
-        }
-    }
-    rows.retain(|(identity, _)| identity_matches_scan(identity, request));
-    if let Some(limit) = request.limit {
-        rows.truncate(limit);
-    }
-    Ok(rows
-        .into_iter()
-        .map(|(identity, index_value)| materialize_identity_row(identity, index_value))
-        .collect())
 }
 
 pub(crate) async fn load_rows(
@@ -233,19 +197,13 @@ where
     for row in rows {
         if row.snapshot_content.is_none() {
             let key = encode_untracked_state_row_key_ref(row.into());
-            writes.delete(UNTRACKED_STATE_ROW_NAMESPACE, key.clone());
-            writes.delete(UNTRACKED_STATE_IDENTITY_INDEX_NAMESPACE, key);
+            writes.delete(UNTRACKED_STATE_ROW_NAMESPACE, key);
         } else {
             let key = encode_untracked_state_row_key_ref(row.into());
             writes.put(
                 UNTRACKED_STATE_ROW_NAMESPACE,
-                key.clone(),
-                crate::untracked_state::codec::encode_row_ref(row)?,
-            );
-            writes.put(
-                UNTRACKED_STATE_IDENTITY_INDEX_NAMESPACE,
                 key,
-                encode_identity_index_value(row),
+                crate::untracked_state::codec::encode_row_ref(row)?,
             );
         }
     }
@@ -258,8 +216,7 @@ where
 {
     for identity in identities {
         let key = encode_untracked_state_row_key_ref(identity);
-        writes.delete(UNTRACKED_STATE_ROW_NAMESPACE, key.clone());
-        writes.delete(UNTRACKED_STATE_IDENTITY_INDEX_NAMESPACE, key);
+        writes.delete(UNTRACKED_STATE_ROW_NAMESPACE, key);
     }
 }
 
@@ -289,78 +246,6 @@ fn row_matches_scan(row: &UntrackedStateRow, request: &UntrackedStateScanRequest
         && nullable_matches_filters(&row.file_id, &request.filter.file_ids)
 }
 
-fn identity_matches_scan(
-    identity: &UntrackedStateIdentity,
-    request: &UntrackedStateScanRequest,
-) -> bool {
-    (request.filter.schema_keys.is_empty()
-        || request.filter.schema_keys.contains(&identity.schema_key))
-        && (request.filter.entity_ids.is_empty()
-            || request.filter.entity_ids.contains(&identity.entity_id))
-        && (request.filter.version_ids.is_empty()
-            || request.filter.version_ids.contains(&identity.version_id))
-        && nullable_matches_filters(&identity.file_id, &request.filter.file_ids)
-}
-
-fn can_scan_from_keys(request: &UntrackedStateScanRequest) -> bool {
-    !request.projection.columns.is_empty()
-        && request.projection.columns.iter().all(|column| {
-            matches!(
-                column.as_str(),
-                "entity_id" | "schema_key" | "file_id" | "version_id"
-            )
-        })
-}
-
-fn scan_key_prefixes(request: &UntrackedStateScanRequest) -> Vec<Vec<u8>> {
-    if request.filter.version_ids.is_empty() {
-        return vec![Vec::new()];
-    }
-    let mut prefixes = Vec::new();
-    for version_id in &request.filter.version_ids {
-        if request.filter.schema_keys.is_empty() {
-            let mut prefix = Vec::new();
-            push_component(&mut prefix, version_id);
-            prefixes.push(prefix);
-            continue;
-        }
-        for schema_key in &request.filter.schema_keys {
-            let mut prefix = Vec::new();
-            push_component(&mut prefix, version_id);
-            push_component(&mut prefix, schema_key);
-            prefixes.push(prefix);
-        }
-    }
-    prefixes.sort();
-    prefixes.dedup();
-    prefixes
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct UntrackedIdentityIndexValue {
-    created_at: String,
-    updated_at: String,
-    global: bool,
-}
-
-fn materialize_identity_row(
-    identity: UntrackedStateIdentity,
-    index_value: UntrackedIdentityIndexValue,
-) -> MaterializedUntrackedStateRow {
-    MaterializedUntrackedStateRow {
-        entity_id: identity.entity_id,
-        schema_key: identity.schema_key,
-        file_id: identity.file_id,
-        snapshot_content: None,
-        metadata: None,
-        deleted: false,
-        created_at: index_value.created_at,
-        updated_at: index_value.updated_at,
-        global: index_value.global,
-        version_id: identity.version_id,
-    }
-}
-
 fn nullable_matches_filters(value: &Option<String>, filters: &[NullableKeyFilter<String>]) -> bool {
     filters.is_empty()
         || filters.iter().any(|filter| match filter {
@@ -388,6 +273,7 @@ fn encode_untracked_state_row_key(identity: &UntrackedStateIdentity) -> Vec<u8> 
     encode_untracked_state_row_key_ref(identity.as_ref())
 }
 
+#[cfg(test)]
 fn decode_untracked_state_row_key(bytes: &[u8]) -> Result<UntrackedStateIdentity, LixError> {
     let mut cursor = 0;
     let version_id = read_component(bytes, &mut cursor)?.to_string();
@@ -432,44 +318,6 @@ fn decode_untracked_state_row_key(bytes: &[u8]) -> Result<UntrackedStateIdentity
     })
 }
 
-fn encode_identity_index_value(row: UntrackedStateRowRef<'_>) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.push(u8::from(row.global));
-    push_component(&mut out, row.created_at);
-    push_component(&mut out, row.updated_at);
-    out
-}
-
-fn decode_identity_index_value(bytes: &[u8]) -> Result<UntrackedIdentityIndexValue, LixError> {
-    let Some(global) = bytes.first().copied() else {
-        return Err(LixError::unknown(
-            "failed to decode untracked-state identity index: missing global flag",
-        ));
-    };
-    let global = match global {
-        0 => false,
-        1 => true,
-        marker => {
-            return Err(LixError::unknown(format!(
-                "failed to decode untracked-state identity index: invalid global flag {marker}"
-            )))
-        }
-    };
-    let mut cursor = 1;
-    let created_at = read_component(bytes, &mut cursor)?.to_string();
-    let updated_at = read_component(bytes, &mut cursor)?.to_string();
-    if cursor != bytes.len() {
-        return Err(LixError::unknown(
-            "failed to decode untracked-state identity index: trailing bytes",
-        ));
-    }
-    Ok(UntrackedIdentityIndexValue {
-        created_at,
-        updated_at,
-        global,
-    })
-}
-
 pub(super) fn encode_untracked_state_row_key_ref(
     identity: UntrackedStateIdentityRef<'_>,
 ) -> Vec<u8> {
@@ -497,6 +345,7 @@ fn push_component(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(bytes);
 }
 
+#[cfg(test)]
 fn read_component<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a str, LixError> {
     let len_bytes = bytes
         .get(*cursor..cursor.saturating_add(4))
@@ -765,21 +614,6 @@ mod tests {
         let key = encode_untracked_state_row_key(&identity);
         let decoded = decode_untracked_state_row_key(&key).expect("key should decode");
         assert_eq!(decoded, identity);
-    }
-
-    #[test]
-    fn identity_index_value_roundtrips_scalars() {
-        let row = untracked_row(crate::GLOBAL_VERSION_ID, "lix_key_value", "ui-tab");
-        let mut writes = StorageWriteSet::new();
-        let canonical =
-            crate::test_support::untracked_state_row_from_materialized(&mut writes, &row)
-                .expect("row should canonicalize");
-        let encoded = encode_identity_index_value(canonical.as_ref());
-        let decoded =
-            decode_identity_index_value(&encoded).expect("identity index value should decode");
-        assert_eq!(decoded.created_at, row.created_at);
-        assert_eq!(decoded.updated_at, row.updated_at);
-        assert_eq!(decoded.global, row.global);
     }
 
     #[tokio::test]
