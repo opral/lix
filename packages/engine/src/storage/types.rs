@@ -357,6 +357,10 @@ impl StorageWriteSet {
         self.batch.delete(namespace, key);
     }
 
+    pub(crate) fn delete_range(&mut self, namespace: &'static str, range: KvScanRange) {
+        self.batch.delete_range(namespace, range);
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.batch.is_empty()
     }
@@ -396,10 +400,14 @@ impl KvWriteBatch {
         group.delete(key.into());
     }
 
+    pub(crate) fn delete_range(&mut self, namespace: impl Into<String>, range: KvScanRange) {
+        let namespace = namespace.into();
+        let group = self.group_mut(namespace);
+        group.delete_range(range);
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
-        self.groups
-            .iter()
-            .all(|group| group.put_count() == 0 && group.delete_count() == 0)
+        self.groups.iter().all(KvWriteGroup::is_empty)
     }
 
     fn group_mut(&mut self, namespace: String) -> &mut KvWriteGroup {
@@ -412,9 +420,7 @@ impl KvWriteBatch {
         }
         self.groups.push(KvWriteGroup {
             namespace,
-            put_keys: backend::BytePageBuilder::new(),
-            put_values: backend::BytePageBuilder::new(),
-            deletes: backend::BytePageBuilder::new(),
+            ops: Vec::new(),
         });
         self.groups.last_mut().expect("group just pushed")
     }
@@ -431,19 +437,35 @@ impl From<KvWriteBatch> for backend::BackendKvWriteBatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KvWriteGroup {
     namespace: String,
-    put_keys: backend::BytePageBuilder,
-    put_values: backend::BytePageBuilder,
-    deletes: backend::BytePageBuilder,
+    ops: Vec<KvWriteOp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KvWriteOp {
+    Put { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+    DeleteRange { range: KvScanRange },
 }
 
 impl From<KvWriteGroup> for backend::BackendKvWriteGroup {
     fn from(group: KvWriteGroup) -> Self {
-        Self::from_pages(
-            group.namespace,
-            group.put_keys.finish(),
-            group.put_values.finish(),
-            group.deletes.finish(),
-        )
+        let mut backend_group = Self::new(group.namespace);
+        for op in group.ops {
+            backend_group.push(op.into());
+        }
+        backend_group
+    }
+}
+
+impl From<KvWriteOp> for backend::BackendKvWriteOp {
+    fn from(op: KvWriteOp) -> Self {
+        match op {
+            KvWriteOp::Put { key, value } => Self::Put { key, value },
+            KvWriteOp::Delete { key } => Self::Delete { key },
+            KvWriteOp::DeleteRange { range } => Self::DeleteRange {
+                range: range.into(),
+            },
+        }
     }
 }
 
@@ -451,39 +473,31 @@ impl KvWriteGroup {
     pub(crate) fn new(namespace: impl Into<String>) -> Self {
         Self {
             namespace: namespace.into(),
-            put_keys: backend::BytePageBuilder::new(),
-            put_values: backend::BytePageBuilder::new(),
-            deletes: backend::BytePageBuilder::new(),
+            ops: Vec::new(),
         }
     }
 
-    pub(crate) fn put(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) {
-        self.put_keys.push(key);
-        self.put_values.push(value);
+    pub(crate) fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
+        self.ops.push(KvWriteOp::Put {
+            key: key.into(),
+            value: value.into(),
+        });
     }
 
-    pub(crate) fn delete(&mut self, key: impl AsRef<[u8]>) {
-        self.deletes.push(key);
+    pub(crate) fn delete(&mut self, key: impl Into<Vec<u8>>) {
+        self.ops.push(KvWriteOp::Delete { key: key.into() });
     }
 
-    pub(crate) fn put_count(&self) -> usize {
-        self.put_keys.len()
+    pub(crate) fn delete_range(&mut self, range: KvScanRange) {
+        self.ops.push(KvWriteOp::DeleteRange { range });
     }
 
-    pub(crate) fn delete_count(&self) -> usize {
-        self.deletes.len()
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ops.is_empty()
     }
 
-    pub(crate) fn put_key(&self, index: usize) -> Option<&[u8]> {
-        self.put_keys.get(index)
-    }
-
-    pub(crate) fn put_value(&self, index: usize) -> Option<&[u8]> {
-        self.put_values.get(index)
-    }
-
-    pub(crate) fn delete_key(&self, index: usize) -> Option<&[u8]> {
-        self.deletes.get(index)
+    pub(crate) fn ops(&self) -> &[KvWriteOp] {
+        &self.ops
     }
 }
 
@@ -491,6 +505,7 @@ impl KvWriteGroup {
 pub(crate) struct KvWriteStats {
     pub(crate) puts: usize,
     pub(crate) deletes: usize,
+    pub(crate) delete_ranges: usize,
     pub(crate) bytes_written: usize,
 }
 
@@ -499,6 +514,7 @@ impl From<backend::BackendKvWriteStats> for KvWriteStats {
         Self {
             puts: stats.puts,
             deletes: stats.deletes,
+            delete_ranges: stats.delete_ranges,
             bytes_written: stats.bytes_written,
         }
     }

@@ -6,9 +6,9 @@ use lix_rs_sdk::{
     open_lix, Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup,
     BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest,
     BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, BytePageBuilder,
-    CreateVersionOptions, LixError, MergeVersionOptions, MergeVersionOutcome, OpenLixOptions,
-    SwitchVersionOptions, Value,
+    BackendKvWriteOp, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
+    BytePageBuilder, CreateVersionOptions, LixError, MergeVersionOptions, MergeVersionOutcome,
+    OpenLixOptions, SwitchVersionOptions, Value,
 };
 
 #[tokio::test]
@@ -485,28 +485,27 @@ impl BackendWriteTransaction for SharedTestTransaction {
         let mut stats = BackendKvWriteStats::default();
         for group in batch.groups {
             let namespace = group.namespace().to_string();
-            for index in 0..group.put_count() {
-                let key = group.put_key(index).ok_or_else(|| {
-                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put key")
-                })?;
-                let value = group.put_value(index).ok_or_else(|| {
-                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put value")
-                })?;
-                stats.puts += 1;
-                stats.bytes_written += key.len() + value.len();
-                self.kv
-                    .insert((namespace.clone(), key.to_vec()), value.to_vec());
-            }
-            for index in 0..group.delete_count() {
-                let key = group.delete_key(index).ok_or_else(|| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        "backend write batch missing delete key",
-                    )
-                })?;
-                stats.deletes += 1;
-                stats.bytes_written += key.len();
-                self.kv.remove(&(namespace.clone(), key.to_vec()));
+            for op in group.ops() {
+                match op {
+                    BackendKvWriteOp::Put { key, value } => {
+                        stats.puts += 1;
+                        stats.bytes_written += key.len() + value.len();
+                        self.kv
+                            .insert((namespace.clone(), key.clone()), value.clone());
+                    }
+                    BackendKvWriteOp::Delete { key } => {
+                        stats.deletes += 1;
+                        stats.bytes_written += key.len();
+                        self.kv.remove(&(namespace.clone(), key.clone()));
+                    }
+                    BackendKvWriteOp::DeleteRange { range } => {
+                        stats.delete_ranges += 1;
+                        stats.bytes_written += delete_range_bytes(range);
+                        self.kv.retain(|(candidate_namespace, key), _| {
+                            candidate_namespace != &namespace || !key_matches_range(key, range)
+                        });
+                    }
+                }
             }
         }
         Ok(stats)
@@ -656,5 +655,12 @@ fn key_matches_range(key: &[u8], range: &BackendKvScanRange) -> bool {
     match range {
         BackendKvScanRange::Prefix(prefix) => key.starts_with(prefix),
         BackendKvScanRange::Range { start, end } => start.as_slice() <= key && key < end.as_slice(),
+    }
+}
+
+fn delete_range_bytes(range: &BackendKvScanRange) -> usize {
+    match range {
+        BackendKvScanRange::Prefix(prefix) => prefix.len(),
+        BackendKvScanRange::Range { start, end } => start.len() + end.len(),
     }
 }

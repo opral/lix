@@ -273,80 +273,53 @@ pub struct BackendKvWriteBatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendKvWriteGroup {
     namespace: String,
-    put_keys: BytePageBuilder,
-    put_values: BytePageBuilder,
-    deletes: BytePageBuilder,
+    ops: Vec<BackendKvWriteOp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendKvWriteOp {
+    Put { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+    DeleteRange { range: BackendKvScanRange },
 }
 
 impl BackendKvWriteGroup {
     pub fn new(namespace: impl Into<String>) -> Self {
         Self {
             namespace: namespace.into(),
-            put_keys: BytePageBuilder::new(),
-            put_values: BytePageBuilder::new(),
-            deletes: BytePageBuilder::new(),
+            ops: Vec::new(),
         }
     }
 
-    pub fn from_pages(
-        namespace: impl Into<String>,
-        put_keys: BytePage,
-        put_values: BytePage,
-        deletes: BytePage,
-    ) -> Self {
-        assert_eq!(
-            put_keys.len(),
-            put_values.len(),
-            "backend write batch must have one value per put key"
-        );
-        Self {
-            namespace: namespace.into(),
-            put_keys: BytePageBuilder::from_page(put_keys),
-            put_values: BytePageBuilder::from_page(put_values),
-            deletes: BytePageBuilder::from_page(deletes),
-        }
+    pub fn put(&mut self, key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
+        self.ops.push(BackendKvWriteOp::Put {
+            key: key.into(),
+            value: value.into(),
+        });
     }
 
-    pub fn put(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) {
-        self.put_keys.push(key);
-        self.put_values.push(value);
+    pub fn delete(&mut self, key: impl Into<Vec<u8>>) {
+        self.ops.push(BackendKvWriteOp::Delete { key: key.into() });
     }
 
-    pub fn delete(&mut self, key: impl AsRef<[u8]>) {
-        self.deletes.push(key);
+    pub fn delete_range(&mut self, range: BackendKvScanRange) {
+        self.ops.push(BackendKvWriteOp::DeleteRange { range });
+    }
+
+    pub fn push(&mut self, op: BackendKvWriteOp) {
+        self.ops.push(op);
     }
 
     pub fn namespace(&self) -> &str {
         &self.namespace
     }
 
-    pub fn put_count(&self) -> usize {
-        self.put_keys.len()
+    pub fn ops(&self) -> &[BackendKvWriteOp] {
+        &self.ops
     }
 
-    pub fn delete_count(&self) -> usize {
-        self.deletes.len()
-    }
-
-    pub fn put_key(&self, index: usize) -> Option<&[u8]> {
-        self.put_keys.get(index)
-    }
-
-    pub fn put_value(&self, index: usize) -> Option<&[u8]> {
-        self.put_values.get(index)
-    }
-
-    pub fn delete_key(&self, index: usize) -> Option<&[u8]> {
-        self.deletes.get(index)
-    }
-
-    pub fn into_parts(self) -> (String, BytePage, BytePage, BytePage) {
-        (
-            self.namespace,
-            self.put_keys.finish(),
-            self.put_values.finish(),
-            self.deletes.finish(),
-        )
+    pub fn into_ops(self) -> (String, Vec<BackendKvWriteOp>) {
+        (self.namespace, self.ops)
     }
 }
 
@@ -354,5 +327,6 @@ impl BackendKvWriteGroup {
 pub struct BackendKvWriteStats {
     pub puts: usize,
     pub deletes: usize,
+    pub delete_ranges: usize,
     pub bytes_written: usize,
 }

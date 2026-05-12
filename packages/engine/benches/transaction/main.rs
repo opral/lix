@@ -4,7 +4,8 @@ use lix_engine::storage_bench::{self, TransactionAccountingReport};
 use lix_engine::{
     Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvGetRequest, BackendKvKeyPage,
     BackendKvScanRequest, BackendKvValueBatch, BackendKvValuePage, BackendKvWriteBatch,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, LixError,
+    BackendKvWriteOp, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
+    LixError,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::sync::OnceLock;
@@ -949,30 +950,31 @@ impl StorageAccounting {
         inner.write_batches += 1;
         for group in &batch.groups {
             let namespace = group.namespace().to_string();
-            for index in 0..group.put_count() {
-                let Some(key) = group.put_key(index) else {
-                    continue;
-                };
-                let Some(value) = group.put_value(index) else {
-                    continue;
-                };
-                *inner
-                    .kv_puts_by_namespace
-                    .entry(namespace.clone())
-                    .or_default() += 1;
-                *inner
-                    .bytes_by_namespace
-                    .entry(namespace.clone())
-                    .or_default() += key.len() + value.len();
-            }
-            for index in 0..group.delete_count() {
-                let Some(key) = group.delete_key(index) else {
-                    continue;
-                };
-                *inner
-                    .bytes_by_namespace
-                    .entry(namespace.clone())
-                    .or_default() += key.len();
+            for op in group.ops() {
+                match op {
+                    BackendKvWriteOp::Put { key, value } => {
+                        *inner
+                            .kv_puts_by_namespace
+                            .entry(namespace.clone())
+                            .or_default() += 1;
+                        *inner
+                            .bytes_by_namespace
+                            .entry(namespace.clone())
+                            .or_default() += key.len() + value.len();
+                    }
+                    BackendKvWriteOp::Delete { key } => {
+                        *inner
+                            .bytes_by_namespace
+                            .entry(namespace.clone())
+                            .or_default() += key.len();
+                    }
+                    BackendKvWriteOp::DeleteRange { range } => {
+                        *inner
+                            .bytes_by_namespace
+                            .entry(namespace.clone())
+                            .or_default() += delete_range_bytes(range);
+                    }
+                }
             }
         }
     }
@@ -1297,6 +1299,13 @@ impl BackendWriteTransaction for CountingWriteTransaction {
 
     async fn commit(self: Box<Self>) -> Result<(), LixError> {
         self.transaction.commit().await
+    }
+}
+
+fn delete_range_bytes(range: &lix_engine::BackendKvScanRange) -> usize {
+    match range {
+        lix_engine::BackendKvScanRange::Prefix(prefix) => prefix.len(),
+        lix_engine::BackendKvScanRange::Range { start, end } => start.len() + end.len(),
     }
 }
 

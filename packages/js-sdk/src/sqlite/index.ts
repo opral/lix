@@ -172,18 +172,24 @@ class BetterSqlite3Transaction implements LixBackendWriteTransaction {
 		const stats: BackendKvWriteStats = {
 			puts: 0,
 			deletes: 0,
+			deleteRanges: 0,
 			bytesWritten: 0,
 		};
 		for (const group of batch.groups) {
-			for (const put of group.puts) {
-				stats.puts += 1;
-				stats.bytesWritten += put.key.length + put.value.length;
-				kvPut(this.#db, group.namespace, put.key, put.value);
-			}
-			for (const key of group.deletes) {
-				stats.deletes += 1;
-				stats.bytesWritten += key.length;
-				kvDelete(this.#db, group.namespace, key);
+			for (const op of group.ops) {
+				if (op.kind === "put") {
+					stats.puts += 1;
+					stats.bytesWritten += op.key.length + op.value.length;
+					kvPut(this.#db, group.namespace, op.key, op.value);
+				} else if (op.kind === "delete") {
+					stats.deletes += 1;
+					stats.bytesWritten += op.key.length;
+					kvDelete(this.#db, group.namespace, op.key);
+				} else {
+					stats.deleteRanges += 1;
+					stats.bytesWritten += deleteRangeBytes(op.range);
+					kvDeleteRange(this.#db, group.namespace, op.range);
+				}
 			}
 		}
 		return stats;
@@ -296,6 +302,15 @@ function kvDelete(db: Database, namespace: string, key: Uint8Array): void {
 	);
 }
 
+function kvDeleteRange(
+	db: Database,
+	namespace: string,
+	range: BackendKvScanRange,
+): void {
+	const { clauses, params } = rangeClauses(namespace, range);
+	db.prepare(`DELETE FROM lix_kv WHERE ${clauses.join(" AND ")}`).run(...params);
+}
+
 function kvScan(
 	db: Database,
 	namespace: string,
@@ -319,6 +334,21 @@ function scanQuery(
 	range: BackendKvScanRange,
 	limit?: number | null,
 ): { sql: string; params: unknown[] } {
+	const { clauses, params } = rangeClauses(namespace, range);
+	let sql = `SELECT key, value FROM lix_kv WHERE ${clauses.join(
+		" AND ",
+	)} ORDER BY key`;
+	if (limit != null) {
+		sql += " LIMIT ?";
+		params.push(limit);
+	}
+	return { sql, params };
+}
+
+function rangeClauses(
+	namespace: string,
+	range: BackendKvScanRange,
+): { clauses: string[]; params: unknown[] } {
 	const params: unknown[] = [namespace];
 	const clauses = ["namespace = ?"];
 
@@ -335,14 +365,14 @@ function scanQuery(
 		params.push(sqliteBytes(range.start), sqliteBytes(range.end));
 	}
 
-	let sql = `SELECT key, value FROM lix_kv WHERE ${clauses.join(
-		" AND ",
-	)} ORDER BY key`;
-	if (limit != null) {
-		sql += " LIMIT ?";
-		params.push(limit);
+	return { clauses, params };
+}
+
+function deleteRangeBytes(range: BackendKvScanRange): number {
+	if (range.kind === "prefix") {
+		return range.prefix.length;
 	}
-	return { sql, params };
+	return range.start.length + range.end.length;
 }
 
 function compareBytes(left: Uint8Array, right: Uint8Array): number {

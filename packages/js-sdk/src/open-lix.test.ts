@@ -159,6 +159,45 @@ test("openLix accepts an explicit backend", async () => {
 	await second.close();
 });
 
+test("custom backend applies ordered deleteRange write ops", () => {
+	const backend = createMemoryBackend();
+	const tx = backend.beginWriteTransaction();
+
+	tx.writeKvBatch({
+		groups: [
+			{
+				namespace: "n",
+				ops: [
+					{ kind: "put", key: new Uint8Array([1]), value: new Uint8Array([10]) },
+					{ kind: "put", key: new Uint8Array([2]), value: new Uint8Array([20]) },
+					{
+						kind: "deleteRange",
+						range: { kind: "prefix", prefix: new Uint8Array([1]) },
+					},
+					{ kind: "put", key: new Uint8Array([1]), value: new Uint8Array([11]) },
+				],
+			},
+		],
+	});
+	expect(tx.commit()).toBeUndefined();
+
+	const read = backend.beginReadTransaction();
+	const values = read.getValues({
+		groups: [
+			{
+				namespace: "n",
+				keys: [new Uint8Array([1]), new Uint8Array([2])],
+			},
+		],
+	});
+
+	expect(values.groups[0]?.values).toEqual([
+		new Uint8Array([11]),
+		new Uint8Array([20]),
+	]);
+	expect(read.rollback()).toBeUndefined();
+});
+
 test("execute supports UNION ALL without trapping wasm", async () => {
 	const lix = await openLix();
 
@@ -653,31 +692,41 @@ function createMemoryBackend(): LixBackend {
 					const stats: BackendKvWriteStats = {
 						puts: 0,
 						deletes: 0,
+						deleteRanges: 0,
 						bytesWritten: 0,
 					};
 					for (const group of batch.groups) {
-						for (const put of group.puts) {
-							stats.puts += 1;
-							stats.bytesWritten += put.key.length + put.value.length;
-							transactionRows = transactionRows.filter(
-								(row) =>
-									row.namespace !== group.namespace ||
-									compareBytes(row.key, put.key) !== 0,
-							);
-							transactionRows.push({
-								namespace: group.namespace,
-								key: new Uint8Array(put.key),
-								value: new Uint8Array(put.value),
-							});
-						}
-						for (const key of group.deletes) {
-							stats.deletes += 1;
-							stats.bytesWritten += key.length;
-							transactionRows = transactionRows.filter(
-								(row) =>
-									row.namespace !== group.namespace ||
-									compareBytes(row.key, key) !== 0,
-							);
+						for (const op of group.ops) {
+							if (op.kind === "put") {
+								stats.puts += 1;
+								stats.bytesWritten += op.key.length + op.value.length;
+								transactionRows = transactionRows.filter(
+									(row) =>
+										row.namespace !== group.namespace ||
+										compareBytes(row.key, op.key) !== 0,
+								);
+								transactionRows.push({
+									namespace: group.namespace,
+									key: new Uint8Array(op.key),
+									value: new Uint8Array(op.value),
+								});
+							} else if (op.kind === "delete") {
+								stats.deletes += 1;
+								stats.bytesWritten += op.key.length;
+								transactionRows = transactionRows.filter(
+									(row) =>
+										row.namespace !== group.namespace ||
+										compareBytes(row.key, op.key) !== 0,
+								);
+							} else {
+								stats.deleteRanges += 1;
+								stats.bytesWritten += deleteRangeBytes(op.range);
+								transactionRows = transactionRows.filter(
+									(row) =>
+										row.namespace !== group.namespace ||
+										!keyMatchesRange(row.key, op.range),
+								);
+							}
 						}
 					}
 					return stats;
@@ -740,6 +789,13 @@ function keyMatchesRange(key: Uint8Array, range: BackendKvScanRange): boolean {
 	return (
 		compareBytes(key, range.start) >= 0 && compareBytes(key, range.end) < 0
 	);
+}
+
+function deleteRangeBytes(range: BackendKvScanRange): number {
+	if (range.kind === "prefix") {
+		return range.prefix.length;
+	}
+	return range.start.length + range.end.length;
 }
 
 function compareBytes(left: Uint8Array, right: Uint8Array): number {

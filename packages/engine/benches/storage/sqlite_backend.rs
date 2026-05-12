@@ -5,8 +5,9 @@ use async_trait::async_trait;
 use lix_engine::{
     Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetRequest,
     BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch,
-    BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteStats,
-    BackendReadTransaction, BackendWriteTransaction, BytePageBuilder, LixError,
+    BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteOp,
+    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, BytePageBuilder,
+    LixError,
 };
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
@@ -263,31 +264,28 @@ impl BackendWriteTransaction for SqliteBenchTransaction {
         let mut stats = BackendKvWriteStats::default();
         for group in batch.groups {
             let namespace = group.namespace().to_string();
-            for index in 0..group.put_count() {
-                let key = group.put_key(index).ok_or_else(|| {
-                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put key")
-                })?;
-                let value = group.put_value(index).ok_or_else(|| {
-                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put value")
-                })?;
-                put_statement
-                    .execute(params![namespace.as_str(), key, value])
-                    .map_err(sqlite_error)?;
-                stats.puts += 1;
-                stats.bytes_written += key.len() + value.len();
-            }
-            for index in 0..group.delete_count() {
-                let key = group.delete_key(index).ok_or_else(|| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        "backend write batch missing delete key",
-                    )
-                })?;
-                delete_statement
-                    .execute(params![namespace.as_str(), key])
-                    .map_err(sqlite_error)?;
-                stats.deletes += 1;
-                stats.bytes_written += key.len();
+            for op in group.ops() {
+                match op {
+                    BackendKvWriteOp::Put { key, value } => {
+                        put_statement
+                            .execute(params![namespace.as_str(), key, value])
+                            .map_err(sqlite_error)?;
+                        stats.puts += 1;
+                        stats.bytes_written += key.len() + value.len();
+                    }
+                    BackendKvWriteOp::Delete { key } => {
+                        delete_statement
+                            .execute(params![namespace.as_str(), key])
+                            .map_err(sqlite_error)?;
+                        stats.deletes += 1;
+                        stats.bytes_written += key.len();
+                    }
+                    BackendKvWriteOp::DeleteRange { range } => {
+                        sqlite_delete_range(&connection, namespace.as_str(), range)?;
+                        stats.delete_ranges += 1;
+                        stats.bytes_written += delete_range_bytes(range);
+                    }
+                }
             }
         }
         Ok(stats)
@@ -504,6 +502,40 @@ fn scan_end_key(range: &BackendKvScanRange) -> Option<Vec<u8>> {
     match range {
         BackendKvScanRange::Prefix(prefix) => prefix_end(prefix),
         BackendKvScanRange::Range { end, .. } => Some(end.clone()),
+    }
+}
+
+fn sqlite_delete_range(
+    connection: &Connection,
+    namespace: &str,
+    range: &BackendKvScanRange,
+) -> Result<(), LixError> {
+    let start = match range {
+        BackendKvScanRange::Prefix(prefix) => prefix.as_slice(),
+        BackendKvScanRange::Range { start, .. } => start.as_slice(),
+    };
+    match scan_end_key(range) {
+        Some(end) => connection
+            .execute(
+                "DELETE FROM kv WHERE namespace = ?1 AND key >= ?2 AND key < ?3",
+                params![namespace, start, end],
+            )
+            .map(|_| ())
+            .map_err(sqlite_error),
+        None => connection
+            .execute(
+                "DELETE FROM kv WHERE namespace = ?1 AND key >= ?2",
+                params![namespace, start],
+            )
+            .map(|_| ())
+            .map_err(sqlite_error),
+    }
+}
+
+fn delete_range_bytes(range: &BackendKvScanRange) -> usize {
+    match range {
+        BackendKvScanRange::Prefix(prefix) => prefix.len(),
+        BackendKvScanRange::Range { start, end } => start.len() + end.len(),
     }
 }
 
