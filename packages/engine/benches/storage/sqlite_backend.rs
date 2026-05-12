@@ -13,6 +13,8 @@ use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, O
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+const UNTRACKED_NAMESPACE: &str = "u";
+
 #[derive(Clone)]
 pub(crate) struct SqliteBenchBackend {
     connection: Arc<Mutex<Connection>>,
@@ -69,6 +71,10 @@ fn configure_connection(connection: &Connection) -> Result<(), LixError> {
                 key BLOB NOT NULL,
                 value BLOB NOT NULL,
                 PRIMARY KEY (namespace, key)
+            ) WITHOUT ROWID;
+            CREATE TABLE kv_u (
+                key BLOB NOT NULL PRIMARY KEY,
+                value BLOB NOT NULL
             ) WITHOUT ROWID;
             ",
         )
@@ -130,18 +136,31 @@ impl BackendReadTransaction for SqliteBenchTransaction {
                 continue;
             }
 
+            let untracked = namespace == UNTRACKED_NAMESPACE;
             let key_placeholders = std::iter::repeat_n("?", key_count)
                 .collect::<Vec<_>>()
                 .join(", ");
-            let sql = format!(
-                "
-                SELECT key, value
-                FROM kv
-                WHERE namespace = ? AND key IN ({key_placeholders})
-                "
-            );
-            let mut parameters = Vec::with_capacity(1 + key_count);
-            parameters.push(SqlValue::Text(namespace.clone()));
+            let sql = if untracked {
+                format!(
+                    "
+                    SELECT key, value
+                    FROM kv_u
+                    WHERE key IN ({key_placeholders})
+                    "
+                )
+            } else {
+                format!(
+                    "
+                    SELECT key, value
+                    FROM kv
+                    WHERE namespace = ? AND key IN ({key_placeholders})
+                    "
+                )
+            };
+            let mut parameters = Vec::with_capacity(usize::from(!untracked) + key_count);
+            if !untracked {
+                parameters.push(SqlValue::Text(namespace.clone()));
+            }
             parameters.extend(keys.iter().cloned().map(SqlValue::Blob));
 
             let mut statement = connection.prepare(&sql).map_err(sqlite_error)?;
@@ -191,18 +210,33 @@ impl BackendReadTransaction for SqliteBenchTransaction {
         let mut statement = connection
             .prepare_cached("SELECT 1 FROM kv WHERE namespace = ?1 AND key = ?2")
             .map_err(sqlite_error)?;
+        let mut untracked_statement = connection
+            .prepare_cached("SELECT 1 FROM kv_u WHERE key = ?1")
+            .map_err(sqlite_error)?;
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
             let namespace = group.namespace.clone();
             let mut exists = Vec::with_capacity(group.keys.len());
-            for key in group.keys {
-                exists.push(
-                    statement
-                        .query_row(params![namespace.as_str(), key.as_slice()], |_| Ok(()))
-                        .optional()
-                        .map_err(sqlite_error)?
-                        .is_some(),
-                );
+            if namespace == UNTRACKED_NAMESPACE {
+                for key in group.keys {
+                    exists.push(
+                        untracked_statement
+                            .query_row(params![key.as_slice()], |_| Ok(()))
+                            .optional()
+                            .map_err(sqlite_error)?
+                            .is_some(),
+                    );
+                }
+            } else {
+                for key in group.keys {
+                    exists.push(
+                        statement
+                            .query_row(params![namespace.as_str(), key.as_slice()], |_| Ok(()))
+                            .optional()
+                            .map_err(sqlite_error)?
+                            .is_some(),
+                    );
+                }
             }
             groups.push(BackendKvExistsGroup { namespace, exists });
         }
@@ -214,7 +248,11 @@ impl BackendReadTransaction for SqliteBenchTransaction {
         request: BackendKvScanRequest,
     ) -> Result<BackendKvKeyPage, LixError> {
         let connection = self.lock_connection()?;
-        sqlite_scan_keys(&connection, request)
+        if request.namespace == UNTRACKED_NAMESPACE {
+            sqlite_scan_untracked_keys(&connection, request)
+        } else {
+            sqlite_scan_keys(&connection, request)
+        }
     }
 
     async fn scan_values(
@@ -222,7 +260,11 @@ impl BackendReadTransaction for SqliteBenchTransaction {
         request: BackendKvScanRequest,
     ) -> Result<BackendKvValuePage, LixError> {
         let connection = self.lock_connection()?;
-        sqlite_scan_values(&connection, request)
+        if request.namespace == UNTRACKED_NAMESPACE {
+            sqlite_scan_untracked_values(&connection, request)
+        } else {
+            sqlite_scan_values(&connection, request)
+        }
     }
 
     async fn scan_entries(
@@ -230,7 +272,11 @@ impl BackendReadTransaction for SqliteBenchTransaction {
         request: BackendKvScanRequest,
     ) -> Result<BackendKvEntryPage, LixError> {
         let connection = self.lock_connection()?;
-        sqlite_scan_entries(&connection, request)
+        if request.namespace == UNTRACKED_NAMESPACE {
+            sqlite_scan_untracked_entries(&connection, request)
+        } else {
+            sqlite_scan_entries(&connection, request)
+        }
     }
 
     async fn rollback(mut self: Box<Self>) -> Result<(), LixError> {
@@ -260,33 +306,65 @@ impl BackendWriteTransaction for SqliteBenchTransaction {
         let mut delete_statement = connection
             .prepare_cached("DELETE FROM kv WHERE namespace = ?1 AND key = ?2")
             .map_err(sqlite_error)?;
+        let mut put_untracked_statement = connection
+            .prepare_cached(
+                "
+                INSERT OR REPLACE INTO kv_u (key, value)
+                VALUES (?1, ?2)
+                ",
+            )
+            .map_err(sqlite_error)?;
+        let mut delete_untracked_statement = connection
+            .prepare_cached("DELETE FROM kv_u WHERE key = ?1")
+            .map_err(sqlite_error)?;
         let mut stats = BackendKvWriteStats::default();
         for group in batch.groups {
             let namespace = group.namespace().to_string();
             for op in group.ops() {
                 match op {
                     BackendKvWriteOp::Put { key, value } => {
-                        put_statement
-                            .raw_bind_parameter(1, namespace.as_str())
-                            .map_err(sqlite_error)?;
-                        put_statement
-                            .raw_bind_parameter(2, key.as_slice())
-                            .map_err(sqlite_error)?;
-                        put_statement
-                            .raw_bind_parameter(3, value.as_slice())
-                            .map_err(sqlite_error)?;
-                        put_statement.raw_execute().map_err(sqlite_error)?;
+                        if namespace == UNTRACKED_NAMESPACE {
+                            put_untracked_statement
+                                .raw_bind_parameter(1, key.as_slice())
+                                .map_err(sqlite_error)?;
+                            put_untracked_statement
+                                .raw_bind_parameter(2, value.as_slice())
+                                .map_err(sqlite_error)?;
+                            put_untracked_statement
+                                .raw_execute()
+                                .map_err(sqlite_error)?;
+                        } else {
+                            put_statement
+                                .raw_bind_parameter(1, namespace.as_str())
+                                .map_err(sqlite_error)?;
+                            put_statement
+                                .raw_bind_parameter(2, key.as_slice())
+                                .map_err(sqlite_error)?;
+                            put_statement
+                                .raw_bind_parameter(3, value.as_slice())
+                                .map_err(sqlite_error)?;
+                            put_statement.raw_execute().map_err(sqlite_error)?;
+                        }
                         stats.puts += 1;
                         stats.bytes_written += key.len() + value.len();
                     }
                     BackendKvWriteOp::Delete { key } => {
-                        delete_statement
-                            .raw_bind_parameter(1, namespace.as_str())
-                            .map_err(sqlite_error)?;
-                        delete_statement
-                            .raw_bind_parameter(2, key.as_slice())
-                            .map_err(sqlite_error)?;
-                        delete_statement.raw_execute().map_err(sqlite_error)?;
+                        if namespace == UNTRACKED_NAMESPACE {
+                            delete_untracked_statement
+                                .raw_bind_parameter(1, key.as_slice())
+                                .map_err(sqlite_error)?;
+                            delete_untracked_statement
+                                .raw_execute()
+                                .map_err(sqlite_error)?;
+                        } else {
+                            delete_statement
+                                .raw_bind_parameter(1, namespace.as_str())
+                                .map_err(sqlite_error)?;
+                            delete_statement
+                                .raw_bind_parameter(2, key.as_slice())
+                                .map_err(sqlite_error)?;
+                            delete_statement.raw_execute().map_err(sqlite_error)?;
+                        }
                         stats.deletes += 1;
                         stats.bytes_written += key.len();
                     }
@@ -377,6 +455,53 @@ fn sqlite_scan_keys(
     })
 }
 
+fn sqlite_scan_untracked_keys(
+    connection: &Connection,
+    request: BackendKvScanRequest,
+) -> Result<BackendKvKeyPage, LixError> {
+    let start = scan_start_key(&request);
+    let end = scan_end_key(&request.range);
+    let limit = sqlite_fetch_limit(request.limit)?;
+    let mut statement = connection
+        .prepare_cached(
+            "
+            SELECT key FROM kv_u
+            WHERE (?1 IS NULL OR key > ?1)
+              AND key >= ?2
+              AND (?3 IS NULL OR key < ?3)
+            ORDER BY key
+            LIMIT ?4
+            ",
+        )
+        .map_err(sqlite_error)?;
+    let mut cursor = statement
+        .query(params![
+            request.after.as_deref(),
+            start.as_slice(),
+            end.as_deref(),
+            limit
+        ])
+        .map_err(sqlite_error)?;
+    let mut keys = BytePageBuilder::new();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
+    while let Some(row) = cursor.next().map_err(sqlite_error)? {
+        let key = row.get::<_, Vec<u8>>(0).map_err(sqlite_error)?;
+        if count < request.limit {
+            resume_after_candidate = Some(key.clone());
+            keys.push(&key);
+        }
+        count += 1;
+    }
+    let resume_after = (count > request.limit)
+        .then_some(resume_after_candidate)
+        .flatten();
+    Ok(BackendKvKeyPage {
+        keys: keys.finish(),
+        resume_after,
+    })
+}
+
 fn sqlite_scan_values(
     connection: &Connection,
     request: BackendKvScanRequest,
@@ -404,6 +529,53 @@ fn sqlite_scan_values(
             start.as_slice(),
             end.as_deref(),
             limit,
+        ])
+        .map_err(sqlite_error)?;
+    let mut values = BytePageBuilder::new();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
+    while let Some(row) = cursor.next().map_err(sqlite_error)? {
+        if count < request.limit {
+            resume_after_candidate = Some(row.get::<_, Vec<u8>>(0).map_err(sqlite_error)?);
+            let value = row.get::<_, Vec<u8>>(1).map_err(sqlite_error)?;
+            values.push(&value);
+        }
+        count += 1;
+    }
+    let resume_after = (count > request.limit)
+        .then_some(resume_after_candidate)
+        .flatten();
+    Ok(BackendKvValuePage {
+        values: values.finish(),
+        resume_after,
+    })
+}
+
+fn sqlite_scan_untracked_values(
+    connection: &Connection,
+    request: BackendKvScanRequest,
+) -> Result<BackendKvValuePage, LixError> {
+    let start = scan_start_key(&request);
+    let end = scan_end_key(&request.range);
+    let limit = sqlite_fetch_limit(request.limit)?;
+    let mut statement = connection
+        .prepare_cached(
+            "
+            SELECT key, value FROM kv_u
+            WHERE (?1 IS NULL OR key > ?1)
+              AND key >= ?2
+              AND (?3 IS NULL OR key < ?3)
+            ORDER BY key
+            LIMIT ?4
+            ",
+        )
+        .map_err(sqlite_error)?;
+    let mut cursor = statement
+        .query(params![
+            request.after.as_deref(),
+            start.as_slice(),
+            end.as_deref(),
+            limit
         ])
         .map_err(sqlite_error)?;
     let mut values = BytePageBuilder::new();
@@ -479,6 +651,57 @@ fn sqlite_scan_entries(
     })
 }
 
+fn sqlite_scan_untracked_entries(
+    connection: &Connection,
+    request: BackendKvScanRequest,
+) -> Result<BackendKvEntryPage, LixError> {
+    let start = scan_start_key(&request);
+    let end = scan_end_key(&request.range);
+    let limit = sqlite_fetch_limit(request.limit)?;
+    let mut statement = connection
+        .prepare_cached(
+            "
+            SELECT key, value FROM kv_u
+            WHERE (?1 IS NULL OR key > ?1)
+              AND key >= ?2
+              AND (?3 IS NULL OR key < ?3)
+            ORDER BY key
+            LIMIT ?4
+            ",
+        )
+        .map_err(sqlite_error)?;
+    let mut cursor = statement
+        .query(params![
+            request.after.as_deref(),
+            start.as_slice(),
+            end.as_deref(),
+            limit
+        ])
+        .map_err(sqlite_error)?;
+    let mut keys = BytePageBuilder::new();
+    let mut values = BytePageBuilder::new();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
+    while let Some(row) = cursor.next().map_err(sqlite_error)? {
+        let key = row.get::<_, Vec<u8>>(0).map_err(sqlite_error)?;
+        if count < request.limit {
+            let value = row.get::<_, Vec<u8>>(1).map_err(sqlite_error)?;
+            resume_after_candidate = Some(key.clone());
+            keys.push(&key);
+            values.push(&value);
+        }
+        count += 1;
+    }
+    let resume_after = (count > request.limit)
+        .then_some(resume_after_candidate)
+        .flatten();
+    Ok(BackendKvEntryPage {
+        keys: keys.finish(),
+        values: values.finish(),
+        resume_after,
+    })
+}
+
 fn sqlite_fetch_limit(limit: usize) -> Result<i64, LixError> {
     if limit == usize::MAX {
         return Ok(i64::MAX);
@@ -520,6 +743,10 @@ fn sqlite_delete_range(
     namespace: &str,
     range: &BackendKvScanRange,
 ) -> Result<(), LixError> {
+    if namespace == UNTRACKED_NAMESPACE {
+        return sqlite_delete_untracked_range(connection, range);
+    }
+
     if matches!(range, BackendKvScanRange::Prefix(prefix) if prefix.is_empty())
         && sqlite_namespace_is_exclusive(connection, namespace)?
     {
@@ -548,6 +775,38 @@ fn sqlite_delete_range(
             )
             .map(|_| ())
             .map_err(sqlite_error),
+    }
+}
+
+fn sqlite_delete_untracked_range(
+    connection: &Connection,
+    range: &BackendKvScanRange,
+) -> Result<(), LixError> {
+    let start = match range {
+        BackendKvScanRange::Prefix(prefix) => prefix.as_slice(),
+        BackendKvScanRange::Range { start, .. } => start.as_slice(),
+    };
+    match scan_end_key(range) {
+        Some(end) => connection
+            .execute(
+                "DELETE FROM kv_u WHERE key >= ?1 AND key < ?2",
+                params![start, end],
+            )
+            .map(|_| ())
+            .map_err(sqlite_error),
+        None => {
+            if start.is_empty() {
+                connection
+                    .execute("DELETE FROM kv_u", [])
+                    .map(|_| ())
+                    .map_err(sqlite_error)
+            } else {
+                connection
+                    .execute("DELETE FROM kv_u WHERE key >= ?1", params![start])
+                    .map(|_| ())
+                    .map_err(sqlite_error)
+            }
+        }
     }
 }
 

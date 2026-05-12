@@ -2085,3 +2085,73 @@ now uses a fresh SQLite backend for the exclusive-namespace branch, and the
 proof now uses first/last ordered namespace probes. Re-review reported HIGH
 None and MEDIUM None.
 ```
+
+## Optimization 22: SQLite Dedicated Untracked Table
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+SQLite physical namespace overhead for untracked-state rows
+```
+
+Change:
+
+```text
+The SQLite bench backend now stores namespace `u` in a dedicated `kv_u`
+WITHOUT ROWID table keyed by `key` instead of storing untracked rows in the
+shared `kv(namespace, key, value)` table. Non-untracked namespaces still use
+the shared table. The backend routing covers get, exists, scans, point writes,
+point deletes, and range deletes for namespace `u`.
+```
+
+This removes the physical namespace column and namespace predicates from the
+hot untracked row table while keeping the generic logical KV API unchanged.
+The artifact precedent is physical separation by storage scope: GreptimeDB's
+SQL KV backends use one concrete SQL table as the scope for KV operations and
+keep range predicates inside that table
+(`artifact/greptimedb/src/common/meta/src/kv_backend/rds/mysql.rs`,
+`artifact/greptimedb/src/common/meta/src/kv_backend/rds/postgres.rs`). The
+untracked namespace is the same kind of isolated local-row scope in this bench
+backend.
+
+Verification:
+
+```sh
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine untracked_state --features storage-benches
+cargo test -p lix_engine --test backend_kv_range_delete --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/lix_sqlite/real_workload/(insert_all_rows|select_all_rows|select_keys_only|select_one_by_pk|select_all_by_pk|update_all_rows|update_one_by_pk|delete_all_rows|delete_one_by_pk)/10k'
+LIX_UNTRACKED_STATE_CRUD_IO=real_workload cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+```
+
+CRUD timing scoreboard:
+
+| backend | workload | operation | after timing | criterion change |
+| --- | --- | --- | ---: | ---: |
+| Lix SQLite | real_workload/10k | `insert_all_rows` | 26.134-26.540 ms | no change in final run; earlier isolated insert run showed -6.8890% to -3.2348% |
+| Lix SQLite | real_workload/10k | `select_all_rows` | 9.8629-9.9627 ms | no change |
+| Lix SQLite | real_workload/10k | `select_keys_only` | 7.0095-7.4929 ms | no change |
+| Lix SQLite | real_workload/10k | `select_one_by_pk` | 2.5131-2.5977 ms | +1.8925% to +5.6445% |
+| Lix SQLite | real_workload/10k | `select_all_by_pk` | 26.878-27.743 ms | -5.1055% to -1.4740% |
+| Lix SQLite | real_workload/10k | `update_all_rows` | 22.229-22.437 ms | -7.8911% to -2.7472% |
+| Lix SQLite | real_workload/10k | `update_one_by_pk` | 3.0898-3.2108 ms | no change |
+| Lix SQLite | real_workload/10k | `delete_all_rows` | 5.8115-5.9552 ms | no change |
+| Lix SQLite | real_workload/10k | `delete_one_by_pk` | 3.2543-3.3737 ms | +1.8307% to +6.5731% |
+
+Logical I/O:
+
+```text
+Unchanged. This is a physical SQLite layout optimization; the logical KV
+request/result counters still report the same keys, values, batches, point
+operations, and range deletes.
+```
+
+Review:
+
+```text
+No sub-agent review: measured improvement is below the >=10% review threshold.
+The single-row point-operation regressions are small and remain faster than raw
+SQLite point operations in the real workload.
+```
