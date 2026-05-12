@@ -37,6 +37,12 @@ harness = false
 required-features = ["storage-benches"]
 
 [[bench]]
+name = "untracked_state_crud"
+path = "benches/untracked_state_crud/main.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
 name = "json_pointer_physical"
 path = "benches/json_pointer_physical/main.rs"
 harness = false

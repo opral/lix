@@ -1389,6 +1389,11 @@ pub struct JsonPointerTrackedStateReadFixture {
     commit_id: String,
 }
 
+pub struct JsonPointerUntrackedStateReadFixture {
+    context: UntrackedStateContext,
+    rows: Vec<JsonPointerStorageRow>,
+}
+
 pub struct JsonPointerTrackedStateDiffFixture {
     context: TrackedStateContext,
     left_commit_id: String,
@@ -1399,6 +1404,12 @@ pub struct JsonPointerTrackedStateDiffFixture {
 pub struct UntrackedStateWriteFixture {
     context: UntrackedStateContext,
     rows: Vec<MaterializedUntrackedStateRow>,
+}
+
+pub struct UntrackedStateDeleteFixture {
+    context: UntrackedStateContext,
+    rows: Vec<MaterializedUntrackedStateRow>,
+    expected_remaining_rows: usize,
 }
 
 pub struct UntrackedStateReadFixture {
@@ -2372,6 +2383,169 @@ pub async fn json_pointer_tracked_state_changed_keys_prepared(
     ))
 }
 
+pub async fn prepare_json_pointer_untracked_state_write_rows(
+    rows: &[JsonPointerStorageRow],
+) -> Result<UntrackedStateWriteFixture, LixError> {
+    Ok(UntrackedStateWriteFixture {
+        context: UntrackedStateContext::new(),
+        rows: json_pointer_untracked_rows(rows, false),
+    })
+}
+
+pub async fn prepare_json_pointer_untracked_state_read(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    rows: &[JsonPointerStorageRow],
+) -> Result<JsonPointerUntrackedStateReadFixture, LixError> {
+    let context = UntrackedStateContext::new();
+    let materialized_rows = json_pointer_untracked_rows(rows, false);
+    write_untracked_rows(backend, &context, &materialized_rows).await?;
+    Ok(JsonPointerUntrackedStateReadFixture {
+        context,
+        rows: rows.to_vec(),
+    })
+}
+
+pub async fn prepare_json_pointer_untracked_state_overwrite_rows(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    rows: &[JsonPointerStorageRow],
+    updated_rows: usize,
+) -> Result<UntrackedStateWriteFixture, LixError> {
+    let context = UntrackedStateContext::new();
+    let base_rows = json_pointer_untracked_rows(rows, false);
+    write_untracked_rows(backend, &context, &base_rows).await?;
+    let updated_rows = json_pointer_untracked_rows(&rows[..updated_rows.min(rows.len())], true);
+    Ok(UntrackedStateWriteFixture {
+        context,
+        rows: updated_rows,
+    })
+}
+
+pub async fn prepare_json_pointer_untracked_state_delete_rows(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    rows: &[JsonPointerStorageRow],
+    deleted_rows: usize,
+) -> Result<UntrackedStateDeleteFixture, LixError> {
+    let context = UntrackedStateContext::new();
+    let base_rows = json_pointer_untracked_rows(rows, false);
+    write_untracked_rows(backend, &context, &base_rows).await?;
+    let deleted_rows = deleted_rows.min(rows.len());
+    let mut tombstones = json_pointer_untracked_rows(&rows[..deleted_rows], false);
+    for row in &mut tombstones {
+        row.snapshot_content = None;
+    }
+    Ok(UntrackedStateDeleteFixture {
+        context,
+        rows: tombstones,
+        expected_remaining_rows: rows.len() - deleted_rows,
+    })
+}
+
+pub async fn json_pointer_untracked_state_read_point_hit_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &JsonPointerUntrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    let mut verified_rows = 0;
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
+    for row in &fixture.rows {
+        if reader
+            .load_row(&UntrackedStateRowRequest {
+                schema_key: "json_pointer".to_string(),
+                version_id: "bench-version".to_string(),
+                entity_id: EntityIdentity::single(json_pointer_entity_id(row.path.as_str())),
+                file_id: NullableKeyFilter::Null,
+            })
+            .await?
+            .is_some()
+        {
+            verified_rows += 1;
+        }
+    }
+    Ok(report(fixture.rows.len(), verified_rows, Duration::ZERO))
+}
+
+pub async fn json_pointer_untracked_state_read_point_hit_constant_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &JsonPointerUntrackedStateReadFixture,
+    measured_reads: usize,
+) -> Result<StorageBenchReport, LixError> {
+    let measured_rows = measured_reads.min(fixture.rows.len());
+    let mut verified_rows = 0;
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
+    let start = if measured_rows == fixture.rows.len() {
+        0
+    } else {
+        fixture.rows.len().saturating_sub(measured_rows) / 2
+    };
+    for row in &fixture.rows[start..start + measured_rows] {
+        if reader
+            .load_row(&UntrackedStateRowRequest {
+                schema_key: "json_pointer".to_string(),
+                version_id: "bench-version".to_string(),
+                entity_id: EntityIdentity::single(json_pointer_entity_id(row.path.as_str())),
+                file_id: NullableKeyFilter::Null,
+            })
+            .await?
+            .is_some()
+        {
+            verified_rows += 1;
+        }
+    }
+    Ok(report(measured_rows, verified_rows, Duration::ZERO))
+}
+
+pub async fn json_pointer_untracked_state_scan_full_rows_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &JsonPointerUntrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    json_pointer_untracked_scan_with_projection(
+        backend,
+        fixture,
+        UntrackedStateProjection::default(),
+    )
+    .await
+}
+
+pub async fn json_pointer_untracked_state_scan_keys_only_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &JsonPointerUntrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    json_pointer_untracked_scan_with_projection(
+        backend,
+        fixture,
+        UntrackedStateProjection {
+            columns: vec!["entity_id".to_string()],
+        },
+    )
+    .await
+}
+
+async fn json_pointer_untracked_scan_with_projection(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &JsonPointerUntrackedStateReadFixture,
+    projection: UntrackedStateProjection,
+) -> Result<StorageBenchReport, LixError> {
+    let mut reader = fixture
+        .context
+        .reader(StorageContext::new(Arc::clone(backend)));
+    let verified_rows = reader
+        .scan_rows(&UntrackedStateScanRequest {
+            filter: UntrackedStateFilter {
+                schema_keys: vec!["json_pointer".to_string()],
+                file_ids: vec![NullableKeyFilter::Null],
+                ..Default::default()
+            },
+            projection,
+            ..Default::default()
+        })
+        .await?
+        .len();
+    Ok(report(fixture.rows.len(), verified_rows, Duration::ZERO))
+}
+
 pub async fn prepare_untracked_state_write_rows(
     config: StorageBenchConfig,
 ) -> Result<UntrackedStateWriteFixture, LixError> {
@@ -2385,7 +2559,7 @@ pub async fn untracked_state_write_rows_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &UntrackedStateWriteFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    write_untracked_rows(backend, &fixture.context, &fixture.rows).await?;
+    untracked_state_write_rows_only_prepared(backend, fixture).await?;
     let verified_rows = scan_untracked(
         backend,
         &fixture.context,
@@ -2394,6 +2568,18 @@ pub async fn untracked_state_write_rows_prepared(
     .await?
     .len();
     Ok(report(fixture.rows.len(), verified_rows, Duration::ZERO))
+}
+
+pub async fn untracked_state_write_rows_only_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &UntrackedStateWriteFixture,
+) -> Result<StorageBenchReport, LixError> {
+    write_untracked_rows(backend, &fixture.context, &fixture.rows).await?;
+    Ok(report(
+        fixture.rows.len(),
+        fixture.rows.len(),
+        Duration::ZERO,
+    ))
 }
 
 pub async fn prepare_untracked_state_read(
@@ -2626,11 +2812,23 @@ pub async fn prepare_untracked_state_overwrite(
     backend: &Arc<dyn Backend + Send + Sync>,
     config: StorageBenchConfig,
 ) -> Result<UntrackedStateWriteFixture, LixError> {
+    prepare_untracked_state_overwrite_rows(
+        backend,
+        config,
+        config.update_fraction.rows(config.rows),
+    )
+    .await
+}
+
+pub async fn prepare_untracked_state_overwrite_rows(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    config: StorageBenchConfig,
+    updated_rows: usize,
+) -> Result<UntrackedStateWriteFixture, LixError> {
     let context = UntrackedStateContext::new();
     let rows = untracked_rows(config);
     write_untracked_rows(backend, &context, &rows).await?;
-    let mut updated_rows =
-        untracked_rows(config.with_rows(config.update_fraction.rows(config.rows)));
+    let mut updated_rows = untracked_rows(config.with_rows(updated_rows.min(config.rows)));
     for (index, row) in updated_rows.iter_mut().enumerate() {
         row.snapshot_content = Some(updated_snapshot_content(index, config.state_payload_bytes));
     }
@@ -2658,11 +2856,31 @@ pub async fn prepare_untracked_state_insert_new_keys(
     })
 }
 
+pub async fn prepare_untracked_state_delete_rows(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    config: StorageBenchConfig,
+    deleted_rows: usize,
+) -> Result<UntrackedStateDeleteFixture, LixError> {
+    let context = UntrackedStateContext::new();
+    let rows = untracked_rows(config);
+    write_untracked_rows(backend, &context, &rows).await?;
+    let deleted_rows = deleted_rows.min(config.rows);
+    let mut tombstones = untracked_rows(config.with_rows(deleted_rows));
+    for row in &mut tombstones {
+        row.snapshot_content = None;
+    }
+    Ok(UntrackedStateDeleteFixture {
+        context,
+        rows: tombstones,
+        expected_remaining_rows: config.rows - deleted_rows,
+    })
+}
+
 pub async fn untracked_state_overwrite_existing_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &UntrackedStateWriteFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    write_untracked_rows(backend, &fixture.context, &fixture.rows).await?;
+    untracked_state_write_rows_only_prepared(backend, fixture).await?;
     let verified_rows = scan_untracked(
         backend,
         &fixture.context,
@@ -2671,6 +2889,43 @@ pub async fn untracked_state_overwrite_existing_prepared(
     .await?
     .len();
     Ok(report(fixture.rows.len(), verified_rows, Duration::ZERO))
+}
+
+pub async fn untracked_state_delete_existing_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &UntrackedStateDeleteFixture,
+) -> Result<StorageBenchReport, LixError> {
+    untracked_state_delete_existing_only_prepared(backend, fixture).await?;
+    let remaining_rows = scan_untracked(
+        backend,
+        &fixture.context,
+        UntrackedStateScanRequest::default(),
+    )
+    .await?
+    .len();
+    if remaining_rows != fixture.expected_remaining_rows {
+        return Err(LixError::unknown(format!(
+            "untracked delete left {remaining_rows} rows; expected {}",
+            fixture.expected_remaining_rows
+        )));
+    }
+    Ok(report(
+        fixture.rows.len(),
+        fixture.rows.len(),
+        Duration::ZERO,
+    ))
+}
+
+pub async fn untracked_state_delete_existing_only_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &UntrackedStateDeleteFixture,
+) -> Result<StorageBenchReport, LixError> {
+    write_untracked_rows(backend, &fixture.context, &fixture.rows).await?;
+    Ok(report(
+        fixture.rows.len(),
+        fixture.rows.len(),
+        Duration::ZERO,
+    ))
 }
 
 pub async fn prepare_changelog_append_changes(
@@ -4261,6 +4516,49 @@ fn json_pointer_tracked_rows(
             }
         })
         .collect()
+}
+
+fn json_pointer_untracked_rows(
+    rows: &[JsonPointerStorageRow],
+    updated: bool,
+) -> Vec<MaterializedUntrackedStateRow> {
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let value_json = if updated {
+                row.updated_value_json.as_str()
+            } else {
+                row.value_json.as_str()
+            };
+            let value = serde_json::from_str::<serde_json::Value>(value_json)
+                .unwrap_or_else(|_| serde_json::Value::String(value_json.to_string()));
+            let snapshot = serde_json::json!({
+                "path": row.path,
+                "value": value,
+            })
+            .to_string();
+            MaterializedUntrackedStateRow {
+                entity_id: EntityIdentity::single(json_pointer_entity_id(row.path.as_str())),
+                schema_key: "json_pointer".to_string(),
+                file_id: None,
+                snapshot_content: Some(snapshot),
+                metadata: None,
+                deleted: false,
+                created_at: timestamp(index),
+                updated_at: timestamp(index),
+                global: false,
+                version_id: "bench-version".to_string(),
+            }
+        })
+        .collect()
+}
+
+fn json_pointer_entity_id(path: &str) -> &str {
+    if path.is_empty() {
+        "/"
+    } else {
+        path
+    }
 }
 
 async fn write_json_pointer_delta_chain(
