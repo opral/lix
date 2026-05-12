@@ -361,6 +361,13 @@ impl StorageWriteSet {
         self.batch.delete_range(namespace, range);
     }
 
+    pub(crate) fn reserve_namespace_ops(&mut self, namespace: &'static str, additional: usize) {
+        if additional == 0 {
+            return;
+        }
+        self.batch.reserve_namespace_ops(namespace, additional);
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.batch.is_empty()
     }
@@ -401,6 +408,14 @@ impl KvWriteBatch {
     pub(crate) fn delete_range(&mut self, namespace: &'static str, range: KvScanRange) {
         let group = self.group_mut(namespace);
         group.delete_range(range);
+    }
+
+    pub(crate) fn reserve_namespace_ops(&mut self, namespace: &'static str, additional: usize) {
+        if additional == 0 {
+            return;
+        }
+        let group = self.group_mut(namespace);
+        group.reserve(additional);
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -487,6 +502,10 @@ impl KvWriteGroup {
 
     pub(crate) fn delete_range(&mut self, range: KvScanRange) {
         self.ops.push(KvWriteOp::DeleteRange { range });
+    }
+
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.ops.reserve(additional);
     }
 
     pub(crate) fn is_empty(&self) -> bool {
