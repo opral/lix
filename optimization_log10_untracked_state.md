@@ -1961,3 +1961,61 @@ precise artifact wording. The helper now panics if a range delete is passed to
 the point-op sorter, and this log now calls the Dolt reference an ordered bulk
 mutation precedent while explicitly noting the in-memory staging tradeoff.
 ```
+
+## Optimization 20: Raw Bind SQLite KV Writes
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+SQLite backend write-loop binding overhead
+```
+
+Change:
+
+```text
+The SQLite bench backend write loop now binds put/delete statement parameters
+with rusqlite's low-level `raw_bind_parameter` API and executes with
+`raw_execute`. Every parameter is rebound on each iteration; statement text,
+transaction semantics, and logical storage I/O are unchanged.
+```
+
+This keeps the same prepared-statement reuse pattern already used throughout
+the SQLite backend, but avoids rebuilding the `params!` parameter container in
+the hot per-row KV write loop. The artifact precedent is direct prepared
+statement binding: Turso's sync engine binds statement parameters explicitly in
+hot database sync operations
+(`artifact/turso/sync/engine/src/database_sync_operations.rs`), and Turso's
+SQLite compatibility tests exercise low-level bind APIs for integer, text, and
+blob parameters (`artifact/turso/sqlite3/tests/compat/mod.rs`).
+
+Verification:
+
+```sh
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo bench -p lix_engine --features storage-benches --bench storage -- 'storage/api/sqlite_tempfile/write_kv_batch_put/10k'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/lix_sqlite/real_workload/(insert_all_rows|update_all_rows|delete_one_by_pk)/10k'
+```
+
+Timing scoreboard:
+
+| benchmark | operation | after timing | criterion change |
+| --- | --- | ---: | ---: |
+| storage/api/sqlite_tempfile | `write_kv_batch_put/10k` | 12.653-12.755 ms | -4.0026% to -2.8143% |
+| untracked_state_crud/lix_sqlite/real_workload/10k | `insert_all_rows` | 26.158-26.514 ms | -5.0459% to -3.0589% |
+| untracked_state_crud/lix_sqlite/real_workload/10k | `update_all_rows` | 23.062-23.609 ms | -4.5133% to -1.0401% |
+| untracked_state_crud/lix_sqlite/real_workload/10k | `delete_one_by_pk` | 3.1464-3.2165 ms | no change |
+
+Logical I/O:
+
+```text
+Unchanged. This only removes per-row rusqlite parameter-container overhead in
+the bench SQLite backend write loop.
+```
+
+Review:
+
+```text
+No sub-agent review: improvement is below the >=10% review threshold.
+```
