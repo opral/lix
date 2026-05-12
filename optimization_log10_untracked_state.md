@@ -1431,3 +1431,59 @@ Review:
 No sub-agent review was required: the observed improvement was below the 10%
 review threshold.
 ```
+
+## Optimization 13: Pre-size Untracked Row Keys
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+key encoding allocation overhead
+```
+
+Change:
+
+```text
+Untracked row key encoding now computes the exact encoded key length before
+allocation and uses `Vec::with_capacity`. The key format itself is unchanged:
+varint length-prefixed version/schema/entity components, a file marker byte,
+and an optional file component.
+```
+
+Verification:
+
+```sh
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine untracked_state --features storage-benches
+cargo test -p lix_engine untracked_state::storage::tests::row_key_capacity_matches_encoded_length --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/(insert_all_rows|update_all_rows)/1k'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/real_workload/(insert_all_rows|update_all_rows)/10k'
+```
+
+Smoke timing scoreboard:
+
+| backend | operation | after timing | criterion change |
+| --- | --- | ---: | ---: |
+| Lix SQLite | `insert_all_rows` | 6.2908-6.5005 ms | no change |
+| Lix SQLite | `update_all_rows` | 5.3675-5.7329 ms | no change |
+| Lix RocksDB | `insert_all_rows` | 2.8327-2.8934 ms | -5.3882% to -3.2482% |
+| Lix RocksDB | `update_all_rows` | 1.9386-1.9769 ms | -10.766% to -8.6780% |
+
+Real-workload timing scoreboard:
+
+| backend | operation | after timing | criterion change |
+| --- | --- | ---: | ---: |
+| Lix SQLite | `insert_all_rows` | 35.126-49.489 ms | no change |
+| Lix SQLite | `update_all_rows` | 26.065-26.967 ms | -5.5578% to -1.9782% |
+| Lix RocksDB | `insert_all_rows` | 15.753-17.072 ms | -9.2094% to -1.4494% |
+| Lix RocksDB | `update_all_rows` | 17.239-17.664 ms | -12.243% to -9.6426% |
+
+Review:
+
+```text
+Sub-agent review reported HIGH None and MEDIUM None. LOW feedback noted that
+the sizing helper duplicates key framing rules, so a focused unit test now
+asserts encoded key capacity exactly matches encoded length for null-file,
+file-id, tuple identity, and varint-boundary component shapes.
+```

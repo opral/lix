@@ -407,7 +407,7 @@ pub(super) fn encode_untracked_state_row_key_ref(
 ) -> Vec<u8> {
     // This compact component framing is for exact-key identity lookups and
     // whole-namespace scans. It is not a logical order-preserving tuple codec.
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(encoded_untracked_state_row_key_len(identity));
     push_component(&mut out, identity.version_id);
     push_component(&mut out, identity.schema_key);
     push_entity_identity(&mut out, identity.entity_id);
@@ -419,6 +419,20 @@ pub(super) fn encode_untracked_state_row_key_ref(
         None => out.push(0),
     }
     out
+}
+
+fn encoded_untracked_state_row_key_len(identity: UntrackedStateIdentityRef<'_>) -> usize {
+    encoded_component_len(identity.version_id)
+        + encoded_component_len(identity.schema_key)
+        + varint_len(identity.entity_id.parts.len())
+        + identity
+            .entity_id
+            .parts
+            .iter()
+            .map(|part| encoded_component_len(part))
+            .sum::<usize>()
+        + 1
+        + identity.file_id.map(encoded_component_len).unwrap_or(0)
 }
 
 fn push_entity_identity(out: &mut Vec<u8>, entity_id: &crate::entity_identity::EntityIdentity) {
@@ -462,6 +476,10 @@ fn push_component(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(bytes);
 }
 
+fn encoded_component_len(value: &str) -> usize {
+    varint_len(value.len()) + value.len()
+}
+
 fn read_component<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a str, LixError> {
     let len = read_varint_len(bytes, cursor)?;
     let component = bytes
@@ -481,6 +499,15 @@ fn push_varint_len(out: &mut Vec<u8>, mut len: usize) {
         len >>= 7;
     }
     out.push(len as u8);
+}
+
+fn varint_len(mut len: usize) -> usize {
+    let mut encoded_len = 1;
+    while len >= 0x80 {
+        encoded_len += 1;
+        len >>= 7;
+    }
+    encoded_len
 }
 
 fn read_varint_len(bytes: &[u8], cursor: &mut usize) -> Result<usize, LixError> {
@@ -835,6 +862,34 @@ mod tests {
         let key = encode_untracked_state_row_key(&identity);
         let decoded = decode_untracked_state_row_key(&key).expect("key should decode");
         assert_eq!(decoded, identity);
+    }
+
+    #[test]
+    fn row_key_capacity_matches_encoded_length() {
+        let long = "x".repeat(128);
+        let identities = [
+            UntrackedStateIdentity {
+                version_id: "v".to_string(),
+                schema_key: "s".to_string(),
+                entity_id: crate::entity_identity::EntityIdentity::single("entity"),
+                file_id: None,
+            },
+            UntrackedStateIdentity {
+                version_id: long.clone(),
+                schema_key: "schema".to_string(),
+                entity_id: crate::entity_identity::EntityIdentity::tuple(vec![
+                    "left".to_string(),
+                    long,
+                ])
+                .expect("tuple identity should be valid"),
+                file_id: Some("settings.json".to_string()),
+            },
+        ];
+
+        for identity in identities {
+            let key = encode_untracked_state_row_key(&identity);
+            assert_eq!(key.capacity(), key.len());
+        }
     }
 
     #[test]
