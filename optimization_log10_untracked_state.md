@@ -66,11 +66,12 @@ LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-b
 LIX_UNTRACKED_STATE_CRUD_IO=real_workload cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/no_such_benchmark'
 ```
 
-The I/O report measures logical backend KV operations after fixture setup is
-reset out of the counters. It reports read calls, returned/read rows, logical
-key/value bytes, write batches, puts, deletes, and logical write bytes. It does
-not measure OS-level disk pages, filesystem cache behavior, WAL flushes, or
-RocksDB compaction bytes.
+The I/O report measures logical backend KV request/result payload accounting
+after fixture setup is reset out of the counters. It reports read calls,
+returned/read rows, request key bytes for point reads, returned key/value bytes
+for scans, write batches, puts, deletes, and logical write bytes. It does not
+measure OS-level disk pages, filesystem cache behavior, WAL flushes, RocksDB
+compaction bytes, or keys examined but not returned by a backend scan.
 
 Groups:
 
@@ -250,3 +251,83 @@ keep row encoding low-copy and projection-aware
 
 Do not use tracked-state machinery to make untracked benchmarks look faster.
 Untracked state owns this path.
+
+## Optimization 1: Projection-Aware Covering Index
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+I/O for identity-only projected scans
+```
+
+Change:
+
+```text
+Untracked-state writes now maintain a small identity index keyed by the same
+row identity key. The index value stores scalar fields needed by projected
+materialization: created_at, updated_at, and global.
+
+Scans whose requested projection is fully covered by identity columns now use
+backend scan_entries over this covering index instead of scanning and decoding
+full row values.
+
+When filters include version_ids, the reader issues one bounded key-prefix scan
+per version. When filters include version_ids and schema_keys, it issues one
+bounded prefix scan per version+schema pair. Broader filters still scan index
+entries and filter decoded identities in memory.
+```
+
+Reference principle:
+
+```text
+This follows the same first-principles shape as projection pushdown / covering
+index scans in query engines: do not read payload columns when the requested
+projection is fully covered by the physical key. DataFusion optimizer tests and
+rules model this with TableScan projection pushdown, and storage engines use
+covering keys/indexes to avoid base-row reads for key-covered projections.
+```
+
+Verification:
+
+```sh
+cargo test -p lix_engine untracked_state::storage --features storage-benches
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/no_such_benchmark'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/select_keys_only/1k'
+```
+
+Smoke I/O scoreboard:
+
+| backend     | operation          | before read bytes | after read bytes | read-byte delta |
+| ----------- | ------------------ | ----------------: | ---------------: | --------------: |
+| Lix SQLite  | `select_keys_only` |         1,020,868 |          150,204 |          -85.3% |
+| Lix RocksDB | `select_keys_only` |         1,020,868 |          150,204 |          -85.3% |
+
+Smoke write I/O tradeoff:
+
+| backend     | operation          | before puts/deletes | after puts/deletes | before write bytes | after write bytes |
+| ----------- | ------------------ | ------------------: | -----------------: | -----------------: | ----------------: |
+| Lix SQLite  | `insert_all_rows`  |          1000 / 0   |         2000 / 0   |          1,114,072 |         1,264,276 |
+| Lix SQLite  | `update_all_rows`  |          1000 / 0   |         2000 / 0   |            474,316 |           624,520 |
+| Lix SQLite  | `delete_all_rows`  |             0 / 1000 |            0 / 2000 |             93,204 |           186,408 |
+| Lix RocksDB | `insert_all_rows`  |          1000 / 0   |         2000 / 0   |          1,114,072 |         1,264,276 |
+| Lix RocksDB | `update_all_rows`  |          1000 / 0   |         2000 / 0   |            474,316 |           624,520 |
+| Lix RocksDB | `delete_all_rows`  |             0 / 1000 |            0 / 2000 |             93,204 |           186,408 |
+
+Smoke timing scoreboard:
+
+| backend     | operation          | before timing      | after timing       | timing read |
+| ----------- | ------------------ | -----------------: | ----------------: | ----------- |
+| Lix SQLite  | `select_keys_only` | 5.1347-5.2920 ms   | 5.8884-6.0097 ms  | slower after scalar-preserving index |
+| Lix RocksDB | `select_keys_only` | 1.6006-1.6339 ms   | 1.4754-1.5353 ms  | modest improvement |
+
+Notes:
+
+```text
+The I/O win is structural and large, but scalar-preserving covering indexes
+add write amplification and make SQLite select_keys_only slower in the smoke
+timing row. This is still useful evidence for the I/O axis: avoiding full
+payload hydration is correct, but the physical index/value shape needs the next
+iteration before this target helps both backends on wall-clock time.
+```
