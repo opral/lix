@@ -361,11 +361,8 @@ impl StorageWriteSet {
         self.batch.delete_range(namespace, range);
     }
 
-    pub(crate) fn reserve_namespace_ops(&mut self, namespace: &'static str, additional: usize) {
-        if additional == 0 {
-            return;
-        }
-        self.batch.reserve_namespace_ops(namespace, additional);
+    pub(crate) fn push_group(&mut self, group: KvWriteGroup) {
+        self.batch.push_group(group);
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -410,16 +407,23 @@ impl KvWriteBatch {
         group.delete_range(range);
     }
 
-    pub(crate) fn reserve_namespace_ops(&mut self, namespace: &'static str, additional: usize) {
-        if additional == 0 {
-            return;
-        }
-        let group = self.group_mut(namespace);
-        group.reserve(additional);
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.groups.iter().all(KvWriteGroup::is_empty)
+    }
+
+    pub(crate) fn push_group(&mut self, group: KvWriteGroup) {
+        if group.is_empty() {
+            return;
+        }
+        if let Some(index) = self
+            .groups
+            .iter()
+            .position(|existing| existing.namespace == group.namespace)
+        {
+            self.groups[index].ops.extend(group.ops);
+        } else {
+            self.groups.push(group);
+        }
     }
 
     fn group_mut(&mut self, namespace: &'static str) -> &mut KvWriteGroup {
@@ -533,5 +537,37 @@ impl From<backend::BackendKvWriteStats> for KvWriteStats {
             delete_ranges: stats.delete_ranges,
             bytes_written: stats.bytes_written,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_group_merges_with_existing_namespace_preserving_same_namespace_order() {
+        let mut writes = StorageWriteSet::new();
+
+        let mut first = KvWriteGroup::new("ns");
+        first.delete(b"old".to_vec());
+        writes.push_group(first);
+
+        let mut second = KvWriteGroup::new("ns");
+        second.put(b"new".to_vec(), b"value".to_vec());
+        writes.push_group(second);
+
+        writes.delete_range("ns", KvScanRange::prefix(Vec::new()));
+
+        assert_eq!(writes.batch.groups.len(), 1);
+        assert_eq!(writes.batch.groups[0].namespace, "ns");
+        assert!(matches!(
+            writes.batch.groups[0].ops[0],
+            KvWriteOp::Delete { .. }
+        ));
+        assert!(matches!(writes.batch.groups[0].ops[1], KvWriteOp::Put { .. }));
+        assert!(matches!(
+            writes.batch.groups[0].ops[2],
+            KvWriteOp::DeleteRange { .. }
+        ));
     }
 }
