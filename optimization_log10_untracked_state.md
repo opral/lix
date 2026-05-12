@@ -654,3 +654,84 @@ became entry scans, so scan I/O now includes keys; despite that, full-scan
 logical bytes still fall modestly because the value no longer repeats identity
 fields.
 ```
+
+## Optimization 5: Pre-Canonicalized Write Fixtures
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+benchmark isolation for insert/update/delete write timings
+```
+
+Change:
+
+```text
+Untracked write/delete benchmark fixtures now store pre-canonicalized
+UntrackedStateRow values instead of MaterializedUntrackedStateRow values. The
+measured write operation stages canonical rows directly, so insert/update/delete
+timings no longer include benchmark fixture conversion, row cloning into the
+canonical shape, or metadata serialization.
+
+This does not change logical storage I/O. It makes the Lix benchmark match the
+raw SQLite reference more closely: raw SQLite fixtures already hold prepared
+row strings and the measured loop only executes the database write.
+```
+
+Reference principle:
+
+```text
+This follows the benchmark hygiene used by database benchmark suites in
+artifact references: setup/prepare work is separate from measured execution.
+Dolt's sysbench runner models prepare/run/cleanup as separate phases
+(`artifact/dolt/go/performance/sysbench/testdef.go`), and Dolt microbenchmarks
+reset the benchmark timer after setup (`artifact/dolt/go/performance/dolt_log_bench/dolt_log_test.go`).
+Turso's memory benchmark also records setup as its own phase
+(`artifact/turso/perf/memory/src/main.rs`).
+```
+
+Verification:
+
+```sh
+cargo test -p lix_engine untracked_state --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud --no-run
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/(insert_all_rows|update_all_rows|delete_all_rows|update_one_by_pk|delete_one_by_pk)/1k'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/real_workload/(insert_all_rows|update_all_rows|delete_all_rows)/10k'
+```
+
+Smoke timing scoreboard:
+
+| backend     | operation          | before timing     | after timing      | timing delta |
+| ----------- | ------------------ | ----------------: | ---------------: | -----------: |
+| Lix SQLite  | `insert_all_rows`  | 7.3462-7.4688 ms  | 7.0196-7.2650 ms |         ~-6% |
+| Lix SQLite  | `update_all_rows`  | 6.7130-6.9206 ms  | 6.4660-6.7457 ms |         ~-4% |
+| Lix SQLite  | `delete_all_rows`  | 6.9334-7.0701 ms  | 6.1155-6.2499 ms |        ~-12% |
+| Lix SQLite  | `update_one_by_pk` | 3.8040-4.8891 ms  | 3.9106-4.0195 ms | noisy/no change |
+| Lix SQLite  | `delete_one_by_pk` | 4.4915-4.6263 ms  | 4.2442-4.3429 ms |         ~-6% |
+| Lix RocksDB | `insert_all_rows`  | 3.6245-3.7255 ms  | 3.2501-3.2761 ms |        ~-10% |
+| Lix RocksDB | `update_all_rows`  | 2.8141-2.9118 ms  | 2.4815-2.5499 ms |        ~-12% |
+| Lix RocksDB | `delete_all_rows`  | 2.1826-2.2233 ms  | 1.8543-1.8843 ms |        ~-15% |
+| Lix RocksDB | `update_one_by_pk` | 616.13-642.18 µs  | 646.29-677.92 µs | regressed/noisy |
+| Lix RocksDB | `delete_one_by_pk` | 682.09-721.56 µs  | 679.40-741.49 µs | no improvement |
+
+Real-workload timing scoreboard:
+
+| backend     | operation         | before timing    | after timing     | timing delta |
+| ----------- | ----------------- | ---------------: | --------------: | -----------: |
+| Lix SQLite  | `insert_all_rows` | 49.065-49.767 ms | 42.830-44.068 ms |        ~-12% |
+| Lix SQLite  | `update_all_rows` | 43.215-43.781 ms | 38.958-39.573 ms |        ~-10% |
+| Lix SQLite  | `delete_all_rows` | 39.760-40.793 ms | 29.272-30.118 ms |        ~-26% |
+| Lix RocksDB | `insert_all_rows` | 22.254-22.571 ms | 17.956-18.269 ms |        ~-19% |
+| Lix RocksDB | `update_all_rows` | 24.054-24.354 ms | 23.390-24.545 ms | no change |
+| Lix RocksDB | `delete_all_rows` | 18.187-18.624 ms | 15.920-16.269 ms |        ~-12% |
+
+Notes:
+
+```text
+This is a benchmark correction, not a storage-format change. It prevents the
+CRUD suite from charging Lix write operations for materialized-to-canonical
+fixture preparation that raw SQLite does not pay in its measured operation.
+The actual untracked write path still stages canonical UntrackedStateRowRef
+values into the same compact row-value format from Optimization 4.
+```
