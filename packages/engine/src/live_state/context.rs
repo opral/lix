@@ -420,10 +420,31 @@ fn untracked_scan_request_from_live(
     UntrackedStateScanRequest {
         filter,
         projection: crate::untracked_state::UntrackedStateProjection {
-            columns: request.projection.columns.clone(),
+            columns: untracked_live_projection_columns(&request.projection.columns),
         },
         limit: None,
     }
+}
+
+fn untracked_live_projection_columns(columns: &[String]) -> Vec<String> {
+    if columns.is_empty() {
+        return Vec::new();
+    }
+    let mut hydrated = columns.to_vec();
+    for required in [
+        "entity_id",
+        "schema_key",
+        "file_id",
+        "version_id",
+        "created_at",
+        "updated_at",
+        "global",
+    ] {
+        if !hydrated.iter().any(|column| column == required) {
+            hydrated.push(required.to_string());
+        }
+    }
+    hydrated
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

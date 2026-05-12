@@ -804,3 +804,86 @@ Real-workload I/O score:
 | Lix RocksDB | `update_one_by_pk` |      1 |       195 |
 | Lix RocksDB | `delete_all_rows`  |      1 |   943,696 |
 | Lix RocksDB | `delete_one_by_pk` |      1 |        43 |
+
+## Optimization 6: Key-Covered Identity Scans
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+logical read I/O for identity-only untracked scans
+```
+
+Change:
+
+```text
+Untracked scans whose projection is covered by the physical key now use
+StorageReader::scan_keys instead of scan_entries. The key-covered set is
+strictly limited to entity_id, schema_key, file_id, and version_id. Value-backed
+header fields such as created_at, updated_at, and global still use the normal
+value scan.
+
+Live-state scans continue to request untracked header fields needed by overlay
+and visibility resolution, so partial identity-only untracked rows do not flow
+into live-state materialization.
+```
+
+Reference principle:
+
+```text
+This follows projection pushdown / covering-read practice from the artifact
+databases: only use a covering access path when every requested field is covered
+by the physical key/index. Dolt's index reader separates covering and primary
+row access (`artifact/dolt/go/libraries/doltcore/sqle/index/index_reader.go`).
+SpiceAI/DataFusion explain snapshots show TableScan projection lists pushed into
+the scan (`artifact/spiceai/crates/test-framework/src/snapshot/snapshots/explain/test_framework__snapshot__file[parquet]-federated_tpcds_q68_explain.snap`).
+```
+
+Verification:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine untracked_state --features storage-benches
+cargo test -p lix_engine live_state --features storage-benches
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/no_such_benchmark'
+LIX_UNTRACKED_STATE_CRUD_IO=real_workload cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/no_such_benchmark'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/(smoke|real_workload)/select_keys_only/(1k|10k)'
+```
+
+I/O scoreboard:
+
+| workload | backend     | operation          | before io bytes | after io bytes | byte delta |
+| -------- | ----------- | ------------------ | --------------: | -------------: | ---------: |
+| smoke/1k | Lix SQLite  | `select_keys_only` |         988,380 |         93,204 |     -90.6% |
+| smoke/1k | Lix RocksDB | `select_keys_only` |         988,380 |         93,204 |     -90.6% |
+| 10k      | Lix SQLite  | `select_keys_only` |       4,191,840 |        943,696 |     -77.5% |
+| 10k      | Lix RocksDB | `select_keys_only` |       4,191,840 |        943,696 |     -77.5% |
+
+Timing scoreboard:
+
+| workload | backend     | operation          | before timing    | after timing    | timing delta |
+| -------- | ----------- | ------------------ | ---------------: | --------------: | -----------: |
+| smoke/1k | Lix SQLite  | `select_keys_only` | 4.9469-5.0845 ms | 4.6147-4.8038 ms |         ~-6% |
+| smoke/1k | Lix RocksDB | `select_keys_only` | 1.7693-1.7959 ms | 1.1913-1.2414 ms |        ~-32% |
+| 10k      | Lix SQLite  | `select_keys_only` | 15.528-15.929 ms | 9.4402-9.8176 ms |        ~-39% |
+| 10k      | Lix RocksDB | `select_keys_only` | 10.885-11.159 ms | 6.7438-6.8900 ms |        ~-39% |
+
+Review:
+
+```text
+First review found two HIGH issues: global was incorrectly treated as
+key-covered, and partial timestamp values could leak into live-state rows. The
+patch was revised to keep the key-covered set to physical key fields only and
+to force live-state untracked scans to hydrate overlay/header fields.
+
+Second review: HIGH None, MEDIUM None, LOW None.
+```
+
+Notes:
+
+```text
+This optimization intentionally improves the direct untracked identity
+projection path without adding an index or extra write path. It is a read I/O
+cut only: write bytes and full-row reads are unchanged.
+```
