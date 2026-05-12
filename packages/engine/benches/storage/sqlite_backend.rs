@@ -267,15 +267,26 @@ impl BackendWriteTransaction for SqliteBenchTransaction {
                 match op {
                     BackendKvWriteOp::Put { key, value } => {
                         put_statement
-                            .execute(params![namespace.as_str(), key, value])
+                            .raw_bind_parameter(1, namespace.as_str())
                             .map_err(sqlite_error)?;
+                        put_statement
+                            .raw_bind_parameter(2, key.as_slice())
+                            .map_err(sqlite_error)?;
+                        put_statement
+                            .raw_bind_parameter(3, value.as_slice())
+                            .map_err(sqlite_error)?;
+                        put_statement.raw_execute().map_err(sqlite_error)?;
                         stats.puts += 1;
                         stats.bytes_written += key.len() + value.len();
                     }
                     BackendKvWriteOp::Delete { key } => {
                         delete_statement
-                            .execute(params![namespace.as_str(), key])
+                            .raw_bind_parameter(1, namespace.as_str())
                             .map_err(sqlite_error)?;
+                        delete_statement
+                            .raw_bind_parameter(2, key.as_slice())
+                            .map_err(sqlite_error)?;
+                        delete_statement.raw_execute().map_err(sqlite_error)?;
                         stats.deletes += 1;
                         stats.bytes_written += key.len();
                     }
