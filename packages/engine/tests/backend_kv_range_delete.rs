@@ -18,6 +18,10 @@ async fn sqlite_range_delete_preserves_order_and_namespace_bounds() {
     let backend = SqliteBenchBackend::tempfile().expect("create sqlite backend");
     range_delete_preserves_order_and_namespace_bounds(&backend).await;
     prefix_ff_range_delete_is_bounded(&backend).await;
+
+    let exclusive_backend =
+        SqliteBenchBackend::tempfile().expect("create exclusive sqlite backend");
+    exclusive_namespace_empty_prefix_range_delete_preserves_order(&exclusive_backend).await;
 }
 
 #[tokio::test]
@@ -103,6 +107,35 @@ async fn prefix_ff_range_delete_is_bounded(backend: &dyn Backend) {
     assert_eq!(
         get(backend, "other_ff", &[0xFF, 0x00]).await,
         Some(b"other".to_vec())
+    );
+}
+
+async fn exclusive_namespace_empty_prefix_range_delete_preserves_order(backend: &dyn Backend) {
+    write_ops(
+        backend,
+        "exclusive",
+        [
+            WriteOp::Put(b"a".as_slice(), b"old-a".as_slice()),
+            WriteOp::Put(b"survivor".as_slice(), b"old-survivor".as_slice()),
+        ],
+    )
+    .await;
+
+    write_ops(
+        backend,
+        "exclusive",
+        [
+            WriteOp::Put(b"survivor".as_slice(), b"before-range".as_slice()),
+            WriteOp::DeleteRange(BackendKvScanRange::prefix(Vec::new())),
+            WriteOp::Put(b"survivor".as_slice(), b"after-range".as_slice()),
+        ],
+    )
+    .await;
+
+    assert_eq!(get(backend, "exclusive", b"a").await, None);
+    assert_eq!(
+        get(backend, "exclusive", b"survivor").await,
+        Some(b"after-range".to_vec())
     );
 }
 

@@ -2019,3 +2019,69 @@ Review:
 ```text
 No sub-agent review: improvement is below the >=10% review threshold.
 ```
+
+## Optimization 21: SQLite Exclusive Namespace Clear
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+SQLite delete-all physical execution for an empty-prefix namespace range delete
+```
+
+Change:
+
+```text
+The SQLite bench backend now detects an empty-prefix DeleteRange whose target
+namespace is the only namespace present in the KV table. In that case it uses
+SQLite's table-wide `DELETE FROM kv` path instead of a namespace/key predicate.
+If any other namespace is present, it falls back to the bounded range delete.
+```
+
+The exclusivity proof uses ordered first/last namespace probes on the
+`PRIMARY KEY(namespace, key)` table rather than a negative namespace scan. This
+keeps the fast path limited to the same physical scope as raw SQLite's
+`DELETE FROM untracked_state`, while preserving multi-namespace correctness.
+GreptimeDB's SQL KV backends keep range deletes bounded by key predicates, and
+use direct full-table deletes only when the logical KV table itself is the
+target scope (`artifact/greptimedb/src/common/meta/src/kv_backend/rds/mysql.rs`,
+`artifact/greptimedb/src/common/meta/src/kv_backend/rds/postgres.rs`).
+
+Verification:
+
+```sh
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine --test backend_kv_range_delete --features storage-benches
+cargo test -p lix_engine untracked_state --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(raw_sqlite|lix_sqlite|lix_rocksdb)/(smoke|real_workload)/delete_all_rows/((1k)|(10k))'
+LIX_UNTRACKED_STATE_CRUD_IO=real_workload cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+```
+
+CRUD timing scoreboard:
+
+| backend | workload | operation | after timing | criterion change |
+| --- | --- | --- | ---: | ---: |
+| Raw SQLite | smoke/1k | `delete_all_rows` | 3.3902-3.4523 ms | baseline rerun |
+| Lix SQLite | smoke/1k | `delete_all_rows` | 4.0924-4.2547 ms | still improved vs pre-opt 4.7058-4.7534 ms |
+| Lix RocksDB | smoke/1k | `delete_all_rows` | 730.68-753.71 us | no change |
+| Raw SQLite | real_workload/10k | `delete_all_rows` | 11.506-11.651 ms | baseline rerun |
+| Lix SQLite | real_workload/10k | `delete_all_rows` | 5.9017-6.2668 ms | -17.216% to -10.547% vs first fast-path run; ~-63% vs pre-opt 16.475-16.727 ms |
+| Lix RocksDB | real_workload/10k | `delete_all_rows` | 3.3158-3.8089 ms | no change |
+
+Logical I/O scoreboard:
+
+| workload | backend | operation | io ops | io bytes/row | write batches | puts | deletes | delete ranges | write bytes/row |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| real_workload/10k | Lix SQLite | `delete_all_rows` | 1 | 0.00 | 1 | 0 | 0 | 1 | 0.00 |
+| real_workload/10k | Lix RocksDB | `delete_all_rows` | 1 | 0.00 | 1 | 0 | 0 | 1 | 0.00 |
+
+Review:
+
+```text
+Sub-agent review initially reported MEDIUM findings for missing direct
+fast-path coverage and an O(n) negative namespace-exclusivity probe. The test
+now uses a fresh SQLite backend for the exclusive-namespace branch, and the
+proof now uses first/last ordered namespace probes. Re-review reported HIGH
+None and MEDIUM None.
+```
