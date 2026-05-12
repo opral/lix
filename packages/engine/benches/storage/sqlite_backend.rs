@@ -252,9 +252,8 @@ impl BackendWriteTransaction for SqliteBenchTransaction {
         let mut put_statement = connection
             .prepare_cached(
                 "
-                INSERT INTO kv (namespace, key, value)
+                INSERT OR REPLACE INTO kv (namespace, key, value)
                 VALUES (?1, ?2, ?3)
-                ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value
                 ",
             )
             .map_err(sqlite_error)?;

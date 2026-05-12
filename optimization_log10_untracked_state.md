@@ -1226,3 +1226,51 @@ write bytes are zero for an empty prefix because no logical key bytes are sent;
 physical SQLite/RocksDB still write journal/WAL/tombstone data and may compact
 later.
 ```
+
+## Optimization 10: SQLite KV Replace Put
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+SQLite bulk write statement cost
+```
+
+Change:
+
+```text
+The Rust bench SQLite KV backend now uses `INSERT OR REPLACE` for BackendKv
+Put instead of `INSERT ... ON CONFLICT DO UPDATE`. The backend table is a
+single `kv(namespace, key, value)` table with `PRIMARY KEY(namespace, key)`
+and `WITHOUT ROWID`, with no triggers, foreign-key cascades, rowid identity, or
+side effects. For this table, both statements implement the same observable KV
+Put semantics: after the write, the key maps to the supplied value.
+```
+
+Verification:
+
+```sh
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine --test backend_kv_range_delete --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/lix_sqlite/smoke/(insert_all_rows|update_all_rows)/1k'
+```
+
+Smoke timing scoreboard:
+
+| backend | operation | before timing | after timing | criterion change |
+| --- | --- | ---: | ---: | ---: |
+| Lix SQLite | `insert_all_rows` | 7.1176-7.3146 ms | 6.9054-6.9571 ms | -4.2168% to -2.1695% |
+| Lix SQLite | `update_all_rows` | 6.4213-6.5897 ms | 5.9479-6.0724 ms | -10.515% to -6.6559% |
+
+Review:
+
+```text
+Review reported HIGH None and MEDIUM None. The reviewer called out the normal
+SQLite semantic distinction: REPLACE deletes the conflicting row before
+inserting, while UPSERT DO UPDATE updates the conflicting row. That distinction
+is not observable for this bench KV table because it has no triggers, foreign
+keys, rowid identity, or generated side effects. LOW feedback noted that the JS
+SQLite backend still uses UPSERT, so this result should be read as a Rust bench
+backend optimization only.
+```
