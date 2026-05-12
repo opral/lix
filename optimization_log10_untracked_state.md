@@ -1809,3 +1809,65 @@ reallocated even when no same-namespace group existed. The final patch pushes
 the prepared group directly on first namespace use and only merges on duplicate
 namespaces. Final re-review reported HIGH None, MEDIUM None, and LOW None.
 ```
+
+## Optimization 18: Larger Point-Read Batches
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+logical backend I/O call count for batched exact primary-key loads
+```
+
+Change:
+
+```text
+Increase the untracked row point-load chunk size from 512 to 2048 rows. This
+keeps the exact same storage format and request semantics, but reduces 10k-row
+`select_all_by_pk` from 20 backend `get_values` calls to 5 calls. The same
+bounded chunk size also applies to key-backed filtered scans that hydrate rows
+after first scanning matching keys.
+```
+
+This follows the bounded batching pattern used in the artifact set. Turso's FTS
+design commits indexed documents in fixed batches and keeps chunk/cache sizes
+bounded (`artifact/turso/docs/fts.md`), while GreptimeDB's export/import design
+uses independently retryable chunks with explicit target chunk sizes
+(`artifact/greptimedb/docs/rfcs/2025-12-30-export-import-v2.md`). Here the
+batch is a fixed 2048 keys, which is 2049 SQLite bind parameters in the bench
+backend because the namespace is bound separately.
+
+Verification:
+
+```sh
+cargo test -p lix_engine untracked_state --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/(smoke|real_workload)/select_all_by_pk/((1k)|(10k))'
+LIX_UNTRACKED_STATE_CRUD_IO=real_workload cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+```
+
+Timing scoreboard:
+
+| backend | workload | operation | after timing | criterion change |
+| --- | --- | --- | ---: | ---: |
+| Lix SQLite | smoke/1k | `select_all_by_pk` | 5.8907-6.1321 ms | no confirmed timing change |
+| Lix RocksDB | smoke/1k | `select_all_by_pk` | 2.0348-2.0778 ms | no confirmed timing change |
+| Lix SQLite | real_workload/10k | `select_all_by_pk` | 27.731-28.055 ms | no confirmed timing change |
+| Lix RocksDB | real_workload/10k | `select_all_by_pk` | 16.656-16.945 ms | no confirmed timing change |
+
+Logical I/O scoreboard:
+
+| workload | backend | operation | before get calls | after get calls | read rows | io bytes/row |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| real_workload/10k | Lix SQLite | `select_all_by_pk` | 20 | 5 | 10000 | 357.18 |
+| real_workload/10k | Lix RocksDB | `select_all_by_pk` | 20 | 5 | 10000 | 357.18 |
+
+Review:
+
+```text
+Sub-agent review reported HIGH None and MEDIUM None. LOW feedback asked for
+more precise SQLite bind-parameter wording, acknowledging that key-backed
+filtered scans share this chunk size, and concrete artifact references. The
+comment and log now call out 2048 keys / 2049 SQLite parameters, the filtered
+scan scope, and bounded batching references from Turso and GreptimeDB artifacts.
+```

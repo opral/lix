@@ -12,7 +12,10 @@ use crate::{LixError, NullableKeyFilter};
 // Compact physical namespace for untracked rows. This string is stored in every
 // backend key, so keep it short; the typed constant preserves the semantic name.
 pub(super) const UNTRACKED_STATE_ROW_NAMESPACE: &str = "u";
-const LOAD_ROWS_BATCH_SIZE: usize = 512;
+// The SQLite bench backend uses one namespace parameter plus one parameter per
+// key, so this is 2049 bind parameters. Current bundled SQLite's default limit
+// is far higher, while this stays bounded for transient request vectors.
+const LOAD_ROWS_BATCH_SIZE: usize = 2048;
 
 pub(crate) async fn scan_rows(
     store: &mut impl StorageReader,
