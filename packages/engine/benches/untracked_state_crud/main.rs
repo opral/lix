@@ -407,10 +407,10 @@ fn maybe_print_io_report(runtime: &Runtime, all_rows: &[PointerRow]) {
 
     println!("\nuntracked_state_crud/io");
     println!(
-        "| workload | backend | operation | io ops | io bytes | read calls | get calls | get keys | scan calls | read rows | read bytes | write batches | puts | deletes | write bytes |"
+        "| workload | backend | operation | logical rows | io ops | io ops/row | io bytes | io bytes/row | read calls | get calls | get keys | scan calls | read rows | read bytes | read bytes/row | write batches | puts | deletes | write bytes | write bytes/row |"
     );
     println!(
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
     );
 
     for (label, row_count) in workloads {
@@ -428,21 +428,26 @@ fn maybe_print_io_report(runtime: &Runtime, all_rows: &[PointerRow]) {
                 "delete_one_by_pk",
             ] {
                 let stats = measure_lix_io(runtime, profile, operation, &rows);
+                let logical_rows = operation_logical_rows(operation, row_count);
                 println!(
-                    "| {label}/{rows_label} | {} | `{operation}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                    "| {label}/{rows_label} | {} | `{operation}` | {logical_rows} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                     profile.name(),
                     stats.io_ops(),
+                    ratio(stats.io_ops(), logical_rows),
                     stats.io_bytes(),
+                    ratio(stats.io_bytes(), logical_rows),
                     stats.read_ops(),
                     stats.get_calls,
                     stats.get_keys,
                     stats.scan_calls(),
                     stats.read_rows(),
                     stats.read_bytes(),
+                    ratio(stats.read_bytes(), logical_rows),
                     stats.write_batches,
                     stats.write_puts,
                     stats.write_deletes,
                     stats.write_bytes,
+                    ratio(stats.write_bytes, logical_rows),
                     rows_label = row_label(row_count),
                 );
             }
@@ -601,6 +606,20 @@ fn measure_lix_io(
         _ => unreachable!("unknown untracked_state io operation"),
     }
     snapshot_io_stats(&stats)
+}
+
+fn operation_logical_rows(operation: &str, row_count: usize) -> usize {
+    match operation {
+        "select_one_by_pk" | "update_one_by_pk" | "delete_one_by_pk" => 1,
+        _ => row_count,
+    }
+}
+
+fn ratio(numerator: usize, denominator: usize) -> String {
+    if denominator == 0 {
+        return "-".to_string();
+    }
+    format!("{:.2}", numerator as f64 / denominator as f64)
 }
 
 fn bench_raw_sqlite(c: &mut Criterion, all_rows: &[PointerRow], row_count: usize, label: &str) {

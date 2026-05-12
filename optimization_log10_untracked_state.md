@@ -1067,3 +1067,23 @@ key/value payloads passed through the backend API. A future I/O counter should
 include backend-encoded namespace bytes if we want the report to capture this
 class of optimization directly.
 ```
+
+## Measurement Update: Normalized I/O Columns
+
+Date: 2026-05-12
+
+Change:
+
+```text
+The untracked_state CRUD I/O report now includes `logical rows`,
+`io ops/row`, `io bytes/row`, `read bytes/row`, and `write bytes/row`.
+Single-row point operations use a logical-row denominator of 1; bulk operations
+use the workload row count. This makes I/O a direct optimization number across
+the smoke 1k and real-workload 10k suites.
+```
+
+Verification:
+
+```sh
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- --list
+```
