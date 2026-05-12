@@ -1385,3 +1385,49 @@ regressed by about 5-8% in this run despite lower logical bytes. The reviewer
 did not consider this a blocker because write/update wins are broad and the
 storage byte reduction is material, but it remains a follow-up profiling target.
 ```
+
+## Optimization 12: Static Storage Write Namespaces
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+write staging allocation overhead
+```
+
+Change:
+
+```text
+Internal StorageWriteSet/KvWriteBatch write namespaces now stay as `&'static str`
+while accumulating writes. The backend boundary still receives owned `String`
+namespaces, but conversion happens once per write group instead of once per
+put/delete call. Untracked inserts issue 1,000/10,000 writes into the same
+namespace `u`, so this removes repeated namespace allocation and comparison
+work from the hot staging loop.
+```
+
+Verification:
+
+```sh
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine untracked_state --features storage-benches
+cargo test -p lix_engine --test storage_accounting --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/(insert_all_rows|update_all_rows)/1k'
+```
+
+Smoke timing scoreboard:
+
+| backend | operation | after timing | criterion change |
+| --- | --- | ---: | ---: |
+| Lix SQLite | `insert_all_rows` | 6.4717-6.5507 ms | -5.7501% to -3.1153% |
+| Lix SQLite | `update_all_rows` | 5.4187-5.6653 ms | no change |
+| Lix RocksDB | `insert_all_rows` | 2.9703-3.0136 ms | -4.0300% to -1.0791% |
+| Lix RocksDB | `update_all_rows` | 2.1662-2.1971 ms | no change |
+
+Review:
+
+```text
+No sub-agent review was required: the observed improvement was below the 10%
+review threshold.
+```
