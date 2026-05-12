@@ -116,6 +116,10 @@ impl IoStats {
             + self.scan_entry_calls
     }
 
+    fn scan_calls(&self) -> usize {
+        self.scan_key_calls + self.scan_value_calls + self.scan_entry_calls
+    }
+
     fn read_rows(&self) -> usize {
         self.get_values + self.scan_keys + self.scan_values + self.scan_entries + self.exists_keys
     }
@@ -395,9 +399,11 @@ fn maybe_print_io_report(runtime: &Runtime, all_rows: &[PointerRow]) {
 
     println!("\nuntracked_state_crud/io");
     println!(
-        "| workload | backend | operation | read ops | read rows | read bytes | write batches | puts | deletes | write bytes |"
+        "| workload | backend | operation | read calls | get calls | get keys | scan calls | read rows | read bytes | write batches | puts | deletes | write bytes |"
     );
-    println!("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    println!(
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    );
 
     for (label, row_count) in workloads {
         let rows = storage_rows(&all_rows[..row_count]);
@@ -415,9 +421,12 @@ fn maybe_print_io_report(runtime: &Runtime, all_rows: &[PointerRow]) {
             ] {
                 let stats = measure_lix_io(runtime, profile, operation, &rows);
                 println!(
-                    "| {label}/{rows_label} | {} | `{operation}` | {} | {} | {} | {} | {} | {} | {} |",
+                    "| {label}/{rows_label} | {} | `{operation}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                     profile.name(),
                     stats.read_ops(),
+                    stats.get_calls,
+                    stats.get_keys,
+                    stats.scan_calls(),
                     stats.read_rows(),
                     stats.read_bytes(),
                     stats.write_batches,

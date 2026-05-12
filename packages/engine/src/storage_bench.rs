@@ -2448,17 +2448,18 @@ pub async fn json_pointer_untracked_state_read_point_hit_prepared(
     let mut reader = fixture
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
-    for row in &fixture.rows {
-        if reader
-            .load_row(&UntrackedStateRowRequest {
-                schema_key: "json_pointer".to_string(),
-                version_id: "bench-version".to_string(),
-                entity_id: EntityIdentity::single(json_pointer_entity_id(row.path.as_str())),
-                file_id: NullableKeyFilter::Null,
-            })
-            .await?
-            .is_some()
-        {
+    let requests = fixture
+        .rows
+        .iter()
+        .map(|row| UntrackedStateRowRequest {
+            schema_key: "json_pointer".to_string(),
+            version_id: "bench-version".to_string(),
+            entity_id: EntityIdentity::single(json_pointer_entity_id(row.path.as_str())),
+            file_id: NullableKeyFilter::Null,
+        })
+        .collect::<Vec<_>>();
+    for row in reader.load_rows(&requests).await? {
+        if row.is_some() {
             verified_rows += 1;
         }
     }
@@ -2480,17 +2481,17 @@ pub async fn json_pointer_untracked_state_read_point_hit_constant_prepared(
     } else {
         fixture.rows.len().saturating_sub(measured_rows) / 2
     };
-    for row in &fixture.rows[start..start + measured_rows] {
-        if reader
-            .load_row(&UntrackedStateRowRequest {
-                schema_key: "json_pointer".to_string(),
-                version_id: "bench-version".to_string(),
-                entity_id: EntityIdentity::single(json_pointer_entity_id(row.path.as_str())),
-                file_id: NullableKeyFilter::Null,
-            })
-            .await?
-            .is_some()
-        {
+    let requests = fixture.rows[start..start + measured_rows]
+        .iter()
+        .map(|row| UntrackedStateRowRequest {
+            schema_key: "json_pointer".to_string(),
+            version_id: "bench-version".to_string(),
+            entity_id: EntityIdentity::single(json_pointer_entity_id(row.path.as_str())),
+            file_id: NullableKeyFilter::Null,
+        })
+        .collect::<Vec<_>>();
+    for row in reader.load_rows(&requests).await? {
+        if row.is_some() {
             verified_rows += 1;
         }
     }
@@ -2605,21 +2606,16 @@ pub async fn untracked_state_read_point_hit_prepared(
     let mut reader = fixture
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
-    for index in 0..fixture.rows {
-        if reader
-            .load_row(&UntrackedStateRowRequest {
-                schema_key: untracked_schema_key(index, StorageBenchSelectivity::Percent100),
-                version_id: "bench-version".to_string(),
-                entity_id: EntityIdentity::single(entity_id(
-                    "untracked",
-                    index,
-                    fixture.key_pattern,
-                )),
-                file_id: NullableKeyFilter::Value("bench.json".to_string()),
-            })
-            .await?
-            .is_some()
-        {
+    let requests = (0..fixture.rows)
+        .map(|index| UntrackedStateRowRequest {
+            schema_key: untracked_schema_key(index, StorageBenchSelectivity::Percent100),
+            version_id: "bench-version".to_string(),
+            entity_id: EntityIdentity::single(entity_id("untracked", index, fixture.key_pattern)),
+            file_id: NullableKeyFilter::Value("bench.json".to_string()),
+        })
+        .collect::<Vec<_>>();
+    for row in reader.load_rows(&requests).await? {
+        if row.is_some() {
             verified_rows += 1;
         }
     }
@@ -2635,29 +2631,21 @@ pub async fn untracked_state_read_point_hit_constant_prepared(
     let mut reader = fixture
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
-    for index in 0..measured_reads.min(fixture.rows) {
-        if reader
-            .load_row(&UntrackedStateRowRequest {
-                schema_key: untracked_schema_key(index, StorageBenchSelectivity::Percent100),
-                version_id: "bench-version".to_string(),
-                entity_id: EntityIdentity::single(entity_id(
-                    "untracked",
-                    index,
-                    fixture.key_pattern,
-                )),
-                file_id: NullableKeyFilter::Value("bench.json".to_string()),
-            })
-            .await?
-            .is_some()
-        {
+    let measured_rows = measured_reads.min(fixture.rows);
+    let requests = (0..measured_rows)
+        .map(|index| UntrackedStateRowRequest {
+            schema_key: untracked_schema_key(index, StorageBenchSelectivity::Percent100),
+            version_id: "bench-version".to_string(),
+            entity_id: EntityIdentity::single(entity_id("untracked", index, fixture.key_pattern)),
+            file_id: NullableKeyFilter::Value("bench.json".to_string()),
+        })
+        .collect::<Vec<_>>();
+    for row in reader.load_rows(&requests).await? {
+        if row.is_some() {
             verified_rows += 1;
         }
     }
-    Ok(report(
-        measured_reads.min(fixture.rows),
-        verified_rows,
-        Duration::ZERO,
-    ))
+    Ok(report(measured_rows, verified_rows, Duration::ZERO))
 }
 
 pub async fn untracked_state_read_point_miss_prepared(
@@ -2668,17 +2656,16 @@ pub async fn untracked_state_read_point_miss_prepared(
     let mut reader = fixture
         .context
         .reader(StorageContext::new(Arc::clone(backend)));
-    for index in 0..fixture.rows {
-        if reader
-            .load_row(&UntrackedStateRowRequest {
-                schema_key: "bench_untracked_entity".to_string(),
-                version_id: "bench-version".to_string(),
-                entity_id: EntityIdentity::single(format!("missing-{index}")),
-                file_id: NullableKeyFilter::Value("bench.json".to_string()),
-            })
-            .await?
-            .is_none()
-        {
+    let requests = (0..fixture.rows)
+        .map(|index| UntrackedStateRowRequest {
+            schema_key: "bench_untracked_entity".to_string(),
+            version_id: "bench-version".to_string(),
+            entity_id: EntityIdentity::single(format!("missing-{index}")),
+            file_id: NullableKeyFilter::Value("bench.json".to_string()),
+        })
+        .collect::<Vec<_>>();
+    for row in reader.load_rows(&requests).await? {
+        if row.is_none() {
             misses += 1;
         }
     }
@@ -3841,21 +3828,16 @@ pub async fn untracked_state_read_point_hit(
     let started = Instant::now();
     let mut verified_rows = 0;
     let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
-    for index in 0..config.rows {
-        if reader
-            .load_row(&UntrackedStateRowRequest {
-                schema_key: untracked_schema_key(index, StorageBenchSelectivity::Percent100),
-                version_id: "bench-version".to_string(),
-                entity_id: EntityIdentity::single(entity_id(
-                    "untracked",
-                    index,
-                    config.key_pattern,
-                )),
-                file_id: NullableKeyFilter::Value("bench.json".to_string()),
-            })
-            .await?
-            .is_some()
-        {
+    let requests = (0..config.rows)
+        .map(|index| UntrackedStateRowRequest {
+            schema_key: untracked_schema_key(index, StorageBenchSelectivity::Percent100),
+            version_id: "bench-version".to_string(),
+            entity_id: EntityIdentity::single(entity_id("untracked", index, config.key_pattern)),
+            file_id: NullableKeyFilter::Value("bench.json".to_string()),
+        })
+        .collect::<Vec<_>>();
+    for row in reader.load_rows(&requests).await? {
+        if row.is_some() {
             verified_rows += 1;
         }
     }
@@ -3873,17 +3855,16 @@ pub async fn untracked_state_read_point_miss(
     let started = Instant::now();
     let mut misses = 0;
     let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
-    for index in 0..config.rows {
-        if reader
-            .load_row(&UntrackedStateRowRequest {
-                schema_key: "bench_untracked_entity".to_string(),
-                version_id: "bench-version".to_string(),
-                entity_id: EntityIdentity::single(format!("missing-{index}")),
-                file_id: NullableKeyFilter::Value("bench.json".to_string()),
-            })
-            .await?
-            .is_none()
-        {
+    let requests = (0..config.rows)
+        .map(|index| UntrackedStateRowRequest {
+            schema_key: "bench_untracked_entity".to_string(),
+            version_id: "bench-version".to_string(),
+            entity_id: EntityIdentity::single(format!("missing-{index}")),
+            file_id: NullableKeyFilter::Value("bench.json".to_string()),
+        })
+        .collect::<Vec<_>>();
+    for row in reader.load_rows(&requests).await? {
+        if row.is_none() {
             misses += 1;
         }
     }

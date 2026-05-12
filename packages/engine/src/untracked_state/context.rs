@@ -53,11 +53,11 @@ where
         crate::untracked_state::storage::scan_rows(&mut self.store, request).await
     }
 
-    pub(crate) async fn load_row(
+    pub(crate) async fn load_rows(
         &mut self,
-        request: &UntrackedStateRowRequest,
-    ) -> Result<Option<MaterializedUntrackedStateRow>, LixError> {
-        crate::untracked_state::storage::load_row(&mut self.store, request).await
+        requests: &[UntrackedStateRowRequest],
+    ) -> Result<Vec<Option<MaterializedUntrackedStateRow>>, LixError> {
+        crate::untracked_state::storage::load_rows(&mut self.store, requests).await
     }
 
     pub(crate) async fn existing_identities<'a, I>(

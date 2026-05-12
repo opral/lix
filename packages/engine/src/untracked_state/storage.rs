@@ -9,6 +9,7 @@ use crate::{LixError, NullableKeyFilter};
 
 pub(super) const UNTRACKED_STATE_ROW_NAMESPACE: &str = "untracked_state.row";
 const UNTRACKED_STATE_IDENTITY_INDEX_NAMESPACE: &str = "untracked_state.identity_index";
+const LOAD_ROWS_BATCH_SIZE: usize = 512;
 
 pub(crate) async fn scan_rows(
     store: &mut impl StorageReader,
@@ -62,7 +63,29 @@ async fn scan_identity_rows_from_keys(
         .collect())
 }
 
-pub(crate) async fn load_row(
+pub(crate) async fn load_rows(
+    store: &mut impl StorageReader,
+    requests: &[UntrackedStateRowRequest],
+) -> Result<Vec<Option<MaterializedUntrackedStateRow>>, LixError> {
+    if let [request] = requests {
+        return load_single_row(store, request).await.map(|row| vec![row]);
+    }
+
+    let mut rows = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    for (index, request) in requests.iter().enumerate() {
+        let Some(identity) = identity_from_request(request) else {
+            continue;
+        };
+        candidates.push((index, encode_untracked_state_row_key(&identity)));
+    }
+    for chunk in candidates.chunks(LOAD_ROWS_BATCH_SIZE) {
+        load_rows_chunk(store, chunk, &mut rows).await?;
+    }
+    Ok(rows)
+}
+
+async fn load_single_row(
     store: &mut impl StorageReader,
     request: &UntrackedStateRowRequest,
 ) -> Result<Option<MaterializedUntrackedStateRow>, LixError> {
@@ -87,6 +110,61 @@ pub(crate) async fn load_row(
     let row = crate::untracked_state::codec::decode_row(&bytes)?;
     crate::untracked_state::materialize_row(row, &UntrackedMaterializationProjection::full())
         .map(Some)
+}
+
+async fn load_rows_chunk(
+    store: &mut impl StorageReader,
+    candidates: &[(usize, Vec<u8>)],
+    rows: &mut [Option<MaterializedUntrackedStateRow>],
+) -> Result<(), LixError> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let result = store
+        .get_values(KvGetRequest {
+            groups: vec![KvGetGroup {
+                namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
+                keys: candidates.iter().map(|(_, key)| key.clone()).collect(),
+            }],
+        })
+        .await?;
+    let group = result.groups.into_iter().next().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "untracked row batch load returned no result group",
+        )
+    })?;
+    if group.namespace() != UNTRACKED_STATE_ROW_NAMESPACE {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "untracked row batch load returned namespace `{}` instead of `{}`",
+                group.namespace(),
+                UNTRACKED_STATE_ROW_NAMESPACE
+            ),
+        ));
+    }
+    if group.len() != candidates.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "untracked row batch load returned {} results for {} requested keys",
+                group.len(),
+                candidates.len()
+            ),
+        ));
+    }
+    for ((index, _), bytes) in candidates.iter().zip(group.values_iter()) {
+        let Some(bytes) = bytes else {
+            continue;
+        };
+        let row = crate::untracked_state::codec::decode_row(bytes)?;
+        rows[*index] = Some(crate::untracked_state::materialize_row(
+            row,
+            &UntrackedMaterializationProjection::full(),
+        )?);
+    }
+    Ok(())
 }
 
 pub(super) async fn existing_identities<'a>(
@@ -155,10 +233,7 @@ where
     for row in rows {
         if row.snapshot_content.is_none() {
             let key = encode_untracked_state_row_key_ref(row.into());
-            writes.delete(
-                UNTRACKED_STATE_ROW_NAMESPACE,
-                key.clone(),
-            );
+            writes.delete(UNTRACKED_STATE_ROW_NAMESPACE, key.clone());
             writes.delete(UNTRACKED_STATE_IDENTITY_INDEX_NAMESPACE, key);
         } else {
             let key = encode_untracked_state_row_key_ref(row.into());
@@ -491,14 +566,16 @@ mod tests {
 
         let loaded = {
             let mut reader = context.reader(storage.clone());
+            let request = UntrackedStateRowRequest {
+                schema_key: "lix_key_value".to_string(),
+                version_id: "global".to_string(),
+                entity_id: crate::entity_identity::EntityIdentity::single("ui-tab"),
+                file_id: NullableKeyFilter::Null,
+            };
             reader
-                .load_row(&UntrackedStateRowRequest {
-                    schema_key: "lix_key_value".to_string(),
-                    version_id: "global".to_string(),
-                    entity_id: crate::entity_identity::EntityIdentity::single("ui-tab"),
-                    file_id: NullableKeyFilter::Null,
-                })
+                .load_rows(std::slice::from_ref(&request))
                 .await
+                .map(|rows| rows.into_iter().next().flatten())
         }
         .expect("load should succeed");
         assert_eq!(loaded, Some(row));
@@ -544,6 +621,70 @@ mod tests {
         assert_eq!(
             rows[0].entity_id,
             crate::entity_identity::EntityIdentity::single("version-ui")
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_load_preserves_request_order_and_misses() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
+        let context = UntrackedStateContext::new();
+        let first = untracked_row("global", "lix_key_value", "first");
+        let second = untracked_row("global", "lix_key_value", "second");
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        write_materialized_rows_to_store(
+            &context,
+            transaction.as_mut(),
+            &[first.clone(), second.clone()],
+        )
+        .await;
+        transaction.commit().await.expect("commit should succeed");
+
+        let loaded = {
+            let mut reader = context.reader(storage.clone());
+            reader
+                .load_rows(&[
+                    UntrackedStateRowRequest {
+                        schema_key: "lix_key_value".to_string(),
+                        version_id: "global".to_string(),
+                        entity_id: crate::entity_identity::EntityIdentity::single("second"),
+                        file_id: NullableKeyFilter::Null,
+                    },
+                    UntrackedStateRowRequest {
+                        schema_key: "lix_key_value".to_string(),
+                        version_id: "global".to_string(),
+                        entity_id: crate::entity_identity::EntityIdentity::single("missing"),
+                        file_id: NullableKeyFilter::Null,
+                    },
+                    UntrackedStateRowRequest {
+                        schema_key: "lix_key_value".to_string(),
+                        version_id: "global".to_string(),
+                        entity_id: crate::entity_identity::EntityIdentity::single("first"),
+                        file_id: NullableKeyFilter::Any,
+                    },
+                    UntrackedStateRowRequest {
+                        schema_key: "lix_key_value".to_string(),
+                        version_id: "global".to_string(),
+                        entity_id: crate::entity_identity::EntityIdentity::single("first"),
+                        file_id: NullableKeyFilter::Null,
+                    },
+                    UntrackedStateRowRequest {
+                        schema_key: "lix_key_value".to_string(),
+                        version_id: "global".to_string(),
+                        entity_id: crate::entity_identity::EntityIdentity::single("second"),
+                        file_id: NullableKeyFilter::Null,
+                    },
+                ])
+                .await
+        }
+        .expect("batch load should succeed");
+
+        assert_eq!(
+            loaded,
+            vec![Some(second.clone()), None, None, Some(first), Some(second)]
         );
     }
 
@@ -630,8 +771,9 @@ mod tests {
     fn identity_index_value_roundtrips_scalars() {
         let row = untracked_row(crate::GLOBAL_VERSION_ID, "lix_key_value", "ui-tab");
         let mut writes = StorageWriteSet::new();
-        let canonical = crate::test_support::untracked_state_row_from_materialized(&mut writes, &row)
-            .expect("row should canonicalize");
+        let canonical =
+            crate::test_support::untracked_state_row_from_materialized(&mut writes, &row)
+                .expect("row should canonicalize");
         let encoded = encode_identity_index_value(canonical.as_ref());
         let decoded =
             decode_identity_index_value(&encoded).expect("identity index value should decode");
@@ -673,14 +815,16 @@ mod tests {
 
         let loaded = {
             let mut reader = context.reader(storage.clone());
+            let request = UntrackedStateRowRequest {
+                schema_key: "lix_key_value".to_string(),
+                version_id: "global".to_string(),
+                entity_id: crate::entity_identity::EntityIdentity::single("ui-tab"),
+                file_id: NullableKeyFilter::Null,
+            };
             reader
-                .load_row(&UntrackedStateRowRequest {
-                    schema_key: "lix_key_value".to_string(),
-                    version_id: "global".to_string(),
-                    entity_id: crate::entity_identity::EntityIdentity::single("ui-tab"),
-                    file_id: NullableKeyFilter::Null,
-                })
+                .load_rows(std::slice::from_ref(&request))
                 .await
+                .map(|rows| rows.into_iter().next().flatten())
         }
         .expect("load should succeed");
         assert_eq!(loaded, None);

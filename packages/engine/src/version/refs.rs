@@ -66,17 +66,18 @@ where
         version_id: &str,
     ) -> Result<Option<VersionHead>, LixError> {
         let mut store = self.store.lock().await;
-        let Some(row) = self
+        let request = UntrackedStateRowRequest {
+            schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            entity_id: EntityIdentity::single(version_id),
+            file_id: NullableKeyFilter::Null,
+        };
+        let mut rows = self
             .untracked_state
             .reader(&mut *store as &mut dyn StorageReader)
-            .load_row(&UntrackedStateRowRequest {
-                schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
-                version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: EntityIdentity::single(version_id),
-                file_id: NullableKeyFilter::Null,
-            })
-            .await?
-        else {
+            .load_rows(std::slice::from_ref(&request))
+            .await?;
+        let Some(row) = rows.pop().flatten() else {
             return Ok(None);
         };
 
@@ -242,15 +243,19 @@ mod tests {
         assert_eq!(head.commit_id, "commit-a");
 
         let mut reader = UntrackedStateContext::new().reader(storage);
+        let request = UntrackedStateRowRequest {
+            schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            entity_id: crate::entity_identity::EntityIdentity::single("version-a"),
+            file_id: NullableKeyFilter::Null,
+        };
         let row = reader
-            .load_row(&UntrackedStateRowRequest {
-                schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
-                version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: crate::entity_identity::EntityIdentity::single("version-a"),
-                file_id: NullableKeyFilter::Null,
-            })
+            .load_rows(std::slice::from_ref(&request))
             .await
             .expect("version-ref row should load")
+            .into_iter()
+            .next()
+            .flatten()
             .expect("version-ref row should exist");
         assert!(row.global);
         assert_eq!(row.created_at, "2026-01-01T00:00:00Z");
