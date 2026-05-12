@@ -605,6 +605,10 @@ fn read_component<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a str, Li
 }
 
 fn push_varint_len(out: &mut Vec<u8>, mut len: usize) {
+    if len < 0x80 {
+        out.push(len as u8);
+        return;
+    }
     while len >= 0x80 {
         out.push((len as u8 & 0x7f) | 0x80);
         len >>= 7;
@@ -613,6 +617,9 @@ fn push_varint_len(out: &mut Vec<u8>, mut len: usize) {
 }
 
 fn varint_len(mut len: usize) -> usize {
+    if len < 0x80 {
+        return 1;
+    }
     let mut encoded_len = 1;
     while len >= 0x80 {
         encoded_len += 1;
@@ -638,9 +645,7 @@ fn read_varint_len(bytes: &[u8], cursor: &mut usize) -> Result<usize, LixError> 
                 ));
             }
             let len = len as usize;
-            let mut canonical = Vec::new();
-            push_varint_len(&mut canonical, len);
-            if bytes.get(start..*cursor) != Some(canonical.as_slice()) {
+            if *cursor - start != varint_len(len) {
                 return Err(LixError::unknown(
                     "failed to decode untracked-state key: non-canonical length",
                 ));

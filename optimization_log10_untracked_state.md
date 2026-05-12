@@ -1630,3 +1630,86 @@ called out that reserving from size_hint is appropriate for current internal
 bounded iterators but should stay conservative if exposed to untrusted iterator
 sources.
 ```
+
+## Optimization 16: Allocation-Free Varint Canonicality
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+decode CPU for key/value component framing
+```
+
+Change:
+
+```text
+Untracked key and value varint helpers now fast-path one-byte lengths. Decode
+canonicality checks no longer allocate and re-encode a temporary varint; they
+compare the consumed byte count with the minimal encoded length for the decoded
+value. The byte format is unchanged.
+```
+
+This follows the artifact database pattern of keeping physical-key codecs
+allocation-free on hot paths. Turso computes varint encoded lengths directly in
+its on-disk SQLite helpers, and compact key/value stores use minimal varint
+length as the canonicality rule instead of allocating a second encoding.
+
+Verification:
+
+```sh
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine untracked_state --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/(insert_all_rows|select_all_rows|select_keys_only|select_all_by_pk|update_all_rows)/1k'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/real_workload/(select_all_rows|select_keys_only|select_all_by_pk|update_all_rows)/10k'
+LIX_UNTRACKED_STATE_CRUD_IO=real_workload cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+```
+
+Smoke timing scoreboard:
+
+| backend | operation | after timing | criterion change |
+| --- | --- | ---: | ---: |
+| Lix SQLite | `insert_all_rows` | 6.3281-6.5346 ms | no change |
+| Lix SQLite | `select_all_rows` | 4.6744-4.7888 ms | no confirmed change |
+| Lix SQLite | `select_keys_only` | 3.8831-3.9651 ms | -7.1689% to -3.3830% on rerun |
+| Lix SQLite | `select_all_by_pk` | 5.9516-6.1213 ms | -11.543% to -5.8961% |
+| Lix SQLite | `update_all_rows` | 5.1776-5.2511 ms | -6.8677% to -1.0810% |
+| Lix RocksDB | `insert_all_rows` | 2.9005-2.9490 ms | no change |
+| Lix RocksDB | `select_all_rows` | 1.3425-1.3580 ms | -8.1836% to -5.7179% |
+| Lix RocksDB | `select_keys_only` | 1.0283-1.0462 ms | -6.4457% to -3.3464% |
+| Lix RocksDB | `select_all_by_pk` | 2.0737-2.1070 ms | -10.168% to -8.5019% |
+| Lix RocksDB | `update_all_rows` | 1.9983-2.0416 ms | no change |
+
+Real-workload timing scoreboard:
+
+| backend | operation | after timing | criterion change |
+| --- | --- | ---: | ---: |
+| Lix SQLite | `select_all_rows` | 9.4119-9.5364 ms | -21.556% to -19.390% |
+| Lix SQLite | `select_keys_only` | 7.6532-7.7342 ms | no change on rerun |
+| Lix SQLite | `select_all_by_pk` | 27.832-28.123 ms | -13.295% to -11.918% |
+| Lix SQLite | `update_all_rows` | 26.682-27.161 ms | no change |
+| Lix RocksDB | `select_all_rows` | 9.3239-9.5333 ms | -12.948% to -10.668% |
+| Lix RocksDB | `select_keys_only` | 6.6582-6.7487 ms | -10.549% to -6.9986% |
+| Lix RocksDB | `select_all_by_pk` | 16.889-17.208 ms | -13.476% to -11.552% |
+| Lix RocksDB | `update_all_rows` | 17.635-17.872 ms | no change |
+
+Logical I/O scoreboard:
+
+| workload | backend | operation | io ops | io bytes/row | note |
+| --- | --- | --- | ---: | ---: | --- |
+| real_workload/10k | Lix SQLite | `select_all_rows` | 1 | 357.18 | unchanged byte format |
+| real_workload/10k | Lix SQLite | `select_keys_only` | 1 | 82.39 | unchanged byte format |
+| real_workload/10k | Lix SQLite | `select_all_by_pk` | 20 | 357.18 | unchanged byte format |
+| real_workload/10k | Lix RocksDB | `select_all_rows` | 1 | 357.18 | unchanged byte format |
+| real_workload/10k | Lix RocksDB | `select_keys_only` | 1 | 82.39 | unchanged byte format |
+| real_workload/10k | Lix RocksDB | `select_all_by_pk` | 20 | 357.18 | unchanged byte format |
+
+Review:
+
+```text
+Sub-agent review reported HIGH None, MEDIUM None, and LOW None. The reviewer
+confirmed that minimal encoded length uniquely determines the canonical
+unsigned LEB128-style representation, so replacing re-encode-and-compare with
+the consumed-length check preserves malformed-varint rejection while removing
+per-varint allocation.
+```
