@@ -331,3 +331,87 @@ timing row. This is still useful evidence for the I/O axis: avoiding full
 payload hydration is correct, but the physical index/value shape needs the next
 iteration before this target helps both backends on wall-clock time.
 ```
+
+## Optimization 2: Batched Point Reads
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+I/O call count for repeated exact primary-key reads
+```
+
+Change:
+
+```text
+Untracked-state storage now uses a batch-first load_rows reader API. Exact row
+identities are encoded into chunked backend get_values requests, preserving
+request order, duplicate identities, misses, and None for non-exact file_id
+filters. The chunk size is 512 keys, so the smoke workload uses 2 backend gets
+for 1,000 exact identities and the real workload uses 20 gets for 10,000 exact
+identities.
+
+The old untracked-state load_row reader API was removed and upstream untracked
+callers were refactored through load_rows. Single-request batches keep a private
+one-row fast path inside storage so point reads do not pay multi-row batch
+bookkeeping.
+
+The SQLite bench backend now executes a chunked get_values group as one
+`SELECT key, value ... WHERE key IN (...)` statement and reconstructs the
+requested order/misses in memory, instead of issuing one SELECT per key.
+```
+
+Verification:
+
+```sh
+cargo test -p lix_engine untracked_state::storage --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud --no-run
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/no_such_benchmark'
+LIX_UNTRACKED_STATE_CRUD_IO=real_workload cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/no_such_benchmark'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/select_(one|all)_by_pk/1k'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/real_workload/select_all_by_pk/10k'
+```
+
+Smoke I/O scoreboard:
+
+| backend     | operation          | before get calls | after get calls | get keys | read rows | read bytes |
+| ----------- | ------------------ | ---------------: | --------------: | -------: | --------: | ---------: |
+| Lix SQLite  | `select_all_by_pk` |             1000 |               2 |     1000 |      1000 |  1,114,072 |
+| Lix RocksDB | `select_all_by_pk` |             1000 |               2 |     1000 |      1000 |  1,114,072 |
+
+Real-workload I/O scoreboard:
+
+| backend     | operation          | before get calls | after get calls | get keys | read rows | read bytes |
+| ----------- | ------------------ | ---------------: | --------------: | -------: | --------: | ---------: |
+| Lix SQLite  | `select_all_by_pk` |            10000 |              20 |    10000 |     10000 |  5,460,528 |
+| Lix RocksDB | `select_all_by_pk` |            10000 |              20 |    10000 |     10000 |  5,460,528 |
+
+Smoke timing scoreboard:
+
+| backend     | operation          | before timing    | after timing     | timing delta |
+| ----------- | ------------------ | ---------------: | --------------: | -----------: |
+| Lix SQLite  | `select_all_by_pk` | 9.8336-11.246 ms | 7.7282-7.8977 ms |        ~-27% |
+| Lix RocksDB | `select_all_by_pk` | 3.1604-3.2220 ms | 2.7012-2.7677 ms |        ~-15% |
+
+Real-workload timing snapshot:
+
+| backend     | operation          | after timing       |
+| ----------- | ------------------ | -----------------: |
+| Lix SQLite  | `select_all_by_pk` | 33.817-34.455 ms   |
+| Lix RocksDB | `select_all_by_pk` | 21.755-21.992 ms   |
+
+Notes:
+
+```text
+This optimization does not reduce payload bytes; it removes per-key backend
+request overhead for workloads that already know exact identities. After review,
+the scorecard reports get calls and get keys separately because a logical
+backend call can still contain many physical keys.
+
+The implementation follows the same batch-oriented execution principle used by
+DataFusion RecordBatches and DuckDB vectors: pass a bounded set of rows/keys
+through the storage boundary, not one row per call. The single-row fast path is
+private implementation detail under the batch-first API, not a retained public
+reader API.
+```

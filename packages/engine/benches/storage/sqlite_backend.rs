@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -7,7 +8,7 @@ use lix_engine::{
     BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteStats,
     BackendReadTransaction, BackendWriteTransaction, BytePageBuilder, LixError,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -112,28 +113,65 @@ impl BackendReadTransaction for SqliteBenchTransaction {
         request: BackendKvGetRequest,
     ) -> Result<BackendKvValueBatch, LixError> {
         let connection = self.lock_connection()?;
-        let mut statement = connection
-            .prepare_cached("SELECT value FROM kv WHERE namespace = ?1 AND key = ?2")
-            .map_err(sqlite_error)?;
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
             let namespace = group.namespace.clone();
-            let mut values = BytePageBuilder::with_capacity(group.keys.len(), 0);
-            let mut present = Vec::with_capacity(group.keys.len());
-            for key in group.keys {
-                let value = statement
-                    .query_row(params![namespace.as_str(), key.as_slice()], |row| {
-                        row.get::<_, Vec<u8>>(0)
-                    })
-                    .optional()
-                    .map_err(sqlite_error)?;
-                if let Some(value) = value {
+            let key_count = group.keys.len();
+            let keys = group.keys;
+            let mut values = BytePageBuilder::with_capacity(key_count, 0);
+            let mut present = Vec::with_capacity(key_count);
+            if keys.is_empty() {
+                groups.push(BackendKvValueGroup::new(
+                    namespace,
+                    values.finish(),
+                    present,
+                ));
+                continue;
+            }
+
+            let key_placeholders = std::iter::repeat_n("?", key_count)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "
+                SELECT key, value
+                FROM kv
+                WHERE namespace = ? AND key IN ({key_placeholders})
+                "
+            );
+            let mut parameters = Vec::with_capacity(1 + key_count);
+            parameters.push(SqlValue::Text(namespace.clone()));
+            parameters.extend(keys.iter().cloned().map(SqlValue::Blob));
+
+            let mut statement = connection.prepare(&sql).map_err(sqlite_error)?;
+            let mut rows = statement
+                .query(params_from_iter(parameters))
+                .map_err(sqlite_error)?;
+            let mut values_by_key = HashMap::with_capacity(key_count);
+            while let Some(row) = rows.next().map_err(sqlite_error)? {
+                values_by_key.insert(
+                    row.get::<_, Vec<u8>>(0).map_err(sqlite_error)?,
+                    row.get::<_, Vec<u8>>(1).map_err(sqlite_error)?,
+                );
+            }
+
+            for key in keys {
+                if let Some(value) = values_by_key.get(&key) {
                     values.push(value);
                     present.push(true);
                 } else {
                     values.push([]);
                     present.push(false);
                 }
+            }
+            if present.len() != key_count {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "sqlite get_values returned {} rows for {key_count} requested keys",
+                        present.len()
+                    ),
+                ));
             }
             groups.push(BackendKvValueGroup::new(
                 namespace,

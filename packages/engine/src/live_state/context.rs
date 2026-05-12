@@ -185,15 +185,14 @@ where
             match candidate.source {
                 LiveStateLookupSource::Untracked => {
                     let store: &mut dyn StorageReader = &mut *store;
-                    if let Some(row) = self
+                    let untracked_request =
+                        untracked_row_request_from_live(request, &candidate.version_id);
+                    let mut rows = self
                         .untracked_state
                         .reader(store)
-                        .load_row(&untracked_row_request_from_live(
-                            request,
-                            &candidate.version_id,
-                        ))
-                        .await?
-                    {
+                        .load_rows(std::slice::from_ref(&untracked_request))
+                        .await?;
+                    if let Some(row) = rows.pop().flatten() {
                         return Ok(Some(visibility::project_loaded_row(
                             MaterializedLiveStateRow::from(row),
                             &request.version_id,
@@ -484,16 +483,17 @@ async fn load_version_ref_commit_id(
     untracked_state: &UntrackedStateContext,
     version_id: &str,
 ) -> Result<Option<String>, LixError> {
-    let Some(row) = untracked_state
+    let request = UntrackedStateRowRequest {
+        schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
+        version_id: GLOBAL_VERSION_ID.to_string(),
+        entity_id: crate::entity_identity::EntityIdentity::single(version_id),
+        file_id: crate::NullableKeyFilter::Null,
+    };
+    let mut rows = untracked_state
         .reader(store)
-        .load_row(&UntrackedStateRowRequest {
-            schema_key: VERSION_REF_SCHEMA_KEY.to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::single(version_id),
-            file_id: crate::NullableKeyFilter::Null,
-        })
-        .await?
-    else {
+        .load_rows(std::slice::from_ref(&request))
+        .await?;
+    let Some(row) = rows.pop().flatten() else {
         return Ok(None);
     };
     let Some(snapshot_content) = row.snapshot_content.as_deref() else {

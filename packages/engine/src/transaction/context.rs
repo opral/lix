@@ -1007,16 +1007,20 @@ mod tests {
             Some(r#"{"key":"tracked-programmatic","value":"tracked"}"#)
         );
 
+        let request = UntrackedStateRowRequest {
+            schema_key: "lix_key_value".to_string(),
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            entity_id: crate::entity_identity::EntityIdentity::single("untracked-programmatic"),
+            file_id: NullableKeyFilter::Null,
+        };
         let untracked_row = crate::untracked_state::UntrackedStateContext::new()
             .reader(storage.clone())
-            .load_row(&UntrackedStateRowRequest {
-                schema_key: "lix_key_value".to_string(),
-                version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: crate::entity_identity::EntityIdentity::single("untracked-programmatic"),
-                file_id: NullableKeyFilter::Null,
-            })
+            .load_rows(std::slice::from_ref(&request))
             .await
             .expect("untracked state should load")
+            .into_iter()
+            .next()
+            .flatten()
             .expect("untracked row should be present in untracked state");
         assert_eq!(
             untracked_row.snapshot_content.as_deref(),

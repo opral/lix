@@ -194,6 +194,10 @@ impl From<backend::BackendKvValueGroup> for KvValueGroup {
 }
 
 impl KvValueGroup {
+    pub(crate) fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.present.len()
     }

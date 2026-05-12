@@ -845,16 +845,20 @@ mod tests {
 
         let loaded = {
             let mut untracked_reader = untracked_state.reader(storage.clone());
+            let request = UntrackedStateRowRequest {
+                schema_key: "test_schema".to_string(),
+                version_id: GLOBAL_VERSION_ID.to_string(),
+                entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+                file_id: NullableKeyFilter::Null,
+            };
             untracked_reader
-                .load_row(&UntrackedStateRowRequest {
-                    schema_key: "test_schema".to_string(),
-                    version_id: GLOBAL_VERSION_ID.to_string(),
-                    entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
-                    file_id: NullableKeyFilter::Null,
-                })
+                .load_rows(std::slice::from_ref(&request))
                 .await
         }
         .expect("untracked row load should succeed")
+        .into_iter()
+        .next()
+        .flatten()
         .expect("untracked row should be persisted");
         assert_eq!(
             loaded.snapshot_content.as_deref(),
@@ -927,9 +931,15 @@ mod tests {
 
         let untracked = {
             let mut untracked_reader = untracked_state.reader(storage.clone());
-            untracked_reader.load_row(&untracked_request()).await
+            let request = untracked_request();
+            untracked_reader
+                .load_rows(std::slice::from_ref(&request))
+                .await
         }
-        .expect("untracked load should succeed");
+        .expect("untracked load should succeed")
+        .into_iter()
+        .next()
+        .flatten();
         assert_eq!(untracked, None);
 
         let visible = live_state
@@ -1072,16 +1082,20 @@ mod tests {
 
         let untracked = {
             let mut untracked_reader = untracked_state.reader(storage.clone());
+            let request = UntrackedStateRowRequest {
+                schema_key: "test_schema".to_string(),
+                version_id: GLOBAL_VERSION_ID.to_string(),
+                entity_id: crate::entity_identity::EntityIdentity::single("entity-2"),
+                file_id: NullableKeyFilter::Null,
+            };
             untracked_reader
-                .load_row(&UntrackedStateRowRequest {
-                    schema_key: "test_schema".to_string(),
-                    version_id: GLOBAL_VERSION_ID.to_string(),
-                    entity_id: crate::entity_identity::EntityIdentity::single("entity-2"),
-                    file_id: NullableKeyFilter::Null,
-                })
+                .load_rows(std::slice::from_ref(&request))
                 .await
         }
         .expect("untracked row load should succeed")
+        .into_iter()
+        .next()
+        .flatten()
         .expect("untracked row should persist");
         assert_eq!(
             untracked.snapshot_content.as_deref(),
