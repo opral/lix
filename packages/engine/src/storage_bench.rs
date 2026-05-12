@@ -27,7 +27,8 @@ use crate::transaction::types::{
 };
 use crate::untracked_state::{
     MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter,
-    UntrackedStateProjection, UntrackedStateRowRequest, UntrackedStateScanRequest,
+    UntrackedStateProjection, UntrackedStateRow, UntrackedStateRowRequest,
+    UntrackedStateScanRequest,
 };
 use crate::version::VersionContext;
 use crate::{Backend, LixError, NullableKeyFilter};
@@ -1403,12 +1404,12 @@ pub struct JsonPointerTrackedStateDiffFixture {
 
 pub struct UntrackedStateWriteFixture {
     context: UntrackedStateContext,
-    rows: Vec<MaterializedUntrackedStateRow>,
+    rows: Vec<UntrackedStateRow>,
 }
 
 pub struct UntrackedStateDeleteFixture {
     context: UntrackedStateContext,
-    rows: Vec<MaterializedUntrackedStateRow>,
+    rows: Vec<UntrackedStateRow>,
     expected_remaining_rows: usize,
 }
 
@@ -2388,7 +2389,7 @@ pub async fn prepare_json_pointer_untracked_state_write_rows(
 ) -> Result<UntrackedStateWriteFixture, LixError> {
     Ok(UntrackedStateWriteFixture {
         context: UntrackedStateContext::new(),
-        rows: json_pointer_untracked_rows(rows, false),
+        rows: canonical_untracked_rows(&json_pointer_untracked_rows(rows, false)),
     })
 }
 
@@ -2413,7 +2414,10 @@ pub async fn prepare_json_pointer_untracked_state_overwrite_rows(
     let context = UntrackedStateContext::new();
     let base_rows = json_pointer_untracked_rows(rows, false);
     write_untracked_rows(backend, &context, &base_rows).await?;
-    let updated_rows = json_pointer_untracked_rows(&rows[..updated_rows.min(rows.len())], true);
+    let updated_rows = canonical_untracked_rows(&json_pointer_untracked_rows(
+        &rows[..updated_rows.min(rows.len())],
+        true,
+    ));
     Ok(UntrackedStateWriteFixture {
         context,
         rows: updated_rows,
@@ -2435,7 +2439,7 @@ pub async fn prepare_json_pointer_untracked_state_delete_rows(
     }
     Ok(UntrackedStateDeleteFixture {
         context,
-        rows: tombstones,
+        rows: canonical_untracked_rows(&tombstones),
         expected_remaining_rows: rows.len() - deleted_rows,
     })
 }
@@ -2552,7 +2556,7 @@ pub async fn prepare_untracked_state_write_rows(
 ) -> Result<UntrackedStateWriteFixture, LixError> {
     Ok(UntrackedStateWriteFixture {
         context: UntrackedStateContext::new(),
-        rows: untracked_rows(config),
+        rows: canonical_untracked_rows(&untracked_rows(config)),
     })
 }
 
@@ -2575,7 +2579,7 @@ pub async fn untracked_state_write_rows_only_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &UntrackedStateWriteFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    write_untracked_rows(backend, &fixture.context, &fixture.rows).await?;
+    write_canonical_untracked_rows(backend, &fixture.context, &fixture.rows).await?;
     Ok(report(
         fixture.rows.len(),
         fixture.rows.len(),
@@ -2821,7 +2825,7 @@ pub async fn prepare_untracked_state_overwrite_rows(
     }
     Ok(UntrackedStateWriteFixture {
         context,
-        rows: updated_rows,
+        rows: canonical_untracked_rows(&updated_rows),
     })
 }
 
@@ -2839,7 +2843,7 @@ pub async fn prepare_untracked_state_insert_new_keys(
     }
     Ok(UntrackedStateWriteFixture {
         context,
-        rows: new_rows,
+        rows: canonical_untracked_rows(&new_rows),
     })
 }
 
@@ -2858,7 +2862,7 @@ pub async fn prepare_untracked_state_delete_rows(
     }
     Ok(UntrackedStateDeleteFixture {
         context,
-        rows: tombstones,
+        rows: canonical_untracked_rows(&tombstones),
         expected_remaining_rows: config.rows - deleted_rows,
     })
 }
@@ -2907,7 +2911,7 @@ pub async fn untracked_state_delete_existing_only_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &UntrackedStateDeleteFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    write_untracked_rows(backend, &fixture.context, &fixture.rows).await?;
+    write_canonical_untracked_rows(backend, &fixture.context, &fixture.rows).await?;
     Ok(report(
         fixture.rows.len(),
         fixture.rows.len(),
@@ -4334,19 +4338,40 @@ async fn write_untracked_rows(
     context: &UntrackedStateContext,
     rows: &[MaterializedUntrackedStateRow],
 ) -> Result<(), LixError> {
+    let rows = canonical_untracked_rows(rows);
+    write_canonical_untracked_rows(backend, context, &rows).await
+}
+
+async fn write_canonical_untracked_rows(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    context: &UntrackedStateContext,
+    rows: &[UntrackedStateRow],
+) -> Result<(), LixError> {
     let storage = StorageContext::new(Arc::clone(backend));
     let mut transaction = storage.begin_write_transaction().await?;
     {
         let mut writes = StorageWriteSet::new();
-        let canonical_rows = rows
-            .iter()
-            .map(|row| crate::test_support::untracked_state_row_from_materialized(&mut writes, row))
-            .collect::<Result<Vec<_>, _>>()?;
         let mut writer = context.writer(&mut writes);
-        writer.stage_rows(canonical_rows.iter().map(|row| row.as_ref()))?;
+        writer.stage_rows(rows.iter().map(|row| row.as_ref()))?;
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await
+}
+
+fn canonical_untracked_rows(rows: &[MaterializedUntrackedStateRow]) -> Vec<UntrackedStateRow> {
+    rows.iter()
+        .map(|row| UntrackedStateRow {
+            entity_id: row.entity_id.clone(),
+            schema_key: row.schema_key.clone(),
+            file_id: row.file_id.clone(),
+            snapshot_content: row.snapshot_content.clone(),
+            metadata: row.metadata.as_ref().map(crate::serialize_row_metadata),
+            created_at: row.created_at.clone(),
+            updated_at: row.updated_at.clone(),
+            global: row.global,
+            version_id: row.version_id.clone(),
+        })
+        .collect()
 }
 
 async fn scan_untracked(
