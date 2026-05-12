@@ -520,6 +520,15 @@ fn sqlite_delete_range(
     namespace: &str,
     range: &BackendKvScanRange,
 ) -> Result<(), LixError> {
+    if matches!(range, BackendKvScanRange::Prefix(prefix) if prefix.is_empty())
+        && sqlite_namespace_is_exclusive(connection, namespace)?
+    {
+        return connection
+            .execute("DELETE FROM kv", [])
+            .map(|_| ())
+            .map_err(sqlite_error);
+    }
+
     let start = match range {
         BackendKvScanRange::Prefix(prefix) => prefix.as_slice(),
         BackendKvScanRange::Range { start, .. } => start.as_slice(),
@@ -540,6 +549,44 @@ fn sqlite_delete_range(
             .map(|_| ())
             .map_err(sqlite_error),
     }
+}
+
+fn sqlite_namespace_is_exclusive(
+    connection: &Connection,
+    namespace: &str,
+) -> Result<bool, LixError> {
+    let first_namespace = sqlite_first_namespace(connection)?;
+    let Some(first_namespace) = first_namespace else {
+        return Ok(true);
+    };
+    if first_namespace != namespace {
+        return Ok(false);
+    }
+
+    let last_namespace = sqlite_last_namespace(connection)?;
+    Ok(last_namespace.as_deref() == Some(namespace))
+}
+
+fn sqlite_first_namespace(connection: &Connection) -> Result<Option<String>, LixError> {
+    connection
+        .query_row(
+            "SELECT namespace FROM kv ORDER BY namespace ASC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(sqlite_error)
+}
+
+fn sqlite_last_namespace(connection: &Connection) -> Result<Option<String>, LixError> {
+    connection
+        .query_row(
+            "SELECT namespace FROM kv ORDER BY namespace DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(sqlite_error)
 }
 
 fn delete_range_bytes(range: &BackendKvScanRange) -> usize {
