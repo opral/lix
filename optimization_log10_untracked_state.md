@@ -415,3 +415,121 @@ through the storage boundary, not one row per call. The single-row fast path is
 private implementation detail under the batch-first API, not a retained public
 reader API.
 ```
+
+## Optimization 3: Remove Identity Side Index
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+write amplification from the identity covering index
+```
+
+Change:
+
+```text
+The separate untracked_state.identity_index namespace was removed. Untracked
+state now stores one canonical row entry per identity again.
+
+Scans no longer use the identity side index. They hydrate canonical row values,
+which preserves stored created_at, updated_at, and global semantics for every
+projection. This intentionally trades back the previous key-only read fast path
+to remove write amplification from inserts, updates, and deletes.
+```
+
+Reference principle:
+
+```text
+This follows a write-path storage-layout principle: avoid maintaining a
+secondary physical structure whose read benefit does not justify its write
+amplification for the target workload. The artifact references model the same
+tradeoff explicitly: Dolt chooses covering index iterators only when an index
+covers the requested projections (`artifact/dolt/go/libraries/doltcore/sqle/index/index_reader.go`),
+and Turso surfaces covering-index plan choices separately from base table
+access (`artifact/turso/core/translate/display.rs`). In this layout, the side
+index was the only scalar-preserving covering structure; removing it is a
+deliberate write/read tradeoff, not a claim that timestamps are covered by the
+primary key.
+```
+
+Verification:
+
+```sh
+cargo test -p lix_engine untracked_state::storage --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud --no-run
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/no_such_benchmark'
+LIX_UNTRACKED_STATE_CRUD_IO=real_workload cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/no_such_benchmark'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/(insert_all_rows|update_all_rows|delete_all_rows|select_keys_only)/1k'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/real_workload/(insert_all_rows|update_all_rows|delete_all_rows|select_keys_only)/10k'
+```
+
+Smoke I/O scoreboard:
+
+| backend     | operation          | before puts/deletes | after puts/deletes | before bytes | after bytes |
+| ----------- | ------------------ | ------------------: | -----------------: | -----------: | ----------: |
+| Lix SQLite  | `insert_all_rows`  |            2000 / 0 |           1000 / 0 |    1,264,276 |   1,114,072 |
+| Lix SQLite  | `update_all_rows`  |            2000 / 0 |           1000 / 0 |      624,520 |     474,316 |
+| Lix SQLite  | `delete_all_rows`  |            0 / 2000 |           0 / 1000 |      186,408 |      93,204 |
+| Lix RocksDB | `insert_all_rows`  |            2000 / 0 |           1000 / 0 |    1,264,276 |   1,114,072 |
+| Lix RocksDB | `update_all_rows`  |            2000 / 0 |           1000 / 0 |      624,520 |     474,316 |
+| Lix RocksDB | `delete_all_rows`  |            0 / 2000 |           0 / 1000 |      186,408 |      93,204 |
+
+Smoke read I/O scoreboard:
+
+| backend     | operation          | before read bytes | after read bytes | read-byte delta |
+| ----------- | ------------------ | ----------------: | ---------------: | --------------: |
+| Lix SQLite  | `select_keys_only` |           150,204 |        1,020,868 |        +579.7% |
+| Lix RocksDB | `select_keys_only` |           150,204 |        1,020,868 |        +579.7% |
+
+Smoke timing scoreboard:
+
+| backend     | operation          | before timing     | after timing      | timing delta |
+| ----------- | ------------------ | ----------------: | ---------------: | -----------: |
+| Lix SQLite  | `insert_all_rows`  | 11.112-11.333 ms  | 8.4015-8.6852 ms |        ~-24% |
+| Lix SQLite  | `select_keys_only` | 5.4289-5.5678 ms  | 5.2545-5.3894 ms |         ~-3% |
+| Lix SQLite  | `update_all_rows`  | 9.4389-9.5586 ms  | 7.8316-7.9436 ms |        ~-17% |
+| Lix SQLite  | `delete_all_rows`  | 8.8763-9.1404 ms  | 7.0143-7.0802 ms |        ~-22% |
+| Lix RocksDB | `insert_all_rows`  | 4.9880-5.2201 ms  | 4.0144-4.1236 ms |        ~-20% |
+| Lix RocksDB | `select_keys_only` | 1.3815-1.4017 ms  | 1.5747-1.5964 ms |        ~+14% |
+| Lix RocksDB | `update_all_rows`  | 4.4034-4.5340 ms  | 3.2577-3.2920 ms |        ~-26% |
+| Lix RocksDB | `delete_all_rows`  | 3.0574-3.0912 ms  | 2.2155-2.2492 ms |        ~-27% |
+
+Real-workload I/O snapshot:
+
+| backend     | operation          | read bytes | puts/deletes | write bytes |
+| ----------- | ------------------ | ---------: | ------------: | ----------: |
+| Lix SQLite  | `insert_all_rows`  |          0 |     10000 / 0 |   5,460,528 |
+| Lix SQLite  | `select_all_rows`  |  4,516,832 |         0 / 0 |           0 |
+| Lix SQLite  | `select_keys_only` |  4,516,832 |         0 / 0 |           0 |
+| Lix SQLite  | `update_all_rows`  |          0 |     10000 / 0 |   4,789,908 |
+| Lix SQLite  | `delete_all_rows`  |          0 |     0 / 10000 |     943,696 |
+| Lix RocksDB | `insert_all_rows`  |          0 |     10000 / 0 |   5,460,528 |
+| Lix RocksDB | `select_all_rows`  |  4,516,832 |         0 / 0 |           0 |
+| Lix RocksDB | `select_keys_only` |  4,516,832 |         0 / 0 |           0 |
+| Lix RocksDB | `update_all_rows`  |          0 |     10000 / 0 |   4,789,908 |
+| Lix RocksDB | `delete_all_rows`  |          0 |     0 / 10000 |     943,696 |
+
+Real-workload timing snapshot:
+
+| backend     | operation          | after timing       |
+| ----------- | ------------------ | -----------------: |
+| Lix SQLite  | `insert_all_rows`  | 60.827-63.465 ms   |
+| Lix SQLite  | `select_keys_only` | 15.528-15.929 ms   |
+| Lix SQLite  | `update_all_rows`  | 53.970-55.711 ms   |
+| Lix SQLite  | `delete_all_rows`  | 39.760-40.793 ms   |
+| Lix RocksDB | `insert_all_rows`  | 39.827-40.662 ms   |
+| Lix RocksDB | `select_keys_only` | 10.885-11.159 ms   |
+| Lix RocksDB | `update_all_rows`  | 29.890-32.065 ms   |
+| Lix RocksDB | `delete_all_rows`  | 18.187-18.624 ms   |
+
+Notes:
+
+```text
+This recovers the write amplification introduced by Optimization 1 while
+preserving hydrated row semantics. The tradeoff is that select_keys_only no
+longer gets the side-index payload-free scan path; it reads canonical row values
+again. The side index was introduced after the baseline and Lix has not shipped,
+so this is an unshipped clean-cut removal with no migration for orphaned local
+developer data.
+```
