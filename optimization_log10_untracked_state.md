@@ -67,11 +67,12 @@ LIX_UNTRACKED_STATE_CRUD_IO=real_workload cargo bench -p lix_engine --features s
 ```
 
 The I/O report measures logical backend KV request/result payload accounting
-after fixture setup is reset out of the counters. It reports read calls,
-returned/read rows, request key bytes for point reads, returned key/value bytes
-for scans, write batches, puts, deletes, and logical write bytes. It does not
-measure OS-level disk pages, filesystem cache behavior, WAL flushes, RocksDB
-compaction bytes, or keys examined but not returned by a backend scan.
+after fixture setup is reset out of the counters. It reports headline `io ops`
+and `io bytes` columns first, followed by read calls, returned/read rows,
+request key bytes for point reads, returned key/value bytes for scans, write
+batches, puts, deletes, and logical write bytes. It does not measure OS-level
+disk pages, filesystem cache behavior, WAL flushes, RocksDB compaction bytes,
+or keys examined but not returned by a backend scan.
 
 Groups:
 
@@ -735,3 +736,71 @@ fixture preparation that raw SQLite does not pay in its measured operation.
 The actual untracked write path still stages canonical UntrackedStateRowRef
 values into the same compact row-value format from Optimization 4.
 ```
+
+## Measurement Update: I/O Score Columns
+
+Date: 2026-05-12
+
+Change:
+
+```text
+The untracked_state CRUD I/O report now includes `io ops` and `io bytes` as
+the first numeric columns. `io ops` is read calls plus write batches. `io bytes`
+is read bytes plus write bytes. This gives each operation a single logical
+payload score to optimize alongside wall-clock timing.
+```
+
+Verification:
+
+```sh
+cargo fmt -p lix_engine
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud --no-run
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/no_such_benchmark'
+LIX_UNTRACKED_STATE_CRUD_IO=real_workload cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/no_such_benchmark'
+```
+
+Smoke I/O score:
+
+| backend     | operation          | io ops | io bytes |
+| ----------- | ------------------ | -----: | -------: |
+| Lix SQLite  | `insert_all_rows`  |      1 |  988,380 |
+| Lix SQLite  | `select_all_rows`  |      1 |  988,380 |
+| Lix SQLite  | `select_keys_only` |      1 |  988,380 |
+| Lix SQLite  | `select_one_by_pk` |      1 |      350 |
+| Lix SQLite  | `select_all_by_pk` |      2 |  988,380 |
+| Lix SQLite  | `update_all_rows`  |      1 |  348,624 |
+| Lix SQLite  | `update_one_by_pk` |      1 |      195 |
+| Lix SQLite  | `delete_all_rows`  |      1 |   93,204 |
+| Lix SQLite  | `delete_one_by_pk` |      1 |       43 |
+| Lix RocksDB | `insert_all_rows`  |      1 |  988,380 |
+| Lix RocksDB | `select_all_rows`  |      1 |  988,380 |
+| Lix RocksDB | `select_keys_only` |      1 |  988,380 |
+| Lix RocksDB | `select_one_by_pk` |      1 |      350 |
+| Lix RocksDB | `select_all_by_pk` |      2 |  988,380 |
+| Lix RocksDB | `update_all_rows`  |      1 |  348,624 |
+| Lix RocksDB | `update_one_by_pk` |      1 |      195 |
+| Lix RocksDB | `delete_all_rows`  |      1 |   93,204 |
+| Lix RocksDB | `delete_one_by_pk` |      1 |       43 |
+
+Real-workload I/O score:
+
+| backend     | operation          | io ops |  io bytes |
+| ----------- | ------------------ | -----: | --------: |
+| Lix SQLite  | `insert_all_rows`  |      1 | 4,191,840 |
+| Lix SQLite  | `select_all_rows`  |      1 | 4,191,840 |
+| Lix SQLite  | `select_keys_only` |      1 | 4,191,840 |
+| Lix SQLite  | `select_one_by_pk` |      1 |       247 |
+| Lix SQLite  | `select_all_by_pk` |     20 | 4,191,840 |
+| Lix SQLite  | `update_all_rows`  |      1 | 3,521,220 |
+| Lix SQLite  | `update_one_by_pk` |      1 |       195 |
+| Lix SQLite  | `delete_all_rows`  |      1 |   943,696 |
+| Lix SQLite  | `delete_one_by_pk` |      1 |        43 |
+| Lix RocksDB | `insert_all_rows`  |      1 | 4,191,840 |
+| Lix RocksDB | `select_all_rows`  |      1 | 4,191,840 |
+| Lix RocksDB | `select_keys_only` |      1 | 4,191,840 |
+| Lix RocksDB | `select_one_by_pk` |      1 |       247 |
+| Lix RocksDB | `select_all_by_pk` |     20 | 4,191,840 |
+| Lix RocksDB | `update_all_rows`  |      1 | 3,521,220 |
+| Lix RocksDB | `update_one_by_pk` |      1 |       195 |
+| Lix RocksDB | `delete_all_rows`  |      1 |   943,696 |
+| Lix RocksDB | `delete_one_by_pk` |      1 |        43 |
