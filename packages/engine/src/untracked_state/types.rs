@@ -3,8 +3,9 @@ use crate::NullableKeyFilter;
 
 /// Durable local row excluded from changelog and commit membership.
 ///
-/// This is the canonical physical shape: identity/header fields are stored
-/// directly, and mutable JSON payloads are stored inline in the sidecar row.
+/// This is the canonical storage row shape after joining the physical key with
+/// the value payload. Identity fields live in the key; mutable JSON payloads
+/// and scalar row state live in the value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UntrackedStateRow {
     pub(crate) entity_id: EntityIdentity,

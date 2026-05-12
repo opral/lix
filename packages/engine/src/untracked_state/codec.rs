@@ -1,80 +1,61 @@
-use crate::entity_identity::EntityIdentity;
-use crate::untracked_state::{UntrackedStateRow, UntrackedStateRowRef};
+use crate::untracked_state::{UntrackedStateIdentity, UntrackedStateRow, UntrackedStateRowRef};
 use crate::LixError;
 
-const UNTRACKED_STATE_FILE_IDENTIFIER: &str = "LXUS";
+const UNTRACKED_STATE_VALUE_FILE_IDENTIFIER: &str = "LXUV";
 
-pub(crate) fn encode_row_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8>, LixError> {
-    let entity_id = row.entity_id.as_json_array_text().map_err(|error| {
-        LixError::unknown(format!(
-            "failed to encode untracked-state entity identity: {error}"
-        ))
-    })?;
-
+pub(crate) fn encode_row_value_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8>, LixError> {
     let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(256);
-    let entity_id = builder.create_string(&entity_id);
-    let schema_key = builder.create_string(row.schema_key);
-    let file_id = row.file_id.map(|value| builder.create_string(value));
     let snapshot_content = row
         .snapshot_content
         .map(|value| builder.create_string(value));
     let metadata = row.metadata.map(|value| builder.create_string(value));
     let created_at = builder.create_string(row.created_at);
     let updated_at = builder.create_string(row.updated_at);
-    let version_id = builder.create_string(row.version_id);
 
-    let root = flatbuffer::create_untracked_state_row(
+    let root = flatbuffer::create_untracked_state_row_value(
         &mut builder,
-        &flatbuffer::UntrackedStateRowArgs {
-            entity_id,
-            schema_key,
-            file_id,
+        &flatbuffer::UntrackedStateRowValueArgs {
             snapshot_content,
             metadata,
             created_at,
             updated_at,
             global: row.global,
-            version_id,
         },
     );
-    builder.finish(root, Some(UNTRACKED_STATE_FILE_IDENTIFIER));
+    builder.finish(root, Some(UNTRACKED_STATE_VALUE_FILE_IDENTIFIER));
     Ok(builder.finished_data().to_vec())
 }
 
-pub(crate) fn decode_row(bytes: &[u8]) -> Result<UntrackedStateRow, LixError> {
+pub(crate) fn decode_row_value(
+    bytes: &[u8],
+    identity: UntrackedStateIdentity,
+) -> Result<UntrackedStateRow, LixError> {
     if bytes.len() < flatbuffers::SIZE_UOFFSET + flatbuffers::FILE_IDENTIFIER_LENGTH
-        || !flatbuffers::buffer_has_identifier(bytes, UNTRACKED_STATE_FILE_IDENTIFIER, false)
+        || !flatbuffers::buffer_has_identifier(bytes, UNTRACKED_STATE_VALUE_FILE_IDENTIFIER, false)
     {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "failed to decode untracked-state row: invalid FlatBuffers file identifier",
+            "failed to decode untracked-state row value: invalid FlatBuffers file identifier",
         ));
     }
 
-    let row = flatbuffer::root_as_untracked_state_row(bytes).map_err(|error| {
+    let value = flatbuffer::root_as_untracked_state_row_value(bytes).map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("failed to decode untracked-state row: {error}"),
+            format!("failed to decode untracked-state row value: {error}"),
         )
     })?;
 
-    let entity_id = required_str(row.entity_id(), "entity_id")?;
-    let entity_id = EntityIdentity::from_json_array_text(entity_id).map_err(|error| {
-        LixError::unknown(format!(
-            "failed to decode untracked-state entity identity: {error}"
-        ))
-    })?;
-
     Ok(UntrackedStateRow {
-        entity_id,
-        schema_key: required_str(row.schema_key(), "schema_key")?.to_string(),
-        file_id: row.file_id().map(ToString::to_string),
-        snapshot_content: row.snapshot_content().map(ToString::to_string),
-        metadata: row.metadata().map(ToString::to_string),
-        created_at: required_str(row.created_at(), "created_at")?.to_string(),
-        updated_at: required_str(row.updated_at(), "updated_at")?.to_string(),
-        global: row.global(),
-        version_id: required_str(row.version_id(), "version_id")?.to_string(),
+        entity_id: identity.entity_id,
+        schema_key: identity.schema_key,
+        file_id: identity.file_id,
+        snapshot_content: value.snapshot_content().map(ToString::to_string),
+        metadata: value.metadata().map(ToString::to_string),
+        created_at: required_str(value.created_at(), "created_at")?.to_string(),
+        updated_at: required_str(value.updated_at(), "updated_at")?.to_string(),
+        global: value.global(),
+        version_id: identity.version_id,
     })
 }
 
@@ -82,19 +63,19 @@ fn required_str<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str, LixE
     value.ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("failed to decode untracked-state row: missing required field `{field}`"),
+            format!("failed to decode untracked-state row value: missing required field `{field}`"),
         )
     })
 }
 
 mod flatbuffer {
     #[derive(Copy, Clone, PartialEq)]
-    pub(super) struct UntrackedStateRow<'a> {
+    pub(super) struct UntrackedStateRowValue<'a> {
         table: flatbuffers::Table<'a>,
     }
 
-    impl<'a> flatbuffers::Follow<'a> for UntrackedStateRow<'a> {
-        type Inner = UntrackedStateRow<'a>;
+    impl<'a> flatbuffers::Follow<'a> for UntrackedStateRowValue<'a> {
+        type Inner = UntrackedStateRowValue<'a>;
 
         #[inline]
         unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
@@ -104,40 +85,12 @@ mod flatbuffer {
         }
     }
 
-    impl<'a> UntrackedStateRow<'a> {
-        const VT_ENTITY_ID: flatbuffers::VOffsetT = 4;
-        const VT_SCHEMA_KEY: flatbuffers::VOffsetT = 6;
-        const VT_FILE_ID: flatbuffers::VOffsetT = 8;
-        const VT_SNAPSHOT_CONTENT: flatbuffers::VOffsetT = 10;
-        const VT_METADATA: flatbuffers::VOffsetT = 12;
-        const VT_CREATED_AT: flatbuffers::VOffsetT = 14;
-        const VT_UPDATED_AT: flatbuffers::VOffsetT = 16;
-        const VT_GLOBAL: flatbuffers::VOffsetT = 18;
-        const VT_VERSION_ID: flatbuffers::VOffsetT = 20;
-
-        #[inline]
-        pub(super) fn entity_id(&self) -> Option<&'a str> {
-            unsafe {
-                self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_ENTITY_ID, None)
-            }
-        }
-
-        #[inline]
-        pub(super) fn schema_key(&self) -> Option<&'a str> {
-            unsafe {
-                self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_SCHEMA_KEY, None)
-            }
-        }
-
-        #[inline]
-        pub(super) fn file_id(&self) -> Option<&'a str> {
-            unsafe {
-                self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_FILE_ID, None)
-            }
-        }
+    impl<'a> UntrackedStateRowValue<'a> {
+        const VT_SNAPSHOT_CONTENT: flatbuffers::VOffsetT = 4;
+        const VT_METADATA: flatbuffers::VOffsetT = 6;
+        const VT_CREATED_AT: flatbuffers::VOffsetT = 8;
+        const VT_UPDATED_AT: flatbuffers::VOffsetT = 10;
+        const VT_GLOBAL: flatbuffers::VOffsetT = 12;
 
         #[inline]
         pub(super) fn snapshot_content(&self) -> Option<&'a str> {
@@ -155,6 +108,7 @@ mod flatbuffer {
             }
         }
 
+        #[inline]
         pub(super) fn created_at(&self) -> Option<&'a str> {
             unsafe {
                 self.table
@@ -174,17 +128,9 @@ mod flatbuffer {
         pub(super) fn global(&self) -> bool {
             unsafe { self.table.get::<bool>(Self::VT_GLOBAL, Some(false)) }.unwrap_or(false)
         }
-
-        #[inline]
-        pub(super) fn version_id(&self) -> Option<&'a str> {
-            unsafe {
-                self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_VERSION_ID, None)
-            }
-        }
     }
 
-    impl flatbuffers::Verifiable for UntrackedStateRow<'_> {
+    impl flatbuffers::Verifiable for UntrackedStateRowValue<'_> {
         #[inline]
         fn run_verifier(
             verifier: &mut flatbuffers::Verifier,
@@ -192,21 +138,6 @@ mod flatbuffer {
         ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
             verifier
                 .visit_table(position)?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "entity_id",
-                    Self::VT_ENTITY_ID,
-                    true,
-                )?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "schema_key",
-                    Self::VT_SCHEMA_KEY,
-                    true,
-                )?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "file_id",
-                    Self::VT_FILE_ID,
-                    false,
-                )?
                 .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
                     "snapshot_content",
                     Self::VT_SNAPSHOT_CONTENT,
@@ -228,80 +159,104 @@ mod flatbuffer {
                     true,
                 )?
                 .visit_field::<bool>("global", Self::VT_GLOBAL, false)?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "version_id",
-                    Self::VT_VERSION_ID,
-                    true,
-                )?
                 .finish();
             Ok(())
         }
     }
 
-    pub(super) struct UntrackedStateRowArgs<'a> {
-        pub(super) entity_id: flatbuffers::WIPOffset<&'a str>,
-        pub(super) schema_key: flatbuffers::WIPOffset<&'a str>,
-        pub(super) file_id: Option<flatbuffers::WIPOffset<&'a str>>,
+    pub(super) struct UntrackedStateRowValueArgs<'a> {
         pub(super) snapshot_content: Option<flatbuffers::WIPOffset<&'a str>>,
         pub(super) metadata: Option<flatbuffers::WIPOffset<&'a str>>,
         pub(super) created_at: flatbuffers::WIPOffset<&'a str>,
         pub(super) updated_at: flatbuffers::WIPOffset<&'a str>,
         pub(super) global: bool,
-        pub(super) version_id: flatbuffers::WIPOffset<&'a str>,
     }
 
-    pub(super) fn create_untracked_state_row<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
+    pub(super) fn create_untracked_state_row_value<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
         builder: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
-        args: &'args UntrackedStateRowArgs<'args>,
-    ) -> flatbuffers::WIPOffset<UntrackedStateRow<'bldr>> {
+        args: &'args UntrackedStateRowValueArgs<'args>,
+    ) -> flatbuffers::WIPOffset<UntrackedStateRowValue<'bldr>> {
         let start = builder.start_table();
+        builder.push_slot::<bool>(UntrackedStateRowValue::VT_GLOBAL, args.global, false);
         builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-            UntrackedStateRow::VT_VERSION_ID,
-            args.version_id,
-        );
-        builder.push_slot::<bool>(UntrackedStateRow::VT_GLOBAL, args.global, false);
-        builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-            UntrackedStateRow::VT_UPDATED_AT,
+            UntrackedStateRowValue::VT_UPDATED_AT,
             args.updated_at,
         );
         builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-            UntrackedStateRow::VT_CREATED_AT,
+            UntrackedStateRowValue::VT_CREATED_AT,
             args.created_at,
         );
         if let Some(metadata) = args.metadata {
             builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-                UntrackedStateRow::VT_METADATA,
+                UntrackedStateRowValue::VT_METADATA,
                 metadata,
             );
         }
         if let Some(snapshot_content) = args.snapshot_content {
             builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-                UntrackedStateRow::VT_SNAPSHOT_CONTENT,
+                UntrackedStateRowValue::VT_SNAPSHOT_CONTENT,
                 snapshot_content,
             );
         }
-        if let Some(file_id) = args.file_id {
-            builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-                UntrackedStateRow::VT_FILE_ID,
-                file_id,
-            );
-        }
-        builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-            UntrackedStateRow::VT_SCHEMA_KEY,
-            args.schema_key,
-        );
-        builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-            UntrackedStateRow::VT_ENTITY_ID,
-            args.entity_id,
-        );
         let offset = builder.end_table(start);
         flatbuffers::WIPOffset::new(offset.value())
     }
 
     #[inline]
-    pub(super) fn root_as_untracked_state_row(
+    pub(super) fn root_as_untracked_state_row_value(
         bytes: &[u8],
-    ) -> Result<UntrackedStateRow<'_>, flatbuffers::InvalidFlatbuffer> {
-        flatbuffers::root::<UntrackedStateRow>(bytes)
+    ) -> Result<UntrackedStateRowValue<'_>, flatbuffers::InvalidFlatbuffer> {
+        flatbuffers::root::<UntrackedStateRowValue>(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entity_identity::EntityIdentity;
+
+    fn row() -> UntrackedStateRow {
+        UntrackedStateRow {
+            entity_id: EntityIdentity::single("entity-a"),
+            schema_key: "schema-a".to_string(),
+            file_id: Some("file-a".to_string()),
+            snapshot_content: Some("{\"value\":1}".to_string()),
+            metadata: None,
+            created_at: "2026-05-12T00:00:00Z".to_string(),
+            updated_at: "2026-05-12T00:00:01Z".to_string(),
+            global: false,
+            version_id: "version-a".to_string(),
+        }
+    }
+
+    #[test]
+    fn row_value_omits_identity_and_decodes_from_supplied_identity() {
+        let row = row();
+        let encoded = encode_row_value_ref(row.as_ref()).expect("row value should encode");
+        let encoded_text = String::from_utf8_lossy(&encoded);
+
+        assert!(encoded_text.contains("{\"value\":1}"));
+        assert!(!encoded_text.contains("entity-a"));
+        assert!(!encoded_text.contains("schema-a"));
+        assert!(!encoded_text.contains("file-a"));
+        assert!(!encoded_text.contains("version-a"));
+
+        let supplied_identity = UntrackedStateIdentity {
+            entity_id: EntityIdentity::single("entity-from-key"),
+            schema_key: "schema-from-key".to_string(),
+            file_id: Some("file-from-key".to_string()),
+            version_id: "version-from-key".to_string(),
+        };
+        let decoded =
+            decode_row_value(&encoded, supplied_identity).expect("row value should decode");
+
+        assert_eq!(decoded.entity_id, EntityIdentity::single("entity-from-key"));
+        assert_eq!(decoded.schema_key, "schema-from-key");
+        assert_eq!(decoded.file_id.as_deref(), Some("file-from-key"));
+        assert_eq!(decoded.version_id, "version-from-key");
+        assert_eq!(decoded.snapshot_content.as_deref(), Some("{\"value\":1}"));
+        assert_eq!(decoded.created_at, row.created_at);
+        assert_eq!(decoded.updated_at, row.updated_at);
+        assert_eq!(decoded.global, row.global);
     }
 }
