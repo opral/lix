@@ -359,9 +359,13 @@ where
         if row.snapshot_content.is_none() {
             group.delete(key);
         } else {
-            group.put(key, crate::untracked_state::codec::encode_row_value_ref(row)?);
+            group.put(
+                key,
+                crate::untracked_state::codec::encode_row_value_ref(row)?,
+            );
         }
     }
+    group.sort_point_ops_by_key();
     writes.push_group(group);
     Ok(())
 }
