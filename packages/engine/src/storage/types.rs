@@ -385,23 +385,20 @@ impl KvWriteBatch {
 
     pub(crate) fn put(
         &mut self,
-        namespace: impl Into<String>,
+        namespace: &'static str,
         key: impl Into<Vec<u8>>,
         value: impl Into<Vec<u8>>,
     ) {
-        let namespace = namespace.into();
         let group = self.group_mut(namespace);
         group.put(key.into(), value.into());
     }
 
-    pub(crate) fn delete(&mut self, namespace: impl Into<String>, key: impl Into<Vec<u8>>) {
-        let namespace = namespace.into();
+    pub(crate) fn delete(&mut self, namespace: &'static str, key: impl Into<Vec<u8>>) {
         let group = self.group_mut(namespace);
         group.delete(key.into());
     }
 
-    pub(crate) fn delete_range(&mut self, namespace: impl Into<String>, range: KvScanRange) {
-        let namespace = namespace.into();
+    pub(crate) fn delete_range(&mut self, namespace: &'static str, range: KvScanRange) {
         let group = self.group_mut(namespace);
         group.delete_range(range);
     }
@@ -410,7 +407,7 @@ impl KvWriteBatch {
         self.groups.iter().all(KvWriteGroup::is_empty)
     }
 
-    fn group_mut(&mut self, namespace: String) -> &mut KvWriteGroup {
+    fn group_mut(&mut self, namespace: &'static str) -> &mut KvWriteGroup {
         if let Some(index) = self
             .groups
             .iter()
@@ -436,7 +433,7 @@ impl From<KvWriteBatch> for backend::BackendKvWriteBatch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KvWriteGroup {
-    namespace: String,
+    namespace: &'static str,
     ops: Vec<KvWriteOp>,
 }
 
@@ -449,7 +446,7 @@ pub(crate) enum KvWriteOp {
 
 impl From<KvWriteGroup> for backend::BackendKvWriteGroup {
     fn from(group: KvWriteGroup) -> Self {
-        let mut backend_group = Self::new(group.namespace);
+        let mut backend_group = Self::new(group.namespace.to_string());
         for op in group.ops {
             backend_group.push(op.into());
         }
@@ -470,9 +467,9 @@ impl From<KvWriteOp> for backend::BackendKvWriteOp {
 }
 
 impl KvWriteGroup {
-    pub(crate) fn new(namespace: impl Into<String>) -> Self {
+    pub(crate) fn new(namespace: &'static str) -> Self {
         Self {
-            namespace: namespace.into(),
+            namespace,
             ops: Vec::new(),
         }
     }
