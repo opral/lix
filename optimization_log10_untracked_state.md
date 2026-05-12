@@ -1871,3 +1871,93 @@ filtered scans share this chunk size, and concrete artifact references. The
 comment and log now call out 2048 keys / 2049 SQLite parameters, the filtered
 scan scope, and bounded batching references from Turso and GreptimeDB artifacts.
 ```
+
+## Optimization 19: Sort Untracked Point Writes By Key
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+SQLite/RocksDB write locality for untracked insert/update batches
+```
+
+Change:
+
+```text
+Untracked row staging now stable-sorts the staged point write group by encoded
+storage key before pushing it into the write set. Same-key operations keep their
+original order, preserving last-writer-wins behavior, while independent keys
+are written in physical key order.
+```
+
+This is a clean internal ordering change: it does not change the key format,
+value format, logical I/O, or backend API. The database-storage precedent is
+ordered bulk mutation: Dolt's prolly tree patcher asserts patches are sorted by
+key for tree construction and patch traversal
+(`artifact/dolt/go/store/prolly/tree/tree_patcher.go`), and its mutable-map
+tests include bulk insert and mixed mutation cases
+(`artifact/dolt/go/store/prolly/mutable_map_write_test.go`). Here the stable
+sort gives SQLite's `WITHOUT ROWID` B-tree and RocksDB's write path a locality
+friendly mutation order while preserving observable same-key ordering.
+
+This is not a universal write-staging CPU win: the in-memory storage benchmark
+regresses slightly because it pays sort CPU without a backend locality benefit.
+The CRUD win comes from applying the already-staged batch to ordered backends in
+physical key order.
+
+Verification:
+
+```sh
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine sort_point_ops_by_key_preserves_same_key_order
+cargo test -p lix_engine untracked_state --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(raw_sqlite|lix_sqlite|lix_rocksdb)/(smoke|real_workload)/(insert_all_rows|update_all_rows|delete_all_rows)/((1k)|(10k))'
+cargo bench -p lix_engine --features storage-benches --bench storage -- 'storage/untracked_state/write_rows/10k'
+LIX_UNTRACKED_STATE_CRUD_IO=real_workload cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+```
+
+CRUD timing scoreboard:
+
+| backend | workload | operation | after timing | criterion change |
+| --- | --- | --- | ---: | ---: |
+| Raw SQLite | real_workload/10k | `insert_all_rows` | 15.895-16.133 ms | baseline rerun |
+| Raw SQLite | real_workload/10k | `update_all_rows` | 33.304-33.840 ms | baseline rerun |
+| Raw SQLite | real_workload/10k | `delete_all_rows` | 11.137-11.663 ms | baseline rerun |
+| Lix SQLite | smoke/1k | `insert_all_rows` | 5.9955-6.0372 ms | -5.1291% to -3.1555% |
+| Lix SQLite | smoke/1k | `update_all_rows` | 5.2671-5.3644 ms | no change |
+| Lix SQLite | smoke/1k | `delete_all_rows` | 4.7058-4.7534 ms | no change |
+| Lix RocksDB | smoke/1k | `insert_all_rows` | 2.7324-2.7764 ms | -7.9693% to -4.8101% |
+| Lix RocksDB | smoke/1k | `update_all_rows` | 1.9376-1.9641 ms | no change |
+| Lix RocksDB | smoke/1k | `delete_all_rows` | 755.54-780.90 us | no change |
+| Lix SQLite | real_workload/10k | `insert_all_rows` | 27.334-28.621 ms | improved vs pre-sort 33.796-34.597 ms |
+| Lix SQLite | real_workload/10k | `update_all_rows` | 23.670-24.306 ms | -28.117% to -25.169% |
+| Lix SQLite | real_workload/10k | `delete_all_rows` | 16.893-18.402 ms | not affected by sorted staging; noisy regression |
+| Lix RocksDB | real_workload/10k | `insert_all_rows` | 14.000-14.418 ms | -10.123% to -7.1869% |
+| Lix RocksDB | real_workload/10k | `update_all_rows` | 17.039-17.382 ms | no change |
+| Lix RocksDB | real_workload/10k | `delete_all_rows` | 3.2595-3.6471 ms | not affected by sorted staging; noisy improvement |
+
+Storage API timing scoreboard:
+
+| operation | after timing | criterion change |
+| --- | ---: | ---: |
+| `storage/untracked_state/write_rows/10k` | 13.803-13.963 ms | +2.2178% to +4.1553%; in-memory staging pays sort CPU without backend locality benefit |
+
+Logical I/O scoreboard:
+
+| workload | backend | operation | io ops | io bytes/row | note |
+| --- | --- | --- | ---: | ---: | --- |
+| real_workload/10k | Lix SQLite | `insert_all_rows` | 1 | 357.18 | unchanged logical batch and byte format |
+| real_workload/10k | Lix SQLite | `update_all_rows` | 1 | 289.79 | unchanged logical batch and byte format |
+| real_workload/10k | Lix RocksDB | `insert_all_rows` | 1 | 357.18 | unchanged logical batch and byte format |
+| real_workload/10k | Lix RocksDB | `update_all_rows` | 1 | 289.79 | unchanged logical batch and byte format |
+
+Review:
+
+```text
+Sub-agent review reported HIGH None and MEDIUM None. LOW feedback asked for a
+sharper helper contract, more explicit benchmark interpretation, and more
+precise artifact wording. The helper now panics if a range delete is passed to
+the point-op sorter, and this log now calls the Dolt reference an ordered bulk
+mutation precedent while explicitly noting the in-memory staging tradeoff.
+```

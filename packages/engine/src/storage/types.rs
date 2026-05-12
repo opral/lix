@@ -516,8 +516,31 @@ impl KvWriteGroup {
         self.ops.is_empty()
     }
 
+    pub(crate) fn sort_point_ops_by_key(&mut self) {
+        if self
+            .ops
+            .iter()
+            .any(|op| matches!(op, KvWriteOp::DeleteRange { .. }))
+        {
+            panic!("range deletes are not point write operations");
+        }
+        // `sort_by` is stable, so repeated operations for the same key keep
+        // their original order and preserve last-writer-wins behavior.
+        self.ops
+            .sort_by(|left, right| write_point_op_key(left).cmp(write_point_op_key(right)));
+    }
+
     pub(crate) fn ops(&self) -> &[KvWriteOp] {
         &self.ops
+    }
+}
+
+fn write_point_op_key(op: &KvWriteOp) -> &[u8] {
+    match op {
+        KvWriteOp::Put { key, .. } | KvWriteOp::Delete { key } => key,
+        KvWriteOp::DeleteRange { .. } => {
+            unreachable!("range deletes are not point write operations")
+        }
     }
 }
 
@@ -564,10 +587,33 @@ mod tests {
             writes.batch.groups[0].ops[0],
             KvWriteOp::Delete { .. }
         ));
-        assert!(matches!(writes.batch.groups[0].ops[1], KvWriteOp::Put { .. }));
+        assert!(matches!(
+            writes.batch.groups[0].ops[1],
+            KvWriteOp::Put { .. }
+        ));
         assert!(matches!(
             writes.batch.groups[0].ops[2],
             KvWriteOp::DeleteRange { .. }
         ));
+    }
+
+    #[test]
+    fn sort_point_ops_by_key_preserves_same_key_order() {
+        let mut group = KvWriteGroup::new("ns");
+        group.put(b"b".to_vec(), b"first-b".to_vec());
+        group.put(b"a".to_vec(), b"first-a".to_vec());
+        group.delete(b"a".to_vec());
+        group.put(b"b".to_vec(), b"second-b".to_vec());
+
+        group.sort_point_ops_by_key();
+
+        assert!(matches!(group.ops[0], KvWriteOp::Put { ref key, .. } if key == b"a"));
+        assert!(matches!(group.ops[1], KvWriteOp::Delete { ref key } if key == b"a"));
+        assert!(
+            matches!(group.ops[2], KvWriteOp::Put { ref key, ref value } if key == b"b" && value == b"first-b")
+        );
+        assert!(
+            matches!(group.ops[3], KvWriteOp::Put { ref key, ref value } if key == b"b" && value == b"second-b")
+        );
     }
 }
