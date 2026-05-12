@@ -3025,7 +3025,6 @@ dependencies = [
  "codspeed-criterion-compat",
  "datafusion",
  "fastcdc",
- "flatbuffers",
  "futures-util",
  "globset",
  "iref",
