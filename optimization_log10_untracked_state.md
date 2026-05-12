@@ -1565,3 +1565,68 @@ broad schema/file filters. Re-review reported HIGH None and MEDIUM None. LOW
 feedback led to a namespace invariant check, a selectivity-gate comment, and a
 filtered full-scan limit/order test.
 ```
+
+## Optimization 15: Reserve Untracked Write Ops
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+write staging allocation overhead
+```
+
+Change:
+
+```text
+StorageWriteSet/KvWriteBatch can now reserve operation capacity for a namespace.
+Untracked `stage_rows` and `stage_delete_rows` reserve from the iterator lower
+bound before pushing thousands of Put/Delete ops. This keeps the public storage
+shape unchanged while avoiding repeated Vec growth in the write staging loop.
+Zero-size reserves are no-ops so empty staging does not create empty write
+groups.
+```
+
+The artifact precedent is conservative preallocation: Turso caps parsed log-op
+preallocation when counts come from data, but reserves exact write-buffer sizes
+after computing trusted sizes. Here the hint comes from internal bounded
+iterators over already-built rows, so reserving the lower bound is conservative.
+
+Verification:
+
+```sh
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine untracked_state --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/(insert_all_rows|update_all_rows|delete_one_by_pk)/1k'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/real_workload/(insert_all_rows|update_all_rows)/10k'
+```
+
+Smoke timing scoreboard:
+
+| backend | operation | after timing | criterion change |
+| --- | --- | ---: | ---: |
+| Lix SQLite | `insert_all_rows` | 6.1619-6.2883 ms | -10.373% to -6.5691% |
+| Lix SQLite | `update_all_rows` | 5.5052-5.5752 ms | no change |
+| Lix SQLite | `delete_one_by_pk` | 3.9391-4.0600 ms | no change |
+| Lix RocksDB | `insert_all_rows` | 2.8385-2.9012 ms | no change |
+| Lix RocksDB | `update_all_rows` | 1.9541-1.9905 ms | no change |
+| Lix RocksDB | `delete_one_by_pk` | 620.94-648.62 us | no change |
+
+Real-workload timing scoreboard:
+
+| backend | operation | after timing | criterion change |
+| --- | --- | ---: | ---: |
+| Lix SQLite | `insert_all_rows` | 33.097-34.801 ms | noisy, no confirmed change |
+| Lix SQLite | `update_all_rows` | 26.578-27.010 ms | no change |
+| Lix RocksDB | `insert_all_rows` | 15.744-15.995 ms | no change |
+| Lix RocksDB | `update_all_rows` | 17.554-18.019 ms | no change |
+
+Review:
+
+```text
+Sub-agent review reported HIGH None and MEDIUM None. LOW feedback noted that
+zero-size reserves should not create empty groups, which is now fixed, and
+called out that reserving from size_hint is appropriate for current internal
+bounded iterators but should stay conservative if exposed to untrusted iterator
+sources.
+```

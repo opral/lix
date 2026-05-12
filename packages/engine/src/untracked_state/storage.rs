@@ -346,6 +346,8 @@ pub(crate) fn stage_rows<'a, I>(writes: &mut StorageWriteSet, rows: I) -> Result
 where
     I: IntoIterator<Item = UntrackedStateRowRef<'a>>,
 {
+    let rows = rows.into_iter();
+    writes.reserve_namespace_ops(UNTRACKED_STATE_ROW_NAMESPACE, rows.size_hint().0);
     for row in rows {
         if row.snapshot_content.is_none() {
             let key = encode_untracked_state_row_key_ref(row.into());
@@ -366,6 +368,8 @@ pub(crate) fn stage_delete_rows<'a, I>(writes: &mut StorageWriteSet, identities:
 where
     I: IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
 {
+    let identities = identities.into_iter();
+    writes.reserve_namespace_ops(UNTRACKED_STATE_ROW_NAMESPACE, identities.size_hint().0);
     for identity in identities {
         let key = encode_untracked_state_row_key_ref(identity);
         writes.delete(UNTRACKED_STATE_ROW_NAMESPACE, key);
