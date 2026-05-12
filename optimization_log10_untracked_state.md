@@ -1274,3 +1274,114 @@ keys, rowid identity, or generated side effects. LOW feedback noted that the JS
 SQLite backend still uses UPSERT, so this result should be read as a Rust bench
 backend optimization only.
 ```
+
+## Optimization 11: Compact Untracked Row Value Codec
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+row-value encoding CPU and logical I/O
+```
+
+Change:
+
+```text
+Untracked row values now use a compact internal binary format instead of
+FlatBuffers. The format is `LXU1`, one flags byte, then varint length-prefixed
+UTF-8 components for optional snapshot_content, optional metadata, created_at,
+and updated_at. The key still owns identity columns, so the value contains only
+mutable row payload fields.
+
+This is a clean cut with no FlatBuffers fallback because Lix has not shipped.
+The direct `flatbuffers` dependency was removed from lix_engine; remaining
+Cargo.lock mentions are transitive through Arrow/DataFusion.
+```
+
+Reference principle:
+
+```text
+Internal storage records should keep hot-path codecs small, versioned, and
+fully validated. The format has an explicit magic/version (`LXU1`), rejects
+unknown flags, requires full input consumption, rejects invalid UTF-8, and uses
+canonical varint length validation. This mirrors the adjacent untracked key
+codec and follows the same bounded internal-codec posture seen in Dolt's store
+codec/manifest parsing under artifact/dolt.
+```
+
+Verification:
+
+```sh
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine untracked_state --features storage-benches
+cargo test -p lix_engine --test storage_accounting --features storage-benches -- --ignored untracked_state_accounting --nocapture
+cargo test -p lix_engine --test tmp_lix_key_value_amplification --features storage-benches
+LIX_UNTRACKED_STATE_CRUD_IO=all cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- --list
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(raw_sqlite|lix_sqlite|lix_rocksdb)/smoke/(insert_all_rows|select_all_rows|select_keys_only|update_all_rows)/1k'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/real_workload/(insert_all_rows|select_all_rows|update_all_rows)/10k'
+```
+
+Smoke timing scoreboard:
+
+| backend | operation | after timing | criterion change |
+| --- | --- | ---: | ---: |
+| Lix SQLite | `insert_all_rows` | 6.4354-6.6107 ms | -10.664% to -6.8696% |
+| Lix SQLite | `select_all_rows` | 4.5582-4.7986 ms | -5.2522% to -1.2870% |
+| Lix SQLite | `select_keys_only` | 4.2186-4.3133 ms | no change |
+| Lix SQLite | `update_all_rows` | 5.6305-6.0596 ms | -8.4335% to -1.4671% |
+| Lix RocksDB | `insert_all_rows` | 3.0046-3.0736 ms | -10.096% to -7.7090% |
+| Lix RocksDB | `select_all_rows` | 1.4239-1.4431 ms | -5.8842% to -3.0027% |
+| Lix RocksDB | `select_keys_only` | 1.1355-1.1718 ms | no change |
+| Lix RocksDB | `update_all_rows` | 2.0977-2.1151 ms | -12.821% to -11.064% |
+
+Real-workload timing scoreboard:
+
+| backend | operation | after timing | criterion change |
+| --- | --- | ---: | ---: |
+| Lix SQLite | `insert_all_rows` | 34.464-35.609 ms | -21.212% to -17.745% |
+| Lix SQLite | `select_all_rows` | 13.939-14.111 ms | -8.4006% to -5.0491% |
+| Lix SQLite | `update_all_rows` | 27.282-27.763 ms | -30.795% to -29.127% |
+| Lix RocksDB | `insert_all_rows` | 17.178-17.397 ms | -5.5327% to -3.4382% |
+| Lix RocksDB | `select_all_rows` | 10.329-10.538 ms | +5.2416% to +8.0680% |
+| Lix RocksDB | `update_all_rows` | 19.401-19.734 ms | -20.457% to -16.267% |
+
+Logical I/O scoreboard:
+
+| workload | operation | before bytes/row | after bytes/row | delta |
+| --- | --- | ---: | ---: | ---: |
+| smoke/1k | `insert_all_rows` | 976.38 | 926.29 | -50.09 |
+| smoke/1k | `select_all_rows` | 976.38 | 926.29 | -50.09 |
+| smoke/1k | `update_all_rows` | 336.62 | 286.48 | -50.14 |
+| real_workload/10k | `insert_all_rows` | 407.21 | 357.18 | -50.03 |
+| real_workload/10k | `select_all_rows` | 407.21 | 357.18 | -50.03 |
+| real_workload/10k | `update_all_rows` | 340.15 | 289.79 | -50.36 |
+
+Storage accounting:
+
+| workload | before row bytes | after row bytes | delta |
+| --- | ---: | ---: | ---: |
+| `write_rows_payload_small/10k` | 1,595,960 | 1,096,670 | -499,290 |
+| `write_rows_payload_1k/10k` | 11,440,000 | 10,940,000 | -500,000 |
+| `write_rows_payload_16k/1k` | 16,504,000 | 16,455,000 | -49,000 |
+| `write_rows_payload_128k/100` | 13,119,200 | 13,114,300 | -4,900 |
+
+Review:
+
+```text
+Initial review reported MEDIUM on non-canonical/overflow varint validation.
+The decoder now uses a u128 accumulator, checks usize overflow, and verifies
+canonical re-encoding before accepting a length. LOW feedback led to golden,
+metadata/global, trailing-byte, invalid UTF-8, non-canonical varint, and
+overflow tests, plus removal of the direct flatbuffers dependency. Re-review
+reported HIGH None and MEDIUM None.
+```
+
+Notes:
+
+```text
+The one negative result is real-workload RocksDB `select_all_rows`, which
+regressed by about 5-8% in this run despite lower logical bytes. The reviewer
+did not consider this a blocker because write/update wins are broad and the
+storage byte reduction is material, but it remains a follow-up profiling target.
+```

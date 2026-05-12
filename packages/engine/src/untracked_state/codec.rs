@@ -1,213 +1,176 @@
 use crate::untracked_state::{UntrackedStateIdentity, UntrackedStateRow, UntrackedStateRowRef};
 use crate::LixError;
 
-const UNTRACKED_STATE_VALUE_FILE_IDENTIFIER: &str = "LXUV";
+const ROW_VALUE_MAGIC: &[u8; 4] = b"LXU1";
+const FLAG_HAS_SNAPSHOT_CONTENT: u8 = 1 << 0;
+const FLAG_HAS_METADATA: u8 = 1 << 1;
+const FLAG_GLOBAL: u8 = 1 << 2;
 
 pub(crate) fn encode_row_value_ref(row: UntrackedStateRowRef<'_>) -> Result<Vec<u8>, LixError> {
-    let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(256);
-    let snapshot_content = row
-        .snapshot_content
-        .map(|value| builder.create_string(value));
-    let metadata = row.metadata.map(|value| builder.create_string(value));
-    let created_at = builder.create_string(row.created_at);
-    let updated_at = builder.create_string(row.updated_at);
+    let snapshot_content = row.snapshot_content.map(str::as_bytes);
+    let metadata = row.metadata.map(str::as_bytes);
+    let created_at = row.created_at.as_bytes();
+    let updated_at = row.updated_at.as_bytes();
+    let mut flags = 0;
+    if snapshot_content.is_some() {
+        flags |= FLAG_HAS_SNAPSHOT_CONTENT;
+    }
+    if metadata.is_some() {
+        flags |= FLAG_HAS_METADATA;
+    }
+    if row.global {
+        flags |= FLAG_GLOBAL;
+    }
 
-    let root = flatbuffer::create_untracked_state_row_value(
-        &mut builder,
-        &flatbuffer::UntrackedStateRowValueArgs {
-            snapshot_content,
-            metadata,
-            created_at,
-            updated_at,
-            global: row.global,
-        },
+    let mut out = Vec::with_capacity(
+        ROW_VALUE_MAGIC.len()
+            + 1
+            + encoded_component_len(snapshot_content.unwrap_or_default())
+            + encoded_component_len(metadata.unwrap_or_default())
+            + encoded_component_len(created_at)
+            + encoded_component_len(updated_at),
     );
-    builder.finish(root, Some(UNTRACKED_STATE_VALUE_FILE_IDENTIFIER));
-    Ok(builder.finished_data().to_vec())
+    out.extend_from_slice(ROW_VALUE_MAGIC);
+    out.push(flags);
+    if let Some(snapshot_content) = snapshot_content {
+        push_component(&mut out, snapshot_content);
+    }
+    if let Some(metadata) = metadata {
+        push_component(&mut out, metadata);
+    }
+    push_component(&mut out, created_at);
+    push_component(&mut out, updated_at);
+    Ok(out)
 }
 
 pub(crate) fn decode_row_value(
     bytes: &[u8],
     identity: UntrackedStateIdentity,
 ) -> Result<UntrackedStateRow, LixError> {
-    if bytes.len() < flatbuffers::SIZE_UOFFSET + flatbuffers::FILE_IDENTIFIER_LENGTH
-        || !flatbuffers::buffer_has_identifier(bytes, UNTRACKED_STATE_VALUE_FILE_IDENTIFIER, false)
+    if bytes.len() < ROW_VALUE_MAGIC.len() + 1
+        || bytes.get(..ROW_VALUE_MAGIC.len()) != Some(ROW_VALUE_MAGIC)
     {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "failed to decode untracked-state row value: invalid FlatBuffers file identifier",
+            "failed to decode untracked-state row value: invalid row value header",
         ));
     }
 
-    let value = flatbuffer::root_as_untracked_state_row_value(bytes).map_err(|error| {
-        LixError::new(
+    let flags = bytes[ROW_VALUE_MAGIC.len()];
+    if flags & !(FLAG_HAS_SNAPSHOT_CONTENT | FLAG_HAS_METADATA | FLAG_GLOBAL) != 0 {
+        return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("failed to decode untracked-state row value: {error}"),
-        )
-    })?;
+            "failed to decode untracked-state row value: invalid row value flags",
+        ));
+    }
+
+    let mut cursor = ROW_VALUE_MAGIC.len() + 1;
+    let snapshot_content = if flags & FLAG_HAS_SNAPSHOT_CONTENT != 0 {
+        Some(read_component(bytes, &mut cursor)?.to_string())
+    } else {
+        None
+    };
+    let metadata = if flags & FLAG_HAS_METADATA != 0 {
+        Some(read_component(bytes, &mut cursor)?.to_string())
+    } else {
+        None
+    };
+    let created_at = read_component(bytes, &mut cursor)?.to_string();
+    let updated_at = read_component(bytes, &mut cursor)?.to_string();
+    if cursor != bytes.len() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "failed to decode untracked-state row value: trailing bytes",
+        ));
+    }
 
     Ok(UntrackedStateRow {
         entity_id: identity.entity_id,
         schema_key: identity.schema_key,
         file_id: identity.file_id,
-        snapshot_content: value.snapshot_content().map(ToString::to_string),
-        metadata: value.metadata().map(ToString::to_string),
-        created_at: required_str(value.created_at(), "created_at")?.to_string(),
-        updated_at: required_str(value.updated_at(), "updated_at")?.to_string(),
-        global: value.global(),
+        snapshot_content,
+        metadata,
+        created_at,
+        updated_at,
+        global: flags & FLAG_GLOBAL != 0,
         version_id: identity.version_id,
     })
 }
 
-fn required_str<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str, LixError> {
-    value.ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("failed to decode untracked-state row value: missing required field `{field}`"),
-        )
+fn encoded_component_len(value: &[u8]) -> usize {
+    varint_len(value.len()) + value.len()
+}
+
+fn push_component(out: &mut Vec<u8>, value: &[u8]) {
+    push_varint_len(out, value.len());
+    out.extend_from_slice(value);
+}
+
+fn read_component<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a str, LixError> {
+    let len = read_varint_len(bytes, cursor)?;
+    let component = bytes
+        .get(*cursor..cursor.saturating_add(len))
+        .ok_or_else(|| {
+            LixError::unknown("failed to decode untracked-state row value: short value")
+        })?;
+    *cursor += len;
+    std::str::from_utf8(component).map_err(|error| {
+        LixError::unknown(format!(
+            "failed to decode untracked-state row value: invalid UTF-8: {error}"
+        ))
     })
 }
 
-mod flatbuffer {
-    #[derive(Copy, Clone, PartialEq)]
-    pub(super) struct UntrackedStateRowValue<'a> {
-        table: flatbuffers::Table<'a>,
+fn push_varint_len(out: &mut Vec<u8>, mut value: usize) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
     }
+    out.push(value as u8);
+}
 
-    impl<'a> flatbuffers::Follow<'a> for UntrackedStateRowValue<'a> {
-        type Inner = UntrackedStateRowValue<'a>;
-
-        #[inline]
-        unsafe fn follow(buf: &'a [u8], loc: usize) -> Self::Inner {
-            Self {
-                table: unsafe { flatbuffers::Table::new(buf, loc) },
+fn read_varint_len(bytes: &[u8], cursor: &mut usize) -> Result<usize, LixError> {
+    let start = *cursor;
+    let mut value = 0u128;
+    let mut shift = 0u32;
+    loop {
+        let byte = *bytes.get(*cursor).ok_or_else(|| {
+            LixError::unknown("failed to decode untracked-state row value: short varint")
+        })?;
+        *cursor += 1;
+        value |= u128::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            if value > usize::MAX as u128 {
+                return Err(LixError::unknown(
+                    "failed to decode untracked-state row value: length overflow",
+                ));
             }
-        }
-    }
-
-    impl<'a> UntrackedStateRowValue<'a> {
-        const VT_SNAPSHOT_CONTENT: flatbuffers::VOffsetT = 4;
-        const VT_METADATA: flatbuffers::VOffsetT = 6;
-        const VT_CREATED_AT: flatbuffers::VOffsetT = 8;
-        const VT_UPDATED_AT: flatbuffers::VOffsetT = 10;
-        const VT_GLOBAL: flatbuffers::VOffsetT = 12;
-
-        #[inline]
-        pub(super) fn snapshot_content(&self) -> Option<&'a str> {
-            unsafe {
-                self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_SNAPSHOT_CONTENT, None)
+            let value = value as usize;
+            let mut canonical = Vec::new();
+            push_varint_len(&mut canonical, value);
+            if bytes.get(start..*cursor) != Some(canonical.as_slice()) {
+                return Err(LixError::unknown(
+                    "failed to decode untracked-state row value: non-canonical length",
+                ));
             }
+            return Ok(value);
         }
-
-        #[inline]
-        pub(super) fn metadata(&self) -> Option<&'a str> {
-            unsafe {
-                self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_METADATA, None)
-            }
-        }
-
-        #[inline]
-        pub(super) fn created_at(&self) -> Option<&'a str> {
-            unsafe {
-                self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_CREATED_AT, None)
-            }
-        }
-
-        #[inline]
-        pub(super) fn updated_at(&self) -> Option<&'a str> {
-            unsafe {
-                self.table
-                    .get::<flatbuffers::ForwardsUOffset<&str>>(Self::VT_UPDATED_AT, None)
-            }
-        }
-
-        #[inline]
-        pub(super) fn global(&self) -> bool {
-            unsafe { self.table.get::<bool>(Self::VT_GLOBAL, Some(false)) }.unwrap_or(false)
+        shift += 7;
+        if shift >= 128 {
+            return Err(LixError::unknown(
+                "failed to decode untracked-state row value: length overflow",
+            ));
         }
     }
+}
 
-    impl flatbuffers::Verifiable for UntrackedStateRowValue<'_> {
-        #[inline]
-        fn run_verifier(
-            verifier: &mut flatbuffers::Verifier,
-            position: usize,
-        ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
-            verifier
-                .visit_table(position)?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "snapshot_content",
-                    Self::VT_SNAPSHOT_CONTENT,
-                    false,
-                )?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "metadata",
-                    Self::VT_METADATA,
-                    false,
-                )?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "created_at",
-                    Self::VT_CREATED_AT,
-                    true,
-                )?
-                .visit_field::<flatbuffers::ForwardsUOffset<&str>>(
-                    "updated_at",
-                    Self::VT_UPDATED_AT,
-                    true,
-                )?
-                .visit_field::<bool>("global", Self::VT_GLOBAL, false)?
-                .finish();
-            Ok(())
-        }
+fn varint_len(mut value: usize) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        len += 1;
+        value >>= 7;
     }
-
-    pub(super) struct UntrackedStateRowValueArgs<'a> {
-        pub(super) snapshot_content: Option<flatbuffers::WIPOffset<&'a str>>,
-        pub(super) metadata: Option<flatbuffers::WIPOffset<&'a str>>,
-        pub(super) created_at: flatbuffers::WIPOffset<&'a str>,
-        pub(super) updated_at: flatbuffers::WIPOffset<&'a str>,
-        pub(super) global: bool,
-    }
-
-    pub(super) fn create_untracked_state_row_value<'bldr: 'args, 'args: 'mut_bldr, 'mut_bldr>(
-        builder: &'mut_bldr mut flatbuffers::FlatBufferBuilder<'bldr>,
-        args: &'args UntrackedStateRowValueArgs<'args>,
-    ) -> flatbuffers::WIPOffset<UntrackedStateRowValue<'bldr>> {
-        let start = builder.start_table();
-        builder.push_slot::<bool>(UntrackedStateRowValue::VT_GLOBAL, args.global, false);
-        builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-            UntrackedStateRowValue::VT_UPDATED_AT,
-            args.updated_at,
-        );
-        builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-            UntrackedStateRowValue::VT_CREATED_AT,
-            args.created_at,
-        );
-        if let Some(metadata) = args.metadata {
-            builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-                UntrackedStateRowValue::VT_METADATA,
-                metadata,
-            );
-        }
-        if let Some(snapshot_content) = args.snapshot_content {
-            builder.push_slot_always::<flatbuffers::WIPOffset<_>>(
-                UntrackedStateRowValue::VT_SNAPSHOT_CONTENT,
-                snapshot_content,
-            );
-        }
-        let offset = builder.end_table(start);
-        flatbuffers::WIPOffset::new(offset.value())
-    }
-
-    #[inline]
-    pub(super) fn root_as_untracked_state_row_value(
-        bytes: &[u8],
-    ) -> Result<UntrackedStateRowValue<'_>, flatbuffers::InvalidFlatbuffer> {
-        flatbuffers::root::<UntrackedStateRowValue>(bytes)
-    }
+    len
 }
 
 #[cfg(test)]
@@ -258,5 +221,79 @@ mod tests {
         assert_eq!(decoded.created_at, row.created_at);
         assert_eq!(decoded.updated_at, row.updated_at);
         assert_eq!(decoded.global, row.global);
+    }
+
+    #[test]
+    fn row_value_roundtrips_metadata_and_global() {
+        let mut row = row();
+        row.metadata = Some("{\"source\":\"test\"}".to_string());
+        row.global = true;
+        let encoded = encode_row_value_ref(row.as_ref()).expect("row value should encode");
+        let decoded = decode_row_value(
+            &encoded,
+            UntrackedStateIdentity {
+                entity_id: row.entity_id.clone(),
+                schema_key: row.schema_key.clone(),
+                file_id: row.file_id.clone(),
+                version_id: row.version_id.clone(),
+            },
+        )
+        .expect("row value should decode");
+
+        assert_eq!(decoded.metadata, row.metadata);
+        assert!(decoded.global);
+    }
+
+    #[test]
+    fn row_value_rejects_malformed_bytes() {
+        let identity = UntrackedStateIdentity {
+            entity_id: EntityIdentity::single("entity-a"),
+            schema_key: "schema-a".to_string(),
+            file_id: None,
+            version_id: "version-a".to_string(),
+        };
+
+        assert!(decode_row_value(b"BAD!", identity.clone()).is_err());
+        assert!(decode_row_value(b"LXU1\x80", identity.clone()).is_err());
+        assert!(decode_row_value(b"LXU1\x00\xff", identity.clone()).is_err());
+        assert!(decode_row_value(b"LXU1\x00\x80\x00", identity.clone()).is_err());
+        let mut overflow = b"LXU1\x00".to_vec();
+        overflow.extend(std::iter::repeat_n(0xff, 19));
+        overflow.push(0x01);
+        assert!(decode_row_value(&overflow, identity).is_err());
+    }
+
+    #[test]
+    fn row_value_rejects_trailing_bytes_and_invalid_utf8() {
+        let identity = UntrackedStateIdentity {
+            entity_id: EntityIdentity::single("entity-a"),
+            schema_key: "schema-a".to_string(),
+            file_id: None,
+            version_id: "version-a".to_string(),
+        };
+        let row = row();
+        let mut encoded = encode_row_value_ref(row.as_ref()).expect("row value should encode");
+        encoded.push(0);
+        assert!(decode_row_value(&encoded, identity.clone()).is_err());
+
+        let invalid_created_at = b"LXU1\x00\x01\xff\x01x".to_vec();
+        assert!(decode_row_value(&invalid_created_at, identity).is_err());
+    }
+
+    #[test]
+    fn row_value_has_stable_golden_encoding() {
+        let mut row = row();
+        row.snapshot_content = Some("abc".to_string());
+        row.metadata = Some("m".to_string());
+        row.created_at = "c".to_string();
+        row.updated_at = "u".to_string();
+        row.global = true;
+
+        let encoded = encode_row_value_ref(row.as_ref()).expect("row value should encode");
+        assert_eq!(
+            encoded,
+            b"LXU1\x07\x03abc\x01m\x01c\x01u",
+            "row value format should remain compact and intentional"
+        );
     }
 }
