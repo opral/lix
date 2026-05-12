@@ -1,5 +1,7 @@
 use crate::storage::KvScanRange;
-use crate::storage::{KvGetGroup, KvGetRequest, KvScanRequest, StorageReader, StorageWriteSet};
+use crate::storage::{
+    KvGetGroup, KvGetRequest, KvScanRequest, KvWriteGroup, StorageReader, StorageWriteSet,
+};
 use crate::untracked_state::{
     MaterializedUntrackedStateRow, UntrackedMaterializationProjection, UntrackedStateIdentity,
     UntrackedStateIdentityRef, UntrackedStateRow, UntrackedStateRowRef, UntrackedStateRowRequest,
@@ -347,20 +349,17 @@ where
     I: IntoIterator<Item = UntrackedStateRowRef<'a>>,
 {
     let rows = rows.into_iter();
-    writes.reserve_namespace_ops(UNTRACKED_STATE_ROW_NAMESPACE, rows.size_hint().0);
+    let mut group = KvWriteGroup::new(UNTRACKED_STATE_ROW_NAMESPACE);
+    group.reserve(rows.size_hint().0);
     for row in rows {
+        let key = encode_untracked_state_row_key_ref(row.into());
         if row.snapshot_content.is_none() {
-            let key = encode_untracked_state_row_key_ref(row.into());
-            writes.delete(UNTRACKED_STATE_ROW_NAMESPACE, key);
+            group.delete(key);
         } else {
-            let key = encode_untracked_state_row_key_ref(row.into());
-            writes.put(
-                UNTRACKED_STATE_ROW_NAMESPACE,
-                key,
-                crate::untracked_state::codec::encode_row_value_ref(row)?,
-            );
+            group.put(key, crate::untracked_state::codec::encode_row_value_ref(row)?);
         }
     }
+    writes.push_group(group);
     Ok(())
 }
 
@@ -369,11 +368,13 @@ where
     I: IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
 {
     let identities = identities.into_iter();
-    writes.reserve_namespace_ops(UNTRACKED_STATE_ROW_NAMESPACE, identities.size_hint().0);
+    let mut group = KvWriteGroup::new(UNTRACKED_STATE_ROW_NAMESPACE);
+    group.reserve(identities.size_hint().0);
     for identity in identities {
         let key = encode_untracked_state_row_key_ref(identity);
-        writes.delete(UNTRACKED_STATE_ROW_NAMESPACE, key);
+        group.delete(key);
     }
+    writes.push_group(group);
 }
 
 #[allow(dead_code)]

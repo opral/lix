@@ -1713,3 +1713,99 @@ unsigned LEB128-style representation, so replacing re-encode-and-compare with
 the consumed-length check preserves malformed-varint rejection while removing
 per-varint allocation.
 ```
+
+## Optimization 17: Build Untracked Write Group Once
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+write staging CPU for same-namespace untracked batches
+```
+
+Change:
+
+```text
+Untracked `stage_rows` and `stage_delete_rows` now build one `KvWriteGroup`
+for the untracked namespace and push it into the write set after staging. This
+avoids a per-row namespace lookup in `StorageWriteSet::put/delete`.
+
+`StorageWriteSet::push_group` merges with an existing same-namespace group to
+preserve same-namespace operation order if callers compose multiple staging
+helpers. It pushes a new group directly when no matching namespace exists, so
+the reserved operation allocation from staging is preserved.
+
+The previous `reserve_namespace_ops` compatibility surface was removed because
+the group-once path replaced its only use.
+```
+
+The artifact precedent is a single coherent transaction write set: database
+write paths accumulate ordered mutations and flush them as a batch, rather than
+re-discovering the target collection for each row. The patch keeps one
+same-namespace operation stream, which also follows the delete-range guidance
+from Greptime-style KV backends where range deletes are first-class operations
+with conformance coverage.
+
+Verification:
+
+```sh
+cargo check -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine push_group_merges_with_existing_namespace_preserving_same_namespace_order
+cargo test -p lix_engine untracked_state --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench storage -- 'storage/untracked_state/write_rows/10k'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/(smoke|real_workload)/(insert_all_rows|update_all_rows|delete_one_by_pk)/((1k)|(10k))'
+LIX_UNTRACKED_STATE_CRUD_IO=real_workload cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+```
+
+Storage API timing scoreboard:
+
+| operation | after timing | criterion change |
+| --- | ---: | ---: |
+| `storage/untracked_state/write_rows/10k` | 13.750-13.877 ms | final rerun no change vs fixed patch; initial candidate showed -11.893% to -10.671% vs prior committed baseline |
+
+CRUD timing scoreboard:
+
+| backend | workload | operation | after timing | criterion change |
+| --- | --- | --- | ---: | ---: |
+| Lix SQLite | smoke/1k | `insert_all_rows` | 6.4785-6.5531 ms | noisy regression on final rerun |
+| Lix SQLite | smoke/1k | `update_all_rows` | 5.2559-5.8523 ms | no change |
+| Lix SQLite | smoke/1k | `delete_one_by_pk` | 3.6881-3.7679 ms | no change |
+| Lix RocksDB | smoke/1k | `insert_all_rows` | 2.8482-2.8600 ms | -3.1032% to -1.0621% |
+| Lix RocksDB | smoke/1k | `update_all_rows` | 1.9511-1.9779 ms | no change |
+| Lix RocksDB | smoke/1k | `delete_one_by_pk` | 610.51-640.97 us | no change |
+| Lix SQLite | real_workload/10k | `insert_all_rows` | 32.996-33.908 ms | no change |
+| Lix SQLite | real_workload/10k | `update_all_rows` | 26.521-26.668 ms | no change |
+| Lix SQLite | real_workload/10k | `delete_one_by_pk` | 3.3077-3.4608 ms | no change |
+| Lix RocksDB | real_workload/10k | `insert_all_rows` | 15.877-16.045 ms | no change |
+| Lix RocksDB | real_workload/10k | `update_all_rows` | 17.837-18.264 ms | noisy regression |
+| Lix RocksDB | real_workload/10k | `delete_one_by_pk` | 2.3824-2.5173 ms | no change |
+
+Logical I/O scoreboard:
+
+| workload | backend | operation | io ops | io bytes/row | note |
+| --- | --- | --- | ---: | ---: | --- |
+| real_workload/10k | Lix SQLite | `insert_all_rows` | 1 | 357.18 | unchanged logical batch and byte format |
+| real_workload/10k | Lix SQLite | `update_all_rows` | 1 | 289.79 | unchanged logical batch and byte format |
+| real_workload/10k | Lix SQLite | `delete_one_by_pk` | 1 | 31.00 | unchanged logical batch and byte format |
+| real_workload/10k | Lix RocksDB | `insert_all_rows` | 1 | 357.18 | unchanged logical batch and byte format |
+| real_workload/10k | Lix RocksDB | `update_all_rows` | 1 | 289.79 | unchanged logical batch and byte format |
+| real_workload/10k | Lix RocksDB | `delete_one_by_pk` | 1 | 31.00 | unchanged logical batch and byte format |
+
+Review:
+
+```text
+Initial sub-agent review reported HIGH on default builds failing because
+`KvWriteGroup` was only re-exported under `storage-benches`, and MEDIUM on
+duplicate same-namespace groups weakening operation ordering when later writes
+used the legacy mutators. The patch now re-exports `KvWriteGroup`
+unconditionally, merges pushed groups into existing same-namespace groups,
+removes the dead reserve API, and adds a unit test covering pushed groups
+followed by a later same-namespace range delete.
+
+Re-review reported one MEDIUM performance concern: the merge implementation
+reallocated even when no same-namespace group existed. The final patch pushes
+the prepared group directly on first namespace use and only merges on duplicate
+namespaces. Final re-review reported HIGH None, MEDIUM None, and LOW None.
+```
