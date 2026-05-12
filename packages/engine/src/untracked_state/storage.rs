@@ -41,7 +41,8 @@ pub(crate) async fn load_rows(
         let Some(identity) = identity_from_request(request) else {
             continue;
         };
-        candidates.push((index, encode_untracked_state_row_key(&identity)));
+        let key = encode_untracked_state_row_key(&identity);
+        candidates.push((index, identity, key));
     }
     for chunk in candidates.chunks(LOAD_ROWS_BATCH_SIZE) {
         load_rows_chunk(store, chunk, &mut rows).await?;
@@ -71,14 +72,14 @@ async fn load_single_row(
     let Some(bytes) = bytes else {
         return Ok(None);
     };
-    let row = crate::untracked_state::codec::decode_row(&bytes)?;
+    let row = crate::untracked_state::codec::decode_row_value(&bytes, identity)?;
     crate::untracked_state::materialize_row(row, &UntrackedMaterializationProjection::full())
         .map(Some)
 }
 
 async fn load_rows_chunk(
     store: &mut impl StorageReader,
-    candidates: &[(usize, Vec<u8>)],
+    candidates: &[(usize, UntrackedStateIdentity, Vec<u8>)],
     rows: &mut [Option<MaterializedUntrackedStateRow>],
 ) -> Result<(), LixError> {
     if candidates.is_empty() {
@@ -88,7 +89,7 @@ async fn load_rows_chunk(
         .get_values(KvGetRequest {
             groups: vec![KvGetGroup {
                 namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
-                keys: candidates.iter().map(|(_, key)| key.clone()).collect(),
+                keys: candidates.iter().map(|(_, _, key)| key.clone()).collect(),
             }],
         })
         .await?;
@@ -118,11 +119,11 @@ async fn load_rows_chunk(
             ),
         ));
     }
-    for ((index, _), bytes) in candidates.iter().zip(group.values_iter()) {
+    for ((index, identity, _), bytes) in candidates.iter().zip(group.values_iter()) {
         let Some(bytes) = bytes else {
             continue;
         };
-        let row = crate::untracked_state::codec::decode_row(bytes)?;
+        let row = crate::untracked_state::codec::decode_row_value(bytes, identity.clone())?;
         rows[*index] = Some(crate::untracked_state::materialize_row(
             row,
             &UntrackedMaterializationProjection::full(),
@@ -203,7 +204,7 @@ where
             writes.put(
                 UNTRACKED_STATE_ROW_NAMESPACE,
                 key,
-                crate::untracked_state::codec::encode_row_ref(row)?,
+                crate::untracked_state::codec::encode_row_value_ref(row)?,
             );
         }
     }
@@ -224,16 +225,20 @@ async fn scan_all_canonical_rows(
     store: &mut impl StorageReader,
 ) -> Result<Vec<UntrackedStateRow>, LixError> {
     let page = store
-        .scan_values(KvScanRequest {
+        .scan_entries(KvScanRequest {
             namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
             range: KvScanRange::prefix(Vec::new()),
             after: None,
             limit: usize::MAX,
         })
         .await?;
-    page.values
+    page.keys
         .iter()
-        .map(crate::untracked_state::codec::decode_row)
+        .zip(page.values.iter())
+        .map(|(key, value)| {
+            let identity = decode_untracked_state_row_key(key)?;
+            crate::untracked_state::codec::decode_row_value(value, identity)
+        })
         .collect()
 }
 
@@ -273,7 +278,6 @@ fn encode_untracked_state_row_key(identity: &UntrackedStateIdentity) -> Vec<u8> 
     encode_untracked_state_row_key_ref(identity.as_ref())
 }
 
-#[cfg(test)]
 fn decode_untracked_state_row_key(bytes: &[u8]) -> Result<UntrackedStateIdentity, LixError> {
     let mut cursor = 0;
     let version_id = read_component(bytes, &mut cursor)?.to_string();
@@ -345,7 +349,6 @@ fn push_component(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(bytes);
 }
 
-#[cfg(test)]
 fn read_component<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a str, LixError> {
     let len_bytes = bytes
         .get(*cursor..cursor.saturating_add(4))

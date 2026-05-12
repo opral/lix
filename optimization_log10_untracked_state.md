@@ -533,3 +533,124 @@ again. The side index was introduced after the baseline and Lix has not shipped,
 so this is an unshipped clean-cut removal with no migration for orphaned local
 developer data.
 ```
+
+## Optimization 4: Compact Row Values
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+row-value payload bytes for reads and writes
+```
+
+Change:
+
+```text
+Untracked-state values no longer duplicate identity fields that are already in
+the physical key. The row value stores only snapshot_content, metadata,
+created_at, updated_at, and global. Point reads decode from the requested
+identity plus the compact value. Scans now use entry scans so they can decode
+identity from each key and row state from each value.
+
+The value file identifier changed from LXUS to LXUV. Lix has not shipped yet,
+so this is a clean-cut storage layout replacement rather than a compatibility
+migration.
+```
+
+Reference principle:
+
+```text
+This follows a storage-normalization principle from the artifact databases:
+avoid storing the same logical columns in both index key and row payload when
+the read path naturally has both. Dolt's covering/non-covering index readers
+separate projected columns available from key/value tuples from columns that
+require primary-row access (`artifact/dolt/go/libraries/doltcore/sqle/index/prolly_index_iter.go`
+and `artifact/dolt/go/libraries/doltcore/sqle/index/index_reader.go`).
+```
+
+Verification:
+
+```sh
+cargo test -p lix_engine untracked_state::storage --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud --no-run
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/no_such_benchmark'
+LIX_UNTRACKED_STATE_CRUD_IO=real_workload cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/no_such_benchmark'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/(insert_all_rows|select_all_rows|select_keys_only|select_one_by_pk|select_all_by_pk|update_all_rows|update_one_by_pk)/1k'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/real_workload/(insert_all_rows|select_all_rows|select_all_by_pk|update_all_rows)/10k'
+```
+
+Smoke I/O scoreboard:
+
+| backend     | operation          | before bytes | after bytes | byte delta |
+| ----------- | ------------------ | -----------: | ----------: | ---------: |
+| Lix SQLite  | `insert_all_rows`  |    1,114,072 |     988,380 |     -11.3% |
+| Lix SQLite  | `select_all_rows`  |    1,020,868 |     988,380 |      -3.2% |
+| Lix SQLite  | `select_one_by_pk` |          478 |         350 |     -26.8% |
+| Lix SQLite  | `select_all_by_pk` |    1,114,072 |     988,380 |     -11.3% |
+| Lix SQLite  | `update_all_rows`  |      474,316 |     348,624 |     -26.5% |
+| Lix SQLite  | `update_one_by_pk` |          271 |         195 |     -28.0% |
+| Lix RocksDB | `insert_all_rows`  |    1,114,072 |     988,380 |     -11.3% |
+| Lix RocksDB | `select_all_rows`  |    1,020,868 |     988,380 |      -3.2% |
+| Lix RocksDB | `select_one_by_pk` |          478 |         350 |     -26.8% |
+| Lix RocksDB | `select_all_by_pk` |    1,114,072 |     988,380 |     -11.3% |
+| Lix RocksDB | `update_all_rows`  |      474,316 |     348,624 |     -26.5% |
+| Lix RocksDB | `update_one_by_pk` |          271 |         195 |     -28.0% |
+
+Real-workload I/O scoreboard:
+
+| backend     | operation          | before bytes | after bytes | byte delta |
+| ----------- | ------------------ | -----------: | ----------: | ---------: |
+| Lix SQLite  | `insert_all_rows`  |    5,460,528 |   4,191,840 |     -23.2% |
+| Lix SQLite  | `select_all_rows`  |    4,516,832 |   4,191,840 |      -7.2% |
+| Lix SQLite  | `select_one_by_pk` |          359 |         247 |     -31.2% |
+| Lix SQLite  | `select_all_by_pk` |    5,460,528 |   4,191,840 |     -23.2% |
+| Lix SQLite  | `update_all_rows`  |    4,789,908 |   3,521,220 |     -26.5% |
+| Lix SQLite  | `update_one_by_pk` |          271 |         195 |     -28.0% |
+| Lix RocksDB | `insert_all_rows`  |    5,460,528 |   4,191,840 |     -23.2% |
+| Lix RocksDB | `select_all_rows`  |    4,516,832 |   4,191,840 |      -7.2% |
+| Lix RocksDB | `select_one_by_pk` |          359 |         247 |     -31.2% |
+| Lix RocksDB | `select_all_by_pk` |    5,460,528 |   4,191,840 |     -23.2% |
+| Lix RocksDB | `update_all_rows`  |    4,789,908 |   3,521,220 |     -26.5% |
+| Lix RocksDB | `update_one_by_pk` |          271 |         195 |     -28.0% |
+
+Smoke timing scoreboard:
+
+| backend     | operation          | before timing    | after timing     | timing delta |
+| ----------- | ------------------ | ---------------: | --------------: | -----------: |
+| Lix SQLite  | `insert_all_rows`  | 8.4015-8.6852 ms | 7.3462-7.4688 ms |        ~-14% |
+| Lix SQLite  | `select_all_rows`  | 5.3115-5.3508 ms | 4.9022-5.0208 ms |         ~-7% |
+| Lix SQLite  | `select_keys_only` | 5.4276-5.6383 ms | 4.9786-5.0484 ms |         ~-9% |
+| Lix SQLite  | `select_one_by_pk` | 4.2838-4.3564 ms | 3.8850-4.0993 ms |         ~-7% |
+| Lix SQLite  | `select_all_by_pk` | 7.3265-7.7430 ms | 6.6975-6.7973 ms |        ~-10% |
+| Lix SQLite  | `update_all_rows`  | 7.8754-8.0260 ms | 6.7130-6.9206 ms |        ~-14% |
+| Lix SQLite  | `update_one_by_pk` | 4.3991-4.5165 ms | 3.8040-4.8891 ms | noisy improvement |
+| Lix RocksDB | `insert_all_rows`  | 4.0083-4.0900 ms | 3.6245-3.7255 ms |         ~-9% |
+| Lix RocksDB | `select_all_rows`  | 1.6062-1.6542 ms | 1.5225-1.5741 ms |         ~-6% |
+| Lix RocksDB | `select_keys_only` | 1.5795-1.6126 ms | 1.5114-1.5333 ms |         ~-4% |
+| Lix RocksDB | `select_all_by_pk` | 2.5475-2.5627 ms | 2.4169-2.4360 ms |         ~-5% |
+| Lix RocksDB | `update_all_rows`  | 3.2083-3.2669 ms | 2.8141-2.9118 ms |        ~-13% |
+| Lix RocksDB | `update_one_by_pk` | 644.32-656.44 µs | 616.13-642.18 µs |         ~-4% |
+
+Real-workload timing snapshot:
+
+| backend     | operation          | after timing      |
+| ----------- | ------------------ | ----------------: |
+| Lix SQLite  | `insert_all_rows`  | 49.065-49.767 ms  |
+| Lix SQLite  | `select_all_rows`  | 14.786-15.298 ms  |
+| Lix SQLite  | `select_all_by_pk` | 31.818-32.202 ms  |
+| Lix SQLite  | `update_all_rows`  | 43.215-43.781 ms  |
+| Lix RocksDB | `insert_all_rows`  | 22.254-22.571 ms  |
+| Lix RocksDB | `select_all_rows`  | 9.7033-9.8601 ms  |
+| Lix RocksDB | `select_all_by_pk` | 19.369-19.619 ms  |
+| Lix RocksDB | `update_all_rows`  | 24.054-24.354 ms  |
+
+Notes:
+
+```text
+This optimization is useful because it helps the main write axis while also
+improving read bytes for point reads and batched point reads. Value-only scans
+became entry scans, so scan I/O now includes keys; despite that, full-scan
+logical bytes still fall modestly because the value no longer repeats identity
+fields.
+```
