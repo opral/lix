@@ -242,6 +242,14 @@ where
     }
 }
 
+#[allow(dead_code)]
+pub(crate) fn stage_delete_all_rows(writes: &mut StorageWriteSet) {
+    writes.delete_range(
+        UNTRACKED_STATE_ROW_NAMESPACE,
+        KvScanRange::prefix(Vec::new()),
+    );
+}
+
 async fn scan_all_canonical_rows(
     store: &mut impl StorageReader,
 ) -> Result<Vec<UntrackedStateRow>, LixError> {
@@ -571,6 +579,76 @@ mod tests {
         }
         .expect("load should succeed");
         assert_eq!(loaded, Some(row));
+    }
+
+    #[tokio::test]
+    async fn delete_all_rows_clears_only_untracked_namespace() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
+        let context = UntrackedStateContext::new();
+        let row = untracked_row("global", "lix_key_value", "ui-tab");
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        write_materialized_rows_to_store(
+            &context,
+            transaction.as_mut(),
+            std::slice::from_ref(&row),
+        )
+        .await;
+        {
+            let mut writes = StorageWriteSet::new();
+            writes.put("other", vec![0xFF], vec![1]);
+            writes
+                .apply(transaction.as_mut())
+                .await
+                .expect("other namespace write should apply");
+        }
+        transaction.commit().await.expect("commit should succeed");
+
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("delete transaction should open");
+        {
+            let mut writes = StorageWriteSet::new();
+            stage_delete_all_rows(&mut writes);
+            writes
+                .apply(transaction.as_mut())
+                .await
+                .expect("delete-all should apply");
+        }
+        transaction.commit().await.expect("commit should succeed");
+
+        let untracked_rows = {
+            let mut reader = context.reader(storage.clone());
+            reader
+                .scan_rows(&UntrackedStateScanRequest::default())
+                .await
+                .expect("untracked scan should succeed")
+        };
+        assert!(untracked_rows.is_empty());
+
+        let mut reader = storage
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
+        let values = reader
+            .get_values(KvGetRequest {
+                groups: vec![KvGetGroup {
+                    namespace: "other".to_string(),
+                    keys: vec![vec![0xFF]],
+                }],
+            })
+            .await
+            .expect("other namespace read should succeed");
+        assert_eq!(
+            values.groups[0].single_value_owned(),
+            Some(vec![1]),
+            "delete-all must not cross namespaces"
+        );
     }
 
     #[tokio::test]

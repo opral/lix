@@ -6,8 +6,9 @@ use async_trait::async_trait;
 use lix_engine::{
     Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetRequest,
     BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch,
-    BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteStats,
-    BackendReadTransaction, BackendWriteTransaction, BytePageBuilder, LixError,
+    BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteOp,
+    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, BytePageBuilder,
+    LixError,
 };
 use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
 use tempfile::TempDir;
@@ -25,11 +26,38 @@ struct RocksDbBenchInner {
 pub(crate) struct RocksDbBenchTransaction {
     inner: Arc<RocksDbBenchInner>,
     pending: BTreeMap<Vec<u8>, PendingWrite>,
+    pending_range_deletes: Vec<EncodedRange>,
+    commit_ops: Vec<EncodedWriteOp>,
 }
 
 enum PendingWrite {
-    Put(Vec<u8>),
+    Put(usize),
     Delete,
+}
+
+enum EncodedWriteOp {
+    Put { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+    DeleteRange { range: EncodedRange },
+}
+
+fn commit_op_value(ops: &[EncodedWriteOp], index: usize) -> Option<&[u8]> {
+    match ops.get(index)? {
+        EncodedWriteOp::Put { value, .. } => Some(value),
+        EncodedWriteOp::Delete { .. } | EncodedWriteOp::DeleteRange { .. } => None,
+    }
+}
+
+#[derive(Clone)]
+struct EncodedRange {
+    start: Vec<u8>,
+    end: Vec<u8>,
+}
+
+impl EncodedRange {
+    fn contains(&self, key: &[u8]) -> bool {
+        key >= self.start.as_slice() && key < self.end.as_slice()
+    }
 }
 
 impl RocksDbBenchBackend {
@@ -55,6 +83,8 @@ impl Backend for RocksDbBenchBackend {
         Ok(Box::new(RocksDbBenchTransaction {
             inner: Arc::clone(&self.inner),
             pending: BTreeMap::new(),
+            pending_range_deletes: Vec::new(),
+            commit_ops: Vec::new(),
         }))
     }
 
@@ -64,6 +94,8 @@ impl Backend for RocksDbBenchBackend {
         Ok(Box::new(RocksDbBenchTransaction {
             inner: Arc::clone(&self.inner),
             pending: BTreeMap::new(),
+            pending_range_deletes: Vec::new(),
+            commit_ops: Vec::new(),
         }))
     }
 }
@@ -83,10 +115,15 @@ impl BackendReadTransaction for RocksDbBenchTransaction {
             for (position, key) in group.keys.into_iter().enumerate() {
                 let encoded_key = encode_key(namespace.as_str(), &key);
                 match self.pending.get(&encoded_key) {
-                    Some(PendingWrite::Put(value)) => {
-                        resolved_values[position] = Some(value.clone())
+                    Some(PendingWrite::Put(op_index)) => {
+                        resolved_values[position] = Some(
+                            commit_op_value(&self.commit_ops, *op_index)
+                                .expect("pending put should point at commit put")
+                                .to_vec(),
+                        )
                     }
                     Some(PendingWrite::Delete) => {}
+                    None if encoded_in_ranges(&encoded_key, &self.pending_range_deletes) => {}
                     None => {
                         committed_positions.push(position);
                         committed_keys.push(encoded_key);
@@ -124,28 +161,50 @@ impl BackendReadTransaction for RocksDbBenchTransaction {
         &mut self,
         request: BackendKvGetRequest,
     ) -> Result<BackendKvExistsBatch, LixError> {
-        rocksdb_get_exists_many(&self.inner.db, &self.pending, request)
+        rocksdb_get_exists_many(
+            &self.inner.db,
+            &self.pending,
+            &self.pending_range_deletes,
+            request,
+        )
     }
 
     async fn scan_keys(
         &mut self,
         request: BackendKvScanRequest,
     ) -> Result<BackendKvKeyPage, LixError> {
-        rocksdb_scan_keys(&self.inner.db, &self.pending, request)
+        rocksdb_scan_keys(
+            &self.inner.db,
+            &self.pending,
+            &self.pending_range_deletes,
+            request,
+        )
     }
 
     async fn scan_values(
         &mut self,
         request: BackendKvScanRequest,
     ) -> Result<BackendKvValuePage, LixError> {
-        rocksdb_scan_values(&self.inner.db, &self.pending, request)
+        rocksdb_scan_values(
+            &self.inner.db,
+            &self.pending,
+            &self.pending_range_deletes,
+            &self.commit_ops,
+            request,
+        )
     }
 
     async fn scan_entries(
         &mut self,
         request: BackendKvScanRequest,
     ) -> Result<BackendKvEntryPage, LixError> {
-        rocksdb_scan_entries(&self.inner.db, &self.pending, request)
+        rocksdb_scan_entries(
+            &self.inner.db,
+            &self.pending,
+            &self.pending_range_deletes,
+            &self.commit_ops,
+            request,
+        )
     }
 
     async fn rollback(self: Box<Self>) -> Result<(), LixError> {
@@ -161,32 +220,41 @@ impl BackendWriteTransaction for RocksDbBenchTransaction {
     ) -> Result<BackendKvWriteStats, LixError> {
         let mut stats = BackendKvWriteStats::default();
         for group in batch.groups {
-            let namespace = group.namespace().to_string();
-            for index in 0..group.put_count() {
-                let key = group.put_key(index).ok_or_else(|| {
-                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put key")
-                })?;
-                let value = group.put_value(index).ok_or_else(|| {
-                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put value")
-                })?;
-                stats.puts += 1;
-                stats.bytes_written += key.len() + value.len();
-                self.pending.insert(
-                    encode_key(namespace.as_str(), key),
-                    PendingWrite::Put(value.to_vec()),
-                );
-            }
-            for index in 0..group.delete_count() {
-                let key = group.delete_key(index).ok_or_else(|| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        "backend write batch missing delete key",
-                    )
-                })?;
-                stats.deletes += 1;
-                stats.bytes_written += key.len();
-                self.pending
-                    .insert(encode_key(namespace.as_str(), key), PendingWrite::Delete);
+            let (namespace, ops) = group.into_ops();
+            for op in ops {
+                match op {
+                    BackendKvWriteOp::Put { key, value } => {
+                        stats.puts += 1;
+                        stats.bytes_written += key.len() + value.len();
+                        let encoded_key = encode_key(namespace.as_str(), &key);
+                        let op_index = self.commit_ops.len();
+                        self.pending
+                            .insert(encoded_key.clone(), PendingWrite::Put(op_index));
+                        self.commit_ops.push(EncodedWriteOp::Put {
+                            key: encoded_key,
+                            value,
+                        });
+                    }
+                    BackendKvWriteOp::Delete { key } => {
+                        stats.deletes += 1;
+                        stats.bytes_written += key.len();
+                        let encoded_key = encode_key(namespace.as_str(), &key);
+                        self.pending
+                            .insert(encoded_key.clone(), PendingWrite::Delete);
+                        self.commit_ops
+                            .push(EncodedWriteOp::Delete { key: encoded_key });
+                    }
+                    BackendKvWriteOp::DeleteRange { range } => {
+                        let encoded_range = encoded_range(namespace.as_str(), &range);
+                        stats.delete_ranges += 1;
+                        stats.bytes_written += delete_range_bytes(&range);
+                        self.pending.retain(|key, _| !encoded_range.contains(key));
+                        self.pending_range_deletes.push(encoded_range.clone());
+                        self.commit_ops.push(EncodedWriteOp::DeleteRange {
+                            range: encoded_range,
+                        });
+                    }
+                }
             }
         }
         Ok(stats)
@@ -194,10 +262,13 @@ impl BackendWriteTransaction for RocksDbBenchTransaction {
 
     async fn commit(self: Box<Self>) -> Result<(), LixError> {
         let mut write_batch = WriteBatch::default();
-        for (key, write) in self.pending {
-            match write {
-                PendingWrite::Put(value) => write_batch.put(key, value),
-                PendingWrite::Delete => write_batch.delete(key),
+        for op in self.commit_ops {
+            match op {
+                EncodedWriteOp::Put { key, value } => write_batch.put(key, value),
+                EncodedWriteOp::Delete { key } => write_batch.delete(key),
+                EncodedWriteOp::DeleteRange { range } => {
+                    write_batch.delete_range(range.start, range.end)
+                }
             }
         }
         self.inner.db.write(write_batch).map_err(rocksdb_error)?;
@@ -216,6 +287,7 @@ fn open_rocksdb(path: &Path) -> Result<DB, LixError> {
 fn rocksdb_get_exists_many(
     db: &DB,
     pending: &BTreeMap<Vec<u8>, PendingWrite>,
+    pending_range_deletes: &[EncodedRange],
     request: BackendKvGetRequest,
 ) -> Result<BackendKvExistsBatch, LixError> {
     let mut groups = Vec::with_capacity(request.groups.len());
@@ -229,6 +301,7 @@ fn rocksdb_get_exists_many(
             match pending.get(&encoded_key) {
                 Some(PendingWrite::Put(_)) => exists[position] = true,
                 Some(PendingWrite::Delete) => {}
+                None if encoded_in_ranges(&encoded_key, pending_range_deletes) => {}
                 None => {
                     committed.push((encoded_key, position));
                 }
@@ -286,10 +359,11 @@ fn fill_committed_exists(
 fn rocksdb_scan_keys(
     db: &DB,
     pending: &BTreeMap<Vec<u8>, PendingWrite>,
+    pending_range_deletes: &[EncodedRange],
     request: BackendKvScanRequest,
 ) -> Result<BackendKvKeyPage, LixError> {
     let bounds = ScanBounds::new(&request);
-    if pending.is_empty() {
+    if pending.is_empty() && pending_range_deletes.is_empty() {
         return rocksdb_scan_committed_keys(db, request, bounds);
     }
 
@@ -302,6 +376,10 @@ fn rocksdb_scan_keys(
         };
         if !bounds.contains_encoded(encoded_key) {
             break;
+        }
+        if encoded_in_ranges(encoded_key, pending_range_deletes) {
+            iter.next();
+            continue;
         }
         let logical_key = decode_key(&request.namespace, encoded_key)?;
         if !key_after_cursor(&request, &logical_key) {
@@ -339,10 +417,12 @@ fn rocksdb_scan_keys(
 fn rocksdb_scan_values(
     db: &DB,
     pending: &BTreeMap<Vec<u8>, PendingWrite>,
+    pending_range_deletes: &[EncodedRange],
+    commit_ops: &[EncodedWriteOp],
     request: BackendKvScanRequest,
 ) -> Result<BackendKvValuePage, LixError> {
     let bounds = ScanBounds::new(&request);
-    if pending.is_empty() {
+    if pending.is_empty() && pending_range_deletes.is_empty() {
         return rocksdb_scan_committed_values(db, request, bounds);
     }
 
@@ -356,23 +436,28 @@ fn rocksdb_scan_values(
         if !bounds.contains_encoded(encoded_key) {
             break;
         }
+        if encoded_in_ranges(encoded_key, pending_range_deletes) {
+            continue;
+        }
         let logical_key = decode_key(&request.namespace, encoded_key)?;
         if !key_after_cursor(&request, &logical_key) {
             continue;
         }
         merged.insert(logical_key, value.to_vec());
     }
-    overlay_pending_values(&mut merged, pending, &request, &bounds)?;
+    overlay_pending_values(&mut merged, pending, commit_ops, &request, &bounds)?;
     Ok(value_page_from_iter(merged, request.limit))
 }
 
 fn rocksdb_scan_entries(
     db: &DB,
     pending: &BTreeMap<Vec<u8>, PendingWrite>,
+    pending_range_deletes: &[EncodedRange],
+    commit_ops: &[EncodedWriteOp],
     request: BackendKvScanRequest,
 ) -> Result<BackendKvEntryPage, LixError> {
     let bounds = ScanBounds::new(&request);
-    if pending.is_empty() {
+    if pending.is_empty() && pending_range_deletes.is_empty() {
         return rocksdb_scan_committed_entries(db, request, bounds);
     }
     let mut merged = BTreeMap::new();
@@ -385,13 +470,16 @@ fn rocksdb_scan_entries(
         if !bounds.contains_encoded(key) {
             break;
         }
+        if encoded_in_ranges(key, pending_range_deletes) {
+            continue;
+        }
         let logical_key = decode_key(&request.namespace, key)?;
         if !key_after_cursor(&request, &logical_key) {
             continue;
         }
         merged.insert(logical_key, value.to_vec());
     }
-    overlay_pending_values(&mut merged, pending, &request, &bounds)?;
+    overlay_pending_values(&mut merged, pending, commit_ops, &request, &bounds)?;
     Ok(entry_page_from_iter(merged, request.limit))
 }
 
@@ -550,6 +638,7 @@ fn rocksdb_scan_committed_entries(
 fn overlay_pending_values(
     merged: &mut BTreeMap<Vec<u8>, Vec<u8>>,
     pending: &BTreeMap<Vec<u8>, PendingWrite>,
+    commit_ops: &[EncodedWriteOp],
     request: &BackendKvScanRequest,
     bounds: &ScanBounds,
 ) -> Result<(), LixError> {
@@ -564,8 +653,10 @@ fn overlay_pending_values(
             continue;
         }
         match write {
-            PendingWrite::Put(value) => {
-                merged.insert(logical_key, value.clone());
+            PendingWrite::Put(op_index) => {
+                let value = commit_op_value(commit_ops, *op_index)
+                    .expect("pending put should point at commit put");
+                merged.insert(logical_key, value.to_vec());
             }
             PendingWrite::Delete => {
                 merged.remove(&logical_key);
@@ -694,9 +785,33 @@ fn namespace_prefix(namespace: &str) -> Vec<u8> {
 }
 
 fn namespace_end_key(namespace: &str) -> Vec<u8> {
-    let mut end = namespace_prefix(namespace);
-    end.push(0xFF);
-    end
+    prefix_end(&namespace_prefix(namespace)).expect("encoded namespace prefix has an upper bound")
+}
+
+fn encoded_range(namespace: &str, range: &BackendKvScanRange) -> EncodedRange {
+    let start = match range {
+        BackendKvScanRange::Prefix(prefix) => prefix.as_slice(),
+        BackendKvScanRange::Range { start, .. } => start.as_slice(),
+    };
+    let end = scan_end_key(range)
+        .as_ref()
+        .map(|end| encode_key(namespace, end))
+        .unwrap_or_else(|| namespace_end_key(namespace));
+    EncodedRange {
+        start: encode_key(namespace, start),
+        end,
+    }
+}
+
+fn encoded_in_ranges(key: &[u8], ranges: &[EncodedRange]) -> bool {
+    ranges.iter().any(|range| range.contains(key))
+}
+
+fn delete_range_bytes(range: &BackendKvScanRange) -> usize {
+    match range {
+        BackendKvScanRange::Prefix(prefix) => prefix.len(),
+        BackendKvScanRange::Range { start, end } => start.len() + end.len(),
+    }
 }
 
 fn decode_key(namespace: &str, encoded: &[u8]) -> Result<Vec<u8>, LixError> {

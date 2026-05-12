@@ -6,10 +6,10 @@ mod wasm {
         open_lix as open_lix_rs, Backend, BackendKvEntryPage, BackendKvExistsBatch,
         BackendKvExistsGroup, BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange,
         BackendKvScanRequest, BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage,
-        BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
-        BytePageBuilder, CreateVersionOptions, ExecuteResult, Lix as RsLix, LixError,
-        MergeVersionOptions, MergeVersionPreviewOptions, OpenLixOptions, SwitchVersionOptions,
-        Value,
+        BackendKvWriteBatch, BackendKvWriteOp, BackendKvWriteStats, BackendReadTransaction,
+        BackendWriteTransaction, BytePageBuilder, CreateVersionOptions, ExecuteResult,
+        Lix as RsLix, LixError, MergeVersionOptions, MergeVersionPreviewOptions, OpenLixOptions,
+        SwitchVersionOptions, Value,
     };
     use serde::Serialize;
     use serde_json::json;
@@ -102,10 +102,10 @@ export type BackendKvEntryPage = {
   resumeAfter?: Uint8Array | null;
 };
 
-export type BackendKvPut = {
-  key: Uint8Array;
-  value: Uint8Array;
-};
+export type BackendKvWriteOp =
+  | { kind: "put"; key: Uint8Array; value: Uint8Array }
+  | { kind: "delete"; key: Uint8Array }
+  | { kind: "deleteRange"; range: BackendKvScanRange };
 
 export type BackendKvWriteBatch = {
   groups: BackendKvWriteGroup[];
@@ -113,13 +113,13 @@ export type BackendKvWriteBatch = {
 
 export type BackendKvWriteGroup = {
   namespace: string;
-  puts: BackendKvPut[];
-  deletes: Uint8Array[];
+  ops: BackendKvWriteOp[];
 };
 
 export type BackendKvWriteStats = {
   puts: number;
   deletes: number;
+  deleteRanges: number;
   bytesWritten: number;
 };
 
@@ -654,36 +654,36 @@ export type MergeConflictSide = {
             let group_object = Object::new();
             set_string(&group_object, "namespace", group.namespace())?;
 
-            let puts = Array::new();
-            for index in 0..group.put_count() {
-                let key = group.put_key(index).ok_or_else(|| {
-                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put key")
-                })?;
-                let value = group.put_value(index).ok_or_else(|| {
-                    LixError::new("LIX_ERROR_UNKNOWN", "backend write batch missing put value")
-                })?;
-                let put = Object::new();
-                Reflect::set(&put, &JsValue::from_str("key"), &bytes_to_js(key))
-                    .map_err(|_| js_sdk_error("could not set write put key"))?;
-                Reflect::set(&put, &JsValue::from_str("value"), &bytes_to_js(value))
-                    .map_err(|_| js_sdk_error("could not set write put value"))?;
-                puts.push(&put);
+            let ops = Array::new();
+            for op in group.ops() {
+                let op_object = Object::new();
+                match op {
+                    BackendKvWriteOp::Put { key, value } => {
+                        set_string(&op_object, "kind", "put")?;
+                        Reflect::set(&op_object, &JsValue::from_str("key"), &bytes_to_js(key))
+                            .map_err(|_| js_sdk_error("could not set write put key"))?;
+                        Reflect::set(&op_object, &JsValue::from_str("value"), &bytes_to_js(value))
+                            .map_err(|_| js_sdk_error("could not set write put value"))?;
+                    }
+                    BackendKvWriteOp::Delete { key } => {
+                        set_string(&op_object, "kind", "delete")?;
+                        Reflect::set(&op_object, &JsValue::from_str("key"), &bytes_to_js(key))
+                            .map_err(|_| js_sdk_error("could not set write delete key"))?;
+                    }
+                    BackendKvWriteOp::DeleteRange { range } => {
+                        set_string(&op_object, "kind", "deleteRange")?;
+                        Reflect::set(
+                            &op_object,
+                            &JsValue::from_str("range"),
+                            &kv_scan_range_to_js(range)?,
+                        )
+                        .map_err(|_| js_sdk_error("could not set write delete range"))?;
+                    }
+                }
+                ops.push(&op_object);
             }
-            Reflect::set(&group_object, &JsValue::from_str("puts"), &puts)
-                .map_err(|_| js_sdk_error("could not set write puts"))?;
-
-            let deletes = Array::new();
-            for index in 0..group.delete_count() {
-                let key = group.delete_key(index).ok_or_else(|| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        "backend write batch missing delete key",
-                    )
-                })?;
-                deletes.push(&bytes_to_js(key));
-            }
-            Reflect::set(&group_object, &JsValue::from_str("deletes"), &deletes)
-                .map_err(|_| js_sdk_error("could not set write deletes"))?;
+            Reflect::set(&group_object, &JsValue::from_str("ops"), &ops)
+                .map_err(|_| js_sdk_error("could not set write ops"))?;
             groups.push(&group_object);
         }
         Reflect::set(&object, &JsValue::from_str("groups"), &groups)
@@ -791,6 +791,7 @@ export type MergeConflictSide = {
         Ok(BackendKvWriteStats {
             puts: required_usize(&object, "puts", context)?,
             deletes: required_usize(&object, "deletes", context)?,
+            delete_ranges: required_usize(&object, "deleteRanges", context)?,
             bytes_written: required_usize(&object, "bytesWritten", context)?,
         })
     }

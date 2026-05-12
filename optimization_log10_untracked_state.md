@@ -1087,3 +1087,142 @@ Verification:
 ```sh
 LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- --list
 ```
+
+## Measurement Update: Logical KV I/O and Range Delete Counters
+
+Date: 2026-05-12
+
+Change:
+
+```text
+The untracked_state CRUD I/O report now prints an explicit scope note and
+includes delete ranges as a separate write counter. The score is logical
+backend KV request/result accounting, not physical disk, WAL, or compaction
+I/O. This keeps the number stable across SQLite and RocksDB while still making
+query-shape, key/value payload, batch count, point deletes, and range deletes
+visible as optimization targets.
+```
+
+Verification:
+
+```sh
+cargo test -p lix_engine untracked_state --features storage-benches
+cargo test -p lix_engine --test tmp_lix_key_value_amplification --features storage-benches
+cargo test -p lix_engine --test storage_accounting --features storage-benches
+LIX_UNTRACKED_STATE_CRUD_IO=all cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- --list
+```
+
+I/O scoreboard:
+
+| workload | backend | operation | io ops | io bytes | write batches | puts | deletes | delete ranges | write bytes |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| smoke/1k | Lix SQLite | `delete_all_rows` | 1 | 0 | 1 | 0 | 0 | 1 | 0 |
+| smoke/1k | Lix RocksDB | `delete_all_rows` | 1 | 0 | 1 | 0 | 0 | 1 | 0 |
+| real_workload/10k | Lix SQLite | `delete_all_rows` | 1 | 0 | 1 | 0 | 0 | 1 | 0 |
+| real_workload/10k | Lix RocksDB | `delete_all_rows` | 1 | 0 | 1 | 0 | 0 | 1 | 0 |
+
+Current real-workload bulk I/O targets:
+
+| backend | operation | logical rows | io ops | io bytes/row | write bytes/row | shape |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| Lix SQLite | `insert_all_rows` | 10,000 | 1 | 407.21 | 407.21 | 10k puts |
+| Lix SQLite | `select_all_rows` | 10,000 | 1 | 407.21 | 0.00 | 1 scan |
+| Lix SQLite | `select_keys_only` | 10,000 | 1 | 82.39 | 0.00 | 1 scan |
+| Lix SQLite | `update_all_rows` | 10,000 | 1 | 340.15 | 340.15 | 10k puts |
+| Lix SQLite | `delete_all_rows` | 10,000 | 1 | 0.00 | 0.00 | 1 range delete |
+| Lix RocksDB | `insert_all_rows` | 10,000 | 1 | 407.21 | 407.21 | 10k puts |
+| Lix RocksDB | `select_all_rows` | 10,000 | 1 | 407.21 | 0.00 | 1 scan |
+| Lix RocksDB | `select_keys_only` | 10,000 | 1 | 82.39 | 0.00 | 1 scan |
+| Lix RocksDB | `update_all_rows` | 10,000 | 1 | 340.15 | 340.15 | 10k puts |
+| Lix RocksDB | `delete_all_rows` | 10,000 | 1 | 0.00 | 0.00 | 1 range delete |
+
+## Optimization 9: Range Delete Untracked Clear
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+bulk delete call/write amplification
+```
+
+Change:
+
+```text
+Backend KV writes now have an ordered operation log with Put, Delete, and
+DeleteRange. The untracked CRUD delete-all prepared path uses the storage-level
+DeleteRange over namespace `u` when the fixture deletes the whole local
+overlay. SQLite applies this as one range DELETE, and RocksDB applies an
+ordered WriteBatch with delete_range in the original mutation order.
+
+The storage-level primitive is intentionally not exposed through
+UntrackedStateWriter. The CRUD benchmark is measuring a backend clear
+primitive, while normal untracked commits still delete exact identities.
+```
+
+Reference principle:
+
+```text
+Range delete is a storage-engine primitive, not a loop of point deletes.
+RocksDB WriteBatch preserves mutation order, so DeleteRange must be part of
+the ordered write stream. GreptimeDB's KV backend treats delete_range as shared
+backend conformance behavior in artifact/greptimedb/src/common/meta/src/kv_backend/test.rs.
+```
+
+Verification:
+
+```sh
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine --test backend_kv_range_delete --features storage-benches
+cargo test -p lix_engine untracked_state --features storage-benches
+cargo test -p lix_engine --test tmp_lix_key_value_amplification --features storage-benches
+cargo test -p lix_engine --test storage_accounting --features storage-benches
+cargo check -p lix_rs_sdk
+cargo check -p lix_engine_wasm_bindgen
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/(insert_all_rows|update_all_rows|delete_all_rows)/1k'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/lix_rocksdb/smoke/(insert_all_rows|update_all_rows|delete_all_rows)/1k'
+```
+
+Smoke timing scoreboard:
+
+| backend | operation | before timing | after timing | timing delta |
+| --- | --- | ---: | ---: | ---: |
+| Lix SQLite | `delete_all_rows` | 5.5988-5.6629 ms | 4.9103-4.9962 ms | ~-12% |
+| Lix RocksDB | `delete_all_rows` | 1.5885-1.6219 ms | 756.29-804.35 us | ~-51% |
+
+Real-workload timing spot check:
+
+| backend | operation | after timing |
+| --- | --- | ---: |
+| Lix SQLite | `delete_all_rows` | 18.683-19.186 ms |
+| Lix RocksDB | `delete_all_rows` | 4.0110-4.1453 ms |
+
+Logical I/O scoreboard:
+
+| workload | backend | operation | before deletes | after deletes | after delete ranges | before write bytes | after write bytes |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| smoke/1k | Lix SQLite | `delete_all_rows` | 1,000 | 0 | 1 | 81,204 | 0 |
+| smoke/1k | Lix RocksDB | `delete_all_rows` | 1,000 | 0 | 1 | 81,204 | 0 |
+| real_workload/10k | Lix SQLite | `delete_all_rows` | 10,000 | 0 | 1 | 823,931 | 0 |
+| real_workload/10k | Lix RocksDB | `delete_all_rows` | 10,000 | 0 | 1 | 823,931 | 0 |
+
+Review:
+
+```text
+Initial review reported HIGH on RocksDB durable order for DeleteRange followed
+by Put, and MEDIUM on partial clean-cut API, benchmark-only domain API shape,
+and missing backend conformance tests. The patch now stores an ordered encoded
+RocksDB commit log, removes the legacy bucket write-group APIs, keeps delete-all
+as a storage-level benchmark primitive, and adds SQLite/RocksDB conformance
+tests for DeleteRange ordering, empty-prefix namespace isolation, and Prefix([0xFF])
+bounds. Re-review reported HIGH None and MEDIUM None.
+```
+
+Notes:
+
+```text
+The I/O numbers are logical backend KV request/result accounting. Range delete
+write bytes are zero for an empty prefix because no logical key bytes are sent;
+physical SQLite/RocksDB still write journal/WAL/tombstone data and may compact
+later.
+```

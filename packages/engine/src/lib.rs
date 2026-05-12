@@ -39,8 +39,8 @@ pub use backend::{
     Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetGroup,
     BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest,
     BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
-    BackendKvWriteGroup, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
-    BytePage, BytePageBuilder,
+    BackendKvWriteGroup, BackendKvWriteOp, BackendKvWriteStats, BackendReadTransaction,
+    BackendWriteTransaction, BytePage, BytePageBuilder,
 };
 pub use common::LixError;
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};

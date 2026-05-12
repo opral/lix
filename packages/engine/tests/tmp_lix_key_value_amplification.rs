@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use lix_engine::{
     Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvGetRequest, BackendKvKeyPage,
-    BackendKvScanRequest, BackendKvValueBatch, BackendKvValuePage, BackendKvWriteBatch,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, CreateVersionOptions,
-    Engine, LixError, SessionContext, Value,
+    BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch, BackendKvValuePage,
+    BackendKvWriteBatch, BackendKvWriteOp, BackendKvWriteStats, BackendReadTransaction,
+    BackendWriteTransaction, CreateVersionOptions, Engine, LixError, SessionContext, Value,
 };
 
 #[allow(dead_code)]
@@ -24,6 +24,7 @@ struct AmplificationCounts {
     write_kv_batch_calls: usize,
     puts: usize,
     deletes: usize,
+    delete_ranges: usize,
     write_bytes: usize,
     get_values_calls: usize,
     get_values_keys: usize,
@@ -37,6 +38,7 @@ struct AmplificationCounts {
     scan_entries_rows: usize,
     puts_by_namespace: BTreeMap<String, usize>,
     deletes_by_namespace: BTreeMap<String, usize>,
+    delete_ranges_by_namespace: BTreeMap<String, usize>,
     bytes_by_namespace: BTreeMap<String, usize>,
 }
 
@@ -45,35 +47,43 @@ impl AmplificationCounts {
         self.write_kv_batch_calls += 1;
         for group in &batch.groups {
             let namespace = group.namespace().to_string();
-            for index in 0..group.put_count() {
-                let Some(key) = group.put_key(index) else {
-                    continue;
-                };
-                let Some(value) = group.put_value(index) else {
-                    continue;
-                };
-                self.puts += 1;
-                self.write_bytes += key.len() + value.len();
-                *self.puts_by_namespace.entry(namespace.clone()).or_default() += 1;
-                *self
-                    .bytes_by_namespace
-                    .entry(namespace.clone())
-                    .or_default() += key.len() + value.len();
-            }
-            for index in 0..group.delete_count() {
-                let Some(key) = group.delete_key(index) else {
-                    continue;
-                };
-                self.deletes += 1;
-                self.write_bytes += key.len();
-                *self
-                    .deletes_by_namespace
-                    .entry(namespace.clone())
-                    .or_default() += 1;
-                *self
-                    .bytes_by_namespace
-                    .entry(namespace.clone())
-                    .or_default() += key.len();
+            for op in group.ops() {
+                match op {
+                    BackendKvWriteOp::Put { key, value } => {
+                        self.puts += 1;
+                        self.write_bytes += key.len() + value.len();
+                        *self.puts_by_namespace.entry(namespace.clone()).or_default() += 1;
+                        *self
+                            .bytes_by_namespace
+                            .entry(namespace.clone())
+                            .or_default() += key.len() + value.len();
+                    }
+                    BackendKvWriteOp::Delete { key } => {
+                        self.deletes += 1;
+                        self.write_bytes += key.len();
+                        *self
+                            .deletes_by_namespace
+                            .entry(namespace.clone())
+                            .or_default() += 1;
+                        *self
+                            .bytes_by_namespace
+                            .entry(namespace.clone())
+                            .or_default() += key.len();
+                    }
+                    BackendKvWriteOp::DeleteRange { range } => {
+                        let bytes = delete_range_bytes(range);
+                        self.delete_ranges += 1;
+                        self.write_bytes += bytes;
+                        *self
+                            .delete_ranges_by_namespace
+                            .entry(namespace.clone())
+                            .or_default() += 1;
+                        *self
+                            .bytes_by_namespace
+                            .entry(namespace.clone())
+                            .or_default() += bytes;
+                    }
+                }
             }
         }
     }
@@ -95,7 +105,7 @@ impl AmplificationCounts {
     }
 
     fn write_mutations(&self) -> usize {
-        self.puts + self.deletes
+        self.puts + self.deletes + self.delete_ranges
     }
 
     fn puts_in(&self, namespace: &str) -> usize {
@@ -109,8 +119,22 @@ impl AmplificationCounts {
             .unwrap_or(0)
     }
 
+    fn delete_ranges_in(&self, namespace: &str) -> usize {
+        self.delete_ranges_by_namespace
+            .get(namespace)
+            .copied()
+            .unwrap_or(0)
+    }
+
     fn bytes_in(&self, namespace: &str) -> usize {
         self.bytes_by_namespace.get(namespace).copied().unwrap_or(0)
+    }
+}
+
+fn delete_range_bytes(range: &BackendKvScanRange) -> usize {
+    match range {
+        BackendKvScanRange::Prefix(prefix) => prefix.len(),
+        BackendKvScanRange::Range { start, end } => start.len() + end.len(),
     }
 }
 
@@ -1137,11 +1161,13 @@ fn print_category_rows(rows: usize, value_bytes: usize, run: &AmplificationRun) 
     );
     println!(
         "AMPLIFICATION_CATEGORY rows={rows} category=sidecar_overlay untracked_puts={} \
-         untracked_deletes={} untracked_bytes={} untracked_mutations_per_row={:.3}",
+         untracked_deletes={} untracked_delete_ranges={} untracked_bytes={} \
+         untracked_mutations_per_row={:.3}",
         counts.puts_in("u"),
         counts.deletes_in("u"),
+        counts.delete_ranges_in("u"),
         counts.bytes_in("u"),
-        (counts.puts_in("u") + counts.deletes_in("u")) as f64
+        (counts.puts_in("u") + counts.deletes_in("u") + counts.delete_ranges_in("u")) as f64
             / rows as f64,
     );
 

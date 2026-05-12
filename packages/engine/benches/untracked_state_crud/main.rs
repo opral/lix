@@ -100,6 +100,7 @@ struct IoStats {
     write_batches: usize,
     write_puts: usize,
     write_deletes: usize,
+    write_delete_ranges: usize,
     write_bytes: usize,
 }
 
@@ -294,6 +295,7 @@ impl BackendWriteTransaction for CountingWriteTransaction {
         stats.write_batches += 1;
         stats.write_puts += write_stats.puts;
         stats.write_deletes += write_stats.deletes;
+        stats.write_delete_ranges += write_stats.delete_ranges;
         stats.write_bytes += write_stats.bytes_written;
         Ok(write_stats)
     }
@@ -407,10 +409,13 @@ fn maybe_print_io_report(runtime: &Runtime, all_rows: &[PointerRow]) {
 
     println!("\nuntracked_state_crud/io");
     println!(
-        "| workload | backend | operation | logical rows | io ops | io ops/row | io bytes | io bytes/row | read calls | get calls | get keys | scan calls | read rows | read bytes | read bytes/row | write batches | puts | deletes | write bytes | write bytes/row |"
+        "logical backend KV request/result accounting; not physical disk, WAL, or compaction I/O"
     );
     println!(
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        "| workload | backend | operation | logical rows | io ops | io ops/row | io bytes | io bytes/row | read calls | get calls | get keys | scan calls | read rows | read bytes | read bytes/row | write batches | puts | deletes | delete ranges | write bytes | write bytes/row |"
+    );
+    println!(
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
     );
 
     for (label, row_count) in workloads {
@@ -430,7 +435,7 @@ fn maybe_print_io_report(runtime: &Runtime, all_rows: &[PointerRow]) {
                 let stats = measure_lix_io(runtime, profile, operation, &rows);
                 let logical_rows = operation_logical_rows(operation, row_count);
                 println!(
-                    "| {label}/{rows_label} | {} | `{operation}` | {logical_rows} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                    "| {label}/{rows_label} | {} | `{operation}` | {logical_rows} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                     profile.name(),
                     stats.io_ops(),
                     ratio(stats.io_ops(), logical_rows),
@@ -446,6 +451,7 @@ fn maybe_print_io_report(runtime: &Runtime, all_rows: &[PointerRow]) {
                     stats.write_batches,
                     stats.write_puts,
                     stats.write_deletes,
+                    stats.write_delete_ranges,
                     stats.write_bytes,
                     ratio(stats.write_bytes, logical_rows),
                     rows_label = row_label(row_count),

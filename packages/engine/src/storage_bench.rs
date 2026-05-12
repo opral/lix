@@ -26,7 +26,7 @@ use crate::transaction::types::{
     TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
 };
 use crate::untracked_state::{
-    MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter,
+    self, MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter,
     UntrackedStateProjection, UntrackedStateRow, UntrackedStateRowRequest,
     UntrackedStateScanRequest,
 };
@@ -2911,7 +2911,11 @@ pub async fn untracked_state_delete_existing_only_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &UntrackedStateDeleteFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    write_canonical_untracked_rows(backend, &fixture.context, &fixture.rows).await?;
+    if fixture.expected_remaining_rows == 0 {
+        delete_all_untracked_rows(backend).await?;
+    } else {
+        write_canonical_untracked_rows(backend, &fixture.context, &fixture.rows).await?;
+    }
     Ok(report(
         fixture.rows.len(),
         fixture.rows.len(),
@@ -4353,6 +4357,19 @@ async fn write_canonical_untracked_rows(
         let mut writes = StorageWriteSet::new();
         let mut writer = context.writer(&mut writes);
         writer.stage_rows(rows.iter().map(|row| row.as_ref()))?;
+        writes.apply(&mut transaction.as_mut()).await?;
+    }
+    transaction.commit().await
+}
+
+async fn delete_all_untracked_rows(
+    backend: &Arc<dyn Backend + Send + Sync>,
+) -> Result<(), LixError> {
+    let storage = StorageContext::new(Arc::clone(backend));
+    let mut transaction = storage.begin_write_transaction().await?;
+    {
+        let mut writes = StorageWriteSet::new();
+        untracked_state::storage::stage_delete_all_rows(&mut writes);
         writes.apply(&mut transaction.as_mut()).await?;
     }
     transaction.commit().await
