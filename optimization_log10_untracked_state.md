@@ -995,3 +995,75 @@ codec. Current untracked scans use exact keys or whole-namespace scans plus
 filtering; future logical range scans should introduce an order-preserving tuple
 encoding rather than depending on this physical format.
 ```
+
+## Optimization 8: Compact Physical Namespace
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+backend physical key bytes not captured by logical key/value I/O counters
+```
+
+Change:
+
+```text
+The untracked row storage namespace changed from `untracked_state.row` to `u`.
+The namespace is part of every SQLite KV primary key and every RocksDB encoded
+key, but the logical I/O report only counts request/result key and value bytes,
+not namespace bytes. The Rust constant keeps the semantic name at call sites,
+while the physical prefix stays compact.
+```
+
+Reference principle:
+
+```text
+Storage engines commonly separate semantic names from compact physical key
+prefixes or column-family identifiers. The artifact RocksDB-backed code paths
+use byte prefixes/encoded keys at the storage boundary; this keeps repeated
+physical discriminators short without exposing the compact token as the domain
+API.
+```
+
+Verification:
+
+```sh
+cargo test -p lix_engine untracked_state --features storage-benches
+cargo test -p lix_engine --test storage_accounting --features storage-benches
+cargo test -p lix_engine --test tmp_lix_key_value_amplification --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/(insert_all_rows|select_all_rows|select_one_by_pk|update_all_rows|delete_all_rows)/1k'
+```
+
+Smoke timing scoreboard:
+
+| backend     | operation         | before timing      | after timing       | timing delta |
+| ----------- | ----------------- | -----------------: | -----------------: | -----------: |
+| Lix SQLite  | `insert_all_rows` | 6.9639-7.2336 ms   | 6.8364-6.9285 ms   |         ~-4% |
+| Lix SQLite  | `select_all_rows` | 5.3387-5.6191 ms   | 5.1273-5.4125 ms   |         ~-5% |
+| Lix SQLite  | `select_one_by_pk`| 4.3489-4.5051 ms   | 3.9218-3.9550 ms   |        ~-11% |
+| Lix SQLite  | `update_all_rows` | 6.6464-6.9794 ms   | 6.3038-6.4384 ms   |         ~-6% |
+| Lix SQLite  | `delete_all_rows` | 5.9204-6.0476 ms   | 5.5184-5.6739 ms   |         ~-6% |
+| Lix RocksDB | `insert_all_rows` | 3.1293-3.1900 ms   | 3.0002-3.0861 ms   |         ~-3% |
+| Lix RocksDB | `select_all_rows` | 1.6875-1.7341 ms   | 1.5016-1.5609 ms   |        ~-10% |
+| Lix RocksDB | `select_one_by_pk`| 710.33-751.36 µs   | 695.49-731.70 µs   | no change |
+| Lix RocksDB | `update_all_rows` | 2.3528-2.4111 ms   | 2.3091-2.3377 ms   |         ~-2% |
+| Lix RocksDB | `delete_all_rows` | 1.8564-1.9483 ms   | 1.6202-1.6674 ms   |        ~-14% |
+
+Review:
+
+```text
+Review reported HIGH None and MEDIUM None. LOW feedback was to update
+diagnostic/accounting hard-codes and document the compact namespace. Both were
+implemented before commit.
+```
+
+Notes:
+
+```text
+This optimization changes physical backend bytes but not the logical I/O
+scoreboard, because that report currently counts only the untracked logical
+key/value payloads passed through the backend API. A future I/O counter should
+include backend-encoded namespace bytes if we want the report to capture this
+class of optimization directly.
+```

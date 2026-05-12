@@ -7,7 +7,9 @@ use crate::untracked_state::{
 };
 use crate::{LixError, NullableKeyFilter};
 
-pub(super) const UNTRACKED_STATE_ROW_NAMESPACE: &str = "untracked_state.row";
+// Compact physical namespace for untracked rows. This string is stored in every
+// backend key, so keep it short; the typed constant preserves the semantic name.
+pub(super) const UNTRACKED_STATE_ROW_NAMESPACE: &str = "u";
 const LOAD_ROWS_BATCH_SIZE: usize = 512;
 
 pub(crate) async fn scan_rows(
