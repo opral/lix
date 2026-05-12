@@ -887,3 +887,111 @@ This optimization intentionally improves the direct untracked identity
 projection path without adding an index or extra write path. It is a read I/O
 cut only: write bytes and full-row reads are unchanged.
 ```
+
+## Optimization 7: Compact Binary Identity Keys
+
+Date: 2026-05-12
+
+Axis:
+
+```text
+logical key bytes across untracked reads, writes, and deletes
+```
+
+Change:
+
+```text
+Untracked row keys now use compact binary component framing:
+
+- component lengths are unsigned canonical varints instead of fixed u32 lengths
+- entity_id is stored as typed identity parts instead of JSON-array text
+
+This is a clean physical-format cut with no legacy decoder because Lix has not
+shipped. The SQL-facing entity_id projection remains JSON-array text; only the
+storage key encoding changed.
+```
+
+Reference principle:
+
+```text
+The artifact databases use compact binary key/value encodings at the storage
+boundary instead of user-facing JSON/text encodings. Dolt stores durable tuples
+through binary tuple descriptors in its storage/index layers, while RocksDB
+examples in the artifact set keep application-level structure in compact byte
+keys. The important first-principles rule is that durable keys should encode
+the typed identity directly, not a presentation format.
+```
+
+Verification:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine untracked_state --features storage-benches
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/no_such_benchmark'
+LIX_UNTRACKED_STATE_CRUD_IO=real_workload cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/no_such_benchmark'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/(insert_all_rows|select_keys_only|select_one_by_pk|select_all_by_pk|update_all_rows|delete_all_rows|delete_one_by_pk)/1k'
+```
+
+I/O scoreboard:
+
+| workload | operation          | before io bytes | after io bytes | byte delta |
+| -------- | ------------------ | --------------: | -------------: | ---------: |
+| smoke/1k | `insert_all_rows`  |         988,380 |        976,380 |      -1.2% |
+| smoke/1k | `select_all_rows`  |         988,380 |        976,380 |      -1.2% |
+| smoke/1k | `select_keys_only` |          93,204 |         81,204 |     -12.9% |
+| smoke/1k | `select_one_by_pk` |             350 |            338 |      -3.4% |
+| smoke/1k | `select_all_by_pk` |         988,380 |        976,380 |      -1.2% |
+| smoke/1k | `update_all_rows`  |         348,624 |        336,624 |      -3.4% |
+| smoke/1k | `update_one_by_pk` |             195 |            183 |      -6.2% |
+| smoke/1k | `delete_all_rows`  |          93,204 |         81,204 |     -12.9% |
+| smoke/1k | `delete_one_by_pk` |              43 |             31 |     -27.9% |
+| 10k      | `insert_all_rows`  |       4,191,840 |      4,072,075 |      -2.9% |
+| 10k      | `select_all_rows`  |       4,191,840 |      4,072,075 |      -2.9% |
+| 10k      | `select_keys_only` |         943,696 |        823,931 |     -12.7% |
+| 10k      | `select_one_by_pk` |             247 |            235 |      -4.9% |
+| 10k      | `select_all_by_pk` |       4,191,840 |      4,072,075 |      -2.9% |
+| 10k      | `update_all_rows`  |       3,521,220 |      3,401,455 |      -3.4% |
+| 10k      | `update_one_by_pk` |             195 |            183 |      -6.2% |
+| 10k      | `delete_all_rows`  |         943,696 |        823,931 |     -12.7% |
+| 10k      | `delete_one_by_pk` |              43 |             31 |     -27.9% |
+
+Smoke timing scoreboard:
+
+| backend     | operation          | before timing    | after timing       | timing delta |
+| ----------- | ------------------ | ---------------: | -----------------: | -----------: |
+| Lix SQLite  | `insert_all_rows`  | 7.4964-7.8174 ms | 6.9639-7.2336 ms   |        ~-10% |
+| Lix SQLite  | `select_keys_only` | 4.6341-4.7996 ms | 4.3781-4.6057 ms   |         ~-5% |
+| Lix SQLite  | `select_one_by_pk` | 4.1554-4.3851 ms | 4.3489-4.5051 ms   | noisy/slower |
+| Lix SQLite  | `select_all_by_pk` | 6.9240-7.1649 ms | 6.9476-7.2937 ms   | noisy/no change |
+| Lix SQLite  | `update_all_rows`  | 6.6485-7.0787 ms | 6.6464-6.9794 ms   | no change |
+| Lix SQLite  | `delete_all_rows`  | 6.2727-6.3839 ms | 5.9204-6.0476 ms   |        ~-6% |
+| Lix SQLite  | `delete_one_by_pk` | 4.4734-4.5866 ms | 4.0703-4.1612 ms   |        ~-9% |
+| Lix RocksDB | `insert_all_rows`  | 3.3850-3.4729 ms | 3.1293-3.1900 ms   |        ~-9% |
+| Lix RocksDB | `select_keys_only` | 1.1824-1.2604 ms | 1.1691-1.1844 ms   | no change |
+| Lix RocksDB | `select_one_by_pk` | 808.84-826.90 µs | 710.33-751.36 µs   |       ~-13% |
+| Lix RocksDB | `select_all_by_pk` | 2.5938-2.6858 ms | 2.3893-2.4239 ms   |        ~-8% |
+| Lix RocksDB | `update_all_rows`  | 2.7287-2.7924 ms | 2.3528-2.4111 ms   |       ~-14% |
+| Lix RocksDB | `delete_all_rows`  | 1.9138-1.9653 ms | 1.8564-1.9483 ms   |         ~-3% |
+| Lix RocksDB | `delete_one_by_pk` | 676.56-726.06 µs | 654.40-708.29 µs   | noisy/no change |
+
+Review:
+
+```text
+First review found one HIGH and two MEDIUM issues in decoder hardening:
+unbounded allocation from part_count, varint canonical/overflow handling, and
+empty identity part validation. The patch now rejects impossible part counts
+before allocation, accumulates varints in u128, rejects non-canonical varints,
+rejects overflow, and rejects empty identity parts. Tests cover these malformed
+key cases.
+
+Second review: HIGH None, MEDIUM None, LOW None.
+```
+
+Notes:
+
+```text
+The compact key framing is explicitly not an order-preserving logical tuple
+codec. Current untracked scans use exact keys or whole-namespace scans plus
+filtering; future logical range scans should introduce an order-preserving tuple
+encoding rather than depending on this physical format.
+```

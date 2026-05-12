@@ -358,13 +358,7 @@ fn decode_untracked_state_row_key(bytes: &[u8]) -> Result<UntrackedStateIdentity
     let mut cursor = 0;
     let version_id = read_component(bytes, &mut cursor)?.to_string();
     let schema_key = read_component(bytes, &mut cursor)?.to_string();
-    let entity_id = read_component(bytes, &mut cursor)?;
-    let entity_id = crate::entity_identity::EntityIdentity::from_json_array_text(entity_id)
-        .map_err(|error| {
-            LixError::unknown(format!(
-                "failed to decode untracked-state key entity identity: {error}"
-            ))
-        })?;
+    let entity_id = read_entity_identity(bytes, &mut cursor)?;
     let file_id = match bytes.get(cursor).copied() {
         Some(0) => {
             cursor += 1;
@@ -401,14 +395,12 @@ fn decode_untracked_state_row_key(bytes: &[u8]) -> Result<UntrackedStateIdentity
 pub(super) fn encode_untracked_state_row_key_ref(
     identity: UntrackedStateIdentityRef<'_>,
 ) -> Vec<u8> {
+    // This compact component framing is for exact-key identity lookups and
+    // whole-namespace scans. It is not a logical order-preserving tuple codec.
     let mut out = Vec::new();
     push_component(&mut out, identity.version_id);
     push_component(&mut out, identity.schema_key);
-    let entity_id = identity
-        .entity_id
-        .as_json_array_text()
-        .expect("untracked-state identity should project");
-    push_component(&mut out, &entity_id);
+    push_entity_identity(&mut out, identity.entity_id);
     match identity.file_id {
         Some(file_id) => {
             out.push(1);
@@ -419,22 +411,49 @@ pub(super) fn encode_untracked_state_row_key_ref(
     out
 }
 
+fn push_entity_identity(out: &mut Vec<u8>, entity_id: &crate::entity_identity::EntityIdentity) {
+    push_varint_len(out, entity_id.parts.len());
+    for part in &entity_id.parts {
+        push_component(out, part);
+    }
+}
+
+fn read_entity_identity(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<crate::entity_identity::EntityIdentity, LixError> {
+    let part_count = read_varint_len(bytes, cursor)?;
+    if part_count == 0 {
+        return Err(LixError::unknown(
+            "failed to decode untracked-state key: empty entity identity",
+        ));
+    }
+    if part_count > bytes.len().saturating_sub(*cursor) {
+        return Err(LixError::unknown(
+            "failed to decode untracked-state key: entity identity part count exceeds remaining bytes",
+        ));
+    }
+    let mut parts = Vec::new();
+    for _ in 0..part_count {
+        let part = read_component(bytes, cursor)?;
+        if part.is_empty() {
+            return Err(LixError::unknown(
+                "failed to decode untracked-state key: empty entity identity part",
+            ));
+        }
+        parts.push(part.to_string());
+    }
+    Ok(crate::entity_identity::EntityIdentity { parts })
+}
+
 fn push_component(out: &mut Vec<u8>, value: &str) {
     let bytes = value.as_bytes();
-    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    push_varint_len(out, bytes.len());
     out.extend_from_slice(bytes);
 }
 
 fn read_component<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a str, LixError> {
-    let len_bytes = bytes
-        .get(*cursor..cursor.saturating_add(4))
-        .ok_or_else(|| LixError::unknown("failed to decode untracked-state key: short length"))?;
-    let len = u32::from_be_bytes(
-        len_bytes
-            .try_into()
-            .expect("component length slice should have four bytes"),
-    ) as usize;
-    *cursor += 4;
+    let len = read_varint_len(bytes, cursor)?;
     let component = bytes
         .get(*cursor..cursor.saturating_add(len))
         .ok_or_else(|| LixError::unknown("failed to decode untracked-state key: short value"))?;
@@ -444,6 +463,49 @@ fn read_component<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a str, Li
             "failed to decode untracked-state key component as UTF-8: {error}"
         ))
     })
+}
+
+fn push_varint_len(out: &mut Vec<u8>, mut len: usize) {
+    while len >= 0x80 {
+        out.push((len as u8 & 0x7f) | 0x80);
+        len >>= 7;
+    }
+    out.push(len as u8);
+}
+
+fn read_varint_len(bytes: &[u8], cursor: &mut usize) -> Result<usize, LixError> {
+    let start = *cursor;
+    let mut len = 0u128;
+    let mut shift = 0u32;
+    loop {
+        let byte = *bytes.get(*cursor).ok_or_else(|| {
+            LixError::unknown("failed to decode untracked-state key: short length")
+        })?;
+        *cursor += 1;
+        len |= u128::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            if len > usize::MAX as u128 {
+                return Err(LixError::unknown(
+                    "failed to decode untracked-state key: length overflow",
+                ));
+            }
+            let len = len as usize;
+            let mut canonical = Vec::new();
+            push_varint_len(&mut canonical, len);
+            if bytes.get(start..*cursor) != Some(canonical.as_slice()) {
+                return Err(LixError::unknown(
+                    "failed to decode untracked-state key: non-canonical length",
+                ));
+            }
+            return Ok(len);
+        }
+        shift += 7;
+        if shift >= 128 {
+            return Err(LixError::unknown(
+                "failed to decode untracked-state key: length overflow",
+            ));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -693,6 +755,32 @@ mod tests {
         let key = encode_untracked_state_row_key(&identity);
         let decoded = decode_untracked_state_row_key(&key).expect("key should decode");
         assert_eq!(decoded, identity);
+    }
+
+    #[test]
+    fn row_key_rejects_malformed_varints_and_identity_parts() {
+        let mut cursor = 0;
+        assert!(read_varint_len(&[0x80, 0x00], &mut cursor).is_err());
+
+        let mut cursor = 0;
+        let mut overflowing = vec![0xff; 19];
+        overflowing.push(0x01);
+        assert!(read_varint_len(&overflowing, &mut cursor).is_err());
+
+        let mut empty_part_key = Vec::new();
+        push_component(&mut empty_part_key, "version-a");
+        push_component(&mut empty_part_key, "schema-a");
+        push_varint_len(&mut empty_part_key, 1);
+        push_component(&mut empty_part_key, "");
+        empty_part_key.push(0);
+        assert!(decode_untracked_state_row_key(&empty_part_key).is_err());
+
+        let mut impossible_part_count_key = Vec::new();
+        push_component(&mut impossible_part_count_key, "version-a");
+        push_component(&mut impossible_part_count_key, "schema-a");
+        push_varint_len(&mut impossible_part_count_key, 1024);
+        impossible_part_count_key.push(0);
+        assert!(decode_untracked_state_row_key(&impossible_part_count_key).is_err());
     }
 
     #[tokio::test]
