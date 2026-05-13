@@ -403,3 +403,72 @@ This is the intended Big-O shift: staged publication closure now scans staged
 changes once instead of resolving each membership change through a repeated
 segment search.
 ```
+
+## Entry 5: Stage Segment Uses Construction-Time Validation
+
+Change:
+
+```text
+stage_segment now uses validate_stage_segment_shape after canonicalize_segment.
+
+validate_stage_segment_shape checks O(K) construction invariants: header counts,
+duplicate ids, commit membership/directory cover, payload directory cover, and
+segment directory cover. Full validate_segment_shape remains the repair/debug/GC
+validator and still re-encodes the segment, verifies byte ranges, and recomputes
+checksums.
+```
+
+Measured with:
+
+```sh
+cargo bench --manifest-path packages/engine/Cargo.toml --features storage-benches --bench changelog_scorecard
+```
+
+### CPU Segment Scoreboard
+
+Times are milliseconds.
+
+| row                                     | entry_5_ms |
+| --------------------------------------- | ---------: |
+| encode_segment / 1c_1000ch              |      0.198 |
+| decode_segment / 1c_1000ch              |      4.005 |
+| view_segment / 1c_1000ch                |      0.645 |
+| validate_segment_shape / 1c_1000ch      |      7.791 |
+| build_decoded_segment_index / 1c_1000ch |     11.764 |
+| build_by_change / 1c_1000ch             |      0.809 |
+| build_by_change_membership / 1c_1000ch  |      0.032 |
+
+### Backend Smoke Scoreboard
+
+Times are milliseconds.
+
+| row                                                  | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms |
+| ---------------------------------------------------- | ----------: | -----------------: | -----------------: |
+| stage_segment_raw_no_indexes / 1c_1000ch             |       0.551 |              4.109 |              4.889 |
+| stage_segment / 1c_1000ch                            |      11.090 |             13.998 |             14.072 |
+| stage_publish_commit / 1c_1ch                        |       0.143 |              0.060 |              0.061 |
+| stage_publish_commit / 1c_100ch                      |       1.234 |              1.192 |              1.209 |
+| stage_publish_commit / 1c_1000ch single-shot         |      14.784 |             14.554 |             14.669 |
+| load_commits_visible_batched / 1c_100ch              |       0.254 |              0.233 |              0.230 |
+| load_changes_visible_batched / 1c_100ch              |       1.848 |              0.890 |              0.711 |
+| load_changes_visible_batched / 1c_1000ch             |     122.225 |             19.177 |              6.954 |
+| load_changes_physical_scattered / 100seg_100c_1000ch |       3.804 |              3.605 |              4.009 |
+| load_changes_visible_scattered / 100seg_100c_1000ch  |     177.936 |             19.481 |              7.828 |
+| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       9.318 |             10.500 |              9.541 |
+| plan_gc / live_50pct_mixed_segments                  |      11.165 |             10.068 |              9.336 |
+| collect_garbage / live_50pct_mixed_segments          |       9.838 |             10.078 |              9.889 |
+
+Read:
+
+```text
+stage_segment improved but did not reach raw write cost:
+
+stage_segment / 1c_1000ch:
+  entry 4: ~18-20ms
+  entry 5: ~11-14ms
+
+The remaining stage cost is now mostly canonicalize_segment itself: checksums,
+payload directories, segment directory construction, and two encodes/views to
+compute stable byte ranges. Next cut should remove the second encode/view pass
+or make directory byte-range patching happen during encode.
+```
