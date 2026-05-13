@@ -643,6 +643,9 @@ fn rocksdb_read4_runs(
         BackendKvRead4Order::RequestOrder => keyed.sort_by_key(|(index, _)| *index),
         BackendKvRead4Order::KeyOrder => keyed.sort_by(|left, right| left.1.cmp(&right.1)),
     }
+    if pending.is_empty() && pending_range_deletes.is_empty() {
+        return rocksdb_read4_committed_runs(db, namespace, keyed, run_spans, projection, order);
+    }
     let values_by_key = rocksdb_read4_collect_spans(
         db,
         pending,
@@ -657,6 +660,210 @@ fn rocksdb_read4_runs(
         .map(|(_, key)| values_by_key.get(key).cloned())
         .collect();
     rocksdb_read4_keyed_page(keyed, resolved, projection, order)
+}
+
+fn rocksdb_read4_committed_runs(
+    db: &DB,
+    namespace: String,
+    keyed: Vec<(u32, Vec<u8>)>,
+    mut run_spans: Vec<(Vec<u8>, Vec<u8>)>,
+    projection: BackendKvRead4Projection,
+    order: BackendKvRead4Order,
+) -> Result<BackendKvRead4Page, LixError> {
+    run_spans.retain(|(lower, upper)| upper.is_empty() || lower < upper);
+    run_spans.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    let targets = rocksdb_read4_run_targets(&namespace, &keyed);
+    match projection {
+        BackendKvRead4Projection::KeysOnly => {
+            rocksdb_read4_committed_key_runs(db, namespace, keyed, run_spans, targets, order)
+        }
+        BackendKvRead4Projection::Parts(parts) => rocksdb_read4_committed_value_runs(
+            db, namespace, keyed, run_spans, targets, parts, order,
+        ),
+    }
+}
+
+fn rocksdb_read4_run_targets(namespace: &str, keyed: &[(u32, Vec<u8>)]) -> Vec<Read4RunTarget> {
+    let mut targets = keyed
+        .iter()
+        .enumerate()
+        .map(|(output_position, (_request_index, key))| Read4RunTarget {
+            encoded_key: encode_key(namespace, key),
+            output_position,
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        left.encoded_key
+            .cmp(&right.encoded_key)
+            .then_with(|| left.output_position.cmp(&right.output_position))
+    });
+    targets
+}
+
+fn rocksdb_read4_committed_key_runs(
+    db: &DB,
+    namespace: String,
+    keyed: Vec<(u32, Vec<u8>)>,
+    run_spans: Vec<(Vec<u8>, Vec<u8>)>,
+    targets: Vec<Read4RunTarget>,
+    order: BackendKvRead4Order,
+) -> Result<BackendKvRead4Page, LixError> {
+    let mut present = vec![false; keyed.len()];
+    for (lower, upper) in run_spans {
+        let bounds = Read4Bounds::new(&namespace, &lower, &upper);
+        let mut target_index =
+            targets.partition_point(|target| target.encoded_key < bounds.start_encoded);
+        let mut iter = db.raw_iterator();
+        iter.seek(&bounds.start_encoded);
+        while iter.valid() && target_index < targets.len() {
+            let Some(current_key) = iter.key() else {
+                break;
+            };
+            if !bounds.contains_encoded(current_key) {
+                break;
+            }
+            while target_index < targets.len()
+                && targets[target_index].encoded_key.as_slice() < current_key
+            {
+                target_index += 1;
+            }
+            if target_index >= targets.len()
+                || targets[target_index].encoded_key.as_slice() >= bounds.end_encoded.as_slice()
+            {
+                break;
+            }
+            if targets[target_index].encoded_key.as_slice() == current_key {
+                while target_index < targets.len()
+                    && targets[target_index].encoded_key.as_slice() == current_key
+                {
+                    present[targets[target_index].output_position] = true;
+                    target_index += 1;
+                }
+            }
+            iter.next();
+        }
+        iter.status().map_err(rocksdb_error)?;
+    }
+
+    let request_indexes = match order {
+        BackendKvRead4Order::RequestOrder => None,
+        BackendKvRead4Order::KeyOrder => Some(keyed.iter().map(|(index, _)| *index).collect()),
+    };
+    let mut keys = BytePageBuilder::with_capacity(keyed.len(), 0);
+    for (_, key) in keyed {
+        keys.push(&key);
+    }
+    Ok(BackendKvRead4Page {
+        keys: keys.finish(),
+        presence: BackendKvReadV3Presence::bitmap(present),
+        values: Vec::new(),
+        request_indexes,
+        resume_after: None,
+    })
+}
+
+fn rocksdb_read4_committed_value_runs(
+    db: &DB,
+    namespace: String,
+    keyed: Vec<(u32, Vec<u8>)>,
+    run_spans: Vec<(Vec<u8>, Vec<u8>)>,
+    targets: Vec<Read4RunTarget>,
+    parts: Vec<lix_engine::BackendKvRead4ValuePart>,
+    order: BackendKvRead4Order,
+) -> Result<BackendKvRead4Page, LixError> {
+    let mut present = vec![false; keyed.len()];
+    let mut projected_values = parts
+        .iter()
+        .map(|_| vec![None; keyed.len()])
+        .collect::<Vec<_>>();
+
+    for (lower, upper) in run_spans {
+        let bounds = Read4Bounds::new(&namespace, &lower, &upper);
+        let mut target_index =
+            targets.partition_point(|target| target.encoded_key < bounds.start_encoded);
+        let mut iter = db.raw_iterator();
+        iter.seek(&bounds.start_encoded);
+        while iter.valid() && target_index < targets.len() {
+            let Some(current_key) = iter.key() else {
+                break;
+            };
+            if !bounds.contains_encoded(current_key) {
+                break;
+            }
+            while target_index < targets.len()
+                && targets[target_index].encoded_key.as_slice() < current_key
+            {
+                target_index += 1;
+            }
+            if target_index >= targets.len()
+                || targets[target_index].encoded_key.as_slice() >= bounds.end_encoded.as_slice()
+            {
+                break;
+            }
+            if targets[target_index].encoded_key.as_slice() == current_key {
+                let value = iter.value().ok_or_else(|| {
+                    LixError::unknown("rocksdb read4 iterator value missing for key")
+                })?;
+                while target_index < targets.len()
+                    && targets[target_index].encoded_key.as_slice() == current_key
+                {
+                    let output_position = targets[target_index].output_position;
+                    present[output_position] = true;
+                    rocksdb_read4_store_projected_parts(
+                        &mut projected_values,
+                        &parts,
+                        output_position,
+                        value,
+                    )?;
+                    target_index += 1;
+                }
+            }
+            iter.next();
+        }
+        iter.status().map_err(rocksdb_error)?;
+    }
+
+    let request_indexes = match order {
+        BackendKvRead4Order::RequestOrder => None,
+        BackendKvRead4Order::KeyOrder => Some(keyed.iter().map(|(index, _)| *index).collect()),
+    };
+    let mut keys = BytePageBuilder::with_capacity(keyed.len(), 0);
+    let mut value_builders = parts
+        .iter()
+        .map(|_| BytePageBuilder::new())
+        .collect::<Vec<_>>();
+    for (position, (_, key)) in keyed.into_iter().enumerate() {
+        keys.push(&key);
+        if present[position] {
+            for (builder, values) in value_builders.iter_mut().zip(projected_values.iter()) {
+                builder.push(
+                    values[position].as_deref().ok_or_else(|| {
+                        LixError::unknown("rocksdb read4 projected value missing")
+                    })?,
+                );
+            }
+        } else {
+            for builder in &mut value_builders {
+                builder.push([]);
+            }
+        }
+    }
+    Ok(BackendKvRead4Page {
+        keys: keys.finish(),
+        presence: BackendKvReadV3Presence::bitmap(present),
+        values: value_builders
+            .into_iter()
+            .map(BytePageBuilder::finish)
+            .collect(),
+        request_indexes,
+        resume_after: None,
+    })
+}
+
+struct Read4RunTarget {
+    encoded_key: Vec<u8>,
+    output_position: usize,
 }
 
 fn rocksdb_read4_keyed_page(
@@ -693,6 +900,18 @@ fn rocksdb_read4_keyed_page(
         request_indexes,
         resume_after: None,
     })
+}
+
+fn rocksdb_read4_store_projected_parts(
+    output: &mut [Vec<Option<Vec<u8>>>],
+    parts: &[lix_engine::BackendKvRead4ValuePart],
+    output_position: usize,
+    value: &[u8],
+) -> Result<(), LixError> {
+    for (part, values) in parts.iter().zip(output.iter_mut()) {
+        values[output_position] = Some(project_backend_read4_value_part(value, *part)?.to_vec());
+    }
+    Ok(())
 }
 
 fn rocksdb_read4_point_values(
