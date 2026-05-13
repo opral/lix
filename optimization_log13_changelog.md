@@ -540,3 +540,72 @@ The remaining gap to raw segment write is mostly canonical checksum and index
 construction cost. The next cut should avoid logical checksum recomputation via
 byte-native object checksums or add borrowed views for checksum/identity fields.
 ```
+
+## Entry 7: Remove Diagnostic Allocation From Segment Views
+
+Change:
+
+```text
+Segment view and object-slice walking now use fast ByteCursor methods that
+report offset-only errors instead of formatting rich field names on successful
+reads.
+
+This follows the reference-system pattern from byte-native engines: hot readers
+walk compact records with cheap static errors; rich diagnostic context stays on
+debug/repair paths.
+```
+
+Measured with:
+
+```sh
+cargo bench --manifest-path packages/engine/Cargo.toml --features storage-benches --bench changelog_scorecard
+```
+
+### CPU Segment Scoreboard
+
+Times are milliseconds.
+
+| row                                     | entry_7_ms |
+| --------------------------------------- | ---------: |
+| encode_segment / 1c_1000ch              |      0.150 |
+| decode_segment / 1c_1000ch              |      3.712 |
+| view_segment / 1c_1000ch                |      0.026 |
+| validate_segment_shape / 1c_1000ch      |      4.840 |
+| build_decoded_segment_index / 1c_1000ch |      8.516 |
+| build_by_change / 1c_1000ch             |      1.019 |
+| build_by_change_membership / 1c_1000ch  |      0.035 |
+
+### Backend Smoke Scoreboard
+
+Times are milliseconds.
+
+| row                                                  | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms |
+| ---------------------------------------------------- | ----------: | -----------------: | -----------------: |
+| stage_segment_raw_no_indexes / 1c_1000ch             |       0.667 |              5.686 |              4.223 |
+| stage_segment / 1c_1000ch                            |       4.730 |              8.665 |              8.221 |
+| stage_publish_commit / 1c_1ch                        |       0.055 |              0.050 |              0.059 |
+| stage_publish_commit / 1c_100ch                      |       0.905 |              0.910 |              0.904 |
+| stage_publish_commit / 1c_1000ch single-shot         |      11.865 |             12.185 |             12.277 |
+| load_commits_visible_batched / 1c_100ch              |       0.209 |              0.265 |              0.187 |
+| load_changes_visible_batched / 1c_100ch              |       1.758 |              0.804 |              0.619 |
+| load_changes_visible_batched / 1c_1000ch             |     124.134 |             17.247 |              5.868 |
+| load_changes_physical_scattered / 100seg_100c_1000ch |       3.127 |              3.091 |              3.179 |
+| load_changes_visible_scattered / 100seg_100c_1000ch  |     174.873 |             18.227 |              6.440 |
+| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       6.564 |              7.635 |              6.524 |
+| plan_gc / live_50pct_mixed_segments                  |       8.463 |              6.859 |              6.737 |
+| collect_garbage / live_50pct_mixed_segments          |       7.166 |              7.256 |              7.316 |
+
+Read:
+
+```text
+view_segment is now cheap enough to stop being a structural concern:
+
+view_segment / 1c_1000ch:
+  entry 6: 0.653ms
+  entry 7: 0.026ms
+
+The broader decode/validate/index rows also improved because object-slice
+walking no longer allocates diagnostic field names in tight loops. The next cut
+should move owned SegmentCommit/SegmentChange decode toward the same fast cursor
+path or make checksum/index construction consume borrowed object views directly.
+```
