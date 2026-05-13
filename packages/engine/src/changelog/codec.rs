@@ -939,7 +939,9 @@ impl<'a> ByteCursor<'a> {
         EntityIdentity::from_parts(parts).map_err(|error| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!("failed to decode changelog {field}: invalid entity identity parts: {error}"),
+                format!(
+                    "failed to decode changelog {field}: invalid entity identity parts: {error}"
+                ),
             )
         })
     }

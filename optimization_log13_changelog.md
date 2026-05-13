@@ -813,3 +813,82 @@ Publish now pays for the requested commit object plus closure validation instead
 of full segment decode. Remaining visible-change read cliffs are not in
 DecodedSegmentIndex; they sit in visible proof / change materialization paths.
 ```
+
+## Entry 11: Remove Unit Backend Read Snapshot Clone
+
+Change:
+
+```text
+The changelog-local mem/unit bench backend no longer clones the entire BTreeMap
+when opening a read transaction.
+
+Read transactions now hold the shared map and lock only while serving each read
+operation. Write transactions keep snapshot-copy semantics and still replace the
+shared map on commit.
+```
+
+Measured with:
+
+```sh
+cargo bench --manifest-path packages/engine/Cargo.toml --features storage-benches --bench changelog_scorecard
+```
+
+### CPU Segment Scoreboard
+
+Times are milliseconds.
+
+| row                                     | entry_11_ms |
+| --------------------------------------- | ----------: |
+| encode_segment / 1c_1000ch              |       0.144 |
+| decode_segment / 1c_1000ch              |       5.294 |
+| view_segment / 1c_1000ch                |       0.028 |
+| validate_segment_shape / 1c_1000ch      |       4.860 |
+| build_decoded_segment_index / 1c_1000ch |       0.243 |
+| build_by_change / 1c_1000ch             |       0.795 |
+| build_by_change_membership / 1c_1000ch  |       0.034 |
+
+### Backend Smoke Scoreboard
+
+Times are milliseconds.
+
+| row                                                  | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms |
+| ---------------------------------------------------- | ----------: | -----------------: | -----------------: |
+| stage_segment_raw_no_indexes / 1c_1000ch             |       0.493 |              3.295 |              3.888 |
+| stage_segment / 1c_1000ch                            |       4.546 |              7.705 |              7.256 |
+| stage_publish_commit / 1c_1ch                        |       0.040 |              0.043 |              0.060 |
+| stage_publish_commit / 1c_100ch                      |       0.469 |              0.492 |              0.521 |
+| stage_publish_commit / 1c_1000ch single-shot         |       4.608 |              4.532 |              4.673 |
+| load_commits_visible_batched / 1c_100ch              |       0.176 |              0.167 |              0.173 |
+| load_changes_visible_batched / 1c_100ch              |       0.585 |              0.790 |              0.569 |
+| load_changes_visible_batched / 1c_1000ch             |      10.767 |             17.283 |              5.567 |
+| load_changes_physical_scattered / 100seg_100c_1000ch |       2.636 |              2.868 |              2.914 |
+| load_changes_visible_scattered / 100seg_100c_1000ch  |      11.956 |             17.893 |              6.293 |
+| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       6.258 |              8.934 |              7.192 |
+| plan_gc / live_50pct_mixed_segments                  |       7.366 |              6.269 |              6.319 |
+| collect_garbage / live_50pct_mixed_segments          |       6.827 |              6.849 |              6.681 |
+
+Read:
+
+```text
+The prior mem/unit cliff was benchmark-backend noise:
+
+load_changes_visible_batched / 1c_1000ch:
+  entry 10 mem/unit: 122.194ms
+  entry 11 mem/unit:  10.767ms
+
+load_changes_visible_scattered / 100seg_100c_1000ch:
+  entry 10 mem/unit: 184.597ms
+  entry 11 mem/unit:  11.956ms
+
+The focused profile also confirms the remaining real read-path cost is not the
+unit backend clone anymore. RocksDB samples point at repeated visible membership
+proof work:
+
+  load_visible_change_entries
+    -> prove_visible_changes_from_commit
+    -> SegmentByteIndex::load_commit
+    -> decode_segment_commit
+
+The next product-code cut is to decode/prove each visible candidate commit once
+per batch and reuse that membership proof for all requested change_ids.
+```
