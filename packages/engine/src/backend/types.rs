@@ -3,12 +3,13 @@ use std::collections::BTreeMap;
 
 use crate::backend::{
     BackendKvEntryPage, BackendKvExistsBatch, BackendKvGetRequest, BackendKvHeaderPayloadFramePart,
-    BackendKvKeyPage, BackendKvKeySpan, BackendKvReadV3Order, BackendKvReadV3Page,
-    BackendKvReadV3Presence, BackendKvReadV3Projection, BackendKvReadV3Request,
-    BackendKvReadV3Source, BackendKvReadV3Strategy, BackendKvReadV3ValuePart, BackendKvScan2Page,
-    BackendKvScan2Projection, BackendKvScan2Request, BackendKvScanRange, BackendKvScanRequest,
-    BackendKvValueBatch, BackendKvValuePage, BackendKvValuePart, BackendKvWriteBatch,
-    BackendKvWriteStats, BytePageBuilder,
+    BackendKvKeyPage, BackendKvKeySpan, BackendKvRead4Page, BackendKvRead4ValuePart,
+    BackendKvReadV3Order, BackendKvReadV3Page, BackendKvReadV3Presence, BackendKvReadV3Projection,
+    BackendKvReadV3Request, BackendKvReadV3Source, BackendKvReadV3Strategy,
+    BackendKvReadV3ValuePart, BackendKvScan2Page, BackendKvScan2Projection, BackendKvScan2Request,
+    BackendKvScanRange, BackendKvScanRequest, BackendKvTableReadRequest, BackendKvValueBatch,
+    BackendKvValuePage, BackendKvValuePart, BackendKvWriteBatch, BackendKvWriteStats,
+    BytePageBuilder,
 };
 use crate::LixError;
 
@@ -99,6 +100,14 @@ pub trait BackendReadTransaction: Send + Sync {
         request: BackendKvReadV3Request,
     ) -> Result<BackendKvReadV3Page, LixError> {
         backend_read_v3_fallback(self, request).await
+    }
+
+    async fn read4(
+        &mut self,
+        request: BackendKvTableReadRequest,
+    ) -> Result<BackendKvRead4Page, LixError> {
+        let _ = request;
+        Err(LixError::unknown("backend read4 is not implemented"))
     }
 
     async fn rollback(self: Box<Self>) -> Result<(), LixError>;
@@ -583,6 +592,25 @@ pub fn project_backend_read_v3_value_part(
             BackendKvHeaderPayloadFramePart::Payload,
         ),
         BackendKvReadV3ValuePart::FullValue => Ok(value),
+    }
+}
+
+pub fn project_backend_read4_value_part(
+    value: &[u8],
+    part: BackendKvRead4ValuePart,
+) -> Result<&[u8], LixError> {
+    match part {
+        BackendKvRead4ValuePart::Header => project_backend_header_payload_frame_part(
+            value,
+            BackendKvHeaderPayloadFramePart::Header,
+        ),
+        BackendKvRead4ValuePart::PayloadRef | BackendKvRead4ValuePart::Payload => {
+            project_backend_header_payload_frame_part(
+                value,
+                BackendKvHeaderPayloadFramePart::Payload,
+            )
+        }
+        BackendKvRead4ValuePart::FullValue => Ok(value),
     }
 }
 

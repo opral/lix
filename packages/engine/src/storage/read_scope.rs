@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use crate::storage::{
-    KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvReadV3Page, KvReadV3Request,
-    KvScan2Page, KvScan2Request, KvScanRequest, KvValueBatch, KvValuePage, StorageReadTransaction,
-    StorageReader,
+    KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvRead4Page, KvReadV3Page,
+    KvReadV3Request, KvScan2Page, KvScan2Request, KvScanRequest, KvTableReadRequest, KvValueBatch,
+    KvValuePage, StorageReadTransaction, StorageReader,
 };
 use crate::LixError;
 use tokio::sync::Mutex;
@@ -95,5 +95,10 @@ where
     async fn read_v3(&mut self, request: KvReadV3Request) -> Result<KvReadV3Page, LixError> {
         let mut store = self.store.lock().await;
         store.read_v3(request).await
+    }
+
+    async fn read4(&mut self, request: KvTableReadRequest) -> Result<KvRead4Page, LixError> {
+        let mut store = self.store.lock().await;
+        store.read4(request).await
     }
 }

@@ -409,7 +409,99 @@ pub struct BackendKvReadV3Page {
     pub resume_after: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendKvTableReadRequest {
+    pub table: BackendKvTableId,
+    pub key_space: BackendKvKeySpace,
+    pub access: Vec<BackendKvAccessSegment>,
+    pub after: Option<Vec<u8>>,
+    pub projection: BackendKvRead4Projection,
+    pub residual_filter: Option<BackendKvResidualFilter>,
+    pub output_order: BackendKvRead4Order,
+    pub limit: Option<usize>,
+    pub session: Option<BackendKvReadSessionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendKvTableId {
+    pub namespace: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendKvKeySpace {
+    OrderedBytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendKvAccessSegment {
+    Points {
+        keys: Vec<Vec<u8>>,
+        request_indexes: Vec<u32>,
+    },
+    Run {
+        lower: Vec<u8>,
+        upper: Vec<u8>,
+        keys: Vec<Vec<u8>>,
+        request_indexes: Vec<u32>,
+    },
+    Span {
+        lower: Vec<u8>,
+        upper: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendKvRead4Projection {
+    KeysOnly,
+    Parts(Vec<BackendKvRead4ValuePart>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKvRead4ValuePart {
+    Header,
+    PayloadRef,
+    Payload,
+    FullValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendKvResidualFilter {
+    UntrackedState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKvRead4Order {
+    RequestOrder,
+    KeyOrder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendKvReadSessionId(pub u64);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendKvRead4Page {
+    pub keys: BytePage,
+    pub presence: BackendKvReadV3Presence,
+    pub values: Vec<BytePage>,
+    pub request_indexes: Option<Vec<u32>>,
+    pub resume_after: Option<Vec<u8>>,
+}
+
 impl BackendKvReadV3Page {
+    pub fn presence_len(&self) -> usize {
+        self.presence.len(self.keys.len())
+    }
+
+    pub fn is_present(&self, index: usize) -> Option<bool> {
+        self.presence.is_present(self.keys.len(), index)
+    }
+
+    pub fn present_count(&self) -> usize {
+        self.presence.present_count(self.keys.len())
+    }
+}
+
+impl BackendKvRead4Page {
     pub fn presence_len(&self) -> usize {
         self.presence.len(self.keys.len())
     }

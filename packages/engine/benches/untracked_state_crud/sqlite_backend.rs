@@ -3,8 +3,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lix_engine::{
-    Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetRequest,
-    BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch,
+    Backend, BackendKvAccessSegment, BackendKvEntryPage, BackendKvExistsBatch,
+    BackendKvExistsGroup, BackendKvGetRequest, BackendKvKeyPage, BackendKvRead4Order,
+    BackendKvRead4Page, BackendKvRead4Projection, BackendKvRead4ValuePart, BackendKvReadV3Presence,
+    BackendKvScanRange, BackendKvScanRequest, BackendKvTableReadRequest, BackendKvValueBatch,
     BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteOp,
     BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, BytePageBuilder,
     LixError,
@@ -279,6 +281,14 @@ impl BackendReadTransaction for SqliteBenchTransaction {
         }
     }
 
+    async fn read4(
+        &mut self,
+        request: BackendKvTableReadRequest,
+    ) -> Result<BackendKvRead4Page, LixError> {
+        let connection = self.lock_connection()?;
+        sqlite_read4(&connection, request)
+    }
+
     async fn rollback(mut self: Box<Self>) -> Result<(), LixError> {
         self.lock_connection()?
             .execute_batch("ROLLBACK")
@@ -403,6 +413,491 @@ impl Drop for SqliteBenchTransaction {
                 let _ = connection.execute_batch("ROLLBACK");
             }
         }
+    }
+}
+
+fn sqlite_read4(
+    connection: &Connection,
+    request: BackendKvTableReadRequest,
+) -> Result<BackendKvRead4Page, LixError> {
+    if request.residual_filter.is_some() {
+        return Err(LixError::unknown(
+            "sqlite bench read4 cannot apply residual filters",
+        ));
+    }
+    if request.session.is_some() {
+        return Err(LixError::unknown(
+            "sqlite bench read4 does not support read sessions",
+        ));
+    }
+
+    let mut keyed = Vec::new();
+    let mut run_spans = Vec::new();
+    let mut spans = Vec::new();
+    for segment in request.access {
+        match segment {
+            BackendKvAccessSegment::Points {
+                keys,
+                request_indexes,
+            } => sqlite_read4_push_indexed_keys(&mut keyed, keys, request_indexes)?,
+            BackendKvAccessSegment::Run {
+                lower,
+                upper,
+                keys,
+                request_indexes,
+            } => {
+                run_spans.push((lower, upper));
+                sqlite_read4_push_indexed_keys(&mut keyed, keys, request_indexes)?;
+            }
+            BackendKvAccessSegment::Span { lower, upper } => spans.push((lower, upper)),
+        }
+    }
+
+    if !keyed.is_empty() && !spans.is_empty() {
+        return Err(LixError::unknown(
+            "sqlite bench read4 cannot mix point/run and span access",
+        ));
+    }
+    if !keyed.is_empty() || spans.is_empty() {
+        if request.after.is_some() {
+            return Err(LixError::unknown(
+                "sqlite bench read4 point/run access does not support after cursors",
+            ));
+        }
+        if run_spans.is_empty() {
+            return sqlite_read4_points(
+                connection,
+                request.table.namespace,
+                keyed,
+                request.projection,
+                request.output_order,
+            );
+        }
+        return sqlite_read4_runs(
+            connection,
+            request.table.namespace,
+            keyed,
+            run_spans,
+            request.projection,
+            request.output_order,
+        );
+    }
+
+    if request.output_order != BackendKvRead4Order::KeyOrder {
+        return Err(LixError::unknown(
+            "sqlite bench read4 span access requires key order output",
+        ));
+    }
+    sqlite_read4_spans(
+        connection,
+        request.table.namespace,
+        spans,
+        request.after,
+        request.limit.unwrap_or(usize::MAX),
+        request.projection,
+    )
+}
+
+fn sqlite_read4_push_indexed_keys(
+    output: &mut Vec<(u32, Vec<u8>)>,
+    keys: Vec<Vec<u8>>,
+    request_indexes: Vec<u32>,
+) -> Result<(), LixError> {
+    if keys.len() != request_indexes.len() {
+        return Err(LixError::unknown("sqlite bench read4 key/index mismatch"));
+    }
+    output.extend(request_indexes.into_iter().zip(keys));
+    Ok(())
+}
+
+fn sqlite_read4_points(
+    connection: &Connection,
+    namespace: String,
+    mut keyed: Vec<(u32, Vec<u8>)>,
+    projection: BackendKvRead4Projection,
+    order: BackendKvRead4Order,
+) -> Result<BackendKvRead4Page, LixError> {
+    match order {
+        BackendKvRead4Order::RequestOrder => keyed.sort_by_key(|(index, _)| *index),
+        BackendKvRead4Order::KeyOrder => keyed.sort_by(|left, right| left.1.cmp(&right.1)),
+    }
+
+    let request_indexes = match order {
+        BackendKvRead4Order::RequestOrder => None,
+        BackendKvRead4Order::KeyOrder => Some(keyed.iter().map(|(index, _)| *index).collect()),
+    };
+    let mut keys = BytePageBuilder::with_capacity(keyed.len(), 0);
+    for (_, key) in &keyed {
+        keys.push(key);
+    }
+    let value_count = sqlite_read4_projection_len(&projection);
+    let mut value_builders = (0..value_count)
+        .map(|_| BytePageBuilder::with_capacity(keyed.len(), 0))
+        .collect::<Vec<_>>();
+
+    if keyed.is_empty() {
+        return Ok(BackendKvRead4Page {
+            keys: keys.finish(),
+            presence: BackendKvReadV3Presence::bitmap(Vec::new()),
+            values: value_builders
+                .into_iter()
+                .map(BytePageBuilder::finish)
+                .collect(),
+            request_indexes,
+            resume_after: None,
+        });
+    }
+
+    let values_by_key =
+        sqlite_read4_select_points(connection, namespace.as_str(), &keyed, &projection)?;
+    let mut present = Vec::with_capacity(keyed.len());
+    for (_, key) in keyed {
+        if let Some(values) = values_by_key.get(&key) {
+            present.push(true);
+            for (builder, value) in value_builders.iter_mut().zip(values) {
+                builder.push(value);
+            }
+        } else {
+            present.push(false);
+            for builder in &mut value_builders {
+                builder.push([]);
+            }
+        }
+    }
+
+    Ok(BackendKvRead4Page {
+        keys: keys.finish(),
+        presence: BackendKvReadV3Presence::bitmap(present),
+        values: value_builders
+            .into_iter()
+            .map(BytePageBuilder::finish)
+            .collect(),
+        request_indexes,
+        resume_after: None,
+    })
+}
+
+fn sqlite_read4_runs(
+    connection: &Connection,
+    namespace: String,
+    mut keyed: Vec<(u32, Vec<u8>)>,
+    run_spans: Vec<(Vec<u8>, Vec<u8>)>,
+    projection: BackendKvRead4Projection,
+    order: BackendKvRead4Order,
+) -> Result<BackendKvRead4Page, LixError> {
+    match order {
+        BackendKvRead4Order::RequestOrder => keyed.sort_by_key(|(index, _)| *index),
+        BackendKvRead4Order::KeyOrder => keyed.sort_by(|left, right| left.1.cmp(&right.1)),
+    }
+
+    let request_indexes = match order {
+        BackendKvRead4Order::RequestOrder => None,
+        BackendKvRead4Order::KeyOrder => Some(keyed.iter().map(|(index, _)| *index).collect()),
+    };
+    let values_by_key =
+        sqlite_read4_collect_spans(connection, namespace.as_str(), run_spans, &projection)?;
+    let mut keys = BytePageBuilder::with_capacity(keyed.len(), 0);
+    let mut present = Vec::with_capacity(keyed.len());
+    let mut value_builders = (0..sqlite_read4_projection_len(&projection))
+        .map(|_| BytePageBuilder::with_capacity(keyed.len(), 0))
+        .collect::<Vec<_>>();
+    for (_, key) in keyed {
+        keys.push(&key);
+        if let Some(values) = values_by_key.get(&key) {
+            present.push(true);
+            for (builder, value) in value_builders.iter_mut().zip(values) {
+                builder.push(value);
+            }
+        } else {
+            present.push(false);
+            for builder in &mut value_builders {
+                builder.push([]);
+            }
+        }
+    }
+    Ok(BackendKvRead4Page {
+        keys: keys.finish(),
+        presence: BackendKvReadV3Presence::bitmap(present),
+        values: value_builders
+            .into_iter()
+            .map(BytePageBuilder::finish)
+            .collect(),
+        request_indexes,
+        resume_after: None,
+    })
+}
+
+fn sqlite_read4_collect_spans(
+    connection: &Connection,
+    namespace: &str,
+    mut spans: Vec<(Vec<u8>, Vec<u8>)>,
+    projection: &BackendKvRead4Projection,
+) -> Result<HashMap<Vec<u8>, Vec<Vec<u8>>>, LixError> {
+    spans.retain(|(lower, upper)| upper.is_empty() || lower < upper);
+    spans.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let mut values_by_key = HashMap::new();
+    for (lower, upper) in spans {
+        let page = sqlite_read4_span_page(
+            connection,
+            namespace,
+            &lower,
+            &upper,
+            None,
+            usize::MAX,
+            projection,
+        )?;
+        for (index, key) in page.keys.iter().enumerate() {
+            let values = page
+                .values
+                .iter()
+                .map(|values| {
+                    values.get(index).map(<[u8]>::to_vec).ok_or_else(|| {
+                        LixError::unknown("sqlite bench read4 run value page is misaligned")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            values_by_key.insert(key.to_vec(), values);
+        }
+    }
+    Ok(values_by_key)
+}
+
+fn sqlite_read4_select_points(
+    connection: &Connection,
+    namespace: &str,
+    keyed: &[(u32, Vec<u8>)],
+    projection: &BackendKvRead4Projection,
+) -> Result<HashMap<Vec<u8>, Vec<Vec<u8>>>, LixError> {
+    let untracked = namespace == UNTRACKED_NAMESPACE;
+    let key_placeholders = std::iter::repeat_n("?", keyed.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let value_columns = sqlite_read4_projection_sql(projection);
+    let select_columns = if value_columns.is_empty() {
+        "key".to_string()
+    } else {
+        format!("key, {}", value_columns.join(", "))
+    };
+    let sql = if untracked {
+        format!(
+            "
+            SELECT {select_columns}
+            FROM kv_u
+            WHERE key IN ({key_placeholders})
+            "
+        )
+    } else {
+        format!(
+            "
+            SELECT {select_columns}
+            FROM kv
+            WHERE namespace = ? AND key IN ({key_placeholders})
+            "
+        )
+    };
+    let mut parameters = Vec::with_capacity(usize::from(!untracked) + keyed.len());
+    if !untracked {
+        parameters.push(SqlValue::Text(namespace.to_string()));
+    }
+    parameters.extend(keyed.iter().map(|(_, key)| SqlValue::Blob(key.clone())));
+
+    let mut statement = connection.prepare_cached(&sql).map_err(sqlite_error)?;
+    let mut rows = statement
+        .query(params_from_iter(parameters))
+        .map_err(sqlite_error)?;
+    let value_count = sqlite_read4_projection_len(projection);
+    let mut values_by_key = HashMap::with_capacity(keyed.len());
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        let key = row.get::<_, Vec<u8>>(0).map_err(sqlite_error)?;
+        let mut values = Vec::with_capacity(value_count);
+        for index in 0..value_count {
+            values.push(row.get::<_, Vec<u8>>(index + 1).map_err(sqlite_error)?);
+        }
+        values_by_key.insert(key, values);
+    }
+    Ok(values_by_key)
+}
+
+fn sqlite_read4_spans(
+    connection: &Connection,
+    namespace: String,
+    mut spans: Vec<(Vec<u8>, Vec<u8>)>,
+    mut after: Option<Vec<u8>>,
+    limit: usize,
+    projection: BackendKvRead4Projection,
+) -> Result<BackendKvRead4Page, LixError> {
+    spans.retain(|(lower, upper)| upper.is_empty() || lower < upper);
+    spans.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    let mut keys = BytePageBuilder::new();
+    let mut value_builders = (0..sqlite_read4_projection_len(&projection))
+        .map(|_| BytePageBuilder::new())
+        .collect::<Vec<_>>();
+    let mut resume_after = None;
+    for (span_index, (lower, upper)) in spans.iter().enumerate() {
+        let remaining = limit.saturating_sub(keys.len());
+        if remaining == 0 {
+            resume_after = keys
+                .len()
+                .checked_sub(1)
+                .and_then(|index| keys.get(index))
+                .map(<[u8]>::to_vec);
+            break;
+        }
+        let page = sqlite_read4_span_page(
+            connection,
+            namespace.as_str(),
+            lower,
+            upper,
+            after.as_deref(),
+            remaining,
+            &projection,
+        )?;
+        for key in page.keys.iter() {
+            keys.push(key);
+        }
+        for (target, source) in value_builders.iter_mut().zip(page.values) {
+            for value in source.iter() {
+                target.push(value);
+            }
+        }
+        resume_after = page.resume_after;
+        if resume_after.is_some() {
+            break;
+        }
+        if keys.len() == limit && span_index + 1 < spans.len() {
+            resume_after = keys
+                .len()
+                .checked_sub(1)
+                .and_then(|index| keys.get(index))
+                .map(<[u8]>::to_vec);
+            break;
+        }
+        after = None;
+    }
+
+    Ok(BackendKvRead4Page {
+        keys: keys.finish(),
+        presence: BackendKvReadV3Presence::All,
+        values: value_builders
+            .into_iter()
+            .map(BytePageBuilder::finish)
+            .collect(),
+        request_indexes: None,
+        resume_after,
+    })
+}
+
+fn sqlite_read4_span_page(
+    connection: &Connection,
+    namespace: &str,
+    lower: &[u8],
+    upper: &[u8],
+    after: Option<&[u8]>,
+    limit: usize,
+    projection: &BackendKvRead4Projection,
+) -> Result<BackendKvRead4Page, LixError> {
+    let untracked = namespace == UNTRACKED_NAMESPACE;
+    let value_columns = sqlite_read4_projection_sql(projection);
+    let select_columns = if value_columns.is_empty() {
+        "key".to_string()
+    } else {
+        format!("key, {}", value_columns.join(", "))
+    };
+    let fetch_limit = sqlite_fetch_limit(limit)?;
+    let sql = if untracked {
+        format!(
+            "
+            SELECT {select_columns}
+            FROM kv_u
+            WHERE (?1 IS NULL OR key > ?1)
+              AND key >= ?2
+              AND (?3 IS NULL OR key < ?3)
+            ORDER BY key
+            LIMIT ?4
+            "
+        )
+    } else {
+        format!(
+            "
+            SELECT {select_columns}
+            FROM kv
+            WHERE namespace = ?1
+              AND (?2 IS NULL OR key > ?2)
+              AND key >= ?3
+              AND (?4 IS NULL OR key < ?4)
+            ORDER BY key
+            LIMIT ?5
+            "
+        )
+    };
+    let upper_param = (!upper.is_empty()).then_some(upper);
+    let mut statement = connection.prepare_cached(&sql).map_err(sqlite_error)?;
+    let mut rows = if untracked {
+        statement
+            .query(params![after, lower, upper_param, fetch_limit])
+            .map_err(sqlite_error)?
+    } else {
+        statement
+            .query(params![namespace, after, lower, upper_param, fetch_limit])
+            .map_err(sqlite_error)?
+    };
+    let value_count = sqlite_read4_projection_len(projection);
+    let mut keys = BytePageBuilder::new();
+    let mut value_builders = (0..value_count)
+        .map(|_| BytePageBuilder::new())
+        .collect::<Vec<_>>();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        let key = row.get::<_, Vec<u8>>(0).map_err(sqlite_error)?;
+        if count < limit {
+            resume_after_candidate = Some(key.clone());
+            keys.push(&key);
+            for (value_index, builder) in value_builders.iter_mut().enumerate() {
+                let value = row
+                    .get::<_, Vec<u8>>(value_index + 1)
+                    .map_err(sqlite_error)?;
+                builder.push(&value);
+            }
+        }
+        count += 1;
+    }
+    let resume_after = (count > limit).then_some(resume_after_candidate).flatten();
+    Ok(BackendKvRead4Page {
+        keys: keys.finish(),
+        presence: BackendKvReadV3Presence::All,
+        values: value_builders
+            .into_iter()
+            .map(BytePageBuilder::finish)
+            .collect(),
+        request_indexes: None,
+        resume_after,
+    })
+}
+
+fn sqlite_read4_projection_len(projection: &BackendKvRead4Projection) -> usize {
+    match projection {
+        BackendKvRead4Projection::KeysOnly => 0,
+        BackendKvRead4Projection::Parts(parts) => parts.len(),
+    }
+}
+
+fn sqlite_read4_projection_sql(projection: &BackendKvRead4Projection) -> Vec<&'static str> {
+    match projection {
+        BackendKvRead4Projection::KeysOnly => Vec::new(),
+        BackendKvRead4Projection::Parts(parts) => parts
+            .iter()
+            .map(|part| match part {
+                BackendKvRead4ValuePart::Header => {
+                    "substr(value, 26, CAST(substr(value, 6, 10) AS INTEGER))"
+                }
+                BackendKvRead4ValuePart::PayloadRef | BackendKvRead4ValuePart::Payload => {
+                    "substr(value, 26 + CAST(substr(value, 6, 10) AS INTEGER), CAST(substr(value, 16, 10) AS INTEGER))"
+                }
+                BackendKvRead4ValuePart::FullValue => "value",
+            })
+            .collect(),
     }
 }
 
