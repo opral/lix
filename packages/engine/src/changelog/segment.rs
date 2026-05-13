@@ -560,7 +560,7 @@ fn checksum_change(change: &SegmentChange) -> Result<String, LixError> {
         &mut hasher,
         change.authored_commit_id.as_deref().unwrap_or_default(),
     );
-    hash_part(&mut hasher, &change.entity_id.as_json_array_text()?);
+    hash_parts(&mut hasher, change.entity_id.parts.iter().map(String::as_str));
     hash_part(&mut hasher, &change.schema_key);
     hash_part(&mut hasher, change.file_id.as_deref().unwrap_or_default());
     hash_optional_json_ref(&mut hasher, change.snapshot_ref.as_ref());
@@ -581,6 +581,12 @@ fn checksum_change(change: &SegmentChange) -> Result<String, LixError> {
 fn hash_part(hasher: &mut blake3::Hasher, value: &str) {
     hasher.update(&(value.len() as u64).to_le_bytes());
     hasher.update(value.as_bytes());
+}
+
+fn hash_parts<'a>(hasher: &mut blake3::Hasher, values: impl Iterator<Item = &'a str>) {
+    for value in values {
+        hash_part(hasher, value);
+    }
 }
 
 fn hash_bytes_part(hasher: &mut blake3::Hasher, value: &[u8]) {

@@ -674,3 +674,71 @@ The remaining CPU profile is still dominated by:
   - EntityIdentity JSON serialization/deserialization
   - checksum construction over logical objects
 ```
+
+## Entry 9: Encode EntityIdentity As Tuple Parts
+
+Change:
+
+```text
+Changelog SegmentChange encoding now stores EntityIdentity as its canonical
+string tuple parts instead of JSON-array text.
+
+checksum_change hashes the entity identity parts directly, avoiding
+EntityIdentity::as_json_array_text and serde_json serialization in checksum hot
+paths.
+
+Owned decode uses a fast tuple reader for entity identity parts instead of
+EntityIdentity::from_json_array_text.
+```
+
+Measured with:
+
+```sh
+cargo bench --manifest-path packages/engine/Cargo.toml --features storage-benches --bench changelog_scorecard
+```
+
+### CPU Segment Scoreboard
+
+Times are milliseconds.
+
+| row                                     | entry_9_ms |
+| --------------------------------------- | ---------: |
+| encode_segment / 1c_1000ch              |      0.147 |
+| decode_segment / 1c_1000ch              |      4.402 |
+| view_segment / 1c_1000ch                |      0.029 |
+| validate_segment_shape / 1c_1000ch      |      4.816 |
+| build_decoded_segment_index / 1c_1000ch |      8.095 |
+| build_by_change / 1c_1000ch             |      0.806 |
+| build_by_change_membership / 1c_1000ch  |      0.033 |
+
+### Backend Smoke Scoreboard
+
+Times are milliseconds.
+
+| row                                                  | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms |
+| ---------------------------------------------------- | ----------: | -----------------: | -----------------: |
+| stage_segment_raw_no_indexes / 1c_1000ch             |       0.459 |              3.289 |              4.134 |
+| stage_segment / 1c_1000ch                            |       4.482 |              7.391 |              7.202 |
+| stage_publish_commit / 1c_1ch                        |       0.048 |              0.044 |              0.053 |
+| stage_publish_commit / 1c_100ch                      |       0.857 |              0.868 |              0.827 |
+| stage_publish_commit / 1c_1000ch single-shot         |      11.059 |             10.931 |             11.101 |
+| load_commits_visible_batched / 1c_100ch              |       0.196 |              0.177 |              0.168 |
+| load_changes_visible_batched / 1c_100ch              |       1.766 |              0.772 |              0.593 |
+| load_changes_visible_batched / 1c_1000ch             |     123.992 |             17.187 |              5.569 |
+| load_changes_physical_scattered / 100seg_100c_1000ch |       2.772 |              2.871 |              3.011 |
+| load_changes_visible_scattered / 100seg_100c_1000ch  |     176.019 |             17.954 |              6.257 |
+| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       6.060 |              7.152 |              5.966 |
+| plan_gc / live_50pct_mixed_segments                  |       7.784 |              6.378 |              6.182 |
+| collect_garbage / live_50pct_mixed_segments          |       6.693 |              6.886 |              6.629 |
+
+Read:
+
+```text
+The cut improved checksum and maintenance-shaped paths, especially stage,
+publish, scattered loads, rebuild, and GC.
+
+decode_segment did not improve because full owned decode still materializes
+SegmentChange strings and EntityIdentity Vec allocations. That confirms the next
+larger structural cut: avoid full owned decode for DecodedSegmentIndex and read
+hot fields through borrowed segment object views.
+```

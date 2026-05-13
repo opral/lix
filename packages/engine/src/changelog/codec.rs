@@ -395,7 +395,7 @@ fn write_state_row_identity(
 }
 
 fn write_entity_identity(bytes: &mut Vec<u8>, identity: &EntityIdentity) -> Result<(), LixError> {
-    write_str(bytes, &identity.as_json_array_text()?)
+    write_strings(bytes, identity.parts.iter().map(String::as_str))
 }
 
 fn write_membership_role(bytes: &mut Vec<u8>, role: MembershipRole) {
@@ -868,7 +868,7 @@ impl<'a> ByteCursor<'a> {
         let start = self.offset;
         let id = self.read_string_ref_fast()?;
         self.skip_optional_string_fast()?;
-        self.skip_string_fast()?;
+        self.skip_strings_fast()?;
         self.skip_string_fast()?;
         self.skip_optional_string_fast()?;
         self.skip_optional_json_ref_fast()?;
@@ -930,11 +930,16 @@ impl<'a> ByteCursor<'a> {
     }
 
     fn read_entity_identity(&mut self, field: &str) -> Result<EntityIdentity, LixError> {
-        let value = self.read_string(field)?;
-        EntityIdentity::from_json_array_text(&value).map_err(|error| {
+        let parts = self.read_strings_fast_owned().map_err(|error| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!("failed to decode changelog {field}: invalid entity identity: {error}"),
+                format!("failed to decode changelog {field}: {error}"),
+            )
+        })?;
+        EntityIdentity::from_parts(parts).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("failed to decode changelog {field}: invalid entity identity parts: {error}"),
             )
         })
     }
@@ -956,6 +961,16 @@ impl<'a> ByteCursor<'a> {
         let mut out = Vec::with_capacity(len);
         for index in 0..len {
             out.push(self.read_string(&format!("{field}[{index}]"))?);
+        }
+        Ok(out)
+    }
+
+    fn read_strings_fast_owned(&mut self) -> Result<Vec<String>, LixError> {
+        let len = self.read_len_fast()?;
+        self.ensure_len_fits_remaining_fast(len)?;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            out.push(self.read_string_fast_owned()?);
         }
         Ok(out)
     }
@@ -995,6 +1010,14 @@ impl<'a> ByteCursor<'a> {
                     format!("failed to decode changelog {field}: invalid UTF-8: {error}"),
                 )
             })
+    }
+
+    fn read_string_fast_owned(&mut self) -> Result<String, LixError> {
+        let len = self.read_len_fast()?;
+        let bytes = self.read_bytes_fast(len)?;
+        std::str::from_utf8(bytes)
+            .map(str::to_string)
+            .map_err(|_| self.fast_error("invalid UTF-8 string"))
     }
 
     fn read_string_ref(&mut self, field: &str) -> Result<&'a str, LixError> {
