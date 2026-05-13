@@ -742,3 +742,74 @@ SegmentChange strings and EntityIdentity Vec allocations. That confirms the next
 larger structural cut: avoid full owned decode for DecodedSegmentIndex and read
 hot fields through borrowed segment object views.
 ```
+
+## Entry 10: Make DecodedSegmentIndex Byte-Backed
+
+Change:
+
+```text
+DecodedSegmentIndex no longer decodes the entire Segment and validates every
+logical object while building the index.
+
+It now builds from SegmentView directory refs, stores segment bytes, and decodes
+individual SegmentCommit / SegmentChange objects only when callers request them.
+Lookup-only paths use contains_commit / contains_change and stay directory-only.
+```
+
+Measured with:
+
+```sh
+cargo bench --manifest-path packages/engine/Cargo.toml --features storage-benches --bench changelog_scorecard
+```
+
+### CPU Segment Scoreboard
+
+Times are milliseconds.
+
+| row                                     | entry_10_ms |
+| --------------------------------------- | ----------: |
+| encode_segment / 1c_1000ch              |       0.130 |
+| decode_segment / 1c_1000ch              |       4.420 |
+| view_segment / 1c_1000ch                |       0.028 |
+| validate_segment_shape / 1c_1000ch      |       4.971 |
+| build_decoded_segment_index / 1c_1000ch |       0.233 |
+| build_by_change / 1c_1000ch             |       0.791 |
+| build_by_change_membership / 1c_1000ch  |       0.032 |
+
+### Backend Smoke Scoreboard
+
+Times are milliseconds.
+
+| row                                                  | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms |
+| ---------------------------------------------------- | ----------: | -----------------: | -----------------: |
+| stage_segment_raw_no_indexes / 1c_1000ch             |       0.443 |              3.398 |              3.979 |
+| stage_segment / 1c_1000ch                            |       4.543 |              7.204 |              6.941 |
+| stage_publish_commit / 1c_1ch                        |       0.075 |              0.036 |              0.037 |
+| stage_publish_commit / 1c_100ch                      |       0.448 |              0.472 |              0.461 |
+| stage_publish_commit / 1c_1000ch single-shot         |       4.535 |              4.280 |              4.735 |
+| load_commits_visible_batched / 1c_100ch              |       0.192 |              0.171 |              0.171 |
+| load_changes_visible_batched / 1c_100ch              |       1.707 |              0.752 |              0.572 |
+| load_changes_visible_batched / 1c_1000ch             |     122.194 |             16.967 |              5.629 |
+| load_changes_physical_scattered / 100seg_100c_1000ch |       2.855 |              2.909 |              2.979 |
+| load_changes_visible_scattered / 100seg_100c_1000ch  |     184.597 |             17.941 |              6.225 |
+| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       6.199 |             10.422 |              8.677 |
+| plan_gc / live_50pct_mixed_segments                  |      10.648 |              7.031 |              6.270 |
+| collect_garbage / live_50pct_mixed_segments          |       6.484 |              7.592 |              6.594 |
+
+Read:
+
+```text
+This is the large structural cut the profiler asked for:
+
+build_decoded_segment_index / 1c_1000ch:
+  entry 9: 8.095ms
+  entry 10: 0.233ms
+
+stage_publish_commit / 1c_1000ch:
+  entry 9: ~11ms
+  entry 10: ~4.3-4.7ms
+
+Publish now pays for the requested commit object plus closure validation instead
+of full segment decode. Remaining visible-change read cliffs are not in
+DecodedSegmentIndex; they sit in visible proof / change materialization paths.
+```

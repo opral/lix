@@ -1287,15 +1287,15 @@ where
             )));
         };
         let segment = DecodedSegmentIndex::decode(&bytes)?;
-        let Some(commit) = segment.commit(commit_id) else {
+        let Some(commit) = segment.commit(commit_id)? else {
             return Err(LixError::unknown(format!(
                 "cannot publish changelog commit '{commit_id}' because segment '{}' does not contain it",
                 location.segment_id
             )));
         };
         segment.validate_commit_location(location, commit_id)?;
-        validate_commit_checksum(&location.checksum, commit_id, commit)?;
-        Ok(commit.clone())
+        validate_commit_checksum(&location.checksum, commit_id, &commit)?;
+        Ok(commit)
     }
 
     async fn validate_publish_parents(&mut self, commit: &SegmentCommit) -> Result<(), LixError> {
