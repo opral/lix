@@ -11,14 +11,10 @@
     "format": "prettier --write ."
   },
   "dependencies": {
-    "@cloudflare/vite-plugin": "^1.36.0",
-    "@lix-js/plugin-json": "1.0.1",
     "@opral/markdown-wc": "0.9.0",
     "@tailwindcss/vite": "^4.2.4",
     "@tanstack/react-router": "^1.169.2",
     "@tanstack/react-start": "^1.167.64",
-    "@tanstack/router-plugin": "^1.167.34",
-    "lucide-react": "^0.544.0",
     "posthog-js": "^1.321.2",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
@@ -26,21 +22,15 @@
     "tailwindcss": "^4.2.4"
   },
   "devDependencies": {
-    "@testing-library/dom": "^10.4.0",
-    "@testing-library/react": "^16.2.0",
     "@types/node": "^22.10.2",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^6.0.1",
-    "@vitest/browser": "^4.1.5",
-    "@vitest/coverage-v8": "^4.1.5",
-    "jsdom": "^27.0.0",
     "prettier": "^3.6.0",
     "typescript": "^5.7.2",
     "vite": "^8.0.10",
     "vite-plugin-static-copy": "^4.1.0",
     "vitest": "^4.1.5",
-    "web-vitals": "^5.1.0",
     "wrangler": "^4.88.0"
   }
 }
