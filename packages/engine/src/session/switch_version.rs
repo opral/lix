@@ -75,6 +75,7 @@ impl SessionContext {
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.catalog_context),
             self.closed_flag(),
+            self.active_transaction_flag(),
         );
         Ok((
             session,

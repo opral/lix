@@ -6,6 +6,7 @@ use crate::storage::{StorageReadScope, StorageWriteSet};
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
 use super::context::{SessionContext, SessionSqlExecutionContext};
+use super::transaction::SessionTransaction;
 
 /// Result of executing one SQL statement through engine.
 ///
@@ -296,13 +297,14 @@ impl SessionContext {
     /// catalog inspection. Lix owns transaction boundaries for each statement.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
+        let _transaction_guard = self.reserve_session_transaction()?;
         let kind = sql2::classify_statement(sql)?;
         if kind == sql2::SqlStatementKind::Write {
             let sql = sql.to_string();
             let sql_for_error = sql.clone();
             let params = params.to_vec();
             return self
-                .with_write_transaction(|transaction| {
+                .with_write_transaction_reserved(|transaction| {
                     Box::pin(async move {
                         // Re-plan against the transaction-backed write
                         // session so provider hooks read and stage through the
@@ -315,6 +317,12 @@ impl SessionContext {
                 })
                 .await
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
+        }
+        if kind == sql2::SqlStatementKind::Other {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "SQL statement is not supported by Lix SQL",
+            ));
         }
 
         let read_scope = StorageReadScope::new(self.storage.begin_read_transaction().await?);
@@ -371,16 +379,62 @@ impl SessionContext {
         &self,
         runtime_functions: &FunctionContext,
     ) -> Result<(), LixError> {
-        let mut transaction = self.storage.begin_write_transaction().await?;
         let mut writes = StorageWriteSet::new();
         runtime_functions
             .stage_persist_if_needed(&mut writes)
             .await?;
-        if !writes.is_empty() {
-            writes.apply(&mut transaction.as_mut()).await?;
+        if writes.is_empty() {
+            return Ok(());
         }
+        let mut transaction = self.storage.begin_write_transaction().await?;
+        writes.apply(&mut transaction.as_mut()).await?;
         transaction.commit().await
     }
+}
+
+impl SessionTransaction {
+    /// Executes one SQL statement inside this transaction.
+    ///
+    /// Write statements are staged until `commit()`. Read statements use the
+    /// transaction overlay, so they can observe writes staged by earlier calls
+    /// on this transaction handle.
+    pub async fn execute(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ExecuteResult, LixError> {
+        let kind = sql2::classify_statement(sql)?;
+        let transaction = self.transaction_mut()?;
+        match kind {
+            sql2::SqlStatementKind::Write => execute_transaction_write(transaction, sql, params)
+                .await
+                .map_err(|error| normalize_sql_surface_error(error, sql)),
+            sql2::SqlStatementKind::Read => {
+                let plan = sql2::create_transaction_read_logical_plan(transaction, sql)
+                    .await
+                    .map_err(|error| normalize_sql_surface_error(error, sql))?;
+                let result = sql2::execute_logical_plan(plan, params)
+                    .await
+                    .map_err(|error| normalize_sql_surface_error(error, sql))?;
+                Ok(ExecuteResult::from_sql_query_result(result))
+            }
+            sql2::SqlStatementKind::Other => Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "SQL statement is not supported by Lix SQL",
+            )),
+        }
+    }
+}
+
+async fn execute_transaction_write(
+    transaction: &mut crate::transaction::Transaction,
+    sql: &str,
+    params: &[Value],
+) -> Result<ExecuteResult, LixError> {
+    let tx_plan = sql2::create_write_logical_plan(transaction, sql).await?;
+    let result = sql2::execute_logical_plan(tx_plan, params).await?;
+    let affected_rows = affected_rows_from_query_result(result)?;
+    Ok(ExecuteResult::from_rows_affected(affected_rows))
 }
 
 fn normalize_sql_surface_error(error: LixError, sql: &str) -> LixError {
