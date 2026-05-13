@@ -1317,16 +1317,16 @@ where
         &mut self,
         commit: &SegmentCommit,
     ) -> Result<(), LixError> {
-        let mut changes = HashMap::new();
-        for membership in &commit.body.membership {
-            let change = self
-                .resolve_publish_change(&membership.member_change_id)
-                .await?;
-            changes.insert(membership.member_change_id.as_str(), change);
-        }
+        let member_change_ids = commit
+            .body
+            .membership
+            .iter()
+            .map(|membership| membership.member_change_id.clone())
+            .collect::<HashSet<_>>();
+        let changes = self.resolve_publish_changes(&member_change_ids).await?;
 
         for (identity, change_id) in &commit.directory.state_row_identities {
-            let Some(change) = changes.get(change_id.as_str()) else {
+            let Some(change) = changes.get(change_id) else {
                 return Err(LixError::unknown(format!(
                     "cannot publish changelog commit '{}' because StateRowIdentity winner references non-member change '{}'",
                     commit.header.id, change_id
@@ -1338,6 +1338,132 @@ where
                     "cannot publish changelog commit '{}' because StateRowIdentity winner for change '{}' does not match changelog.change",
                     commit.header.id, change_id
                 )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn resolve_publish_changes(
+        &mut self,
+        change_ids: &HashSet<String>,
+    ) -> Result<HashMap<String, SegmentChange>, LixError> {
+        let mut found = HashMap::new();
+        for segment in self.staged_segments.values() {
+            for change in &segment.changes {
+                if change_ids.contains(&change.id) {
+                    if found.insert(change.id.clone(), change.clone()).is_some() {
+                        return Err(LixError::unknown(format!(
+                            "cannot publish changelog change '{}' because it appears in multiple staged/stored segments",
+                            change.id
+                        )));
+                    }
+                }
+            }
+        }
+
+        let mut remaining = change_ids
+            .difference(&found.keys().cloned().collect::<HashSet<_>>())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !remaining.is_empty() {
+            self.resolve_publish_changes_from_by_change(&remaining, &mut found)
+                .await?;
+            remaining.retain(|change_id| !found.contains_key(change_id));
+        }
+        if !remaining.is_empty() {
+            self.resolve_publish_changes_by_segment_scan(&remaining, &mut found)
+                .await?;
+        }
+
+        for change_id in change_ids {
+            if !found.contains_key(change_id) {
+                return Err(LixError::unknown(format!(
+                    "cannot publish changelog change '{change_id}' because no changelog.change exists"
+                )));
+            }
+        }
+        Ok(found)
+    }
+
+    async fn resolve_publish_changes_from_by_change(
+        &mut self,
+        change_ids: &[String],
+        found: &mut HashMap<String, SegmentChange>,
+    ) -> Result<(), LixError> {
+        let values = get_many(
+            &mut *self.store,
+            BY_CHANGE_INDEX_NAMESPACE,
+            change_ids
+                .iter()
+                .map(|change_id| by_change_key(change_id))
+                .collect(),
+        )
+        .await?;
+        let mut entries = Vec::new();
+        let mut segment_ids = Vec::new();
+        for (change_id, value) in change_ids.iter().zip(values.into_iter()) {
+            let Some(bytes) = value else {
+                continue;
+            };
+            let entry = decode_by_change_entry(&bytes)?;
+            if entry.change_id != *change_id {
+                return Err(LixError::unknown(format!(
+                    "by_change key for '{change_id}' contains change_id '{}'",
+                    entry.change_id
+                )));
+            }
+            push_unique(&mut segment_ids, entry.location.segment_id.clone());
+            entries.push(entry);
+        }
+
+        let segment_values = get_many(
+            &mut *self.store,
+            SEGMENT_NAMESPACE,
+            segment_ids
+                .iter()
+                .map(|segment_id| segment_key(segment_id))
+                .collect(),
+        )
+        .await?;
+        let mut segments = HashMap::new();
+        for (segment_id, value) in segment_ids.iter().zip(segment_values.into_iter()) {
+            if let Some(bytes) = value {
+                segments.insert(segment_id.clone(), SegmentByteIndex::decode(bytes)?);
+            }
+        }
+
+        for entry in entries {
+            let Some(segment) = segments.get(&entry.location.segment_id) else {
+                continue;
+            };
+            let change = segment.load_change(&entry.location, &entry.change_id)?;
+            validate_change_checksum(&entry.location.checksum, &entry.change_id, &change)?;
+            if found.insert(entry.change_id.clone(), change).is_some() {
+                return Err(LixError::unknown(format!(
+                    "cannot publish changelog change '{}' because it appears in multiple staged/stored segments",
+                    entry.change_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn resolve_publish_changes_by_segment_scan(
+        &mut self,
+        change_ids: &[String],
+        found: &mut HashMap<String, SegmentChange>,
+    ) -> Result<(), LixError> {
+        let unresolved = change_ids.iter().cloned().collect::<HashSet<_>>();
+        for segment in self.scan_all_segments().await? {
+            for change in &segment.changes {
+                if unresolved.contains(&change.id) {
+                    if found.insert(change.id.clone(), change.clone()).is_some() {
+                        return Err(LixError::unknown(format!(
+                            "cannot publish changelog change '{}' because it appears in multiple staged/stored segments",
+                            change.id
+                        )));
+                    }
+                }
             }
         }
         Ok(())

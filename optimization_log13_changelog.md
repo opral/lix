@@ -332,3 +332,74 @@ in-memory backend behavior, not physical IO. The next structural cliff is now
 stage_publish_commit / 1c_1000ch, which still validates publication closure in
 a per-change way.
 ```
+
+## Entry 4: Batch Publish Membership Closure Validation
+
+Change:
+
+```text
+stage_publish_commit now validates membership closure as one batch.
+
+The writer collects all CommitBody.membership change_ids, resolves staged
+changes by scanning staged segments once, resolves stored changes through
+by_change grouped by physical segment, and only falls back to one full segment
+scan for unresolved changes.
+```
+
+Measured with:
+
+```sh
+cargo bench --manifest-path packages/engine/Cargo.toml --features storage-benches --bench changelog_scorecard
+```
+
+### CPU Segment Scoreboard
+
+Times are milliseconds.
+
+| row                                     | entry_4_ms |
+| --------------------------------------- | ---------: |
+| encode_segment / 1c_1000ch              |      0.174 |
+| decode_segment / 1c_1000ch              |      4.976 |
+| view_segment / 1c_1000ch                |      0.603 |
+| validate_segment_shape / 1c_1000ch      |      7.557 |
+| build_decoded_segment_index / 1c_1000ch |     11.273 |
+| build_by_change / 1c_1000ch             |      0.702 |
+| build_by_change_membership / 1c_1000ch  |      0.032 |
+
+### Backend Smoke Scoreboard
+
+Times are milliseconds.
+
+| row                                                  | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms |
+| ---------------------------------------------------- | ----------: | -----------------: | -----------------: |
+| stage_segment_raw_no_indexes / 1c_1000ch             |       0.517 |              3.368 |              4.114 |
+| stage_segment / 1c_1000ch                            |      18.046 |             20.361 |             20.342 |
+| stage_publish_commit / 1c_1ch                        |       0.056 |              0.051 |              0.059 |
+| stage_publish_commit / 1c_100ch                      |       1.167 |              1.244 |              1.223 |
+| stage_publish_commit / 1c_1000ch single-shot         |      14.898 |             14.540 |             15.028 |
+| load_commits_visible_batched / 1c_100ch              |       0.246 |              0.230 |              0.221 |
+| load_changes_visible_batched / 1c_100ch              |       1.840 |              0.907 |              0.722 |
+| load_changes_visible_batched / 1c_1000ch             |     123.311 |             18.612 |              7.530 |
+| load_changes_physical_scattered / 100seg_100c_1000ch |       3.788 |              3.634 |              4.037 |
+| load_changes_visible_scattered / 100seg_100c_1000ch  |     198.086 |             19.525 |              7.762 |
+| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       9.273 |             11.254 |              9.291 |
+| plan_gc / live_50pct_mixed_segments                  |      11.081 |              9.356 |              9.398 |
+| collect_garbage / live_50pct_mixed_segments          |       9.498 |              9.870 |              9.699 |
+
+Read:
+
+```text
+The publish cliff collapsed:
+
+stage_publish_commit / 1c_1000ch single-shot:
+  entry 3: ~11.1s
+  entry 4: ~14-15ms
+
+stage_publish_commit / 1c_100ch:
+  entry 3: ~80-94ms
+  entry 4: ~1.2ms
+
+This is the intended Big-O shift: staged publication closure now scans staged
+changes once instead of resolving each membership change through a repeated
+segment search.
+```
