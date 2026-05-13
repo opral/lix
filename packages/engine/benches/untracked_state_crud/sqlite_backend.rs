@@ -6,12 +6,12 @@ use lix_engine::{
     Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetRequest,
     BackendKvKeyPage, BackendKvKeySpan, BackendKvReadV3Order, BackendKvReadV3Page,
     BackendKvReadV3Presence, BackendKvReadV3Projection, BackendKvReadV3Request,
-    BackendKvReadV3Source, BackendKvReadV3Strategy, BackendKvReadV3ValuePart, BackendKvScan2Page,
-    BackendKvScan2Projection, BackendKvScan2Request, BackendKvScanPlanV3Page,
-    BackendKvScanPlanV3Projection, BackendKvScanPlanV3Request, BackendKvScanPlanV3ValuePart,
-    BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch, BackendKvValueGroup,
-    BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteOp, BackendKvWriteStats,
-    BackendReadTransaction, BackendWriteTransaction, BytePageBuilder, LixError,
+    BackendKvReadV3Source, BackendKvReadV3Strategy, BackendKvReadV3ValuePart,
+    BackendKvScanPlanV3Page, BackendKvScanPlanV3Projection, BackendKvScanPlanV3Request,
+    BackendKvScanPlanV3ValuePart, BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch,
+    BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteOp,
+    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, BytePageBuilder,
+    LixError,
 };
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
@@ -281,14 +281,6 @@ impl BackendReadTransaction for SqliteBenchTransaction {
         } else {
             sqlite_scan_entries(&connection, request)
         }
-    }
-
-    async fn scan2(
-        &mut self,
-        request: BackendKvScan2Request,
-    ) -> Result<BackendKvScan2Page, LixError> {
-        let connection = self.lock_connection()?;
-        sqlite_scan2(&connection, request)
     }
 
     async fn scan_plan_v3(
@@ -730,108 +722,6 @@ fn sqlite_scan_untracked_entries(
     })
 }
 
-fn sqlite_scan2(
-    connection: &Connection,
-    request: BackendKvScan2Request,
-) -> Result<BackendKvScan2Page, LixError> {
-    match request.projection.clone() {
-        BackendKvScan2Projection::KeysOnly => {
-            let page = if request.namespace == UNTRACKED_NAMESPACE {
-                sqlite_scan_untracked_keys(connection, scan2_primary_request(&request))?
-            } else {
-                sqlite_scan_keys(connection, scan2_primary_request(&request))?
-            };
-            Ok(BackendKvScan2Page {
-                keys: page.keys,
-                values: None,
-                resume_after: page.resume_after,
-            })
-        }
-        BackendKvScan2Projection::FullValue => {
-            let page = if request.namespace == UNTRACKED_NAMESPACE {
-                sqlite_scan_untracked_entries(connection, scan2_primary_request(&request))?
-            } else {
-                sqlite_scan_entries(connection, scan2_primary_request(&request))?
-            };
-            Ok(BackendKvScan2Page {
-                keys: page.keys,
-                values: Some(page.values),
-                resume_after: page.resume_after,
-            })
-        }
-        BackendKvScan2Projection::ValuePart(part) => {
-            sqlite_scan2_value_part(connection, request, sqlite_value_part_expr(&part)?)
-        }
-    }
-}
-
-fn sqlite_scan2_value_part(
-    connection: &Connection,
-    request: BackendKvScan2Request,
-    value_expr: String,
-) -> Result<BackendKvScan2Page, LixError> {
-    let mut parameters = Vec::new();
-    let from_clause = if request.namespace == UNTRACKED_NAMESPACE {
-        "kv_u AS p".to_string()
-    } else {
-        parameters.push(SqlValue::Text(request.namespace.clone()));
-        "kv AS p".to_string()
-    };
-    let namespace_filter = if request.namespace == UNTRACKED_NAMESPACE {
-        ""
-    } else {
-        "p.namespace = ? AND"
-    };
-    let start = scan2_start_key(&request);
-    let end = scan_end_key(&request.range);
-    parameters.push(nullable_blob_value(request.after.as_deref()));
-    parameters.push(nullable_blob_value(request.after.as_deref()));
-    parameters.push(SqlValue::Blob(start));
-    parameters.push(nullable_blob_value(end.as_deref()));
-    parameters.push(nullable_blob_value(end.as_deref()));
-    parameters.push(SqlValue::Integer(sqlite_fetch_limit(request.page_size)?));
-
-    let sql = format!(
-        "
-        SELECT p.key, {value_expr}
-        FROM {from_clause}
-        WHERE {namespace_filter}
-          (? IS NULL OR p.key > ?)
-          AND p.key >= ?
-          AND (? IS NULL OR p.key < ?)
-        ORDER BY p.key
-        LIMIT ?
-        "
-    );
-    let mut statement = connection.prepare(&sql).map_err(sqlite_error)?;
-    let mut cursor = statement
-        .query(params_from_iter(parameters))
-        .map_err(sqlite_error)?;
-    let mut keys = BytePageBuilder::new();
-    let mut values = BytePageBuilder::new();
-    let mut count = 0;
-    let mut resume_after_candidate = None;
-    while let Some(row) = cursor.next().map_err(sqlite_error)? {
-        let key = row.get::<_, Vec<u8>>(0).map_err(sqlite_error)?;
-        if count < request.page_size {
-            resume_after_candidate = Some(key.clone());
-            keys.push(&key);
-            let value = row.get::<_, Vec<u8>>(1).map_err(sqlite_error)?;
-            values.push(&value);
-        }
-        count += 1;
-    }
-
-    let resume_after = (count > request.page_size)
-        .then_some(resume_after_candidate)
-        .flatten();
-    Ok(BackendKvScan2Page {
-        keys: keys.finish(),
-        values: Some(values.finish()),
-        resume_after,
-    })
-}
-
 fn sqlite_scan_plan_v3(
     connection: &Connection,
     request: BackendKvScanPlanV3Request,
@@ -1218,32 +1108,6 @@ fn read_v3_scan_plan_v3_projection(
     }
 }
 
-fn sqlite_value_part_expr(part: &lix_engine::BackendKvValuePart) -> Result<String, LixError> {
-    match part {
-        lix_engine::BackendKvValuePart::ByteRange { offset, len } => {
-            let start = offset.checked_add(1).ok_or_else(|| {
-                LixError::unknown("sqlite scan2 value projection start overflow")
-            })?;
-            Ok(format!("substr(p.value, {start}, {len})"))
-        }
-        lix_engine::BackendKvValuePart::ByteSuffix { offset } => {
-            let start = offset.checked_add(1).ok_or_else(|| {
-                LixError::unknown("sqlite scan2 value projection start overflow")
-            })?;
-            Ok(format!("substr(p.value, {start})"))
-        }
-        lix_engine::BackendKvValuePart::HeaderPayloadFrame(part) => match part {
-            lix_engine::BackendKvHeaderPayloadFramePart::Header => {
-                Ok("substr(p.value, 26, CAST(substr(p.value, 6, 10) AS INTEGER))".to_string())
-            }
-            lix_engine::BackendKvHeaderPayloadFramePart::Payload => Ok(
-                "substr(p.value, 26 + CAST(substr(p.value, 6, 10) AS INTEGER), CAST(substr(p.value, 16, 10) AS INTEGER))"
-                    .to_string(),
-            ),
-        },
-    }
-}
-
 fn sqlite_scan_plan_v3_value_part_expr(part: BackendKvScanPlanV3ValuePart) -> &'static str {
     match part {
         BackendKvScanPlanV3ValuePart::Header => {
@@ -1258,26 +1122,6 @@ fn sqlite_scan_plan_v3_value_part_expr(part: BackendKvScanPlanV3ValuePart) -> &'
 
 fn sqlite_read_v3_value_part_expr(part: BackendKvReadV3ValuePart) -> &'static str {
     sqlite_scan_plan_v3_value_part_expr(part.into())
-}
-
-fn scan2_primary_request(request: &BackendKvScan2Request) -> BackendKvScanRequest {
-    BackendKvScanRequest {
-        namespace: request.namespace.clone(),
-        range: request.range.clone(),
-        after: request.after.clone(),
-        limit: request.page_size,
-    }
-}
-
-fn scan2_start_key(request: &BackendKvScan2Request) -> Vec<u8> {
-    let range_start = match &request.range {
-        BackendKvScanRange::Prefix(prefix) => prefix.as_slice(),
-        BackendKvScanRange::Range { start, .. } => start.as_slice(),
-    };
-    match request.after.as_deref() {
-        Some(after) if after > range_start => after.to_vec(),
-        _ => range_start.to_vec(),
-    }
 }
 
 fn nullable_blob_value(value: Option<&[u8]>) -> SqlValue {

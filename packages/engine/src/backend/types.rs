@@ -3,13 +3,13 @@ use std::collections::BTreeMap;
 
 use crate::backend::{
     BackendKvEntryPage, BackendKvExistsBatch, BackendKvGetRequest, BackendKvHeaderPayloadFramePart,
-    BackendKvKeyPage, BackendKvKeySpan, BackendKvRead3Order, BackendKvRead3Page,
-    BackendKvRead3Presence, BackendKvRead3Projection, BackendKvRead3Request, BackendKvRead3Source,
-    BackendKvRead3Strategy, BackendKvRead3ValuePart, BackendKvScan2Page, BackendKvScan2Projection,
-    BackendKvScan2Request, BackendKvScanPlanPage, BackendKvScanPlanRequest,
-    BackendKvScanPlanValuePart, BackendKvScanProjection, BackendKvScanRange, BackendKvScanRequest,
-    BackendKvValueBatch, BackendKvValuePage, BackendKvValuePart, BackendKvWriteBatch,
-    BackendKvWriteStats, BytePageBuilder,
+    BackendKvKeyPage, BackendKvKeySpan, BackendKvReadV3Order, BackendKvReadV3Page,
+    BackendKvReadV3Presence, BackendKvReadV3Projection, BackendKvReadV3Request,
+    BackendKvReadV3Source, BackendKvReadV3Strategy, BackendKvReadV3ValuePart, BackendKvScan2Page,
+    BackendKvScan2Projection, BackendKvScan2Request, BackendKvScanPlanV3Page,
+    BackendKvScanPlanV3Projection, BackendKvScanPlanV3Request, BackendKvScanPlanV3ValuePart,
+    BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch, BackendKvValuePage,
+    BackendKvValuePart, BackendKvWriteBatch, BackendKvWriteStats, BytePageBuilder,
 };
 use crate::LixError;
 
@@ -95,18 +95,18 @@ pub trait BackendReadTransaction: Send + Sync {
         backend_scan2_fallback(self, request).await
     }
 
-    async fn scan_plan(
+    async fn scan_plan_v3(
         &mut self,
-        request: BackendKvScanPlanRequest,
-    ) -> Result<BackendKvScanPlanPage, LixError> {
-        backend_scan_plan_fallback(self, request).await
+        request: BackendKvScanPlanV3Request,
+    ) -> Result<BackendKvScanPlanV3Page, LixError> {
+        backend_scan_plan_v3_fallback(self, request).await
     }
 
-    async fn read3(
+    async fn read_v3(
         &mut self,
-        request: BackendKvRead3Request,
-    ) -> Result<BackendKvRead3Page, LixError> {
-        backend_read3_fallback(self, request).await
+        request: BackendKvReadV3Request,
+    ) -> Result<BackendKvReadV3Page, LixError> {
+        backend_read_v3_fallback(self, request).await
     }
 
     async fn rollback(self: Box<Self>) -> Result<(), LixError>;
@@ -182,15 +182,15 @@ where
     }
 }
 
-async fn backend_scan_plan_fallback<T>(
+async fn backend_scan_plan_v3_fallback<T>(
     transaction: &mut T,
-    request: BackendKvScanPlanRequest,
-) -> Result<BackendKvScanPlanPage, LixError>
+    request: BackendKvScanPlanV3Request,
+) -> Result<BackendKvScanPlanV3Page, LixError>
 where
     T: BackendReadTransaction + ?Sized,
 {
     match request.projection {
-        BackendKvScanProjection::KeysOnly => {
+        BackendKvScanPlanV3Projection::KeysOnly => {
             let mut keys = BytePageBuilder::new();
             let mut resume_after = None;
             let spans = normalize_backend_spans(request.spans);
@@ -226,13 +226,13 @@ where
                     break;
                 }
             }
-            Ok(BackendKvScanPlanPage {
+            Ok(BackendKvScanPlanV3Page {
                 keys: keys.finish(),
                 values: Vec::new(),
                 resume_after,
             })
         }
-        BackendKvScanProjection::ValueParts(parts) => {
+        BackendKvScanPlanV3Projection::ValueParts(parts) => {
             let mut keys = BytePageBuilder::new();
             let mut value_builders = parts
                 .iter()
@@ -264,7 +264,7 @@ where
                     })?;
                     keys.push(key);
                     for (part, builder) in parts.iter().zip(value_builders.iter_mut()) {
-                        builder.push(project_backend_scan_plan_value_part(value, *part)?);
+                        builder.push(project_backend_scan_plan_v3_value_part(value, *part)?);
                     }
                 }
                 resume_after = page.resume_after;
@@ -278,7 +278,7 @@ where
                     break;
                 }
             }
-            Ok(BackendKvScanPlanPage {
+            Ok(BackendKvScanPlanV3Page {
                 keys: keys.finish(),
                 values: value_builders
                     .into_iter()
@@ -290,16 +290,16 @@ where
     }
 }
 
-async fn backend_read3_fallback<T>(
+async fn backend_read_v3_fallback<T>(
     transaction: &mut T,
-    request: BackendKvRead3Request,
-) -> Result<BackendKvRead3Page, LixError>
+    request: BackendKvReadV3Request,
+) -> Result<BackendKvReadV3Page, LixError>
 where
     T: BackendReadTransaction + ?Sized,
 {
     match request.source {
-        BackendKvRead3Source::Keys { keys } => {
-            backend_read3_keys_fallback(
+        BackendKvReadV3Source::Keys { keys } => {
+            backend_read_v3_keys_fallback(
                 transaction,
                 request.namespace,
                 keys,
@@ -308,9 +308,9 @@ where
             )
             .await
         }
-        BackendKvRead3Source::KeysOrSpans { keys, spans } => match request.strategy {
-            BackendKvRead3Strategy::Scan => {
-                backend_read3_scan_then_reorder_fallback(
+        BackendKvReadV3Source::KeysOrSpans { keys, spans } => match request.strategy {
+            BackendKvReadV3Strategy::Scan => {
+                backend_read_v3_scan_then_reorder_fallback(
                     transaction,
                     request.namespace,
                     keys,
@@ -320,8 +320,8 @@ where
                 )
                 .await
             }
-            BackendKvRead3Strategy::Auto | BackendKvRead3Strategy::Points => {
-                backend_read3_keys_fallback(
+            BackendKvReadV3Strategy::Auto | BackendKvReadV3Strategy::Points => {
+                backend_read_v3_keys_fallback(
                     transaction,
                     request.namespace,
                     keys,
@@ -331,19 +331,21 @@ where
                 .await
             }
         },
-        BackendKvRead3Source::Spans { spans, after } => {
+        BackendKvReadV3Source::Spans { spans, after } => {
             let page_size = request.page_size.unwrap_or(usize::MAX);
             let projection = match request.projection {
-                BackendKvRead3Projection::KeysOnly => BackendKvScanProjection::KeysOnly,
-                BackendKvRead3Projection::ValueParts(parts) => BackendKvScanProjection::ValueParts(
-                    parts
-                        .into_iter()
-                        .map(BackendKvScanPlanValuePart::from)
-                        .collect(),
-                ),
+                BackendKvReadV3Projection::KeysOnly => BackendKvScanPlanV3Projection::KeysOnly,
+                BackendKvReadV3Projection::ValueParts(parts) => {
+                    BackendKvScanPlanV3Projection::ValueParts(
+                        parts
+                            .into_iter()
+                            .map(BackendKvScanPlanV3ValuePart::from)
+                            .collect(),
+                    )
+                }
             };
             let page = transaction
-                .scan_plan(BackendKvScanPlanRequest {
+                .scan_plan_v3(BackendKvScanPlanV3Request {
                     namespace: request.namespace,
                     spans,
                     after,
@@ -351,9 +353,9 @@ where
                     projection,
                 })
                 .await?;
-            Ok(BackendKvRead3Page {
+            Ok(BackendKvReadV3Page {
                 keys: page.keys,
-                presence: BackendKvRead3Presence::All,
+                presence: BackendKvReadV3Presence::All,
                 values: page.values,
                 request_indexes: None,
                 resume_after: page.resume_after,
@@ -362,18 +364,18 @@ where
     }
 }
 
-async fn backend_read3_keys_fallback<T>(
+async fn backend_read_v3_keys_fallback<T>(
     transaction: &mut T,
     namespace: String,
     keys: Vec<Vec<u8>>,
-    projection: BackendKvRead3Projection,
-    order: BackendKvRead3Order,
-) -> Result<BackendKvRead3Page, LixError>
+    projection: BackendKvReadV3Projection,
+    order: BackendKvReadV3Order,
+) -> Result<BackendKvReadV3Page, LixError>
 where
     T: BackendReadTransaction + ?Sized,
 {
     match projection {
-        BackendKvRead3Projection::KeysOnly => {
+        BackendKvReadV3Projection::KeysOnly => {
             let result = transaction
                 .exists_many(BackendKvGetRequest {
                     groups: vec![crate::backend::BackendKvGetGroup {
@@ -383,21 +385,21 @@ where
                 })
                 .await?;
             let group = result.groups.into_iter().next().ok_or_else(|| {
-                LixError::unknown("backend read3 fallback exists returned no result group")
+                LixError::unknown("backend read_v3 fallback exists returned no result group")
             })?;
             let mut key_builder = BytePageBuilder::new();
             let mut present = Vec::new();
             let mut request_indexes = match order {
-                BackendKvRead3Order::RequestOrder => None,
-                BackendKvRead3Order::KeyOrder => Some(Vec::new()),
+                BackendKvReadV3Order::RequestOrder => None,
+                BackendKvReadV3Order::KeyOrder => Some(Vec::new()),
             };
             for (index, (key, exists)) in keys.into_iter().zip(group.exists).enumerate() {
                 match order {
-                    BackendKvRead3Order::RequestOrder => {
+                    BackendKvReadV3Order::RequestOrder => {
                         key_builder.push(key);
                         present.push(exists);
                     }
-                    BackendKvRead3Order::KeyOrder => {
+                    BackendKvReadV3Order::KeyOrder => {
                         if exists {
                             key_builder.push(key);
                             present.push(true);
@@ -405,21 +407,21 @@ where
                                 .as_mut()
                                 .expect("request indexes exist")
                                 .push(u32::try_from(index).map_err(|_| {
-                                    LixError::unknown("backend read3 request index overflow")
+                                    LixError::unknown("backend read_v3 request index overflow")
                                 })?);
                         }
                     }
                 }
             }
-            Ok(BackendKvRead3Page {
+            Ok(BackendKvReadV3Page {
                 keys: key_builder.finish(),
-                presence: BackendKvRead3Presence::bitmap(present),
+                presence: BackendKvReadV3Presence::bitmap(present),
                 values: Vec::new(),
                 request_indexes,
                 resume_after: None,
             })
         }
-        BackendKvRead3Projection::ValueParts(parts) => {
+        BackendKvReadV3Projection::ValueParts(parts) => {
             let result = transaction
                 .get_values(BackendKvGetRequest {
                     groups: vec![crate::backend::BackendKvGetGroup {
@@ -429,7 +431,7 @@ where
                 })
                 .await?;
             let group = result.groups.into_iter().next().ok_or_else(|| {
-                LixError::unknown("backend read3 fallback get returned no result group")
+                LixError::unknown("backend read_v3 fallback get returned no result group")
             })?;
             let mut key_builder = BytePageBuilder::new();
             let mut present = Vec::new();
@@ -438,47 +440,47 @@ where
                 .map(|_| BytePageBuilder::new())
                 .collect::<Vec<_>>();
             let mut request_indexes = match order {
-                BackendKvRead3Order::RequestOrder => None,
-                BackendKvRead3Order::KeyOrder => Some(Vec::new()),
+                BackendKvReadV3Order::RequestOrder => None,
+                BackendKvReadV3Order::KeyOrder => Some(Vec::new()),
             };
             for (index, key) in keys.into_iter().enumerate() {
                 let value = group.value(index).ok_or_else(|| {
-                    LixError::unknown("backend read3 fallback result index missing")
+                    LixError::unknown("backend read_v3 fallback result index missing")
                 })?;
                 match (order, value) {
-                    (BackendKvRead3Order::RequestOrder, Some(value)) => {
+                    (BackendKvReadV3Order::RequestOrder, Some(value)) => {
                         key_builder.push(key);
                         present.push(true);
                         for (part, builder) in parts.iter().zip(value_builders.iter_mut()) {
-                            builder.push(project_backend_read3_value_part(value, *part)?);
+                            builder.push(project_backend_read_v3_value_part(value, *part)?);
                         }
                     }
-                    (BackendKvRead3Order::RequestOrder, None) => {
+                    (BackendKvReadV3Order::RequestOrder, None) => {
                         key_builder.push(key);
                         present.push(false);
                         for builder in &mut value_builders {
                             builder.push([]);
                         }
                     }
-                    (BackendKvRead3Order::KeyOrder, Some(value)) => {
+                    (BackendKvReadV3Order::KeyOrder, Some(value)) => {
                         key_builder.push(key);
                         present.push(true);
                         request_indexes
                             .as_mut()
                             .expect("request indexes exist")
                             .push(u32::try_from(index).map_err(|_| {
-                                LixError::unknown("backend read3 request index overflow")
+                                LixError::unknown("backend read_v3 request index overflow")
                             })?);
                         for (part, builder) in parts.iter().zip(value_builders.iter_mut()) {
-                            builder.push(project_backend_read3_value_part(value, *part)?);
+                            builder.push(project_backend_read_v3_value_part(value, *part)?);
                         }
                     }
-                    (BackendKvRead3Order::KeyOrder, None) => {}
+                    (BackendKvReadV3Order::KeyOrder, None) => {}
                 }
             }
-            Ok(BackendKvRead3Page {
+            Ok(BackendKvReadV3Page {
                 keys: key_builder.finish(),
-                presence: BackendKvRead3Presence::bitmap(present),
+                presence: BackendKvReadV3Presence::bitmap(present),
                 values: value_builders
                     .into_iter()
                     .map(BytePageBuilder::finish)
@@ -490,36 +492,37 @@ where
     }
 }
 
-async fn backend_read3_scan_then_reorder_fallback<T>(
+async fn backend_read_v3_scan_then_reorder_fallback<T>(
     transaction: &mut T,
     namespace: String,
     keys: Vec<Vec<u8>>,
     spans: Vec<BackendKvKeySpan>,
-    projection: BackendKvRead3Projection,
-    order: BackendKvRead3Order,
-) -> Result<BackendKvRead3Page, LixError>
+    projection: BackendKvReadV3Projection,
+    order: BackendKvReadV3Order,
+) -> Result<BackendKvReadV3Page, LixError>
 where
     T: BackendReadTransaction + ?Sized,
 {
     if spans.is_empty() {
-        return backend_read3_keys_fallback(transaction, namespace, keys, projection, order).await;
+        return backend_read_v3_keys_fallback(transaction, namespace, keys, projection, order)
+            .await;
     }
 
     let part_count = match &projection {
-        BackendKvRead3Projection::KeysOnly => 0,
-        BackendKvRead3Projection::ValueParts(parts) => parts.len(),
+        BackendKvReadV3Projection::KeysOnly => 0,
+        BackendKvReadV3Projection::ValueParts(parts) => parts.len(),
     };
     let scan_projection = match projection {
-        BackendKvRead3Projection::KeysOnly => BackendKvScanProjection::KeysOnly,
-        BackendKvRead3Projection::ValueParts(parts) => BackendKvScanProjection::ValueParts(
+        BackendKvReadV3Projection::KeysOnly => BackendKvScanPlanV3Projection::KeysOnly,
+        BackendKvReadV3Projection::ValueParts(parts) => BackendKvScanPlanV3Projection::ValueParts(
             parts
                 .into_iter()
-                .map(BackendKvScanPlanValuePart::from)
+                .map(BackendKvScanPlanV3ValuePart::from)
                 .collect(),
         ),
     };
     let page = transaction
-        .scan_plan(BackendKvScanPlanRequest {
+        .scan_plan_v3(BackendKvScanPlanV3Request {
             namespace,
             spans,
             after: None,
@@ -534,7 +537,7 @@ where
             values.push(
                 values_page
                     .get(index)
-                    .ok_or_else(|| LixError::unknown("backend read3 scan value missing"))?
+                    .ok_or_else(|| LixError::unknown("backend read_v3 scan value missing"))?
                     .to_vec(),
             );
         }
@@ -547,47 +550,45 @@ where
         .map(|_| BytePageBuilder::new())
         .collect::<Vec<_>>();
     let mut request_indexes = match order {
-        BackendKvRead3Order::RequestOrder => None,
-        BackendKvRead3Order::KeyOrder => Some(Vec::new()),
+        BackendKvReadV3Order::RequestOrder => None,
+        BackendKvReadV3Order::KeyOrder => Some(Vec::new()),
     };
     for (index, key) in keys.into_iter().enumerate() {
         let values = values_by_key.get(&key);
         match (order, values) {
-            (BackendKvRead3Order::RequestOrder, Some(values)) => {
+            (BackendKvReadV3Order::RequestOrder, Some(values)) => {
                 key_builder.push(&key);
                 present.push(true);
                 for (value, builder) in values.iter().zip(value_builders.iter_mut()) {
                     builder.push(value);
                 }
             }
-            (BackendKvRead3Order::RequestOrder, None) => {
+            (BackendKvReadV3Order::RequestOrder, None) => {
                 key_builder.push(&key);
                 present.push(false);
                 for builder in &mut value_builders {
                     builder.push([]);
                 }
             }
-            (BackendKvRead3Order::KeyOrder, Some(values)) => {
+            (BackendKvReadV3Order::KeyOrder, Some(values)) => {
                 key_builder.push(&key);
                 present.push(true);
                 request_indexes
                     .as_mut()
                     .expect("request indexes exist")
-                    .push(
-                        u32::try_from(index).map_err(|_| {
-                            LixError::unknown("backend read3 request index overflow")
-                        })?,
-                    );
+                    .push(u32::try_from(index).map_err(|_| {
+                        LixError::unknown("backend read_v3 request index overflow")
+                    })?);
                 for (value, builder) in values.iter().zip(value_builders.iter_mut()) {
                     builder.push(value);
                 }
             }
-            (BackendKvRead3Order::KeyOrder, None) => {}
+            (BackendKvReadV3Order::KeyOrder, None) => {}
         }
     }
-    Ok(BackendKvRead3Page {
+    Ok(BackendKvReadV3Page {
         keys: key_builder.finish(),
-        presence: BackendKvRead3Presence::bitmap(present),
+        presence: BackendKvReadV3Presence::bitmap(present),
         values: value_builders
             .into_iter()
             .map(BytePageBuilder::finish)
@@ -597,36 +598,36 @@ where
     })
 }
 
-pub fn project_backend_read3_value_part(
+pub fn project_backend_read_v3_value_part(
     value: &[u8],
-    part: BackendKvRead3ValuePart,
+    part: BackendKvReadV3ValuePart,
 ) -> Result<&[u8], LixError> {
-    project_backend_scan_plan_value_part(value, part.into())
+    project_backend_scan_plan_v3_value_part(value, part.into())
 }
 
-pub fn project_backend_scan_plan_value_part(
+pub fn project_backend_scan_plan_v3_value_part(
     value: &[u8],
-    part: BackendKvScanPlanValuePart,
+    part: BackendKvScanPlanV3ValuePart,
 ) -> Result<&[u8], LixError> {
     match part {
-        BackendKvScanPlanValuePart::Header => project_backend_header_payload_frame_part(
+        BackendKvScanPlanV3ValuePart::Header => project_backend_header_payload_frame_part(
             value,
             BackendKvHeaderPayloadFramePart::Header,
         ),
-        BackendKvScanPlanValuePart::Payload => project_backend_header_payload_frame_part(
+        BackendKvScanPlanV3ValuePart::Payload => project_backend_header_payload_frame_part(
             value,
             BackendKvHeaderPayloadFramePart::Payload,
         ),
-        BackendKvScanPlanValuePart::FullValue => Ok(value),
+        BackendKvScanPlanV3ValuePart::FullValue => Ok(value),
     }
 }
 
-impl From<BackendKvRead3ValuePart> for BackendKvScanPlanValuePart {
-    fn from(part: BackendKvRead3ValuePart) -> Self {
+impl From<BackendKvReadV3ValuePart> for BackendKvScanPlanV3ValuePart {
+    fn from(part: BackendKvReadV3ValuePart) -> Self {
         match part {
-            BackendKvRead3ValuePart::Header => Self::Header,
-            BackendKvRead3ValuePart::Payload => Self::Payload,
-            BackendKvRead3ValuePart::FullValue => Self::FullValue,
+            BackendKvReadV3ValuePart::Header => Self::Header,
+            BackendKvReadV3ValuePart::Payload => Self::Payload,
+            BackendKvReadV3ValuePart::FullValue => Self::FullValue,
         }
     }
 }

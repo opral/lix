@@ -5,9 +5,10 @@ use async_trait::async_trait;
 use crate::backend::{Backend, BackendReadTransaction, BackendWriteTransaction};
 use crate::storage::types::{KvWriteBatch, StorageWriter};
 use crate::storage::{
-    KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvRead3Page, KvRead3Request, KvScan2Page,
-    KvScan2Request, KvScanPlanPage, KvScanPlanRequest, KvScanRequest, KvValueBatch, KvValuePage,
-    KvWriteStats, StorageReadTransaction, StorageReader, StorageWriteTransaction,
+    KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvReadV3Page, KvReadV3Request,
+    KvScan2Page, KvScan2Request, KvScanPlanV3Page, KvScanPlanV3Request, KvScanRequest,
+    KvValueBatch, KvValuePage, KvWriteStats, StorageReadTransaction, StorageReader,
+    StorageWriteTransaction,
 };
 use crate::LixError;
 
@@ -137,9 +138,12 @@ impl StorageReader for StorageContext {
         }
     }
 
-    async fn scan_plan(&mut self, request: KvScanPlanRequest) -> Result<KvScanPlanPage, LixError> {
+    async fn scan_plan_v3(
+        &mut self,
+        request: KvScanPlanV3Request,
+    ) -> Result<KvScanPlanV3Page, LixError> {
         let mut transaction = self.begin_read_transaction().await?;
-        let result = transaction.scan_plan(request).await;
+        let result = transaction.scan_plan_v3(request).await;
         match result {
             Ok(result) => {
                 transaction.rollback().await?;
@@ -152,9 +156,9 @@ impl StorageReader for StorageContext {
         }
     }
 
-    async fn read3(&mut self, request: KvRead3Request) -> Result<KvRead3Page, LixError> {
+    async fn read_v3(&mut self, request: KvReadV3Request) -> Result<KvReadV3Page, LixError> {
         let mut transaction = self.begin_read_transaction().await?;
-        let result = transaction.read3(request).await;
+        let result = transaction.read_v3(request).await;
         match result {
             Ok(result) => {
                 transaction.rollback().await?;
@@ -217,15 +221,21 @@ impl StorageReader for StorageContextReadTransaction {
         self.transaction.scan2(request.into()).await.map(Into::into)
     }
 
-    async fn scan_plan(&mut self, request: KvScanPlanRequest) -> Result<KvScanPlanPage, LixError> {
+    async fn scan_plan_v3(
+        &mut self,
+        request: KvScanPlanV3Request,
+    ) -> Result<KvScanPlanV3Page, LixError> {
         self.transaction
-            .scan_plan(request.into())
+            .scan_plan_v3(request.into())
             .await
             .map(Into::into)
     }
 
-    async fn read3(&mut self, request: KvRead3Request) -> Result<KvRead3Page, LixError> {
-        self.transaction.read3(request.into()).await.map(Into::into)
+    async fn read_v3(&mut self, request: KvReadV3Request) -> Result<KvReadV3Page, LixError> {
+        self.transaction
+            .read_v3(request.into())
+            .await
+            .map(Into::into)
     }
 }
 
@@ -277,15 +287,21 @@ impl StorageReader for StorageContextWriteTransaction {
         self.transaction.scan2(request.into()).await.map(Into::into)
     }
 
-    async fn scan_plan(&mut self, request: KvScanPlanRequest) -> Result<KvScanPlanPage, LixError> {
+    async fn scan_plan_v3(
+        &mut self,
+        request: KvScanPlanV3Request,
+    ) -> Result<KvScanPlanV3Page, LixError> {
         self.transaction
-            .scan_plan(request.into())
+            .scan_plan_v3(request.into())
             .await
             .map(Into::into)
     }
 
-    async fn read3(&mut self, request: KvRead3Request) -> Result<KvRead3Page, LixError> {
-        self.transaction.read3(request.into()).await.map(Into::into)
+    async fn read_v3(&mut self, request: KvReadV3Request) -> Result<KvReadV3Page, LixError> {
+        self.transaction
+            .read_v3(request.into())
+            .await
+            .map(Into::into)
     }
 }
 
@@ -320,9 +336,9 @@ mod tests {
     use crate::backend::testing::UnitTestBackend;
     use crate::storage::types::KvWriteBatch;
     use crate::storage::{
-        KvGetGroup, KvHeaderPayloadFramePart, KvKeySpan, KvRead3Order, KvRead3Projection,
-        KvRead3Request, KvRead3Source, KvRead3Strategy, KvRead3ValuePart, KvScan2Projection,
-        KvScanPlanValuePart, KvScanProjection, KvScanRange, KvValuePart, StorageWriteSet,
+        KvGetGroup, KvHeaderPayloadFramePart, KvKeySpan, KvReadV3Order, KvReadV3Projection,
+        KvReadV3Request, KvReadV3Source, KvReadV3Strategy, KvReadV3ValuePart, KvScan2Projection,
+        KvScanPlanV3Projection, KvScanPlanV3ValuePart, KvScanRange, KvValuePart, StorageWriteSet,
     };
 
     use super::*;
@@ -616,7 +632,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_plan_keys_only_multi_span_returns_global_order_and_cursor() {
+    async fn scan_plan_v3_keys_only_multi_span_returns_global_order_and_cursor() {
         let storage = seeded_scan2_storage().await;
         let mut tx = storage
             .begin_read_transaction()
@@ -624,22 +640,22 @@ mod tests {
             .expect("read transaction opens");
 
         let first = tx
-            .scan_plan(KvScanPlanRequest {
+            .scan_plan_v3(KvScanPlanV3Request {
                 namespace: "primary".to_string(),
                 spans: vec![span_prefix(b"a/"), span_prefix(b"b/")],
                 after: None,
                 page_size: 2,
-                projection: KvScanProjection::KeysOnly,
+                projection: KvScanPlanV3Projection::KeysOnly,
             })
             .await
             .expect("first scan plan page reads");
         let second = tx
-            .scan_plan(KvScanPlanRequest {
+            .scan_plan_v3(KvScanPlanV3Request {
                 namespace: "primary".to_string(),
                 spans: vec![span_prefix(b"a/"), span_prefix(b"b/")],
                 after: first.resume_after.clone(),
                 page_size: 2,
-                projection: KvScanProjection::KeysOnly,
+                projection: KvScanPlanV3Projection::KeysOnly,
             })
             .await
             .expect("second scan plan page reads");
@@ -653,7 +669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_plan_full_values_match_scan_entries() {
+    async fn scan_plan_v3_full_values_match_scan_entries() {
         let storage = seeded_scan2_storage().await;
         let mut tx = storage
             .begin_read_transaction()
@@ -670,12 +686,14 @@ mod tests {
             .await
             .expect("scan entries reads");
         let page = tx
-            .scan_plan(KvScanPlanRequest {
+            .scan_plan_v3(KvScanPlanV3Request {
                 namespace: "primary".to_string(),
                 spans: vec![KvKeySpan::all()],
                 after: None,
                 page_size: 3,
-                projection: KvScanProjection::ValueParts(vec![KvScanPlanValuePart::FullValue]),
+                projection: KvScanPlanV3Projection::ValueParts(vec![
+                    KvScanPlanV3ValuePart::FullValue,
+                ]),
             })
             .await
             .expect("scan plan reads");
@@ -693,7 +711,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_plan_multiple_value_parts_return_aligned_pages() {
+    async fn scan_plan_v3_multiple_value_parts_return_aligned_pages() {
         let storage = seeded_scan2_storage().await;
         let mut tx = storage
             .begin_read_transaction()
@@ -701,14 +719,14 @@ mod tests {
             .expect("read transaction opens");
 
         let page = tx
-            .scan_plan(KvScanPlanRequest {
+            .scan_plan_v3(KvScanPlanV3Request {
                 namespace: "packed".to_string(),
                 spans: vec![KvKeySpan::all()],
                 after: None,
                 page_size: 2,
-                projection: KvScanProjection::ValueParts(vec![
-                    KvScanPlanValuePart::Header,
-                    KvScanPlanValuePart::Payload,
+                projection: KvScanPlanV3Projection::ValueParts(vec![
+                    KvScanPlanV3ValuePart::Header,
+                    KvScanPlanV3ValuePart::Payload,
                 ]),
             })
             .await
@@ -724,7 +742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read3_projected_points_preserve_request_order_and_misses() {
+    async fn read_v3_projected_points_preserve_request_order_and_misses() {
         let storage = seeded_scan2_storage().await;
         let mut tx = storage
             .begin_read_transaction()
@@ -732,18 +750,18 @@ mod tests {
             .expect("read transaction opens");
 
         let page = tx
-            .read3(KvRead3Request {
+            .read_v3(KvReadV3Request {
                 namespace: "packed".to_string(),
-                source: KvRead3Source::Keys {
+                source: KvReadV3Source::Keys {
                     keys: vec![b"k2".to_vec(), b"missing".to_vec(), b"k1".to_vec()],
                 },
-                projection: KvRead3Projection::ValueParts(vec![KvRead3ValuePart::Header]),
-                order: KvRead3Order::RequestOrder,
+                projection: KvReadV3Projection::ValueParts(vec![KvReadV3ValuePart::Header]),
+                order: KvReadV3Order::RequestOrder,
                 page_size: None,
-                strategy: KvRead3Strategy::Auto,
+                strategy: KvReadV3Strategy::Auto,
             })
             .await
-            .expect("read3 reads");
+            .expect("read_v3 reads");
 
         assert_eq!(
             page.keys.iter().collect::<Vec<_>>(),
@@ -758,7 +776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read3_span_scan_uses_key_order_and_cursor() {
+    async fn read_v3_span_scan_uses_key_order_and_cursor() {
         let storage = seeded_scan2_storage().await;
         let mut tx = storage
             .begin_read_transaction()
@@ -766,19 +784,19 @@ mod tests {
             .expect("read transaction opens");
 
         let page = tx
-            .read3(KvRead3Request {
+            .read_v3(KvReadV3Request {
                 namespace: "primary".to_string(),
-                source: KvRead3Source::Spans {
+                source: KvReadV3Source::Spans {
                     spans: vec![KvKeySpan::new(b"a/".to_vec(), b"a0".to_vec())],
                     after: None,
                 },
-                projection: KvRead3Projection::KeysOnly,
-                order: KvRead3Order::KeyOrder,
+                projection: KvReadV3Projection::KeysOnly,
+                order: KvReadV3Order::KeyOrder,
                 page_size: Some(1),
-                strategy: KvRead3Strategy::Scan,
+                strategy: KvReadV3Strategy::Scan,
             })
             .await
-            .expect("read3 scans");
+            .expect("read_v3 scans");
 
         assert_eq!(page.keys.iter().collect::<Vec<_>>(), vec![b"a/1"]);
         assert_eq!(page.presence_vec(), vec![true]);
@@ -787,7 +805,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_plan_overlapping_spans_do_not_duplicate_keys() {
+    async fn scan_plan_v3_overlapping_spans_do_not_duplicate_keys() {
         let storage = seeded_scan2_storage().await;
         let mut tx = storage
             .begin_read_transaction()
@@ -795,12 +813,12 @@ mod tests {
             .expect("read transaction opens");
 
         let page = tx
-            .scan_plan(KvScanPlanRequest {
+            .scan_plan_v3(KvScanPlanV3Request {
                 namespace: "primary".to_string(),
                 spans: vec![span_prefix(b"a/"), span_exact(b"a/1")],
                 after: None,
                 page_size: 10,
-                projection: KvScanProjection::KeysOnly,
+                projection: KvScanPlanV3Projection::KeysOnly,
             })
             .await
             .expect("scan plan reads");
