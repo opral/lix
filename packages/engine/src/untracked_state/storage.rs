@@ -1038,9 +1038,8 @@ mod tests {
     use super::*;
     use crate::backend::testing::UnitTestBackend;
     use crate::storage::{
-        KvEntryPage, KvExistsBatch, KvKeyPage, KvScanPlanV3Page, KvScanPlanV3Projection,
-        KvScanPlanV3Request, KvValueBatch, KvValuePage, StorageContext, StorageReader,
-        StorageWriteTransaction,
+        KvEntryPage, KvExistsBatch, KvKeyPage, KvReadV3Page, KvReadV3Projection, KvReadV3Request,
+        KvValueBatch, KvValuePage, StorageContext, StorageReader, StorageWriteTransaction,
     };
     use crate::untracked_state::{
         MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateRowRequest,
@@ -1914,18 +1913,15 @@ mod tests {
             self.inner.scan_entries(request).await
         }
 
-        async fn scan_plan_v3(
-            &mut self,
-            request: KvScanPlanV3Request,
-        ) -> Result<KvScanPlanV3Page, LixError> {
+        async fn read_v3(&mut self, request: KvReadV3Request) -> Result<KvReadV3Page, LixError> {
             if request.namespace == UNTRACKED_STATE_ROW_NAMESPACE
-                && request.projection != KvScanPlanV3Projection::KeysOnly
+                && request.projection != KvReadV3Projection::KeysOnly
             {
                 return Err(LixError::unknown(
                     "identity scan unexpectedly read untracked row values",
                 ));
             }
-            self.inner.scan_plan_v3(request).await
+            self.inner.read_v3(request).await
         }
     }
 

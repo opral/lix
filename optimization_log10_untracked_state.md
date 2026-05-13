@@ -3504,132 +3504,14 @@ Use it with the density matrix to compare Auto, forced points, and forced scan
 for select_all_by_pk and projected point-read variants.
 ```
 
-## Optimization 40: redb embedded backend baseline
-
-Implementation:
-
-- Added `redb = "4.1"` as a bench/dev dependency for `lix_engine`.
-- Added `RedbBenchBackend` for the storage/untracked-state benchmark matrix.
-- Wired `lix_redb` into `untracked_state_crud` alongside `lix_sqlite` and `lix_rocksdb`.
-- Kept `read3` naming unchanged.
-- Kept redb intentionally primitive for this baseline: it implements the existing KV operations and exercises the default `scan2`, `scan_plan`, and `read3` fallback paths. Native redb lowering is left for a measured follow-up.
-
-Verification:
-
-```sh
-cargo fmt -p lix_engine
-cargo check -p lix_engine --features storage-benches --benches --tests
-cargo test -p lix_engine untracked_state:: --lib
-cargo test -p lix_engine storage:: --lib
-LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
-cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb|lix_redb)/smoke/.*/1k'
-cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/storage_plans/(lix_sqlite|lix_rocksdb|lix_redb)/smoke/.*/1k'
-```
-
-Smoke I/O scoreboard:
-
-| workload | backend     | operation             | logical rows | io ops | io bytes/row | read calls | get calls | get keys | scan calls | read rows | read bytes/row | puts | deletes | delete ranges | write bytes/row |
-| -------- | ----------- | --------------------- | -----------: | -----: | -----------: | ---------: | --------: | -------: | ---------: | --------: | -------------: | ---: | ------: | ------------: | --------------: |
-| smoke/1k | lix_sqlite  | `insert_all_rows`     |         1000 |      1 |       956.31 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          956.31 |
-| smoke/1k | lix_sqlite  | `select_all_rows`     |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
-| smoke/1k | lix_sqlite  | `select_keys_only`    |         1000 |      2 |        81.22 |          2 |         1 |        1 |          1 |      1001 |          81.22 |    0 |       0 |             0 |            0.00 |
-| smoke/1k | lix_sqlite  | `select_headers_only` |         1000 |      2 |       136.22 |          2 |         1 |        1 |          1 |      1001 |         136.22 |    0 |       0 |             0 |            0.00 |
-| smoke/1k | lix_sqlite  | `select_one_by_pk`    |            1 |      2 |       336.00 |          2 |         1 |        1 |          1 |         2 |         336.00 |    0 |       0 |             0 |            0.00 |
-| smoke/1k | lix_sqlite  | `select_all_by_pk`    |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
-| smoke/1k | lix_rocksdb | `insert_all_rows`     |         1000 |      1 |       956.31 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          956.31 |
-| smoke/1k | lix_rocksdb | `select_all_rows`     |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
-| smoke/1k | lix_rocksdb | `select_keys_only`    |         1000 |      2 |        81.22 |          2 |         1 |        1 |          1 |      1001 |          81.22 |    0 |       0 |             0 |            0.00 |
-| smoke/1k | lix_rocksdb | `select_headers_only` |         1000 |      2 |       136.22 |          2 |         1 |        1 |          1 |      1001 |         136.22 |    0 |       0 |             0 |            0.00 |
-| smoke/1k | lix_rocksdb | `select_one_by_pk`    |            1 |      2 |       336.00 |          2 |         1 |        1 |          1 |         2 |         336.00 |    0 |       0 |             0 |            0.00 |
-| smoke/1k | lix_rocksdb | `select_all_by_pk`    |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
-| smoke/1k | lix_redb    | `insert_all_rows`     |         1000 |      1 |       956.31 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          956.31 |
-| smoke/1k | lix_redb    | `select_all_rows`     |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
-| smoke/1k | lix_redb    | `select_keys_only`    |         1000 |      2 |        81.22 |          2 |         1 |        1 |          1 |      1001 |          81.22 |    0 |       0 |             0 |            0.00 |
-| smoke/1k | lix_redb    | `select_headers_only` |         1000 |      2 |       136.22 |          2 |         1 |        1 |          1 |      1001 |         136.22 |    0 |       0 |             0 |            0.00 |
-| smoke/1k | lix_redb    | `select_one_by_pk`    |            1 |      2 |       336.00 |          2 |         1 |        1 |          1 |         2 |         336.00 |    0 |       0 |             0 |            0.00 |
-| smoke/1k | lix_redb    | `select_all_by_pk`    |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
-
-Smoke timing scoreboard:
-
-| backend     | operation                |          time 95% CI | Criterion change              |
-| ----------- | ------------------------ | -------------------: | ----------------------------- |
-| lix_sqlite  | `insert_all_rows/1k`     | 6.1062 ms..6.3567 ms | no change                     |
-| lix_sqlite  | `select_all_rows/1k`     | 4.5738 ms..4.6750 ms | -5.6299%..-2.4151%, improved  |
-| lix_sqlite  | `select_keys_only/1k`    | 4.1423 ms..4.2385 ms | -9.0532%..-5.5011%, improved  |
-| lix_sqlite  | `select_headers_only/1k` | 4.4813 ms..4.6574 ms | no change                     |
-| lix_sqlite  | `select_one_by_pk/1k`    | 3.7319 ms..3.8601 ms | -8.0777%..-3.7391%, improved  |
-| lix_sqlite  | `select_all_by_pk/1k`    | 5.4944 ms..5.7518 ms | no change                     |
-| lix_sqlite  | `update_all_rows/1k`     | 5.3856 ms..5.5123 ms | no change                     |
-| lix_sqlite  | `update_one_by_pk/1k`    | 3.5989 ms..3.6943 ms | no change                     |
-| lix_sqlite  | `delete_all_rows/1k`     | 3.9304 ms..4.0197 ms | no change                     |
-| lix_sqlite  | `delete_one_by_pk/1k`    | 3.7483 ms..3.9284 ms | no change                     |
-| lix_rocksdb | `insert_all_rows/1k`     | 2.9403 ms..2.9816 ms | -6.0737%..-2.3578%, improved  |
-| lix_rocksdb | `select_all_rows/1k`     | 1.5586 ms..1.5803 ms | no change                     |
-| lix_rocksdb | `select_keys_only/1k`    | 1.0677 ms..1.1691 ms | no change                     |
-| lix_rocksdb | `select_headers_only/1k` | 1.3519 ms..1.3881 ms | no change                     |
-| lix_rocksdb | `select_one_by_pk/1k`    | 703.50 us..723.08 us | no change                     |
-| lix_rocksdb | `select_all_by_pk/1k`    | 2.3768 ms..2.4101 ms | no change                     |
-| lix_rocksdb | `update_all_rows/1k`     | 2.1722 ms..2.2062 ms | change within noise threshold |
-| lix_rocksdb | `update_one_by_pk/1k`    | 617.01 us..629.72 us | no change                     |
-| lix_rocksdb | `delete_all_rows/1k`     | 786.17 us..813.47 us | no change                     |
-| lix_rocksdb | `delete_one_by_pk/1k`    | 649.40 us..674.95 us | no change                     |
-| lix_redb    | `insert_all_rows/1k`     | 4.4886 ms..4.5702 ms | new baseline                  |
-| lix_redb    | `select_all_rows/1k`     | 2.8771 ms..2.9836 ms | new baseline                  |
-| lix_redb    | `select_keys_only/1k`    | 2.2557 ms..2.2990 ms | new baseline                  |
-| lix_redb    | `select_headers_only/1k` | 2.5230 ms..2.5950 ms | new baseline                  |
-| lix_redb    | `select_one_by_pk/1k`    | 1.9266 ms..2.0452 ms | new baseline                  |
-| lix_redb    | `select_all_by_pk/1k`    | 3.5083 ms..3.5718 ms | new baseline                  |
-| lix_redb    | `update_all_rows/1k`     | 4.0701 ms..4.1963 ms | new baseline                  |
-| lix_redb    | `update_one_by_pk/1k`    | 1.9417 ms..1.9716 ms | new baseline                  |
-| lix_redb    | `delete_all_rows/1k`     | 3.1441 ms..3.2741 ms | new baseline                  |
-| lix_redb    | `delete_one_by_pk/1k`    | 2.0235 ms..2.1007 ms | new baseline                  |
-
-Storage-plan smoke scoreboard:
-
-| backend     | operation                           |          time 95% CI | Criterion change              |
-| ----------- | ----------------------------------- | -------------------: | ----------------------------- |
-| lix_sqlite  | `scan_keys_row/1k`                  | 3.7607 ms..3.9115 ms | change within noise threshold |
-| lix_sqlite  | `scan2_header_valuepart/1k`         | 3.9516 ms..4.0724 ms | -7.2599%..-1.2317%, improved  |
-| lix_sqlite  | `dual_scan2_header_payload/1k`      | 4.3910 ms..4.4915 ms | -11.941%..-7.3863%, improved  |
-| lix_sqlite  | `scan2_full_value/1k`               | 3.8527 ms..3.9656 ms | -12.044%..-4.9634%, improved  |
-| lix_sqlite  | `scan_plan_header_valuepart/1k`     | 3.9987 ms..4.0760 ms | -8.4970%..-3.2086%, improved  |
-| lix_sqlite  | `scan_plan_header_payload_parts/1k` | 4.2446 ms..4.3811 ms | -9.8542%..-4.0054%, improved  |
-| lix_sqlite  | `scan_plan_full_value/1k`           | 4.0143 ms..4.1391 ms | no change                     |
-| lix_sqlite  | `scan_keys_get_full_value/1k`       | 5.0876 ms..5.2174 ms | -5.2504%..-2.5748%, improved  |
-| lix_rocksdb | `scan_keys_row/1k`                  | 791.06 us..834.42 us | no change                     |
-| lix_rocksdb | `scan2_header_valuepart/1k`         | 921.95 us..939.82 us | -7.4054%..-1.7486%, improved  |
-| lix_rocksdb | `dual_scan2_header_payload/1k`      | 1.1635 ms..1.1808 ms | -12.037%..-3.3311%, improved  |
-| lix_rocksdb | `scan2_full_value/1k`               | 854.36 us..868.76 us | -8.8778%..-2.8428%, improved  |
-| lix_rocksdb | `scan_plan_header_valuepart/1k`     | 946.45 us..972.30 us | -9.6018%..-3.9581%, improved  |
-| lix_rocksdb | `scan_plan_header_payload_parts/1k` | 1.0195 ms..1.0472 ms | -13.189%..-3.7152%, improved  |
-| lix_rocksdb | `scan_plan_full_value/1k`           | 932.31 us..965.19 us | no change                     |
-| lix_rocksdb | `scan_keys_get_full_value/1k`       | 1.3710 ms..1.3948 ms | -11.632%..-5.1745%, improved  |
-| lix_redb    | `scan_keys_row/1k`                  | 1.9431 ms..2.0708 ms | new baseline                  |
-| lix_redb    | `scan2_header_valuepart/1k`         | 2.1233 ms..2.2023 ms | new baseline                  |
-| lix_redb    | `dual_scan2_header_payload/1k`      | 2.3176 ms..2.3894 ms | new baseline                  |
-| lix_redb    | `scan2_full_value/1k`               | 1.9943 ms..2.0864 ms | new baseline                  |
-| lix_redb    | `scan_plan_header_valuepart/1k`     | 2.0408 ms..2.0593 ms | new baseline                  |
-| lix_redb    | `scan_plan_header_payload_parts/1k` | 2.1141 ms..2.1428 ms | new baseline                  |
-| lix_redb    | `scan_plan_full_value/1k`           | 2.0917 ms..2.1270 ms | new baseline                  |
-| lix_redb    | `scan_keys_get_full_value/1k`       | 2.3999 ms..2.5055 ms | new baseline                  |
-
-Result:
-
-```text
-redb is now a third embedded backend in the smoke matrix. With the primitive
-fallback implementation, redb lands between SQLite and RocksDB for most 1k
-read paths: faster than SQLite scans/point reads, slower than RocksDB. The
-storage-plan baseline is useful because it shows the cost of generic fallback
-lowering before any redb-native scan_plan/read3 implementation.
-```
-
-### Optimization 40 rerun: isolated untracked backends and v3 API names
+## Optimization 40: clean redb embedded backend baseline after read_v3 hard cut
 
 Implementation context:
 
-- Reran the redb baseline after copying SQLite, RocksDB, and redb backend implementations into `benches/untracked_state_crud`.
-- The untracked CRUD bench no longer imports backend implementations from `benches/storage`.
-- The direct storage-plan smoke surface now uses v3 API names: `scan_plan_v3_*`.
+- Kept redb as the third embedded backend in the untracked-state smoke matrix.
+- Reran the baseline after the hard Rust type cut that removed public `scan_plan_v3`/`ScanPlanV3` APIs.
+- The storage-plan smoke surface now uses `read_v3_scan_*` labels and span-based `read_v3` requests.
+- The shared storage bench backends no longer carry native v3 overrides; the isolated untracked CRUD backend copies remain local to the untracked benchmark harness.
 
 Verification:
 
@@ -3664,62 +3546,61 @@ Smoke I/O scoreboard:
 
 Smoke timing scoreboard:
 
-| backend     | operation                |          time 95% CI | Criterion change              |
-| ----------- | ------------------------ | -------------------: | ----------------------------- |
-| lix_sqlite  | `insert_all_rows/1k`     | 6.2627 ms..6.3665 ms | no change                     |
-| lix_sqlite  | `select_all_rows/1k`     | 4.6826 ms..4.7957 ms | +1.7335%..+7.7094%, regressed |
-| lix_sqlite  | `select_keys_only/1k`    | 4.1012 ms..4.2105 ms | no change                     |
-| lix_sqlite  | `select_headers_only/1k` | 4.4987 ms..4.5423 ms | no change                     |
-| lix_sqlite  | `select_one_by_pk/1k`    | 3.7784 ms..3.9293 ms | +1.7587%..+7.4884%, regressed |
-| lix_sqlite  | `select_all_by_pk/1k`    | 5.4530 ms..5.5596 ms | no change                     |
-| lix_sqlite  | `update_all_rows/1k`     | 5.1869 ms..5.3785 ms | change within noise threshold |
-| lix_sqlite  | `update_one_by_pk/1k`    | 3.5901 ms..3.8732 ms | no change                     |
-| lix_sqlite  | `delete_all_rows/1k`     | 4.1277 ms..4.2984 ms | no change                     |
-| lix_sqlite  | `delete_one_by_pk/1k`    | 3.8024 ms..3.8648 ms | no change                     |
-| lix_rocksdb | `insert_all_rows/1k`     | 2.9479 ms..2.9736 ms | no change                     |
-| lix_rocksdb | `select_all_rows/1k`     | 1.5822 ms..1.6011 ms | change within noise threshold |
-| lix_rocksdb | `select_keys_only/1k`    | 1.0920 ms..1.1100 ms | no change                     |
-| lix_rocksdb | `select_headers_only/1k` | 1.3268 ms..1.3448 ms | -3.6175%..-1.6930%, improved  |
-| lix_rocksdb | `select_one_by_pk/1k`    | 720.17 us..753.92 us | +2.4964%..+10.757%, regressed |
-| lix_rocksdb | `select_all_by_pk/1k`    | 2.3766 ms..2.4047 ms | no change                     |
-| lix_rocksdb | `update_all_rows/1k`     | 2.2276 ms..2.3438 ms | +1.6427%..+6.0356%, regressed |
-| lix_rocksdb | `update_one_by_pk/1k`    | 613.96 us..629.97 us | no change                     |
-| lix_rocksdb | `delete_all_rows/1k`     | 766.55 us..797.83 us | change within noise threshold |
-| lix_rocksdb | `delete_one_by_pk/1k`    | 632.14 us..650.54 us | -4.8563%..-1.2123%, improved  |
-| lix_redb    | `insert_all_rows/1k`     | 4.5020 ms..4.5307 ms | no change                     |
-| lix_redb    | `select_all_rows/1k`     | 2.8409 ms..2.9249 ms | change within noise threshold |
-| lix_redb    | `select_keys_only/1k`    | 2.3864 ms..2.4553 ms | +3.3367%..+6.9375%, regressed |
-| lix_redb    | `select_headers_only/1k` | 2.5879 ms..2.8872 ms | +1.0642%..+7.7759%, regressed |
-| lix_redb    | `select_one_by_pk/1k`    | 1.8911 ms..1.9300 ms | no change                     |
-| lix_redb    | `select_all_by_pk/1k`    | 3.4982 ms..3.5742 ms | no change                     |
-| lix_redb    | `update_all_rows/1k`     | 4.0289 ms..4.1509 ms | no change                     |
-| lix_redb    | `update_one_by_pk/1k`    | 2.0068 ms..2.0739 ms | +4.6245%..+7.6407%, regressed |
-| lix_redb    | `delete_all_rows/1k`     | 3.1720 ms..3.2682 ms | no change                     |
-| lix_redb    | `delete_one_by_pk/1k`    | 2.1405 ms..2.1607 ms | +3.2816%..+8.1195%, regressed |
+| backend     | operation                |          time 95% CI | Criterion change |
+| ----------- | ------------------------ | -------------------: | ---------------- |
+| lix_sqlite  | `insert_all_rows/1k`     | 6.1705 ms..6.5242 ms | no change        |
+| lix_sqlite  | `select_all_rows/1k`     | 4.8608 ms..4.9797 ms | no change        |
+| lix_sqlite  | `select_keys_only/1k`    | 4.3879 ms..4.4533 ms | regressed        |
+| lix_sqlite  | `select_headers_only/1k` | 4.5437 ms..4.6608 ms | no change        |
+| lix_sqlite  | `select_one_by_pk/1k`    | 3.9575 ms..4.0997 ms | no change        |
+| lix_sqlite  | `select_all_by_pk/1k`    | 6.5438 ms..6.7136 ms | regressed        |
+| lix_sqlite  | `update_all_rows/1k`     | 5.4140 ms..5.6726 ms | regressed        |
+| lix_sqlite  | `update_one_by_pk/1k`    | 3.6751 ms..3.9019 ms | no change        |
+| lix_sqlite  | `delete_all_rows/1k`     | 3.9683 ms..4.1307 ms | noise threshold  |
+| lix_sqlite  | `delete_one_by_pk/1k`    | 3.8248 ms..3.8816 ms | no change        |
+| lix_rocksdb | `insert_all_rows/1k`     | 2.9503 ms..3.0185 ms | noise threshold  |
+| lix_rocksdb | `select_all_rows/1k`     | 1.5737 ms..1.6118 ms | no change        |
+| lix_rocksdb | `select_keys_only/1k`    | 1.0849 ms..1.0980 ms | noise threshold  |
+| lix_rocksdb | `select_headers_only/1k` | 1.3278 ms..1.3584 ms | no change        |
+| lix_rocksdb | `select_one_by_pk/1k`    | 706.16 us..722.46 us | improved         |
+| lix_rocksdb | `select_all_by_pk/1k`    | 2.4093 ms..2.4856 ms | regressed        |
+| lix_rocksdb | `update_all_rows/1k`     | 2.2358 ms..2.3192 ms | no change        |
+| lix_rocksdb | `update_one_by_pk/1k`    | 622.57 us..641.32 us | noise threshold  |
+| lix_rocksdb | `delete_all_rows/1k`     | 800.54 us..824.54 us | regressed        |
+| lix_rocksdb | `delete_one_by_pk/1k`    | 629.34 us..643.77 us | no change        |
+| lix_redb    | `insert_all_rows/1k`     | 4.5348 ms..4.6237 ms | noise threshold  |
+| lix_redb    | `select_all_rows/1k`     | 2.8495 ms..3.0134 ms | no change        |
+| lix_redb    | `select_keys_only/1k`    | 2.3631 ms..2.5655 ms | no change        |
+| lix_redb    | `select_headers_only/1k` | 2.7244 ms..2.9029 ms | noise threshold  |
+| lix_redb    | `select_one_by_pk/1k`    | 1.8965 ms..1.9896 ms | no change        |
+| lix_redb    | `select_all_by_pk/1k`    | 3.5581 ms..3.6421 ms | noise threshold  |
+| lix_redb    | `update_all_rows/1k`     | 4.0360 ms..4.1914 ms | no change        |
+| lix_redb    | `update_one_by_pk/1k`    | 2.0634 ms..2.1023 ms | no change        |
+| lix_redb    | `delete_all_rows/1k`     | 3.1496 ms..3.3372 ms | no change        |
+| lix_redb    | `delete_one_by_pk/1k`    | 2.0703 ms..2.1887 ms | no change        |
 
-Storage-plan v3 smoke scoreboard:
+Storage-plan timing scoreboard:
 
-| backend              | operation                                     |          time 95% CI | Criterion change              |
-| -------------------- | --------------------------------------------- | -------------------: | ----------------------------- |
-| lix_sqlite           | `scan_plan_v3_header_valuepart/1k`            | 4.0649 ms..4.2142 ms | new label baseline            |
-| lix_sqlite           | `scan_plan_v3_header_payload_parts/1k`        | 4.2750 ms..4.3552 ms | new label baseline            |
-| lix_sqlite           | `scan_plan_v3_full_value/1k`                  | 3.9595 ms..4.1020 ms | new label baseline            |
-| lix_rocksdb          | `scan_plan_v3_header_valuepart/1k`            | 943.71 us..963.56 us | new label baseline            |
-| lix_rocksdb          | `scan_plan_v3_header_payload_parts/1k`        | 1.0171 ms..1.0307 ms | new label baseline            |
-| lix_rocksdb          | `scan_plan_v3_full_value/1k`                  | 962.70 us..977.93 us | new label baseline            |
-| lix_redb             | `scan_plan_v3_header_valuepart/1k`            | 2.2087 ms..2.2907 ms | new label baseline            |
-| lix_redb             | `scan_plan_v3_header_payload_parts/1k`        | 2.1777 ms..2.2591 ms | new label baseline            |
-| lix_redb             | `scan_plan_v3_full_value/1k`                  | 2.1232 ms..2.1925 ms | new label baseline            |
-| raw_sqlite_projected | `scan_keys/1k`                                | 3.7642 ms..3.8108 ms | -3.9940%..-2.2977%, improved  |
-| raw_sqlite_projected | `scan_header/1k`                              | 3.8992 ms..3.9432 ms | change within noise threshold |
-| raw_sqlite_projected | `scan_full/1k`                                | 3.8210 ms..3.9062 ms | no change                     |
+| backend              | operation                        |          time 95% CI |
+| -------------------- | -------------------------------- | -------------------: |
+| lix_sqlite           | `read_v3_scan_header/1k`         | 3.9804 ms..4.0945 ms |
+| lix_sqlite           | `read_v3_scan_header_payload/1k` | 4.1507 ms..4.3383 ms |
+| lix_sqlite           | `read_v3_scan_full/1k`           | 4.0813 ms..4.2249 ms |
+| lix_rocksdb          | `read_v3_scan_header/1k`         | 965.27 us..1.0048 ms |
+| lix_rocksdb          | `read_v3_scan_header_payload/1k` | 1.1031 ms..1.1130 ms |
+| lix_rocksdb          | `read_v3_scan_full/1k`           | 952.04 us..1.0140 ms |
+| lix_redb             | `read_v3_scan_header/1k`         | 2.4152 ms..2.5452 ms |
+| lix_redb             | `read_v3_scan_header_payload/1k` | 2.3546 ms..2.4451 ms |
+| lix_redb             | `read_v3_scan_full/1k`           | 2.3781 ms..2.4564 ms |
+| raw_sqlite_projected | `scan_keys/1k`                   | 3.9019 ms..3.9637 ms |
+| raw_sqlite_projected | `scan_header/1k`                 | 4.0650 ms..4.3097 ms |
+| raw_sqlite_projected | `scan_full/1k`                   | 4.0692 ms..4.1740 ms |
 
 Result:
 
 ```text
-The isolated untracked backend copies preserve the logical I/O scoreboard.
-Absolute timings remain in the same band as the original redb baseline:
-redb remains between SQLite and RocksDB for most 1k read paths. The storage
-plan group is now a clean v3 baseline with renamed labels, so Criterion treats
-those entries as new benchmarks.
+The hard type cut did not change logical I/O. The direct storage-plan baseline
+is now read_v3-only, with read_v3_scan_* labels. redb remains between SQLite
+and RocksDB on most read paths. Shared storage bench backends use fallback v3
+lowering, while the isolated untracked CRUD harness owns the backend matrix.
 ```
