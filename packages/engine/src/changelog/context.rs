@@ -163,6 +163,23 @@ impl SegmentByteIndex {
         location: &SegmentObjectLocation,
         change_id: &str,
     ) -> Result<SegmentChange, LixError> {
+        self.validate_change_location(location, change_id)?;
+        let bytes = self.object_bytes(location, "change", change_id)?;
+        let change = decode_segment_change(bytes)?;
+        if change.id != change_id {
+            return Err(LixError::unknown(format!(
+                "changelog change locator for '{change_id}' decoded change '{}'",
+                change.id
+            )));
+        }
+        Ok(change)
+    }
+
+    fn validate_change_location(
+        &self,
+        location: &SegmentObjectLocation,
+        change_id: &str,
+    ) -> Result<(), LixError> {
         let expected = self.change_locations.get(change_id).ok_or_else(|| {
             LixError::unknown(format!(
                 "changelog by_change entry for '{change_id}' points to segment '{}' without that change",
@@ -174,15 +191,8 @@ impl SegmentByteIndex {
                 "changelog change '{change_id}' locator does not match segment directory"
             )));
         }
-        let bytes = self.object_bytes(location, "change", change_id)?;
-        let change = decode_segment_change(bytes)?;
-        if change.id != change_id {
-            return Err(LixError::unknown(format!(
-                "changelog change locator for '{change_id}' decoded change '{}'",
-                change.id
-            )));
-        }
-        Ok(change)
+        self.object_bytes(location, "change", change_id)?;
+        Ok(())
     }
 
     fn object_bytes(
@@ -361,6 +371,13 @@ where
                     by_change.location.segment_id
                 )));
             };
+            if projection == ChangeProjection::PhysicalLocation {
+                segment.validate_change_location(&by_change.location, change_id)?;
+                entries.push(Some(ChangeLoadEntry::PhysicalLocation(
+                    by_change.location.clone(),
+                )));
+                continue;
+            }
             let change = segment.load_change(&by_change.location, change_id)?;
             validate_change_checksum(&by_change.location.checksum, change_id, &change)?;
             entries.push(Some(project_change_with_location(
@@ -398,6 +415,13 @@ where
                     )));
                 }
                 if let Some(segment) = segments.get(&by_change.location.segment_id) {
+                    if projection == ChangeProjection::PhysicalLocation {
+                        segment.validate_change_location(&by_change.location, change_id)?;
+                        entries.push(Some(ChangeLoadEntry::PhysicalLocation(
+                            by_change.location.clone(),
+                        )));
+                        continue;
+                    }
                     let change = segment.load_change(&by_change.location, change_id)?;
                     validate_change_checksum(&by_change.location.checksum, change_id, &change)?;
                     Some((by_change.location.clone(), change))
