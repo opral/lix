@@ -147,11 +147,12 @@ changelog.commit
 
 changelog.change
   catalog object for one row/entity Change
-  decodes to Change: tracked key, snapshot/metadata refs, and optional inline payloads
+  decodes logically to Change: id, entity_id, schema_key, file_id,
+  snapshot/metadata refs, and authored_commit_id provenance
 
 changelog.segment
   physical append/container object
-  stores SegmentCommit[] and SegmentChange[]
+  stores SegmentCommit[] and SegmentChange[] encoded entries
 
 tracked_state.root
   derived Dolt-like/prolly root per commit
@@ -166,16 +167,21 @@ Naming note:
 
 ```text
 changelog.commit is the catalog object for one logical Commit:
-  CommitHeader, MembershipRecords, and CommitDirectory.
+  CommitHeader. CommitBody carries membership when the caller needs the
+  state-transition body.
 
 changelog.change is the catalog object for one logical Change:
-  change_id, tracked key, snapshot_ref, metadata_ref, and inline payloads.
+  id, entity_id, schema_key, file_id, snapshot_ref, metadata_ref,
+  authored_commit_id, and created_at.
 
 changelog.segment is the physical append/container object:
   SegmentHeader, SegmentDirectory, SegmentCommit[], and SegmentChange[].
 
 SegmentCommit is the encoded segment member for a Commit.
-SegmentChange is the encoded segment member for a Change.
+SegmentChange is the encoded segment member for a Change. It is a physical
+superset of Change: it owns inline payload bytes and a
+SegmentChangeDirectory, and can lower to a borrowed logical ChangeRef without
+copying.
 
 The dotted names are catalog/object-type names, not filesystem paths.
 ```
@@ -193,7 +199,7 @@ Publish order:
 
 A commit is visible only after its non-derived commit_visibility record is
 published.
-A branch ref names a visible commit_id. Moving a branch ref to a commit must
+A version ref names a visible commit_id. Moving a version ref to a commit must
 atomically ensure commit_visibility exists for that commit.
 changelog.index.by_commit is rebuildable and is not the visibility source.
 Any index/projection/root object for an unpublished commit can be ignored or rebuilt.
@@ -216,9 +222,9 @@ Truth closure:
 
 ```text
 CommitHeader
-  -> MembershipRecords
+  -> CommitBody.membership
   -> changelog.change
-  -> InlinePayloads or json_store.json
+  -> SegmentInlinePayloads or json_store.json
 
 tracked_state.root is not in the truth closure.
 Physical pack/segment placement is not logical identity.
@@ -233,10 +239,10 @@ TrackedKey = schema_key + file_id + entity_id
 Commit and change identity:
 
 ```text
-CommitHeader.lix_commit_change_id is the derived own change id for the
-lix_commit projection.
+CommitHeader.derivable_change_id is the commit's own derived change id for
+the lix_commit projection.
 changelog.change objects are first-class row/entity changes.
-MembershipRecords reference change_id.
+CommitBody membership records reference change_id.
 tracked_state.root leaves reference change_id.
 by_change maps change_id -> physical changelog.change location.
 change_id is logical identity, not physical placement.
@@ -255,7 +261,7 @@ Directories and indexes:
 
 ```text
 SegmentDirectory makes each physical segment self-describing.
-CommitDirectory makes each logical changelog.commit self-describing.
+SegmentCommitDirectory makes each physical SegmentCommit self-describing.
 Both directories are enough to rebuild global indexes.
 changelog.index.* accelerates cross-segment lookup.
 by_commit and by_change are mandatory rebuildable indexes.
@@ -332,17 +338,15 @@ part of tracked_state.root semantics.
 │                              │ │   -> candidate change_ids    │ │ key ranges                   │
 │ SegmentCommit decodes to:    │ └──────────────────────────────┘ │ subtree hashes               │
 │ - CommitHeader              │                                  │ leaf: tracked key            │
-│ - MembershipRecords          │                                  │   -> change_id               │  │
-│ - CommitDirectory            │                                  │   -> deleted                 │  │
+│ - CommitBody                │                                  │   -> change_id               │  │
+│ - SegmentCommitDirectory     │                                  │   -> deleted                 │  │
 │                              │                                  │   -> snapshot_ref cache      │  │
 │                              │                                  │   -> metadata_ref cache      │  │
 │                              │                                  └──────────────────────────────┘  │
-│ SegmentChange decodes to:    │                                                                    │
-│ - change_id                 │                                                                    │
-│ - TrackedKey                │                                                                    │
-│ - snapshot_ref              │                                                                    │
-│ - metadata_ref              │                                                                    │
-│ - InlinePayloads            │                                                                    │
+│ SegmentChange contains:      │                                                                    │
+│ - Change fields             │                                                                    │
+│ - SegmentInlinePayloads     │                                                                    │
+│ - SegmentChangeDirectory    │                                                                    │
 └──────────────┬───────────────┘                                  └──────────────────────────────┘  │
                │ tracked_state and memberships point to changelog.change by change_id                │
                └────────────────────────────────────────────────────────────────────────────────────┘
@@ -360,7 +364,7 @@ part of tracked_state.root semantics.
 
 Large payloads:
 
-changelog.change / InlinePayloads
+changelog.change / SegmentInlinePayloads
   └─ json_ref ──► json_store.json
 ```
 
@@ -388,25 +392,31 @@ changelog.segment/<segment_id>
 ```text
 Commit
   CommitHeader
-    commit_id
+    id
     parent_commit_ids
-    lix_commit_change_id
+    derivable_change_id
+    author_account_ids
+    created_at
     membership_count
-    checksum / hash
 
-  MembershipRecords
+CommitBody
+  membership records
     member_change_id: change_id
     member_role: authored/adopted
     source_parent_ordinal optional
 
-  CommitDirectory
+SegmentCommit
+  physical encoded superset of Commit + CommitBody
+
+  SegmentCommitDirectory
     tracked_key -> member_change_id
     member_change_id -> membership_record_ordinal
+    checksum / hash
 ```
 
 ```text
 Change
-  change_id
+  id
   authored_commit_id optional provenance
   schema_key
   entity_id
@@ -414,12 +424,19 @@ Change
   TrackedKey = schema_key + file_id + entity_id
   snapshot_ref
   metadata_ref
+  created_at
 
-  InlinePayloads
+ChangeRef
+  borrowed zero-copy logical view over Change or SegmentChange
+
+SegmentChange
+  physical encoded superset of Change
+
+  SegmentInlinePayloads
     packed small JSON payloads
     json_ref -> offset/len
 
-  ChangeDirectory
+  SegmentChangeDirectory
     payload_ref -> offset/len, indexed
 ```
 
@@ -442,17 +459,17 @@ json_ref
 ```
 
 `changelog.change` stores `snapshot_ref` / `metadata_ref` as logical `json_ref`
-values, not physical payload locations. Inline placement lives in the
-changelog.change `ChangeDirectory.payload_ref -> offset/len`; if a ref is not
-local to the changelog change, readers load it from `json_store.json`.
+values, not physical payload locations. `SegmentChange` owns inline placement:
+`SegmentChangeDirectory.payload_ref -> offset/len`. If a ref is not local to the
+encoded segment change, readers load it from `json_store.json`.
 
 This differs from systems that content-address most objects. The tradeoff is
 intentional: two identical payloads can still be different authored changes with
 different commits, metadata, membership, and history. Lix dedups payload bytes;
 it does not collapse authored change identity.
 
-`changelog.change` objects are pure row facts. They do not store `op`, `tombstone`, or
-physical segment placement.
+Logical `Change` objects are pure row facts. They do not store `op`,
+`tombstone`, inline payload bytes, directories, or physical segment placement.
 
 ```text
 delete
@@ -468,17 +485,17 @@ commit ownership
 
 payload placement
   = snapshot_ref / metadata_ref are json_ref values
-  = ChangeDirectory.payload_ref -> offset/len finds inline payloads
+  = SegmentChangeDirectory.payload_ref -> offset/len finds inline payloads
   = missing local payload_ref resolves through json_store.json
 ```
 
 Inline payload scope:
 
 ```text
-Inline payloads are local to one changelog.change object in the MVP.
-ChangeDirectory.payload_ref -> offset/len resolves only local inline payloads.
-If the json_ref is not present in the local ChangeDirectory, readers resolve it
-through json_store.json.
+Inline payloads are local to one SegmentChange object in the MVP.
+SegmentChangeDirectory.payload_ref -> offset/len resolves only local inline
+payloads. If the json_ref is not present in the local
+SegmentChangeDirectory, readers resolve it through json_store.json.
 Cross-change or segment-level inline payload dedup is a later physical
 optimization.
 ```
@@ -594,33 +611,35 @@ root lookup for bounded replay.
 
 ```text
 insert rows
-  changelog: +1 CommitHeader, +N MembershipRecords, +N changelog.change objects
+  changelog: +1 CommitHeader, +N CommitBody.membership records,
+             +N changelog.change objects
   tracked: update parent root with inserted keys -> change_id
   json_store.json: only large payloads
 
 update rows
-  changelog: +1 CommitHeader, +N MembershipRecords, +N changelog.change objects
+  changelog: +1 CommitHeader, +N CommitBody.membership records,
+             +N changelog.change objects
   tracked: update parent root with updated keys -> change_id
   json_store.json: only large payloads
 
 delete rows
-  changelog: +1 CommitHeader, +N MembershipRecords, +N changelog.change objects
-    with snapshot_ref = null
+  changelog: +1 CommitHeader, +N CommitBody.membership records,
+             +N changelog.change objects with snapshot_ref = null
   tracked: update parent root with deleted keys -> change_id
   json_store.json: none
 
-branch from commit
+version from commit
   changelog: no row facts
   tracked: reuse existing root
-  metadata: branch/ref -> commit_id
+  metadata: version/ref -> commit_id
 
-write on branch
-  changelog: new commit has parent = previous branch head
-  tracked: derive new root from previous branch head root
-  metadata: move branch/ref -> new_commit_id
+write on version
+  changelog: new commit has parent = previous version head
+  tracked: derive new root from previous version head root
+  metadata: move version/ref -> new_commit_id
 
 merge commit
-  changelog: merge CommitHeader + MembershipRecords for adopted change_ids
+  changelog: merge CommitHeader + CommitBody.membership for adopted change_ids
   tracked: derive merge root by applying adopted and authored change_ids
   copied: no adopted changelog.change objects, no adopted payload bytes
 ```
@@ -628,10 +647,10 @@ merge commit
 Merge membership is deterministic net state after planning:
 
 ```text
-MembershipRecords contain adopted change_ids that survive conflict checks.
+CommitBody membership records contain adopted change_ids that survive conflict checks.
 For a tracked key, the merge result has one visible winning change_id.
 If the merge authors a row change for the same key, that authored row wins.
-MembershipRecords are for changed/adopted keys, not all keys in the result.
+CommitBody membership records are for changed/adopted keys, not all keys in the result.
 Merge storage is O(M + A), never O(N).
 ```
 
@@ -642,7 +661,7 @@ merge_commit
   -> commit_visibility / by_commit
   -> segment_id + offset/len/checksum
   -> changelog.commit bytes
-  -> MembershipRecords.member_change_id
+  -> CommitBody.membership.member_change_id
   -> by_change
   -> changelog.change
   -> tracked key / snapshot_ref / metadata_ref
@@ -732,7 +751,7 @@ Q = membership records or root entries emitted by an operation
 Target bounds:
 
 ```text
-branch from commit
+version from commit
   O(1)
 
 exact row at commit
@@ -821,7 +840,7 @@ MVP:
   no changelog reference rewrite
 
 Reachability roots:
-  branch heads
+  version heads
   pinned commits
   sync/remote refs
 
@@ -853,7 +872,7 @@ Later:
 GC marks from publication roots, not from derived indexes:
 
 ```text
-branch/ref/pin/remote root
+version/ref/pin/remote root
   -> visible commit_id
   -> changelog.commit
   -> parent commits
@@ -879,14 +898,14 @@ deleted/rebuilt.
 | Mixed live/dead physical segment                       | whole segment in MVP                                                           | old segment after scavenge                        | Scavenge copies live commits/changes and updates physical indexes. |
 | Stale/missing `by_commit` / `by_change` / `by_key`     | visible truth objects                                                          | stale index records                               | Rebuild from segment directories and visible commits.              |
 | Missing `commit_visibility`                            | nothing is published by that edge                                              | unpublished commit/change objects if unreferenced | Segment bytes alone do not publish commits.                        |
-| Pinned commit or remote/sync ref                       | same closure as branch head                                                    | unrelated objects                                 | Pins and remote refs are GC roots.                                 |
+| Pinned commit or remote/sync ref                       | same closure as version head                                                   | unrelated objects                                 | Pins and remote refs are GC roots.                                 |
 
 ## Clean Cuts
 
 ```text
 1. Replace commit_store/tracked_state.delta_pack source split with changelog.segment.
 2. Make tracked_state only a derived prolly root plus projection refs.
-3. Move small JSON payloads into changelog.change InlinePayloads.
+3. Move small JSON payloads into SegmentChange SegmentInlinePayloads.
 4. Keep large/deduplicated payloads in json_store.json.
 5. Make change_id the logical identity for row/entity changes.
 6. Keep changelog indexes rebuildable.
