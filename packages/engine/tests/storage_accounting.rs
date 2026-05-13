@@ -729,7 +729,7 @@ impl AccountingBackend {
                     snapshot.changelog_entries += 1;
                     snapshot.changelog_value_bytes += value.len();
                 }
-                "u" => {
+                "u1" => {
                     snapshot.untracked_entries += 1;
                     snapshot.untracked_value_bytes += value.len();
                 }

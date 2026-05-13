@@ -13,7 +13,7 @@ use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, O
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-const UNTRACKED_NAMESPACE: &str = "u";
+const UNTRACKED_NAMESPACE: &str = "u1";
 
 #[derive(Clone)]
 pub(crate) struct SqliteBenchBackend {

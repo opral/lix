@@ -50,6 +50,53 @@ pub(crate) trait StorageWriter: StorageReader {
     async fn write_kv_batch(&mut self, batch: KvWriteBatch) -> Result<KvWriteStats, LixError>;
 }
 
+pub(crate) const DEFAULT_GET_VALUES_CHUNK_SIZE: usize = 2048;
+
+pub(crate) async fn get_values_single_namespace_chunked(
+    store: &mut (impl StorageReader + ?Sized),
+    namespace: &'static str,
+    keys: &[Vec<u8>],
+) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+    let mut values = Vec::with_capacity(keys.len());
+    for chunk in keys.chunks(DEFAULT_GET_VALUES_CHUNK_SIZE) {
+        let result = store
+            .get_values(KvGetRequest {
+                groups: vec![KvGetGroup {
+                    namespace: namespace.to_string(),
+                    keys: chunk.to_vec(),
+                }],
+            })
+            .await?;
+        let group = result.groups.into_iter().next().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "chunked storage get returned no result group",
+            )
+        })?;
+        if group.namespace() != namespace {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "chunked storage get returned namespace `{}` instead of `{namespace}`",
+                    group.namespace()
+                ),
+            ));
+        }
+        if group.len() != chunk.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "chunked storage get returned {} results for {} requested keys",
+                    group.len(),
+                    chunk.len()
+                ),
+            ));
+        }
+        values.extend(group.values_iter().map(|value| value.map(<[u8]>::to_vec)));
+    }
+    Ok(values)
+}
+
 #[async_trait]
 pub(crate) trait StorageReadTransaction: StorageReader + Send + Sync {
     async fn rollback(self: Box<Self>) -> Result<(), LixError>;

@@ -27,8 +27,8 @@ use crate::transaction::types::{
 };
 use crate::untracked_state::{
     self, MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter,
-    UntrackedStateProjection, UntrackedStateRow, UntrackedStateRowRequest,
-    UntrackedStateScanRequest,
+    UntrackedStateGetManyRequest, UntrackedStateIdentity, UntrackedStateProjection,
+    UntrackedStateRow, UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
 use crate::version::VersionContext;
 use crate::{Backend, LixError, NullableKeyFilter};
@@ -2449,9 +2449,6 @@ pub async fn json_pointer_untracked_state_read_point_hit_prepared(
     fixture: &JsonPointerUntrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let mut verified_rows = 0;
-    let mut reader = fixture
-        .context
-        .reader(StorageContext::new(Arc::clone(backend)));
     let requests = fixture
         .rows
         .iter()
@@ -2462,7 +2459,14 @@ pub async fn json_pointer_untracked_state_read_point_hit_prepared(
             file_id: NullableKeyFilter::Null,
         })
         .collect::<Vec<_>>();
-    for row in reader.load_rows(&requests).await? {
+    for row in read_untracked_rows(
+        backend,
+        &fixture.context,
+        &requests,
+        UntrackedStateProjection::Full,
+    )
+    .await?
+    {
         if row.is_some() {
             verified_rows += 1;
         }
@@ -2477,9 +2481,6 @@ pub async fn json_pointer_untracked_state_read_point_hit_constant_prepared(
 ) -> Result<StorageBenchReport, LixError> {
     let measured_rows = measured_reads.min(fixture.rows.len());
     let mut verified_rows = 0;
-    let mut reader = fixture
-        .context
-        .reader(StorageContext::new(Arc::clone(backend)));
     let start = if measured_rows == fixture.rows.len() {
         0
     } else {
@@ -2494,7 +2495,14 @@ pub async fn json_pointer_untracked_state_read_point_hit_constant_prepared(
             file_id: NullableKeyFilter::Null,
         })
         .collect::<Vec<_>>();
-    for row in reader.load_rows(&requests).await? {
+    for row in read_untracked_rows(
+        backend,
+        &fixture.context,
+        &requests,
+        UntrackedStateProjection::Full,
+    )
+    .await?
+    {
         if row.is_some() {
             verified_rows += 1;
         }
@@ -2521,11 +2529,17 @@ pub async fn json_pointer_untracked_state_scan_keys_only_prepared(
     json_pointer_untracked_scan_with_projection(
         backend,
         fixture,
-        UntrackedStateProjection {
-            columns: vec!["entity_id".to_string()],
-        },
+        UntrackedStateProjection::Identity,
     )
     .await
+}
+
+pub async fn json_pointer_untracked_state_scan_headers_only_prepared(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    fixture: &JsonPointerUntrackedStateReadFixture,
+) -> Result<StorageBenchReport, LixError> {
+    json_pointer_untracked_scan_with_projection(backend, fixture, UntrackedStateProjection::Header)
+        .await
 }
 
 async fn json_pointer_untracked_scan_with_projection(
@@ -2533,21 +2547,24 @@ async fn json_pointer_untracked_scan_with_projection(
     fixture: &JsonPointerUntrackedStateReadFixture,
     projection: UntrackedStateProjection,
 ) -> Result<StorageBenchReport, LixError> {
-    let mut reader = fixture
-        .context
-        .reader(StorageContext::new(Arc::clone(backend)));
-    let verified_rows = reader
-        .scan_rows(&UntrackedStateScanRequest {
-            filter: UntrackedStateFilter {
-                schema_keys: vec!["json_pointer".to_string()],
-                file_ids: vec![NullableKeyFilter::Null],
-                ..Default::default()
-            },
-            projection,
+    let request = UntrackedStateScanRequest {
+        filter: UntrackedStateFilter {
+            schema_keys: vec!["json_pointer".to_string()],
+            file_ids: vec![NullableKeyFilter::Null],
             ..Default::default()
-        })
-        .await?
-        .len();
+        },
+        projection,
+        ..Default::default()
+    };
+    let verified_rows = if projection == UntrackedStateProjection::Full {
+        scan_untracked(backend, &fixture.context, request)
+            .await?
+            .len()
+    } else {
+        scan_untracked_projected(backend, &fixture.context, request)
+            .await?
+            .len()
+    };
     Ok(report(fixture.rows.len(), verified_rows, Duration::ZERO))
 }
 
@@ -2607,9 +2624,6 @@ pub async fn untracked_state_read_point_hit_prepared(
     fixture: &UntrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let mut verified_rows = 0;
-    let mut reader = fixture
-        .context
-        .reader(StorageContext::new(Arc::clone(backend)));
     let requests = (0..fixture.rows)
         .map(|index| UntrackedStateRowRequest {
             schema_key: untracked_schema_key(index, StorageBenchSelectivity::Percent100),
@@ -2618,7 +2632,14 @@ pub async fn untracked_state_read_point_hit_prepared(
             file_id: NullableKeyFilter::Value("bench.json".to_string()),
         })
         .collect::<Vec<_>>();
-    for row in reader.load_rows(&requests).await? {
+    for row in read_untracked_rows(
+        backend,
+        &fixture.context,
+        &requests,
+        UntrackedStateProjection::Full,
+    )
+    .await?
+    {
         if row.is_some() {
             verified_rows += 1;
         }
@@ -2632,9 +2653,6 @@ pub async fn untracked_state_read_point_hit_constant_prepared(
     measured_reads: usize,
 ) -> Result<StorageBenchReport, LixError> {
     let mut verified_rows = 0;
-    let mut reader = fixture
-        .context
-        .reader(StorageContext::new(Arc::clone(backend)));
     let measured_rows = measured_reads.min(fixture.rows);
     let requests = (0..measured_rows)
         .map(|index| UntrackedStateRowRequest {
@@ -2644,7 +2662,14 @@ pub async fn untracked_state_read_point_hit_constant_prepared(
             file_id: NullableKeyFilter::Value("bench.json".to_string()),
         })
         .collect::<Vec<_>>();
-    for row in reader.load_rows(&requests).await? {
+    for row in read_untracked_rows(
+        backend,
+        &fixture.context,
+        &requests,
+        UntrackedStateProjection::Full,
+    )
+    .await?
+    {
         if row.is_some() {
             verified_rows += 1;
         }
@@ -2657,9 +2682,6 @@ pub async fn untracked_state_read_point_miss_prepared(
     fixture: &UntrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
     let mut misses = 0;
-    let mut reader = fixture
-        .context
-        .reader(StorageContext::new(Arc::clone(backend)));
     let requests = (0..fixture.rows)
         .map(|index| UntrackedStateRowRequest {
             schema_key: "bench_untracked_entity".to_string(),
@@ -2668,7 +2690,14 @@ pub async fn untracked_state_read_point_miss_prepared(
             file_id: NullableKeyFilter::Value("bench.json".to_string()),
         })
         .collect::<Vec<_>>();
-    for row in reader.load_rows(&requests).await? {
+    for row in read_untracked_rows(
+        backend,
+        &fixture.context,
+        &requests,
+        UntrackedStateProjection::Full,
+    )
+    .await?
+    {
         if row.is_none() {
             misses += 1;
         }
@@ -2694,13 +2723,11 @@ pub async fn untracked_state_scan_keys_only_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &UntrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let verified_rows = scan_untracked(
+    let verified_rows = scan_untracked_projected(
         backend,
         &fixture.context,
         UntrackedStateScanRequest {
-            projection: UntrackedStateProjection {
-                columns: vec!["entity_id".to_string()],
-            },
+            projection: UntrackedStateProjection::Identity,
             ..Default::default()
         },
     )
@@ -2713,13 +2740,11 @@ pub async fn untracked_state_scan_headers_only_prepared(
     backend: &Arc<dyn Backend + Send + Sync>,
     fixture: &UntrackedStateReadFixture,
 ) -> Result<StorageBenchReport, LixError> {
-    let verified_rows = scan_untracked(
+    let verified_rows = scan_untracked_projected(
         backend,
         &fixture.context,
         UntrackedStateScanRequest {
-            projection: UntrackedStateProjection {
-                columns: untracked_state_header_columns(),
-            },
+            projection: UntrackedStateProjection::Header,
             ..Default::default()
         },
     )
@@ -3835,7 +3860,6 @@ pub async fn untracked_state_read_point_hit(
 
     let started = Instant::now();
     let mut verified_rows = 0;
-    let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
     let requests = (0..config.rows)
         .map(|index| UntrackedStateRowRequest {
             schema_key: untracked_schema_key(index, StorageBenchSelectivity::Percent100),
@@ -3844,7 +3868,9 @@ pub async fn untracked_state_read_point_hit(
             file_id: NullableKeyFilter::Value("bench.json".to_string()),
         })
         .collect::<Vec<_>>();
-    for row in reader.load_rows(&requests).await? {
+    for row in
+        read_untracked_rows(backend, &context, &requests, UntrackedStateProjection::Full).await?
+    {
         if row.is_some() {
             verified_rows += 1;
         }
@@ -3862,7 +3888,6 @@ pub async fn untracked_state_read_point_miss(
 
     let started = Instant::now();
     let mut misses = 0;
-    let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
     let requests = (0..config.rows)
         .map(|index| UntrackedStateRowRequest {
             schema_key: "bench_untracked_entity".to_string(),
@@ -3871,7 +3896,9 @@ pub async fn untracked_state_read_point_miss(
             file_id: NullableKeyFilter::Value("bench.json".to_string()),
         })
         .collect::<Vec<_>>();
-    for row in reader.load_rows(&requests).await? {
+    for row in
+        read_untracked_rows(backend, &context, &requests, UntrackedStateProjection::Full).await?
+    {
         if row.is_none() {
             misses += 1;
         }
@@ -4397,7 +4424,64 @@ async fn scan_untracked(
     request: UntrackedStateScanRequest,
 ) -> Result<Vec<MaterializedUntrackedStateRow>, LixError> {
     let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
-    reader.scan_rows(&request).await
+    reader
+        .scan(UntrackedStateScanRequest {
+            projection: UntrackedStateProjection::Full,
+            ..request
+        })
+        .await?
+        .rows
+        .into_iter()
+        .map(|row| row.into_materialized_full())
+        .collect()
+}
+
+async fn scan_untracked_projected(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    context: &UntrackedStateContext,
+    mut request: UntrackedStateScanRequest,
+) -> Result<Vec<crate::untracked_state::UntrackedStateProjectedRow>, LixError> {
+    let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
+    request.after = None;
+    request.batch_size = None;
+    let response = reader.scan(request).await?;
+    Ok(response.rows)
+}
+
+async fn read_untracked_rows(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    context: &UntrackedStateContext,
+    requests: &[UntrackedStateRowRequest],
+    projection: UntrackedStateProjection,
+) -> Result<Vec<Option<MaterializedUntrackedStateRow>>, LixError> {
+    let mut rows = (0..requests.len()).map(|_| None).collect::<Vec<_>>();
+    let mut identities = Vec::new();
+    let mut indices = Vec::new();
+    for (index, request) in requests.iter().enumerate() {
+        if let Some(identity) = UntrackedStateIdentity::from_exact_row_request(request) {
+            identities.push(identity);
+            indices.push(index);
+        }
+    }
+    if identities.is_empty() {
+        return Ok(rows);
+    }
+    let mut reader = context.reader(StorageContext::new(Arc::clone(backend)));
+    let loaded = reader
+        .get_many(UntrackedStateGetManyRequest {
+            identities,
+            projection: if projection == UntrackedStateProjection::Identity {
+                UntrackedStateProjection::Identity
+            } else {
+                UntrackedStateProjection::Full
+            },
+        })
+        .await?
+        .rows;
+    for (index, row) in indices.into_iter().zip(loaded) {
+        rows[index] = row.map(|row| row.into_materialized_full()).transpose()?;
+    }
+    Ok(rows)
 }
 
 async fn append_changelog_changes(
@@ -4967,22 +5051,6 @@ fn tracked_state_header_columns() -> Vec<String> {
         "updated_at",
         "change_id",
         "commit_id",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
-}
-
-fn untracked_state_header_columns() -> Vec<String> {
-    [
-        "entity_id",
-        "schema_key",
-        "file_id",
-        "metadata",
-        "created_at",
-        "updated_at",
-        "global",
-        "version_id",
     ]
     .into_iter()
     .map(str::to_string)

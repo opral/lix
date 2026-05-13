@@ -5,8 +5,9 @@ use tokio::sync::Mutex;
 use crate::entity_identity::EntityIdentity;
 use crate::storage::{StorageReader, StorageWriteSet};
 use crate::untracked_state::{
-    MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter, UntrackedStateRow,
-    UntrackedStateRowRequest, UntrackedStateScanRequest,
+    MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateFilter,
+    UntrackedStateGetManyRequest, UntrackedStateIdentity, UntrackedStateProjection,
+    UntrackedStateRow, UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
 use crate::version::VERSION_REF_SCHEMA_KEY;
 use crate::version::{VersionHead, VersionRefReader};
@@ -72,12 +73,28 @@ where
             entity_id: EntityIdentity::single(version_id),
             file_id: NullableKeyFilter::Null,
         };
+        let identity =
+            UntrackedStateIdentity::from_exact_row_request(&request).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "version-ref lookup must be an exact untracked identity",
+                )
+            })?;
         let mut rows = self
             .untracked_state
             .reader(&mut *store as &mut dyn StorageReader)
-            .load_rows(std::slice::from_ref(&request))
-            .await?;
-        let Some(row) = rows.pop().flatten() else {
+            .get_many(UntrackedStateGetManyRequest {
+                identities: vec![identity],
+                projection: UntrackedStateProjection::Full,
+            })
+            .await?
+            .rows;
+        let Some(row) = rows
+            .pop()
+            .flatten()
+            .map(|row| row.into_materialized_full())
+            .transpose()?
+        else {
             return Ok(None);
         };
 
@@ -96,15 +113,21 @@ where
         let rows = self
             .untracked_state
             .reader(&mut *store as &mut dyn StorageReader)
-            .scan_rows(&UntrackedStateScanRequest {
+            .scan(UntrackedStateScanRequest {
                 filter: UntrackedStateFilter {
                     schema_keys: vec![VERSION_REF_SCHEMA_KEY.to_string()],
                     version_ids: vec![GLOBAL_VERSION_ID.to_string()],
                     ..UntrackedStateFilter::default()
                 },
-                ..UntrackedStateScanRequest::default()
+                projection: UntrackedStateProjection::Full,
+                limit: None,
+                ..Default::default()
             })
-            .await?;
+            .await?
+            .rows
+            .into_iter()
+            .map(|row| row.into_materialized_full())
+            .collect::<Result<Vec<_>, _>>()?;
         let mut heads = rows
             .iter()
             .map(|row| {
@@ -249,13 +272,21 @@ mod tests {
             entity_id: crate::entity_identity::EntityIdentity::single("version-a"),
             file_id: NullableKeyFilter::Null,
         };
+        let identity = UntrackedStateIdentity::from_exact_row_request(&request)
+            .expect("version-ref request should be exact");
         let row = reader
-            .load_rows(std::slice::from_ref(&request))
+            .get_many(UntrackedStateGetManyRequest {
+                identities: vec![identity],
+                projection: UntrackedStateProjection::Full,
+            })
             .await
             .expect("version-ref row should load")
-            .into_iter()
-            .next()
+            .rows
+            .pop()
             .flatten()
+            .map(|row| row.into_materialized_full())
+            .transpose()
+            .expect("version-ref row should materialize")
             .expect("version-ref row should exist");
         assert!(row.global);
         assert_eq!(row.created_at, "2026-01-01T00:00:00Z");
