@@ -16,13 +16,20 @@ pub(super) fn directory_commit_location(
     segment: &Segment,
     commit_id: &str,
 ) -> Result<SegmentObjectLocation, LixError> {
+    Ok(directory_commit_location_ref(segment, commit_id)?.clone())
+}
+
+pub(super) fn directory_commit_location_ref<'a>(
+    segment: &'a Segment,
+    commit_id: &str,
+) -> Result<&'a SegmentObjectLocation, LixError> {
     segment
         .directory
         .commits
         .iter()
         .find_map(|(candidate, location)| {
             if candidate == commit_id {
-                Some(location.clone())
+                Some(location)
             } else {
                 None
             }
@@ -39,13 +46,20 @@ pub(super) fn directory_change_location(
     segment: &Segment,
     change_id: &str,
 ) -> Result<SegmentObjectLocation, LixError> {
+    Ok(directory_change_location_ref(segment, change_id)?.clone())
+}
+
+pub(super) fn directory_change_location_ref<'a>(
+    segment: &'a Segment,
+    change_id: &str,
+) -> Result<&'a SegmentObjectLocation, LixError> {
     segment
         .directory
         .changes
         .iter()
         .find_map(|(candidate, location)| {
             if candidate == change_id {
-                Some(location.clone())
+                Some(location)
             } else {
                 None
             }
@@ -797,8 +811,8 @@ pub(super) fn validate_commit_location(
     segment: &Segment,
     commit_id: &str,
 ) -> Result<(), LixError> {
-    let expected = directory_commit_location(segment, commit_id)?;
-    if location != &expected {
+    let expected = directory_commit_location_ref(segment, commit_id)?;
+    if location != expected {
         return Err(LixError::unknown(format!(
             "changelog commit '{commit_id}' locator does not match segment directory"
         )));
@@ -841,8 +855,8 @@ pub(super) fn validate_change_location(
     segment: &Segment,
     change_id: &str,
 ) -> Result<(), LixError> {
-    let expected = directory_change_location(segment, change_id)?;
-    if location != &expected {
+    let expected = directory_change_location_ref(segment, change_id)?;
+    if location != expected {
         return Err(LixError::unknown(format!(
             "changelog change '{change_id}' locator does not match segment directory"
         )));
