@@ -58,6 +58,12 @@ impl Lix {
         self.session.execute(sql, params).await
     }
 
+    pub async fn begin_transaction(&self) -> Result<LixTransaction, LixError> {
+        Ok(LixTransaction {
+            inner: self.session.begin_transaction().await?,
+        })
+    }
+
     pub async fn active_version_id(&self) -> Result<String, LixError> {
         self.session.active_version_id().await
     }
@@ -97,6 +103,28 @@ impl Lix {
             self.backend.close().await?;
         }
         Ok(())
+    }
+}
+
+pub struct LixTransaction {
+    inner: lix_engine::SessionTransaction,
+}
+
+impl LixTransaction {
+    pub async fn execute(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ExecuteResult, LixError> {
+        self.inner.execute(sql, params).await
+    }
+
+    pub async fn commit(self) -> Result<(), LixError> {
+        self.inner.commit().await
+    }
+
+    pub async fn rollback(self) -> Result<(), LixError> {
+        self.inner.rollback().await
     }
 }
 

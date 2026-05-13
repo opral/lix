@@ -41,6 +41,6 @@ pub(crate) use context::{
 };
 #[allow(unused_imports)]
 pub(crate) use execute::{
-    create_logical_plan, create_write_logical_plan, execute_logical_plan, execute_sql,
-    SqlLogicalPlan,
+    create_logical_plan, create_transaction_read_logical_plan, create_write_logical_plan,
+    execute_logical_plan, execute_sql, SqlLogicalPlan,
 };

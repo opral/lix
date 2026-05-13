@@ -25,6 +25,8 @@ use crate::version::{
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
+use super::transaction::transaction_state_error;
+
 pub(crate) const WORKSPACE_VERSION_KEY: &str = "lix_workspace_version_id";
 
 #[derive(Clone)]
@@ -54,6 +56,7 @@ pub struct SessionContext {
     pub(super) version_ctx: Arc<VersionContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
     closed: Arc<AtomicBool>,
+    active_transaction: Arc<AtomicBool>,
 }
 
 impl SessionContext {
@@ -124,6 +127,7 @@ impl SessionContext {
             version_ctx,
             catalog_context,
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
         )
     }
 
@@ -137,6 +141,7 @@ impl SessionContext {
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
         closed: Arc<AtomicBool>,
+        active_transaction: Arc<AtomicBool>,
     ) -> Self {
         Self {
             mode,
@@ -148,6 +153,7 @@ impl SessionContext {
             version_ctx,
             catalog_context,
             closed,
+            active_transaction,
         }
     }
 
@@ -164,6 +170,10 @@ impl SessionContext {
 
     pub(crate) fn closed_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.closed)
+    }
+
+    pub(crate) fn active_transaction_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.active_transaction)
     }
 
     pub(crate) fn ensure_open(&self) -> Result<(), LixError> {
@@ -277,6 +287,11 @@ impl SessionContext {
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
         self.ensure_open()?;
+        if self.active_transaction.load(Ordering::SeqCst) {
+            return Err(transaction_state_error(
+                "Lix handle has an active transaction; use the transaction handle for writes until it is committed or rolled back",
+            ));
+        }
         let opened = open_transaction(
             &self.mode,
             self.storage.clone(),

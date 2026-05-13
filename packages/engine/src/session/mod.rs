@@ -14,6 +14,7 @@ mod merge;
 #[cfg(feature = "storage-benches")]
 pub mod optimization9_sql2_bench;
 mod switch_version;
+mod transaction;
 
 pub use context::SessionContext;
 pub(crate) use context::{SessionMode, WORKSPACE_VERSION_KEY};
@@ -25,3 +26,4 @@ pub use merge::{
     MergeVersionReceipt,
 };
 pub use switch_version::{SwitchVersionOptions, SwitchVersionReceipt};
+pub use transaction::SessionTransaction;
