@@ -25,7 +25,7 @@ pub(crate) use codec::{
     decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility,
     decode_empty_index_value, decode_segment, decode_segment_change, decode_segment_commit,
     encode_by_change_entry, encode_by_commit_entry, encode_commit_visibility,
-    encode_empty_index_value, encode_segment, view_segment,
+    encode_empty_index_value, encode_segment, segment_commit_membership_contains_any, view_segment,
 };
 #[allow(unused_imports)]
 pub(crate) use context::{ChangelogContext, ChangelogStoreReader, ChangelogStoreWriter};

@@ -102,6 +102,15 @@ pub(crate) fn decode_segment_commit(bytes: &[u8]) -> Result<SegmentCommit, LixEr
     Ok(commit)
 }
 
+pub(crate) fn segment_commit_membership_contains_any(
+    bytes: &[u8],
+    requested_change_ids: &std::collections::HashSet<String>,
+) -> Result<Vec<String>, LixError> {
+    let mut cursor = ByteCursor::new(bytes);
+    cursor.skip_commit_header_fast()?;
+    cursor.read_matching_membership_change_ids(requested_change_ids)
+}
+
 pub(crate) fn decode_segment_change(bytes: &[u8]) -> Result<SegmentChange, LixError> {
     let mut cursor = ByteCursor::new(bytes);
     let change = cursor.read_segment_change("change")?;
@@ -751,6 +760,15 @@ impl<'a> ByteCursor<'a> {
         })
     }
 
+    fn skip_commit_header_fast(&mut self) -> Result<(), LixError> {
+        self.skip_string_fast()?;
+        self.skip_strings_fast()?;
+        self.skip_string_fast()?;
+        self.skip_strings_fast()?;
+        self.skip_string_fast()?;
+        self.skip_u32_fast()
+    }
+
     fn read_commit_body(&mut self, field: &str) -> Result<CommitBody, LixError> {
         let len = self.read_len(&format!("{field}.membership"))?;
         self.ensure_len_fits_remaining(len, &format!("{field}.membership"))?;
@@ -768,6 +786,24 @@ impl<'a> ByteCursor<'a> {
             source_parent_ordinal: self
                 .read_optional_u32(&format!("{field}.source_parent_ordinal"))?,
         })
+    }
+
+    fn read_matching_membership_change_ids(
+        &mut self,
+        requested_change_ids: &std::collections::HashSet<String>,
+    ) -> Result<Vec<String>, LixError> {
+        let len = self.read_len_fast()?;
+        self.ensure_len_fits_remaining_fast(len)?;
+        let mut matches = Vec::new();
+        for _ in 0..len {
+            let member_change_id = self.read_string_ref_fast()?;
+            if requested_change_ids.contains(member_change_id) {
+                matches.push(member_change_id.to_string());
+            }
+            self.skip_u8_fast()?;
+            self.skip_optional_u32_fast()?;
+        }
+        Ok(matches)
     }
 
     fn read_segment_commit_directory(
