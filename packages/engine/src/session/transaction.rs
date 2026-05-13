@@ -11,7 +11,6 @@ pub struct SessionTransaction {
     pub(super) transaction: Option<Transaction>,
     pub(super) runtime_functions: FunctionContext,
     _transaction_guard: SessionTransactionGuard,
-    closed: bool,
 }
 
 impl SessionContext {
@@ -39,16 +38,12 @@ impl SessionContext {
             transaction: Some(opened.transaction),
             runtime_functions: opened.runtime_functions,
             _transaction_guard: transaction_guard,
-            closed: false,
         })
     }
 }
 
 impl SessionTransaction {
     pub(super) fn transaction_mut(&mut self) -> Result<&mut Transaction, LixError> {
-        if self.closed {
-            return Err(transaction_state_error("Lix transaction is closed"));
-        }
         self.transaction
             .as_mut()
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))
@@ -59,7 +54,6 @@ impl SessionTransaction {
             .transaction
             .take()
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))?;
-        self.closed = true;
         let result = transaction
             .commit(&self.runtime_functions)
             .await
@@ -72,7 +66,6 @@ impl SessionTransaction {
             .transaction
             .take()
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))?;
-        self.closed = true;
         let result = transaction.rollback().await;
         result
     }
