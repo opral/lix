@@ -287,11 +287,7 @@ impl SessionContext {
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
         self.ensure_open()?;
-        if self.active_transaction.load(Ordering::SeqCst) {
-            return Err(transaction_state_error(
-                "Lix handle has an active transaction; use the transaction handle for writes until it is committed or rolled back",
-            ));
-        }
+        let _write_guard = self.reserve_write_transaction()?;
         let opened = open_transaction(
             &self.mode,
             self.storage.clone(),
@@ -317,11 +313,34 @@ impl SessionContext {
             }
         }
     }
+
+    pub(super) fn reserve_write_transaction(&self) -> Result<SessionWriteGuard, LixError> {
+        let active_transaction = self.active_transaction_flag();
+        if active_transaction
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(transaction_state_error(
+                "Lix handle has an active transaction; use the transaction handle for writes until it is committed or rolled back",
+            ));
+        }
+        Ok(SessionWriteGuard { active_transaction })
+    }
 }
 
 fn closed_error() -> LixError {
     LixError::new(LixError::CODE_CLOSED, "Lix handle is closed")
         .with_hint("Open a new Lix handle before calling this method.")
+}
+
+pub(super) struct SessionWriteGuard {
+    active_transaction: Arc<AtomicBool>,
+}
+
+impl Drop for SessionWriteGuard {
+    fn drop(&mut self) {
+        self.active_transaction.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Read-only SQL execution context derived from a session.

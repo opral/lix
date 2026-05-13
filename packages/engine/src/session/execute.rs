@@ -372,14 +372,16 @@ impl SessionContext {
         &self,
         runtime_functions: &FunctionContext,
     ) -> Result<(), LixError> {
-        let mut transaction = self.storage.begin_write_transaction().await?;
         let mut writes = StorageWriteSet::new();
         runtime_functions
             .stage_persist_if_needed(&mut writes)
             .await?;
-        if !writes.is_empty() {
-            writes.apply(&mut transaction.as_mut()).await?;
+        if writes.is_empty() {
+            return Ok(());
         }
+        let _write_guard = self.reserve_write_transaction()?;
+        let mut transaction = self.storage.begin_write_transaction().await?;
+        writes.apply(&mut transaction.as_mut()).await?;
         transaction.commit().await
     }
 }
