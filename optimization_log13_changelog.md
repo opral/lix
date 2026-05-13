@@ -609,3 +609,68 @@ walking no longer allocates diagnostic field names in tight loops. The next cut
 should move owned SegmentCommit/SegmentChange decode toward the same fast cursor
 path or make checksum/index construction consume borrowed object views directly.
 ```
+
+## Entry 8: Borrow Segment Directory Locations During Validation
+
+Change:
+
+```text
+directory_commit_location_ref and directory_change_location_ref return borrowed
+SegmentObjectLocation values for validation paths.
+
+Owned directory lookup wrappers remain for APIs that must return or persist a
+locator, but pure validation no longer clones locators just to compare them.
+```
+
+Measured with:
+
+```sh
+cargo bench --manifest-path packages/engine/Cargo.toml --features storage-benches --bench changelog_scorecard
+```
+
+### CPU Segment Scoreboard
+
+Times are milliseconds.
+
+| row                                     | entry_8_ms |
+| --------------------------------------- | ---------: |
+| encode_segment / 1c_1000ch              |      0.137 |
+| decode_segment / 1c_1000ch              |      3.421 |
+| view_segment / 1c_1000ch                |      0.027 |
+| validate_segment_shape / 1c_1000ch      |      4.775 |
+| build_decoded_segment_index / 1c_1000ch |      8.504 |
+| build_by_change / 1c_1000ch             |      0.791 |
+| build_by_change_membership / 1c_1000ch  |      0.033 |
+
+### Backend Smoke Scoreboard
+
+Times are milliseconds.
+
+| row                                                  | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms |
+| ---------------------------------------------------- | ----------: | -----------------: | -----------------: |
+| stage_segment_raw_no_indexes / 1c_1000ch             |       0.528 |              5.738 |              4.235 |
+| stage_segment / 1c_1000ch                            |       4.841 |              8.197 |              7.688 |
+| stage_publish_commit / 1c_1ch                        |       0.053 |              0.042 |              0.054 |
+| stage_publish_commit / 1c_100ch                      |       0.871 |              0.895 |              0.987 |
+| stage_publish_commit / 1c_1000ch single-shot         |      11.610 |             11.597 |             11.741 |
+| load_commits_visible_batched / 1c_100ch              |       0.196 |              0.164 |              0.173 |
+| load_changes_visible_batched / 1c_100ch              |       1.726 |              0.758 |              0.593 |
+| load_changes_visible_batched / 1c_1000ch             |     122.412 |             17.104 |              6.050 |
+| load_changes_physical_scattered / 100seg_100c_1000ch |       3.059 |              3.073 |              3.093 |
+| load_changes_visible_scattered / 100seg_100c_1000ch  |     180.548 |             18.731 |              6.636 |
+| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       6.338 |              7.806 |              6.698 |
+| plan_gc / live_50pct_mixed_segments                  |       8.422 |              6.807 |              7.660 |
+| collect_garbage / live_50pct_mixed_segments          |       7.911 |              8.466 |              7.496 |
+
+Read:
+
+```text
+This was a small constant-factor cut. It removes the cloned locator/free frames
+seen in the sampled validation profile, while keeping the public owned lookup
+shape for index-entry construction.
+
+The remaining CPU profile is still dominated by:
+  - full owned decode into SegmentChange strings
+  - EntityIdentity JSON serialization/deserialization
+  - checksum construction over logical objects
+```
