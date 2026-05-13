@@ -111,6 +111,33 @@ pub(crate) async fn create_write_logical_plan(
     })
 }
 
+pub(crate) async fn create_transaction_read_logical_plan(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    sql: &str,
+) -> Result<SqlLogicalPlan, LixError> {
+    super::validate_supported_statement_ast(sql)?;
+    super::udfs::validate_public_udf_calls(sql)?;
+    validate_public_read_sql_surface(sql)?;
+    let session = build_write_session(ctx).await?;
+    let plan = session
+        .state()
+        .create_logical_plan(sql)
+        .await
+        .map_err(datafusion_error_to_lix_error)?;
+    validate_supported_logical_plan(&plan)?;
+    validate_json_predicates_in_logical_plan(&plan)?;
+    let kind = classify_logical_plan(&plan);
+    let notices = history_filter_notices(&plan);
+
+    Ok(SqlLogicalPlan {
+        session,
+        plan,
+        kind,
+        notices,
+        strict_binary_params: BTreeSet::new(),
+    })
+}
+
 fn validate_public_read_sql_surface(sql: &str) -> Result<(), LixError> {
     let normalized = sql.to_ascii_lowercase();
     if normalized.contains("lower(path)") {

@@ -25,6 +25,8 @@ use crate::version::{
 use crate::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
+use super::transaction::transaction_state_error;
+
 pub(crate) const WORKSPACE_VERSION_KEY: &str = "lix_workspace_version_id";
 
 #[derive(Clone)]
@@ -36,13 +38,10 @@ pub(crate) enum SessionMode {
 /// Session-context state for engine execution.
 ///
 /// A session context pins the active version selector and shared execution
-/// services. Each call to `execute(...)` projects this state into a read-only
-/// SQL context or a transaction-owned write context.
-///
-/// Write transaction invariant: any engine operation that may write must enter
-/// through `SessionContext::with_write_transaction`. Reads that influence writes
-/// are only available from that transaction capability, not from session-level
-/// helpers.
+/// services. Parent-handle `execute(...)` runs as an implicit single-statement
+/// transaction. Explicit transactions hold the session execution lease until
+/// commit or rollback, so all SQL during that window must run through the
+/// transaction handle.
 #[derive(Clone)]
 pub struct SessionContext {
     pub(super) mode: SessionMode,
@@ -54,6 +53,7 @@ pub struct SessionContext {
     pub(super) version_ctx: Arc<VersionContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
     closed: Arc<AtomicBool>,
+    active_transaction: Arc<AtomicBool>,
 }
 
 impl SessionContext {
@@ -124,6 +124,7 @@ impl SessionContext {
             version_ctx,
             catalog_context,
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
         )
     }
 
@@ -137,6 +138,7 @@ impl SessionContext {
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
         closed: Arc<AtomicBool>,
+        active_transaction: Arc<AtomicBool>,
     ) -> Self {
         Self {
             mode,
@@ -148,6 +150,7 @@ impl SessionContext {
             version_ctx,
             catalog_context,
             closed,
+            active_transaction,
         }
     }
 
@@ -164,6 +167,10 @@ impl SessionContext {
 
     pub(crate) fn closed_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.closed)
+    }
+
+    pub(crate) fn active_transaction_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.active_transaction)
     }
 
     pub(crate) fn ensure_open(&self) -> Result<(), LixError> {
@@ -277,6 +284,16 @@ impl SessionContext {
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
         self.ensure_open()?;
+        let _transaction_guard = self.reserve_session_transaction()?;
+        self.with_write_transaction_reserved(f).await
+    }
+
+    pub(crate) async fn with_write_transaction_reserved<T, F>(&self, f: F) -> Result<T, LixError>
+    where
+        F: for<'tx> FnOnce(
+            &'tx mut Transaction,
+        ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
+    {
         let opened = open_transaction(
             &self.mode,
             self.storage.clone(),
@@ -302,11 +319,34 @@ impl SessionContext {
             }
         }
     }
+
+    pub(super) fn reserve_session_transaction(&self) -> Result<SessionTransactionGuard, LixError> {
+        let active_transaction = self.active_transaction_flag();
+        if active_transaction
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(transaction_state_error(
+                "Lix handle has an active transaction; use the transaction handle for reads and writes until it is committed or rolled back",
+            ));
+        }
+        Ok(SessionTransactionGuard { active_transaction })
+    }
 }
 
 fn closed_error() -> LixError {
     LixError::new(LixError::CODE_CLOSED, "Lix handle is closed")
         .with_hint("Open a new Lix handle before calling this method.")
+}
+
+pub(super) struct SessionTransactionGuard {
+    active_transaction: Arc<AtomicBool>,
+}
+
+impl Drop for SessionTransactionGuard {
+    fn drop(&mut self) {
+        self.active_transaction.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Read-only SQL execution context derived from a session.

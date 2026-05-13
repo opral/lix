@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 
 use async_trait::async_trait;
 use lix_engine::{
@@ -133,11 +134,220 @@ async fn rebuild_tracked_state_rolls_back_read_and_write_transactions_on_failure
     assert_eq!(delta.write_committed, 0, "failed rebuild must not commit");
 }
 
+#[tokio::test]
+async fn active_transaction_blocks_session_read_and_allows_transaction_read() {
+    let backend = RecordingBackend::new();
+    let _receipt = Engine::initialize(Box::new(backend.clone()))
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(Box::new(backend))
+        .await
+        .expect("initialized backend should create an engine");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("workspace session should open");
+
+    session
+        .execute(
+            "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
+             VALUES ('lix_deterministic_mode', \
+             lix_json('{\"enabled\":true}'), true, true)",
+            &[],
+        )
+        .await
+        .expect("deterministic mode insert should succeed");
+
+    let mut tx = session
+        .begin_transaction()
+        .await
+        .expect("transaction should begin");
+
+    let error = session
+        .execute("SELECT lix_uuid_v7()", &[])
+        .await
+        .expect_err("session read should be blocked while transaction is active");
+    assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
+
+    let result = tx
+        .execute("SELECT lix_uuid_v7()", &[])
+        .await
+        .expect("deterministic transaction read should succeed");
+    assert_eq!(
+        result
+            .rows()
+            .first()
+            .expect("read should return a row")
+            .get::<String>("lix_uuid_v7()")
+            .expect("uuid should be returned as text"),
+        "01920000-0000-7000-8000-000000000000",
+    );
+
+    tx.rollback()
+        .await
+        .expect("transaction rollback should succeed");
+}
+
+#[tokio::test]
+async fn begin_transaction_cannot_race_with_opening_session_write() {
+    let backend = BlockingBeginWriteBackend::new();
+    let gate = backend.gate();
+    let _receipt = Engine::initialize(Box::new(backend.clone()))
+        .await
+        .expect("backend should initialize");
+    let engine = Engine::new(Box::new(backend))
+        .await
+        .expect("initialized backend should create an engine");
+    let session = Arc::new(
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open"),
+    );
+
+    gate.block_next_write();
+    let writer_session = Arc::clone(&session);
+    let writer = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async move {
+            writer_session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ('racing-session-write', 'value')",
+                    &[],
+                )
+                .await
+        })
+    });
+
+    gate.wait_until_blocked();
+    let error = match session.begin_transaction().await {
+        Ok(_) => panic!("explicit transaction should not race past a session write reservation"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
+
+    gate.release();
+    writer
+        .join()
+        .expect("writer thread should not panic")
+        .expect("session write should complete after release");
+
+    let result = session
+        .execute(
+            "SELECT key FROM lix_key_value WHERE key = 'racing-session-write'",
+            &[],
+        )
+        .await
+        .expect("session write should be committed");
+    assert_eq!(result.len(), 1);
+}
+
 #[derive(Clone, Default)]
 struct RecordingBackend {
     data: Arc<Mutex<KvMap>>,
     stats: Arc<TransactionStats>,
     fail_read_namespace: Arc<Mutex<Option<String>>>,
+}
+
+#[derive(Clone)]
+struct BlockingBeginWriteBackend {
+    inner: RecordingBackend,
+    gate: BlockingBeginWriteGate,
+}
+
+impl BlockingBeginWriteBackend {
+    fn new() -> Self {
+        Self {
+            inner: RecordingBackend::new(),
+            gate: BlockingBeginWriteGate::new(),
+        }
+    }
+
+    fn gate(&self) -> BlockingBeginWriteGate {
+        self.gate.clone()
+    }
+}
+
+#[async_trait]
+impl Backend for BlockingBeginWriteBackend {
+    async fn begin_read_transaction(
+        &self,
+    ) -> Result<Box<dyn BackendReadTransaction + Send + Sync + 'static>, LixError> {
+        self.inner.begin_read_transaction().await
+    }
+
+    async fn begin_write_transaction(
+        &self,
+    ) -> Result<Box<dyn BackendWriteTransaction + Send + Sync + 'static>, LixError> {
+        self.gate.maybe_block();
+        self.inner.begin_write_transaction().await
+    }
+}
+
+#[derive(Clone)]
+struct BlockingBeginWriteGate {
+    state: Arc<(Mutex<BlockingBeginWriteState>, Condvar)>,
+}
+
+impl BlockingBeginWriteGate {
+    fn new() -> Self {
+        Self {
+            state: Arc::new((
+                Mutex::new(BlockingBeginWriteState::default()),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    fn block_next_write(&self) {
+        let (lock, _) = &*self.state;
+        let mut state = lock.lock().expect("blocking gate lock should be available");
+        state.block_next = true;
+        state.blocked = false;
+        state.released = false;
+    }
+
+    fn maybe_block(&self) {
+        let (lock, condvar) = &*self.state;
+        let mut state = lock.lock().expect("blocking gate lock should be available");
+        if !state.block_next {
+            return;
+        }
+        state.block_next = false;
+        state.blocked = true;
+        condvar.notify_all();
+        while !state.released {
+            state = condvar
+                .wait(state)
+                .expect("blocking gate lock should be available after wait");
+        }
+    }
+
+    fn wait_until_blocked(&self) {
+        let (lock, condvar) = &*self.state;
+        let mut state = lock.lock().expect("blocking gate lock should be available");
+        while !state.blocked {
+            state = condvar
+                .wait(state)
+                .expect("blocking gate lock should be available after wait");
+        }
+    }
+
+    fn release(&self) {
+        let (lock, condvar) = &*self.state;
+        let mut state = lock.lock().expect("blocking gate lock should be available");
+        state.released = true;
+        condvar.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct BlockingBeginWriteState {
+    block_next: bool,
+    blocked: bool,
+    released: bool,
 }
 
 impl RecordingBackend {

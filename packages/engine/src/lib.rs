@@ -55,7 +55,7 @@ pub use session::{
     CreateVersionOptions, CreateVersionReceipt, MergeChangeStats, MergeConflict,
     MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, MergeVersionOptions,
     MergeVersionOutcome, MergeVersionPreview, MergeVersionPreviewOptions, MergeVersionReceipt,
-    SessionContext, SwitchVersionOptions, SwitchVersionReceipt,
+    SessionContext, SessionTransaction, SwitchVersionOptions, SwitchVersionReceipt,
 };
 pub use session::{ExecuteResult, Row, RowRef, TryFromValue};
 
