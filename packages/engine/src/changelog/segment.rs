@@ -2,7 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::codec::{decode_segment, view_segment_object_slices};
+use super::codec::{
+    decode_segment, encode_segment_with_object_locations, view_segment_object_slices,
+};
 use super::store::segment_value;
 use super::types::{
     MembershipRole, Segment, SegmentChange, SegmentCommit, SegmentDirectory, SegmentObjectLocation,
@@ -224,10 +226,10 @@ pub(super) fn canonicalize_segment(mut segment: Segment) -> Result<Segment, LixE
     };
     segment.header.byte_count = 0;
     segment.header.checksum = empty_checksum();
-    apply_encoded_object_locations(&mut segment)?;
-    segment.header.byte_count = segment_value(&segment)?.len() as u64;
+    let encoded = encode_segment_with_object_locations(&segment)?;
+    segment.header.byte_count = encoded.bytes.len() as u64;
     segment.header.checksum = checksum_segment(&segment)?;
-    apply_encoded_object_locations(&mut segment)?;
+    apply_encoded_object_locations_from_encoded(&mut segment, &encoded)?;
     Ok(segment)
 }
 
@@ -235,30 +237,38 @@ fn empty_checksum() -> String {
     "0".repeat(64)
 }
 
-fn apply_encoded_object_locations(segment: &mut Segment) -> Result<(), LixError> {
-    let bytes = segment_value(segment)?;
-    let (commit_slices, change_slices) = view_segment_object_slices(&bytes)?;
-
+fn apply_encoded_object_locations_from_encoded(
+    segment: &mut Segment,
+    encoded: &super::codec::EncodedSegment,
+) -> Result<(), LixError> {
     for (commit_id, location) in &mut segment.directory.commits {
-        let Some(slice) = commit_slices.iter().find(|slice| slice.id == commit_id) else {
+        let Some(object) = encoded
+            .commits
+            .iter()
+            .find(|object| object.id == *commit_id)
+        else {
             return Err(LixError::unknown(format!(
                 "changelog segment '{}' could not locate encoded commit '{}'",
                 segment.header.segment_id, commit_id
             )));
         };
-        location.offset = slice.offset;
-        location.len = slice.len;
+        location.offset = object.offset;
+        location.len = object.len;
     }
 
     for (change_id, location) in &mut segment.directory.changes {
-        let Some(slice) = change_slices.iter().find(|slice| slice.id == change_id) else {
+        let Some(object) = encoded
+            .changes
+            .iter()
+            .find(|object| object.id == *change_id)
+        else {
             return Err(LixError::unknown(format!(
                 "changelog segment '{}' could not locate encoded change '{}'",
                 segment.header.segment_id, change_id
             )));
         };
-        location.offset = slice.offset;
-        location.len = slice.len;
+        location.offset = object.offset;
+        location.len = object.len;
     }
 
     Ok(())

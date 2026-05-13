@@ -15,19 +15,58 @@ const BY_COMMIT_MAGIC: &[u8; 5] = b"LXBC1";
 const BY_CHANGE_MAGIC: &[u8; 5] = b"LXBG1";
 
 pub(crate) fn encode_segment(segment: &Segment) -> Result<Vec<u8>, LixError> {
+    Ok(encode_segment_with_object_locations(segment)?.bytes)
+}
+
+pub(crate) fn encode_segment_with_object_locations(
+    segment: &Segment,
+) -> Result<EncodedSegment, LixError> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(SEGMENT_MAGIC);
     write_segment_header(&mut bytes, &segment.header)?;
     write_segment_directory(&mut bytes, &segment.directory)?;
     write_len(&mut bytes, segment.commits.len(), "segment commits")?;
+    let mut commits = Vec::with_capacity(segment.commits.len());
     for commit in &segment.commits {
+        let start = bytes.len() as u64;
         write_segment_commit(&mut bytes, commit)?;
+        commits.push(EncodedSegmentObject {
+            id: commit.header.id.clone(),
+            offset: start,
+            len: bytes.len() as u64 - start,
+            checksum: Some(commit.checksum.clone()),
+        });
     }
     write_len(&mut bytes, segment.changes.len(), "segment changes")?;
+    let mut changes = Vec::with_capacity(segment.changes.len());
     for change in &segment.changes {
+        let start = bytes.len() as u64;
         write_segment_change(&mut bytes, change)?;
+        changes.push(EncodedSegmentObject {
+            id: change.id.clone(),
+            offset: start,
+            len: bytes.len() as u64 - start,
+            checksum: None,
+        });
     }
-    Ok(bytes)
+    Ok(EncodedSegment {
+        bytes,
+        commits,
+        changes,
+    })
+}
+
+pub(crate) struct EncodedSegment {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) commits: Vec<EncodedSegmentObject>,
+    pub(crate) changes: Vec<EncodedSegmentObject>,
+}
+
+pub(crate) struct EncodedSegmentObject {
+    pub(crate) id: String,
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
+    pub(crate) checksum: Option<String>,
 }
 
 pub(crate) fn decode_segment(bytes: &[u8]) -> Result<Segment, LixError> {
