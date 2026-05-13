@@ -112,9 +112,9 @@ pub(crate) fn decode_segment_change(bytes: &[u8]) -> Result<SegmentChange, LixEr
 pub(crate) fn view_segment(bytes: &[u8]) -> Result<SegmentView<'_>, LixError> {
     let mut cursor = ByteCursor::new(bytes);
     cursor.expect_magic(SEGMENT_MAGIC, "segment")?;
-    let header = cursor.read_segment_header_view("header")?;
-    let directory_commits = cursor.read_segment_directory_commit_views("directory.commits")?;
-    let directory_changes = cursor.read_segment_directory_change_views("directory.changes")?;
+    let header = cursor.read_segment_header_view_fast()?;
+    let directory_commits = cursor.read_segment_directory_commit_views_fast()?;
+    let directory_changes = cursor.read_segment_directory_change_views_fast()?;
     let object_bytes = cursor.remaining_bytes();
 
     Ok(SegmentView {
@@ -137,22 +137,22 @@ pub(crate) fn view_segment_object_slices(
 ) -> Result<(Vec<SegmentObjectSlice<'_>>, Vec<SegmentObjectSlice<'_>>), LixError> {
     let mut cursor = ByteCursor::new(bytes);
     cursor.expect_magic(SEGMENT_MAGIC, "segment")?;
-    let _ = cursor.read_segment_header_view("header")?;
-    let _ = cursor.read_segment_directory_commit_views("directory.commits")?;
-    let _ = cursor.read_segment_directory_change_views("directory.changes")?;
+    let _ = cursor.read_segment_header_view_fast()?;
+    let _ = cursor.read_segment_directory_commit_views_fast()?;
+    let _ = cursor.read_segment_directory_change_views_fast()?;
 
-    let commit_len = cursor.read_len("commits")?;
-    cursor.ensure_len_fits_remaining(commit_len, "commits")?;
+    let commit_len = cursor.read_len_fast()?;
+    cursor.ensure_len_fits_remaining_fast(commit_len)?;
     let mut commits = Vec::with_capacity(commit_len);
-    for index in 0..commit_len {
-        commits.push(cursor.read_segment_commit_slice(&format!("commits[{index}]"))?);
+    for _ in 0..commit_len {
+        commits.push(cursor.read_segment_commit_slice_fast()?);
     }
 
-    let change_len = cursor.read_len("changes")?;
-    cursor.ensure_len_fits_remaining(change_len, "changes")?;
+    let change_len = cursor.read_len_fast()?;
+    cursor.ensure_len_fits_remaining_fast(change_len)?;
     let mut changes = Vec::with_capacity(change_len);
-    for index in 0..change_len {
-        changes.push(cursor.read_segment_change_slice(&format!("changes[{index}]"))?);
+    for _ in 0..change_len {
+        changes.push(cursor.read_segment_change_slice_fast()?);
     }
 
     cursor.expect_end("segment")?;
@@ -557,6 +557,19 @@ impl<'a> ByteCursor<'a> {
         })
     }
 
+    fn read_location_view_fast(&mut self) -> Result<SegmentObjectLocationRef<'a>, LixError> {
+        let segment_id = self.read_string_ref_fast()?;
+        let offset = self.read_u64_fast()?;
+        let len = self.read_u64_fast()?;
+        let checksum = self.read_string_ref_fast()?;
+        Ok(SegmentObjectLocationRef {
+            segment_id,
+            offset,
+            len,
+            checksum,
+        })
+    }
+
     fn read_segment_header(&mut self, field: &str) -> Result<SegmentHeader, LixError> {
         Ok(SegmentHeader {
             segment_id: self.read_string(&format!("{field}.segment_id"))?,
@@ -578,6 +591,18 @@ impl<'a> ByteCursor<'a> {
             byte_count: self.read_u64(&format!("{field}.byte_count"))?,
             payload_count: self.read_u32(&format!("{field}.payload_count"))?,
             checksum: self.read_string_ref(&format!("{field}.checksum"))?,
+        })
+    }
+
+    fn read_segment_header_view_fast(&mut self) -> Result<SegmentHeaderView<'a>, LixError> {
+        Ok(SegmentHeaderView {
+            segment_id: self.read_string_ref_fast()?,
+            format_version: self.read_u32_fast()?,
+            commit_count: self.read_u32_fast()?,
+            change_count: self.read_u32_fast()?,
+            byte_count: self.read_u64_fast()?,
+            payload_count: self.read_u32_fast()?,
+            checksum: self.read_string_ref_fast()?,
         })
     }
 
@@ -618,6 +643,20 @@ impl<'a> ByteCursor<'a> {
         Ok(commits)
     }
 
+    fn read_segment_directory_commit_views_fast(
+        &mut self,
+    ) -> Result<Vec<SegmentDirectoryEntryRef<'a>>, LixError> {
+        let len = self.read_len_fast()?;
+        self.ensure_len_fits_remaining_fast(len)?;
+        let mut commits = Vec::with_capacity(len);
+        for _ in 0..len {
+            let id = self.read_string_ref_fast()?;
+            let location = self.read_location_view_fast()?;
+            commits.push(SegmentDirectoryEntryRef { id, location });
+        }
+        Ok(commits)
+    }
+
     fn read_segment_directory_change_views(
         &mut self,
         field: &str,
@@ -628,6 +667,20 @@ impl<'a> ByteCursor<'a> {
         for index in 0..len {
             let id = self.read_string_ref(&format!("{field}[{index}].change_id"))?;
             let location = self.read_location_view(&format!("{field}[{index}].location"))?;
+            changes.push(SegmentDirectoryEntryRef { id, location });
+        }
+        Ok(changes)
+    }
+
+    fn read_segment_directory_change_views_fast(
+        &mut self,
+    ) -> Result<Vec<SegmentDirectoryEntryRef<'a>>, LixError> {
+        let len = self.read_len_fast()?;
+        self.ensure_len_fits_remaining_fast(len)?;
+        let mut changes = Vec::with_capacity(len);
+        for _ in 0..len {
+            let id = self.read_string_ref_fast()?;
+            let location = self.read_location_view_fast()?;
             changes.push(SegmentDirectoryEntryRef { id, location });
         }
         Ok(changes)
@@ -656,6 +709,27 @@ impl<'a> ByteCursor<'a> {
         self.skip_commit_body(&format!("{field}.body"))?;
         self.skip_segment_commit_directory(&format!("{field}.directory"))?;
         let checksum = self.read_string_ref(&format!("{field}.checksum"))?;
+        let end = self.offset;
+        Ok(SegmentObjectSlice {
+            id,
+            offset: start as u64,
+            len: (end - start) as u64,
+            encoded_checksum: Some(checksum),
+            bytes: &self.bytes[start..end],
+        })
+    }
+
+    fn read_segment_commit_slice_fast(&mut self) -> Result<SegmentObjectSlice<'a>, LixError> {
+        let start = self.offset;
+        let id = self.read_string_ref_fast()?;
+        self.skip_strings_fast()?;
+        self.skip_string_fast()?;
+        self.skip_strings_fast()?;
+        self.skip_string_fast()?;
+        self.skip_u32_fast()?;
+        self.skip_commit_body_fast()?;
+        self.skip_segment_commit_directory_fast()?;
+        let checksum = self.read_string_ref_fast()?;
         let end = self.offset;
         Ok(SegmentObjectSlice {
             id,
@@ -790,6 +864,28 @@ impl<'a> ByteCursor<'a> {
         })
     }
 
+    fn read_segment_change_slice_fast(&mut self) -> Result<SegmentObjectSlice<'a>, LixError> {
+        let start = self.offset;
+        let id = self.read_string_ref_fast()?;
+        self.skip_optional_string_fast()?;
+        self.skip_string_fast()?;
+        self.skip_string_fast()?;
+        self.skip_optional_string_fast()?;
+        self.skip_optional_json_ref_fast()?;
+        self.skip_optional_json_ref_fast()?;
+        self.skip_string_fast()?;
+        self.skip_segment_inline_payloads_fast()?;
+        self.skip_segment_change_directory_fast()?;
+        let end = self.offset;
+        Ok(SegmentObjectSlice {
+            id,
+            offset: start as u64,
+            len: (end - start) as u64,
+            encoded_checksum: None,
+            bytes: &self.bytes[start..end],
+        })
+    }
+
     fn remaining_bytes(&self) -> &'a [u8] {
         &self.bytes[self.offset..]
     }
@@ -873,6 +969,15 @@ impl<'a> ByteCursor<'a> {
         Ok(())
     }
 
+    fn skip_strings_fast(&mut self) -> Result<(), LixError> {
+        let len = self.read_len_fast()?;
+        self.ensure_len_fits_remaining_fast(len)?;
+        for _ in 0..len {
+            self.skip_string_fast()?;
+        }
+        Ok(())
+    }
+
     fn read_string(&mut self, field: &str) -> Result<String, LixError> {
         let len = self.read_u32(&format!("{field}.len"))?;
         let len = usize::try_from(len).map_err(|_| {
@@ -909,6 +1014,12 @@ impl<'a> ByteCursor<'a> {
         })
     }
 
+    fn read_string_ref_fast(&mut self) -> Result<&'a str, LixError> {
+        let len = self.read_len_fast()?;
+        let bytes = self.read_bytes_fast(len)?;
+        std::str::from_utf8(bytes).map_err(|_| self.fast_error("invalid UTF-8 string"))
+    }
+
     fn skip_string(&mut self, field: &str) -> Result<(), LixError> {
         let len = self.read_u32(&format!("{field}.len"))?;
         let len = usize::try_from(len).map_err(|_| {
@@ -918,6 +1029,11 @@ impl<'a> ByteCursor<'a> {
             )
         })?;
         self.skip_bytes(len, field)
+    }
+
+    fn skip_string_fast(&mut self) -> Result<(), LixError> {
+        let len = self.read_len_fast()?;
+        self.skip_bytes_fast(len)
     }
 
     fn read_optional_string(&mut self, field: &str) -> Result<Option<String>, LixError> {
@@ -931,6 +1047,14 @@ impl<'a> ByteCursor<'a> {
     fn skip_optional_string(&mut self, field: &str) -> Result<(), LixError> {
         if self.read_bool(&format!("{field}.present"))? {
             self.skip_string(field)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn skip_optional_string_fast(&mut self) -> Result<(), LixError> {
+        if self.read_bool_fast()? {
+            self.skip_string_fast()
         } else {
             Ok(())
         }
@@ -952,6 +1076,14 @@ impl<'a> ByteCursor<'a> {
         }
     }
 
+    fn skip_optional_u32_fast(&mut self) -> Result<(), LixError> {
+        if self.read_bool_fast()? {
+            self.skip_u32_fast()
+        } else {
+            Ok(())
+        }
+    }
+
     fn read_optional_json_ref(&mut self, field: &str) -> Result<Option<JsonRef>, LixError> {
         if self.read_bool(&format!("{field}.present"))? {
             Ok(Some(self.read_json_ref(field)?))
@@ -963,6 +1095,14 @@ impl<'a> ByteCursor<'a> {
     fn skip_optional_json_ref(&mut self, field: &str) -> Result<(), LixError> {
         if self.read_bool(&format!("{field}.present"))? {
             self.skip_bytes(32, field)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn skip_optional_json_ref_fast(&mut self) -> Result<(), LixError> {
+        if self.read_bool_fast()? {
+            self.skip_bytes_fast(32)
         } else {
             Ok(())
         }
@@ -985,6 +1125,11 @@ impl<'a> ByteCursor<'a> {
         self.skip_bytes(len, field)
     }
 
+    fn skip_byte_vec_fast(&mut self) -> Result<(), LixError> {
+        let len = self.read_len_fast()?;
+        self.skip_bytes_fast(len)
+    }
+
     fn skip_commit_body(&mut self, field: &str) -> Result<(), LixError> {
         let len = self.read_len(&format!("{field}.membership"))?;
         self.ensure_len_fits_remaining(len, &format!("{field}.membership"))?;
@@ -994,6 +1139,17 @@ impl<'a> ByteCursor<'a> {
             self.skip_optional_u32(&format!(
                 "{field}.membership[{index}].source_parent_ordinal"
             ))?;
+        }
+        Ok(())
+    }
+
+    fn skip_commit_body_fast(&mut self) -> Result<(), LixError> {
+        let len = self.read_len_fast()?;
+        self.ensure_len_fits_remaining_fast(len)?;
+        for _ in 0..len {
+            self.skip_string_fast()?;
+            self.skip_u8_fast()?;
+            self.skip_optional_u32_fast()?;
         }
         Ok(())
     }
@@ -1023,12 +1179,41 @@ impl<'a> ByteCursor<'a> {
         Ok(())
     }
 
+    fn skip_segment_commit_directory_fast(&mut self) -> Result<(), LixError> {
+        let identity_len = self.read_len_fast()?;
+        self.ensure_len_fits_remaining_fast(identity_len)?;
+        for _ in 0..identity_len {
+            self.skip_string_fast()?;
+            self.skip_string_fast()?;
+            self.skip_string_fast()?;
+            self.skip_string_fast()?;
+        }
+
+        let ordinal_len = self.read_len_fast()?;
+        self.ensure_len_fits_remaining_fast(ordinal_len)?;
+        for _ in 0..ordinal_len {
+            self.skip_string_fast()?;
+            self.skip_u32_fast()?;
+        }
+        Ok(())
+    }
+
     fn skip_segment_inline_payloads(&mut self, field: &str) -> Result<(), LixError> {
         let len = self.read_len(field)?;
         self.ensure_len_fits_remaining(len, field)?;
         for index in 0..len {
             self.skip_bytes(32, &format!("{field}[{index}].json_ref"))?;
             self.skip_byte_vec(&format!("{field}[{index}].bytes"))?;
+        }
+        Ok(())
+    }
+
+    fn skip_segment_inline_payloads_fast(&mut self) -> Result<(), LixError> {
+        let len = self.read_len_fast()?;
+        self.ensure_len_fits_remaining_fast(len)?;
+        for _ in 0..len {
+            self.skip_bytes_fast(32)?;
+            self.skip_byte_vec_fast()?;
         }
         Ok(())
     }
@@ -1044,6 +1229,17 @@ impl<'a> ByteCursor<'a> {
         Ok(())
     }
 
+    fn skip_segment_change_directory_fast(&mut self) -> Result<(), LixError> {
+        let len = self.read_len_fast()?;
+        self.ensure_len_fits_remaining_fast(len)?;
+        for _ in 0..len {
+            self.skip_bytes_fast(32)?;
+            self.skip_u64_fast()?;
+            self.skip_u64_fast()?;
+        }
+        Ok(())
+    }
+
     fn read_len(&mut self, field: &str) -> Result<usize, LixError> {
         let len = self.read_u32(&format!("{field}.len"))?;
         usize::try_from(len).map_err(|_| {
@@ -1054,6 +1250,10 @@ impl<'a> ByteCursor<'a> {
         })
     }
 
+    fn read_len_fast(&mut self) -> Result<usize, LixError> {
+        Ok(self.read_u32_fast()? as usize)
+    }
+
     fn ensure_len_fits_remaining(&self, len: usize, field: &str) -> Result<(), LixError> {
         if len <= self.bytes.len().saturating_sub(self.offset) {
             return Ok(());
@@ -1062,6 +1262,13 @@ impl<'a> ByteCursor<'a> {
             LixError::CODE_INTERNAL_ERROR,
             format!("failed to decode changelog {field}: declared length exceeds remaining bytes"),
         ))
+    }
+
+    fn ensure_len_fits_remaining_fast(&self, len: usize) -> Result<(), LixError> {
+        if len <= self.bytes.len().saturating_sub(self.offset) {
+            return Ok(());
+        }
+        Err(self.fast_error("declared length exceeds remaining bytes"))
     }
 
     fn read_bool(&mut self, field: &str) -> Result<bool, LixError> {
@@ -1075,12 +1282,28 @@ impl<'a> ByteCursor<'a> {
         }
     }
 
+    fn read_bool_fast(&mut self) -> Result<bool, LixError> {
+        match self.read_u8_fast()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(self.fast_error("invalid bool value")),
+        }
+    }
+
     fn read_u8(&mut self, field: &str) -> Result<u8, LixError> {
         Ok(self.read_bytes(1, field)?[0])
     }
 
+    fn read_u8_fast(&mut self) -> Result<u8, LixError> {
+        Ok(self.read_bytes_fast(1)?[0])
+    }
+
     fn skip_u8(&mut self, field: &str) -> Result<(), LixError> {
         self.skip_bytes(1, field)
+    }
+
+    fn skip_u8_fast(&mut self) -> Result<(), LixError> {
+        self.skip_bytes_fast(1)
     }
 
     fn read_u32(&mut self, field: &str) -> Result<u32, LixError> {
@@ -1090,8 +1313,19 @@ impl<'a> ByteCursor<'a> {
         Ok(u32::from_le_bytes(out))
     }
 
+    fn read_u32_fast(&mut self) -> Result<u32, LixError> {
+        let bytes = self.read_bytes_fast(4)?;
+        let mut out = [0_u8; 4];
+        out.copy_from_slice(bytes);
+        Ok(u32::from_le_bytes(out))
+    }
+
     fn skip_u32(&mut self, field: &str) -> Result<(), LixError> {
         self.skip_bytes(4, field)
+    }
+
+    fn skip_u32_fast(&mut self) -> Result<(), LixError> {
+        self.skip_bytes_fast(4)
     }
 
     fn read_u64(&mut self, field: &str) -> Result<u64, LixError> {
@@ -1101,8 +1335,19 @@ impl<'a> ByteCursor<'a> {
         Ok(u64::from_le_bytes(out))
     }
 
+    fn read_u64_fast(&mut self) -> Result<u64, LixError> {
+        let bytes = self.read_bytes_fast(8)?;
+        let mut out = [0_u8; 8];
+        out.copy_from_slice(bytes);
+        Ok(u64::from_le_bytes(out))
+    }
+
     fn skip_u64(&mut self, field: &str) -> Result<(), LixError> {
         self.skip_bytes(8, field)
+    }
+
+    fn skip_u64_fast(&mut self) -> Result<(), LixError> {
+        self.skip_bytes_fast(8)
     }
 
     fn read_bytes(&mut self, len: usize, field: &str) -> Result<&'a [u8], LixError> {
@@ -1123,8 +1368,26 @@ impl<'a> ByteCursor<'a> {
         Ok(out)
     }
 
+    fn read_bytes_fast(&mut self, len: usize) -> Result<&'a [u8], LixError> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| self.fast_error("offset overflow"))?;
+        if end > self.bytes.len() {
+            return Err(self.fast_error("truncated bytes"));
+        }
+        let out = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(out)
+    }
+
     fn skip_bytes(&mut self, len: usize, field: &str) -> Result<(), LixError> {
         let _ = self.read_bytes(len, field)?;
+        Ok(())
+    }
+
+    fn skip_bytes_fast(&mut self, len: usize) -> Result<(), LixError> {
+        let _ = self.read_bytes_fast(len)?;
         Ok(())
     }
 
@@ -1136,6 +1399,16 @@ impl<'a> ByteCursor<'a> {
             LixError::CODE_INTERNAL_ERROR,
             format!("failed to decode changelog {label}: trailing bytes"),
         ))
+    }
+
+    fn fast_error(&self, message: &'static str) -> LixError {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "failed to decode changelog segment at byte {}: {message}",
+                self.offset
+            ),
+        )
     }
 }
 
