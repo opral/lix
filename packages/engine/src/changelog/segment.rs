@@ -265,6 +265,76 @@ fn apply_encoded_object_locations(segment: &mut Segment) -> Result<(), LixError>
 }
 
 pub(super) fn validate_segment_shape(segment: &Segment) -> Result<(), LixError> {
+    validate_stage_segment_shape(segment)?;
+
+    let encoded = segment_value(segment)?;
+    let (encoded_commits, encoded_changes) = view_segment_object_slices(&encoded)?;
+
+    for (commit_id, location) in &segment.directory.commits {
+        let commit = segment_commit(segment, commit_id).ok_or_else(|| {
+            LixError::unknown(format!(
+                "changelog segment '{}' directory points to missing commit '{}'",
+                segment.header.segment_id, commit_id
+            ))
+        })?;
+        validate_commit_location(location, segment, commit_id)?;
+        validate_encoded_object_location(
+            &segment.header.segment_id,
+            "commit",
+            commit_id,
+            location,
+            encoded_commits.iter().map(|slice| {
+                (
+                    slice.id,
+                    slice.offset,
+                    slice.len,
+                    slice.encoded_checksum.unwrap_or_default(),
+                )
+            }),
+        )?;
+        validate_commit_checksum(&location.checksum, commit_id, commit)?;
+    }
+
+    for (change_id, location) in &segment.directory.changes {
+        validate_change_location(location, segment, change_id)?;
+        let change = segment_change(segment, change_id).ok_or_else(|| {
+            LixError::unknown(format!(
+                "changelog segment '{}' directory points to missing change '{}'",
+                segment.header.segment_id, change_id
+            ))
+        })?;
+        validate_encoded_object_location(
+            &segment.header.segment_id,
+            "change",
+            change_id,
+            location,
+            encoded_changes
+                .iter()
+                .map(|slice| (slice.id, slice.offset, slice.len, "")),
+        )?;
+        validate_change_checksum(&location.checksum, change_id, change)?;
+    }
+
+    let encoded_len = encoded.len() as u64;
+    if segment.header.byte_count != encoded_len {
+        return Err(LixError::unknown(format!(
+            "changelog segment '{}' byte_count {} does not match encoded length {}",
+            segment.header.segment_id, segment.header.byte_count, encoded_len
+        )));
+    }
+
+    let checksum = checksum_segment(segment)?;
+    if segment.header.checksum != checksum {
+        return Err(LixError::unknown(format!(
+            "changelog segment '{}' checksum '{}' does not match canonical checksum '{}'",
+            segment.header.segment_id, segment.header.checksum, checksum
+        )));
+    }
+
+    Ok(())
+}
+
+pub(super) fn validate_stage_segment_shape(segment: &Segment) -> Result<(), LixError> {
     if segment.header.format_version != 1 {
         return Err(LixError::unknown(format!(
             "changelog segment '{}' format_version {} is not supported",
@@ -363,70 +433,6 @@ pub(super) fn validate_segment_shape(segment: &Segment) -> Result<(), LixError> 
             .iter()
             .map(|(id, location)| (id.as_str(), location)),
     )?;
-
-    let encoded = segment_value(segment)?;
-    let (encoded_commits, encoded_changes) = view_segment_object_slices(&encoded)?;
-
-    for (commit_id, location) in &segment.directory.commits {
-        let commit = segment_commit(segment, commit_id).ok_or_else(|| {
-            LixError::unknown(format!(
-                "changelog segment '{}' directory points to missing commit '{}'",
-                segment.header.segment_id, commit_id
-            ))
-        })?;
-        validate_commit_location(location, segment, commit_id)?;
-        validate_encoded_object_location(
-            &segment.header.segment_id,
-            "commit",
-            commit_id,
-            location,
-            encoded_commits.iter().map(|slice| {
-                (
-                    slice.id,
-                    slice.offset,
-                    slice.len,
-                    slice.encoded_checksum.unwrap_or_default(),
-                )
-            }),
-        )?;
-        validate_commit_checksum(&location.checksum, commit_id, commit)?;
-    }
-
-    for (change_id, location) in &segment.directory.changes {
-        validate_change_location(location, segment, change_id)?;
-        let change = segment_change(segment, change_id).ok_or_else(|| {
-            LixError::unknown(format!(
-                "changelog segment '{}' directory points to missing change '{}'",
-                segment.header.segment_id, change_id
-            ))
-        })?;
-        validate_encoded_object_location(
-            &segment.header.segment_id,
-            "change",
-            change_id,
-            location,
-            encoded_changes
-                .iter()
-                .map(|slice| (slice.id, slice.offset, slice.len, "")),
-        )?;
-        validate_change_checksum(&location.checksum, change_id, change)?;
-    }
-
-    let encoded_len = encoded.len() as u64;
-    if segment.header.byte_count != encoded_len {
-        return Err(LixError::unknown(format!(
-            "changelog segment '{}' byte_count {} does not match encoded length {}",
-            segment.header.segment_id, segment.header.byte_count, encoded_len
-        )));
-    }
-
-    let checksum = checksum_segment(segment)?;
-    if segment.header.checksum != checksum {
-        return Err(LixError::unknown(format!(
-            "changelog segment '{}' checksum '{}' does not match canonical checksum '{}'",
-            segment.header.segment_id, segment.header.checksum, checksum
-        )));
-    }
 
     Ok(())
 }

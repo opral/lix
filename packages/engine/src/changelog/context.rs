@@ -6,7 +6,8 @@ use super::by_commit_index::{by_commit_entries_for_segment, by_commit_entries_fo
 use super::segment::{
     canonicalize_segment, directory_change_location, directory_commit_location, segment_change,
     segment_commit, validate_change_checksum, validate_change_location, validate_commit_checksum,
-    validate_commit_location, validate_segment_shape, DecodedSegmentIndex,
+    validate_commit_location, validate_segment_shape, validate_stage_segment_shape,
+    DecodedSegmentIndex,
 };
 use super::store::{
     by_change_index_value, by_change_key, by_change_membership_commit_id_from_key,
@@ -1075,7 +1076,7 @@ where
 {
     pub(crate) async fn stage_segment(&mut self, segment: Segment) -> Result<(), LixError> {
         let segment = canonicalize_segment(segment)?;
-        validate_segment_shape(&segment)?;
+        validate_stage_segment_shape(&segment)?;
         self.reject_duplicate_logical_ids(&segment).await?;
         let segment_id = segment.header.segment_id.clone();
         self.writes.put(
