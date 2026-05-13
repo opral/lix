@@ -3,7 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::codec::{
-    decode_segment, encode_segment_with_object_locations, view_segment_object_slices,
+    decode_segment, decode_segment_change, decode_segment_commit, encode_segment_with_object_locations,
+    view_segment, view_segment_object_slices,
 };
 use super::store::segment_value;
 use super::types::{
@@ -73,7 +74,8 @@ pub(super) fn directory_change_location_ref<'a>(
 }
 
 pub(super) struct DecodedSegmentIndex {
-    pub(super) segment: Segment,
+    bytes: Vec<u8>,
+    segment_id: String,
     commit_ordinals: HashMap<String, usize>,
     change_ordinals: HashMap<String, usize>,
     commit_locations: HashMap<String, SegmentObjectLocation>,
@@ -82,20 +84,39 @@ pub(super) struct DecodedSegmentIndex {
 
 impl DecodedSegmentIndex {
     pub(super) fn decode(bytes: &[u8]) -> Result<Self, LixError> {
-        let segment = decode_segment(bytes)?;
-        validate_segment_shape(&segment)?;
+        let view = view_segment(bytes)?;
+        let segment_id = view.segment_id.to_string();
         let mut commit_ordinals = HashMap::new();
-        for (ordinal, commit) in segment.commits.iter().enumerate() {
-            commit_ordinals.insert(commit.header.id.clone(), ordinal);
+        let mut commit_locations = HashMap::new();
+        for (ordinal, entry) in view.directory_commits.iter().enumerate() {
+            commit_ordinals.insert(entry.id.to_string(), ordinal);
+            commit_locations.insert(
+                entry.id.to_string(),
+                SegmentObjectLocation {
+                    segment_id: entry.location.segment_id.to_string(),
+                    offset: entry.location.offset,
+                    len: entry.location.len,
+                    checksum: entry.location.checksum.to_string(),
+                },
+            );
         }
         let mut change_ordinals = HashMap::new();
-        for (ordinal, change) in segment.changes.iter().enumerate() {
-            change_ordinals.insert(change.id.clone(), ordinal);
+        let mut change_locations = HashMap::new();
+        for (ordinal, entry) in view.directory_changes.iter().enumerate() {
+            change_ordinals.insert(entry.id.to_string(), ordinal);
+            change_locations.insert(
+                entry.id.to_string(),
+                SegmentObjectLocation {
+                    segment_id: entry.location.segment_id.to_string(),
+                    offset: entry.location.offset,
+                    len: entry.location.len,
+                    checksum: entry.location.checksum.to_string(),
+                },
+            );
         }
-        let commit_locations = segment.directory.commits.iter().cloned().collect();
-        let change_locations = segment.directory.changes.iter().cloned().collect();
         Ok(Self {
-            segment,
+            bytes: bytes.to_vec(),
+            segment_id,
             commit_ordinals,
             change_ordinals,
             commit_locations,
@@ -103,16 +124,42 @@ impl DecodedSegmentIndex {
         })
     }
 
-    pub(super) fn commit(&self, commit_id: &str) -> Option<&SegmentCommit> {
-        self.commit_ordinals
-            .get(commit_id)
-            .and_then(|ordinal| self.segment.commits.get(*ordinal))
+    pub(super) fn contains_commit(&self, commit_id: &str) -> bool {
+        self.commit_ordinals.contains_key(commit_id)
     }
 
-    pub(super) fn change(&self, change_id: &str) -> Option<&SegmentChange> {
-        self.change_ordinals
-            .get(change_id)
-            .and_then(|ordinal| self.segment.changes.get(*ordinal))
+    pub(super) fn contains_change(&self, change_id: &str) -> bool {
+        self.change_ordinals.contains_key(change_id)
+    }
+
+    pub(super) fn commit(&self, commit_id: &str) -> Result<Option<SegmentCommit>, LixError> {
+        let Some(location) = self.commit_locations.get(commit_id) else {
+            return Ok(None);
+        };
+        let bytes = self.object_bytes(location, "commit", commit_id)?;
+        let commit = decode_segment_commit(bytes)?;
+        if commit.header.id != commit_id {
+            return Err(LixError::unknown(format!(
+                "changelog commit locator for '{commit_id}' decoded commit '{}'",
+                commit.header.id
+            )));
+        }
+        Ok(Some(commit))
+    }
+
+    pub(super) fn change(&self, change_id: &str) -> Result<Option<SegmentChange>, LixError> {
+        let Some(location) = self.change_locations.get(change_id) else {
+            return Ok(None);
+        };
+        let bytes = self.object_bytes(location, "change", change_id)?;
+        let change = decode_segment_change(bytes)?;
+        if change.id != change_id {
+            return Err(LixError::unknown(format!(
+                "changelog change locator for '{change_id}' decoded change '{}'",
+                change.id
+            )));
+        }
+        Ok(Some(change))
     }
 
     pub(super) fn validate_commit_location(
@@ -123,7 +170,7 @@ impl DecodedSegmentIndex {
         let Some(expected) = self.commit_locations.get(commit_id) else {
             return Err(LixError::unknown(format!(
                 "changelog segment '{}' is missing directory location for commit '{}'",
-                self.segment.header.segment_id, commit_id
+                self.segment_id, commit_id
             )));
         };
         if location != expected {
@@ -142,7 +189,7 @@ impl DecodedSegmentIndex {
         let Some(expected) = self.change_locations.get(change_id) else {
             return Err(LixError::unknown(format!(
                 "changelog segment '{}' is missing directory location for change '{}'",
-                self.segment.header.segment_id, change_id
+                self.segment_id, change_id
             )));
         };
         if location != expected {
@@ -150,14 +197,47 @@ impl DecodedSegmentIndex {
                 "changelog change '{change_id}' locator does not match segment directory"
             )));
         }
-        let Some(change) = self.change(change_id) else {
+        let Some(change) = self.change(change_id)? else {
             return Err(LixError::unknown(format!(
                 "changelog segment '{}' is missing change '{}'",
-                self.segment.header.segment_id, change_id
+                self.segment_id, change_id
             )));
         };
-        validate_change_checksum(&location.checksum, change_id, change)?;
+        validate_change_checksum(&location.checksum, change_id, &change)?;
         Ok(())
+    }
+
+    fn object_bytes(
+        &self,
+        location: &SegmentObjectLocation,
+        kind: &str,
+        id: &str,
+    ) -> Result<&[u8], LixError> {
+        if location.segment_id != self.segment_id {
+            return Err(LixError::unknown(format!(
+                "changelog {kind} '{id}' locator points to segment '{}' but loaded '{}'",
+                location.segment_id, self.segment_id
+            )));
+        }
+        let start = usize::try_from(location.offset).map_err(|_| {
+            LixError::unknown(format!(
+                "changelog {kind} '{id}' locator offset does not fit usize"
+            ))
+        })?;
+        let len = usize::try_from(location.len).map_err(|_| {
+            LixError::unknown(format!(
+                "changelog {kind} '{id}' locator len does not fit usize"
+            ))
+        })?;
+        let end = start.checked_add(len).ok_or_else(|| {
+            LixError::unknown(format!("changelog {kind} '{id}' locator range overflows"))
+        })?;
+        self.bytes.get(start..end).ok_or_else(|| {
+            LixError::unknown(format!(
+                "changelog {kind} '{id}' locator range is outside segment '{}'",
+                self.segment_id
+            ))
+        })
     }
 }
 

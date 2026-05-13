@@ -398,7 +398,7 @@ pub fn lookup_decoded_segment_index_commits(
 ) -> usize {
     commit_ids
         .iter()
-        .filter(|commit_id| index.inner.commit(commit_id).is_some())
+        .filter(|commit_id| index.inner.contains_commit(commit_id))
         .count()
 }
 
@@ -408,7 +408,7 @@ pub fn lookup_decoded_segment_index_changes(
 ) -> usize {
     change_ids
         .iter()
-        .filter(|change_id| index.inner.change(change_id).is_some())
+        .filter(|change_id| index.inner.contains_change(change_id))
         .count()
 }
 
