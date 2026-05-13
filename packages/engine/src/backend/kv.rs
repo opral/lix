@@ -284,15 +284,6 @@ pub struct BackendKvScan2Page {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendKvScanPlanV3Request {
-    pub namespace: String,
-    pub spans: Vec<BackendKvKeySpan>,
-    pub after: Option<Vec<u8>>,
-    pub page_size: usize,
-    pub projection: BackendKvScanPlanV3Projection,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendKvKeySpan {
     pub start: Vec<u8>,
     pub end: Vec<u8>,
@@ -312,26 +303,6 @@ impl BackendKvKeySpan {
             end: Vec::new(),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BackendKvScanPlanV3Projection {
-    KeysOnly,
-    ValueParts(Vec<BackendKvScanPlanV3ValuePart>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendKvScanPlanV3ValuePart {
-    Header,
-    Payload,
-    FullValue,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendKvScanPlanV3Page {
-    pub keys: BytePage,
-    pub values: Vec<BytePage>,
-    pub resume_after: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -50,13 +50,6 @@ pub(crate) trait StorageReader: Send {
         storage_scan2_fallback(self, request).await
     }
 
-    async fn scan_plan_v3(
-        &mut self,
-        request: KvScanPlanV3Request,
-    ) -> Result<KvScanPlanV3Page, LixError> {
-        storage_scan_plan_v3_fallback(self, request).await
-    }
-
     async fn read_v3(&mut self, request: KvReadV3Request) -> Result<KvReadV3Page, LixError> {
         storage_read_v3_fallback(self, request).await
     }
@@ -174,30 +167,34 @@ where
     }
 }
 
-async fn storage_scan_plan_v3_fallback<T>(
+async fn storage_read_v3_scan_spans_fallback<T>(
     store: &mut T,
-    request: KvScanPlanV3Request,
-) -> Result<KvScanPlanV3Page, LixError>
+    namespace: String,
+    spans: Vec<KvKeySpan>,
+    after: Option<Vec<u8>>,
+    page_size: usize,
+    projection: KvReadV3Projection,
+) -> Result<KvReadV3Page, LixError>
 where
     T: StorageReader + ?Sized,
 {
-    match request.projection {
-        KvScanPlanV3Projection::KeysOnly => {
+    match projection {
+        KvReadV3Projection::KeysOnly => {
             let mut keys = BytePageBuilder::new();
             let mut resume_after = None;
-            let spans = normalize_spans(request.spans);
+            let spans = normalize_spans(spans);
             let span_count = spans.len();
             for (span_index, span) in spans.into_iter().enumerate() {
-                let Some(after) = scan_after_for_span(&span, request.after.as_deref()) else {
+                let Some(after) = scan_after_for_span(&span, after.as_deref()) else {
                     continue;
                 };
-                let remaining = request.page_size.saturating_sub(keys.len());
+                let remaining = page_size.saturating_sub(keys.len());
                 if remaining == 0 {
                     break;
                 }
                 let page = store
                     .scan_keys(KvScanRequest {
-                        namespace: request.namespace.clone(),
+                        namespace: namespace.clone(),
                         range: span_scan_range(&span),
                         after,
                         limit: remaining,
@@ -207,7 +204,7 @@ where
                     keys.push(key);
                 }
                 resume_after = page.resume_after;
-                if keys.len() == request.page_size {
+                if keys.len() == page_size {
                     if resume_after.is_some() || span_index + 1 < span_count {
                         resume_after = last_key(&keys);
                     }
@@ -217,32 +214,34 @@ where
                     break;
                 }
             }
-            Ok(KvScanPlanV3Page {
+            Ok(KvReadV3Page {
                 keys: keys.finish(),
+                presence: KvReadV3Presence::All,
                 values: Vec::new(),
+                request_indexes: None,
                 resume_after,
             })
         }
-        KvScanPlanV3Projection::ValueParts(parts) => {
+        KvReadV3Projection::ValueParts(parts) => {
             let mut keys = BytePageBuilder::new();
             let mut value_builders = parts
                 .iter()
                 .map(|_| BytePageBuilder::new())
                 .collect::<Vec<_>>();
             let mut resume_after = None;
-            let spans = normalize_spans(request.spans);
+            let spans = normalize_spans(spans);
             let span_count = spans.len();
             for (span_index, span) in spans.into_iter().enumerate() {
-                let Some(after) = scan_after_for_span(&span, request.after.as_deref()) else {
+                let Some(after) = scan_after_for_span(&span, after.as_deref()) else {
                     continue;
                 };
-                let remaining = request.page_size.saturating_sub(keys.len());
+                let remaining = page_size.saturating_sub(keys.len());
                 if remaining == 0 {
                     break;
                 }
                 let page = store
                     .scan_entries(KvScanRequest {
-                        namespace: request.namespace.clone(),
+                        namespace: namespace.clone(),
                         range: span_scan_range(&span),
                         after,
                         limit: remaining,
@@ -254,11 +253,11 @@ where
                     })?;
                     keys.push(key);
                     for (part, builder) in parts.iter().zip(value_builders.iter_mut()) {
-                        builder.push(project_scan_plan_v3_value_part(value, *part)?);
+                        builder.push(project_read_v3_value_part(value, *part)?);
                     }
                 }
                 resume_after = page.resume_after;
-                if keys.len() == request.page_size {
+                if keys.len() == page_size {
                     if resume_after.is_some() || span_index + 1 < span_count {
                         resume_after = last_key(&keys);
                     }
@@ -268,12 +267,14 @@ where
                     break;
                 }
             }
-            Ok(KvScanPlanV3Page {
+            Ok(KvReadV3Page {
                 keys: keys.finish(),
+                presence: KvReadV3Presence::All,
                 values: value_builders
                     .into_iter()
                     .map(BytePageBuilder::finish)
                     .collect(),
+                request_indexes: None,
                 resume_after,
             })
         }
@@ -323,28 +324,15 @@ where
         },
         KvReadV3Source::Spans { spans, after } => {
             let page_size = request.page_size.unwrap_or(usize::MAX);
-            let projection = match request.projection {
-                KvReadV3Projection::KeysOnly => KvScanPlanV3Projection::KeysOnly,
-                KvReadV3Projection::ValueParts(parts) => {
-                    KvScanPlanV3Projection::ValueParts(parts.into_iter().map(Into::into).collect())
-                }
-            };
-            let page = store
-                .scan_plan_v3(KvScanPlanV3Request {
-                    namespace: request.namespace,
-                    spans,
-                    after,
-                    page_size,
-                    projection,
-                })
-                .await?;
-            Ok(KvReadV3Page {
-                keys: page.keys,
-                presence: KvReadV3Presence::All,
-                values: page.values,
-                request_indexes: None,
-                resume_after: page.resume_after,
-            })
+            storage_read_v3_scan_spans_fallback(
+                store,
+                request.namespace,
+                spans,
+                after,
+                page_size,
+                request.projection,
+            )
+            .await
         }
     }
 }
@@ -496,21 +484,9 @@ where
         KvReadV3Projection::KeysOnly => 0,
         KvReadV3Projection::ValueParts(parts) => parts.len(),
     };
-    let scan_projection = match projection {
-        KvReadV3Projection::KeysOnly => KvScanPlanV3Projection::KeysOnly,
-        KvReadV3Projection::ValueParts(parts) => {
-            KvScanPlanV3Projection::ValueParts(parts.into_iter().map(Into::into).collect())
-        }
-    };
-    let page = store
-        .scan_plan_v3(KvScanPlanV3Request {
-            namespace,
-            spans,
-            after: None,
-            page_size: usize::MAX,
-            projection: scan_projection,
-        })
-        .await?;
+    let page =
+        storage_read_v3_scan_spans_fallback(store, namespace, spans, None, usize::MAX, projection)
+            .await?;
     let mut values_by_key = BTreeMap::new();
     for (index, key) in page.keys.iter().enumerate() {
         let mut values = Vec::with_capacity(part_count);
@@ -584,21 +560,14 @@ pub(crate) fn project_read_v3_value_part(
     value: &[u8],
     part: KvReadV3ValuePart,
 ) -> Result<&[u8], LixError> {
-    project_scan_plan_v3_value_part(value, part.into())
-}
-
-pub(crate) fn project_scan_plan_v3_value_part(
-    value: &[u8],
-    part: KvScanPlanV3ValuePart,
-) -> Result<&[u8], LixError> {
     match part {
-        KvScanPlanV3ValuePart::Header => {
+        KvReadV3ValuePart::Header => {
             project_header_payload_frame_part(value, KvHeaderPayloadFramePart::Header)
         }
-        KvScanPlanV3ValuePart::Payload => {
+        KvReadV3ValuePart::Payload => {
             project_header_payload_frame_part(value, KvHeaderPayloadFramePart::Payload)
         }
-        KvScanPlanV3ValuePart::FullValue => Ok(value),
+        KvReadV3ValuePart::FullValue => Ok(value),
     }
 }
 
@@ -782,13 +751,6 @@ where
         (**self).scan2(request).await
     }
 
-    async fn scan_plan_v3(
-        &mut self,
-        request: KvScanPlanV3Request,
-    ) -> Result<KvScanPlanV3Page, LixError> {
-        (**self).scan_plan_v3(request).await
-    }
-
     async fn read_v3(&mut self, request: KvReadV3Request) -> Result<KvReadV3Page, LixError> {
         (**self).read_v3(request).await
     }
@@ -821,13 +783,6 @@ where
 
     async fn scan2(&mut self, request: KvScan2Request) -> Result<KvScan2Page, LixError> {
         (**self).scan2(request).await
-    }
-
-    async fn scan_plan_v3(
-        &mut self,
-        request: KvScanPlanV3Request,
-    ) -> Result<KvScanPlanV3Page, LixError> {
-        (**self).scan_plan_v3(request).await
     }
 
     async fn read_v3(&mut self, request: KvReadV3Request) -> Result<KvReadV3Page, LixError> {
@@ -1030,27 +985,6 @@ impl From<KvScan2Request> for backend::BackendKvScan2Request {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct KvScanPlanV3Request {
-    pub(crate) namespace: String,
-    pub(crate) spans: Vec<KvKeySpan>,
-    pub(crate) after: Option<Vec<u8>>,
-    pub(crate) page_size: usize,
-    pub(crate) projection: KvScanPlanV3Projection,
-}
-
-impl From<KvScanPlanV3Request> for backend::BackendKvScanPlanV3Request {
-    fn from(request: KvScanPlanV3Request) -> Self {
-        Self {
-            namespace: request.namespace,
-            spans: request.spans.into_iter().map(Into::into).collect(),
-            after: request.after,
-            page_size: request.page_size,
-            projection: request.projection.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KvKeySpan {
     pub(crate) start: Vec<u8>,
     pub(crate) end: Vec<u8>,
@@ -1077,40 +1011,6 @@ impl From<KvKeySpan> for backend::BackendKvKeySpan {
         Self {
             start: span.start,
             end: span.end,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum KvScanPlanV3Projection {
-    KeysOnly,
-    ValueParts(Vec<KvScanPlanV3ValuePart>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KvScanPlanV3ValuePart {
-    Header,
-    Payload,
-    FullValue,
-}
-
-impl From<KvScanPlanV3Projection> for backend::BackendKvScanPlanV3Projection {
-    fn from(projection: KvScanPlanV3Projection) -> Self {
-        match projection {
-            KvScanPlanV3Projection::KeysOnly => Self::KeysOnly,
-            KvScanPlanV3Projection::ValueParts(parts) => {
-                Self::ValueParts(parts.into_iter().map(Into::into).collect())
-            }
-        }
-    }
-}
-
-impl From<KvScanPlanV3ValuePart> for backend::BackendKvScanPlanV3ValuePart {
-    fn from(part: KvScanPlanV3ValuePart) -> Self {
-        match part {
-            KvScanPlanV3ValuePart::Header => Self::Header,
-            KvScanPlanV3ValuePart::Payload => Self::Payload,
-            KvScanPlanV3ValuePart::FullValue => Self::FullValue,
         }
     }
 }
@@ -1229,23 +1129,6 @@ impl From<backend::BackendKvScan2Page> for KvScan2Page {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct KvScanPlanV3Page {
-    pub(crate) keys: BytePage,
-    pub(crate) values: Vec<BytePage>,
-    pub(crate) resume_after: Option<Vec<u8>>,
-}
-
-impl From<backend::BackendKvScanPlanV3Page> for KvScanPlanV3Page {
-    fn from(result: backend::BackendKvScanPlanV3Page) -> Self {
-        Self {
-            keys: result.keys,
-            values: result.values,
-            resume_after: result.resume_after,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KvReadV3Request {
     pub(crate) namespace: String,
     pub(crate) source: KvReadV3Source,
@@ -1324,16 +1207,6 @@ pub(crate) enum KvReadV3ValuePart {
 }
 
 impl From<KvReadV3ValuePart> for backend::BackendKvReadV3ValuePart {
-    fn from(part: KvReadV3ValuePart) -> Self {
-        match part {
-            KvReadV3ValuePart::Header => Self::Header,
-            KvReadV3ValuePart::Payload => Self::Payload,
-            KvReadV3ValuePart::FullValue => Self::FullValue,
-        }
-    }
-}
-
-impl From<KvReadV3ValuePart> for KvScanPlanV3ValuePart {
     fn from(part: KvReadV3ValuePart) -> Self {
         match part {
             KvReadV3ValuePart::Header => Self::Header,
