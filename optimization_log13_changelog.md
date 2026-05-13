@@ -967,3 +967,77 @@ load_changes_visible_scattered / 100seg_100c_1000ch:
 The remaining visible-read cost is now mostly membership proof:
 by_change_membership scans, visible commit decode, and commit checksum.
 ```
+
+## Entry 13: Scan Commit Membership Bytes For Visibility Proof
+
+Change:
+
+```text
+Visible change proof no longer decodes a full SegmentCommit just to inspect
+CommitBody.membership.
+
+SegmentByteIndex now validates the commit locator against the segment directory,
+checks the visibility checksum against the physical locator checksum, then scans
+the encoded commit body for matching member_change_id values. Header,
+directories, authors, and membership records are not materialized on this path.
+```
+
+Measured with:
+
+```sh
+cargo bench --manifest-path packages/engine/Cargo.toml --features storage-benches --bench changelog_scorecard
+```
+
+### CPU Segment Scoreboard
+
+Times are milliseconds.
+
+| row                                     | entry_13_ms |
+| --------------------------------------- | ----------: |
+| encode_segment / 1c_1000ch              |       0.081 |
+| decode_segment / 1c_1000ch              |       3.579 |
+| view_segment / 1c_1000ch                |       0.027 |
+| validate_segment_shape / 1c_1000ch      |       5.266 |
+| build_decoded_segment_index / 1c_1000ch |       0.264 |
+| build_by_change / 1c_1000ch             |       0.756 |
+| build_by_change_membership / 1c_1000ch  |       0.036 |
+
+### Backend Smoke Scoreboard
+
+Times are milliseconds.
+
+| row                                                  | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms |
+| ---------------------------------------------------- | ----------: | -----------------: | -----------------: |
+| stage_segment_raw_no_indexes / 1c_1000ch             |       0.503 |              4.412 |              5.000 |
+| stage_segment / 1c_1000ch                            |       4.802 |              9.156 |              8.715 |
+| stage_publish_commit / 1c_1ch                        |       0.043 |              0.040 |              0.052 |
+| stage_publish_commit / 1c_100ch                      |       0.494 |              0.535 |              0.523 |
+| stage_publish_commit / 1c_1000ch single-shot         |       4.784 |              4.852 |              5.488 |
+| load_commits_visible_batched / 1c_100ch              |       0.193 |              0.188 |              0.199 |
+| load_changes_visible_batched / 1c_100ch              |       0.285 |              0.531 |              0.290 |
+| load_changes_visible_batched / 1c_1000ch             |       8.410 |             15.493 |              3.199 |
+| load_changes_physical_scattered / 100seg_100c_1000ch |       1.128 |              1.460 |              1.610 |
+| load_changes_visible_scattered / 100seg_100c_1000ch  |       9.574 |             16.554 |              3.351 |
+| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       6.712 |              8.822 |              6.807 |
+| plan_gc / live_50pct_mixed_segments                  |       7.147 |              6.790 |              6.885 |
+| collect_garbage / live_50pct_mixed_segments          |       7.327 |              8.086 |              7.912 |
+
+Read:
+
+```text
+This removes full commit decode/checksum from visible proof when the caller only
+needs to prove that requested change_ids appear in membership.
+
+load_changes_visible_batched / 1c_1000ch:
+  entry 12 rocksdb: 4.219ms
+  entry 13 rocksdb: 3.199ms
+
+load_changes_visible_scattered / 100seg_100c_1000ch:
+  entry 12 rocksdb: 4.624ms
+  entry 13 rocksdb: 3.351ms
+
+The next remaining cost should be by_change_membership prefix scans and
+membership string comparisons. A likely follow-up is a batched membership index
+lookup shape or a range-scan API that can scan many change_id prefixes without
+creating one iterator per change_id.
+```

@@ -18,7 +18,8 @@ use super::store::{
 };
 use crate::changelog::{
     decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility, decode_segment,
-    decode_segment_change, decode_segment_commit, view_segment,
+    decode_segment_change, decode_segment_commit, segment_commit_membership_contains_any,
+    view_segment,
 };
 use crate::changelog::{
     ByChangeEntry, ByCommitEntry, Change, ChangeLoadBatch, ChangeLoadEntry, ChangeLoadRequest,
@@ -156,6 +157,27 @@ impl SegmentByteIndex {
             )));
         }
         Ok(commit)
+    }
+
+    fn prove_commit_membership(
+        &self,
+        location: &SegmentObjectLocation,
+        commit_id: &str,
+        requested_change_ids: &HashSet<String>,
+    ) -> Result<Vec<String>, LixError> {
+        let expected = self.commit_locations.get(commit_id).ok_or_else(|| {
+            LixError::unknown(format!(
+                "changelog by_commit entry for '{commit_id}' points to segment '{}' without that commit",
+                self.segment_id
+            ))
+        })?;
+        if location != expected {
+            return Err(LixError::unknown(format!(
+                "changelog commit '{commit_id}' locator does not match segment directory"
+            )));
+        }
+        let bytes = self.object_bytes(location, "commit", commit_id)?;
+        segment_commit_membership_contains_any(bytes, requested_change_ids)
     }
 
     fn load_change(
@@ -986,12 +1008,17 @@ where
                 visibility.location.segment_id
             )));
         };
-        let commit = segment.load_commit(&visibility.location, commit_id)?;
-        validate_commit_checksum(&visibility.checksum, commit_id, &commit)?;
-        for membership in &commit.body.membership {
-            if requested_change_ids.contains(&membership.member_change_id) {
-                proven.insert(membership.member_change_id.clone());
-            }
+        if visibility.checksum != visibility.location.checksum {
+            return Err(LixError::unknown(format!(
+                "visible changelog commit '{commit_id}' checksum does not match physical locator checksum"
+            )));
+        }
+        for change_id in segment.prove_commit_membership(
+            &visibility.location,
+            commit_id,
+            requested_change_ids,
+        )? {
+            proven.insert(change_id);
         }
         Ok(())
     }
