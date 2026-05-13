@@ -53,6 +53,10 @@ pub(crate) trait StorageReader: Send {
     async fn read_v3(&mut self, request: KvReadV3Request) -> Result<KvReadV3Page, LixError> {
         storage_read_v3_fallback(self, request).await
     }
+
+    async fn read4(&mut self, request: KvTableReadRequest) -> Result<KvRead4Page, LixError> {
+        storage_read4_unsupported(self, request).await
+    }
 }
 
 #[async_trait]
@@ -335,6 +339,17 @@ where
             .await
         }
     }
+}
+
+async fn storage_read4_unsupported<T>(
+    store: &mut T,
+    request: KvTableReadRequest,
+) -> Result<KvRead4Page, LixError>
+where
+    T: StorageReader + ?Sized,
+{
+    let _ = (store, request);
+    Err(LixError::unknown("storage read4 is not implemented"))
 }
 
 async fn storage_read_v3_keys_fallback<T>(
@@ -754,6 +769,10 @@ where
     async fn read_v3(&mut self, request: KvReadV3Request) -> Result<KvReadV3Page, LixError> {
         (**self).read_v3(request).await
     }
+
+    async fn read4(&mut self, request: KvTableReadRequest) -> Result<KvRead4Page, LixError> {
+        (**self).read4(request).await
+    }
 }
 
 #[async_trait]
@@ -787,6 +806,10 @@ where
 
     async fn read_v3(&mut self, request: KvReadV3Request) -> Result<KvReadV3Page, LixError> {
         (**self).read_v3(request).await
+    }
+
+    async fn read4(&mut self, request: KvTableReadRequest) -> Result<KvRead4Page, LixError> {
+        (**self).read4(request).await
     }
 }
 
@@ -1330,6 +1353,217 @@ impl KvReadV3Page {
 
 impl From<backend::BackendKvReadV3Page> for KvReadV3Page {
     fn from(result: backend::BackendKvReadV3Page) -> Self {
+        Self {
+            keys: result.keys,
+            presence: result.presence.into(),
+            values: result.values,
+            request_indexes: result.request_indexes,
+            resume_after: result.resume_after,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KvTableReadRequest {
+    pub(crate) table: KvTableId,
+    pub(crate) key_space: KvKeySpace,
+    pub(crate) access: Vec<KvAccessSegment>,
+    pub(crate) after: Option<Vec<u8>>,
+    pub(crate) projection: KvRead4Projection,
+    pub(crate) residual_filter: Option<KvResidualFilter>,
+    pub(crate) output_order: KvRead4Order,
+    pub(crate) limit: Option<usize>,
+    pub(crate) session: Option<KvReadSessionId>,
+}
+
+impl From<KvTableReadRequest> for backend::BackendKvTableReadRequest {
+    fn from(request: KvTableReadRequest) -> Self {
+        Self {
+            table: request.table.into(),
+            key_space: request.key_space.into(),
+            access: request.access.into_iter().map(Into::into).collect(),
+            after: request.after,
+            projection: request.projection.into(),
+            residual_filter: request.residual_filter.map(Into::into),
+            output_order: request.output_order.into(),
+            limit: request.limit,
+            session: request.session.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KvTableId {
+    pub(crate) namespace: String,
+}
+
+impl From<KvTableId> for backend::BackendKvTableId {
+    fn from(table: KvTableId) -> Self {
+        Self {
+            namespace: table.namespace,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KvKeySpace {
+    OrderedBytes,
+}
+
+impl From<KvKeySpace> for backend::BackendKvKeySpace {
+    fn from(key_space: KvKeySpace) -> Self {
+        match key_space {
+            KvKeySpace::OrderedBytes => Self::OrderedBytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KvAccessSegment {
+    Points {
+        keys: Vec<Vec<u8>>,
+        request_indexes: Vec<u32>,
+    },
+    Run {
+        lower: Vec<u8>,
+        upper: Vec<u8>,
+        keys: Vec<Vec<u8>>,
+        request_indexes: Vec<u32>,
+    },
+    Span {
+        lower: Vec<u8>,
+        upper: Vec<u8>,
+    },
+}
+
+impl From<KvAccessSegment> for backend::BackendKvAccessSegment {
+    fn from(segment: KvAccessSegment) -> Self {
+        match segment {
+            KvAccessSegment::Points {
+                keys,
+                request_indexes,
+            } => Self::Points {
+                keys,
+                request_indexes,
+            },
+            KvAccessSegment::Run {
+                lower,
+                upper,
+                keys,
+                request_indexes,
+            } => Self::Run {
+                lower,
+                upper,
+                keys,
+                request_indexes,
+            },
+            KvAccessSegment::Span { lower, upper } => Self::Span { lower, upper },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KvRead4Projection {
+    KeysOnly,
+    Parts(Vec<KvRead4ValuePart>),
+}
+
+impl From<KvRead4Projection> for backend::BackendKvRead4Projection {
+    fn from(projection: KvRead4Projection) -> Self {
+        match projection {
+            KvRead4Projection::KeysOnly => Self::KeysOnly,
+            KvRead4Projection::Parts(parts) => {
+                Self::Parts(parts.into_iter().map(Into::into).collect())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KvRead4ValuePart {
+    Header,
+    PayloadRef,
+    Payload,
+    FullValue,
+}
+
+impl From<KvRead4ValuePart> for backend::BackendKvRead4ValuePart {
+    fn from(part: KvRead4ValuePart) -> Self {
+        match part {
+            KvRead4ValuePart::Header => Self::Header,
+            KvRead4ValuePart::PayloadRef => Self::PayloadRef,
+            KvRead4ValuePart::Payload => Self::Payload,
+            KvRead4ValuePart::FullValue => Self::FullValue,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KvResidualFilter {
+    UntrackedState,
+}
+
+impl From<KvResidualFilter> for backend::BackendKvResidualFilter {
+    fn from(filter: KvResidualFilter) -> Self {
+        match filter {
+            KvResidualFilter::UntrackedState => Self::UntrackedState,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KvRead4Order {
+    RequestOrder,
+    KeyOrder,
+}
+
+impl From<KvRead4Order> for backend::BackendKvRead4Order {
+    fn from(order: KvRead4Order) -> Self {
+        match order {
+            KvRead4Order::RequestOrder => Self::RequestOrder,
+            KvRead4Order::KeyOrder => Self::KeyOrder,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KvReadSessionId(pub(crate) u64);
+
+impl From<KvReadSessionId> for backend::BackendKvReadSessionId {
+    fn from(session: KvReadSessionId) -> Self {
+        Self(session.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KvRead4Page {
+    pub(crate) keys: BytePage,
+    pub(crate) presence: KvReadV3Presence,
+    pub(crate) values: Vec<BytePage>,
+    pub(crate) request_indexes: Option<Vec<u32>>,
+    pub(crate) resume_after: Option<Vec<u8>>,
+}
+
+impl KvRead4Page {
+    pub(crate) fn presence_len(&self) -> usize {
+        self.presence.len(self.keys.len())
+    }
+
+    pub(crate) fn is_present(&self, index: usize) -> Option<bool> {
+        self.presence.is_present(self.keys.len(), index)
+    }
+
+    pub(crate) fn present_count(&self) -> usize {
+        self.presence.present_count(self.keys.len())
+    }
+
+    pub(crate) fn presence_vec(&self) -> Vec<bool> {
+        self.presence.to_vec(self.keys.len())
+    }
+}
+
+impl From<backend::BackendKvRead4Page> for KvRead4Page {
+    fn from(result: backend::BackendKvRead4Page) -> Self {
         Self {
             keys: result.keys,
             presence: result.presence.into(),

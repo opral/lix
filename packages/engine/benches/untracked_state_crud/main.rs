@@ -4,10 +4,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use lix_engine::{
-    storage_bench, Backend, BackendKvEntryPage, BackendKvGetRequest, BackendKvKeyPage,
-    BackendKvKeySpan, BackendKvReadV3Order, BackendKvReadV3Page, BackendKvReadV3Projection,
-    BackendKvReadV3Request, BackendKvReadV3Source, BackendKvReadV3Strategy,
-    BackendKvReadV3ValuePart, BackendKvScanRequest, BackendKvValueBatch, BackendKvValuePage,
+    storage_bench, Backend, BackendKvAccessSegment, BackendKvEntryPage, BackendKvGetRequest,
+    BackendKvKeyPage, BackendKvKeySpace, BackendKvRead4Order, BackendKvRead4Page,
+    BackendKvRead4Projection, BackendKvRead4ValuePart, BackendKvReadV3Page,
+    BackendKvReadV3Projection, BackendKvReadV3Request, BackendKvReadV3Source, BackendKvScanRequest,
+    BackendKvTableId, BackendKvTableReadRequest, BackendKvValueBatch, BackendKvValuePage,
     BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
     LixError,
 };
@@ -222,6 +223,15 @@ impl BackendReadTransaction for CountingReadTransaction {
         Ok(page)
     }
 
+    async fn read4(
+        &mut self,
+        request: BackendKvTableReadRequest,
+    ) -> Result<BackendKvRead4Page, LixError> {
+        let page = self.inner.read4(request.clone()).await?;
+        record_read4(&self.stats, &request, &page);
+        Ok(page)
+    }
+
     async fn rollback(self: Box<Self>) -> Result<(), LixError> {
         self.inner.rollback().await
     }
@@ -280,6 +290,15 @@ impl BackendReadTransaction for CountingWriteTransaction {
     ) -> Result<BackendKvReadV3Page, LixError> {
         let page = self.inner.read_v3(request.clone()).await?;
         record_read_v3(&self.stats, &request, &page);
+        Ok(page)
+    }
+
+    async fn read4(
+        &mut self,
+        request: BackendKvTableReadRequest,
+    ) -> Result<BackendKvRead4Page, LixError> {
+        let page = self.inner.read4(request.clone()).await?;
+        record_read4(&self.stats, &request, &page);
         Ok(page)
     }
 
@@ -404,6 +423,48 @@ fn record_read_v3(
     }
 }
 
+fn record_read4(
+    stats: &Arc<Mutex<IoStats>>,
+    request: &BackendKvTableReadRequest,
+    page: &BackendKvRead4Page,
+) {
+    let mut stats = stats.lock().expect("io stats mutex should lock");
+    let key_bytes = page.keys.iter().map(|bytes| bytes.len()).sum::<usize>();
+    let value_bytes = page
+        .values
+        .iter()
+        .flat_map(|values| values.iter())
+        .map(|bytes| bytes.len())
+        .sum::<usize>();
+    let is_key_only = matches!(request.projection, BackendKvRead4Projection::KeysOnly);
+    let point_like = request
+        .access
+        .iter()
+        .all(|segment| !matches!(segment, BackendKvAccessSegment::Span { .. }));
+    if point_like {
+        if is_key_only {
+            stats.exists_calls += 1;
+            stats.exists_keys += page.presence_len();
+            stats.exists_key_bytes += key_bytes;
+        } else {
+            stats.get_calls += 1;
+            stats.get_keys += page.presence_len();
+            stats.get_key_bytes += key_bytes;
+            stats.get_values += page.present_count();
+            stats.get_value_bytes += value_bytes;
+        }
+    } else if is_key_only {
+        stats.scan_key_calls += 1;
+        stats.scan_keys += page.keys.len();
+        stats.scan_key_bytes += key_bytes;
+    } else {
+        stats.scan_entry_calls += 1;
+        stats.scan_entries += page.keys.len();
+        stats.scan_entry_key_bytes += key_bytes;
+        stats.scan_entry_value_bytes += value_bytes;
+    }
+}
+
 fn counting_backend(
     profile: LixBackendProfile,
 ) -> (Arc<dyn Backend + Send + Sync>, Arc<Mutex<IoStats>>) {
@@ -432,6 +493,7 @@ fn untracked_state_crud_benches(c: &mut Criterion) {
     maybe_print_io_report(&runtime, &rows);
 
     bench_storage_plan_smoke(c, &runtime, &rows);
+    bench_read4_density_smoke(c, &runtime, &rows);
     bench_raw_sqlite(c, &rows, SMOKE_ROWS, "smoke");
     bench_lix(c, &runtime, &rows, SMOKE_ROWS, "smoke");
     bench_raw_sqlite(c, &rows, REAL_WORKLOAD_ROWS, "real_workload");
@@ -1001,15 +1063,15 @@ fn bench_storage_plan_smoke(c: &mut Criterion, runtime: &Runtime, all_rows: &[Po
         configure_group(&mut group, SMOKE_ROWS);
 
         group.bench_function(
-            format!("read_v3_scan_header/{}", row_label(SMOKE_ROWS)),
+            format!("read4_span_header/{}", row_label(SMOKE_ROWS)),
             |b| {
                 b.iter_batched(
                     || prepare_lix_read(runtime, profile, &rows),
                     |(backend, _fixture)| {
                         black_box(
                             runtime
-                                .block_on(storage_plan_read_v3_header(&backend, SMOKE_ROWS))
-                                .expect("storage plan read_v3 header"),
+                                .block_on(storage_plan_read4_header(&backend, SMOKE_ROWS))
+                                .expect("storage plan read4 header"),
                         )
                     },
                     BatchSize::LargeInput,
@@ -1018,15 +1080,15 @@ fn bench_storage_plan_smoke(c: &mut Criterion, runtime: &Runtime, all_rows: &[Po
         );
 
         group.bench_function(
-            format!("read_v3_scan_header_payload/{}", row_label(SMOKE_ROWS)),
+            format!("read4_span_header_payload/{}", row_label(SMOKE_ROWS)),
             |b| {
                 b.iter_batched(
                     || prepare_lix_read(runtime, profile, &rows),
                     |(backend, _fixture)| {
                         black_box(
                             runtime
-                                .block_on(storage_plan_read_v3_header_payload(&backend, SMOKE_ROWS))
-                                .expect("storage plan read_v3 header payload"),
+                                .block_on(storage_plan_read4_header_payload(&backend, SMOKE_ROWS))
+                                .expect("storage plan read4 header payload"),
                         )
                     },
                     BatchSize::LargeInput,
@@ -1034,22 +1096,19 @@ fn bench_storage_plan_smoke(c: &mut Criterion, runtime: &Runtime, all_rows: &[Po
             },
         );
 
-        group.bench_function(
-            format!("read_v3_scan_full/{}", row_label(SMOKE_ROWS)),
-            |b| {
-                b.iter_batched(
-                    || prepare_lix_read(runtime, profile, &rows),
-                    |(backend, _fixture)| {
-                        black_box(
-                            runtime
-                                .block_on(storage_plan_read_v3_full(&backend, SMOKE_ROWS))
-                                .expect("storage plan read_v3 full"),
-                        )
-                    },
-                    BatchSize::LargeInput,
-                )
-            },
-        );
+        group.bench_function(format!("read4_span_full/{}", row_label(SMOKE_ROWS)), |b| {
+            b.iter_batched(
+                || prepare_lix_read(runtime, profile, &rows),
+                |(backend, _fixture)| {
+                    black_box(
+                        runtime
+                            .block_on(storage_plan_read4_full(&backend, SMOKE_ROWS))
+                            .expect("storage plan read4 full"),
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        });
 
         group.finish();
     }
@@ -1082,6 +1141,160 @@ fn bench_storage_plan_smoke(c: &mut Criterion, runtime: &Runtime, all_rows: &[Po
     group.finish();
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Read4DensityShape {
+    Points,
+    Run,
+    Span,
+}
+
+impl Read4DensityShape {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Points => "points",
+            Self::Run => "run",
+            Self::Span => "span",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Read4DensityProjection {
+    KeysOnly,
+    Header,
+    PayloadRef,
+    FullValue,
+}
+
+impl Read4DensityProjection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::KeysOnly => "keys",
+            Self::Header => "header",
+            Self::PayloadRef => "payload_ref",
+            Self::FullValue => "full",
+        }
+    }
+
+    fn projection(self) -> BackendKvRead4Projection {
+        match self {
+            Self::KeysOnly => BackendKvRead4Projection::KeysOnly,
+            Self::Header => BackendKvRead4Projection::Parts(vec![BackendKvRead4ValuePart::Header]),
+            Self::PayloadRef => {
+                BackendKvRead4Projection::Parts(vec![BackendKvRead4ValuePart::PayloadRef])
+            }
+            Self::FullValue => {
+                BackendKvRead4Projection::Parts(vec![BackendKvRead4ValuePart::FullValue])
+            }
+        }
+    }
+
+    fn part_count(self) -> usize {
+        match self {
+            Self::KeysOnly => 0,
+            Self::Header | Self::PayloadRef | Self::FullValue => 1,
+        }
+    }
+}
+
+fn bench_read4_density_smoke(c: &mut Criterion, runtime: &Runtime, all_rows: &[PointerRow]) {
+    let rows = storage_rows(&all_rows[..SMOKE_ROWS]);
+    let projections = [
+        Read4DensityProjection::KeysOnly,
+        Read4DensityProjection::Header,
+        Read4DensityProjection::PayloadRef,
+        Read4DensityProjection::FullValue,
+    ];
+    for profile in LIX_BACKEND_PROFILES {
+        let mut group = c.benchmark_group(format!(
+            "untracked_state_crud/read4_density/{}/smoke",
+            profile.name()
+        ));
+        configure_group(&mut group, SMOKE_ROWS);
+
+        for density in [1usize, 10, 50, 100] {
+            for ordered in [true, false] {
+                for shape in [Read4DensityShape::Points, Read4DensityShape::Run] {
+                    for projection in projections {
+                        group.bench_function(
+                            format!(
+                                "{}/{}/{}/{}/{}",
+                                shape.label(),
+                                if ordered { "sorted" } else { "random" },
+                                projection.label(),
+                                density,
+                                row_label(SMOKE_ROWS)
+                            ),
+                            |b| {
+                                b.iter_batched(
+                                    || {
+                                        let (backend, _fixture) =
+                                            prepare_lix_read(runtime, profile, &rows);
+                                        let all_keys = runtime
+                                            .block_on(collect_untracked_keys(&backend, SMOKE_ROWS))
+                                            .expect("collect untracked keys");
+                                        let selected =
+                                            select_density_keys(&all_keys, density, ordered);
+                                        (backend, selected)
+                                    },
+                                    |(backend, selected)| {
+                                        black_box(
+                                            runtime
+                                                .block_on(storage_plan_read4_density(
+                                                    &backend, shape, projection, selected,
+                                                    SMOKE_ROWS,
+                                                ))
+                                                .expect("read4 density plan"),
+                                        )
+                                    },
+                                    BatchSize::LargeInput,
+                                )
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        for projection in projections {
+            group.bench_function(
+                format!(
+                    "span/key_order/{}/100/{}",
+                    projection.label(),
+                    row_label(SMOKE_ROWS)
+                ),
+                |b| {
+                    b.iter_batched(
+                        || {
+                            let (backend, _fixture) = prepare_lix_read(runtime, profile, &rows);
+                            let all_keys = runtime
+                                .block_on(collect_untracked_keys(&backend, SMOKE_ROWS))
+                                .expect("collect untracked keys");
+                            (backend, all_keys)
+                        },
+                        |(backend, keys)| {
+                            black_box(
+                                runtime
+                                    .block_on(storage_plan_read4_density(
+                                        &backend,
+                                        Read4DensityShape::Span,
+                                        projection,
+                                        keys,
+                                        SMOKE_ROWS,
+                                    ))
+                                    .expect("read4 span density plan"),
+                            )
+                        },
+                        BatchSize::LargeInput,
+                    )
+                },
+            );
+        }
+
+        group.finish();
+    }
+}
+
 fn prepare_lix_read(
     runtime: &Runtime,
     profile: LixBackendProfile,
@@ -1099,58 +1312,186 @@ fn prepare_lix_read(
     (backend, fixture)
 }
 
-async fn storage_plan_read_v3_header(
+async fn collect_untracked_keys(
     backend: &Arc<dyn Backend + Send + Sync>,
     expected_rows: usize,
-) -> Result<usize, LixError> {
-    storage_plan_read_v3_value_parts(backend, expected_rows, &[BackendKvReadV3ValuePart::Header])
-        .await
+) -> Result<Vec<Vec<u8>>, LixError> {
+    let mut tx = backend.begin_read_transaction().await?;
+    let page = tx
+        .read4(BackendKvTableReadRequest {
+            table: BackendKvTableId {
+                namespace: UNTRACKED_ROW_NAMESPACE.to_string(),
+            },
+            key_space: BackendKvKeySpace::OrderedBytes,
+            access: vec![BackendKvAccessSegment::Span {
+                lower: Vec::new(),
+                upper: Vec::new(),
+            }],
+            after: None,
+            projection: BackendKvRead4Projection::KeysOnly,
+            residual_filter: None,
+            output_order: BackendKvRead4Order::KeyOrder,
+            limit: Some(expected_rows),
+            session: None,
+        })
+        .await?;
+    tx.rollback().await?;
+    assert_eq!(page.keys.len(), expected_rows);
+    Ok(page.keys.iter().map(<[u8]>::to_vec).collect())
 }
 
-async fn storage_plan_read_v3_header_payload(
+fn select_density_keys(keys: &[Vec<u8>], density: usize, sorted: bool) -> Vec<Vec<u8>> {
+    let count = keys.len().saturating_mul(density).div_ceil(100).max(1);
+    let mut selected = if sorted {
+        keys.iter().take(count).cloned().collect::<Vec<_>>()
+    } else {
+        let step = if keys.len() > 1 { keys.len() - 3 } else { 1 };
+        (0..count)
+            .map(|index| keys[(index * step) % keys.len()].clone())
+            .collect::<Vec<_>>()
+    };
+    if sorted {
+        selected.sort();
+    }
+    selected
+}
+
+async fn storage_plan_read4_density(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    shape: Read4DensityShape,
+    projection: Read4DensityProjection,
+    keys: Vec<Vec<u8>>,
+    expected_total_rows: usize,
+) -> Result<usize, LixError> {
+    let expected_rows = match shape {
+        Read4DensityShape::Span => expected_total_rows,
+        Read4DensityShape::Points | Read4DensityShape::Run => keys.len(),
+    };
+    let access = read4_density_access(shape, &keys)?;
+    let mut tx = backend.begin_read_transaction().await?;
+    let page = tx
+        .read4(BackendKvTableReadRequest {
+            table: BackendKvTableId {
+                namespace: UNTRACKED_ROW_NAMESPACE.to_string(),
+            },
+            key_space: BackendKvKeySpace::OrderedBytes,
+            access,
+            after: None,
+            projection: projection.projection(),
+            residual_filter: None,
+            output_order: match shape {
+                Read4DensityShape::Span => BackendKvRead4Order::KeyOrder,
+                Read4DensityShape::Points | Read4DensityShape::Run => {
+                    BackendKvRead4Order::RequestOrder
+                }
+            },
+            limit: Some(expected_rows),
+            session: None,
+        })
+        .await?;
+    tx.rollback().await?;
+    assert_eq!(page.keys.len(), expected_rows);
+    assert_eq!(page.values.len(), projection.part_count());
+    for values in &page.values {
+        assert_eq!(values.len(), expected_rows);
+    }
+    Ok(page.keys.iter().map(|key| key.len()).sum::<usize>()
+        + page
+            .values
+            .iter()
+            .flat_map(|values| values.iter())
+            .map(|value| value.len())
+            .sum::<usize>())
+}
+
+fn read4_density_access(
+    shape: Read4DensityShape,
+    keys: &[Vec<u8>],
+) -> Result<Vec<BackendKvAccessSegment>, LixError> {
+    let request_indexes = (0..keys.len())
+        .map(|index| u32::try_from(index).map_err(|_| LixError::unknown("read4 index overflow")))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(match shape {
+        Read4DensityShape::Points => vec![BackendKvAccessSegment::Points {
+            keys: keys.to_vec(),
+            request_indexes,
+        }],
+        Read4DensityShape::Run => {
+            let mut sorted = keys.to_vec();
+            sorted.sort();
+            let lower = sorted.first().cloned().unwrap_or_default();
+            let mut upper = sorted.last().cloned().unwrap_or_default();
+            upper.push(0);
+            vec![BackendKvAccessSegment::Run {
+                lower,
+                upper,
+                keys: keys.to_vec(),
+                request_indexes,
+            }]
+        }
+        Read4DensityShape::Span => vec![BackendKvAccessSegment::Span {
+            lower: Vec::new(),
+            upper: Vec::new(),
+        }],
+    })
+}
+
+async fn storage_plan_read4_header(
     backend: &Arc<dyn Backend + Send + Sync>,
     expected_rows: usize,
 ) -> Result<usize, LixError> {
-    storage_plan_read_v3_value_parts(
+    storage_plan_read4_value_parts(backend, expected_rows, &[BackendKvRead4ValuePart::Header]).await
+}
+
+async fn storage_plan_read4_header_payload(
+    backend: &Arc<dyn Backend + Send + Sync>,
+    expected_rows: usize,
+) -> Result<usize, LixError> {
+    storage_plan_read4_value_parts(
         backend,
         expected_rows,
         &[
-            BackendKvReadV3ValuePart::Header,
-            BackendKvReadV3ValuePart::Payload,
+            BackendKvRead4ValuePart::Header,
+            BackendKvRead4ValuePart::Payload,
         ],
     )
     .await
 }
 
-async fn storage_plan_read_v3_full(
+async fn storage_plan_read4_full(
     backend: &Arc<dyn Backend + Send + Sync>,
     expected_rows: usize,
 ) -> Result<usize, LixError> {
-    storage_plan_read_v3_value_parts(
+    storage_plan_read4_value_parts(
         backend,
         expected_rows,
-        &[BackendKvReadV3ValuePart::FullValue],
+        &[BackendKvRead4ValuePart::FullValue],
     )
     .await
 }
 
-async fn storage_plan_read_v3_value_parts(
+async fn storage_plan_read4_value_parts(
     backend: &Arc<dyn Backend + Send + Sync>,
     expected_rows: usize,
-    parts: &[BackendKvReadV3ValuePart],
+    parts: &[BackendKvRead4ValuePart],
 ) -> Result<usize, LixError> {
     let mut tx = backend.begin_read_transaction().await?;
     let page = tx
-        .read_v3(BackendKvReadV3Request {
-            namespace: UNTRACKED_ROW_NAMESPACE.to_string(),
-            source: BackendKvReadV3Source::Spans {
-                spans: vec![BackendKvKeySpan::all()],
-                after: None,
+        .read4(BackendKvTableReadRequest {
+            table: BackendKvTableId {
+                namespace: UNTRACKED_ROW_NAMESPACE.to_string(),
             },
-            projection: BackendKvReadV3Projection::ValueParts(parts.to_vec()),
-            order: BackendKvReadV3Order::KeyOrder,
-            page_size: Some(expected_rows),
-            strategy: BackendKvReadV3Strategy::Scan,
+            key_space: BackendKvKeySpace::OrderedBytes,
+            access: vec![BackendKvAccessSegment::Span {
+                lower: Vec::new(),
+                upper: Vec::new(),
+            }],
+            after: None,
+            projection: BackendKvRead4Projection::Parts(parts.to_vec()),
+            residual_filter: None,
+            output_order: BackendKvRead4Order::KeyOrder,
+            limit: Some(expected_rows),
+            session: None,
         })
         .await?;
     tx.rollback().await?;

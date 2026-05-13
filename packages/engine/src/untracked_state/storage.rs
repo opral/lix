@@ -1,7 +1,7 @@
 use crate::storage::{
-    KvGetGroup, KvGetRequest, KvKeySpan, KvReadV3Order, KvReadV3Page, KvReadV3Projection,
-    KvReadV3Request, KvReadV3Source, KvReadV3Strategy, KvReadV3ValuePart, KvScanRange,
-    KvScanRequest, KvWriteGroup, StorageReader, StorageWriteSet,
+    KvAccessSegment, KvKeySpace, KvKeySpan, KvRead4Order, KvRead4Page, KvRead4Projection,
+    KvRead4ValuePart, KvScanRange, KvTableId, KvTableReadRequest, KvWriteGroup, StorageReader,
+    StorageWriteSet,
 };
 use crate::untracked_state::{
     UntrackedStateGetManyRequest, UntrackedStateGetManyResponse, UntrackedStateIdentity,
@@ -48,14 +48,14 @@ async fn load_identity_existence(
     store: &mut (impl StorageReader + ?Sized),
     identities: &[UntrackedStateIdentity],
 ) -> Result<Vec<Option<UntrackedStateProjectedRow>>, LixError> {
-    let page = read_v3_untracked_keys(
+    let page = read4_untracked_keys(
         store,
         identities,
-        KvReadV3Projection::KeysOnly,
+        KvRead4Projection::KeysOnly,
         Some(point_read_covering_spans(identities)),
     )
     .await?;
-    validate_read_v3_point_page(&page, identities.len(), 0)?;
+    validate_read4_point_page(&page, identities.len(), 0)?;
     Ok(identities
         .iter()
         .cloned()
@@ -68,15 +68,15 @@ async fn load_projected_headers(
     store: &mut (impl StorageReader + ?Sized),
     identities: &[UntrackedStateIdentity],
 ) -> Result<Vec<Option<UntrackedStateProjectedRow>>, LixError> {
-    let page = read_v3_untracked_keys(
+    let page = read4_untracked_keys(
         store,
         identities,
-        KvReadV3Projection::ValueParts(vec![KvReadV3ValuePart::Header]),
+        KvRead4Projection::Parts(vec![KvRead4ValuePart::Header]),
         Some(point_read_covering_spans(identities)),
     )
     .await?;
-    validate_read_v3_point_page(&page, identities.len(), 1)?;
-    let headers = read_v3_values(&page, 0)?;
+    validate_read4_point_page(&page, identities.len(), 1)?;
+    let headers = read4_values(&page, 0)?;
     identities
         .iter()
         .cloned()
@@ -87,7 +87,7 @@ async fn load_projected_headers(
             }
             let bytes = headers
                 .get(index)
-                .ok_or_else(|| LixError::unknown("untracked-state read_v3 header value missing"))?;
+                .ok_or_else(|| LixError::unknown("untracked-state read4 header value missing"))?;
             let row = crate::untracked_state::codec::decode_header_value(bytes, identity)?;
             Ok(Some(project_header(row)))
         })
@@ -98,15 +98,15 @@ async fn load_projected_payloads(
     store: &mut (impl StorageReader + ?Sized),
     identities: &[UntrackedStateIdentity],
 ) -> Result<Vec<Option<UntrackedStateProjectedRow>>, LixError> {
-    let page = read_v3_untracked_keys(
+    let page = read4_untracked_keys(
         store,
         identities,
-        KvReadV3Projection::ValueParts(vec![KvReadV3ValuePart::Payload]),
+        KvRead4Projection::Parts(vec![KvRead4ValuePart::Payload]),
         Some(point_read_covering_spans(identities)),
     )
     .await?;
-    validate_read_v3_point_page(&page, identities.len(), 1)?;
-    let payloads = read_v3_values(&page, 0)?;
+    validate_read4_point_page(&page, identities.len(), 1)?;
+    let payloads = read4_values(&page, 0)?;
     identities
         .iter()
         .cloned()
@@ -115,9 +115,9 @@ async fn load_projected_payloads(
             if !page.is_present(index).unwrap_or(false) {
                 return Ok(None);
             }
-            let bytes = payloads.get(index).ok_or_else(|| {
-                LixError::unknown("untracked-state read_v3 payload value missing")
-            })?;
+            let bytes = payloads
+                .get(index)
+                .ok_or_else(|| LixError::unknown("untracked-state read4 payload value missing"))?;
             let payload = crate::untracked_state::codec::decode_payload_value(bytes)?;
             Ok(Some(project_payload(identity, payload)))
         })
@@ -128,15 +128,15 @@ async fn load_projected_full_rows(
     store: &mut (impl StorageReader + ?Sized),
     identities: &[UntrackedStateIdentity],
 ) -> Result<Vec<Option<UntrackedStateProjectedRow>>, LixError> {
-    let page = read_v3_untracked_keys(
+    let page = read4_untracked_keys(
         store,
         identities,
-        KvReadV3Projection::ValueParts(vec![KvReadV3ValuePart::FullValue]),
+        KvRead4Projection::Parts(vec![KvRead4ValuePart::FullValue]),
         Some(point_read_covering_spans(identities)),
     )
     .await?;
-    validate_read_v3_point_page(&page, identities.len(), 1)?;
-    let values = read_v3_values(&page, 0)?;
+    validate_read4_point_page(&page, identities.len(), 1)?;
+    let values = read4_values(&page, 0)?;
     identities
         .iter()
         .cloned()
@@ -147,7 +147,7 @@ async fn load_projected_full_rows(
             }
             let value = values
                 .get(index)
-                .ok_or_else(|| LixError::unknown("untracked-state read_v3 full value missing"))?;
+                .ok_or_else(|| LixError::unknown("untracked-state read4 full value missing"))?;
             let row = crate::untracked_state::codec::decode_packed_row_value(value, identity)?;
             Ok(Some(project_row(row, UntrackedStateProjection::Full)?))
         })
@@ -183,19 +183,14 @@ async fn scan_identity(
     let spans = scan_spans_for_request(request);
     let mut after = request.after.clone();
     loop {
-        let page = store
-            .read_v3(KvReadV3Request {
-                namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
-                source: KvReadV3Source::Spans {
-                    spans: spans.clone(),
-                    after: after.clone(),
-                },
-                page_size: Some(batch_size),
-                projection: KvReadV3Projection::KeysOnly,
-                order: KvReadV3Order::KeyOrder,
-                strategy: KvReadV3Strategy::Scan,
-            })
-            .await?;
+        let page = read4_untracked_spans(
+            store,
+            spans.clone(),
+            after.clone(),
+            batch_size,
+            KvRead4Projection::KeysOnly,
+        )
+        .await?;
         for key in page.keys.iter() {
             let identity = decode_untracked_state_row_key(key)?;
             if identity_matches_scan(&identity, request) {
@@ -229,20 +224,15 @@ async fn scan_projected_headers(
     let spans = scan_spans_for_request(request);
     let mut after = request.after.clone();
     loop {
-        let page = store
-            .read_v3(KvReadV3Request {
-                namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
-                source: KvReadV3Source::Spans {
-                    spans: spans.clone(),
-                    after: after.clone(),
-                },
-                page_size: Some(batch_size),
-                projection: KvReadV3Projection::ValueParts(vec![KvReadV3ValuePart::Header]),
-                order: KvReadV3Order::KeyOrder,
-                strategy: KvReadV3Strategy::Scan,
-            })
-            .await?;
-        let headers = read_v3_values(&page, 0)?;
+        let page = read4_untracked_spans(
+            store,
+            spans.clone(),
+            after.clone(),
+            batch_size,
+            KvRead4Projection::Parts(vec![KvRead4ValuePart::Header]),
+        )
+        .await?;
+        let headers = read4_values(&page, 0)?;
         for (index, key) in page.keys.iter().enumerate() {
             let value = headers
                 .get(index)
@@ -280,20 +270,15 @@ async fn scan_projected_payloads(
     let spans = scan_spans_for_request(request);
     let mut after = request.after.clone();
     loop {
-        let page = store
-            .read_v3(KvReadV3Request {
-                namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
-                source: KvReadV3Source::Spans {
-                    spans: spans.clone(),
-                    after: after.clone(),
-                },
-                page_size: Some(batch_size),
-                projection: KvReadV3Projection::ValueParts(vec![KvReadV3ValuePart::Payload]),
-                order: KvReadV3Order::KeyOrder,
-                strategy: KvReadV3Strategy::Scan,
-            })
-            .await?;
-        let payloads = read_v3_values(&page, 0)?;
+        let page = read4_untracked_spans(
+            store,
+            spans.clone(),
+            after.clone(),
+            batch_size,
+            KvRead4Projection::Parts(vec![KvRead4ValuePart::Payload]),
+        )
+        .await?;
+        let payloads = read4_values(&page, 0)?;
         for (index, key) in page.keys.iter().enumerate() {
             let value = payloads
                 .get(index)
@@ -331,20 +316,15 @@ async fn scan_projected_full_rows(
     let spans = scan_spans_for_request(request);
     let mut after = request.after.clone();
     loop {
-        let page = store
-            .read_v3(KvReadV3Request {
-                namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
-                source: KvReadV3Source::Spans {
-                    spans: spans.clone(),
-                    after: after.clone(),
-                },
-                page_size: Some(batch_size),
-                projection: KvReadV3Projection::ValueParts(vec![KvReadV3ValuePart::FullValue]),
-                order: KvReadV3Order::KeyOrder,
-                strategy: KvReadV3Strategy::Scan,
-            })
-            .await?;
-        let values = read_v3_values(&page, 0)?;
+        let page = read4_untracked_spans(
+            store,
+            spans.clone(),
+            after.clone(),
+            batch_size,
+            KvRead4Projection::Parts(vec![KvRead4ValuePart::FullValue]),
+        )
+        .await?;
+        let values = read4_values(&page, 0)?;
         for (index, key) in page.keys.iter().enumerate() {
             let identity = decode_untracked_state_row_key(key)?;
             let value = values
@@ -522,18 +502,34 @@ pub(crate) fn stage_delete_all_rows(writes: &mut StorageWriteSet) {
 }
 
 async fn ensure_read_format(store: &mut (impl StorageReader + ?Sized)) -> Result<(), LixError> {
-    let marker = store
-        .get_values(KvGetRequest {
-            groups: vec![KvGetGroup {
+    let marker_page = store
+        .read4(KvTableReadRequest {
+            table: KvTableId {
                 namespace: UNTRACKED_STATE_FORMAT_NAMESPACE.to_string(),
+            },
+            key_space: KvKeySpace::OrderedBytes,
+            access: vec![KvAccessSegment::Points {
                 keys: vec![UNTRACKED_STATE_FORMAT_KEY.to_vec()],
+                request_indexes: vec![0],
             }],
+            after: None,
+            projection: KvRead4Projection::Parts(vec![KvRead4ValuePart::FullValue]),
+            residual_filter: None,
+            output_order: KvRead4Order::RequestOrder,
+            limit: None,
+            session: None,
         })
-        .await?
-        .groups
-        .into_iter()
-        .next()
-        .and_then(|group| group.single_value_owned());
+        .await?;
+    let marker_present = marker_page.is_present(0).unwrap_or(false);
+    let marker = marker_present
+        .then(|| {
+            marker_page
+                .values
+                .into_iter()
+                .next()
+                .and_then(|values| values.get(0).map(<[u8]>::to_vec))
+        })
+        .flatten();
     match marker.as_deref() {
         Some(UNTRACKED_STATE_FORMAT_VALUE) => Ok(()),
         Some(value) => Err(LixError::unknown(format!(
@@ -565,11 +561,21 @@ async fn namespace_has_any_key(
     namespace: &str,
 ) -> Result<bool, LixError> {
     let page = store
-        .scan_keys(KvScanRequest {
-            namespace: namespace.to_string(),
-            range: KvScanRange::prefix(Vec::new()),
+        .read4(KvTableReadRequest {
+            table: KvTableId {
+                namespace: namespace.to_string(),
+            },
+            key_space: KvKeySpace::OrderedBytes,
+            access: vec![KvAccessSegment::Span {
+                lower: Vec::new(),
+                upper: Vec::new(),
+            }],
             after: None,
-            limit: 1,
+            projection: KvRead4Projection::KeysOnly,
+            residual_filter: None,
+            output_order: KvRead4Order::KeyOrder,
+            limit: Some(1),
+            session: None,
         })
         .await?;
     Ok(!page.keys.is_empty())
@@ -730,34 +736,132 @@ fn nullable_matches_filters(value: &Option<String>, filters: &[NullableKeyFilter
         })
 }
 
-async fn read_v3_untracked_keys(
+async fn read4_untracked_keys(
     store: &mut (impl StorageReader + ?Sized),
     identities: &[UntrackedStateIdentity],
-    projection: KvReadV3Projection,
+    projection: KvRead4Projection,
     spans: Option<Vec<KvKeySpan>>,
-) -> Result<KvReadV3Page, LixError> {
+) -> Result<KvRead4Page, LixError> {
     let keys = identities
         .iter()
         .map(encode_untracked_state_row_key)
         .collect::<Vec<_>>();
-    let source = match spans {
-        Some(spans) => KvReadV3Source::KeysOrSpans { keys, spans },
-        None => KvReadV3Source::Keys { keys },
+    let request_indexes = request_indexes(keys.len())?;
+    let access = match spans {
+        Some(spans) if !spans.is_empty() => read4_run_segments(keys, request_indexes, spans)?,
+        _ => vec![KvAccessSegment::Points {
+            keys,
+            request_indexes,
+        }],
     };
     store
-        .read_v3(KvReadV3Request {
-            namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
-            source,
+        .read4(KvTableReadRequest {
+            table: untracked_table_id(),
+            key_space: KvKeySpace::OrderedBytes,
+            access,
+            after: None,
             projection,
-            order: KvReadV3Order::RequestOrder,
-            page_size: None,
-            strategy: KvReadV3Strategy::Auto,
+            residual_filter: None,
+            output_order: KvRead4Order::RequestOrder,
+            limit: None,
+            session: None,
         })
         .await
 }
 
-fn validate_read_v3_point_page(
-    page: &KvReadV3Page,
+fn read4_run_segments(
+    keys: Vec<Vec<u8>>,
+    request_indexes: Vec<u32>,
+    spans: Vec<KvKeySpan>,
+) -> Result<Vec<KvAccessSegment>, LixError> {
+    let mut segments = Vec::new();
+    let mut assigned = vec![false; keys.len()];
+    for span in spans {
+        let mut run_keys = Vec::new();
+        let mut run_indexes = Vec::new();
+        for (position, (key, request_index)) in keys.iter().zip(request_indexes.iter()).enumerate()
+        {
+            if !assigned[position] && key_in_span(key, &span) {
+                assigned[position] = true;
+                run_keys.push(key.clone());
+                run_indexes.push(*request_index);
+            }
+        }
+        if !run_keys.is_empty() {
+            segments.push(KvAccessSegment::Run {
+                lower: span.start,
+                upper: span.end,
+                keys: run_keys,
+                request_indexes: run_indexes,
+            });
+        }
+    }
+    let mut point_keys = Vec::new();
+    let mut point_indexes = Vec::new();
+    for ((key, request_index), assigned) in keys.into_iter().zip(request_indexes).zip(assigned) {
+        if !assigned {
+            point_keys.push(key);
+            point_indexes.push(request_index);
+        }
+    }
+    if !point_keys.is_empty() {
+        segments.push(KvAccessSegment::Points {
+            keys: point_keys,
+            request_indexes: point_indexes,
+        });
+    }
+    Ok(segments)
+}
+
+fn key_in_span(key: &[u8], span: &KvKeySpan) -> bool {
+    key >= span.start.as_slice() && (span.end.is_empty() || key < span.end.as_slice())
+}
+
+async fn read4_untracked_spans(
+    store: &mut (impl StorageReader + ?Sized),
+    spans: Vec<KvKeySpan>,
+    after: Option<Vec<u8>>,
+    limit: usize,
+    projection: KvRead4Projection,
+) -> Result<KvRead4Page, LixError> {
+    store
+        .read4(KvTableReadRequest {
+            table: untracked_table_id(),
+            key_space: KvKeySpace::OrderedBytes,
+            access: spans
+                .into_iter()
+                .map(|span| KvAccessSegment::Span {
+                    lower: span.start,
+                    upper: span.end,
+                })
+                .collect(),
+            after,
+            projection,
+            residual_filter: None,
+            output_order: KvRead4Order::KeyOrder,
+            limit: Some(limit),
+            session: None,
+        })
+        .await
+}
+
+fn untracked_table_id() -> KvTableId {
+    KvTableId {
+        namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
+    }
+}
+
+fn request_indexes(len: usize) -> Result<Vec<u32>, LixError> {
+    (0..len)
+        .map(|index| {
+            u32::try_from(index)
+                .map_err(|_| LixError::unknown("untracked-state read4 request index overflow"))
+        })
+        .collect()
+}
+
+fn validate_read4_point_page(
+    page: &KvRead4Page,
     expected_len: usize,
     expected_value_parts: usize,
 ) -> Result<(), LixError> {
@@ -765,7 +869,7 @@ fn validate_read_v3_point_page(
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
-                "storage read_v3 returned {} keys for {expected_len} requested keys",
+                "storage read4 returned {} keys for {expected_len} requested keys",
                 page.keys.len()
             ),
         ));
@@ -774,7 +878,7 @@ fn validate_read_v3_point_page(
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
-                "storage read_v3 returned {} presence bits for {expected_len} requested keys",
+                "storage read4 returned {} presence bits for {expected_len} requested keys",
                 page.presence_len()
             ),
         ));
@@ -783,7 +887,7 @@ fn validate_read_v3_point_page(
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
-                "storage read_v3 returned {} value parts for {expected_value_parts} requested parts",
+                "storage read4 returned {} value parts for {expected_value_parts} requested parts",
                 page.values.len()
             ),
         ));
@@ -793,7 +897,7 @@ fn validate_read_v3_point_page(
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
-                    "storage read_v3 returned {} values for {expected_len} requested keys",
+                    "storage read4 returned {} values for {expected_len} requested keys",
                     values.len()
                 ),
             ));
@@ -802,21 +906,21 @@ fn validate_read_v3_point_page(
     Ok(())
 }
 
-fn read_v3_values(
-    page: &KvReadV3Page,
+fn read4_values(
+    page: &KvRead4Page,
     part_index: usize,
 ) -> Result<&crate::backend::BytePage, LixError> {
     let values = page.values.get(part_index).ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            "storage read_v3 returned no projected values",
+            "storage read4 returned no projected values",
         )
     })?;
     if values.len() != page.keys.len() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
-                "storage read_v3 returned {} values for {} keys",
+                "storage read4 returned {} values for {} keys",
                 values.len(),
                 page.keys.len()
             ),
@@ -1038,8 +1142,9 @@ mod tests {
     use super::*;
     use crate::backend::testing::UnitTestBackend;
     use crate::storage::{
-        KvEntryPage, KvExistsBatch, KvKeyPage, KvReadV3Page, KvReadV3Projection, KvReadV3Request,
-        KvValueBatch, KvValuePage, StorageContext, StorageReader, StorageWriteTransaction,
+        KvEntryPage, KvExistsBatch, KvGetGroup, KvGetRequest, KvKeyPage, KvRead4Page,
+        KvRead4Projection, KvScanRequest, KvTableReadRequest, KvValueBatch, KvValuePage,
+        StorageContext, StorageReader, StorageWriteTransaction,
     };
     use crate::untracked_state::{
         MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateRowRequest,
@@ -1889,56 +1994,46 @@ mod tests {
 
     #[async_trait::async_trait]
     impl StorageReader for UntrackedValueForbiddenStorage {
-        async fn get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, LixError> {
-            reject_untracked_value_get(&request)?;
-            self.inner.get_values(request).await
+        async fn get_values(&mut self, _request: KvGetRequest) -> Result<KvValueBatch, LixError> {
+            Err(LixError::unknown(
+                "identity scan unexpectedly used legacy get_values",
+            ))
         }
 
-        async fn exists_many(&mut self, request: KvGetRequest) -> Result<KvExistsBatch, LixError> {
-            reject_untracked_value_get(&request)?;
-            self.inner.exists_many(request).await
+        async fn exists_many(&mut self, _request: KvGetRequest) -> Result<KvExistsBatch, LixError> {
+            Err(LixError::unknown(
+                "identity scan unexpectedly used legacy exists_many",
+            ))
         }
 
-        async fn scan_keys(&mut self, request: KvScanRequest) -> Result<KvKeyPage, LixError> {
-            self.inner.scan_keys(request).await
+        async fn scan_keys(&mut self, _request: KvScanRequest) -> Result<KvKeyPage, LixError> {
+            Err(LixError::unknown(
+                "identity scan unexpectedly used legacy scan_keys",
+            ))
         }
 
-        async fn scan_values(&mut self, request: KvScanRequest) -> Result<KvValuePage, LixError> {
-            reject_untracked_value_scan_namespace(&request.namespace)?;
-            self.inner.scan_values(request).await
+        async fn scan_values(&mut self, _request: KvScanRequest) -> Result<KvValuePage, LixError> {
+            Err(LixError::unknown(
+                "identity scan unexpectedly used legacy scan_values",
+            ))
         }
 
-        async fn scan_entries(&mut self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
-            reject_untracked_value_scan_namespace(&request.namespace)?;
-            self.inner.scan_entries(request).await
+        async fn scan_entries(&mut self, _request: KvScanRequest) -> Result<KvEntryPage, LixError> {
+            Err(LixError::unknown(
+                "identity scan unexpectedly used legacy scan_entries",
+            ))
         }
 
-        async fn read_v3(&mut self, request: KvReadV3Request) -> Result<KvReadV3Page, LixError> {
-            if request.namespace == UNTRACKED_STATE_ROW_NAMESPACE
-                && request.projection != KvReadV3Projection::KeysOnly
+        async fn read4(&mut self, request: KvTableReadRequest) -> Result<KvRead4Page, LixError> {
+            if request.table.namespace == UNTRACKED_STATE_ROW_NAMESPACE
+                && request.projection != KvRead4Projection::KeysOnly
             {
                 return Err(LixError::unknown(
                     "identity scan unexpectedly read untracked row values",
                 ));
             }
-            self.inner.read_v3(request).await
+            self.inner.read4(request).await
         }
-    }
-
-    fn reject_untracked_value_get(request: &KvGetRequest) -> Result<(), LixError> {
-        for group in &request.groups {
-            reject_untracked_value_scan_namespace(&group.namespace)?;
-        }
-        Ok(())
-    }
-
-    fn reject_untracked_value_scan_namespace(namespace: &str) -> Result<(), LixError> {
-        if namespace == UNTRACKED_STATE_ROW_NAMESPACE {
-            return Err(LixError::unknown(
-                "identity scan unexpectedly read untracked row values",
-            ));
-        }
-        Ok(())
     }
 
     #[test]

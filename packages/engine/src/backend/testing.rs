@@ -4,8 +4,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::backend::{
-    Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetRequest,
-    BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch,
+    project_backend_read4_value_part, Backend, BackendKvAccessSegment, BackendKvEntryPage,
+    BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetRequest, BackendKvKeyPage,
+    BackendKvRead4Order, BackendKvRead4Page, BackendKvRead4Projection, BackendKvReadV3Presence,
+    BackendKvScanRange, BackendKvScanRequest, BackendKvTableReadRequest, BackendKvValueBatch,
     BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteOp,
     BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, BytePageBuilder,
 };
@@ -129,6 +131,13 @@ impl BackendReadTransaction for UnitTestTransaction {
         request: BackendKvScanRequest,
     ) -> Result<BackendKvEntryPage, LixError> {
         Ok(scan_map_entries(&self.kv, request))
+    }
+
+    async fn read4(
+        &mut self,
+        request: BackendKvTableReadRequest,
+    ) -> Result<BackendKvRead4Page, LixError> {
+        read4_map(&self.kv, request)
     }
 
     async fn rollback(self: Box<Self>) -> Result<(), LixError> {
@@ -295,6 +304,198 @@ fn scan_filtered_pairs<'a>(
                 .is_none_or(|after| key.as_slice() > after)
         })
         .collect()
+}
+
+fn read4_map(
+    kv: &KvMap,
+    request: BackendKvTableReadRequest,
+) -> Result<BackendKvRead4Page, LixError> {
+    if request.residual_filter.is_some() {
+        return Err(LixError::unknown(
+            "unit test backend read4 cannot apply residual filters",
+        ));
+    }
+    let namespace = request.table.namespace;
+    let limit = request.limit.unwrap_or(usize::MAX);
+    let mut keyed = Vec::new();
+    let mut spans = Vec::new();
+    let mut saw_points_or_runs = false;
+    let mut saw_spans = false;
+    for segment in request.access {
+        match segment {
+            BackendKvAccessSegment::Points {
+                keys,
+                request_indexes,
+            } => {
+                saw_points_or_runs = true;
+                read4_push_indexed_keys(&mut keyed, keys, request_indexes)?;
+            }
+            BackendKvAccessSegment::Run {
+                lower,
+                upper,
+                keys,
+                request_indexes,
+            } => {
+                saw_points_or_runs = true;
+                spans.push(read4_scan_range(lower, upper));
+                read4_push_indexed_keys(&mut keyed, keys, request_indexes)?;
+            }
+            BackendKvAccessSegment::Span { lower, upper } => {
+                saw_spans = true;
+                spans.push(read4_scan_range(lower, upper));
+            }
+        }
+    }
+    if saw_points_or_runs && saw_spans {
+        return Err(LixError::unknown(
+            "unit test backend read4 cannot mix spans with point/run access",
+        ));
+    }
+    if saw_points_or_runs {
+        read4_map_points(
+            kv,
+            namespace,
+            keyed,
+            request.projection,
+            request.output_order,
+        )
+    } else {
+        read4_map_spans(
+            kv,
+            namespace,
+            spans,
+            request.after,
+            limit,
+            request.projection,
+        )
+    }
+}
+
+fn read4_push_indexed_keys(
+    output: &mut Vec<(u32, Vec<u8>)>,
+    keys: Vec<Vec<u8>>,
+    request_indexes: Vec<u32>,
+) -> Result<(), LixError> {
+    if keys.len() != request_indexes.len() {
+        return Err(LixError::unknown(
+            "unit test backend read4 key/index mismatch",
+        ));
+    }
+    output.extend(request_indexes.into_iter().zip(keys));
+    Ok(())
+}
+
+fn read4_scan_range(lower: Vec<u8>, upper: Vec<u8>) -> BackendKvScanRange {
+    if lower.is_empty() && upper.is_empty() {
+        BackendKvScanRange::Prefix(Vec::new())
+    } else {
+        BackendKvScanRange::Range {
+            start: lower,
+            end: upper,
+        }
+    }
+}
+
+fn read4_map_points(
+    kv: &KvMap,
+    namespace: String,
+    mut keyed: Vec<(u32, Vec<u8>)>,
+    projection: BackendKvRead4Projection,
+    order: BackendKvRead4Order,
+) -> Result<BackendKvRead4Page, LixError> {
+    match order {
+        BackendKvRead4Order::RequestOrder => keyed.sort_by_key(|(index, _)| *index),
+        BackendKvRead4Order::KeyOrder => keyed.sort_by(|left, right| left.1.cmp(&right.1)),
+    }
+    let mut keys = BytePageBuilder::with_capacity(keyed.len(), 0);
+    let mut present = Vec::with_capacity(keyed.len());
+    let mut value_builders = read4_value_builders(&projection);
+    let mut request_indexes = match order {
+        BackendKvRead4Order::RequestOrder => None,
+        BackendKvRead4Order::KeyOrder => Some(Vec::new()),
+    };
+    for (index, key) in keyed {
+        let value = kv.get(&(namespace.clone(), key.clone()));
+        keys.push(&key);
+        present.push(value.is_some());
+        if let Some(indexes) = request_indexes.as_mut() {
+            indexes.push(index);
+        }
+        if let BackendKvRead4Projection::Parts(parts) = &projection {
+            for (part, builder) in parts.iter().zip(value_builders.iter_mut()) {
+                if let Some(value) = value {
+                    builder.push(project_backend_read4_value_part(value, *part)?);
+                } else {
+                    builder.push([]);
+                }
+            }
+        }
+    }
+    Ok(BackendKvRead4Page {
+        keys: keys.finish(),
+        presence: BackendKvReadV3Presence::bitmap(present),
+        values: value_builders
+            .into_iter()
+            .map(BytePageBuilder::finish)
+            .collect(),
+        request_indexes,
+        resume_after: None,
+    })
+}
+
+fn read4_map_spans(
+    kv: &KvMap,
+    namespace: String,
+    spans: Vec<BackendKvScanRange>,
+    after: Option<Vec<u8>>,
+    limit: usize,
+    projection: BackendKvRead4Projection,
+) -> Result<BackendKvRead4Page, LixError> {
+    let mut pairs = Vec::new();
+    for range in spans {
+        pairs.extend(
+            scan_pairs(kv, &namespace, &range, None)
+                .into_iter()
+                .filter(|(key, _)| after.as_deref().is_none_or(|after| key.as_slice() > after)),
+        );
+    }
+    pairs.sort_by(|left, right| left.0.cmp(right.0));
+    pairs.dedup_by(|left, right| left.0 == right.0);
+    let has_more = pairs.len() > limit;
+    let mut keys = BytePageBuilder::with_capacity(limit.min(pairs.len()), 0);
+    let mut value_builders = read4_value_builders(&projection);
+    let mut resume_after = None;
+    for (index, (key, value)) in pairs.into_iter().enumerate() {
+        if index >= limit {
+            break;
+        }
+        resume_after = Some(key.clone());
+        keys.push(key);
+        if let BackendKvRead4Projection::Parts(parts) = &projection {
+            for (part, builder) in parts.iter().zip(value_builders.iter_mut()) {
+                builder.push(project_backend_read4_value_part(value, *part)?);
+            }
+        }
+    }
+    Ok(BackendKvRead4Page {
+        keys: keys.finish(),
+        presence: BackendKvReadV3Presence::All,
+        values: value_builders
+            .into_iter()
+            .map(BytePageBuilder::finish)
+            .collect(),
+        request_indexes: None,
+        resume_after: has_more.then_some(resume_after).flatten(),
+    })
+}
+
+fn read4_value_builders(projection: &BackendKvRead4Projection) -> Vec<BytePageBuilder> {
+    match projection {
+        BackendKvRead4Projection::KeysOnly => Vec::new(),
+        BackendKvRead4Projection::Parts(parts) => {
+            parts.iter().map(|_| BytePageBuilder::new()).collect()
+        }
+    }
 }
 
 fn key_matches_range(key: &[u8], range: &BackendKvScanRange) -> bool {

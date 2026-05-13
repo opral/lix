@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use crate::backend::{Backend, BackendReadTransaction, BackendWriteTransaction};
 use crate::storage::types::{KvWriteBatch, StorageWriter};
 use crate::storage::{
-    KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvReadV3Page, KvReadV3Request,
-    KvScan2Page, KvScan2Request, KvScanRequest, KvValueBatch, KvValuePage, KvWriteStats,
-    StorageReadTransaction, StorageReader, StorageWriteTransaction,
+    KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvRead4Page, KvReadV3Page,
+    KvReadV3Request, KvScan2Page, KvScan2Request, KvScanRequest, KvTableReadRequest, KvValueBatch,
+    KvValuePage, KvWriteStats, StorageReadTransaction, StorageReader, StorageWriteTransaction,
 };
 use crate::LixError;
 
@@ -151,6 +151,21 @@ impl StorageReader for StorageContext {
             }
         }
     }
+
+    async fn read4(&mut self, request: KvTableReadRequest) -> Result<KvRead4Page, LixError> {
+        let mut transaction = self.begin_read_transaction().await?;
+        let result = transaction.read4(request).await;
+        match result {
+            Ok(result) => {
+                transaction.rollback().await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
 }
 
 struct StorageContextReadTransaction {
@@ -208,6 +223,10 @@ impl StorageReader for StorageContextReadTransaction {
             .await
             .map(Into::into)
     }
+
+    async fn read4(&mut self, request: KvTableReadRequest) -> Result<KvRead4Page, LixError> {
+        self.transaction.read4(request.into()).await.map(Into::into)
+    }
 }
 
 #[async_trait]
@@ -263,6 +282,10 @@ impl StorageReader for StorageContextWriteTransaction {
             .read_v3(request.into())
             .await
             .map(Into::into)
+    }
+
+    async fn read4(&mut self, request: KvTableReadRequest) -> Result<KvRead4Page, LixError> {
+        self.transaction.read4(request.into()).await.map(Into::into)
     }
 }
 
