@@ -968,7 +968,7 @@ fn print_category_rows(rows: usize, value_bytes: usize, run: &AmplificationRun) 
         "binary_cas.manifest_chunk",
         "binary_cas.chunk",
     ];
-    let sidecar_storage_namespaces = ["u"];
+    let sidecar_storage_namespaces = ["u1"];
     let canonical_storage = storage_totals_for(storage, &canonical_storage_namespaces);
     let canonical_changelog_row_storage =
         storage_totals_for(storage, &canonical_changelog_row_namespaces);
@@ -1008,7 +1008,7 @@ fn print_category_rows(rows: usize, value_bytes: usize, run: &AmplificationRun) 
         + counts.puts_in("commit_store.change_pack")
         + counts.puts_in("commit_store.membership_pack");
     let tracked_encoded_objects = index_puts;
-    let sidecar_encoded_objects = counts.puts_in("u");
+    let sidecar_encoded_objects = counts.puts_in("u1");
 
     println!(
         "AMPLIFICATION_CATEGORY rows={rows} category=row logical_rows={rows} \
@@ -1163,11 +1163,11 @@ fn print_category_rows(rows: usize, value_bytes: usize, run: &AmplificationRun) 
         "AMPLIFICATION_CATEGORY rows={rows} category=sidecar_overlay untracked_puts={} \
          untracked_deletes={} untracked_delete_ranges={} untracked_bytes={} \
          untracked_mutations_per_row={:.3}",
-        counts.puts_in("u"),
-        counts.deletes_in("u"),
-        counts.delete_ranges_in("u"),
-        counts.bytes_in("u"),
-        (counts.puts_in("u") + counts.deletes_in("u") + counts.delete_ranges_in("u")) as f64
+        counts.puts_in("u1"),
+        counts.deletes_in("u1"),
+        counts.delete_ranges_in("u1"),
+        counts.bytes_in("u1"),
+        (counts.puts_in("u1") + counts.deletes_in("u1") + counts.delete_ranges_in("u1")) as f64
             / rows as f64,
     );
 

@@ -897,7 +897,10 @@ mod tests {
     use crate::commit_store::{ChangeScanRequest, CommitStoreContext};
     use crate::tracked_state::{TrackedStateRowRequest, TrackedStateScanRequest};
     use crate::transaction::types::TransactionJson;
-    use crate::untracked_state::{UntrackedStateContext, UntrackedStateRowRequest};
+    use crate::untracked_state::{
+        UntrackedStateContext, UntrackedStateGetManyRequest, UntrackedStateIdentity,
+        UntrackedStateProjection, UntrackedStateRowRequest,
+    };
     use crate::version::VersionContext;
     use crate::Backend;
     use crate::NullableKeyFilter;
@@ -1013,14 +1016,22 @@ mod tests {
             entity_id: crate::entity_identity::EntityIdentity::single("untracked-programmatic"),
             file_id: NullableKeyFilter::Null,
         };
+        let identity = UntrackedStateIdentity::from_exact_row_request(&request)
+            .expect("untracked test request should be exact");
         let untracked_row = crate::untracked_state::UntrackedStateContext::new()
             .reader(storage.clone())
-            .load_rows(std::slice::from_ref(&request))
+            .get_many(UntrackedStateGetManyRequest {
+                identities: vec![identity],
+                projection: UntrackedStateProjection::Full,
+            })
             .await
             .expect("untracked state should load")
-            .into_iter()
-            .next()
+            .rows
+            .pop()
             .flatten()
+            .map(|row| row.into_materialized_full())
+            .transpose()
+            .expect("untracked row should materialize")
             .expect("untracked row should be present in untracked state");
         assert_eq!(
             untracked_row.snapshot_content.as_deref(),

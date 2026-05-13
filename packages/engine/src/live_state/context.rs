@@ -13,7 +13,8 @@ use crate::tracked_state::{
     TrackedStateRowRequest, TrackedStateScanRequest,
 };
 use crate::untracked_state::{
-    UntrackedStateContext, UntrackedStateRowRequest, UntrackedStateScanRequest,
+    UntrackedStateContext, UntrackedStateGetManyRequest, UntrackedStateIdentity,
+    UntrackedStateProjection, UntrackedStateRowRequest, UntrackedStateScanRequest,
 };
 use crate::version::VERSION_REF_SCHEMA_KEY;
 use crate::LixError;
@@ -106,13 +107,21 @@ where
 
         let untracked_rows = if request.filter.untracked != Some(false) {
             let store: &mut dyn StorageReader = &mut *store;
+            let untracked_request =
+                untracked_scan_request_from_live(request, &scope.storage_version_ids);
             self.untracked_state
                 .reader(store)
-                .scan_rows(&untracked_scan_request_from_live(
-                    request,
-                    &scope.storage_version_ids,
-                ))
+                .scan(UntrackedStateScanRequest {
+                    filter: untracked_request.filter,
+                    projection: untracked_request.projection,
+                    limit: None,
+                    ..Default::default()
+                })
                 .await?
+                .rows
+                .into_iter()
+                .map(|row| row.into_materialized_full())
+                .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .map(MaterializedLiveStateRow::from)
                 .collect::<Vec<_>>()
@@ -187,12 +196,26 @@ where
                     let store: &mut dyn StorageReader = &mut *store;
                     let untracked_request =
                         untracked_row_request_from_live(request, &candidate.version_id);
+                    let Some(identity) =
+                        UntrackedStateIdentity::from_exact_row_request(&untracked_request)
+                    else {
+                        continue;
+                    };
                     let mut rows = self
                         .untracked_state
                         .reader(store)
-                        .load_rows(std::slice::from_ref(&untracked_request))
-                        .await?;
-                    if let Some(row) = rows.pop().flatten() {
+                        .get_many(UntrackedStateGetManyRequest {
+                            identities: vec![identity],
+                            projection: UntrackedStateProjection::Full,
+                        })
+                        .await?
+                        .rows;
+                    if let Some(row) = rows
+                        .pop()
+                        .flatten()
+                        .map(|row| row.into_materialized_full())
+                        .transpose()?
+                    {
                         return Ok(Some(visibility::project_loaded_row(
                             MaterializedLiveStateRow::from(row),
                             &request.version_id,
@@ -419,16 +442,15 @@ fn untracked_scan_request_from_live(
     filter.version_ids = version_ids.to_vec();
     UntrackedStateScanRequest {
         filter,
-        projection: crate::untracked_state::UntrackedStateProjection {
-            columns: untracked_live_projection_columns(&request.projection.columns),
-        },
+        projection: untracked_projection_from_live(&request.projection.columns),
         limit: None,
+        ..Default::default()
     }
 }
 
-fn untracked_live_projection_columns(columns: &[String]) -> Vec<String> {
+fn untracked_projection_from_live(columns: &[String]) -> UntrackedStateProjection {
     if columns.is_empty() {
-        return Vec::new();
+        return UntrackedStateProjection::Full;
     }
     let mut hydrated = columns.to_vec();
     for required in [
@@ -444,7 +466,7 @@ fn untracked_live_projection_columns(columns: &[String]) -> Vec<String> {
             hydrated.push(required.to_string());
         }
     }
-    hydrated
+    UntrackedStateProjection::from_column_names(&hydrated)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -485,15 +507,21 @@ async fn all_version_ref_ids(
 ) -> Result<Vec<String>, LixError> {
     let rows = untracked_state
         .reader(store)
-        .scan_rows(&UntrackedStateScanRequest {
+        .scan(UntrackedStateScanRequest {
             filter: crate::untracked_state::UntrackedStateFilter {
                 schema_keys: vec![VERSION_REF_SCHEMA_KEY.to_string()],
                 version_ids: vec![GLOBAL_VERSION_ID.to_string()],
                 ..Default::default()
             },
+            projection: UntrackedStateProjection::Full,
+            limit: None,
             ..Default::default()
         })
-        .await?;
+        .await?
+        .rows
+        .into_iter()
+        .map(|row| row.into_materialized_full())
+        .collect::<Result<Vec<_>, _>>()?;
     rows.into_iter()
         .map(|row| row.entity_id.as_single_string_owned())
         .collect()
@@ -510,11 +538,26 @@ async fn load_version_ref_commit_id(
         entity_id: crate::entity_identity::EntityIdentity::single(version_id),
         file_id: crate::NullableKeyFilter::Null,
     };
+    let identity = UntrackedStateIdentity::from_exact_row_request(&request).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "version-ref lookup must be an exact untracked identity",
+        )
+    })?;
     let mut rows = untracked_state
         .reader(store)
-        .load_rows(std::slice::from_ref(&request))
-        .await?;
-    let Some(row) = rows.pop().flatten() else {
+        .get_many(UntrackedStateGetManyRequest {
+            identities: vec![identity],
+            projection: UntrackedStateProjection::Full,
+        })
+        .await?
+        .rows;
+    let Some(row) = rows
+        .pop()
+        .flatten()
+        .map(|row| row.into_materialized_full())
+        .transpose()?
+    else {
         return Ok(None);
     };
     let Some(snapshot_content) = row.snapshot_content.as_deref() else {

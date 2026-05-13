@@ -425,6 +425,7 @@ fn maybe_print_io_report(runtime: &Runtime, all_rows: &[PointerRow]) {
                 "insert_all_rows",
                 "select_all_rows",
                 "select_keys_only",
+                "select_headers_only",
                 "select_one_by_pk",
                 "select_all_by_pk",
                 "update_all_rows",
@@ -510,6 +511,21 @@ fn measure_lix_io(
                     ),
                 )
                 .expect("measure untracked_state select keys io");
+        }
+        "select_headers_only" => {
+            let fixture = runtime
+                .block_on(storage_bench::prepare_json_pointer_untracked_state_read(
+                    &backend, rows,
+                ))
+                .expect("prepare untracked_state select headers io");
+            reset_io_stats(&stats);
+            runtime
+                .block_on(
+                    storage_bench::json_pointer_untracked_state_scan_headers_only_prepared(
+                        &backend, &fixture,
+                    ),
+                )
+                .expect("measure untracked_state select headers io");
         }
         "select_one_by_pk" => {
             let fixture = runtime
@@ -759,6 +775,24 @@ fn bench_lix(
                                 ),
                             )
                             .expect("untracked_state scan keys"),
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        });
+
+        group.bench_function(format!("select_headers_only/{}", row_label(row_count)), |b| {
+            b.iter_batched(
+                || prepare_lix_read(runtime, profile, &rows),
+                |(backend, fixture)| {
+                    black_box(
+                        runtime
+                            .block_on(
+                                storage_bench::json_pointer_untracked_state_scan_headers_only_prepared(
+                                    &backend, &fixture,
+                                ),
+                            )
+                            .expect("untracked_state scan headers"),
                     )
                 },
                 BatchSize::LargeInput,

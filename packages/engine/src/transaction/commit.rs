@@ -8,7 +8,8 @@ use crate::transaction::prepare_version_ref_row;
 use crate::transaction::staging::PreparedWriteSet;
 use crate::transaction::types::{PreparedAdoptedStateRow, PreparedStateRow, StagedCommitMembers};
 use crate::untracked_state::{
-    UntrackedStateContext, UntrackedStateIdentity, UntrackedStateIdentityRef, UntrackedStateRowRef,
+    UntrackedStateContext, UntrackedStateGetManyRequest, UntrackedStateIdentity,
+    UntrackedStateIdentityRef, UntrackedStateProjection, UntrackedStateRowRef,
 };
 use crate::version::{VersionContext, VersionRefReader};
 use crate::LixError;
@@ -222,10 +223,33 @@ async fn existing_untracked_overlay_delete_identities<'a>(
     transaction: &mut (impl StorageReader + ?Sized),
     identities: impl IntoIterator<Item = UntrackedStateIdentityRef<'a>>,
 ) -> Result<Vec<UntrackedStateIdentity>, LixError> {
-    UntrackedStateContext::new()
+    let mut identities = identities
+        .into_iter()
+        .map(|identity| UntrackedStateIdentity {
+            version_id: identity.version_id.to_string(),
+            schema_key: identity.schema_key.to_string(),
+            entity_id: identity.entity_id.clone(),
+            file_id: identity.file_id.map(str::to_string),
+        })
+        .collect::<Vec<_>>();
+    identities.sort();
+    identities.dedup();
+    if identities.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = UntrackedStateContext::new()
         .reader(transaction)
-        .existing_identities(identities)
-        .await
+        .get_many(UntrackedStateGetManyRequest {
+            identities: identities.clone(),
+            projection: UntrackedStateProjection::Identity,
+        })
+        .await?
+        .rows;
+    Ok(identities
+        .into_iter()
+        .zip(rows)
+        .filter_map(|(identity, row)| row.is_some().then_some(identity))
+        .collect())
 }
 
 struct PreparedRowIndex {
@@ -699,7 +723,8 @@ mod tests {
     use crate::storage::StorageContext;
     use crate::transaction::types::PreparedRowFacts;
     use crate::untracked_state::{
-        MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateRowRequest,
+        MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateGetManyRequest,
+        UntrackedStateIdentity, UntrackedStateProjection,
     };
     use crate::version::VersionContext;
     use crate::NullableKeyFilter;
@@ -807,7 +832,6 @@ mod tests {
         let storage = StorageContext::new(Arc::clone(&backend));
         let binary_cas = BinaryCasContext::new();
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
-        let untracked_state = UntrackedStateContext::new();
         let mut transaction = storage
             .begin_write_transaction()
             .await
@@ -843,23 +867,27 @@ mod tests {
             .expect("commit-store change index should load");
         assert_eq!(index_entries, vec![None]);
 
-        let loaded = {
-            let mut untracked_reader = untracked_state.reader(storage.clone());
-            let request = UntrackedStateRowRequest {
-                schema_key: "test_schema".to_string(),
-                version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
-                file_id: NullableKeyFilter::Null,
-            };
-            untracked_reader
-                .load_rows(std::slice::from_ref(&request))
-                .await
-        }
-        .expect("untracked row load should succeed")
-        .into_iter()
-        .next()
-        .flatten()
-        .expect("untracked row should be persisted");
+        let mut loaded_rows = UntrackedStateContext::new()
+            .reader(storage.clone())
+            .get_many(UntrackedStateGetManyRequest {
+                identities: vec![UntrackedStateIdentity {
+                    version_id: GLOBAL_VERSION_ID.to_string(),
+                    schema_key: "test_schema".to_string(),
+                    entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+                    file_id: None,
+                }],
+                projection: UntrackedStateProjection::Full,
+            })
+            .await
+            .expect("untracked row load should succeed")
+            .rows;
+        let loaded = loaded_rows
+            .pop()
+            .flatten()
+            .map(|row| row.into_materialized_full())
+            .transpose()
+            .expect("untracked row should materialize")
+            .expect("untracked row should be persisted");
         assert_eq!(
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked\"}")
@@ -929,17 +957,26 @@ mod tests {
             .await
             .expect("commit should persist kv");
 
-        let untracked = {
-            let mut untracked_reader = untracked_state.reader(storage.clone());
-            let request = untracked_request();
-            untracked_reader
-                .load_rows(std::slice::from_ref(&request))
-                .await
-        }
-        .expect("untracked load should succeed")
-        .into_iter()
-        .next()
-        .flatten();
+        let mut untracked_rows = UntrackedStateContext::new()
+            .reader(storage.clone())
+            .get_many(UntrackedStateGetManyRequest {
+                identities: vec![UntrackedStateIdentity {
+                    version_id: GLOBAL_VERSION_ID.to_string(),
+                    schema_key: "test_schema".to_string(),
+                    entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
+                    file_id: None,
+                }],
+                projection: UntrackedStateProjection::Full,
+            })
+            .await
+            .expect("untracked load should succeed")
+            .rows;
+        let untracked = untracked_rows
+            .pop()
+            .flatten()
+            .map(|row| row.into_materialized_full())
+            .transpose()
+            .expect("untracked row should materialize");
         assert_eq!(untracked, None);
 
         let visible = live_state
@@ -961,7 +998,6 @@ mod tests {
         let storage = StorageContext::new(backend);
         let binary_cas = BinaryCasContext::new();
         let live_state = Arc::new(live_state_context());
-        let untracked_state = UntrackedStateContext::new();
         let version_ctx = VersionContext::new(Arc::new(UntrackedStateContext::new()));
         crate::test_support::seed_global_version_head(storage.clone()).await;
         {
@@ -1080,23 +1116,27 @@ mod tests {
             .expect("version ref load should succeed");
         assert_eq!(loaded_head.as_deref(), Some("test-uuid-1"));
 
-        let untracked = {
-            let mut untracked_reader = untracked_state.reader(storage.clone());
-            let request = UntrackedStateRowRequest {
-                schema_key: "test_schema".to_string(),
-                version_id: GLOBAL_VERSION_ID.to_string(),
-                entity_id: crate::entity_identity::EntityIdentity::single("entity-2"),
-                file_id: NullableKeyFilter::Null,
-            };
-            untracked_reader
-                .load_rows(std::slice::from_ref(&request))
-                .await
-        }
-        .expect("untracked row load should succeed")
-        .into_iter()
-        .next()
-        .flatten()
-        .expect("untracked row should persist");
+        let mut untracked_rows = UntrackedStateContext::new()
+            .reader(storage.clone())
+            .get_many(UntrackedStateGetManyRequest {
+                identities: vec![UntrackedStateIdentity {
+                    version_id: GLOBAL_VERSION_ID.to_string(),
+                    schema_key: "test_schema".to_string(),
+                    entity_id: crate::entity_identity::EntityIdentity::single("entity-2"),
+                    file_id: None,
+                }],
+                projection: UntrackedStateProjection::Full,
+            })
+            .await
+            .expect("untracked row load should succeed")
+            .rows;
+        let untracked = untracked_rows
+            .pop()
+            .flatten()
+            .map(|row| row.into_materialized_full())
+            .transpose()
+            .expect("untracked row should materialize")
+            .expect("untracked row should persist");
         assert_eq!(
             untracked.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked\"}")
@@ -1375,15 +1415,6 @@ mod tests {
             commit_id: None,
             untracked: true,
             ..row
-        }
-    }
-
-    fn untracked_request() -> UntrackedStateRowRequest {
-        UntrackedStateRowRequest {
-            schema_key: "test_schema".to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: crate::entity_identity::EntityIdentity::single("entity-1"),
-            file_id: NullableKeyFilter::Null,
         }
     }
 
