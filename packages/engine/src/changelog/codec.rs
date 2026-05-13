@@ -1,8 +1,9 @@
 use super::types::{
     ByChangeEntry, ByCommitEntry, CommitBody, CommitHeader, CommitVisibility, MembershipRecord,
     MembershipRole, Segment, SegmentChange, SegmentChangeDirectory, SegmentCommit,
-    SegmentCommitDirectory, SegmentDirectory, SegmentHeader, SegmentInlinePayload,
-    SegmentObjectLocation, SegmentPayloadLocation, StateRowIdentity,
+    SegmentCommitDirectory, SegmentDirectory, SegmentDirectoryEntryRef, SegmentHeader,
+    SegmentInlinePayload, SegmentObjectLocation, SegmentObjectLocationRef, SegmentObjectSlice,
+    SegmentPayloadLocation, SegmentView, StateRowIdentity,
 };
 use crate::common::{CanonicalSchemaKey, EntityId, FileId, LixError};
 use crate::entity_identity::EntityIdentity;
@@ -53,6 +54,70 @@ pub(crate) fn decode_segment(bytes: &[u8]) -> Result<Segment, LixError> {
         commits,
         changes,
     })
+}
+
+pub(crate) fn decode_segment_commit(bytes: &[u8]) -> Result<SegmentCommit, LixError> {
+    let mut cursor = ByteCursor::new(bytes);
+    let commit = cursor.read_segment_commit("commit")?;
+    cursor.expect_end("commit")?;
+    Ok(commit)
+}
+
+pub(crate) fn decode_segment_change(bytes: &[u8]) -> Result<SegmentChange, LixError> {
+    let mut cursor = ByteCursor::new(bytes);
+    let change = cursor.read_segment_change("change")?;
+    cursor.expect_end("change")?;
+    Ok(change)
+}
+
+pub(crate) fn view_segment(bytes: &[u8]) -> Result<SegmentView<'_>, LixError> {
+    let mut cursor = ByteCursor::new(bytes);
+    cursor.expect_magic(SEGMENT_MAGIC, "segment")?;
+    let header = cursor.read_segment_header_view("header")?;
+    let directory_commits = cursor.read_segment_directory_commit_views("directory.commits")?;
+    let directory_changes = cursor.read_segment_directory_change_views("directory.changes")?;
+    let object_bytes = cursor.remaining_bytes();
+
+    Ok(SegmentView {
+        bytes,
+        segment_id: header.segment_id,
+        format_version: header.format_version,
+        commit_count: header.commit_count,
+        change_count: header.change_count,
+        byte_count: header.byte_count,
+        payload_count: header.payload_count,
+        checksum: header.checksum,
+        directory_commits,
+        directory_changes,
+        object_bytes,
+    })
+}
+
+pub(crate) fn view_segment_object_slices(
+    bytes: &[u8],
+) -> Result<(Vec<SegmentObjectSlice<'_>>, Vec<SegmentObjectSlice<'_>>), LixError> {
+    let mut cursor = ByteCursor::new(bytes);
+    cursor.expect_magic(SEGMENT_MAGIC, "segment")?;
+    let _ = cursor.read_segment_header_view("header")?;
+    let _ = cursor.read_segment_directory_commit_views("directory.commits")?;
+    let _ = cursor.read_segment_directory_change_views("directory.changes")?;
+
+    let commit_len = cursor.read_len("commits")?;
+    cursor.ensure_len_fits_remaining(commit_len, "commits")?;
+    let mut commits = Vec::with_capacity(commit_len);
+    for index in 0..commit_len {
+        commits.push(cursor.read_segment_commit_slice(&format!("commits[{index}]"))?);
+    }
+
+    let change_len = cursor.read_len("changes")?;
+    cursor.ensure_len_fits_remaining(change_len, "changes")?;
+    let mut changes = Vec::with_capacity(change_len);
+    for index in 0..change_len {
+        changes.push(cursor.read_segment_change_slice(&format!("changes[{index}]"))?);
+    }
+
+    cursor.expect_end("segment")?;
+    Ok((commits, changes))
 }
 
 pub(crate) fn encode_commit_visibility(visibility: &CommitVisibility) -> Result<Vec<u8>, LixError> {
@@ -437,6 +502,22 @@ impl<'a> ByteCursor<'a> {
         })
     }
 
+    fn read_location_view(
+        &mut self,
+        field: &str,
+    ) -> Result<SegmentObjectLocationRef<'a>, LixError> {
+        let segment_id = self.read_string_ref(&format!("{field}.segment_id"))?;
+        let offset = self.read_u64(&format!("{field}.offset"))?;
+        let len = self.read_u64(&format!("{field}.len"))?;
+        let checksum = self.read_string_ref(&format!("{field}.checksum"))?;
+        Ok(SegmentObjectLocationRef {
+            segment_id,
+            offset,
+            len,
+            checksum,
+        })
+    }
+
     fn read_segment_header(&mut self, field: &str) -> Result<SegmentHeader, LixError> {
         Ok(SegmentHeader {
             segment_id: self.read_string(&format!("{field}.segment_id"))?,
@@ -446,6 +527,18 @@ impl<'a> ByteCursor<'a> {
             byte_count: self.read_u64(&format!("{field}.byte_count"))?,
             payload_count: self.read_u32(&format!("{field}.payload_count"))?,
             checksum: self.read_string(&format!("{field}.checksum"))?,
+        })
+    }
+
+    fn read_segment_header_view(&mut self, field: &str) -> Result<SegmentHeaderView<'a>, LixError> {
+        Ok(SegmentHeaderView {
+            segment_id: self.read_string_ref(&format!("{field}.segment_id"))?,
+            format_version: self.read_u32(&format!("{field}.format_version"))?,
+            commit_count: self.read_u32(&format!("{field}.commit_count"))?,
+            change_count: self.read_u32(&format!("{field}.change_count"))?,
+            byte_count: self.read_u64(&format!("{field}.byte_count"))?,
+            payload_count: self.read_u32(&format!("{field}.payload_count"))?,
+            checksum: self.read_string_ref(&format!("{field}.checksum"))?,
         })
     }
 
@@ -471,12 +564,66 @@ impl<'a> ByteCursor<'a> {
         Ok(SegmentDirectory { commits, changes })
     }
 
+    fn read_segment_directory_commit_views(
+        &mut self,
+        field: &str,
+    ) -> Result<Vec<SegmentDirectoryEntryRef<'a>>, LixError> {
+        let len = self.read_len(field)?;
+        self.ensure_len_fits_remaining(len, field)?;
+        let mut commits = Vec::with_capacity(len);
+        for index in 0..len {
+            let id = self.read_string_ref(&format!("{field}[{index}].commit_id"))?;
+            let location = self.read_location_view(&format!("{field}[{index}].location"))?;
+            commits.push(SegmentDirectoryEntryRef { id, location });
+        }
+        Ok(commits)
+    }
+
+    fn read_segment_directory_change_views(
+        &mut self,
+        field: &str,
+    ) -> Result<Vec<SegmentDirectoryEntryRef<'a>>, LixError> {
+        let len = self.read_len(field)?;
+        self.ensure_len_fits_remaining(len, field)?;
+        let mut changes = Vec::with_capacity(len);
+        for index in 0..len {
+            let id = self.read_string_ref(&format!("{field}[{index}].change_id"))?;
+            let location = self.read_location_view(&format!("{field}[{index}].location"))?;
+            changes.push(SegmentDirectoryEntryRef { id, location });
+        }
+        Ok(changes)
+    }
+
     fn read_segment_commit(&mut self, field: &str) -> Result<SegmentCommit, LixError> {
         Ok(SegmentCommit {
             header: self.read_commit_header(&format!("{field}.header"))?,
             body: self.read_commit_body(&format!("{field}.body"))?,
             directory: self.read_segment_commit_directory(&format!("{field}.directory"))?,
             checksum: self.read_string(&format!("{field}.checksum"))?,
+        })
+    }
+
+    fn read_segment_commit_slice(
+        &mut self,
+        field: &str,
+    ) -> Result<SegmentObjectSlice<'a>, LixError> {
+        let start = self.offset;
+        let id = self.read_string_ref(&format!("{field}.header.id"))?;
+        self.skip_strings(&format!("{field}.header.parent_commit_ids"))?;
+        self.skip_string(&format!("{field}.header.derivable_change_id"))?;
+        self.skip_strings(&format!("{field}.header.author_account_ids"))?;
+        self.skip_string(&format!("{field}.header.created_at"))?;
+        self.skip_u32(&format!("{field}.header.membership_count"))?;
+        self.skip_commit_body(&format!("{field}.body"))?;
+        self.skip_segment_commit_directory(&format!("{field}.directory"))?;
+        let checksum = self.read_string_ref(&format!("{field}.checksum"))?;
+        let end = self.offset;
+        Ok(SegmentObjectSlice {
+            id,
+            offset: start as u64,
+            len: (end - start) as u64,
+            encoded_checksum: Some(checksum),
+            bytes: &self.bytes[start..end],
         })
     }
 
@@ -579,6 +726,35 @@ impl<'a> ByteCursor<'a> {
         })
     }
 
+    fn read_segment_change_slice(
+        &mut self,
+        field: &str,
+    ) -> Result<SegmentObjectSlice<'a>, LixError> {
+        let start = self.offset;
+        let id = self.read_string_ref(&format!("{field}.id"))?;
+        self.skip_optional_string(&format!("{field}.authored_commit_id"))?;
+        self.skip_string(&format!("{field}.entity_id"))?;
+        self.skip_string(&format!("{field}.schema_key"))?;
+        self.skip_optional_string(&format!("{field}.file_id"))?;
+        self.skip_optional_json_ref(&format!("{field}.snapshot_ref"))?;
+        self.skip_optional_json_ref(&format!("{field}.metadata_ref"))?;
+        self.skip_string(&format!("{field}.created_at"))?;
+        self.skip_segment_inline_payloads(&format!("{field}.inline_payloads"))?;
+        self.skip_segment_change_directory(&format!("{field}.directory"))?;
+        let end = self.offset;
+        Ok(SegmentObjectSlice {
+            id,
+            offset: start as u64,
+            len: (end - start) as u64,
+            encoded_checksum: None,
+            bytes: &self.bytes[start..end],
+        })
+    }
+
+    fn remaining_bytes(&self) -> &'a [u8] {
+        &self.bytes[self.offset..]
+    }
+
     fn read_segment_inline_payload(
         &mut self,
         field: &str,
@@ -649,6 +825,15 @@ impl<'a> ByteCursor<'a> {
         Ok(out)
     }
 
+    fn skip_strings(&mut self, field: &str) -> Result<(), LixError> {
+        let len = self.read_len(field)?;
+        self.ensure_len_fits_remaining(len, field)?;
+        for index in 0..len {
+            self.skip_string(&format!("{field}[{index}]"))?;
+        }
+        Ok(())
+    }
+
     fn read_string(&mut self, field: &str) -> Result<String, LixError> {
         let len = self.read_u32(&format!("{field}.len"))?;
         let len = usize::try_from(len).map_err(|_| {
@@ -668,11 +853,47 @@ impl<'a> ByteCursor<'a> {
             })
     }
 
+    fn read_string_ref(&mut self, field: &str) -> Result<&'a str, LixError> {
+        let len = self.read_u32(&format!("{field}.len"))?;
+        let len = usize::try_from(len).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("failed to decode changelog {field}: length exceeds usize"),
+            )
+        })?;
+        let bytes = self.read_bytes(len, field)?;
+        std::str::from_utf8(bytes).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("failed to decode changelog {field}: invalid UTF-8: {error}"),
+            )
+        })
+    }
+
+    fn skip_string(&mut self, field: &str) -> Result<(), LixError> {
+        let len = self.read_u32(&format!("{field}.len"))?;
+        let len = usize::try_from(len).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("failed to decode changelog {field}: length exceeds usize"),
+            )
+        })?;
+        self.skip_bytes(len, field)
+    }
+
     fn read_optional_string(&mut self, field: &str) -> Result<Option<String>, LixError> {
         if self.read_bool(&format!("{field}.present"))? {
             Ok(Some(self.read_string(field)?))
         } else {
             Ok(None)
+        }
+    }
+
+    fn skip_optional_string(&mut self, field: &str) -> Result<(), LixError> {
+        if self.read_bool(&format!("{field}.present"))? {
+            self.skip_string(field)
+        } else {
+            Ok(())
         }
     }
 
@@ -684,11 +905,27 @@ impl<'a> ByteCursor<'a> {
         }
     }
 
+    fn skip_optional_u32(&mut self, field: &str) -> Result<(), LixError> {
+        if self.read_bool(&format!("{field}.present"))? {
+            self.skip_u32(field)
+        } else {
+            Ok(())
+        }
+    }
+
     fn read_optional_json_ref(&mut self, field: &str) -> Result<Option<JsonRef>, LixError> {
         if self.read_bool(&format!("{field}.present"))? {
             Ok(Some(self.read_json_ref(field)?))
         } else {
             Ok(None)
+        }
+    }
+
+    fn skip_optional_json_ref(&mut self, field: &str) -> Result<(), LixError> {
+        if self.read_bool(&format!("{field}.present"))? {
+            self.skip_bytes(32, field)
+        } else {
+            Ok(())
         }
     }
 
@@ -702,6 +939,70 @@ impl<'a> ByteCursor<'a> {
     fn read_byte_vec(&mut self, field: &str) -> Result<Vec<u8>, LixError> {
         let len = self.read_len(field)?;
         Ok(self.read_bytes(len, field)?.to_vec())
+    }
+
+    fn skip_byte_vec(&mut self, field: &str) -> Result<(), LixError> {
+        let len = self.read_len(field)?;
+        self.skip_bytes(len, field)
+    }
+
+    fn skip_commit_body(&mut self, field: &str) -> Result<(), LixError> {
+        let len = self.read_len(&format!("{field}.membership"))?;
+        self.ensure_len_fits_remaining(len, &format!("{field}.membership"))?;
+        for index in 0..len {
+            self.skip_string(&format!("{field}.membership[{index}].member_change_id"))?;
+            self.skip_u8(&format!("{field}.membership[{index}].role"))?;
+            self.skip_optional_u32(&format!(
+                "{field}.membership[{index}].source_parent_ordinal"
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn skip_segment_commit_directory(&mut self, field: &str) -> Result<(), LixError> {
+        let identity_len = self.read_len(&format!("{field}.state_row_identities"))?;
+        self.ensure_len_fits_remaining(identity_len, &format!("{field}.state_row_identities"))?;
+        for index in 0..identity_len {
+            self.skip_string(&format!(
+                "{field}.state_row_identities[{index}].state_row_identity.schema_key"
+            ))?;
+            self.skip_string(&format!(
+                "{field}.state_row_identities[{index}].state_row_identity.file_id"
+            ))?;
+            self.skip_string(&format!(
+                "{field}.state_row_identities[{index}].state_row_identity.entity_id"
+            ))?;
+            self.skip_string(&format!("{field}.state_row_identities[{index}].change_id"))?;
+        }
+
+        let ordinal_len = self.read_len(&format!("{field}.membership_ordinals"))?;
+        self.ensure_len_fits_remaining(ordinal_len, &format!("{field}.membership_ordinals"))?;
+        for index in 0..ordinal_len {
+            self.skip_string(&format!("{field}.membership_ordinals[{index}].change_id"))?;
+            self.skip_u32(&format!("{field}.membership_ordinals[{index}].ordinal"))?;
+        }
+        Ok(())
+    }
+
+    fn skip_segment_inline_payloads(&mut self, field: &str) -> Result<(), LixError> {
+        let len = self.read_len(field)?;
+        self.ensure_len_fits_remaining(len, field)?;
+        for index in 0..len {
+            self.skip_bytes(32, &format!("{field}[{index}].json_ref"))?;
+            self.skip_byte_vec(&format!("{field}[{index}].bytes"))?;
+        }
+        Ok(())
+    }
+
+    fn skip_segment_change_directory(&mut self, field: &str) -> Result<(), LixError> {
+        let len = self.read_len(&format!("{field}.payloads"))?;
+        self.ensure_len_fits_remaining(len, &format!("{field}.payloads"))?;
+        for index in 0..len {
+            self.skip_bytes(32, &format!("{field}.payloads[{index}].json_ref"))?;
+            self.skip_u64(&format!("{field}.payloads[{index}].offset"))?;
+            self.skip_u64(&format!("{field}.payloads[{index}].len"))?;
+        }
+        Ok(())
     }
 
     fn read_len(&mut self, field: &str) -> Result<usize, LixError> {
@@ -739,6 +1040,10 @@ impl<'a> ByteCursor<'a> {
         Ok(self.read_bytes(1, field)?[0])
     }
 
+    fn skip_u8(&mut self, field: &str) -> Result<(), LixError> {
+        self.skip_bytes(1, field)
+    }
+
     fn read_u32(&mut self, field: &str) -> Result<u32, LixError> {
         let bytes = self.read_bytes(4, field)?;
         let mut out = [0_u8; 4];
@@ -746,11 +1051,19 @@ impl<'a> ByteCursor<'a> {
         Ok(u32::from_le_bytes(out))
     }
 
+    fn skip_u32(&mut self, field: &str) -> Result<(), LixError> {
+        self.skip_bytes(4, field)
+    }
+
     fn read_u64(&mut self, field: &str) -> Result<u64, LixError> {
         let bytes = self.read_bytes(8, field)?;
         let mut out = [0_u8; 8];
         out.copy_from_slice(bytes);
         Ok(u64::from_le_bytes(out))
+    }
+
+    fn skip_u64(&mut self, field: &str) -> Result<(), LixError> {
+        self.skip_bytes(8, field)
     }
 
     fn read_bytes(&mut self, len: usize, field: &str) -> Result<&'a [u8], LixError> {
@@ -771,6 +1084,11 @@ impl<'a> ByteCursor<'a> {
         Ok(out)
     }
 
+    fn skip_bytes(&mut self, len: usize, field: &str) -> Result<(), LixError> {
+        let _ = self.read_bytes(len, field)?;
+        Ok(())
+    }
+
     fn expect_end(&self, label: &str) -> Result<(), LixError> {
         if self.offset == self.bytes.len() {
             return Ok(());
@@ -780,6 +1098,16 @@ impl<'a> ByteCursor<'a> {
             format!("failed to decode changelog {label}: trailing bytes"),
         ))
     }
+}
+
+struct SegmentHeaderView<'a> {
+    segment_id: &'a str,
+    format_version: u32,
+    commit_count: u32,
+    change_count: u32,
+    byte_count: u64,
+    payload_count: u32,
+    checksum: &'a str,
 }
 
 fn changelog_codec_not_implemented(message: impl Into<String>) -> LixError {
@@ -867,6 +1195,15 @@ mod tests {
             decode_segment(&encode_segment(&segment).unwrap()).unwrap(),
             segment
         );
+
+        let encoded = encode_segment(&segment).unwrap();
+        let view = view_segment(&encoded).unwrap();
+        assert_eq!(view.segment_id, "segment-1");
+        assert_eq!(view.commit_count, 1);
+        assert_eq!(view.change_count, 1);
+        assert_eq!(view.directory_commits[0].id, "commit-1");
+        assert_eq!(view.directory_changes[0].id, "change-1");
+        assert!(!view.object_bytes.is_empty());
     }
 
     #[test]

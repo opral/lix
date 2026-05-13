@@ -66,6 +66,12 @@ path = "benches/changelog/scorecard.rs"
 harness = false
 required-features = ["storage-benches"]
 
+[[bench]]
+name = "changelog_cpu_profile"
+path = "benches/changelog/profile_cpu.rs"
+harness = false
+required-features = ["storage-benches"]
+
 [dependencies]
 async-trait = "0.1"
 cel = { version = "0.12.0", features = ["json"] }
