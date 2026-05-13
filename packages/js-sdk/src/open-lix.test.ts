@@ -262,11 +262,15 @@ test("beginTransaction blocks session writes on the same handle", async () => {
 	await lix.close();
 });
 
-test("beginTransaction allows session reads on the same handle", async () => {
+test("beginTransaction blocks session reads on the same handle", async () => {
 	const lix = await openLix();
 	const tx = await lix.beginTransaction();
 
-	const result = await lix.execute("SELECT 1 AS ok");
+	await expect(lix.execute("SELECT 1 AS ok")).rejects.toMatchObject({
+		code: "LIX_INVALID_TRANSACTION_STATE",
+	});
+
+	const result = await tx.execute("SELECT 1 AS ok");
 	expect(result.rows[0]?.get("ok")).toBe(1);
 
 	await tx.rollback();

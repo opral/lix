@@ -297,13 +297,14 @@ impl SessionContext {
     /// catalog inspection. Lix owns transaction boundaries for each statement.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
+        let _transaction_guard = self.reserve_session_transaction()?;
         let kind = sql2::classify_statement(sql)?;
         if kind == sql2::SqlStatementKind::Write {
             let sql = sql.to_string();
             let sql_for_error = sql.clone();
             let params = params.to_vec();
             return self
-                .with_write_transaction(|transaction| {
+                .with_write_transaction_reserved(|transaction| {
                     Box::pin(async move {
                         // Re-plan against the transaction-backed write
                         // session so provider hooks read and stage through the
@@ -316,6 +317,12 @@ impl SessionContext {
                 })
                 .await
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
+        }
+        if kind == sql2::SqlStatementKind::Other {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "SQL statement is not supported by Lix SQL",
+            ));
         }
 
         let read_scope = StorageReadScope::new(self.storage.begin_read_transaction().await?);
@@ -379,7 +386,6 @@ impl SessionContext {
         if writes.is_empty() {
             return Ok(());
         }
-        let _write_guard = self.reserve_write_transaction()?;
         let mut transaction = self.storage.begin_write_transaction().await?;
         writes.apply(&mut transaction.as_mut()).await?;
         transaction.commit().await

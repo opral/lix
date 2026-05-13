@@ -54,6 +54,8 @@ impl Lix {
     /// and transaction statements such as `sqlite_master`, `BEGIN`, and
     /// `COMMIT` are not part of this contract; use `information_schema` for
     /// catalog inspection. Lix owns transaction boundaries for each statement.
+    /// While a transaction is active, call `execute()` on the transaction
+    /// handle instead.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         self.session.execute(sql, params).await
     }
@@ -111,6 +113,10 @@ pub struct LixTransaction {
 }
 
 impl LixTransaction {
+    /// Executes one SQL statement inside this transaction.
+    ///
+    /// Writes are staged until `commit()`. Reads use the transaction overlay,
+    /// so they can observe writes staged by earlier calls on this handle.
     pub async fn execute(
         &mut self,
         sql: &str,
