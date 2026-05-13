@@ -13,7 +13,7 @@ use super::types::{
     SegmentChange, SegmentCommit, SegmentObjectLocation,
 };
 use crate::changelog::decode_segment;
-use crate::json_store::{store::JSON_NAMESPACE, JsonRef};
+use crate::json_store::{self, JsonRef};
 use crate::storage::{KvScanRange, KvScanRequest, StorageReader, StorageWriteSet};
 use crate::LixError;
 
@@ -215,7 +215,7 @@ pub(super) fn stage_gc_sweep(writes: &mut StorageWriteSet, plan: &GcPlan) -> Res
         );
     }
     for json_ref in &plan.sweep.json_payloads {
-        writes.delete(JSON_NAMESPACE, json_ref.as_hash_bytes().to_vec());
+        json_store::stage_direct_json_payload_delete(writes, json_ref);
     }
     Ok(())
 }
@@ -325,24 +325,13 @@ where
     let mut out = Vec::new();
     loop {
         let page = store
-            .scan_keys(KvScanRequest {
-                namespace: JSON_NAMESPACE.to_string(),
-                range: KvScanRange::prefix(Vec::new()),
-                after,
-                limit: 256,
-            })
+            .scan_keys(json_store::direct_json_payload_scan_request(after, 256))
             .await?;
         for index in 0..page.keys.len() {
             let Some(key) = page.keys.get(index) else {
                 continue;
             };
-            let hash: [u8; 32] = key.try_into().map_err(|_| {
-                LixError::unknown(format!(
-                    "changelog GC found json_store.json key with {} bytes, expected 32",
-                    key.len()
-                ))
-            })?;
-            out.push(JsonRef::from_hash_bytes(hash));
+            out.push(json_store::direct_json_payload_ref_from_key(key)?);
         }
         let Some(next_after) = page.resume_after else {
             break;
@@ -892,16 +881,8 @@ mod tests {
             writer.stage_segment(live_segment).await.unwrap();
             writer.stage_publish_commit("commit-1").await.unwrap();
         }
-        writes.put(
-            JSON_NAMESPACE,
-            live_ref.as_hash_bytes().to_vec(),
-            b"live".to_vec(),
-        );
-        writes.put(
-            JSON_NAMESPACE,
-            dead_ref.as_hash_bytes().to_vec(),
-            b"dead".to_vec(),
-        );
+        json_store::stage_direct_json_payload_put(&mut writes, &live_ref, b"live".to_vec());
+        json_store::stage_direct_json_payload_put(&mut writes, &dead_ref, b"dead".to_vec());
         writes.apply(&mut *transaction).await.unwrap();
         transaction.commit().await.unwrap();
 
@@ -921,15 +902,9 @@ mod tests {
 
         let mut transaction = storage.begin_read_transaction().await.unwrap();
         let result = transaction
-            .get_values(KvGetRequest {
-                groups: vec![KvGetGroup {
-                    namespace: JSON_NAMESPACE.to_string(),
-                    keys: vec![
-                        live_ref.as_hash_bytes().to_vec(),
-                        dead_ref.as_hash_bytes().to_vec(),
-                    ],
-                }],
-            })
+            .get_values(json_store::direct_json_payload_get_request([
+                &live_ref, &dead_ref,
+            ]))
             .await
             .unwrap();
         assert_eq!(result.groups[0].value(0), Some(Some(&b"live"[..])));

@@ -1,3 +1,9 @@
+#[cfg(feature = "storage-benches")]
+mod bench_support;
+#[cfg(feature = "storage-benches")]
+pub mod bench {
+    pub use super::bench_support::*;
+}
 mod by_change_index;
 mod by_change_membership_index;
 mod by_commit_index;

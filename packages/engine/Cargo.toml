@@ -54,6 +54,18 @@ path = "benches/log12_physical_layout/main.rs"
 harness = false
 required-features = ["storage-benches"]
 
+[[bench]]
+name = "changelog"
+path = "benches/changelog/main.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "changelog_scorecard"
+path = "benches/changelog/scorecard.rs"
+harness = false
+required-features = ["storage-benches"]
+
 [dependencies]
 async-trait = "0.1"
 cel = { version = "0.12.0", features = ["json"] }
