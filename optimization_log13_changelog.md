@@ -255,3 +255,80 @@ proof work, not whole-segment decoding. The next cut should batch membership
 proofs by candidate commit and reuse decoded commit membership once per visible
 commit instead of once per change_id.
 ```
+
+## Entry 3: Batch Visible Change Membership Proofs By Commit
+
+Change:
+
+```text
+Visible change reads now prove requested change_ids as one batch.
+
+The reader scans by_change_membership candidates for all requested changes,
+groups proof work by candidate commit_id, loads each visible candidate commit
+once, scans its CommitBody.membership once, and marks all requested change_ids
+proven by that commit. The fallback path also scans visible commits once for
+the remaining unproven changes.
+```
+
+Measured with:
+
+```sh
+cargo bench --manifest-path packages/engine/Cargo.toml --features storage-benches --bench changelog_scorecard
+```
+
+### CPU Segment Scoreboard
+
+Times are milliseconds.
+
+| row                                     | entry_3_ms |
+| --------------------------------------- | ---------: |
+| encode_segment / 1c_1000ch              |      0.167 |
+| decode_segment / 1c_1000ch              |      4.336 |
+| view_segment / 1c_1000ch                |      0.613 |
+| validate_segment_shape / 1c_1000ch      |      7.690 |
+| build_decoded_segment_index / 1c_1000ch |     11.454 |
+| build_by_change / 1c_1000ch             |      0.809 |
+| build_by_change_membership / 1c_1000ch  |      0.035 |
+
+### Backend Smoke Scoreboard
+
+Times are milliseconds.
+
+| row                                                  | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms |
+| ---------------------------------------------------- | ----------: | -----------------: | -----------------: |
+| stage_segment_raw_no_indexes / 1c_1000ch             |       0.515 |              3.406 |              4.087 |
+| stage_segment / 1c_1000ch                            |      18.083 |             20.663 |             20.969 |
+| stage_publish_commit / 1c_1ch                        |       0.050 |              0.061 |              0.094 |
+| stage_publish_commit / 1c_100ch                      |      80.784 |             94.250 |             79.890 |
+| stage_publish_commit / 1c_1000ch single-shot         |   11264.882 |          11141.916 |          11117.231 |
+| load_commits_visible_batched / 1c_100ch              |       0.262 |              0.278 |              0.228 |
+| load_changes_visible_batched / 1c_100ch              |       1.902 |              0.886 |              0.704 |
+| load_changes_visible_batched / 1c_1000ch             |     134.949 |             18.746 |              6.960 |
+| load_changes_physical_scattered / 100seg_100c_1000ch |       3.818 |              3.713 |              3.920 |
+| load_changes_visible_scattered / 100seg_100c_1000ch  |     179.248 |             19.738 |              7.797 |
+| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       9.031 |             10.435 |              9.151 |
+| plan_gc / live_50pct_mixed_segments                  |      10.831 |              9.316 |              9.555 |
+| collect_garbage / live_50pct_mixed_segments          |       9.553 |              9.787 |              9.751 |
+
+Read:
+
+```text
+The repeated proof cliff is mostly gone:
+
+load_changes_visible_batched / 1c_1000ch:
+  entry 2: ~2.0-2.4s
+  entry 3: ~7-135ms depending backend smoke variance
+
+load_changes_visible_batched / 1c_100ch:
+  entry 2: ~22-26ms
+  entry 3: ~0.7-1.9ms
+
+load_changes_visible_scattered:
+  entry 2: ~31-452ms
+  entry 3: ~8-179ms
+
+The remaining large Unit variance likely comes from the benchmark harness and
+in-memory backend behavior, not physical IO. The next structural cliff is now
+stage_publish_commit / 1c_1000ch, which still validates publication closure in
+a per-change way.
+```

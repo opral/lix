@@ -382,10 +382,10 @@ where
             push_unique(&mut segment_ids, entry.location.segment_id.clone());
         }
         let segments = self.load_segment_byte_indexes_by_id(&segment_ids).await?;
+        let visible_change_ids = self.prove_visible_changes(change_ids).await?;
         let mut entries = Vec::with_capacity(change_ids.len());
         for (change_id, by_change) in change_ids.iter().zip(by_change_entries.iter()) {
-            let visible = self.visible_membership_contains_change(change_id).await?;
-            if !visible {
+            if !visible_change_ids.contains(change_id) {
                 entries.push(None);
                 continue;
             }
@@ -675,6 +675,48 @@ where
         Ok(out)
     }
 
+    async fn prove_visible_changes(
+        &mut self,
+        change_ids: &[String],
+    ) -> Result<HashSet<String>, LixError> {
+        let requested: HashSet<String> = change_ids.iter().cloned().collect();
+        if requested.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let mut candidate_changes_by_commit: HashMap<String, HashSet<String>> = HashMap::new();
+        for change_id in &requested {
+            for commit_id in self.load_change_membership_candidates(change_id).await? {
+                candidate_changes_by_commit
+                    .entry(commit_id)
+                    .or_default()
+                    .insert(change_id.clone());
+            }
+        }
+
+        let mut proven = HashSet::new();
+        let mut checked_commits = HashSet::new();
+        for (commit_id, candidate_change_ids) in candidate_changes_by_commit {
+            checked_commits.insert(commit_id.clone());
+            self.prove_visible_changes_from_commit(&commit_id, &candidate_change_ids, &mut proven)
+                .await?;
+            if proven.len() == requested.len() {
+                return Ok(proven);
+            }
+        }
+
+        let remaining = requested
+            .difference(&proven)
+            .cloned()
+            .collect::<HashSet<_>>();
+        if remaining.is_empty() {
+            return Ok(proven);
+        }
+        self.scan_visible_commits_for_changes(&remaining, checked_commits, &mut proven)
+            .await?;
+        Ok(proven)
+    }
+
     async fn load_segment(&mut self, segment_id: &str) -> Result<Option<Segment>, LixError> {
         let Some(bytes) =
             get_one(&mut self.store, SEGMENT_NAMESPACE, segment_key(segment_id)).await?
@@ -891,8 +933,24 @@ where
         commit_id: &str,
         change_id: &str,
     ) -> Result<bool, LixError> {
+        let mut proven = HashSet::new();
+        self.prove_visible_changes_from_commit(
+            commit_id,
+            &HashSet::from([change_id.to_string()]),
+            &mut proven,
+        )
+        .await?;
+        Ok(proven.contains(change_id))
+    }
+
+    async fn prove_visible_changes_from_commit(
+        &mut self,
+        commit_id: &str,
+        requested_change_ids: &HashSet<String>,
+        proven: &mut HashSet<String>,
+    ) -> Result<(), LixError> {
         let Some(visibility) = self.load_commit_visibility(commit_id).await? else {
-            return Ok(false);
+            return Ok(());
         };
         let Some(segment) = self
             .load_segment_byte_index(&visibility.location.segment_id)
@@ -905,11 +963,12 @@ where
         };
         let commit = segment.load_commit(&visibility.location, commit_id)?;
         validate_commit_checksum(&visibility.checksum, commit_id, &commit)?;
-        Ok(commit
-            .body
-            .membership
-            .iter()
-            .any(|membership| membership.member_change_id == change_id))
+        for membership in &commit.body.membership {
+            if requested_change_ids.contains(&membership.member_change_id) {
+                proven.insert(membership.member_change_id.clone());
+            }
+        }
+        Ok(())
     }
 
     async fn scan_visible_commits_for_change(
@@ -951,6 +1010,51 @@ where
             after = Some(next_after);
         }
         Ok(false)
+    }
+
+    async fn scan_visible_commits_for_changes(
+        &mut self,
+        requested_change_ids: &HashSet<String>,
+        mut checked: HashSet<String>,
+        proven: &mut HashSet<String>,
+    ) -> Result<(), LixError> {
+        let mut after = None;
+        loop {
+            let page = self
+                .store
+                .scan_keys(KvScanRequest {
+                    namespace: COMMIT_VISIBILITY_NAMESPACE.to_string(),
+                    range: KvScanRange::prefix(Vec::new()),
+                    after,
+                    limit: 256,
+                })
+                .await?;
+            for index in 0..page.keys.len() {
+                let Some(key) = page.keys.get(index) else {
+                    continue;
+                };
+                let commit_id = std::str::from_utf8(key).map_err(|error| {
+                    LixError::unknown(format!(
+                        "changelog commit_visibility key contains invalid UTF-8: {error}"
+                    ))
+                })?;
+                if checked.insert(commit_id.to_string()) {
+                    self.prove_visible_changes_from_commit(commit_id, requested_change_ids, proven)
+                        .await?;
+                    if requested_change_ids
+                        .iter()
+                        .all(|change_id| proven.contains(change_id))
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            let Some(next_after) = page.resume_after else {
+                break;
+            };
+            after = Some(next_after);
+        }
+        Ok(())
     }
 }
 
