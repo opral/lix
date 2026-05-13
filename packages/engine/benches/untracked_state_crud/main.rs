@@ -4,27 +4,21 @@ use std::time::Duration;
 use async_trait::async_trait;
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use lix_engine::{
-    storage_bench, Backend, BackendKvEntryPage, BackendKvGetGroup, BackendKvGetRequest,
-    BackendKvHeaderPayloadFramePart, BackendKvKeyPage, BackendKvKeySpan, BackendKvRead3Page,
-    BackendKvRead3Projection, BackendKvRead3Request, BackendKvRead3Source, BackendKvScan2Page,
-    BackendKvScan2Projection, BackendKvScan2Request, BackendKvScanPlanPage,
-    BackendKvScanPlanRequest, BackendKvScanPlanValuePart, BackendKvScanProjection,
-    BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch, BackendKvValuePage,
-    BackendKvValuePart, BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction,
-    BackendWriteTransaction, LixError,
+    storage_bench, Backend, BackendKvEntryPage, BackendKvGetRequest, BackendKvKeyPage,
+    BackendKvKeySpan, BackendKvReadV3Page, BackendKvReadV3Projection, BackendKvReadV3Request,
+    BackendKvReadV3Source, BackendKvScanPlanV3Page, BackendKvScanPlanV3Projection,
+    BackendKvScanPlanV3Request, BackendKvScanPlanV3ValuePart, BackendKvScanRequest,
+    BackendKvValueBatch, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteStats,
+    BackendReadTransaction, BackendWriteTransaction, LixError,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value as JsonValue;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
-#[path = "../storage/rocksdb_backend.rs"]
-mod rocksdb_backend;
-#[path = "../storage/sqlite_backend.rs"]
-mod sqlite_backend;
+mod backends;
 
-use rocksdb_backend::RocksDbBenchBackend;
-use sqlite_backend::SqliteBenchBackend;
+use backends::{LixBackendProfile, LIX_BACKEND_PROFILES};
 
 const SMOKE_ROWS: usize = 1_000;
 const REAL_WORKLOAD_ROWS: usize = 10_000;
@@ -50,32 +44,6 @@ struct RawUntrackedRow {
     created_at: String,
     updated_at: String,
     global: bool,
-}
-
-#[derive(Clone, Copy)]
-enum LixBackendProfile {
-    Sqlite,
-    RocksDb,
-}
-
-impl LixBackendProfile {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Sqlite => "lix_sqlite",
-            Self::RocksDb => "lix_rocksdb",
-        }
-    }
-
-    fn backend(self) -> Arc<dyn Backend + Send + Sync> {
-        match self {
-            Self::Sqlite => Arc::new(
-                SqliteBenchBackend::tempfile().expect("create sqlite untracked-state backend"),
-            ),
-            Self::RocksDb => Arc::new(
-                RocksDbBenchBackend::new().expect("create rocksdb untracked-state backend"),
-            ),
-        }
-    }
 }
 
 struct RawSqliteFixture {
@@ -245,30 +213,21 @@ impl BackendReadTransaction for CountingReadTransaction {
         Ok(page)
     }
 
-    async fn scan2(
+    async fn scan_plan_v3(
         &mut self,
-        request: BackendKvScan2Request,
-    ) -> Result<BackendKvScan2Page, LixError> {
-        let page = self.inner.scan2(request).await?;
-        record_scan2(&self.stats, &page);
+        request: BackendKvScanPlanV3Request,
+    ) -> Result<BackendKvScanPlanV3Page, LixError> {
+        let page = self.inner.scan_plan_v3(request).await?;
+        record_scan_plan_v3(&self.stats, &page);
         Ok(page)
     }
 
-    async fn scan_plan(
+    async fn read_v3(
         &mut self,
-        request: BackendKvScanPlanRequest,
-    ) -> Result<BackendKvScanPlanPage, LixError> {
-        let page = self.inner.scan_plan(request).await?;
-        record_scan_plan(&self.stats, &page);
-        Ok(page)
-    }
-
-    async fn read3(
-        &mut self,
-        request: BackendKvRead3Request,
-    ) -> Result<BackendKvRead3Page, LixError> {
-        let page = self.inner.read3(request.clone()).await?;
-        record_read3(&self.stats, &request, &page);
+        request: BackendKvReadV3Request,
+    ) -> Result<BackendKvReadV3Page, LixError> {
+        let page = self.inner.read_v3(request.clone()).await?;
+        record_read_v3(&self.stats, &request, &page);
         Ok(page)
     }
 
@@ -324,30 +283,21 @@ impl BackendReadTransaction for CountingWriteTransaction {
         Ok(page)
     }
 
-    async fn scan2(
+    async fn scan_plan_v3(
         &mut self,
-        request: BackendKvScan2Request,
-    ) -> Result<BackendKvScan2Page, LixError> {
-        let page = self.inner.scan2(request).await?;
-        record_scan2(&self.stats, &page);
+        request: BackendKvScanPlanV3Request,
+    ) -> Result<BackendKvScanPlanV3Page, LixError> {
+        let page = self.inner.scan_plan_v3(request).await?;
+        record_scan_plan_v3(&self.stats, &page);
         Ok(page)
     }
 
-    async fn scan_plan(
+    async fn read_v3(
         &mut self,
-        request: BackendKvScanPlanRequest,
-    ) -> Result<BackendKvScanPlanPage, LixError> {
-        let page = self.inner.scan_plan(request).await?;
-        record_scan_plan(&self.stats, &page);
-        Ok(page)
-    }
-
-    async fn read3(
-        &mut self,
-        request: BackendKvRead3Request,
-    ) -> Result<BackendKvRead3Page, LixError> {
-        let page = self.inner.read3(request.clone()).await?;
-        record_read3(&self.stats, &request, &page);
+        request: BackendKvReadV3Request,
+    ) -> Result<BackendKvReadV3Page, LixError> {
+        let page = self.inner.read_v3(request.clone()).await?;
+        record_read_v3(&self.stats, &request, &page);
         Ok(page)
     }
 
@@ -433,24 +383,7 @@ fn record_scan_entries(stats: &Arc<Mutex<IoStats>>, page: &BackendKvEntryPage) {
     stats.scan_entry_value_bytes += page.values.iter().map(|bytes| bytes.len()).sum::<usize>();
 }
 
-fn record_scan2(stats: &Arc<Mutex<IoStats>>, page: &BackendKvScan2Page) {
-    let mut stats = stats.lock().expect("io stats mutex should lock");
-    if page.values.is_none() {
-        stats.scan_key_calls += 1;
-        stats.scan_keys += page.keys.len();
-        stats.scan_key_bytes += page.keys.iter().map(|bytes| bytes.len()).sum::<usize>();
-        return;
-    }
-
-    stats.scan_entry_calls += 1;
-    stats.scan_entries += page.keys.len();
-    stats.scan_entry_key_bytes += page.keys.iter().map(|bytes| bytes.len()).sum::<usize>();
-    if let Some(values) = &page.values {
-        stats.scan_entry_value_bytes += values.iter().map(|bytes| bytes.len()).sum::<usize>();
-    }
-}
-
-fn record_scan_plan(stats: &Arc<Mutex<IoStats>>, page: &BackendKvScanPlanPage) {
+fn record_scan_plan_v3(stats: &Arc<Mutex<IoStats>>, page: &BackendKvScanPlanV3Page) {
     let mut stats = stats.lock().expect("io stats mutex should lock");
     if page.values.is_empty() {
         stats.scan_key_calls += 1;
@@ -470,10 +403,10 @@ fn record_scan_plan(stats: &Arc<Mutex<IoStats>>, page: &BackendKvScanPlanPage) {
         .sum::<usize>();
 }
 
-fn record_read3(
+fn record_read_v3(
     stats: &Arc<Mutex<IoStats>>,
-    request: &BackendKvRead3Request,
-    page: &BackendKvRead3Page,
+    request: &BackendKvReadV3Request,
+    page: &BackendKvReadV3Page,
 ) {
     let mut stats = stats.lock().expect("io stats mutex should lock");
     let key_bytes = page.keys.iter().map(|bytes| bytes.len()).sum::<usize>();
@@ -483,8 +416,8 @@ fn record_read3(
         .flat_map(|values| values.iter())
         .map(|bytes| bytes.len())
         .sum::<usize>();
-    let is_key_only = matches!(request.projection, BackendKvRead3Projection::KeysOnly);
-    let point_like = matches!(request.source, BackendKvRead3Source::Keys { .. });
+    let is_key_only = matches!(request.projection, BackendKvReadV3Projection::KeysOnly);
+    let point_like = matches!(request.source, BackendKvReadV3Source::Keys { .. });
     if point_like {
         if is_key_only {
             stats.exists_calls += 1;
@@ -569,7 +502,7 @@ fn maybe_print_io_report(runtime: &Runtime, all_rows: &[PointerRow]) {
 
     for (label, row_count) in workloads {
         let rows = storage_rows(&all_rows[..row_count]);
-        for profile in [LixBackendProfile::Sqlite, LixBackendProfile::RocksDb] {
+        for profile in LIX_BACKEND_PROFILES {
             for operation in [
                 "insert_all_rows",
                 "select_all_rows",
@@ -865,7 +798,7 @@ fn bench_lix(
     label: &str,
 ) {
     let rows = storage_rows(&all_rows[..row_count]);
-    for profile in [LixBackendProfile::Sqlite, LixBackendProfile::RocksDb] {
+    for profile in LIX_BACKEND_PROFILES {
         let mut group =
             c.benchmark_group(format!("untracked_state_crud/{}/{label}", profile.name()));
         configure_group(&mut group, row_count);
@@ -1098,37 +1031,23 @@ fn bench_lix(
 
 fn bench_storage_plan_smoke(c: &mut Criterion, runtime: &Runtime, all_rows: &[PointerRow]) {
     let rows = storage_rows(&all_rows[..SMOKE_ROWS]);
-    for profile in [LixBackendProfile::Sqlite, LixBackendProfile::RocksDb] {
+    for profile in LIX_BACKEND_PROFILES {
         let mut group = c.benchmark_group(format!(
             "untracked_state_crud/storage_plans/{}/smoke",
             profile.name()
         ));
         configure_group(&mut group, SMOKE_ROWS);
 
-        group.bench_function(format!("scan_keys_row/{}", row_label(SMOKE_ROWS)), |b| {
-            b.iter_batched(
-                || prepare_lix_read(runtime, profile, &rows),
-                |(backend, _fixture)| {
-                    black_box(
-                        runtime
-                            .block_on(storage_plan_scan_keys_header(&backend, SMOKE_ROWS))
-                            .expect("storage plan scan header keys"),
-                    )
-                },
-                BatchSize::LargeInput,
-            )
-        });
-
         group.bench_function(
-            format!("scan2_header_valuepart/{}", row_label(SMOKE_ROWS)),
+            format!("scan_plan_v3_header_valuepart/{}", row_label(SMOKE_ROWS)),
             |b| {
                 b.iter_batched(
                     || prepare_lix_read(runtime, profile, &rows),
                     |(backend, _fixture)| {
                         black_box(
                             runtime
-                                .block_on(storage_plan_scan_entries_header(&backend, SMOKE_ROWS))
-                                .expect("storage plan scan header entries"),
+                                .block_on(storage_plan_scan_plan_v3_header(&backend, SMOKE_ROWS))
+                                .expect("storage plan scan_plan_v3 header"),
                         )
                     },
                     BatchSize::LargeInput,
@@ -1137,65 +1056,20 @@ fn bench_storage_plan_smoke(c: &mut Criterion, runtime: &Runtime, all_rows: &[Po
         );
 
         group.bench_function(
-            format!("dual_scan2_header_payload/{}", row_label(SMOKE_ROWS)),
+            format!(
+                "scan_plan_v3_header_payload_parts/{}",
+                row_label(SMOKE_ROWS)
+            ),
             |b| {
                 b.iter_batched(
                     || prepare_lix_read(runtime, profile, &rows),
                     |(backend, _fixture)| {
                         black_box(
                             runtime
-                                .block_on(storage_plan_dual_scan_full(&backend, SMOKE_ROWS))
-                                .expect("storage plan dual scan full"),
-                        )
-                    },
-                    BatchSize::LargeInput,
-                )
-            },
-        );
-
-        group.bench_function(format!("scan2_full_value/{}", row_label(SMOKE_ROWS)), |b| {
-            b.iter_batched(
-                || prepare_lix_read(runtime, profile, &rows),
-                |(backend, _fixture)| {
-                    black_box(
-                        runtime
-                            .block_on(storage_plan_scan2_join_full(&backend, SMOKE_ROWS))
-                            .expect("storage plan scan2 join full"),
-                    )
-                },
-                BatchSize::LargeInput,
-            )
-        });
-
-        group.bench_function(
-            format!("scan_plan_header_valuepart/{}", row_label(SMOKE_ROWS)),
-            |b| {
-                b.iter_batched(
-                    || prepare_lix_read(runtime, profile, &rows),
-                    |(backend, _fixture)| {
-                        black_box(
-                            runtime
-                                .block_on(storage_plan_scan_plan_header(&backend, SMOKE_ROWS))
-                                .expect("storage plan scan_plan header"),
-                        )
-                    },
-                    BatchSize::LargeInput,
-                )
-            },
-        );
-
-        group.bench_function(
-            format!("scan_plan_header_payload_parts/{}", row_label(SMOKE_ROWS)),
-            |b| {
-                b.iter_batched(
-                    || prepare_lix_read(runtime, profile, &rows),
-                    |(backend, _fixture)| {
-                        black_box(
-                            runtime
-                                .block_on(storage_plan_scan_plan_header_payload(
+                                .block_on(storage_plan_scan_plan_v3_header_payload(
                                     &backend, SMOKE_ROWS,
                                 ))
-                                .expect("storage plan scan_plan header payload"),
+                                .expect("storage plan scan_plan_v3 header payload"),
                         )
                     },
                     BatchSize::LargeInput,
@@ -1204,34 +1078,15 @@ fn bench_storage_plan_smoke(c: &mut Criterion, runtime: &Runtime, all_rows: &[Po
         );
 
         group.bench_function(
-            format!("scan_plan_full_value/{}", row_label(SMOKE_ROWS)),
+            format!("scan_plan_v3_full_value/{}", row_label(SMOKE_ROWS)),
             |b| {
                 b.iter_batched(
                     || prepare_lix_read(runtime, profile, &rows),
                     |(backend, _fixture)| {
                         black_box(
                             runtime
-                                .block_on(storage_plan_scan_plan_full(&backend, SMOKE_ROWS))
-                                .expect("storage plan scan_plan full"),
-                        )
-                    },
-                    BatchSize::LargeInput,
-                )
-            },
-        );
-
-        group.bench_function(
-            format!("scan_keys_get_full_value/{}", row_label(SMOKE_ROWS)),
-            |b| {
-                b.iter_batched(
-                    || prepare_lix_read(runtime, profile, &rows),
-                    |(backend, _fixture)| {
-                        black_box(
-                            runtime
-                                .block_on(storage_plan_primary_scan_get_payload_full(
-                                    &backend, SMOKE_ROWS,
-                                ))
-                                .expect("storage plan primary scan plus payload get"),
+                                .block_on(storage_plan_scan_plan_v3_full(&backend, SMOKE_ROWS))
+                                .expect("storage plan scan_plan_v3 full"),
                         )
                     },
                     BatchSize::LargeInput,
@@ -1287,172 +1142,58 @@ fn prepare_lix_read(
     (backend, fixture)
 }
 
-async fn storage_plan_scan_keys_header(
+async fn storage_plan_scan_plan_v3_header(
     backend: &Arc<dyn Backend + Send + Sync>,
     expected_rows: usize,
 ) -> Result<usize, LixError> {
-    let mut tx = backend.begin_read_transaction().await?;
-    let page = tx
-        .scan_keys(BackendKvScanRequest {
-            namespace: UNTRACKED_ROW_NAMESPACE.to_string(),
-            range: BackendKvScanRange::prefix(Vec::new()),
-            after: None,
-            limit: expected_rows,
-        })
-        .await?;
-    tx.rollback().await?;
-    assert_eq!(page.keys.len(), expected_rows);
-    Ok(page.keys.iter().map(|key| key.len()).sum())
-}
-
-async fn storage_plan_scan_entries_header(
-    backend: &Arc<dyn Backend + Send + Sync>,
-    expected_rows: usize,
-) -> Result<usize, LixError> {
-    let mut tx = backend.begin_read_transaction().await?;
-    let page = tx
-        .scan2(BackendKvScan2Request {
-            namespace: UNTRACKED_ROW_NAMESPACE.to_string(),
-            range: BackendKvScanRange::prefix(Vec::new()),
-            after: None,
-            page_size: expected_rows,
-            projection: BackendKvScan2Projection::ValuePart(
-                BackendKvValuePart::HeaderPayloadFrame(BackendKvHeaderPayloadFramePart::Header),
-            ),
-        })
-        .await?;
-    tx.rollback().await?;
-    assert_eq!(page.keys.len(), expected_rows);
-    let values = page.values.as_ref().expect("header values should exist");
-    Ok(page.keys.iter().map(|key| key.len()).sum::<usize>()
-        + values.iter().map(|value| value.len()).sum::<usize>())
-}
-
-async fn storage_plan_dual_scan_full(
-    backend: &Arc<dyn Backend + Send + Sync>,
-    expected_rows: usize,
-) -> Result<usize, LixError> {
-    let mut tx = backend.begin_read_transaction().await?;
-    let headers = tx
-        .scan2(BackendKvScan2Request {
-            namespace: UNTRACKED_ROW_NAMESPACE.to_string(),
-            range: BackendKvScanRange::prefix(Vec::new()),
-            after: None,
-            page_size: expected_rows,
-            projection: BackendKvScan2Projection::ValuePart(
-                BackendKvValuePart::HeaderPayloadFrame(BackendKvHeaderPayloadFramePart::Header),
-            ),
-        })
-        .await?;
-    let payloads = tx
-        .scan2(BackendKvScan2Request {
-            namespace: UNTRACKED_ROW_NAMESPACE.to_string(),
-            range: BackendKvScanRange::prefix(Vec::new()),
-            after: None,
-            page_size: expected_rows,
-            projection: BackendKvScan2Projection::ValuePart(
-                BackendKvValuePart::HeaderPayloadFrame(BackendKvHeaderPayloadFramePart::Payload),
-            ),
-        })
-        .await?;
-    tx.rollback().await?;
-    assert_eq!(headers.keys.len(), expected_rows);
-    assert_eq!(payloads.keys.len(), expected_rows);
-    for (header_key, payload_key) in headers.keys.iter().zip(payloads.keys.iter()) {
-        assert_eq!(header_key, payload_key);
-    }
-    Ok(headers.keys.iter().map(|key| key.len()).sum::<usize>()
-        + headers
-            .values
-            .as_ref()
-            .expect("header values should exist")
-            .iter()
-            .map(|value| value.len())
-            .sum::<usize>()
-        + payloads.keys.iter().map(|key| key.len()).sum::<usize>()
-        + payloads
-            .values
-            .as_ref()
-            .expect("payload values should exist")
-            .iter()
-            .map(|value| value.len())
-            .sum::<usize>())
-}
-
-async fn storage_plan_scan2_join_full(
-    backend: &Arc<dyn Backend + Send + Sync>,
-    expected_rows: usize,
-) -> Result<usize, LixError> {
-    let mut tx = backend.begin_read_transaction().await?;
-    let page = tx
-        .scan2(BackendKvScan2Request {
-            namespace: UNTRACKED_ROW_NAMESPACE.to_string(),
-            range: BackendKvScanRange::prefix(Vec::new()),
-            after: None,
-            page_size: expected_rows,
-            projection: BackendKvScan2Projection::FullValue,
-        })
-        .await?;
-    tx.rollback().await?;
-    assert_eq!(page.keys.len(), expected_rows);
-    let values = page.values.as_ref().expect("full values should exist");
-    assert_eq!(values.len(), expected_rows);
-    Ok(page.keys.iter().map(|key| key.len()).sum::<usize>()
-        + values.iter().map(|value| value.len()).sum::<usize>())
-}
-
-async fn storage_plan_scan_plan_header(
-    backend: &Arc<dyn Backend + Send + Sync>,
-    expected_rows: usize,
-) -> Result<usize, LixError> {
-    storage_plan_scan_plan_value_parts(
+    storage_plan_scan_plan_v3_value_parts(
         backend,
         expected_rows,
-        &[BackendKvScanPlanValuePart::Header],
+        &[BackendKvScanPlanV3ValuePart::Header],
     )
     .await
 }
 
-async fn storage_plan_scan_plan_header_payload(
+async fn storage_plan_scan_plan_v3_header_payload(
     backend: &Arc<dyn Backend + Send + Sync>,
     expected_rows: usize,
 ) -> Result<usize, LixError> {
-    storage_plan_scan_plan_value_parts(
+    storage_plan_scan_plan_v3_value_parts(
         backend,
         expected_rows,
         &[
-            BackendKvScanPlanValuePart::Header,
-            BackendKvScanPlanValuePart::Payload,
+            BackendKvScanPlanV3ValuePart::Header,
+            BackendKvScanPlanV3ValuePart::Payload,
         ],
     )
     .await
 }
 
-async fn storage_plan_scan_plan_full(
+async fn storage_plan_scan_plan_v3_full(
     backend: &Arc<dyn Backend + Send + Sync>,
     expected_rows: usize,
 ) -> Result<usize, LixError> {
-    storage_plan_scan_plan_value_parts(
+    storage_plan_scan_plan_v3_value_parts(
         backend,
         expected_rows,
-        &[BackendKvScanPlanValuePart::FullValue],
+        &[BackendKvScanPlanV3ValuePart::FullValue],
     )
     .await
 }
 
-async fn storage_plan_scan_plan_value_parts(
+async fn storage_plan_scan_plan_v3_value_parts(
     backend: &Arc<dyn Backend + Send + Sync>,
     expected_rows: usize,
-    parts: &[BackendKvScanPlanValuePart],
+    parts: &[BackendKvScanPlanV3ValuePart],
 ) -> Result<usize, LixError> {
     let mut tx = backend.begin_read_transaction().await?;
     let page = tx
-        .scan_plan(BackendKvScanPlanRequest {
+        .scan_plan_v3(BackendKvScanPlanV3Request {
             namespace: UNTRACKED_ROW_NAMESPACE.to_string(),
             spans: vec![BackendKvKeySpan::all()],
             after: None,
             page_size: expected_rows,
-            projection: BackendKvScanProjection::ValueParts(parts.to_vec()),
+            projection: BackendKvScanPlanV3Projection::ValueParts(parts.to_vec()),
         })
         .await?;
     tx.rollback().await?;
@@ -1466,47 +1207,6 @@ async fn storage_plan_scan_plan_value_parts(
             .values
             .iter()
             .flat_map(|values| values.iter())
-            .map(|value| value.len())
-            .sum::<usize>())
-}
-
-async fn storage_plan_primary_scan_get_payload_full(
-    backend: &Arc<dyn Backend + Send + Sync>,
-    expected_rows: usize,
-) -> Result<usize, LixError> {
-    let mut tx = backend.begin_read_transaction().await?;
-    let headers = tx
-        .scan_keys(BackendKvScanRequest {
-            namespace: UNTRACKED_ROW_NAMESPACE.to_string(),
-            range: BackendKvScanRange::prefix(Vec::new()),
-            after: None,
-            limit: expected_rows,
-        })
-        .await?;
-    let keys = headers.keys.iter().map(<[u8]>::to_vec).collect::<Vec<_>>();
-    let payloads = tx
-        .get_values(BackendKvGetRequest {
-            groups: vec![BackendKvGetGroup {
-                namespace: UNTRACKED_ROW_NAMESPACE.to_string(),
-                keys,
-            }],
-        })
-        .await?;
-    tx.rollback().await?;
-    assert_eq!(headers.keys.len(), expected_rows);
-    let payload_group = payloads.groups.first().expect("payload group exists");
-    assert_eq!(payload_group.len(), expected_rows);
-    assert_eq!(
-        payload_group
-            .values_iter()
-            .filter(|value| value.is_some())
-            .count(),
-        expected_rows
-    );
-    Ok(headers.keys.iter().map(|key| key.len()).sum::<usize>()
-        + payload_group
-            .values_iter()
-            .flatten()
             .map(|value| value.len())
             .sum::<usize>())
 }

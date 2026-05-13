@@ -4,12 +4,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lix_engine::{
-    project_backend_read_v3_value_part, project_backend_scan_plan_v3_value_part,
-    project_backend_value_part, Backend, BackendKvEntryPage, BackendKvExistsBatch,
-    BackendKvExistsGroup, BackendKvGetRequest, BackendKvKeyPage, BackendKvKeySpan,
-    BackendKvReadV3Order, BackendKvReadV3Page, BackendKvReadV3Presence, BackendKvReadV3Projection,
-    BackendKvReadV3Request, BackendKvReadV3Source, BackendKvReadV3Strategy,
-    BackendKvReadV3ValuePart, BackendKvScan2Page, BackendKvScan2Projection, BackendKvScan2Request,
+    project_backend_read_v3_value_part, project_backend_scan_plan_v3_value_part, Backend,
+    BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetRequest,
+    BackendKvKeyPage, BackendKvKeySpan, BackendKvReadV3Order, BackendKvReadV3Page,
+    BackendKvReadV3Presence, BackendKvReadV3Projection, BackendKvReadV3Request,
+    BackendKvReadV3Source, BackendKvReadV3Strategy, BackendKvReadV3ValuePart,
     BackendKvScanPlanV3Page, BackendKvScanPlanV3Projection, BackendKvScanPlanV3Request,
     BackendKvScanPlanV3ValuePart, BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch,
     BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteOp,
@@ -205,19 +204,6 @@ impl BackendReadTransaction for RocksDbBenchTransaction {
         request: BackendKvScanRequest,
     ) -> Result<BackendKvEntryPage, LixError> {
         rocksdb_scan_entries(
-            &self.inner.db,
-            &self.pending,
-            &self.pending_range_deletes,
-            &self.commit_ops,
-            request,
-        )
-    }
-
-    async fn scan2(
-        &mut self,
-        request: BackendKvScan2Request,
-    ) -> Result<BackendKvScan2Page, LixError> {
-        rocksdb_scan2(
             &self.inner.db,
             &self.pending,
             &self.pending_range_deletes,
@@ -526,78 +512,6 @@ fn rocksdb_scan_entries(
     }
     overlay_pending_values(&mut merged, pending, commit_ops, &request, &bounds)?;
     Ok(entry_page_from_iter(merged, request.limit))
-}
-
-fn rocksdb_scan2(
-    db: &DB,
-    pending: &BTreeMap<Vec<u8>, PendingWrite>,
-    pending_range_deletes: &[EncodedRange],
-    commit_ops: &[EncodedWriteOp],
-    request: BackendKvScan2Request,
-) -> Result<BackendKvScan2Page, LixError> {
-    match request.projection.clone() {
-        BackendKvScan2Projection::KeysOnly => {
-            let page = rocksdb_scan_keys(
-                db,
-                pending,
-                pending_range_deletes,
-                scan2_primary_request(&request),
-            )?;
-            Ok(BackendKvScan2Page {
-                keys: page.keys,
-                values: None,
-                resume_after: page.resume_after,
-            })
-        }
-        BackendKvScan2Projection::FullValue => {
-            let page = rocksdb_scan_entries(
-                db,
-                pending,
-                pending_range_deletes,
-                commit_ops,
-                scan2_primary_request(&request),
-            )?;
-            Ok(BackendKvScan2Page {
-                keys: page.keys,
-                values: Some(page.values),
-                resume_after: page.resume_after,
-            })
-        }
-        BackendKvScan2Projection::ValuePart(part) => rocksdb_scan2_value_part(
-            db,
-            pending,
-            pending_range_deletes,
-            commit_ops,
-            request,
-            part,
-        ),
-    }
-}
-
-fn rocksdb_scan2_value_part(
-    db: &DB,
-    pending: &BTreeMap<Vec<u8>, PendingWrite>,
-    pending_range_deletes: &[EncodedRange],
-    commit_ops: &[EncodedWriteOp],
-    request: BackendKvScan2Request,
-    part: lix_engine::BackendKvValuePart,
-) -> Result<BackendKvScan2Page, LixError> {
-    let page = rocksdb_scan_entries(
-        db,
-        pending,
-        pending_range_deletes,
-        commit_ops,
-        scan2_primary_request(&request),
-    )?;
-    let mut values = BytePageBuilder::with_capacity(page.values.len(), 0);
-    for value in page.values.iter() {
-        values.push(project_backend_value_part(value, &part)?);
-    }
-    Ok(BackendKvScan2Page {
-        keys: page.keys,
-        values: Some(values.finish()),
-        resume_after: page.resume_after,
-    })
 }
 
 fn rocksdb_scan_plan_v3(
@@ -1099,15 +1013,6 @@ fn rocksdb_scan_plan_v3_value_parts(
             .collect(),
         resume_after,
     })
-}
-
-fn scan2_primary_request(request: &BackendKvScan2Request) -> BackendKvScanRequest {
-    BackendKvScanRequest {
-        namespace: request.namespace.clone(),
-        range: request.range.clone(),
-        after: request.after.clone(),
-        limit: request.page_size,
-    }
 }
 
 fn scan_plan_v3_span_request(
