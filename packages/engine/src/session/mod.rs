@@ -1,11 +1,9 @@
 //! Engine session boundary.
 //!
-//! Transaction invariant:
-//! any engine operation that may write must enter through
-//! `SessionContext::with_write_transaction`. Reads that influence writes are
-//! only available from the transaction capability. Session APIs must not
-//! open `Transaction` directly or use session-level read helpers inside write
-//! flows.
+//! Transaction invariant: a session has one execution lease. Parent-handle
+//! calls use it for implicit single-statement execution; explicit transactions
+//! hold it until commit or rollback. Session APIs must not open `Transaction`
+//! directly or use session-level read helpers inside write flows.
 
 mod context;
 mod create_version;

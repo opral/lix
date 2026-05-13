@@ -309,7 +309,8 @@ export type Lix = {
 	 * This is not SQLite SQL. Use the DataFusion SQL dialect; positional
 	 * placeholders are `$1`, `$2`, and so on. SQLite-specific catalog tables and
 	 * transaction statements such as `sqlite_master`, `BEGIN`, and `COMMIT` are
-	 * not available. Use `information_schema` for catalog inspection.
+	 * not available. Use `information_schema` for catalog inspection. While a
+	 * transaction is active, call `execute()` on the transaction handle instead.
 	 */
 	execute(
 		sql: string,

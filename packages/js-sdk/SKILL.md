@@ -62,7 +62,7 @@ Do not use this skill for raw SQLite access, private engine/wasm internals, SDK 
 - Use `lix_json($1)` when inserting JSON text into JSON-typed columns.
 - Use scalar SQL functions `SELECT lix_uuid_v7()` and `SELECT lix_timestamp()` when consumer code needs Lix-generated UUID v7 ids or ISO timestamps. Do not call them as table functions with `SELECT * FROM ...`.
 - Use `beginTransaction()` for batch writes. One `lix.execute()` write is one transaction and therefore one commit.
-- Do not write through the parent `lix` handle while a transaction is active; use the transaction handle until `commit()` or `rollback()`.
+- Do not call `execute()` through the parent `lix` handle while a transaction is active; use the transaction handle for reads and writes until `commit()` or `rollback()`.
 - Use stable, namespaced, lowercase schema keys like `acme_section`, not generic names like `task`.
 - Always include `x-lix-primary-key` and `additionalProperties: false` on app schemas.
 - Use version names from the user's vocabulary, such as `"Marketing edit"` or `"Q3 pricing draft"`.
@@ -237,7 +237,7 @@ Transaction rules:
 - `commit()` makes the whole transaction durable as one commit.
 - `rollback()` drops the staged writes.
 - After `commit()` or `rollback()`, the transaction handle is closed and cannot be reused.
-- A Lix handle allows one active transaction at a time. While it is active, keep writes on `tx`; ordinary `lix.execute()` writes are rejected until the transaction closes.
+- A Lix handle allows one active transaction at a time. While it is active, use `tx.execute()` for reads and writes; parent-handle `lix.execute()` is rejected until the transaction closes.
 - Do not use a callback-style transaction helper. The JS SDK mirrors the Rust SDK shape: explicitly `beginTransaction()`, then `commit()` or `rollback()`.
 
 ## Registering Schemas
@@ -491,7 +491,7 @@ Other UDFs, such as `lix_json_get`, `lix_uuid_v7`, `lix_text_encode`, and `lix_e
 | Use `$1`, `$2`, `$3` placeholders. | Bare `?` placeholders. |
 | Use `lix_json($1)` for JSON parameters. | Inlining stringified JSON directly into SQL. |
 | Use `beginTransaction()` for imports and batch writes that should be one commit. | Loops of standalone `lix.execute()` writes for bulk imports. |
-| Use the transaction handle for writes until it commits or rolls back. | Mixing parent-handle writes into an active transaction. |
+| Use the transaction handle for reads and writes until it commits or rolls back. | Calling parent-handle `execute()` during an active transaction. |
 | Use `_by_version` for cross-version reads/writes. | Switching versions just to render a side-by-side view. |
 | Name versions in user vocabulary. | User-facing words like branch, branch-1, or generic Draft. |
 | Model collaborative data as small rows. | One giant row when multiple reviewers edit different parts. |

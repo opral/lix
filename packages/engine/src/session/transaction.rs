@@ -4,20 +4,20 @@ use crate::functions::FunctionContext;
 use crate::transaction::{open_transaction, Transaction};
 use crate::LixError;
 
-use super::context::SessionWriteGuard;
+use super::context::SessionTransactionGuard;
 use super::SessionContext;
 
 pub struct SessionTransaction {
     pub(super) transaction: Option<Transaction>,
     pub(super) runtime_functions: FunctionContext,
-    _write_guard: SessionWriteGuard,
+    _transaction_guard: SessionTransactionGuard,
     closed: bool,
 }
 
 impl SessionContext {
     pub async fn begin_transaction(&self) -> Result<SessionTransaction, LixError> {
         self.ensure_open()?;
-        let write_guard = self.reserve_write_transaction()?;
+        let transaction_guard = self.reserve_session_transaction()?;
         let opened = match open_transaction(
             &self.mode,
             self.storage.clone(),
@@ -38,7 +38,7 @@ impl SessionContext {
         Ok(SessionTransaction {
             transaction: Some(opened.transaction),
             runtime_functions: opened.runtime_functions,
-            _write_guard: write_guard,
+            _transaction_guard: transaction_guard,
             closed: false,
         })
     }

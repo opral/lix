@@ -310,7 +310,7 @@ async fn transaction_rollback_discards_staged_writes() {
 }
 
 #[tokio::test]
-async fn transaction_blocks_session_writes_on_same_handle() {
+async fn transaction_blocks_session_execute_on_same_handle() {
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     register_crm_task_schema(&lix).await;
 
@@ -340,6 +340,18 @@ async fn transaction_blocks_session_writes_on_same_handle() {
         .await
         .expect_err("session writes should be blocked while explicit transaction is active");
     assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
+
+    let error = lix
+        .execute("SELECT 1 AS ok", &[])
+        .await
+        .expect_err("session reads should be blocked while explicit transaction is active");
+    assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
+
+    let tx_read = tx
+        .execute("SELECT 1 AS ok", &[])
+        .await
+        .expect("transaction reads should remain available");
+    assert_eq!(tx_read.rows()[0].get::<i64>("ok").unwrap(), 1);
 
     tx.commit().await.unwrap();
 
