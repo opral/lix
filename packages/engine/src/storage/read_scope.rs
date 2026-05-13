@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use crate::storage::{
-    KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch, KvValuePage,
+    KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvRead3Page, KvRead3Request, KvScan2Page,
+    KvScan2Request, KvScanPlanPage, KvScanPlanRequest, KvScanRequest, KvValueBatch, KvValuePage,
     StorageReadTransaction, StorageReader,
 };
 use crate::LixError;
@@ -84,5 +85,20 @@ where
     async fn scan_entries(&mut self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
         let mut store = self.store.lock().await;
         store.scan_entries(request).await
+    }
+
+    async fn scan2(&mut self, request: KvScan2Request) -> Result<KvScan2Page, LixError> {
+        let mut store = self.store.lock().await;
+        store.scan2(request).await
+    }
+
+    async fn scan_plan(&mut self, request: KvScanPlanRequest) -> Result<KvScanPlanPage, LixError> {
+        let mut store = self.store.lock().await;
+        store.scan_plan(request).await
+    }
+
+    async fn read3(&mut self, request: KvRead3Request) -> Result<KvRead3Page, LixError> {
+        let mut store = self.store.lock().await;
+        store.read3(request).await
     }
 }

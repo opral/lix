@@ -3,8 +3,10 @@ use crate::LixError;
 
 const HEADER_VALUE_MAGIC: &[u8; 4] = b"LXUH";
 const PAYLOAD_VALUE_MAGIC: &[u8; 4] = b"LXUP";
+const PACKED_ROW_VALUE_MAGIC: &[u8; 4] = b"LXU2";
 const HEADER_FLAG_GLOBAL: u8 = 1 << 0;
 const PAYLOAD_FLAG_HAS_METADATA: u8 = 1 << 0;
+const PACKED_ROW_HEADER_LEN: usize = 25;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UntrackedStatePayloadValue {
@@ -135,6 +137,127 @@ pub(crate) fn decode_payload_value(bytes: &[u8]) -> Result<UntrackedStatePayload
     Ok(UntrackedStatePayloadValue {
         snapshot_content,
         metadata,
+    })
+}
+
+pub(crate) fn encode_packed_row_value_ref(
+    row: UntrackedStateRowRef<'_>,
+) -> Result<Option<Vec<u8>>, LixError> {
+    if row.snapshot_content.is_none() {
+        return Ok(None);
+    }
+    let header = encode_header_value_ref(row);
+    let payload = encode_payload_value_ref(row)
+        .ok_or_else(|| LixError::unknown("live untracked row missing payload"))?;
+    let header_len = u32::try_from(header.len()).map_err(|_| {
+        LixError::unknown("failed to encode untracked-state packed row: header too large")
+    })?;
+    let payload_len = u32::try_from(payload.len()).map_err(|_| {
+        LixError::unknown("failed to encode untracked-state packed row: payload too large")
+    })?;
+    let mut out = Vec::with_capacity(PACKED_ROW_HEADER_LEN + header.len() + payload.len());
+    out.extend_from_slice(PACKED_ROW_VALUE_MAGIC);
+    out.push(0);
+    push_fixed_width_decimal(&mut out, header_len);
+    push_fixed_width_decimal(&mut out, payload_len);
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&payload);
+    Ok(Some(out))
+}
+
+#[allow(dead_code)]
+pub(crate) fn decode_packed_header_value(
+    bytes: &[u8],
+    identity: UntrackedStateIdentity,
+) -> Result<UntrackedStateRow, LixError> {
+    decode_header_value(packed_header_value(bytes)?, identity)
+}
+
+#[allow(dead_code)]
+pub(crate) fn decode_packed_payload_value(
+    bytes: &[u8],
+) -> Result<UntrackedStatePayloadValue, LixError> {
+    decode_payload_value(packed_payload_value(bytes)?)
+}
+
+pub(crate) fn decode_packed_row_value(
+    bytes: &[u8],
+    identity: UntrackedStateIdentity,
+) -> Result<UntrackedStateRow, LixError> {
+    let header = packed_header_value(bytes)?;
+    let payload = packed_payload_value(bytes)?;
+    let mut row = decode_header_value(header, identity)?;
+    let payload = decode_payload_value(payload)?;
+    row.snapshot_content = Some(payload.snapshot_content);
+    row.metadata = payload.metadata;
+    Ok(row)
+}
+
+fn packed_header_value(bytes: &[u8]) -> Result<&[u8], LixError> {
+    let (header, _) = packed_value_parts(bytes)?;
+    Ok(header)
+}
+
+fn packed_payload_value(bytes: &[u8]) -> Result<&[u8], LixError> {
+    let (_, payload) = packed_value_parts(bytes)?;
+    Ok(payload)
+}
+
+fn packed_value_parts(bytes: &[u8]) -> Result<(&[u8], &[u8]), LixError> {
+    if bytes.len() < PACKED_ROW_HEADER_LEN
+        || bytes.get(..PACKED_ROW_VALUE_MAGIC.len()) != Some(PACKED_ROW_VALUE_MAGIC)
+    {
+        return Err(LixError::unknown(
+            "failed to decode untracked-state packed row value: invalid header",
+        ));
+    }
+    if bytes[PACKED_ROW_VALUE_MAGIC.len()] != 0 {
+        return Err(LixError::unknown(
+            "failed to decode untracked-state packed row value: invalid flags",
+        ));
+    }
+    let header_len = read_fixed_width_decimal(&bytes[5..15])?;
+    let payload_len = read_fixed_width_decimal(&bytes[15..25])?;
+    let header_start = PACKED_ROW_HEADER_LEN;
+    let header_end = header_start.checked_add(header_len).ok_or_else(|| {
+        LixError::unknown("failed to decode untracked-state packed row value: length overflow")
+    })?;
+    let payload_end = header_end.checked_add(payload_len).ok_or_else(|| {
+        LixError::unknown("failed to decode untracked-state packed row value: length overflow")
+    })?;
+    if payload_end != bytes.len() {
+        return Err(LixError::unknown(
+            "failed to decode untracked-state packed row value: trailing or short bytes",
+        ));
+    }
+    let header = bytes.get(header_start..header_end).ok_or_else(|| {
+        LixError::unknown("failed to decode untracked-state packed row value: short header")
+    })?;
+    let payload = bytes.get(header_end..payload_end).ok_or_else(|| {
+        LixError::unknown("failed to decode untracked-state packed row value: short payload")
+    })?;
+    Ok((header, payload))
+}
+
+fn push_fixed_width_decimal(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(format!("{value:010}").as_bytes());
+}
+
+fn read_fixed_width_decimal(bytes: &[u8]) -> Result<usize, LixError> {
+    if bytes.len() != 10 || bytes.iter().any(|byte| !byte.is_ascii_digit()) {
+        return Err(LixError::unknown(
+            "failed to decode untracked-state packed row value: invalid length",
+        ));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        LixError::unknown(format!(
+            "failed to decode untracked-state packed row value: invalid length utf-8: {error}"
+        ))
+    })?;
+    text.parse::<usize>().map_err(|error| {
+        LixError::unknown(format!(
+            "failed to decode untracked-state packed row value: invalid length: {error}"
+        ))
     })
 }
 
@@ -362,5 +485,56 @@ mod tests {
         let payload = encode_payload_value_ref(row.as_ref()).expect("payload should encode");
         assert_eq!(header, b"LXUH\x01\x01c\x01u");
         assert_eq!(payload, b"LXUP\x01\x03abc\x01m");
+    }
+
+    #[test]
+    fn packed_row_value_roundtrips_header_payload_and_full_row() {
+        let mut row = row();
+        row.snapshot_content = Some("abc".to_string());
+        row.metadata = Some("m".to_string());
+        row.created_at = "c".to_string();
+        row.updated_at = "u".to_string();
+        row.global = true;
+        let identity = UntrackedStateIdentity {
+            entity_id: row.entity_id.clone(),
+            schema_key: row.schema_key.clone(),
+            file_id: row.file_id.clone(),
+            version_id: row.version_id.clone(),
+        };
+
+        let packed = encode_packed_row_value_ref(row.as_ref())
+            .expect("packed row should encode")
+            .expect("live row should produce value");
+
+        let header = decode_packed_header_value(&packed, identity.clone())
+            .expect("packed header should decode");
+        assert_eq!(header.created_at, "c");
+        assert_eq!(header.updated_at, "u");
+        assert!(header.global);
+        assert_eq!(header.snapshot_content, None);
+
+        let payload = decode_packed_payload_value(&packed).expect("packed payload should decode");
+        assert_eq!(payload.snapshot_content, "abc");
+        assert_eq!(payload.metadata.as_deref(), Some("m"));
+
+        let decoded =
+            decode_packed_row_value(&packed, identity).expect("packed full row should decode");
+        assert_eq!(decoded.snapshot_content.as_deref(), Some("abc"));
+        assert_eq!(decoded.metadata.as_deref(), Some("m"));
+        assert_eq!(decoded.created_at, "c");
+    }
+
+    #[test]
+    fn packed_row_value_rejects_malformed_frame() {
+        assert!(decode_packed_payload_value(b"BAD!").is_err());
+        let mut invalid_flags = b"LXU2\x01".to_vec();
+        invalid_flags.extend_from_slice(b"0000000000");
+        invalid_flags.extend_from_slice(b"0000000000");
+        assert!(decode_packed_payload_value(&invalid_flags).is_err());
+
+        let mut short = b"LXU2\x00".to_vec();
+        short.extend_from_slice(b"0000000010");
+        short.extend_from_slice(b"0000000000");
+        assert!(decode_packed_payload_value(&short).is_err());
     }
 }
