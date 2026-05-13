@@ -1,31 +1,23 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::functions::FunctionContext;
 use crate::transaction::{open_transaction, Transaction};
 use crate::LixError;
 
+use super::context::SessionWriteGuard;
 use super::SessionContext;
 
 pub struct SessionTransaction {
     pub(super) transaction: Option<Transaction>,
     pub(super) runtime_functions: FunctionContext,
-    active_transaction: Arc<AtomicBool>,
+    _write_guard: SessionWriteGuard,
     closed: bool,
 }
 
 impl SessionContext {
     pub async fn begin_transaction(&self) -> Result<SessionTransaction, LixError> {
         self.ensure_open()?;
-        let active_transaction = self.active_transaction_flag();
-        if active_transaction
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err(transaction_state_error(
-                "Lix handle already has an active transaction",
-            ));
-        }
+        let write_guard = self.reserve_write_transaction()?;
         let opened = match open_transaction(
             &self.mode,
             self.storage.clone(),
@@ -40,14 +32,13 @@ impl SessionContext {
         {
             Ok(opened) => opened,
             Err(error) => {
-                active_transaction.store(false, Ordering::SeqCst);
                 return Err(error);
             }
         };
         Ok(SessionTransaction {
             transaction: Some(opened.transaction),
             runtime_functions: opened.runtime_functions,
-            active_transaction,
+            _write_guard: write_guard,
             closed: false,
         })
     }
@@ -73,7 +64,6 @@ impl SessionTransaction {
             .commit(&self.runtime_functions)
             .await
             .map(|_| ());
-        self.active_transaction.store(false, Ordering::SeqCst);
         result
     }
 
@@ -84,14 +74,7 @@ impl SessionTransaction {
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))?;
         self.closed = true;
         let result = transaction.rollback().await;
-        self.active_transaction.store(false, Ordering::SeqCst);
         result
-    }
-}
-
-impl Drop for SessionTransaction {
-    fn drop(&mut self) {
-        self.active_transaction.store(false, Ordering::SeqCst);
     }
 }
 
