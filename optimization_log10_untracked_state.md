@@ -3804,3 +3804,88 @@ lowering. This is still not a 2x result because the physical row layout remains
 packed and the operation still materializes the same row values; the API is now
 able to expose the dense access shape to backends.
 ```
+
+## Optimization 43: RocksDB streaming read4 Run cleanup
+
+Implementation:
+
+- Changed the isolated RocksDB untracked CRUD backend so clean `read4` `Run`
+  requests stream ordered RocksDB iterators directly instead of materializing
+  the whole run into a `BTreeMap`.
+- Split committed RocksDB `Run` lowering into a dedicated keys-only path and a
+  value-projecting path.
+- Kept the pending-write path on the existing merge/collect implementation for
+  correctness.
+
+Verification:
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine untracked_state:: --lib
+cargo test -p lix_engine storage:: --lib
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb|lix_redb)/smoke/.*/1k'
+```
+
+Smoke I/O scoreboard:
+
+```text
+Logical I/O is unchanged across backends. Public untracked reads still show two
+read4 calls: one format-marker read plus one row read. The get/scan columns are
+logical recorder buckets inside record_read4, not legacy API calls.
+```
+
+Smoke timing scoreboard:
+
+| backend     | operation                |          time 95% CI | Criterion change       |
+| ----------- | ------------------------ | -------------------: | ---------------------- |
+| lix_sqlite  | `insert_all_rows/1k`     | 6.2739 ms..6.5908 ms | no change              |
+| lix_sqlite  | `select_all_rows/1k`     | 4.7111 ms..4.8424 ms | regressed              |
+| lix_sqlite  | `select_keys_only/1k`    | 4.1488 ms..4.2243 ms | noise threshold        |
+| lix_sqlite  | `select_headers_only/1k` | 4.4478 ms..4.5633 ms | improved               |
+| lix_sqlite  | `select_one_by_pk/1k`    | 3.9476 ms..4.2760 ms | no change              |
+| lix_sqlite  | `select_all_by_pk/1k`    | 5.5535 ms..5.8664 ms | no change              |
+| lix_sqlite  | `update_all_rows/1k`     | 5.3803 ms..5.4809 ms | no change              |
+| lix_sqlite  | `update_one_by_pk/1k`    | 3.7272 ms..3.8993 ms | no change              |
+| lix_sqlite  | `delete_all_rows/1k`     | 3.9508 ms..4.1895 ms | improved               |
+| lix_sqlite  | `delete_one_by_pk/1k`    | 3.7880 ms..3.9211 ms | noise threshold        |
+| lix_rocksdb | `insert_all_rows/1k`     | 2.9471 ms..2.9783 ms | noise threshold        |
+| lix_rocksdb | `select_all_rows/1k`     | 1.6478 ms..1.6852 ms | no change              |
+| lix_rocksdb | `select_keys_only/1k`    | 1.2235 ms..1.2575 ms | no change              |
+| lix_rocksdb | `select_headers_only/1k` | 1.4341 ms..1.4909 ms | no change              |
+| lix_rocksdb | `select_one_by_pk/1k`    | 736.64 us..769.96 us | no change              |
+| lix_rocksdb | `select_all_by_pk/1k`    | 2.1807 ms..2.2295 ms | regressed              |
+| lix_rocksdb | `update_all_rows/1k`     | 2.1865 ms..2.2394 ms | no change              |
+| lix_rocksdb | `update_one_by_pk/1k`    | 621.44 us..640.95 us | no change              |
+| lix_rocksdb | `delete_all_rows/1k`     | 786.62 us..805.20 us | improved               |
+| lix_rocksdb | `delete_one_by_pk/1k`    | 643.31 us..672.08 us | no change              |
+| lix_redb    | `insert_all_rows/1k`     | 4.4527 ms..4.5735 ms | no change              |
+| lix_redb    | `select_all_rows/1k`     | 2.9346 ms..2.9734 ms | no change              |
+| lix_redb    | `select_keys_only/1k`    | 2.5933 ms..2.7669 ms | no change              |
+| lix_redb    | `select_headers_only/1k` | 2.6065 ms..2.7071 ms | noise threshold        |
+| lix_redb    | `select_one_by_pk/1k`    | 1.9023 ms..1.9447 ms | regressed              |
+| lix_redb    | `select_all_by_pk/1k`    | 3.5902 ms..3.6687 ms | no change              |
+| lix_redb    | `update_all_rows/1k`     | 3.9354 ms..4.0726 ms | improved               |
+| lix_redb    | `update_one_by_pk/1k`    | 1.8383 ms..1.9028 ms | no change              |
+| lix_redb    | `delete_all_rows/1k`     | 3.1006 ms..3.1686 ms | no change              |
+| lix_redb    | `delete_one_by_pk/1k`    | 2.0933 ms..2.2080 ms | no change              |
+
+Comparison to Optimization 42:
+
+| backend     | operation              | Optimization 42 | Optimization 43 | Result |
+| ----------- | ---------------------- | --------------: | --------------: | ------ |
+| lix_sqlite  | `select_all_by_pk/1k`  | 5.5339 ms..5.7322 ms | 5.5535 ms..5.8664 ms | roughly same |
+| lix_rocksdb | `select_all_by_pk/1k`  | 2.3339 ms..2.3857 ms | 2.1807 ms..2.2295 ms | ~5-9% faster than log entry |
+| lix_redb    | `select_all_by_pk/1k`  | 3.5972 ms..3.7912 ms | 3.5902 ms..3.6687 ms | same/slightly better |
+
+Result:
+
+```text
+The RocksDB streaming Run path keeps the improvement over Optimization 42 for
+dense by-primary-key reads, but Criterion reports no new improvement against the
+immediate local baseline after the targeted run moved that baseline forward.
+The dedicated keys-only Run split is cleaner structurally, but did not produce a
+separate measurable win; RocksDB key iteration and output page construction now
+appear to dominate the smoke key-only path.
+```
