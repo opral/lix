@@ -892,3 +892,78 @@ proof work:
 The next product-code cut is to decode/prove each visible candidate commit once
 per batch and reuse that membership proof for all requested change_ids.
 ```
+
+## Entry 12: Skip Change Decode For Physical Location Projection
+
+Change:
+
+```text
+ChangeProjection::PhysicalLocation no longer decodes and checksums the full
+SegmentChange on the indexed path.
+
+Readers still validate that the by_change locator matches the segment directory
+and that the byte range is inside the segment. Logical / Segment projections
+continue to decode and checksum the change body.
+```
+
+Measured with:
+
+```sh
+cargo bench --manifest-path packages/engine/Cargo.toml --features storage-benches --bench changelog_scorecard
+```
+
+### CPU Segment Scoreboard
+
+Times are milliseconds.
+
+| row                                     | entry_12_ms |
+| --------------------------------------- | ----------: |
+| encode_segment / 1c_1000ch              |       0.073 |
+| decode_segment / 1c_1000ch              |       3.338 |
+| view_segment / 1c_1000ch                |       0.026 |
+| validate_segment_shape / 1c_1000ch      |       4.706 |
+| build_decoded_segment_index / 1c_1000ch |       0.250 |
+| build_by_change / 1c_1000ch             |       0.694 |
+| build_by_change_membership / 1c_1000ch  |       0.038 |
+
+### Backend Smoke Scoreboard
+
+Times are milliseconds.
+
+| row                                                  | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms |
+| ---------------------------------------------------- | ----------: | -----------------: | -----------------: |
+| stage_segment_raw_no_indexes / 1c_1000ch             |       0.456 |              3.358 |              4.102 |
+| stage_segment / 1c_1000ch                            |       4.688 |              7.827 |              7.522 |
+| stage_publish_commit / 1c_1ch                        |       0.038 |              0.042 |              0.053 |
+| stage_publish_commit / 1c_100ch                      |       0.453 |              0.494 |              0.488 |
+| stage_publish_commit / 1c_1000ch single-shot         |       5.084 |              4.366 |              4.676 |
+| load_commits_visible_batched / 1c_100ch              |       0.186 |              0.168 |              0.185 |
+| load_changes_visible_batched / 1c_100ch              |       0.397 |              0.609 |              0.416 |
+| load_changes_visible_batched / 1c_1000ch             |       8.981 |             15.617 |              4.219 |
+| load_changes_physical_scattered / 100seg_100c_1000ch |       0.958 |              1.228 |              1.342 |
+| load_changes_visible_scattered / 100seg_100c_1000ch  |      10.383 |             16.545 |              4.624 |
+| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       6.074 |              7.396 |              6.207 |
+| plan_gc / live_50pct_mixed_segments                  |       6.127 |              6.380 |              6.239 |
+| collect_garbage / live_50pct_mixed_segments          |       6.669 |              7.009 |              7.193 |
+
+Read:
+
+```text
+This is a projection pushdown cut: if the caller asks only for the physical
+location, decoding the row fact is wasted work.
+
+load_changes_visible_batched / 1c_1000ch:
+  entry 11 rocksdb: 5.567ms
+  entry 12 rocksdb: 4.219ms
+
+load_changes_physical_scattered / 100seg_100c_1000ch:
+  entry 11 rocksdb: 2.914ms
+  entry 12 rocksdb: 1.342ms
+
+load_changes_visible_scattered / 100seg_100c_1000ch:
+  entry 11 rocksdb: 6.293ms
+  entry 12 rocksdb: 4.624ms
+
+The remaining visible-read cost is now mostly membership proof:
+by_change_membership scans, visible commit decode, and commit checksum.
+```
