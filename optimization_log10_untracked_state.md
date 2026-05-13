@@ -2776,3 +2776,730 @@ and projection controls bytes read. The removed read_many wrapper can no longer
 hide scan-vs-get costs or require fake materialized rows for identity-only
 results.
 ```
+
+## Optimization 34: projection-aware storage scan API
+
+Date: 2026-05-13
+
+Axis: move untracked scan projection lowering into storage/backend.
+
+Change:
+
+```text
+Added additive scan2 APIs to StorageReader and BackendReadTransaction:
+
+  primary_namespace: key order, cursor, range, returned keys
+  joined_namespaces: same-key namespaces allowed for joined values
+  projection: KeysOnly or Values([namespace...])
+
+The default fallback lowers to existing scan/get primitives:
+
+  KeysOnly -> scan_keys
+  primary Values -> scan_entries
+  joined Values -> primary scan plus grouped get_values for joined namespaces
+
+Untracked scan now issues one logical scan2 request per page:
+
+  Identity -> primary uh2, KeysOnly
+  Header   -> primary uh2, Values([uh2])
+  Payload  -> primary up2, Values([up2])
+  Full     -> primary uh2, joined up2, Values([uh2, up2])
+```
+
+Verification commands:
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine untracked_state:: --features storage-benches
+cargo test -p lix_engine storage:: --lib
+```
+
+Notes:
+
+```text
+This keeps the old storage APIs in place while giving untracked_state a single
+first-principles scan request shape. Missing joined payload values are preserved
+as None by storage scan2 and rejected by untracked full projection; header and
+identity projections remain payload-free.
+```
+
+Smoke scoreboard:
+
+```sh
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/(insert_all_rows|select_all_rows|select_keys_only|select_headers_only)/1k'
+```
+
+Smoke I/O scoreboard:
+
+| workload | backend     | operation             | logical rows | io ops | io bytes/row | read calls | get calls | get keys | scan calls | read rows | read bytes/row | puts | deletes | delete ranges | write bytes/row |
+| -------- | ----------- | --------------------- | -----------: | -----: | -----------: | ---------: | --------: | -------: | ---------: | --------: | -------------: | ---: | ------: | ------------: | --------------: |
+| smoke/1k | lix_sqlite  | `insert_all_rows`     |         1000 |      1 |      1012.51 |          0 |         0 |        0 |          0 |         0 |           0.00 | 2001 |       0 |             0 |         1012.51 |
+| smoke/1k | lix_sqlite  | `select_all_rows`     |         1000 |      3 |      1012.51 |          3 |         2 |     1001 |          1 |      2001 |        1012.51 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `select_keys_only`    |         1000 |      2 |        81.22 |          2 |         1 |        1 |          1 |      1001 |          81.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `select_headers_only` |         1000 |      2 |       136.22 |          2 |         1 |        1 |          1 |      1001 |         136.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `insert_all_rows`     |         1000 |      1 |      1012.51 |          0 |         0 |        0 |          0 |         0 |           0.00 | 2001 |       0 |             0 |         1012.51 |
+| smoke/1k | lix_rocksdb | `select_all_rows`     |         1000 |      3 |      1012.51 |          3 |         2 |     1001 |          1 |      2001 |        1012.51 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `select_keys_only`    |         1000 |      2 |        81.22 |          2 |         1 |        1 |          1 |      1001 |          81.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `select_headers_only` |         1000 |      2 |       136.22 |          2 |         1 |        1 |          1 |      1001 |         136.22 |    0 |       0 |             0 |            0.00 |
+
+Smoke timing scoreboard:
+
+| backend     | operation                |          time 95% CI | Criterion change                 |
+| ----------- | ------------------------ | -------------------: | -------------------------------- |
+| lix_sqlite  | `insert_all_rows/1k`     | 7.1249 ms..7.4199 ms | +0.6466%..+4.7433%, within noise |
+| lix_sqlite  | `select_all_rows/1k`     | 6.1300 ms..6.2851 ms | +23.890%..+27.821%, regressed    |
+| lix_sqlite  | `select_keys_only/1k`    | 4.4649 ms..4.5179 ms | -2.1406%..+1.4118%, no change    |
+| lix_sqlite  | `select_headers_only/1k` | 4.7178 ms..4.9949 ms | -2.4591%..+4.5266%, no change    |
+| lix_rocksdb | `insert_all_rows/1k`     | 3.4858 ms..3.5621 ms | -1.4041%..+1.8484%, no change    |
+| lix_rocksdb | `select_all_rows/1k`     | 2.0157 ms..2.0460 ms | +26.753%..+29.613%, regressed    |
+| lix_rocksdb | `select_keys_only/1k`    | 1.0817 ms..1.1319 ms | -2.8529%..+1.5468%, no change    |
+| lix_rocksdb | `select_headers_only/1k` | 1.3171 ms..1.4736 ms | -2.5478%..+4.6533%, no change    |
+
+Smoke notes:
+
+```text
+The default scan2 fallback preserves key-only and header-only I/O. Full scans
+now use one primary header scan plus grouped payload get_values in the fallback,
+so read bytes remain unchanged but select_all_rows regresses versus the prior
+lockstep dual-scan implementation until backend-specific scan2 overrides lower
+the joined projection more directly.
+```
+
+Native scan2 backend override follow-up:
+
+```text
+Implemented native scan2 overrides in the benchmark SQLite and RocksDB
+backends used by the untracked_state CRUD scoreboard.
+
+SQLite lowers Values([primary, joined...]) to one ordered primary scan with
+LEFT JOINs on requested joined namespaces by key. RocksDB lowers committed
+multi-namespace scan2 to one ordered primary iterator plus co-ordered joined
+iterators advanced to each primary key. Both preserve primary_namespace as the
+only source of key order, cursor, range, and returned keys.
+
+The benchmark counting wrapper now forwards scan2 to the inner backend instead
+of accidentally invoking the default fallback at the wrapper layer.
+```
+
+Verification commands:
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine storage:: --lib
+cargo test -p lix_engine untracked_state:: --features storage-benches
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/(insert_all_rows|select_all_rows|select_keys_only|select_headers_only)/1k'
+```
+
+Native scan2 smoke I/O scoreboard:
+
+| workload | backend     | operation             | logical rows | io ops | io bytes/row | read calls | get calls | get keys | scan calls | read rows | read bytes/row | puts | deletes | delete ranges | write bytes/row |
+| -------- | ----------- | --------------------- | -----------: | -----: | -----------: | ---------: | --------: | -------: | ---------: | --------: | -------------: | ---: | ------: | ------------: | --------------: |
+| smoke/1k | lix_sqlite  | `insert_all_rows`     |         1000 |      1 |      1012.51 |          0 |         0 |        0 |          0 |         0 |           0.00 | 2001 |       0 |             0 |         1012.51 |
+| smoke/1k | lix_sqlite  | `select_all_rows`     |         1000 |      2 |       931.31 |          2 |         1 |        1 |          1 |      2001 |         931.31 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `select_keys_only`    |         1000 |      2 |        81.22 |          2 |         1 |        1 |          1 |      1001 |          81.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `select_headers_only` |         1000 |      2 |       136.22 |          2 |         1 |        1 |          1 |      1001 |         136.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `insert_all_rows`     |         1000 |      1 |      1012.51 |          0 |         0 |        0 |          0 |         0 |           0.00 | 2001 |       0 |             0 |         1012.51 |
+| smoke/1k | lix_rocksdb | `select_all_rows`     |         1000 |      2 |       931.31 |          2 |         1 |        1 |          1 |      2001 |         931.31 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `select_keys_only`    |         1000 |      2 |        81.22 |          2 |         1 |        1 |          1 |      1001 |          81.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `select_headers_only` |         1000 |      2 |       136.22 |          2 |         1 |        1 |          1 |      1001 |         136.22 |    0 |       0 |             0 |            0.00 |
+
+Native scan2 smoke timing scoreboard:
+
+| backend     | operation                |          time 95% CI | Criterion change              |
+| ----------- | ------------------------ | -------------------: | ----------------------------- |
+| lix_sqlite  | `insert_all_rows/1k`     | 7.2089 ms..7.5665 ms | -0.5906%..+6.4073%, no change |
+| lix_sqlite  | `select_all_rows/1k`     | 5.3959 ms..5.8378 ms | -11.361%..-6.8866%, improved  |
+| lix_sqlite  | `select_keys_only/1k`    | 4.4697 ms..4.6229 ms | -0.9992%..+2.8956%, no change |
+| lix_sqlite  | `select_headers_only/1k` | 4.5916 ms..4.7424 ms | -5.4266%..+0.4231%, no change |
+| lix_rocksdb | `insert_all_rows/1k`     | 3.4360 ms..3.5090 ms | -1.9164%..+1.2597%, no change |
+| lix_rocksdb | `select_all_rows/1k`     | 1.5716 ms..1.6313 ms | -22.970%..-20.656%, improved  |
+| lix_rocksdb | `select_keys_only/1k`    | 1.0892 ms..1.2081 ms | -0.9241%..+7.5818%, no change |
+| lix_rocksdb | `select_headers_only/1k` | 1.2370 ms..1.3243 ms | -10.975%..-2.6151%, improved  |
+
+Native scan2 notes:
+
+```text
+The hard cut recovered the scan2 abstraction cost in smoke. Full scans now use
+one logical scan2 backend call after the format marker read, avoid duplicated
+payload key bytes in the accounting report, and improve select_all_rows on both
+bench backends versus the default fallback.
+```
+
+Storage plan smoke benchmark follow-up:
+
+```text
+Added a 1k smoke storage-plan benchmark group to untracked_state_crud:
+
+  untracked_state_crud/storage_plans/lix_sqlite/smoke/*
+  untracked_state_crud/storage_plans/lix_rocksdb/smoke/*
+  untracked_state_crud/storage_plans/raw_sqlite_projected/smoke/*
+
+The backend API plans use the same seeded untracked uh2/up2 rows:
+
+  scan_keys_header
+  scan_entries_header
+  dual_scan_full
+  scan2_join_full
+  primary_scan_get_payload_full
+
+The raw SQLite projected-table ceiling uses a single WITHOUT ROWID table with:
+
+  key BLOB PRIMARY KEY
+  header BLOB NOT NULL
+  payload BLOB NOT NULL
+```
+
+Verification commands:
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/storage_plans/.*/smoke/.*/1k'
+```
+
+Storage plan smoke timing scoreboard:
+
+| backend/profile      | plan                               |          time 95% CI |
+| -------------------- | ---------------------------------- | -------------------: |
+| lix_sqlite           | `scan_keys_header/1k`              | 4.1816 ms..4.3506 ms |
+| lix_sqlite           | `scan_entries_header/1k`           | 4.1440 ms..4.3025 ms |
+| lix_sqlite           | `dual_scan_full/1k`                | 4.6349 ms..6.5113 ms |
+| lix_sqlite           | `scan2_join_full/1k`               | 4.7852 ms..4.9004 ms |
+| lix_sqlite           | `primary_scan_get_payload_full/1k` | 5.3915 ms..5.5910 ms |
+| lix_rocksdb          | `scan_keys_header/1k`              | 786.11 us..873.01 us |
+| lix_rocksdb          | `scan_entries_header/1k`           | 849.93 us..863.63 us |
+| lix_rocksdb          | `dual_scan_full/1k`                | 1.0261 ms..1.0476 ms |
+| lix_rocksdb          | `scan2_join_full/1k`               | 1.0155 ms..1.0280 ms |
+| lix_rocksdb          | `primary_scan_get_payload_full/1k` | 1.4692 ms..1.5426 ms |
+| raw_sqlite_projected | `scan_keys/1k`                     | 3.8663 ms..3.9491 ms |
+| raw_sqlite_projected | `scan_header/1k`                   | 3.8932 ms..3.9778 ms |
+| raw_sqlite_projected | `scan_full/1k`                     | 3.8851 ms..4.0478 ms |
+
+Storage plan notes:
+
+```text
+The benchmark isolates the backend/storage plan cost from untracked decoding.
+For RocksDB, scan2 co-iteration and dual scan are effectively tied, while
+primary scan + payload get is materially slower. For SQLite, raw projected
+single-table scans are the ceiling and are faster than the generic KV plans;
+scan2 join is more stable than the dual-scan run here but still above the raw
+projected table ceiling.
+```
+
+## Optimization 35: packed KV untracked rows + value-projection scan2
+
+Hard-cut untracked storage from split `uh2`/`up2` namespaces to one packed `u3`
+KV namespace. `scan2` is now a single-namespace physical scan API with
+`KeysOnly`, `FullValue`, and projected value parts instead of same-key namespace
+joins. Untracked writes one framed value per live row, and header/payload scans
+project the framed value part they need.
+
+Implementation notes:
+
+```text
+- New untracked format marker: 3.
+- Old split marker 2 is rejected instead of compatibility-read.
+- Packed row value: LXU2 + flags + fixed-width decimal header/payload lengths
+  + existing header bytes + existing payload bytes.
+- SQLite bench backend lowers framed header/payload projections to substr(...)
+  over the single untracked KV table.
+- RocksDB bench backend uses one ordered iterator and projects value bytes after
+  reading each entry.
+```
+
+Verification commands:
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine storage:: --lib
+cargo test -p lix_engine untracked_state:: --features storage-benches
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/(insert_all_rows|select_all_rows|select_keys_only|select_headers_only)/1k'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/storage_plans/.*/smoke/.*/1k'
+```
+
+Smoke I/O scoreboard:
+
+| workload | backend     | operation             | logical rows | io ops | io bytes/row | read calls | get calls | get keys | scan calls | read rows | read bytes/row | puts | deletes | delete ranges | write bytes/row |
+| -------- | ----------- | --------------------- | -----------: | -----: | -----------: | ---------: | --------: | -------: | ---------: | --------: | -------------: | ---: | ------: | ------------: | --------------: |
+| smoke/1k | lix_sqlite  | `insert_all_rows`     |         1000 |      1 |       956.31 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          956.31 |
+| smoke/1k | lix_sqlite  | `select_all_rows`     |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `select_keys_only`    |         1000 |      2 |        81.22 |          2 |         1 |        1 |          1 |      1001 |          81.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `select_headers_only` |         1000 |      2 |       136.22 |          2 |         1 |        1 |          1 |      1001 |         136.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `insert_all_rows`     |         1000 |      1 |       956.31 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          956.31 |
+| smoke/1k | lix_rocksdb | `select_all_rows`     |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `select_keys_only`    |         1000 |      2 |        81.22 |          2 |         1 |        1 |          1 |      1001 |          81.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `select_headers_only` |         1000 |      2 |       136.22 |          2 |         1 |        1 |          1 |      1001 |         136.22 |    0 |       0 |             0 |            0.00 |
+
+Smoke timing scoreboard:
+
+| backend     | operation                |          time 95% CI | Criterion change              |
+| ----------- | ------------------------ | -------------------: | ----------------------------- |
+| lix_sqlite  | `insert_all_rows/1k`     | 6.3080 ms..6.8760 ms | -12.396%..+15.196%, no change |
+| lix_sqlite  | `select_all_rows/1k`     | 4.5881 ms..4.8284 ms | -18.716%..-13.567%, improved  |
+| lix_sqlite  | `select_keys_only/1k`    | 4.3094 ms..4.3693 ms | -5.8866%..-2.0172%, improved  |
+| lix_sqlite  | `select_headers_only/1k` | 4.5250 ms..4.6154 ms | -3.1345%..-0.0591%, no change |
+| lix_rocksdb | `insert_all_rows/1k`     | 2.9480 ms..3.0842 ms | -16.730%..-12.347%, improved  |
+| lix_rocksdb | `select_all_rows/1k`     | 1.5211 ms..1.5601 ms | -2.9810%..+7.3395%, no change |
+| lix_rocksdb | `select_keys_only/1k`    | 1.0761 ms..1.1772 ms | -8.3188%..+0.7880%, no change |
+| lix_rocksdb | `select_headers_only/1k` | 1.2944 ms..1.3642 ms | +1.3066%..+8.0670%, regressed |
+
+Storage plan smoke timing scoreboard:
+
+| backend/profile      | plan                           |          time 95% CI |
+| -------------------- | ------------------------------ | -------------------: |
+| lix_sqlite           | `scan_keys_row/1k`             | 3.8841 ms..3.9590 ms |
+| lix_sqlite           | `scan2_header_valuepart/1k`    | 4.0210 ms..4.1437 ms |
+| lix_sqlite           | `dual_scan2_header_payload/1k` | 4.3417 ms..4.4672 ms |
+| lix_sqlite           | `scan2_full_value/1k`          | 3.8748 ms..4.0528 ms |
+| lix_sqlite           | `scan_keys_get_full_value/1k`  | 5.0485 ms..5.2669 ms |
+| lix_rocksdb          | `scan_keys_row/1k`             | 814.86 us..837.35 us |
+| lix_rocksdb          | `scan2_header_valuepart/1k`    | 923.10 us..959.31 us |
+| lix_rocksdb          | `dual_scan2_header_payload/1k` | 1.1901 ms..1.2265 ms |
+| lix_rocksdb          | `scan2_full_value/1k`          | 885.74 us..911.21 us |
+| lix_rocksdb          | `scan_keys_get_full_value/1k`  | 1.4346 ms..1.4937 ms |
+| raw_sqlite_projected | `scan_keys/1k`                 | 3.8810 ms..3.9701 ms |
+| raw_sqlite_projected | `scan_header/1k`               | 3.8971 ms..4.0348 ms |
+| raw_sqlite_projected | `scan_full/1k`                 | 3.9954 ms..4.1977 ms |
+
+Optimization 35 notes:
+
+```text
+The packed KV shape removes the second live-row put in smoke: insert_all_rows
+drops from 2001 puts to 1001 puts. Full read I/O is one packed value per key;
+the fixed frame adds about 25 bytes/row versus the native scan2 split-read
+scoreboard, but write bytes still drop versus the split format because the
+payload namespace key is gone.
+
+The storage-plan ceiling moved as intended. SQLite scan2_full_value is now at
+the raw projected SQLite scan ceiling for 1k smoke, and RocksDB scan2_full_value
+is faster than the previous joined scan2 storage-plan result. Header-only
+RocksDB is slightly slower in this run because RocksDB still reads the full
+packed value before slicing; this is the expected tradeoff of keeping a simple
+KV value shape.
+```
+
+## Optimization 36: additive scan_plan API + untracked migration
+
+Added the first-principles backend-lowerable `scan_plan` API alongside legacy
+`scan2`. The legacy APIs stay source-compatible. Untracked scans now compile
+filters into ordered key spans and issue one logical `scan_plan` request per
+page; the default backend/storage fallback lowers spans through existing
+`scan_keys` / `scan_entries`.
+
+Implementation notes:
+
+```text
+- scan2 remains available for legacy callers and benchmark adapters.
+- scan_plan owns namespace, spans, after, page_size, and projection.
+- Untracked pushes version/schema/entity/file filters into key spans where the
+  row-key shape supports it, then keeps residual Rust filters for correctness.
+- No native SQLite/RocksDB scan_plan override was added in this pass, so
+  projected value-part scans use the fallback and read full packed values.
+```
+
+Verification and scoreboard commands:
+
+```sh
+cargo check -p lix_engine --features storage-benches --benches --tests
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/(insert_all_rows|select_all_rows|select_keys_only|select_headers_only)/1k'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/storage_plans/.*/smoke/.*/1k'
+```
+
+Smoke I/O scoreboard:
+
+| workload | backend     | operation             | logical rows | io ops | io bytes/row | read calls | get calls | get keys | scan calls | read rows | read bytes/row | puts | deletes | delete ranges | write bytes/row |
+| -------- | ----------- | --------------------- | -----------: | -----: | -----------: | ---------: | --------: | -------: | ---------: | --------: | -------------: | ---: | ------: | ------------: | --------------: |
+| smoke/1k | lix_sqlite  | `insert_all_rows`     |         1000 |      1 |       956.31 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          956.31 |
+| smoke/1k | lix_sqlite  | `select_all_rows`     |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `select_keys_only`    |         1000 |      2 |        81.22 |          2 |         1 |        1 |          1 |      1001 |          81.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `select_headers_only` |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `insert_all_rows`     |         1000 |      1 |       956.31 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          956.31 |
+| smoke/1k | lix_rocksdb | `select_all_rows`     |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `select_keys_only`    |         1000 |      2 |        81.22 |          2 |         1 |        1 |          1 |      1001 |          81.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `select_headers_only` |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
+
+Smoke timing scoreboard:
+
+| backend     | operation                |          time 95% CI | Criterion change              |
+| ----------- | ------------------------ | -------------------: | ----------------------------- |
+| lix_sqlite  | `insert_all_rows/1k`     | 6.0872 ms..6.2532 ms | -29.367%..-4.3810%, improved  |
+| lix_sqlite  | `select_all_rows/1k`     | 4.6176 ms..4.8058 ms | -2.2873%..+3.1899%, no change |
+| lix_sqlite  | `select_keys_only/1k`    | 4.0556 ms..4.1575 ms | -5.8344%..-1.8699%, improved  |
+| lix_sqlite  | `select_headers_only/1k` | 4.4472 ms..4.5585 ms | -2.0573%..+1.9168%, no change |
+| lix_rocksdb | `insert_all_rows/1k`     | 2.9690 ms..3.0612 ms | -2.3209%..+3.2582%, no change |
+| lix_rocksdb | `select_all_rows/1k`     | 1.5107 ms..1.5502 ms | -8.8005%..+2.1618%, no change |
+| lix_rocksdb | `select_keys_only/1k`    | 1.0937 ms..1.1454 ms | -1.7199%..+5.2797%, no change |
+| lix_rocksdb | `select_headers_only/1k` | 1.3231 ms..1.3614 ms | +0.0782%..+4.4395%, no change |
+
+Storage plan smoke timing scoreboard:
+
+| backend/profile      | plan                           |          time 95% CI |
+| -------------------- | ------------------------------ | -------------------: |
+| lix_sqlite           | `scan_keys_row/1k`             | 3.7184 ms..3.8961 ms |
+| lix_sqlite           | `scan2_header_valuepart/1k`    | 4.0606 ms..4.1722 ms |
+| lix_sqlite           | `dual_scan2_header_payload/1k` | 4.4911 ms..4.9946 ms |
+| lix_sqlite           | `scan2_full_value/1k`          | 3.8834 ms..4.0531 ms |
+| lix_sqlite           | `scan_keys_get_full_value/1k`  | 5.1495 ms..5.2216 ms |
+| lix_rocksdb          | `scan_keys_row/1k`             | 816.41 us..848.09 us |
+| lix_rocksdb          | `scan2_header_valuepart/1k`    | 917.51 us..937.14 us |
+| lix_rocksdb          | `dual_scan2_header_payload/1k` | 1.1864 ms..1.2589 ms |
+| lix_rocksdb          | `scan2_full_value/1k`          | 872.04 us..967.55 us |
+| lix_rocksdb          | `scan_keys_get_full_value/1k`  | 1.3636 ms..1.4090 ms |
+| raw_sqlite_projected | `scan_keys/1k`                 | 3.7906 ms..3.9605 ms |
+| raw_sqlite_projected | `scan_header/1k`               | 3.7746 ms..3.8746 ms |
+| raw_sqlite_projected | `scan_full/1k`                 | 3.7996 ms..3.8960 ms |
+
+Optimization 36 notes:
+
+```text
+This pass is an API/ownership cut, not a backend-native lowering pass. The key
+result is that untracked now expresses one physical scan plan with spans, cursor,
+limit, and projection while scan2 remains available.
+
+The I/O scoreboard exposes the next backend task clearly: select_headers_only
+now reads 956.31 bytes/row through fallback scan_entries instead of the 136.22
+bytes/row native scan2 value-part path from Optimization 35. Timings were still
+within noise for 1k smoke, but the I/O regression confirms that SQLite/RocksDB
+native scan_plan overrides are the next cut.
+
+The storage plan scoreboard above is still the legacy scan2 storage-plan group;
+it remains useful as the current native-projection ceiling until scan_plan-native
+storage-plan probes are added.
+```
+
+## Optimization 37: native scan_plan lowering for bench backends
+
+Implemented native `scan_plan` overrides for the storage benchmark backends and
+added direct scan-plan probes to the storage-plan smoke group. The additive
+`scan2` API remains intact; `scan_plan` is now the backend-lowerable path used
+by untracked scans and measurable directly in the benchmark harness.
+
+Implementation notes:
+
+```text
+- SQLite lowers scan_plan spans into ordered SQL key predicates.
+- SQLite projects Header, Payload, FullValue, and multi-part projections in one
+  query using the packed-row substr(...) expressions.
+- RocksDB iterates spans directly; KeysOnly stays on key scans, while value-part
+  projections read the packed value once and slice in backend code.
+- The counting benchmark wrapper now forwards scan_plan to the inner backend so
+  I/O probes measure native backend behavior instead of the default fallback.
+- The storage-plan smoke group now includes scan_plan_header_valuepart,
+  scan_plan_header_payload_parts, and scan_plan_full_value.
+```
+
+Verification and scoreboard commands:
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine storage:: --lib
+cargo test -p lix_engine untracked_state:: --lib
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/(insert_all_rows|select_all_rows|select_keys_only|select_headers_only)/1k'
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/storage_plans/.*/smoke/.*/1k'
+```
+
+Smoke I/O scoreboard:
+
+| workload | backend     | operation             | logical rows | io ops | io bytes/row | read calls | get calls | get keys | scan calls | read rows | read bytes/row | puts | deletes | delete ranges | write bytes/row |
+| -------- | ----------- | --------------------- | -----------: | -----: | -----------: | ---------: | --------: | -------: | ---------: | --------: | -------------: | ---: | ------: | ------------: | --------------: |
+| smoke/1k | lix_sqlite  | `insert_all_rows`     |         1000 |      1 |       956.31 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          956.31 |
+| smoke/1k | lix_sqlite  | `select_all_rows`     |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `select_keys_only`    |         1000 |      2 |        81.22 |          2 |         1 |        1 |          1 |      1001 |          81.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `select_headers_only` |         1000 |      2 |       136.22 |          2 |         1 |        1 |          1 |      1001 |         136.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `insert_all_rows`     |         1000 |      1 |       956.31 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          956.31 |
+| smoke/1k | lix_rocksdb | `select_all_rows`     |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `select_keys_only`    |         1000 |      2 |        81.22 |          2 |         1 |        1 |          1 |      1001 |          81.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `select_headers_only` |         1000 |      2 |       136.22 |          2 |         1 |        1 |          1 |      1001 |         136.22 |    0 |       0 |             0 |            0.00 |
+
+Smoke timing scoreboard:
+
+| backend     | operation                |          time 95% CI | Criterion change              |
+| ----------- | ------------------------ | -------------------: | ----------------------------- |
+| lix_sqlite  | `insert_all_rows/1k`     | 6.2740 ms..6.4024 ms | no change                     |
+| lix_sqlite  | `select_all_rows/1k`     | 4.6824 ms..6.4854 ms | no change                     |
+| lix_sqlite  | `select_keys_only/1k`    | 4.2193 ms..4.5494 ms | +1.0785%..+7.2012%, regressed |
+| lix_sqlite  | `select_headers_only/1k` | 4.4338 ms..4.6643 ms | no change                     |
+| lix_rocksdb | `insert_all_rows/1k`     | 2.9315 ms..3.0184 ms | no change                     |
+| lix_rocksdb | `select_all_rows/1k`     | 1.6008 ms..1.6429 ms | change within noise threshold |
+| lix_rocksdb | `select_keys_only/1k`    | 1.0587 ms..1.0765 ms | -6.6473%..-2.4297%, improved  |
+| lix_rocksdb | `select_headers_only/1k` | 1.3091 ms..1.3535 ms | no change                     |
+
+Storage plan smoke timing scoreboard:
+
+| backend/profile      | plan                                |          time 95% CI |
+| -------------------- | ----------------------------------- | -------------------: |
+| lix_sqlite           | `scan_keys_row/1k`                  | 3.9207 ms..4.1203 ms |
+| lix_sqlite           | `scan2_header_valuepart/1k`         | 4.0325 ms..4.1304 ms |
+| lix_sqlite           | `dual_scan2_header_payload/1k`      | 4.6262 ms..4.7536 ms |
+| lix_sqlite           | `scan2_full_value/1k`               | 3.9868 ms..4.1495 ms |
+| lix_sqlite           | `scan_plan_header_valuepart/1k`     | 4.0912 ms..4.1735 ms |
+| lix_sqlite           | `scan_plan_header_payload_parts/1k` | 4.3856 ms..4.4931 ms |
+| lix_sqlite           | `scan_plan_full_value/1k`           | 3.9665 ms..4.1127 ms |
+| lix_sqlite           | `scan_keys_get_full_value/1k`       | 5.2596 ms..5.4632 ms |
+| lix_rocksdb          | `scan_keys_row/1k`                  | 800.32 us..828.66 us |
+| lix_rocksdb          | `scan2_header_valuepart/1k`         | 945.05 us..1.0279 ms |
+| lix_rocksdb          | `dual_scan2_header_payload/1k`      | 1.2541 ms..1.3306 ms |
+| lix_rocksdb          | `scan2_full_value/1k`               | 930.68 us..947.22 us |
+| lix_rocksdb          | `scan_plan_header_valuepart/1k`     | 988.21 us..1.0164 ms |
+| lix_rocksdb          | `scan_plan_header_payload_parts/1k` | 1.0254 ms..1.0646 ms |
+| lix_rocksdb          | `scan_plan_full_value/1k`           | 940.60 us..979.61 us |
+| lix_rocksdb          | `scan_keys_get_full_value/1k`       | 1.3951 ms..1.4365 ms |
+| raw_sqlite_projected | `scan_keys/1k`                      | 3.9161 ms..4.0282 ms |
+| raw_sqlite_projected | `scan_header/1k`                    | 3.9471 ms..4.1030 ms |
+| raw_sqlite_projected | `scan_full/1k`                      | 4.1792 ms..4.3182 ms |
+
+Optimization 37 notes:
+
+```text
+The native scan_plan path restores header-only I/O from the Optimization 36
+fallback regression: select_headers_only is back to 136.22 bytes/row instead of
+956.31 bytes/row for both SQLite and RocksDB in the smoke I/O probe.
+
+The direct storage-plan scoreboard shows scan_plan_full_value at parity with
+scan2_full_value, and one-call scan_plan_header_payload_parts beating the
+legacy dual scan2 header+payload plan in this smoke run. SQLite improves from
+4.6262..4.7536 ms to 4.3856..4.4931 ms; RocksDB improves from
+1.2541..1.3306 ms to 1.0254..1.0646 ms.
+
+The remaining ceiling is physical layout, not API ownership: RocksDB still has
+to read packed values for Header/Payload projections, and SQLite projected
+header scans are near the raw projected SQLite ceiling but still pay packed-row
+substr decoding.
+```
+
+## Optimization 38: v3 read-plan API for projected point reads and dense get planning
+
+Added an additive backend/storage `read3` API and migrated untracked reads to
+use it. The older `get_values`, `exists_many`, `scan2`, and `scan_plan` APIs
+remain available.
+
+Implementation notes:
+
+```text
+- New read3 source shapes: Keys, Spans, and KeysOrSpans.
+- New read3 projection shape: KeysOnly or ValueParts(Header/Payload/FullValue).
+- read3 pages carry keys, presence bits, projected value pages, optional
+  request indexes, and scan cursors.
+- Default fallback lowers point reads to get_values/exists_many and span reads
+  to scan_plan.
+- Untracked get_many now uses read3 for identity/header/payload/full point
+  reads, preserving request order, duplicates, and misses.
+- Untracked scan now uses read3 span reads instead of direct scan_plan calls.
+- SQLite bench backend lowers projected point reads to one SQL query with the
+  same substr(...) projection expressions used for scan_plan.
+- SQLite KeysOrSpans uses a dense scan path at 512+ requested keys.
+- RocksDB bench backend lowers read3 to MultiGet for sparse keys, bounded
+  scan_plan for spans, and dense scan substitution at 4096+ requested keys.
+```
+
+Verification commands:
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine storage::context::tests::read3 --lib
+cargo test -p lix_engine untracked_state:: --lib
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/(select_all_by_pk|select_one_by_pk)/1k'
+```
+
+Smoke I/O notes:
+
+```text
+The v3 path preserves previous scan projection byte counts:
+- select_keys_only: 81.22 bytes/row for both SQLite and RocksDB.
+- select_headers_only: 136.22 bytes/row for both SQLite and RocksDB.
+- select_all_by_pk: 956.31 bytes/row for both SQLite and RocksDB.
+
+The I/O probe now records dense KeysOrSpans reads as scan-like logical reads
+when the backend takes the span-capable path.
+```
+
+Focused smoke timing scoreboard:
+
+| backend     | operation              |          time 95% CI | Criterion change              |
+| ----------- | ---------------------- | -------------------: | ----------------------------- |
+| lix_sqlite  | `select_one_by_pk/1k`  | 3.7533 ms..3.9476 ms | no change                     |
+| lix_sqlite  | `select_all_by_pk/1k`  | 5.4244 ms..5.6657 ms | no change                     |
+| lix_rocksdb | `select_one_by_pk/1k`  | 731.18 us..749.49 us | no change                     |
+| lix_rocksdb | `select_all_by_pk/1k`  | 2.3044 ms..2.3442 ms | -13.434%..-9.9288%, improved  |
+
+Optimization 38 notes:
+
+```text
+The API cut is now in place: untracked expresses projected point reads and
+span-capable dense reads through one storage request, and backends own the
+physical lowering. SQLite can project Header/Payload point reads without
+materializing full packed values. RocksDB keeps sparse reads on MultiGet and
+only switches to scan substitution above the smoke-regression threshold.
+
+The next benchmark work is a density matrix for select_all_by_pk at 1%, 10%,
+50%, and 100%, plus payload-size variants for projected point reads. That will
+let the backend thresholds become measured policy instead of hardcoded smoke
+heuristics.
+```
+
+Full smoke scoreboard rerun:
+
+```sh
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/.*/1k'
+```
+
+Full smoke I/O scoreboard:
+
+| workload | backend     | operation             | logical rows | io ops | io bytes/row | read calls | get calls | get keys | scan calls | read rows | read bytes/row | puts | deletes | delete ranges | write bytes/row |
+| -------- | ----------- | --------------------- | -----------: | -----: | -----------: | ---------: | --------: | -------: | ---------: | --------: | -------------: | ---: | ------: | ------------: | --------------: |
+| smoke/1k | lix_sqlite  | `insert_all_rows`     |         1000 |      1 |       956.31 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          956.31 |
+| smoke/1k | lix_sqlite  | `select_all_rows`     |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `select_keys_only`    |         1000 |      2 |        81.22 |          2 |         1 |        1 |          1 |      1001 |          81.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `select_headers_only` |         1000 |      2 |       136.22 |          2 |         1 |        1 |          1 |      1001 |         136.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `select_one_by_pk`    |            1 |      2 |       336.00 |          2 |         1 |        1 |          1 |         2 |         336.00 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `select_all_by_pk`    |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `update_all_rows`     |         1000 |      1 |       316.49 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          316.49 |
+| smoke/1k | lix_sqlite  | `update_one_by_pk`    |            1 |      1 |       179.00 |          0 |         0 |        0 |          0 |         0 |           0.00 |    2 |       0 |             0 |          179.00 |
+| smoke/1k | lix_sqlite  | `delete_all_rows`     |         1000 |      1 |         0.02 |          0 |         0 |        0 |          0 |         0 |           0.00 |    1 |       0 |             3 |            0.02 |
+| smoke/1k | lix_sqlite  | `delete_one_by_pk`    |            1 |      1 |        47.00 |          0 |         0 |        0 |          0 |         0 |           0.00 |    1 |       1 |             0 |           47.00 |
+| smoke/1k | lix_rocksdb | `insert_all_rows`     |         1000 |      1 |       956.31 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          956.31 |
+| smoke/1k | lix_rocksdb | `select_all_rows`     |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `select_keys_only`    |         1000 |      2 |        81.22 |          2 |         1 |        1 |          1 |      1001 |          81.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `select_headers_only` |         1000 |      2 |       136.22 |          2 |         1 |        1 |          1 |      1001 |         136.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `select_one_by_pk`    |            1 |      2 |       336.00 |          2 |         1 |        1 |          1 |         2 |         336.00 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `select_all_by_pk`    |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `update_all_rows`     |         1000 |      1 |       316.49 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          316.49 |
+| smoke/1k | lix_rocksdb | `update_one_by_pk`    |            1 |      1 |       179.00 |          0 |         0 |        0 |          0 |         0 |           0.00 |    2 |       0 |             0 |          179.00 |
+| smoke/1k | lix_rocksdb | `delete_all_rows`     |         1000 |      1 |         0.02 |          0 |         0 |        0 |          0 |         0 |           0.00 |    1 |       0 |             3 |            0.02 |
+| smoke/1k | lix_rocksdb | `delete_one_by_pk`    |            1 |      1 |        47.00 |          0 |         0 |        0 |          0 |         0 |           0.00 |    1 |       1 |             0 |           47.00 |
+
+Full smoke timing scoreboard:
+
+| backend     | operation                |          time 95% CI | Criterion change                  |
+| ----------- | ------------------------ | -------------------: | --------------------------------- |
+| lix_sqlite  | `insert_all_rows/1k`     | 6.2531 ms..6.4806 ms | no change                         |
+| lix_sqlite  | `select_all_rows/1k`     | 4.8661 ms..5.0333 ms | +3.1894%..+6.8280%, regressed     |
+| lix_sqlite  | `select_keys_only/1k`    | 4.4372 ms..4.7988 ms | +5.8552%..+11.063%, regressed     |
+| lix_sqlite  | `select_headers_only/1k` | 4.7482 ms..4.8692 ms | change within noise threshold     |
+| lix_sqlite  | `select_one_by_pk/1k`    | 4.1262 ms..4.4447 ms | +6.2468%..+14.613%, regressed     |
+| lix_sqlite  | `select_all_by_pk/1k`    | 5.7155 ms..5.8201 ms | +1.3034%..+6.3218%, regressed     |
+| lix_sqlite  | `update_all_rows/1k`     | 5.6017 ms..5.6758 ms | +7.9624%..+11.557%, regressed     |
+| lix_sqlite  | `update_one_by_pk/1k`    | 3.8087 ms..3.9978 ms | +3.4119%..+8.1866%, regressed     |
+| lix_sqlite  | `delete_all_rows/1k`     | 4.1421 ms..4.3714 ms | +4.5092%..+10.994%, regressed     |
+| lix_sqlite  | `delete_one_by_pk/1k`    | 4.0305 ms..4.3760 ms | +1.1131%..+12.458%, regressed     |
+| lix_rocksdb | `insert_all_rows/1k`     | 2.9472 ms..3.0212 ms | no change                         |
+| lix_rocksdb | `select_all_rows/1k`     | 1.5464 ms..1.6078 ms | no change                         |
+| lix_rocksdb | `select_keys_only/1k`    | 1.0740 ms..1.1004 ms | no change                         |
+| lix_rocksdb | `select_headers_only/1k` | 1.3613 ms..1.3823 ms | no change                         |
+| lix_rocksdb | `select_one_by_pk/1k`    | 729.42 us..753.85 us | no change                         |
+| lix_rocksdb | `select_all_by_pk/1k`    | 2.4002 ms..2.4466 ms | +4.1741%..+6.6691%, regressed     |
+| lix_rocksdb | `update_all_rows/1k`     | 2.2743 ms..2.3183 ms | +10.645%..+14.566%, regressed     |
+| lix_rocksdb | `update_one_by_pk/1k`    | 645.84 us..660.21 us | +5.2407%..+9.3978%, regressed     |
+| lix_rocksdb | `delete_all_rows/1k`     | 808.73 us..831.73 us | +1.7133%..+5.2046%, regressed     |
+| lix_rocksdb | `delete_one_by_pk/1k`    | 651.97 us..666.67 us | +3.5656%..+9.0407%, regressed     |
+
+Full smoke scoreboard note:
+
+```text
+The full smoke timing run is noisier than the focused read-only rerun and flags
+write/delete regressions even though Optimization 38 only changes read paths.
+The stable I/O table is the stronger correctness signal here. Before using the
+timing table to tune thresholds, rerun the density matrix and compare forced
+point vs forced scan strategies in the same Criterion baseline window.
+```
+
+## Optimization 39: explicit read3 strategies and compact scan presence
+
+Implementation:
+
+- Added `BackendKvRead3Strategy::{Auto, Points, Scan}` and mirrored storage-level strategy.
+- Kept untracked point reads on `Auto`, while scan reads declare `Scan`.
+- Added `BackendKvRead3Presence::{All, Bitmap}` and storage mirror so span scans no longer allocate one `true` bit per returned row.
+- Updated fallback, SQLite bench backend, RocksDB bench backend, untracked consumers, and I/O accounting to use compact presence helpers.
+- Added bench-only `LIX_READ3_STRATEGY=points|scan` override for backend `Auto` decisions so point-vs-scan density experiments can run without code edits.
+
+Verification:
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches --benches --tests
+cargo test -p lix_engine storage::context::tests::read3 --lib
+cargo test -p lix_engine untracked_state:: --lib
+LIX_UNTRACKED_STATE_CRUD_IO=smoke LIX_READ3_STRATEGY=scan cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+LIX_UNTRACKED_STATE_CRUD_IO=smoke cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud __io_probe_no_timing__
+cargo bench -p lix_engine --features storage-benches --bench untracked_state_crud -- 'untracked_state_crud/(lix_sqlite|lix_rocksdb)/smoke/.*/1k'
+```
+
+Default smoke I/O scoreboard:
+
+| workload | backend     | operation             | logical rows | io ops | io bytes/row | read calls | get calls | get keys | scan calls | read rows | read bytes/row | puts | deletes | delete ranges | write bytes/row |
+| -------- | ----------- | --------------------- | -----------: | -----: | -----------: | ---------: | --------: | -------: | ---------: | --------: | -------------: | ---: | ------: | ------------: | --------------: |
+| smoke/1k | lix_sqlite  | `insert_all_rows`     |         1000 |      1 |       956.31 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          956.31 |
+| smoke/1k | lix_sqlite  | `select_all_rows`     |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `select_keys_only`    |         1000 |      2 |        81.22 |          2 |         1 |        1 |          1 |      1001 |          81.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `select_headers_only` |         1000 |      2 |       136.22 |          2 |         1 |        1 |          1 |      1001 |         136.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `select_one_by_pk`    |            1 |      2 |       336.00 |          2 |         1 |        1 |          1 |         2 |         336.00 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `select_all_by_pk`    |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_sqlite  | `update_all_rows`     |         1000 |      1 |       316.49 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          316.49 |
+| smoke/1k | lix_sqlite  | `update_one_by_pk`    |            1 |      1 |       179.00 |          0 |         0 |        0 |          0 |         0 |           0.00 |    2 |       0 |             0 |          179.00 |
+| smoke/1k | lix_sqlite  | `delete_all_rows`     |         1000 |      1 |         0.02 |          0 |         0 |        0 |          0 |         0 |           0.00 |    1 |       0 |             3 |            0.02 |
+| smoke/1k | lix_sqlite  | `delete_one_by_pk`    |            1 |      1 |        47.00 |          0 |         0 |        0 |          0 |         0 |           0.00 |    1 |       1 |             0 |           47.00 |
+| smoke/1k | lix_rocksdb | `insert_all_rows`     |         1000 |      1 |       956.31 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          956.31 |
+| smoke/1k | lix_rocksdb | `select_all_rows`     |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `select_keys_only`    |         1000 |      2 |        81.22 |          2 |         1 |        1 |          1 |      1001 |          81.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `select_headers_only` |         1000 |      2 |       136.22 |          2 |         1 |        1 |          1 |      1001 |         136.22 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `select_one_by_pk`    |            1 |      2 |       336.00 |          2 |         1 |        1 |          1 |         2 |         336.00 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `select_all_by_pk`    |         1000 |      2 |       956.31 |          2 |         1 |        1 |          1 |      1001 |         956.31 |    0 |       0 |             0 |            0.00 |
+| smoke/1k | lix_rocksdb | `update_all_rows`     |         1000 |      1 |       316.49 |          0 |         0 |        0 |          0 |         0 |           0.00 | 1001 |       0 |             0 |          316.49 |
+| smoke/1k | lix_rocksdb | `update_one_by_pk`    |            1 |      1 |       179.00 |          0 |         0 |        0 |          0 |         0 |           0.00 |    2 |       0 |             0 |          179.00 |
+| smoke/1k | lix_rocksdb | `delete_all_rows`     |         1000 |      1 |         0.02 |          0 |         0 |        0 |          0 |         0 |           0.00 |    1 |       0 |             3 |            0.02 |
+| smoke/1k | lix_rocksdb | `delete_one_by_pk`    |            1 |      1 |        47.00 |          0 |         0 |        0 |          0 |         0 |           0.00 |    1 |       1 |             0 |           47.00 |
+
+Default smoke timing scoreboard:
+
+| backend     | operation                |          time 95% CI | Criterion change              |
+| ----------- | ------------------------ | -------------------: | ----------------------------- |
+| lix_sqlite  | `insert_all_rows/1k`     | 6.1586 ms..6.3194 ms | no change                     |
+| lix_sqlite  | `select_all_rows/1k`     | 4.7206 ms..4.8481 ms | -5.6665%..-1.7116%, improved  |
+| lix_sqlite  | `select_keys_only/1k`    | 4.3573 ms..4.4722 ms | change within noise threshold |
+| lix_sqlite  | `select_headers_only/1k` | 4.4960 ms..4.5854 ms | -5.5679%..-2.0745%, improved  |
+| lix_sqlite  | `select_one_by_pk/1k`    | 3.8902 ms..3.9732 ms | -9.3443%..-3.7231%, improved  |
+| lix_sqlite  | `select_all_by_pk/1k`    | 5.3756 ms..5.6342 ms | -8.4561%..-4.1783%, improved  |
+| lix_sqlite  | `update_all_rows/1k`     | 5.5015 ms..5.5965 ms | change within noise threshold |
+| lix_sqlite  | `update_one_by_pk/1k`    | 3.5835 ms..3.7482 ms | -10.145%..-6.1479%, improved  |
+| lix_sqlite  | `delete_all_rows/1k`     | 4.1619 ms..4.2600 ms | no change                     |
+| lix_sqlite  | `delete_one_by_pk/1k`    | 3.7839 ms..3.9009 ms | -13.033%..-3.4056%, improved  |
+| lix_rocksdb | `insert_all_rows/1k`     | 2.9601 ms..3.0870 ms | change within noise threshold |
+| lix_rocksdb | `select_all_rows/1k`     | 1.5837 ms..1.6157 ms | no change                     |
+| lix_rocksdb | `select_keys_only/1k`    | 1.0909 ms..1.1107 ms | no change                     |
+| lix_rocksdb | `select_headers_only/1k` | 1.3553 ms..1.3919 ms | no change                     |
+| lix_rocksdb | `select_one_by_pk/1k`    | 727.88 us..766.40 us | no change                     |
+| lix_rocksdb | `select_all_by_pk/1k`    | 2.3705 ms..2.5896 ms | no change                     |
+| lix_rocksdb | `update_all_rows/1k`     | 2.1938 ms..2.2540 ms | -4.7430%..-2.2151%, improved  |
+| lix_rocksdb | `update_one_by_pk/1k`    | 626.44 us..633.12 us | -4.3659%..-1.0469%, improved  |
+| lix_rocksdb | `delete_all_rows/1k`     | 805.21 us..844.93 us | no change                     |
+| lix_rocksdb | `delete_one_by_pk/1k`    | 654.47 us..672.61 us | no change                     |
+
+Result:
+
+```text
+All checks/tests passed. The default smoke I/O scoreboard stayed stable.
+The compact scan presence change recovered the previous SQLite read-path
+regressions: select_all_rows, select_headers_only, select_one_by_pk, and
+select_all_by_pk all improved in this Criterion window. RocksDB read paths are
+mostly neutral at smoke/1k.
+
+The important new benchmark knob remains:
+
+  LIX_READ3_STRATEGY=points|scan
+
+Use it with the density matrix to compare Auto, forced points, and forced scan
+for select_all_by_pk and projected point-read variants.
+```

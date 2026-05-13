@@ -36,11 +36,17 @@ pub use schema::{
 };
 
 pub use backend::{
-    Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetGroup,
-    BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest,
-    BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
-    BackendKvWriteGroup, BackendKvWriteOp, BackendKvWriteStats, BackendReadTransaction,
-    BackendWriteTransaction, BytePage, BytePageBuilder,
+    project_backend_read3_value_part, project_backend_scan_plan_value_part,
+    project_backend_value_part, Backend, BackendKvEntryPage, BackendKvExistsBatch,
+    BackendKvExistsGroup, BackendKvGetGroup, BackendKvGetRequest, BackendKvHeaderPayloadFramePart,
+    BackendKvKeyPage, BackendKvKeySpan, BackendKvRead3Order, BackendKvRead3Page,
+    BackendKvRead3Presence, BackendKvRead3Projection, BackendKvRead3Request, BackendKvRead3Source,
+    BackendKvRead3Strategy, BackendKvRead3ValuePart, BackendKvScan2Page, BackendKvScan2Projection,
+    BackendKvScan2Request, BackendKvScanPlanPage, BackendKvScanPlanRequest,
+    BackendKvScanPlanValuePart, BackendKvScanProjection, BackendKvScanRange, BackendKvScanRequest,
+    BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvValuePart,
+    BackendKvWriteBatch, BackendKvWriteGroup, BackendKvWriteOp, BackendKvWriteStats,
+    BackendReadTransaction, BackendWriteTransaction, BytePage, BytePageBuilder,
 };
 pub use common::LixError;
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};

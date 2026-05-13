@@ -1,7 +1,7 @@
 use crate::storage::{
-    get_values_single_namespace_chunked, KvEntryPage, KvGetGroup, KvGetRequest, KvScanRange,
-    KvScanRequest, KvValueGroup, KvWriteGroup, StorageReader, StorageWriteSet,
-    DEFAULT_GET_VALUES_CHUNK_SIZE,
+    KvGetGroup, KvGetRequest, KvKeySpan, KvRead3Order, KvRead3Page, KvRead3Projection,
+    KvRead3Request, KvRead3Source, KvRead3Strategy, KvRead3ValuePart, KvScanRange, KvScanRequest,
+    KvWriteGroup, StorageReader, StorageWriteSet,
 };
 use crate::untracked_state::{
     UntrackedStateGetManyRequest, UntrackedStateGetManyResponse, UntrackedStateIdentity,
@@ -10,16 +10,17 @@ use crate::untracked_state::{
 };
 use crate::{LixError, NullableKeyFilter};
 
-// Compact physical namespaces for untracked rows. Identity fields live in the
-// key; hot header fields and larger payload fields are split so projections
-// read only the bytes they request.
-pub(super) const UNTRACKED_STATE_HEADER_NAMESPACE: &str = "uh2";
-const UNTRACKED_STATE_PAYLOAD_NAMESPACE: &str = "up2";
+// Packed physical namespace for untracked rows. Identity fields live in the
+// key; header and payload fields live in one framed value so scans need one
+// ordered KV iterator and can project only the requested value bytes.
+pub(super) const UNTRACKED_STATE_ROW_NAMESPACE: &str = "u3";
+const LEGACY_UNTRACKED_STATE_HEADER_NAMESPACE: &str = "uh2";
+const LEGACY_UNTRACKED_STATE_PAYLOAD_NAMESPACE: &str = "up2";
 const LEGACY_UNTRACKED_STATE_ROW_NAMESPACE_V1: &str = "u1";
 const LEGACY_UNTRACKED_STATE_ROW_NAMESPACE: &str = "u";
 const UNTRACKED_STATE_FORMAT_NAMESPACE: &str = "lix.storage_format";
 const UNTRACKED_STATE_FORMAT_KEY: &[u8] = b"untracked_state";
-const UNTRACKED_STATE_FORMAT_VALUE: &[u8] = b"2";
+const UNTRACKED_STATE_FORMAT_VALUE: &[u8] = b"3";
 
 pub(crate) async fn get_many(
     store: &mut impl StorageReader,
@@ -47,74 +48,47 @@ async fn load_identity_existence(
     store: &mut (impl StorageReader + ?Sized),
     identities: &[UntrackedStateIdentity],
 ) -> Result<Vec<Option<UntrackedStateProjectedRow>>, LixError> {
-    let mut rows = Vec::with_capacity(identities.len());
-    for chunk in identities.chunks(DEFAULT_GET_VALUES_CHUNK_SIZE) {
-        let keys = chunk
-            .iter()
-            .map(encode_untracked_state_row_key)
-            .collect::<Vec<_>>();
-        let result = store
-            .exists_many(KvGetRequest {
-                groups: vec![KvGetGroup {
-                    namespace: UNTRACKED_STATE_HEADER_NAMESPACE.to_string(),
-                    keys,
-                }],
-            })
-            .await?;
-        let group = result.groups.into_iter().next().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "chunked storage exists returned no result group",
-            )
-        })?;
-        if group.namespace != UNTRACKED_STATE_HEADER_NAMESPACE {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "chunked storage exists returned namespace `{}` instead of `{}`",
-                    group.namespace, UNTRACKED_STATE_HEADER_NAMESPACE
-                ),
-            ));
-        }
-        if group.exists.len() != chunk.len() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "chunked storage exists returned {} results for {} requested keys",
-                    group.exists.len(),
-                    chunk.len()
-                ),
-            ));
-        }
-        rows.extend(
-            chunk
-                .iter()
-                .zip(group.exists)
-                .map(|(identity, exists)| exists.then(|| project_identity(identity.clone()))),
-        );
-    }
-    Ok(rows)
+    let page = read3_untracked_keys(
+        store,
+        identities,
+        KvRead3Projection::KeysOnly,
+        Some(point_read_covering_spans(identities)),
+    )
+    .await?;
+    validate_read3_point_page(&page, identities.len(), 0)?;
+    Ok(identities
+        .iter()
+        .cloned()
+        .zip(page.presence_vec())
+        .map(|(identity, present)| present.then(|| project_identity(identity)))
+        .collect())
 }
 
 async fn load_projected_headers(
     store: &mut (impl StorageReader + ?Sized),
     identities: &[UntrackedStateIdentity],
 ) -> Result<Vec<Option<UntrackedStateProjectedRow>>, LixError> {
-    let keys = identities
-        .iter()
-        .map(encode_untracked_state_row_key)
-        .collect::<Vec<_>>();
-    let values =
-        get_values_single_namespace_chunked(store, UNTRACKED_STATE_HEADER_NAMESPACE, &keys).await?;
+    let page = read3_untracked_keys(
+        store,
+        identities,
+        KvRead3Projection::ValueParts(vec![KvRead3ValuePart::Header]),
+        Some(point_read_covering_spans(identities)),
+    )
+    .await?;
+    validate_read3_point_page(&page, identities.len(), 1)?;
+    let headers = read3_values(&page, 0)?;
     identities
         .iter()
         .cloned()
-        .zip(values)
-        .map(|(identity, bytes)| {
-            let Some(bytes) = bytes else {
+        .enumerate()
+        .map(|(index, identity)| {
+            if !page.is_present(index).unwrap_or(false) {
                 return Ok(None);
-            };
-            let row = crate::untracked_state::codec::decode_header_value(&bytes, identity)?;
+            }
+            let bytes = headers
+                .get(index)
+                .ok_or_else(|| LixError::unknown("untracked-state read3 header value missing"))?;
+            let row = crate::untracked_state::codec::decode_header_value(bytes, identity)?;
             Ok(Some(project_header(row)))
         })
         .collect()
@@ -124,22 +98,27 @@ async fn load_projected_payloads(
     store: &mut (impl StorageReader + ?Sized),
     identities: &[UntrackedStateIdentity],
 ) -> Result<Vec<Option<UntrackedStateProjectedRow>>, LixError> {
-    let keys = identities
-        .iter()
-        .map(encode_untracked_state_row_key)
-        .collect::<Vec<_>>();
-    let values =
-        get_values_single_namespace_chunked(store, UNTRACKED_STATE_PAYLOAD_NAMESPACE, &keys)
-            .await?;
+    let page = read3_untracked_keys(
+        store,
+        identities,
+        KvRead3Projection::ValueParts(vec![KvRead3ValuePart::Payload]),
+        Some(point_read_covering_spans(identities)),
+    )
+    .await?;
+    validate_read3_point_page(&page, identities.len(), 1)?;
+    let payloads = read3_values(&page, 0)?;
     identities
         .iter()
         .cloned()
-        .zip(values)
-        .map(|(identity, bytes)| {
-            let Some(bytes) = bytes else {
+        .enumerate()
+        .map(|(index, identity)| {
+            if !page.is_present(index).unwrap_or(false) {
                 return Ok(None);
-            };
-            let payload = crate::untracked_state::codec::decode_payload_value(&bytes)?;
+            }
+            let bytes = payloads
+                .get(index)
+                .ok_or_else(|| LixError::unknown("untracked-state read3 payload value missing"))?;
+            let payload = crate::untracked_state::codec::decode_payload_value(bytes)?;
             Ok(Some(project_payload(identity, payload)))
         })
         .collect()
@@ -149,70 +128,30 @@ async fn load_projected_full_rows(
     store: &mut (impl StorageReader + ?Sized),
     identities: &[UntrackedStateIdentity],
 ) -> Result<Vec<Option<UntrackedStateProjectedRow>>, LixError> {
-    let mut rows = Vec::with_capacity(identities.len());
-    for chunk in identities.chunks(DEFAULT_GET_VALUES_CHUNK_SIZE) {
-        let keys = chunk
-            .iter()
-            .map(encode_untracked_state_row_key)
-            .collect::<Vec<_>>();
-        let result = store
-            .get_values(KvGetRequest {
-                groups: vec![
-                    KvGetGroup {
-                        namespace: UNTRACKED_STATE_HEADER_NAMESPACE.to_string(),
-                        keys: keys.clone(),
-                    },
-                    KvGetGroup {
-                        namespace: UNTRACKED_STATE_PAYLOAD_NAMESPACE.to_string(),
-                        keys,
-                    },
-                ],
-            })
-            .await?;
-        let mut groups = result.groups.into_iter();
-        let headers = groups.next().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "storage get returned no header result group",
-            )
-        })?;
-        let payloads = groups.next().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "storage get returned no payload result group",
-            )
-        })?;
-        validate_value_group(&headers, UNTRACKED_STATE_HEADER_NAMESPACE, chunk.len())?;
-        validate_value_group(&payloads, UNTRACKED_STATE_PAYLOAD_NAMESPACE, chunk.len())?;
-        for (index, identity) in chunk.iter().cloned().enumerate() {
-            let header = headers.value(index).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "storage header result group index missing",
-                )
-            })?;
-            let payload = payloads.value(index).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "storage payload result group index missing",
-                )
-            })?;
-            rows.push(match (header, payload) {
-                (None, None) => None,
-                (None, Some(_)) => return Err(orphan_payload_error(&identity)),
-                (Some(_), None) => return Err(missing_payload_error_for_identity(&identity)),
-                (Some(header), Some(payload)) => {
-                    let mut row =
-                        crate::untracked_state::codec::decode_header_value(header, identity)?;
-                    let payload = crate::untracked_state::codec::decode_payload_value(payload)?;
-                    row.snapshot_content = Some(payload.snapshot_content);
-                    row.metadata = payload.metadata;
-                    Some(project_row(row, UntrackedStateProjection::Full)?)
-                }
-            });
-        }
-    }
-    Ok(rows)
+    let page = read3_untracked_keys(
+        store,
+        identities,
+        KvRead3Projection::ValueParts(vec![KvRead3ValuePart::FullValue]),
+        Some(point_read_covering_spans(identities)),
+    )
+    .await?;
+    validate_read3_point_page(&page, identities.len(), 1)?;
+    let values = read3_values(&page, 0)?;
+    identities
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, identity)| {
+            if !page.is_present(index).unwrap_or(false) {
+                return Ok(None);
+            }
+            let value = values
+                .get(index)
+                .ok_or_else(|| LixError::unknown("untracked-state read3 full value missing"))?;
+            let row = crate::untracked_state::codec::decode_packed_row_value(value, identity)?;
+            Ok(Some(project_row(row, UntrackedStateProjection::Full)?))
+        })
+        .collect()
 }
 
 pub(crate) async fn scan(
@@ -241,36 +180,38 @@ async fn scan_identity(
     let mut rows = Vec::new();
     let batch_size = request.batch_size.unwrap_or(usize::MAX);
     let output_limit = request.limit.unwrap_or(usize::MAX).min(batch_size);
-    for range in scan_ranges_for_request(request) {
-        let Some(mut after) = scan_after_for_range(&range, request.after.as_deref()) else {
-            continue;
-        };
-        loop {
-            let page = store
-                .scan_keys(KvScanRequest {
-                    namespace: UNTRACKED_STATE_HEADER_NAMESPACE.to_string(),
-                    range: range.clone(),
+    let spans = scan_spans_for_request(request);
+    let mut after = request.after.clone();
+    loop {
+        let page = store
+            .read3(KvRead3Request {
+                namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
+                source: KvRead3Source::Spans {
+                    spans: spans.clone(),
                     after: after.clone(),
-                    limit: batch_size,
-                })
-                .await?;
-            for key in page.keys.iter() {
-                let identity = decode_untracked_state_row_key(key)?;
-                if identity_matches_scan(&identity, request) {
-                    rows.push(project_identity(identity));
-                    if rows.len() == output_limit {
-                        return Ok(UntrackedStateScanResponse {
-                            rows,
-                            resume_after: Some(key.to_vec()),
-                        });
-                    }
+                },
+                page_size: Some(batch_size),
+                projection: KvRead3Projection::KeysOnly,
+                order: KvRead3Order::KeyOrder,
+                strategy: KvRead3Strategy::Scan,
+            })
+            .await?;
+        for key in page.keys.iter() {
+            let identity = decode_untracked_state_row_key(key)?;
+            if identity_matches_scan(&identity, request) {
+                rows.push(project_identity(identity));
+                if rows.len() == output_limit {
+                    return Ok(UntrackedStateScanResponse {
+                        rows,
+                        resume_after: Some(key.to_vec()),
+                    });
                 }
             }
-            let Some(resume_after) = page.resume_after else {
-                break;
-            };
-            after = Some(resume_after);
         }
+        let Some(resume_after) = page.resume_after else {
+            break;
+        };
+        after = Some(resume_after);
     }
     Ok(UntrackedStateScanResponse {
         rows,
@@ -285,37 +226,43 @@ async fn scan_projected_headers(
     let mut rows = Vec::new();
     let batch_size = request.batch_size.unwrap_or(usize::MAX);
     let output_limit = request.limit.unwrap_or(usize::MAX).min(batch_size);
-    for range in scan_ranges_for_request(request) {
-        let Some(mut after) = scan_after_for_range(&range, request.after.as_deref()) else {
-            continue;
-        };
-        loop {
-            let page = store
-                .scan_entries(KvScanRequest {
-                    namespace: UNTRACKED_STATE_HEADER_NAMESPACE.to_string(),
-                    range: range.clone(),
+    let spans = scan_spans_for_request(request);
+    let mut after = request.after.clone();
+    loop {
+        let page = store
+            .read3(KvRead3Request {
+                namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
+                source: KvRead3Source::Spans {
+                    spans: spans.clone(),
                     after: after.clone(),
-                    limit: batch_size,
-                })
-                .await?;
-            for (key, value) in page.keys.iter().zip(page.values.iter()) {
-                let identity = decode_untracked_state_row_key(key)?;
-                let row = crate::untracked_state::codec::decode_header_value(value, identity)?;
-                if row_matches_scan(&row, request) {
-                    rows.push(project_header(row));
-                    if rows.len() == output_limit {
-                        return Ok(UntrackedStateScanResponse {
-                            rows,
-                            resume_after: Some(key.to_vec()),
-                        });
-                    }
+                },
+                page_size: Some(batch_size),
+                projection: KvRead3Projection::ValueParts(vec![KvRead3ValuePart::Header]),
+                order: KvRead3Order::KeyOrder,
+                strategy: KvRead3Strategy::Scan,
+            })
+            .await?;
+        let headers = read3_values(&page, 0)?;
+        for (index, key) in page.keys.iter().enumerate() {
+            let value = headers
+                .get(index)
+                .ok_or_else(|| LixError::unknown("untracked-state header scan value missing"))?;
+            let identity = decode_untracked_state_row_key(key)?;
+            let row = crate::untracked_state::codec::decode_header_value(value, identity)?;
+            if row_matches_scan(&row, request) {
+                rows.push(project_header(row));
+                if rows.len() == output_limit {
+                    return Ok(UntrackedStateScanResponse {
+                        rows,
+                        resume_after: Some(key.to_vec()),
+                    });
                 }
             }
-            let Some(resume_after) = page.resume_after else {
-                break;
-            };
-            after = Some(resume_after);
         }
+        let Some(resume_after) = page.resume_after else {
+            break;
+        };
+        after = Some(resume_after);
     }
     Ok(UntrackedStateScanResponse {
         rows,
@@ -330,37 +277,43 @@ async fn scan_projected_payloads(
     let mut rows = Vec::new();
     let batch_size = request.batch_size.unwrap_or(usize::MAX);
     let output_limit = request.limit.unwrap_or(usize::MAX).min(batch_size);
-    for range in scan_ranges_for_request(request) {
-        let Some(mut after) = scan_after_for_range(&range, request.after.as_deref()) else {
-            continue;
-        };
-        loop {
-            let page = store
-                .scan_entries(KvScanRequest {
-                    namespace: UNTRACKED_STATE_PAYLOAD_NAMESPACE.to_string(),
-                    range: range.clone(),
+    let spans = scan_spans_for_request(request);
+    let mut after = request.after.clone();
+    loop {
+        let page = store
+            .read3(KvRead3Request {
+                namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
+                source: KvRead3Source::Spans {
+                    spans: spans.clone(),
                     after: after.clone(),
-                    limit: batch_size,
-                })
-                .await?;
-            for (key, value) in page.keys.iter().zip(page.values.iter()) {
-                let identity = decode_untracked_state_row_key(key)?;
-                if identity_matches_scan(&identity, request) {
-                    let payload = crate::untracked_state::codec::decode_payload_value(value)?;
-                    rows.push(project_payload(identity, payload));
-                    if rows.len() == output_limit {
-                        return Ok(UntrackedStateScanResponse {
-                            rows,
-                            resume_after: Some(key.to_vec()),
-                        });
-                    }
+                },
+                page_size: Some(batch_size),
+                projection: KvRead3Projection::ValueParts(vec![KvRead3ValuePart::Payload]),
+                order: KvRead3Order::KeyOrder,
+                strategy: KvRead3Strategy::Scan,
+            })
+            .await?;
+        let payloads = read3_values(&page, 0)?;
+        for (index, key) in page.keys.iter().enumerate() {
+            let value = payloads
+                .get(index)
+                .ok_or_else(|| LixError::unknown("untracked-state payload scan value missing"))?;
+            let identity = decode_untracked_state_row_key(key)?;
+            if identity_matches_scan(&identity, request) {
+                let payload = crate::untracked_state::codec::decode_payload_value(value)?;
+                rows.push(project_payload(identity, payload));
+                if rows.len() == output_limit {
+                    return Ok(UntrackedStateScanResponse {
+                        rows,
+                        resume_after: Some(key.to_vec()),
+                    });
                 }
             }
-            let Some(resume_after) = page.resume_after else {
-                break;
-            };
-            after = Some(resume_after);
         }
+        let Some(resume_after) = page.resume_after else {
+            break;
+        };
+        after = Some(resume_after);
     }
     Ok(UntrackedStateScanResponse {
         rows,
@@ -375,97 +328,48 @@ async fn scan_projected_full_rows(
     let mut rows = Vec::new();
     let batch_size = request.batch_size.unwrap_or(usize::MAX);
     let output_limit = request.limit.unwrap_or(usize::MAX).min(batch_size);
-    for range in scan_ranges_for_request(request) {
-        let Some(mut after) = scan_after_for_range(&range, request.after.as_deref()) else {
-            continue;
-        };
-        loop {
-            let header_page = store
-                .scan_entries(KvScanRequest {
-                    namespace: UNTRACKED_STATE_HEADER_NAMESPACE.to_string(),
-                    range: range.clone(),
+    let spans = scan_spans_for_request(request);
+    let mut after = request.after.clone();
+    loop {
+        let page = store
+            .read3(KvRead3Request {
+                namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
+                source: KvRead3Source::Spans {
+                    spans: spans.clone(),
                     after: after.clone(),
-                    limit: batch_size,
-                })
-                .await?;
-            let payload_page = store
-                .scan_entries(KvScanRequest {
-                    namespace: UNTRACKED_STATE_PAYLOAD_NAMESPACE.to_string(),
-                    range: range.clone(),
-                    after: after.clone(),
-                    limit: batch_size,
-                })
-                .await?;
-            validate_join_pages(&header_page, &payload_page)?;
-            for ((key, header), payload) in header_page
-                .keys
-                .iter()
-                .zip(header_page.values.iter())
-                .zip(payload_page.values.iter())
-            {
-                let identity = decode_untracked_state_row_key(key)?;
-                let mut row = crate::untracked_state::codec::decode_header_value(header, identity)?;
-                let payload = crate::untracked_state::codec::decode_payload_value(payload)?;
-                row.snapshot_content = Some(payload.snapshot_content);
-                row.metadata = payload.metadata;
-                if row_matches_scan(&row, request) {
-                    rows.push(project_row(row, UntrackedStateProjection::Full)?);
-                    if rows.len() == output_limit {
-                        return Ok(UntrackedStateScanResponse {
-                            rows,
-                            resume_after: Some(key.to_vec()),
-                        });
-                    }
-                }
-            }
-            match (header_page.resume_after, payload_page.resume_after) {
-                (None, None) => break,
-                (Some(resume_after), Some(payload_resume_after))
-                    if payload_resume_after == resume_after =>
-                {
-                    after = Some(resume_after);
-                }
-                _ => {
-                    return Err(LixError::unknown(
-                        "untracked-state header and payload scan cursors diverged",
-                    ))
+                },
+                page_size: Some(batch_size),
+                projection: KvRead3Projection::ValueParts(vec![KvRead3ValuePart::FullValue]),
+                order: KvRead3Order::KeyOrder,
+                strategy: KvRead3Strategy::Scan,
+            })
+            .await?;
+        let values = read3_values(&page, 0)?;
+        for (index, key) in page.keys.iter().enumerate() {
+            let identity = decode_untracked_state_row_key(key)?;
+            let value = values
+                .get(index)
+                .ok_or_else(|| LixError::unknown("untracked-state full scan value missing"))?;
+            let row = crate::untracked_state::codec::decode_packed_row_value(value, identity)?;
+            if row_matches_scan(&row, request) {
+                rows.push(project_row(row, UntrackedStateProjection::Full)?);
+                if rows.len() == output_limit {
+                    return Ok(UntrackedStateScanResponse {
+                        rows,
+                        resume_after: Some(key.to_vec()),
+                    });
                 }
             }
         }
+        let Some(resume_after) = page.resume_after else {
+            break;
+        };
+        after = Some(resume_after);
     }
     Ok(UntrackedStateScanResponse {
         rows,
         resume_after: None,
     })
-}
-
-fn scan_after_for_range(range: &KvScanRange, after: Option<&[u8]>) -> Option<Option<Vec<u8>>> {
-    let Some(after) = after else {
-        return Some(None);
-    };
-    if key_in_range(after, range) {
-        return Some(Some(after.to_vec()));
-    }
-    if range_is_exhausted_by_after(range, after) {
-        return None;
-    }
-    Some(None)
-}
-
-fn range_is_exhausted_by_after(range: &KvScanRange, after: &[u8]) -> bool {
-    match range {
-        KvScanRange::Prefix(prefix) => prefix_upper_bound(prefix)
-            .as_deref()
-            .is_some_and(|upper| upper <= after),
-        KvScanRange::Range { end, .. } => end.as_slice() <= after,
-    }
-}
-
-fn key_in_range(key: &[u8], range: &KvScanRange) -> bool {
-    match range {
-        KvScanRange::Prefix(prefix) => key.starts_with(prefix),
-        KvScanRange::Range { start, end } => start.as_slice() <= key && key < end.as_slice(),
-    }
 }
 
 fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
@@ -568,30 +472,18 @@ where
 {
     stage_format_marker(writes);
     let rows = rows.into_iter();
-    let mut header_group = KvWriteGroup::new(UNTRACKED_STATE_HEADER_NAMESPACE);
-    let mut payload_group = KvWriteGroup::new(UNTRACKED_STATE_PAYLOAD_NAMESPACE);
+    let mut row_group = KvWriteGroup::new(UNTRACKED_STATE_ROW_NAMESPACE);
     let lower_bound = rows.size_hint().0;
-    header_group.reserve(lower_bound);
-    payload_group.reserve(lower_bound);
+    row_group.reserve(lower_bound);
     for row in rows {
         let key = encode_untracked_state_row_key_ref(row.into());
-        if row.snapshot_content.is_none() {
-            header_group.delete(key.clone());
-            payload_group.delete(key);
-        } else {
-            header_group.put(
-                key.clone(),
-                crate::untracked_state::codec::encode_header_value_ref(row),
-            );
-            let payload = crate::untracked_state::codec::encode_payload_value_ref(row)
-                .ok_or_else(|| LixError::unknown("live untracked row missing payload"))?;
-            payload_group.put(key, payload);
+        match crate::untracked_state::codec::encode_packed_row_value_ref(row)? {
+            Some(value) => row_group.put(key, value),
+            None => row_group.delete(key),
         }
     }
-    header_group.sort_point_ops_by_key();
-    payload_group.sort_point_ops_by_key();
-    writes.push_group(header_group);
-    writes.push_group(payload_group);
+    row_group.sort_point_ops_by_key();
+    writes.push_group(row_group);
     Ok(())
 }
 
@@ -601,31 +493,30 @@ where
 {
     stage_format_marker(writes);
     let identities = identities.into_iter();
-    let mut header_group = KvWriteGroup::new(UNTRACKED_STATE_HEADER_NAMESPACE);
-    let mut payload_group = KvWriteGroup::new(UNTRACKED_STATE_PAYLOAD_NAMESPACE);
+    let mut row_group = KvWriteGroup::new(UNTRACKED_STATE_ROW_NAMESPACE);
     let lower_bound = identities.size_hint().0;
-    header_group.reserve(lower_bound);
-    payload_group.reserve(lower_bound);
+    row_group.reserve(lower_bound);
     for identity in identities {
         let key = encode_untracked_state_row_key_ref(identity);
-        header_group.delete(key.clone());
-        payload_group.delete(key);
+        row_group.delete(key);
     }
-    header_group.sort_point_ops_by_key();
-    payload_group.sort_point_ops_by_key();
-    writes.push_group(header_group);
-    writes.push_group(payload_group);
+    row_group.sort_point_ops_by_key();
+    writes.push_group(row_group);
 }
 
 #[allow(dead_code)]
 pub(crate) fn stage_delete_all_rows(writes: &mut StorageWriteSet) {
     stage_format_marker(writes);
     writes.delete_range(
-        UNTRACKED_STATE_HEADER_NAMESPACE,
+        UNTRACKED_STATE_ROW_NAMESPACE,
         KvScanRange::prefix(Vec::new()),
     );
     writes.delete_range(
-        UNTRACKED_STATE_PAYLOAD_NAMESPACE,
+        LEGACY_UNTRACKED_STATE_HEADER_NAMESPACE,
+        KvScanRange::prefix(Vec::new()),
+    );
+    writes.delete_range(
+        LEGACY_UNTRACKED_STATE_PAYLOAD_NAMESPACE,
         KvScanRange::prefix(Vec::new()),
     );
 }
@@ -650,14 +541,16 @@ async fn ensure_read_format(store: &mut (impl StorageReader + ?Sized)) -> Result
             String::from_utf8_lossy(value)
         ))),
         None => {
-            let has_header = namespace_has_any_key(store, UNTRACKED_STATE_HEADER_NAMESPACE).await?;
+            let has_packed = namespace_has_any_key(store, UNTRACKED_STATE_ROW_NAMESPACE).await?;
+            let has_header =
+                namespace_has_any_key(store, LEGACY_UNTRACKED_STATE_HEADER_NAMESPACE).await?;
             let has_payload =
-                namespace_has_any_key(store, UNTRACKED_STATE_PAYLOAD_NAMESPACE).await?;
+                namespace_has_any_key(store, LEGACY_UNTRACKED_STATE_PAYLOAD_NAMESPACE).await?;
             let has_v1 =
                 namespace_has_any_key(store, LEGACY_UNTRACKED_STATE_ROW_NAMESPACE_V1).await?;
             let has_legacy =
                 namespace_has_any_key(store, LEGACY_UNTRACKED_STATE_ROW_NAMESPACE).await?;
-            if has_header || has_payload || has_v1 || has_legacy {
+            if has_packed || has_header || has_payload || has_v1 || has_legacy {
                 return Err(LixError::unknown(
                     "untracked-state rows exist without a storage format marker",
                 ));
@@ -690,34 +583,85 @@ fn stage_format_marker(writes: &mut StorageWriteSet) {
     );
 }
 
-fn scan_ranges_for_request(request: &UntrackedStateScanRequest) -> Vec<KvScanRange> {
-    let mut ranges = Vec::new();
+fn scan_spans_for_request(request: &UntrackedStateScanRequest) -> Vec<KvKeySpan> {
+    let mut spans = Vec::new();
     if request.filter.version_ids.is_empty() {
-        ranges.push(KvScanRange::prefix(Vec::new()));
-        return ranges;
+        spans.push(KvKeySpan::all());
+        return spans;
     }
 
     for version_id in &request.filter.version_ids {
         if request.filter.schema_keys.is_empty() {
-            ranges.push(KvScanRange::prefix(row_key_version_prefix(version_id)));
-        } else {
-            for schema_key in &request.filter.schema_keys {
-                ranges.push(KvScanRange::prefix(row_key_version_schema_prefix(
+            spans.push(prefix_span(row_key_version_prefix(version_id)));
+            continue;
+        }
+
+        for schema_key in &request.filter.schema_keys {
+            if request.filter.entity_ids.is_empty() {
+                spans.push(prefix_span(row_key_version_schema_prefix(
                     version_id, schema_key,
                 )));
+                continue;
+            }
+
+            for entity_id in &request.filter.entity_ids {
+                if request.filter.file_ids.is_empty()
+                    || request
+                        .filter
+                        .file_ids
+                        .iter()
+                        .any(|filter| matches!(filter, NullableKeyFilter::Any))
+                {
+                    spans.push(prefix_span(row_key_version_schema_entity_prefix(
+                        version_id, schema_key, entity_id,
+                    )));
+                    continue;
+                }
+
+                for file_filter in &request.filter.file_ids {
+                    match file_filter {
+                        NullableKeyFilter::Null => {
+                            spans.push(exact_row_key_span(UntrackedStateIdentityRef {
+                                version_id,
+                                schema_key,
+                                entity_id,
+                                file_id: None,
+                            }));
+                        }
+                        NullableKeyFilter::Value(file_id) => {
+                            spans.push(exact_row_key_span(UntrackedStateIdentityRef {
+                                version_id,
+                                schema_key,
+                                entity_id,
+                                file_id: Some(file_id.as_str()),
+                            }));
+                        }
+                        NullableKeyFilter::Any => {}
+                    }
+                }
             }
         }
     }
-    ranges.sort_by(|left, right| range_start(left).cmp(range_start(right)));
-    ranges.dedup_by(|left, right| range_start(left) == range_start(right));
-    ranges
+
+    spans.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then_with(|| left.end.cmp(&right.end))
+    });
+    spans.dedup();
+    spans
 }
 
-fn range_start(range: &KvScanRange) -> &[u8] {
-    match range {
-        KvScanRange::Prefix(prefix) => prefix,
-        KvScanRange::Range { start, .. } => start,
-    }
+fn exact_row_key_span(identity: UntrackedStateIdentityRef<'_>) -> KvKeySpan {
+    let key = encode_untracked_state_row_key_ref(identity);
+    let mut end = key.clone();
+    end.push(0);
+    KvKeySpan::new(key, end)
+}
+
+fn prefix_span(prefix: Vec<u8>) -> KvKeySpan {
+    let end = prefix_upper_bound(&prefix).unwrap_or_default();
+    KvKeySpan::new(prefix, end)
 }
 
 fn row_key_version_prefix(version_id: &str) -> Vec<u8> {
@@ -731,6 +675,27 @@ fn row_key_version_schema_prefix(version_id: &str, schema_key: &str) -> Vec<u8> 
         Vec::with_capacity(encoded_component_len(version_id) + encoded_component_len(schema_key));
     push_component(&mut out, version_id);
     push_component(&mut out, schema_key);
+    out
+}
+
+fn row_key_version_schema_entity_prefix(
+    version_id: &str,
+    schema_key: &str,
+    entity_id: &crate::entity_identity::EntityIdentity,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        encoded_component_len(version_id)
+            + encoded_component_len(schema_key)
+            + varint_len(entity_id.parts.len())
+            + entity_id
+                .parts
+                .iter()
+                .map(|part| encoded_component_len(part))
+                .sum::<usize>(),
+    );
+    push_component(&mut out, version_id);
+    push_component(&mut out, schema_key);
+    push_entity_identity(&mut out, entity_id);
     out
 }
 
@@ -765,65 +730,115 @@ fn nullable_matches_filters(value: &Option<String>, filters: &[NullableKeyFilter
         })
 }
 
-fn validate_value_group(
-    group: &KvValueGroup,
-    namespace: &'static str,
-    expected_len: usize,
-) -> Result<(), LixError> {
-    if group.namespace() != namespace {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "storage get returned namespace `{}` instead of `{namespace}`",
-                group.namespace()
-            ),
-        ));
-    }
-    if group.len() != expected_len {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "storage get returned {} results for {expected_len} requested keys",
-                group.len()
-            ),
-        ));
-    }
-    Ok(())
+async fn read3_untracked_keys(
+    store: &mut (impl StorageReader + ?Sized),
+    identities: &[UntrackedStateIdentity],
+    projection: KvRead3Projection,
+    spans: Option<Vec<KvKeySpan>>,
+) -> Result<KvRead3Page, LixError> {
+    let keys = identities
+        .iter()
+        .map(encode_untracked_state_row_key)
+        .collect::<Vec<_>>();
+    let source = match spans {
+        Some(spans) => KvRead3Source::KeysOrSpans { keys, spans },
+        None => KvRead3Source::Keys { keys },
+    };
+    store
+        .read3(KvRead3Request {
+            namespace: UNTRACKED_STATE_ROW_NAMESPACE.to_string(),
+            source,
+            projection,
+            order: KvRead3Order::RequestOrder,
+            page_size: None,
+            strategy: KvRead3Strategy::Auto,
+        })
+        .await
 }
 
-fn validate_join_pages(
-    header_page: &KvEntryPage,
-    payload_page: &KvEntryPage,
+fn validate_read3_point_page(
+    page: &KvRead3Page,
+    expected_len: usize,
+    expected_value_parts: usize,
 ) -> Result<(), LixError> {
-    if header_page.len() != payload_page.len() {
-        return Err(LixError::unknown(format!(
-            "untracked-state header/payload scan length mismatch: {} headers, {} payloads",
-            header_page.len(),
-            payload_page.len()
-        )));
+    if page.keys.len() != expected_len {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "storage read3 returned {} keys for {expected_len} requested keys",
+                page.keys.len()
+            ),
+        ));
     }
-    for (header_key, payload_key) in header_page.keys.iter().zip(payload_page.keys.iter()) {
-        if header_key != payload_key {
-            return Err(LixError::unknown(
-                "untracked-state header and payload keys diverged during scan",
+    if page.presence_len() != expected_len {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "storage read3 returned {} presence bits for {expected_len} requested keys",
+                page.presence_len()
+            ),
+        ));
+    }
+    if page.values.len() != expected_value_parts {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "storage read3 returned {} value parts for {expected_value_parts} requested parts",
+                page.values.len()
+            ),
+        ));
+    }
+    for values in &page.values {
+        if values.len() != expected_len {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "storage read3 returned {} values for {expected_len} requested keys",
+                    values.len()
+                ),
             ));
         }
     }
     Ok(())
 }
 
-fn missing_payload_error_for_identity(identity: &UntrackedStateIdentity) -> LixError {
-    LixError::unknown(format!(
-        "untracked-state payload missing for header identity `{}` `{}`",
-        identity.version_id, identity.schema_key
-    ))
+fn read3_values(
+    page: &KvRead3Page,
+    part_index: usize,
+) -> Result<&crate::backend::BytePage, LixError> {
+    let values = page.values.get(part_index).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "storage read3 returned no projected values",
+        )
+    })?;
+    if values.len() != page.keys.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "storage read3 returned {} values for {} keys",
+                values.len(),
+                page.keys.len()
+            ),
+        ));
+    }
+    Ok(values)
 }
 
-fn orphan_payload_error(identity: &UntrackedStateIdentity) -> LixError {
-    LixError::unknown(format!(
-        "untracked-state payload exists without header for identity `{}` `{}`",
-        identity.version_id, identity.schema_key
-    ))
+fn point_read_covering_spans(identities: &[UntrackedStateIdentity]) -> Vec<KvKeySpan> {
+    let mut keys = identities
+        .iter()
+        .map(encode_untracked_state_row_key)
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    keys.sort();
+    keys.dedup();
+    let start = keys.first().expect("keys is non-empty").clone();
+    let mut end = keys.last().expect("keys is non-empty").clone();
+    end.push(0);
+    vec![KvKeySpan::new(start, end)]
 }
 
 fn encode_untracked_state_row_key(identity: &UntrackedStateIdentity) -> Vec<u8> {
@@ -1022,7 +1037,10 @@ mod tests {
 
     use super::*;
     use crate::backend::testing::UnitTestBackend;
-    use crate::storage::{StorageContext, StorageWriteTransaction};
+    use crate::storage::{
+        KvEntryPage, KvExistsBatch, KvKeyPage, KvScanPlanPage, KvScanPlanRequest, KvScanProjection,
+        KvValueBatch, KvValuePage, StorageContext, StorageReader, StorageWriteTransaction,
+    };
     use crate::untracked_state::{
         MaterializedUntrackedStateRow, UntrackedStateContext, UntrackedStateRowRequest,
     };
@@ -1348,9 +1366,11 @@ mod tests {
             .expect("transaction should open");
         let mut writes = StorageWriteSet::new();
         writes.put(
-            UNTRACKED_STATE_HEADER_NAMESPACE,
+            UNTRACKED_STATE_ROW_NAMESPACE,
             encode_untracked_state_row_key_ref(row.as_ref().into()),
-            crate::untracked_state::codec::encode_header_value_ref(row.as_ref()),
+            crate::untracked_state::codec::encode_packed_row_value_ref(row.as_ref())
+                .expect("packed row should encode")
+                .expect("live row should produce packed value"),
         );
         writes
             .apply(transaction.as_mut())
@@ -1403,7 +1423,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn header_projection_tolerates_missing_payload_but_full_projection_rejects_it() {
+    async fn read_rejects_old_split_marker() {
         let backend = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(backend.clone());
         let context = UntrackedStateContext::new();
@@ -1417,9 +1437,13 @@ mod tests {
         let canonical =
             crate::test_support::untracked_state_row_from_materialized(&mut writes, &row)
                 .expect("row should canonicalize");
-        stage_format_marker(&mut writes);
         writes.put(
-            UNTRACKED_STATE_HEADER_NAMESPACE,
+            UNTRACKED_STATE_FORMAT_NAMESPACE,
+            UNTRACKED_STATE_FORMAT_KEY.to_vec(),
+            b"2".to_vec(),
+        );
+        writes.put(
+            LEGACY_UNTRACKED_STATE_HEADER_NAMESPACE,
             encode_untracked_state_row_key_ref(canonical.as_ref().into()),
             crate::untracked_state::codec::encode_header_value_ref(canonical.as_ref()),
         );
@@ -1429,31 +1453,18 @@ mod tests {
             .expect("manual header row should write");
         transaction.commit().await.expect("commit should succeed");
 
-        let header_rows = context
-            .reader(storage.clone())
-            .scan(UntrackedStateScanRequest {
-                projection: crate::untracked_state::UntrackedStateProjection::Header,
-                ..Default::default()
-            })
-            .await
-            .expect("header scan should not need payload");
-        assert_eq!(header_rows.rows.len(), 1);
-        assert_eq!(
-            header_rows.rows[0].created_at.as_deref(),
-            Some(row.created_at.as_str())
-        );
-        assert_eq!(header_rows.rows[0].snapshot_content, None);
-
         let error = read_scan(
             &context,
             storage.clone(),
             UntrackedStateScanRequest::default(),
         )
         .await
-        .expect_err("full scan should reject missing payload");
+        .expect_err("old split marker should be rejected");
         assert!(
-            error.message.contains("payload"),
-            "error should describe missing payload: {error:?}"
+            error
+                .message
+                .contains("unsupported untracked-state storage format marker"),
+            "error should describe unsupported marker: {error:?}"
         );
     }
 
@@ -1837,6 +1848,102 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn identity_scan_uses_keys_only_for_untracked_rows() {
+        let backend = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(backend.clone());
+        let context = UntrackedStateContext::new();
+        let row = untracked_row(crate::GLOBAL_VERSION_ID, "lix_key_value", "a");
+        let mut transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("transaction should open");
+        write_materialized_rows_to_store(
+            &context,
+            transaction.as_mut(),
+            std::slice::from_ref(&row),
+        )
+        .await;
+        transaction.commit().await.expect("commit should succeed");
+
+        let mut guarded = UntrackedValueForbiddenStorage {
+            inner: storage.clone(),
+        };
+        let page = scan(
+            &mut guarded,
+            UntrackedStateScanRequest {
+                projection: crate::untracked_state::UntrackedStateProjection::Identity,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("identity scan should succeed without untracked value reads");
+
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].identity, materialized_identity(&row));
+    }
+
+    struct UntrackedValueForbiddenStorage {
+        inner: StorageContext,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageReader for UntrackedValueForbiddenStorage {
+        async fn get_values(&mut self, request: KvGetRequest) -> Result<KvValueBatch, LixError> {
+            reject_untracked_value_get(&request)?;
+            self.inner.get_values(request).await
+        }
+
+        async fn exists_many(&mut self, request: KvGetRequest) -> Result<KvExistsBatch, LixError> {
+            reject_untracked_value_get(&request)?;
+            self.inner.exists_many(request).await
+        }
+
+        async fn scan_keys(&mut self, request: KvScanRequest) -> Result<KvKeyPage, LixError> {
+            self.inner.scan_keys(request).await
+        }
+
+        async fn scan_values(&mut self, request: KvScanRequest) -> Result<KvValuePage, LixError> {
+            reject_untracked_value_scan_namespace(&request.namespace)?;
+            self.inner.scan_values(request).await
+        }
+
+        async fn scan_entries(&mut self, request: KvScanRequest) -> Result<KvEntryPage, LixError> {
+            reject_untracked_value_scan_namespace(&request.namespace)?;
+            self.inner.scan_entries(request).await
+        }
+
+        async fn scan_plan(
+            &mut self,
+            request: KvScanPlanRequest,
+        ) -> Result<KvScanPlanPage, LixError> {
+            if request.namespace == UNTRACKED_STATE_ROW_NAMESPACE
+                && request.projection != KvScanProjection::KeysOnly
+            {
+                return Err(LixError::unknown(
+                    "identity scan unexpectedly read untracked row values",
+                ));
+            }
+            self.inner.scan_plan(request).await
+        }
+    }
+
+    fn reject_untracked_value_get(request: &KvGetRequest) -> Result<(), LixError> {
+        for group in &request.groups {
+            reject_untracked_value_scan_namespace(&group.namespace)?;
+        }
+        Ok(())
+    }
+
+    fn reject_untracked_value_scan_namespace(namespace: &str) -> Result<(), LixError> {
+        if namespace == UNTRACKED_STATE_ROW_NAMESPACE {
+            return Err(LixError::unknown(
+                "identity scan unexpectedly read untracked row values",
+            ));
+        }
+        Ok(())
+    }
+
     #[test]
     fn row_key_roundtrips_identity() {
         let identity = UntrackedStateIdentity {
@@ -1913,9 +2020,9 @@ mod tests {
             },
             ..Default::default()
         };
-        let starts = scan_ranges_for_request(&request)
+        let starts = scan_spans_for_request(&request)
             .into_iter()
-            .map(|range| range_start(&range).to_vec())
+            .map(|span| span.start)
             .collect::<Vec<_>>();
         assert_eq!(
             starts,
@@ -1924,6 +2031,41 @@ mod tests {
                 b"\x02v1\x01b".to_vec(),
                 b"\x02v2\x01a".to_vec(),
                 b"\x02v2\x01b".to_vec(),
+            ]
+        );
+
+        let entity_id = crate::entity_identity::EntityIdentity::single("entity");
+        let request = UntrackedStateScanRequest {
+            filter: crate::untracked_state::UntrackedStateFilter {
+                version_ids: vec!["v".to_string()],
+                schema_keys: vec!["s".to_string()],
+                entity_ids: vec![entity_id.clone()],
+                file_ids: vec![
+                    NullableKeyFilter::Null,
+                    NullableKeyFilter::Value("f".to_string()),
+                ],
+            },
+            ..Default::default()
+        };
+        let starts = scan_spans_for_request(&request)
+            .into_iter()
+            .map(|span| span.start)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            starts,
+            vec![
+                encode_untracked_state_row_key(&UntrackedStateIdentity {
+                    version_id: "v".to_string(),
+                    schema_key: "s".to_string(),
+                    entity_id: entity_id.clone(),
+                    file_id: None,
+                }),
+                encode_untracked_state_row_key(&UntrackedStateIdentity {
+                    version_id: "v".to_string(),
+                    schema_key: "s".to_string(),
+                    entity_id,
+                    file_id: Some("f".to_string()),
+                }),
             ]
         );
     }

@@ -4,11 +4,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lix_engine::{
-    Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetRequest,
-    BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch,
-    BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteOp,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, BytePageBuilder,
-    LixError,
+    project_backend_read3_value_part, project_backend_scan_plan_value_part,
+    project_backend_value_part, Backend, BackendKvEntryPage, BackendKvExistsBatch,
+    BackendKvExistsGroup, BackendKvGetRequest, BackendKvKeyPage, BackendKvKeySpan,
+    BackendKvRead3Order, BackendKvRead3Page, BackendKvRead3Presence, BackendKvRead3Projection,
+    BackendKvRead3Request, BackendKvRead3Source, BackendKvRead3Strategy, BackendKvRead3ValuePart,
+    BackendKvScan2Page, BackendKvScan2Projection, BackendKvScan2Request, BackendKvScanPlanPage,
+    BackendKvScanPlanRequest, BackendKvScanPlanValuePart, BackendKvScanProjection,
+    BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch, BackendKvValueGroup,
+    BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteOp, BackendKvWriteStats,
+    BackendReadTransaction, BackendWriteTransaction, BytePageBuilder, LixError,
 };
 use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
 use tempfile::TempDir;
@@ -199,6 +204,45 @@ impl BackendReadTransaction for RocksDbBenchTransaction {
         request: BackendKvScanRequest,
     ) -> Result<BackendKvEntryPage, LixError> {
         rocksdb_scan_entries(
+            &self.inner.db,
+            &self.pending,
+            &self.pending_range_deletes,
+            &self.commit_ops,
+            request,
+        )
+    }
+
+    async fn scan2(
+        &mut self,
+        request: BackendKvScan2Request,
+    ) -> Result<BackendKvScan2Page, LixError> {
+        rocksdb_scan2(
+            &self.inner.db,
+            &self.pending,
+            &self.pending_range_deletes,
+            &self.commit_ops,
+            request,
+        )
+    }
+
+    async fn scan_plan(
+        &mut self,
+        request: BackendKvScanPlanRequest,
+    ) -> Result<BackendKvScanPlanPage, LixError> {
+        rocksdb_scan_plan(
+            &self.inner.db,
+            &self.pending,
+            &self.pending_range_deletes,
+            &self.commit_ops,
+            request,
+        )
+    }
+
+    async fn read3(
+        &mut self,
+        request: BackendKvRead3Request,
+    ) -> Result<BackendKvRead3Page, LixError> {
+        rocksdb_read3(
             &self.inner.db,
             &self.pending,
             &self.pending_range_deletes,
@@ -481,6 +525,675 @@ fn rocksdb_scan_entries(
     }
     overlay_pending_values(&mut merged, pending, commit_ops, &request, &bounds)?;
     Ok(entry_page_from_iter(merged, request.limit))
+}
+
+fn rocksdb_scan2(
+    db: &DB,
+    pending: &BTreeMap<Vec<u8>, PendingWrite>,
+    pending_range_deletes: &[EncodedRange],
+    commit_ops: &[EncodedWriteOp],
+    request: BackendKvScan2Request,
+) -> Result<BackendKvScan2Page, LixError> {
+    match request.projection.clone() {
+        BackendKvScan2Projection::KeysOnly => {
+            let page = rocksdb_scan_keys(
+                db,
+                pending,
+                pending_range_deletes,
+                scan2_primary_request(&request),
+            )?;
+            Ok(BackendKvScan2Page {
+                keys: page.keys,
+                values: None,
+                resume_after: page.resume_after,
+            })
+        }
+        BackendKvScan2Projection::FullValue => {
+            let page = rocksdb_scan_entries(
+                db,
+                pending,
+                pending_range_deletes,
+                commit_ops,
+                scan2_primary_request(&request),
+            )?;
+            Ok(BackendKvScan2Page {
+                keys: page.keys,
+                values: Some(page.values),
+                resume_after: page.resume_after,
+            })
+        }
+        BackendKvScan2Projection::ValuePart(part) => rocksdb_scan2_value_part(
+            db,
+            pending,
+            pending_range_deletes,
+            commit_ops,
+            request,
+            part,
+        ),
+    }
+}
+
+fn rocksdb_scan2_value_part(
+    db: &DB,
+    pending: &BTreeMap<Vec<u8>, PendingWrite>,
+    pending_range_deletes: &[EncodedRange],
+    commit_ops: &[EncodedWriteOp],
+    request: BackendKvScan2Request,
+    part: lix_engine::BackendKvValuePart,
+) -> Result<BackendKvScan2Page, LixError> {
+    let page = rocksdb_scan_entries(
+        db,
+        pending,
+        pending_range_deletes,
+        commit_ops,
+        scan2_primary_request(&request),
+    )?;
+    let mut values = BytePageBuilder::with_capacity(page.values.len(), 0);
+    for value in page.values.iter() {
+        values.push(project_backend_value_part(value, &part)?);
+    }
+    Ok(BackendKvScan2Page {
+        keys: page.keys,
+        values: Some(values.finish()),
+        resume_after: page.resume_after,
+    })
+}
+
+fn rocksdb_scan_plan(
+    db: &DB,
+    pending: &BTreeMap<Vec<u8>, PendingWrite>,
+    pending_range_deletes: &[EncodedRange],
+    commit_ops: &[EncodedWriteOp],
+    request: BackendKvScanPlanRequest,
+) -> Result<BackendKvScanPlanPage, LixError> {
+    match request.projection {
+        BackendKvScanProjection::KeysOnly => rocksdb_scan_plan_keys(
+            db,
+            pending,
+            pending_range_deletes,
+            request.namespace,
+            request.spans,
+            request.after,
+            request.page_size,
+        ),
+        BackendKvScanProjection::ValueParts(parts) => rocksdb_scan_plan_value_parts(
+            db,
+            pending,
+            pending_range_deletes,
+            commit_ops,
+            request.namespace,
+            request.spans,
+            request.after,
+            request.page_size,
+            parts,
+        ),
+    }
+}
+
+const ROCKSDB_READ3_DENSE_SCAN_THRESHOLD: usize = 4096;
+
+fn rocksdb_read3(
+    db: &DB,
+    pending: &BTreeMap<Vec<u8>, PendingWrite>,
+    pending_range_deletes: &[EncodedRange],
+    commit_ops: &[EncodedWriteOp],
+    request: BackendKvRead3Request,
+) -> Result<BackendKvRead3Page, LixError> {
+    match request.source {
+        BackendKvRead3Source::Spans { spans, after } => {
+            let page = rocksdb_scan_plan(
+                db,
+                pending,
+                pending_range_deletes,
+                commit_ops,
+                BackendKvScanPlanRequest {
+                    namespace: request.namespace,
+                    spans,
+                    after,
+                    page_size: request.page_size.unwrap_or(usize::MAX),
+                    projection: read3_scan_projection(request.projection),
+                },
+            )?;
+            Ok(BackendKvRead3Page {
+                keys: page.keys,
+                presence: BackendKvRead3Presence::All,
+                values: page.values,
+                request_indexes: None,
+                resume_after: page.resume_after,
+            })
+        }
+        BackendKvRead3Source::Keys { keys } => rocksdb_read3_keys(
+            db,
+            pending,
+            pending_range_deletes,
+            commit_ops,
+            request.namespace,
+            keys,
+            request.projection,
+            request.order,
+        ),
+        BackendKvRead3Source::KeysOrSpans { keys, spans } => {
+            let strategy = effective_read3_strategy(request.strategy);
+            let use_scan = match strategy {
+                BackendKvRead3Strategy::Scan => !spans.is_empty(),
+                BackendKvRead3Strategy::Points => false,
+                BackendKvRead3Strategy::Auto => {
+                    request.order == BackendKvRead3Order::RequestOrder
+                        && keys.len() >= ROCKSDB_READ3_DENSE_SCAN_THRESHOLD
+                        && !spans.is_empty()
+                }
+            };
+            if use_scan {
+                rocksdb_read3_dense_scan(
+                    db,
+                    pending,
+                    pending_range_deletes,
+                    commit_ops,
+                    request.namespace,
+                    keys,
+                    spans,
+                    request.projection,
+                )
+            } else {
+                rocksdb_read3_keys(
+                    db,
+                    pending,
+                    pending_range_deletes,
+                    commit_ops,
+                    request.namespace,
+                    keys,
+                    request.projection,
+                    request.order,
+                )
+            }
+        }
+    }
+}
+
+fn effective_read3_strategy(strategy: BackendKvRead3Strategy) -> BackendKvRead3Strategy {
+    if strategy != BackendKvRead3Strategy::Auto {
+        return strategy;
+    }
+    match std::env::var("LIX_READ3_STRATEGY").as_deref() {
+        Ok("points") => BackendKvRead3Strategy::Points,
+        Ok("scan") => BackendKvRead3Strategy::Scan,
+        _ => BackendKvRead3Strategy::Auto,
+    }
+}
+
+fn rocksdb_read3_keys(
+    db: &DB,
+    pending: &BTreeMap<Vec<u8>, PendingWrite>,
+    pending_range_deletes: &[EncodedRange],
+    commit_ops: &[EncodedWriteOp],
+    namespace: String,
+    keys: Vec<Vec<u8>>,
+    projection: BackendKvRead3Projection,
+    order: BackendKvRead3Order,
+) -> Result<BackendKvRead3Page, LixError> {
+    let part_count = match &projection {
+        BackendKvRead3Projection::KeysOnly => 0,
+        BackendKvRead3Projection::ValueParts(parts) => parts.len(),
+    };
+    if keys.is_empty() {
+        return Ok(empty_read3_page(part_count));
+    }
+
+    let resolved_values = rocksdb_resolve_values(
+        db,
+        pending,
+        pending_range_deletes,
+        commit_ops,
+        &namespace,
+        &keys,
+    )?;
+    let parts = match projection {
+        BackendKvRead3Projection::KeysOnly => Vec::new(),
+        BackendKvRead3Projection::ValueParts(parts) => parts,
+    };
+    assemble_read3_from_resolved(keys, resolved_values, &parts, order)
+}
+
+fn rocksdb_read3_dense_scan(
+    db: &DB,
+    pending: &BTreeMap<Vec<u8>, PendingWrite>,
+    pending_range_deletes: &[EncodedRange],
+    commit_ops: &[EncodedWriteOp],
+    namespace: String,
+    keys: Vec<Vec<u8>>,
+    spans: Vec<BackendKvKeySpan>,
+    projection: BackendKvRead3Projection,
+) -> Result<BackendKvRead3Page, LixError> {
+    let scan_projection = read3_scan_projection(projection.clone());
+    let parts = match projection {
+        BackendKvRead3Projection::KeysOnly => Vec::new(),
+        BackendKvRead3Projection::ValueParts(parts) => parts,
+    };
+    let page = rocksdb_scan_plan(
+        db,
+        pending,
+        pending_range_deletes,
+        commit_ops,
+        BackendKvScanPlanRequest {
+            namespace,
+            spans,
+            after: None,
+            page_size: usize::MAX,
+            projection: scan_projection,
+        },
+    )?;
+    let mut values_by_key = BTreeMap::new();
+    for (index, key) in page.keys.iter().enumerate() {
+        let mut values = Vec::with_capacity(parts.len());
+        for values_page in &page.values {
+            values.push(
+                values_page
+                    .get(index)
+                    .ok_or_else(|| LixError::unknown("rocksdb read3 dense scan value missing"))?
+                    .to_vec(),
+            );
+        }
+        values_by_key.insert(key.to_vec(), values);
+    }
+    let resolved_values = keys
+        .iter()
+        .map(|key| values_by_key.get(key).cloned())
+        .collect::<Vec<_>>();
+    assemble_read3_from_projected(keys, resolved_values, BackendKvRead3Order::RequestOrder)
+}
+
+fn rocksdb_resolve_values(
+    db: &DB,
+    pending: &BTreeMap<Vec<u8>, PendingWrite>,
+    pending_range_deletes: &[EncodedRange],
+    commit_ops: &[EncodedWriteOp],
+    namespace: &str,
+    keys: &[Vec<u8>],
+) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+    let mut resolved_values = vec![None; keys.len()];
+    let mut committed_keys = Vec::new();
+    let mut committed_positions = Vec::new();
+    for (position, key) in keys.iter().enumerate() {
+        let encoded_key = encode_key(namespace, key);
+        match pending.get(&encoded_key) {
+            Some(PendingWrite::Put(op_index)) => {
+                resolved_values[position] = Some(
+                    commit_op_value(commit_ops, *op_index)
+                        .expect("pending put should point at commit put")
+                        .to_vec(),
+                )
+            }
+            Some(PendingWrite::Delete) => {}
+            None if encoded_in_ranges(&encoded_key, pending_range_deletes) => {}
+            None => {
+                committed_positions.push(position);
+                committed_keys.push(encoded_key);
+            }
+        }
+    }
+    let committed_values = db.multi_get(committed_keys);
+    for (position, value) in committed_positions.into_iter().zip(committed_values) {
+        if let Some(value) = value.map_err(rocksdb_error)? {
+            resolved_values[position] = Some(value);
+        }
+    }
+    Ok(resolved_values)
+}
+
+fn assemble_read3_from_resolved(
+    keys: Vec<Vec<u8>>,
+    resolved_values: Vec<Option<Vec<u8>>>,
+    parts: &[BackendKvRead3ValuePart],
+    order: BackendKvRead3Order,
+) -> Result<BackendKvRead3Page, LixError> {
+    let mut key_builder = BytePageBuilder::new();
+    let mut present = Vec::new();
+    let mut value_builders = parts
+        .iter()
+        .map(|_| BytePageBuilder::new())
+        .collect::<Vec<_>>();
+    let mut request_indexes = match order {
+        BackendKvRead3Order::RequestOrder => None,
+        BackendKvRead3Order::KeyOrder => Some(Vec::new()),
+    };
+    for (index, (key, value)) in keys.into_iter().zip(resolved_values).enumerate() {
+        match (order, value.as_deref()) {
+            (BackendKvRead3Order::RequestOrder, Some(value)) => {
+                key_builder.push(&key);
+                present.push(true);
+                for (part, builder) in parts.iter().zip(value_builders.iter_mut()) {
+                    builder.push(project_backend_read3_value_part(value, *part)?);
+                }
+            }
+            (BackendKvRead3Order::RequestOrder, None) => {
+                key_builder.push(&key);
+                present.push(false);
+                for builder in &mut value_builders {
+                    builder.push([]);
+                }
+            }
+            (BackendKvRead3Order::KeyOrder, Some(value)) => {
+                key_builder.push(&key);
+                present.push(true);
+                request_indexes
+                    .as_mut()
+                    .expect("request indexes exist")
+                    .push(
+                        u32::try_from(index).map_err(|_| {
+                            LixError::unknown("rocksdb read3 request index overflow")
+                        })?,
+                    );
+                for (part, builder) in parts.iter().zip(value_builders.iter_mut()) {
+                    builder.push(project_backend_read3_value_part(value, *part)?);
+                }
+            }
+            (BackendKvRead3Order::KeyOrder, None) => {}
+        }
+    }
+    Ok(BackendKvRead3Page {
+        keys: key_builder.finish(),
+        presence: BackendKvRead3Presence::bitmap(present),
+        values: value_builders
+            .into_iter()
+            .map(BytePageBuilder::finish)
+            .collect(),
+        request_indexes,
+        resume_after: None,
+    })
+}
+
+fn assemble_read3_from_projected(
+    keys: Vec<Vec<u8>>,
+    resolved_values: Vec<Option<Vec<Vec<u8>>>>,
+    order: BackendKvRead3Order,
+) -> Result<BackendKvRead3Page, LixError> {
+    let part_count = resolved_values
+        .iter()
+        .find_map(|values| values.as_ref().map(Vec::len))
+        .unwrap_or(0);
+    let mut key_builder = BytePageBuilder::new();
+    let mut present = Vec::new();
+    let mut value_builders = (0..part_count)
+        .map(|_| BytePageBuilder::new())
+        .collect::<Vec<_>>();
+    let mut request_indexes = match order {
+        BackendKvRead3Order::RequestOrder => None,
+        BackendKvRead3Order::KeyOrder => Some(Vec::new()),
+    };
+    for (index, (key, values)) in keys.into_iter().zip(resolved_values).enumerate() {
+        match (order, values) {
+            (BackendKvRead3Order::RequestOrder, Some(values)) => {
+                key_builder.push(&key);
+                present.push(true);
+                for (value, builder) in values.iter().zip(value_builders.iter_mut()) {
+                    builder.push(value);
+                }
+            }
+            (BackendKvRead3Order::RequestOrder, None) => {
+                key_builder.push(&key);
+                present.push(false);
+                for builder in &mut value_builders {
+                    builder.push([]);
+                }
+            }
+            (BackendKvRead3Order::KeyOrder, Some(values)) => {
+                key_builder.push(&key);
+                present.push(true);
+                request_indexes
+                    .as_mut()
+                    .expect("request indexes exist")
+                    .push(
+                        u32::try_from(index).map_err(|_| {
+                            LixError::unknown("rocksdb read3 request index overflow")
+                        })?,
+                    );
+                for (value, builder) in values.iter().zip(value_builders.iter_mut()) {
+                    builder.push(value);
+                }
+            }
+            (BackendKvRead3Order::KeyOrder, None) => {}
+        }
+    }
+    Ok(BackendKvRead3Page {
+        keys: key_builder.finish(),
+        presence: BackendKvRead3Presence::bitmap(present),
+        values: value_builders
+            .into_iter()
+            .map(BytePageBuilder::finish)
+            .collect(),
+        request_indexes,
+        resume_after: None,
+    })
+}
+
+fn empty_read3_page(part_count: usize) -> BackendKvRead3Page {
+    BackendKvRead3Page {
+        keys: BytePageBuilder::new().finish(),
+        presence: BackendKvRead3Presence::Bitmap(Vec::new()),
+        values: (0..part_count)
+            .map(|_| BytePageBuilder::new().finish())
+            .collect(),
+        request_indexes: None,
+        resume_after: None,
+    }
+}
+
+fn read3_scan_projection(projection: BackendKvRead3Projection) -> BackendKvScanProjection {
+    match projection {
+        BackendKvRead3Projection::KeysOnly => BackendKvScanProjection::KeysOnly,
+        BackendKvRead3Projection::ValueParts(parts) => BackendKvScanProjection::ValueParts(
+            parts
+                .into_iter()
+                .map(BackendKvScanPlanValuePart::from)
+                .collect(),
+        ),
+    }
+}
+
+fn rocksdb_scan_plan_keys(
+    db: &DB,
+    pending: &BTreeMap<Vec<u8>, PendingWrite>,
+    pending_range_deletes: &[EncodedRange],
+    namespace: String,
+    spans: Vec<BackendKvKeySpan>,
+    scan_after: Option<Vec<u8>>,
+    page_size: usize,
+) -> Result<BackendKvScanPlanPage, LixError> {
+    let mut keys = BytePageBuilder::new();
+    let mut resume_after = None;
+    let spans = normalize_scan_plan_spans(spans);
+    let span_count = spans.len();
+    for (span_index, span) in spans.into_iter().enumerate() {
+        let Some(after) = scan_plan_after_for_span(&span, scan_after.as_deref()) else {
+            continue;
+        };
+        let remaining = page_size.saturating_sub(keys.len());
+        if remaining == 0 {
+            break;
+        }
+        let page = rocksdb_scan_keys(
+            db,
+            pending,
+            pending_range_deletes,
+            scan_plan_span_request(&namespace, span, after, remaining),
+        )?;
+        for key in page.keys.iter() {
+            keys.push(key);
+        }
+        resume_after = page.resume_after;
+        if keys.len() == page_size {
+            if resume_after.is_some() || span_index + 1 < span_count {
+                resume_after = last_scan_plan_key(&keys);
+            }
+            break;
+        }
+        if resume_after.is_some() {
+            break;
+        }
+    }
+    Ok(BackendKvScanPlanPage {
+        keys: keys.finish(),
+        values: Vec::new(),
+        resume_after,
+    })
+}
+
+fn rocksdb_scan_plan_value_parts(
+    db: &DB,
+    pending: &BTreeMap<Vec<u8>, PendingWrite>,
+    pending_range_deletes: &[EncodedRange],
+    commit_ops: &[EncodedWriteOp],
+    namespace: String,
+    spans: Vec<BackendKvKeySpan>,
+    scan_after: Option<Vec<u8>>,
+    page_size: usize,
+    parts: Vec<BackendKvScanPlanValuePart>,
+) -> Result<BackendKvScanPlanPage, LixError> {
+    let mut keys = BytePageBuilder::new();
+    let mut value_builders = parts
+        .iter()
+        .map(|_| BytePageBuilder::new())
+        .collect::<Vec<_>>();
+    let mut resume_after = None;
+    let spans = normalize_scan_plan_spans(spans);
+    let span_count = spans.len();
+    for (span_index, span) in spans.into_iter().enumerate() {
+        let Some(after) = scan_plan_after_for_span(&span, scan_after.as_deref()) else {
+            continue;
+        };
+        let remaining = page_size.saturating_sub(keys.len());
+        if remaining == 0 {
+            break;
+        }
+        let page = rocksdb_scan_entries(
+            db,
+            pending,
+            pending_range_deletes,
+            commit_ops,
+            scan_plan_span_request(&namespace, span, after, remaining),
+        )?;
+        for (index, key) in page.keys.iter().enumerate() {
+            let value = page
+                .value(index)
+                .ok_or_else(|| LixError::unknown("rocksdb scan plan value missing"))?;
+            keys.push(key);
+            for (part, builder) in parts.iter().zip(value_builders.iter_mut()) {
+                builder.push(project_backend_scan_plan_value_part(value, *part)?);
+            }
+        }
+        resume_after = page.resume_after;
+        if keys.len() == page_size {
+            if resume_after.is_some() || span_index + 1 < span_count {
+                resume_after = last_scan_plan_key(&keys);
+            }
+            break;
+        }
+        if resume_after.is_some() {
+            break;
+        }
+    }
+    Ok(BackendKvScanPlanPage {
+        keys: keys.finish(),
+        values: value_builders
+            .into_iter()
+            .map(BytePageBuilder::finish)
+            .collect(),
+        resume_after,
+    })
+}
+
+fn scan2_primary_request(request: &BackendKvScan2Request) -> BackendKvScanRequest {
+    BackendKvScanRequest {
+        namespace: request.namespace.clone(),
+        range: request.range.clone(),
+        after: request.after.clone(),
+        limit: request.page_size,
+    }
+}
+
+fn scan_plan_span_request(
+    namespace: &str,
+    span: BackendKvKeySpan,
+    after: Option<Vec<u8>>,
+    limit: usize,
+) -> BackendKvScanRequest {
+    let range = if span.start.is_empty() && span.end.is_empty() {
+        BackendKvScanRange::Prefix(Vec::new())
+    } else if span.end.is_empty() {
+        BackendKvScanRange::Range {
+            start: span.start,
+            end: vec![u8::MAX],
+        }
+    } else {
+        BackendKvScanRange::Range {
+            start: span.start,
+            end: span.end,
+        }
+    };
+    BackendKvScanRequest {
+        namespace: namespace.to_string(),
+        range,
+        after,
+        limit,
+    }
+}
+
+fn scan_plan_after_for_span(
+    span: &BackendKvKeySpan,
+    after: Option<&[u8]>,
+) -> Option<Option<Vec<u8>>> {
+    let Some(after) = after else {
+        return Some(None);
+    };
+    if !span.end.is_empty() && span.end.as_slice() <= after {
+        return None;
+    }
+    if span.start.as_slice() <= after {
+        return Some(Some(after.to_vec()));
+    }
+    Some(None)
+}
+
+fn last_scan_plan_key(keys: &BytePageBuilder) -> Option<Vec<u8>> {
+    keys.len()
+        .checked_sub(1)
+        .and_then(|index| keys.get(index))
+        .map(<[u8]>::to_vec)
+}
+
+fn normalize_scan_plan_spans(mut spans: Vec<BackendKvKeySpan>) -> Vec<BackendKvKeySpan> {
+    spans.retain(|span| span.end.is_empty() || span.start < span.end);
+    spans.sort_by(|left, right| {
+        left.start.cmp(&right.start).then_with(|| {
+            scan_plan_span_end_for_order(left).cmp(scan_plan_span_end_for_order(right))
+        })
+    });
+
+    let mut normalized: Vec<BackendKvKeySpan> = Vec::new();
+    for span in spans {
+        let Some(last) = normalized.last_mut() else {
+            normalized.push(span);
+            continue;
+        };
+        if last.end.is_empty() || last.end >= span.start {
+            if last.end.is_empty() || span.end.is_empty() {
+                last.end.clear();
+            } else if span.end > last.end {
+                last.end = span.end;
+            }
+        } else {
+            normalized.push(span);
+        }
+    }
+    normalized
+}
+
+fn scan_plan_span_end_for_order(span: &BackendKvKeySpan) -> &[u8] {
+    if span.end.is_empty() {
+        &[u8::MAX]
+    } else {
+        &span.end
+    }
 }
 
 struct ScanBounds {

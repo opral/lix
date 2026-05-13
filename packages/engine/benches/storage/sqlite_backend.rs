@@ -4,16 +4,20 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use lix_engine::{
     Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetRequest,
-    BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest, BackendKvValueBatch,
-    BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch, BackendKvWriteOp,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, BytePageBuilder,
-    LixError,
+    BackendKvKeyPage, BackendKvKeySpan, BackendKvRead3Order, BackendKvRead3Page,
+    BackendKvRead3Presence, BackendKvRead3Projection, BackendKvRead3Request, BackendKvRead3Source,
+    BackendKvRead3Strategy, BackendKvRead3ValuePart, BackendKvScan2Page, BackendKvScan2Projection,
+    BackendKvScan2Request, BackendKvScanPlanPage, BackendKvScanPlanRequest,
+    BackendKvScanPlanValuePart, BackendKvScanProjection, BackendKvScanRange, BackendKvScanRequest,
+    BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage, BackendKvWriteBatch,
+    BackendKvWriteOp, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
+    BytePageBuilder, LixError,
 };
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-const UNTRACKED_NAMESPACE: &str = "u1";
+const UNTRACKED_NAMESPACE: &str = "u3";
 
 #[derive(Clone)]
 pub(crate) struct SqliteBenchBackend {
@@ -277,6 +281,30 @@ impl BackendReadTransaction for SqliteBenchTransaction {
         } else {
             sqlite_scan_entries(&connection, request)
         }
+    }
+
+    async fn scan2(
+        &mut self,
+        request: BackendKvScan2Request,
+    ) -> Result<BackendKvScan2Page, LixError> {
+        let connection = self.lock_connection()?;
+        sqlite_scan2(&connection, request)
+    }
+
+    async fn scan_plan(
+        &mut self,
+        request: BackendKvScanPlanRequest,
+    ) -> Result<BackendKvScanPlanPage, LixError> {
+        let connection = self.lock_connection()?;
+        sqlite_scan_plan(&connection, request)
+    }
+
+    async fn read3(
+        &mut self,
+        request: BackendKvRead3Request,
+    ) -> Result<BackendKvRead3Page, LixError> {
+        let connection = self.lock_connection()?;
+        sqlite_read3(&connection, request)
     }
 
     async fn rollback(mut self: Box<Self>) -> Result<(), LixError> {
@@ -700,6 +728,591 @@ fn sqlite_scan_untracked_entries(
         values: values.finish(),
         resume_after,
     })
+}
+
+fn sqlite_scan2(
+    connection: &Connection,
+    request: BackendKvScan2Request,
+) -> Result<BackendKvScan2Page, LixError> {
+    match request.projection.clone() {
+        BackendKvScan2Projection::KeysOnly => {
+            let page = if request.namespace == UNTRACKED_NAMESPACE {
+                sqlite_scan_untracked_keys(connection, scan2_primary_request(&request))?
+            } else {
+                sqlite_scan_keys(connection, scan2_primary_request(&request))?
+            };
+            Ok(BackendKvScan2Page {
+                keys: page.keys,
+                values: None,
+                resume_after: page.resume_after,
+            })
+        }
+        BackendKvScan2Projection::FullValue => {
+            let page = if request.namespace == UNTRACKED_NAMESPACE {
+                sqlite_scan_untracked_entries(connection, scan2_primary_request(&request))?
+            } else {
+                sqlite_scan_entries(connection, scan2_primary_request(&request))?
+            };
+            Ok(BackendKvScan2Page {
+                keys: page.keys,
+                values: Some(page.values),
+                resume_after: page.resume_after,
+            })
+        }
+        BackendKvScan2Projection::ValuePart(part) => {
+            sqlite_scan2_value_part(connection, request, sqlite_value_part_expr(&part)?)
+        }
+    }
+}
+
+fn sqlite_scan2_value_part(
+    connection: &Connection,
+    request: BackendKvScan2Request,
+    value_expr: String,
+) -> Result<BackendKvScan2Page, LixError> {
+    let mut parameters = Vec::new();
+    let from_clause = if request.namespace == UNTRACKED_NAMESPACE {
+        "kv_u AS p".to_string()
+    } else {
+        parameters.push(SqlValue::Text(request.namespace.clone()));
+        "kv AS p".to_string()
+    };
+    let namespace_filter = if request.namespace == UNTRACKED_NAMESPACE {
+        ""
+    } else {
+        "p.namespace = ? AND"
+    };
+    let start = scan2_start_key(&request);
+    let end = scan_end_key(&request.range);
+    parameters.push(nullable_blob_value(request.after.as_deref()));
+    parameters.push(nullable_blob_value(request.after.as_deref()));
+    parameters.push(SqlValue::Blob(start));
+    parameters.push(nullable_blob_value(end.as_deref()));
+    parameters.push(nullable_blob_value(end.as_deref()));
+    parameters.push(SqlValue::Integer(sqlite_fetch_limit(request.page_size)?));
+
+    let sql = format!(
+        "
+        SELECT p.key, {value_expr}
+        FROM {from_clause}
+        WHERE {namespace_filter}
+          (? IS NULL OR p.key > ?)
+          AND p.key >= ?
+          AND (? IS NULL OR p.key < ?)
+        ORDER BY p.key
+        LIMIT ?
+        "
+    );
+    let mut statement = connection.prepare(&sql).map_err(sqlite_error)?;
+    let mut cursor = statement
+        .query(params_from_iter(parameters))
+        .map_err(sqlite_error)?;
+    let mut keys = BytePageBuilder::new();
+    let mut values = BytePageBuilder::new();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
+    while let Some(row) = cursor.next().map_err(sqlite_error)? {
+        let key = row.get::<_, Vec<u8>>(0).map_err(sqlite_error)?;
+        if count < request.page_size {
+            resume_after_candidate = Some(key.clone());
+            keys.push(&key);
+            let value = row.get::<_, Vec<u8>>(1).map_err(sqlite_error)?;
+            values.push(&value);
+        }
+        count += 1;
+    }
+
+    let resume_after = (count > request.page_size)
+        .then_some(resume_after_candidate)
+        .flatten();
+    Ok(BackendKvScan2Page {
+        keys: keys.finish(),
+        values: Some(values.finish()),
+        resume_after,
+    })
+}
+
+fn sqlite_scan_plan(
+    connection: &Connection,
+    request: BackendKvScanPlanRequest,
+) -> Result<BackendKvScanPlanPage, LixError> {
+    let spans = normalize_scan_plan_spans(request.spans);
+    if spans.is_empty() {
+        return Ok(BackendKvScanPlanPage {
+            keys: BytePageBuilder::new().finish(),
+            values: match request.projection {
+                BackendKvScanProjection::KeysOnly => Vec::new(),
+                BackendKvScanProjection::ValueParts(parts) => parts
+                    .iter()
+                    .map(|_| BytePageBuilder::new().finish())
+                    .collect(),
+            },
+            resume_after: None,
+        });
+    }
+
+    let mut parameters = Vec::new();
+    let from_clause = if request.namespace == UNTRACKED_NAMESPACE {
+        "kv_u AS p"
+    } else {
+        parameters.push(SqlValue::Text(request.namespace.clone()));
+        "kv AS p"
+    };
+    let namespace_filter = if request.namespace == UNTRACKED_NAMESPACE {
+        ""
+    } else {
+        "p.namespace = ? AND"
+    };
+
+    parameters.push(nullable_blob_value(request.after.as_deref()));
+    parameters.push(nullable_blob_value(request.after.as_deref()));
+
+    let mut span_clauses = Vec::with_capacity(spans.len());
+    for span in &spans {
+        parameters.push(SqlValue::Blob(span.start.clone()));
+        parameters.push(nullable_blob_value(non_empty_slice(&span.end)));
+        parameters.push(nullable_blob_value(non_empty_slice(&span.end)));
+        span_clauses.push("(p.key >= ? AND (? IS NULL OR p.key < ?))");
+    }
+    parameters.push(SqlValue::Integer(sqlite_fetch_limit(request.page_size)?));
+
+    let (value_parts, projection_sql) = match request.projection {
+        BackendKvScanProjection::KeysOnly => (Vec::new(), String::new()),
+        BackendKvScanProjection::ValueParts(parts) => {
+            let mut projection_sql = String::new();
+            for part in &parts {
+                projection_sql.push_str(", ");
+                projection_sql.push_str(sqlite_scan_plan_value_part_expr(*part));
+            }
+            (parts, projection_sql)
+        }
+    };
+
+    let sql = format!(
+        "
+        SELECT p.key{projection_sql}
+        FROM {from_clause}
+        WHERE {namespace_filter}
+          (? IS NULL OR p.key > ?)
+          AND ({})
+        ORDER BY p.key
+        LIMIT ?
+        ",
+        span_clauses.join(" OR ")
+    );
+
+    let mut statement = connection.prepare(&sql).map_err(sqlite_error)?;
+    let mut cursor = statement
+        .query(params_from_iter(parameters))
+        .map_err(sqlite_error)?;
+    let mut keys = BytePageBuilder::new();
+    let mut value_builders = value_parts
+        .iter()
+        .map(|_| BytePageBuilder::new())
+        .collect::<Vec<_>>();
+    let mut count = 0;
+    let mut resume_after_candidate = None;
+    while let Some(row) = cursor.next().map_err(sqlite_error)? {
+        let key = row.get::<_, Vec<u8>>(0).map_err(sqlite_error)?;
+        if count < request.page_size {
+            resume_after_candidate = Some(key.clone());
+            keys.push(&key);
+            for (part_index, values) in value_builders.iter_mut().enumerate() {
+                let value = row
+                    .get::<_, Vec<u8>>(part_index + 1)
+                    .map_err(sqlite_error)?;
+                values.push(&value);
+            }
+        }
+        count += 1;
+    }
+
+    let resume_after = (count > request.page_size)
+        .then_some(resume_after_candidate)
+        .flatten();
+    Ok(BackendKvScanPlanPage {
+        keys: keys.finish(),
+        values: value_builders
+            .into_iter()
+            .map(BytePageBuilder::finish)
+            .collect(),
+        resume_after,
+    })
+}
+
+const SQLITE_READ3_DENSE_SCAN_THRESHOLD: usize = 512;
+
+fn sqlite_read3(
+    connection: &Connection,
+    request: BackendKvRead3Request,
+) -> Result<BackendKvRead3Page, LixError> {
+    match request.source {
+        BackendKvRead3Source::Spans { spans, after } => {
+            let page = sqlite_scan_plan(
+                connection,
+                BackendKvScanPlanRequest {
+                    namespace: request.namespace,
+                    spans,
+                    after,
+                    page_size: request.page_size.unwrap_or(usize::MAX),
+                    projection: read3_scan_projection(request.projection),
+                },
+            )?;
+            Ok(BackendKvRead3Page {
+                keys: page.keys,
+                presence: BackendKvRead3Presence::All,
+                values: page.values,
+                request_indexes: None,
+                resume_after: page.resume_after,
+            })
+        }
+        BackendKvRead3Source::Keys { keys } => sqlite_read3_keys(
+            connection,
+            request.namespace,
+            keys,
+            request.projection,
+            request.order,
+        ),
+        BackendKvRead3Source::KeysOrSpans { keys, spans } => {
+            let strategy = effective_read3_strategy(request.strategy);
+            let use_scan = match strategy {
+                BackendKvRead3Strategy::Scan => !spans.is_empty(),
+                BackendKvRead3Strategy::Points => false,
+                BackendKvRead3Strategy::Auto => {
+                    request.order == BackendKvRead3Order::RequestOrder
+                        && keys.len() >= SQLITE_READ3_DENSE_SCAN_THRESHOLD
+                        && !spans.is_empty()
+                }
+            };
+            if use_scan {
+                sqlite_read3_dense_scan(
+                    connection,
+                    request.namespace,
+                    keys,
+                    spans,
+                    request.projection,
+                )
+            } else {
+                sqlite_read3_keys(
+                    connection,
+                    request.namespace,
+                    keys,
+                    request.projection,
+                    request.order,
+                )
+            }
+        }
+    }
+}
+
+fn effective_read3_strategy(strategy: BackendKvRead3Strategy) -> BackendKvRead3Strategy {
+    if strategy != BackendKvRead3Strategy::Auto {
+        return strategy;
+    }
+    match std::env::var("LIX_READ3_STRATEGY").as_deref() {
+        Ok("points") => BackendKvRead3Strategy::Points,
+        Ok("scan") => BackendKvRead3Strategy::Scan,
+        _ => BackendKvRead3Strategy::Auto,
+    }
+}
+
+fn sqlite_read3_keys(
+    connection: &Connection,
+    namespace: String,
+    keys: Vec<Vec<u8>>,
+    projection: BackendKvRead3Projection,
+    order: BackendKvRead3Order,
+) -> Result<BackendKvRead3Page, LixError> {
+    if keys.is_empty() {
+        return Ok(empty_read3_page(projection, 0));
+    }
+
+    let key_count = keys.len();
+    let untracked = namespace == UNTRACKED_NAMESPACE;
+    let key_placeholders = std::iter::repeat_n("?", key_count)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let from_clause = if untracked { "kv_u AS p" } else { "kv AS p" };
+    let namespace_filter = if untracked { "" } else { "p.namespace = ? AND" };
+    let mut parameters = Vec::with_capacity(usize::from(!untracked) + key_count);
+    if !untracked {
+        parameters.push(SqlValue::Text(namespace));
+    }
+    parameters.extend(keys.iter().cloned().map(SqlValue::Blob));
+
+    let (parts, projection_sql) = match projection {
+        BackendKvRead3Projection::KeysOnly => (Vec::new(), String::new()),
+        BackendKvRead3Projection::ValueParts(parts) => {
+            let mut projection_sql = String::new();
+            for part in &parts {
+                projection_sql.push_str(", ");
+                projection_sql.push_str(sqlite_read3_value_part_expr(*part));
+            }
+            (parts, projection_sql)
+        }
+    };
+    let sql = format!(
+        "
+        SELECT p.key{projection_sql}
+        FROM {from_clause}
+        WHERE {namespace_filter} p.key IN ({key_placeholders})
+        "
+    );
+    let mut statement = connection.prepare(&sql).map_err(sqlite_error)?;
+    let mut cursor = statement
+        .query(params_from_iter(parameters))
+        .map_err(sqlite_error)?;
+    let mut values_by_key = HashMap::with_capacity(key_count);
+    while let Some(row) = cursor.next().map_err(sqlite_error)? {
+        let key = row.get::<_, Vec<u8>>(0).map_err(sqlite_error)?;
+        let mut values = Vec::with_capacity(parts.len());
+        for part_index in 0..parts.len() {
+            values.push(
+                row.get::<_, Vec<u8>>(part_index + 1)
+                    .map_err(sqlite_error)?,
+            );
+        }
+        values_by_key.insert(key, values);
+    }
+
+    assemble_read3_from_key_map(keys, parts.len(), order, |key| {
+        values_by_key.get(key).map(Vec::as_slice)
+    })
+}
+
+fn sqlite_read3_dense_scan(
+    connection: &Connection,
+    namespace: String,
+    keys: Vec<Vec<u8>>,
+    spans: Vec<BackendKvKeySpan>,
+    projection: BackendKvRead3Projection,
+) -> Result<BackendKvRead3Page, LixError> {
+    let part_count = match &projection {
+        BackendKvRead3Projection::KeysOnly => 0,
+        BackendKvRead3Projection::ValueParts(parts) => parts.len(),
+    };
+    let page = sqlite_scan_plan(
+        connection,
+        BackendKvScanPlanRequest {
+            namespace,
+            spans,
+            after: None,
+            page_size: usize::MAX,
+            projection: read3_scan_projection(projection),
+        },
+    )?;
+    let mut values_by_key = HashMap::with_capacity(page.keys.len());
+    for (index, key) in page.keys.iter().enumerate() {
+        let mut values = Vec::with_capacity(part_count);
+        for values_page in &page.values {
+            values.push(
+                values_page
+                    .get(index)
+                    .ok_or_else(|| LixError::unknown("sqlite read3 dense scan value missing"))?
+                    .to_vec(),
+            );
+        }
+        values_by_key.insert(key.to_vec(), values);
+    }
+    assemble_read3_from_key_map(keys, part_count, BackendKvRead3Order::RequestOrder, |key| {
+        values_by_key.get(key).map(Vec::as_slice)
+    })
+}
+
+fn assemble_read3_from_key_map<'a>(
+    keys: Vec<Vec<u8>>,
+    part_count: usize,
+    order: BackendKvRead3Order,
+    mut lookup: impl FnMut(&[u8]) -> Option<&'a [Vec<u8>]>,
+) -> Result<BackendKvRead3Page, LixError> {
+    let mut key_builder = BytePageBuilder::new();
+    let mut present = Vec::new();
+    let mut value_builders = (0..part_count)
+        .map(|_| BytePageBuilder::new())
+        .collect::<Vec<_>>();
+    let mut request_indexes = match order {
+        BackendKvRead3Order::RequestOrder => None,
+        BackendKvRead3Order::KeyOrder => Some(Vec::new()),
+    };
+
+    for (index, key) in keys.into_iter().enumerate() {
+        let values = lookup(&key);
+        match (order, values) {
+            (BackendKvRead3Order::RequestOrder, Some(values)) => {
+                key_builder.push(&key);
+                present.push(true);
+                for (value, builder) in values.iter().zip(value_builders.iter_mut()) {
+                    builder.push(value);
+                }
+            }
+            (BackendKvRead3Order::RequestOrder, None) => {
+                key_builder.push(&key);
+                present.push(false);
+                for builder in &mut value_builders {
+                    builder.push([]);
+                }
+            }
+            (BackendKvRead3Order::KeyOrder, Some(values)) => {
+                key_builder.push(&key);
+                present.push(true);
+                request_indexes
+                    .as_mut()
+                    .expect("request indexes exist")
+                    .push(
+                        u32::try_from(index).map_err(|_| {
+                            LixError::unknown("sqlite read3 request index overflow")
+                        })?,
+                    );
+                for (value, builder) in values.iter().zip(value_builders.iter_mut()) {
+                    builder.push(value);
+                }
+            }
+            (BackendKvRead3Order::KeyOrder, None) => {}
+        }
+    }
+    Ok(BackendKvRead3Page {
+        keys: key_builder.finish(),
+        presence: BackendKvRead3Presence::bitmap(present),
+        values: value_builders
+            .into_iter()
+            .map(BytePageBuilder::finish)
+            .collect(),
+        request_indexes,
+        resume_after: None,
+    })
+}
+
+fn empty_read3_page(projection: BackendKvRead3Projection, key_count: usize) -> BackendKvRead3Page {
+    let value_count = match projection {
+        BackendKvRead3Projection::KeysOnly => 0,
+        BackendKvRead3Projection::ValueParts(parts) => parts.len(),
+    };
+    BackendKvRead3Page {
+        keys: BytePageBuilder::new().finish(),
+        presence: BackendKvRead3Presence::Bitmap(Vec::with_capacity(key_count)),
+        values: (0..value_count)
+            .map(|_| BytePageBuilder::new().finish())
+            .collect(),
+        request_indexes: None,
+        resume_after: None,
+    }
+}
+
+fn read3_scan_projection(projection: BackendKvRead3Projection) -> BackendKvScanProjection {
+    match projection {
+        BackendKvRead3Projection::KeysOnly => BackendKvScanProjection::KeysOnly,
+        BackendKvRead3Projection::ValueParts(parts) => BackendKvScanProjection::ValueParts(
+            parts
+                .into_iter()
+                .map(BackendKvScanPlanValuePart::from)
+                .collect(),
+        ),
+    }
+}
+
+fn sqlite_value_part_expr(part: &lix_engine::BackendKvValuePart) -> Result<String, LixError> {
+    match part {
+        lix_engine::BackendKvValuePart::ByteRange { offset, len } => {
+            let start = offset.checked_add(1).ok_or_else(|| {
+                LixError::unknown("sqlite scan2 value projection start overflow")
+            })?;
+            Ok(format!("substr(p.value, {start}, {len})"))
+        }
+        lix_engine::BackendKvValuePart::ByteSuffix { offset } => {
+            let start = offset.checked_add(1).ok_or_else(|| {
+                LixError::unknown("sqlite scan2 value projection start overflow")
+            })?;
+            Ok(format!("substr(p.value, {start})"))
+        }
+        lix_engine::BackendKvValuePart::HeaderPayloadFrame(part) => match part {
+            lix_engine::BackendKvHeaderPayloadFramePart::Header => {
+                Ok("substr(p.value, 26, CAST(substr(p.value, 6, 10) AS INTEGER))".to_string())
+            }
+            lix_engine::BackendKvHeaderPayloadFramePart::Payload => Ok(
+                "substr(p.value, 26 + CAST(substr(p.value, 6, 10) AS INTEGER), CAST(substr(p.value, 16, 10) AS INTEGER))"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+fn sqlite_scan_plan_value_part_expr(part: BackendKvScanPlanValuePart) -> &'static str {
+    match part {
+        BackendKvScanPlanValuePart::Header => {
+            "substr(p.value, 26, CAST(substr(p.value, 6, 10) AS INTEGER))"
+        }
+        BackendKvScanPlanValuePart::Payload => {
+            "substr(p.value, 26 + CAST(substr(p.value, 6, 10) AS INTEGER), CAST(substr(p.value, 16, 10) AS INTEGER))"
+        }
+        BackendKvScanPlanValuePart::FullValue => "p.value",
+    }
+}
+
+fn sqlite_read3_value_part_expr(part: BackendKvRead3ValuePart) -> &'static str {
+    sqlite_scan_plan_value_part_expr(part.into())
+}
+
+fn scan2_primary_request(request: &BackendKvScan2Request) -> BackendKvScanRequest {
+    BackendKvScanRequest {
+        namespace: request.namespace.clone(),
+        range: request.range.clone(),
+        after: request.after.clone(),
+        limit: request.page_size,
+    }
+}
+
+fn scan2_start_key(request: &BackendKvScan2Request) -> Vec<u8> {
+    let range_start = match &request.range {
+        BackendKvScanRange::Prefix(prefix) => prefix.as_slice(),
+        BackendKvScanRange::Range { start, .. } => start.as_slice(),
+    };
+    match request.after.as_deref() {
+        Some(after) if after > range_start => after.to_vec(),
+        _ => range_start.to_vec(),
+    }
+}
+
+fn nullable_blob_value(value: Option<&[u8]>) -> SqlValue {
+    value.map_or(SqlValue::Null, |value| SqlValue::Blob(value.to_vec()))
+}
+
+fn non_empty_slice(value: &[u8]) -> Option<&[u8]> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn normalize_scan_plan_spans(mut spans: Vec<BackendKvKeySpan>) -> Vec<BackendKvKeySpan> {
+    spans.retain(|span| span.end.is_empty() || span.start < span.end);
+    spans.sort_by(|left, right| {
+        left.start.cmp(&right.start).then_with(|| {
+            scan_plan_span_end_for_order(left).cmp(scan_plan_span_end_for_order(right))
+        })
+    });
+
+    let mut normalized: Vec<BackendKvKeySpan> = Vec::new();
+    for span in spans {
+        let Some(last) = normalized.last_mut() else {
+            normalized.push(span);
+            continue;
+        };
+        if last.end.is_empty() || last.end >= span.start {
+            if last.end.is_empty() || span.end.is_empty() {
+                last.end.clear();
+            } else if span.end > last.end {
+                last.end = span.end;
+            }
+        } else {
+            normalized.push(span);
+        }
+    }
+    normalized
+}
+
+fn scan_plan_span_end_for_order(span: &BackendKvKeySpan) -> &[u8] {
+    if span.end.is_empty() {
+        &[u8::MAX]
+    } else {
+        &span.end
+    }
 }
 
 fn sqlite_fetch_limit(limit: usize) -> Result<i64, LixError> {

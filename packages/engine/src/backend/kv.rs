@@ -229,6 +229,35 @@ pub struct BackendKvScanRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendKvScan2Request {
+    pub namespace: String,
+    pub range: BackendKvScanRange,
+    pub after: Option<Vec<u8>>,
+    pub page_size: usize,
+    pub projection: BackendKvScan2Projection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendKvScan2Projection {
+    KeysOnly,
+    FullValue,
+    ValuePart(BackendKvValuePart),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendKvValuePart {
+    ByteRange { offset: usize, len: usize },
+    ByteSuffix { offset: usize },
+    HeaderPayloadFrame(BackendKvHeaderPayloadFramePart),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKvHeaderPayloadFramePart {
+    Header,
+    Payload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendKvKeyPage {
     pub keys: BytePage,
     pub resume_after: Option<Vec<u8>>,
@@ -245,6 +274,182 @@ pub struct BackendKvEntryPage {
     pub keys: BytePage,
     pub values: BytePage,
     pub resume_after: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendKvScan2Page {
+    pub keys: BytePage,
+    pub values: Option<BytePage>,
+    pub resume_after: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendKvScanPlanRequest {
+    pub namespace: String,
+    pub spans: Vec<BackendKvKeySpan>,
+    pub after: Option<Vec<u8>>,
+    pub page_size: usize,
+    pub projection: BackendKvScanProjection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendKvKeySpan {
+    pub start: Vec<u8>,
+    pub end: Vec<u8>,
+}
+
+impl BackendKvKeySpan {
+    pub fn new(start: impl Into<Vec<u8>>, end: impl Into<Vec<u8>>) -> Self {
+        Self {
+            start: start.into(),
+            end: end.into(),
+        }
+    }
+
+    pub fn all() -> Self {
+        Self {
+            start: Vec::new(),
+            end: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendKvScanProjection {
+    KeysOnly,
+    ValueParts(Vec<BackendKvScanPlanValuePart>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKvScanPlanValuePart {
+    Header,
+    Payload,
+    FullValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendKvScanPlanPage {
+    pub keys: BytePage,
+    pub values: Vec<BytePage>,
+    pub resume_after: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendKvRead3Request {
+    pub namespace: String,
+    pub source: BackendKvRead3Source,
+    pub projection: BackendKvRead3Projection,
+    pub order: BackendKvRead3Order,
+    pub page_size: Option<usize>,
+    pub strategy: BackendKvRead3Strategy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendKvRead3Source {
+    Keys {
+        keys: Vec<Vec<u8>>,
+    },
+    Spans {
+        spans: Vec<BackendKvKeySpan>,
+        after: Option<Vec<u8>>,
+    },
+    KeysOrSpans {
+        keys: Vec<Vec<u8>>,
+        spans: Vec<BackendKvKeySpan>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendKvRead3Projection {
+    KeysOnly,
+    ValueParts(Vec<BackendKvRead3ValuePart>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKvRead3ValuePart {
+    Header,
+    Payload,
+    FullValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKvRead3Order {
+    RequestOrder,
+    KeyOrder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKvRead3Strategy {
+    Auto,
+    Points,
+    Scan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendKvRead3Presence {
+    All,
+    Bitmap(Vec<bool>),
+}
+
+impl BackendKvRead3Presence {
+    pub fn bitmap(bits: Vec<bool>) -> Self {
+        if bits.iter().all(|present| *present) {
+            Self::All
+        } else {
+            Self::Bitmap(bits)
+        }
+    }
+
+    pub fn len(&self, row_count: usize) -> usize {
+        match self {
+            Self::All => row_count,
+            Self::Bitmap(bits) => bits.len(),
+        }
+    }
+
+    pub fn is_present(&self, row_count: usize, index: usize) -> Option<bool> {
+        match self {
+            Self::All => (index < row_count).then_some(true),
+            Self::Bitmap(bits) => bits.get(index).copied(),
+        }
+    }
+
+    pub fn present_count(&self, row_count: usize) -> usize {
+        match self {
+            Self::All => row_count,
+            Self::Bitmap(bits) => bits.iter().filter(|present| **present).count(),
+        }
+    }
+
+    pub fn to_vec(&self, row_count: usize) -> Vec<bool> {
+        match self {
+            Self::All => vec![true; row_count],
+            Self::Bitmap(bits) => bits.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendKvRead3Page {
+    pub keys: BytePage,
+    pub presence: BackendKvRead3Presence,
+    pub values: Vec<BytePage>,
+    pub request_indexes: Option<Vec<u32>>,
+    pub resume_after: Option<Vec<u8>>,
+}
+
+impl BackendKvRead3Page {
+    pub fn presence_len(&self) -> usize {
+        self.presence.len(self.keys.len())
+    }
+
+    pub fn is_present(&self, index: usize) -> Option<bool> {
+        self.presence.is_present(self.keys.len(), index)
+    }
+
+    pub fn present_count(&self) -> usize {
+        self.presence.present_count(self.keys.len())
+    }
 }
 
 impl BackendKvEntryPage {
