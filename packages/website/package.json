@@ -13,7 +13,6 @@
   "dependencies": {
     "@cloudflare/vite-plugin": "^1.36.0",
     "@lix-js/plugin-json": "1.0.1",
-    "@lix-js/sdk": "workspace:*",
     "@opral/markdown-wc": "0.9.0",
     "@tailwindcss/vite": "^4.2.4",
     "@tanstack/react-router": "^1.169.2",
