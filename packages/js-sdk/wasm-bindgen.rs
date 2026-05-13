@@ -8,8 +8,8 @@ mod wasm {
         BackendKvScanRequest, BackendKvValueBatch, BackendKvValueGroup, BackendKvValuePage,
         BackendKvWriteBatch, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
         BytePageBuilder, CreateVersionOptions, ExecuteResult, Lix as RsLix, LixError,
-        MergeVersionOptions, MergeVersionPreviewOptions, OpenLixOptions, SwitchVersionOptions,
-        Value,
+        LixTransaction as RsLixTransaction, MergeVersionOptions, MergeVersionPreviewOptions,
+        OpenLixOptions, SwitchVersionOptions, Value,
     };
     use serde::Serialize;
     use serde_json::json;
@@ -229,6 +229,11 @@ export type MergeConflictSide = {
     }
 
     #[wasm_bindgen]
+    pub struct LixTransaction {
+        inner: Option<RsLixTransaction>,
+    }
+
+    #[wasm_bindgen]
     impl Lix {
         /// Executes one DataFusion SQL statement against this Lix session.
         ///
@@ -256,6 +261,12 @@ export type MergeConflictSide = {
                 .map_err(js_error)?;
             let result = self.inner.execute(&sql, &values).await.map_err(js_error)?;
             execute_result_to_js(result).map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = beginTransaction)]
+        pub async fn begin_transaction(&self) -> Result<LixTransaction, JsValue> {
+            let inner = self.inner.begin_transaction().await.map_err(js_error)?;
+            Ok(LixTransaction { inner: Some(inner) })
         }
 
         #[wasm_bindgen(js_name = activeVersionId)]
@@ -350,6 +361,55 @@ export type MergeConflictSide = {
         #[wasm_bindgen(js_name = close)]
         pub async fn close(&self) -> Result<(), JsValue> {
             self.inner.close().await.map_err(js_error)
+        }
+    }
+
+    #[wasm_bindgen]
+    impl LixTransaction {
+        #[wasm_bindgen(js_name = execute)]
+        pub async fn execute(&mut self, sql: JsValue, params: JsValue) -> Result<JsValue, JsValue> {
+            let sql = sql
+                .as_string()
+                .ok_or_else(|| invalid_argument_error("execute", "sql", "string", &sql))
+                .map_err(js_error)?;
+            if !Array::is_array(&params) {
+                return Err(js_error(invalid_argument_error(
+                    "execute", "params", "array", &params,
+                )));
+            }
+            let params = Array::from(&params);
+            let values = params
+                .iter()
+                .map(value_from_js)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(js_error)?;
+            let inner = self
+                .inner
+                .as_mut()
+                .ok_or_else(transaction_closed_error)
+                .map_err(js_error)?;
+            let result = inner.execute(&sql, &values).await.map_err(js_error)?;
+            execute_result_to_js(result).map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = commit)]
+        pub async fn commit(&mut self) -> Result<(), JsValue> {
+            let inner = self
+                .inner
+                .take()
+                .ok_or_else(transaction_closed_error)
+                .map_err(js_error)?;
+            inner.commit().await.map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = rollback)]
+        pub async fn rollback(&mut self) -> Result<(), JsValue> {
+            let inner = self
+                .inner
+                .take()
+                .ok_or_else(transaction_closed_error)
+                .map_err(js_error)?;
+            inner.rollback().await.map_err(js_error)
         }
     }
 
@@ -1319,6 +1379,10 @@ export type MergeConflictSide = {
 
     fn js_sdk_error(message: impl Into<String>) -> LixError {
         LixError::new("LIX_ERROR_JS_SDK", message.into())
+    }
+
+    fn transaction_closed_error() -> LixError {
+        LixError::new("LIX_INVALID_TRANSACTION_STATE", "Lix transaction is closed")
     }
 
     fn js_error(error: LixError) -> JsValue {
