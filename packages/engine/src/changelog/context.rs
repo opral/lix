@@ -17,6 +17,7 @@ use super::store::{
 };
 use crate::changelog::{
     decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility, decode_segment,
+    decode_segment_change, decode_segment_commit, view_segment,
 };
 use crate::changelog::{
     ByChangeEntry, ByCommitEntry, Change, ChangeLoadBatch, ChangeLoadEntry, ChangeLoadRequest,
@@ -80,6 +81,143 @@ pub(crate) struct ChangelogStoreReader<S> {
     store: S,
 }
 
+struct SegmentByteIndex {
+    bytes: Vec<u8>,
+    segment_id: String,
+    commit_locations: HashMap<String, SegmentObjectLocation>,
+    change_locations: HashMap<String, SegmentObjectLocation>,
+}
+
+impl SegmentByteIndex {
+    fn decode(bytes: Vec<u8>) -> Result<Self, LixError> {
+        let view = view_segment(&bytes)?;
+        let segment_id = view.segment_id.to_string();
+        let commit_locations = view
+            .directory_commits
+            .iter()
+            .map(|entry| {
+                (
+                    entry.id.to_string(),
+                    SegmentObjectLocation {
+                        segment_id: entry.location.segment_id.to_string(),
+                        offset: entry.location.offset,
+                        len: entry.location.len,
+                        checksum: entry.location.checksum.to_string(),
+                    },
+                )
+            })
+            .collect();
+        let change_locations = view
+            .directory_changes
+            .iter()
+            .map(|entry| {
+                (
+                    entry.id.to_string(),
+                    SegmentObjectLocation {
+                        segment_id: entry.location.segment_id.to_string(),
+                        offset: entry.location.offset,
+                        len: entry.location.len,
+                        checksum: entry.location.checksum.to_string(),
+                    },
+                )
+            })
+            .collect();
+        Ok(Self {
+            bytes,
+            segment_id,
+            commit_locations,
+            change_locations,
+        })
+    }
+
+    fn load_commit(
+        &self,
+        location: &SegmentObjectLocation,
+        commit_id: &str,
+    ) -> Result<SegmentCommit, LixError> {
+        let expected = self.commit_locations.get(commit_id).ok_or_else(|| {
+            LixError::unknown(format!(
+                "changelog by_commit entry for '{commit_id}' points to segment '{}' without that commit",
+                self.segment_id
+            ))
+        })?;
+        if location != expected {
+            return Err(LixError::unknown(format!(
+                "changelog commit '{commit_id}' locator does not match segment directory"
+            )));
+        }
+        let bytes = self.object_bytes(location, "commit", commit_id)?;
+        let commit = decode_segment_commit(bytes)?;
+        if commit.header.id != commit_id {
+            return Err(LixError::unknown(format!(
+                "changelog commit locator for '{commit_id}' decoded commit '{}'",
+                commit.header.id
+            )));
+        }
+        Ok(commit)
+    }
+
+    fn load_change(
+        &self,
+        location: &SegmentObjectLocation,
+        change_id: &str,
+    ) -> Result<SegmentChange, LixError> {
+        let expected = self.change_locations.get(change_id).ok_or_else(|| {
+            LixError::unknown(format!(
+                "changelog by_change entry for '{change_id}' points to segment '{}' without that change",
+                self.segment_id
+            ))
+        })?;
+        if location != expected {
+            return Err(LixError::unknown(format!(
+                "changelog change '{change_id}' locator does not match segment directory"
+            )));
+        }
+        let bytes = self.object_bytes(location, "change", change_id)?;
+        let change = decode_segment_change(bytes)?;
+        if change.id != change_id {
+            return Err(LixError::unknown(format!(
+                "changelog change locator for '{change_id}' decoded change '{}'",
+                change.id
+            )));
+        }
+        Ok(change)
+    }
+
+    fn object_bytes(
+        &self,
+        location: &SegmentObjectLocation,
+        kind: &str,
+        id: &str,
+    ) -> Result<&[u8], LixError> {
+        if location.segment_id != self.segment_id {
+            return Err(LixError::unknown(format!(
+                "changelog {kind} '{id}' locator points to segment '{}' but loaded '{}'",
+                location.segment_id, self.segment_id
+            )));
+        }
+        let start = usize::try_from(location.offset).map_err(|_| {
+            LixError::unknown(format!(
+                "changelog {kind} '{id}' locator offset does not fit usize"
+            ))
+        })?;
+        let len = usize::try_from(location.len).map_err(|_| {
+            LixError::unknown(format!(
+                "changelog {kind} '{id}' locator len does not fit usize"
+            ))
+        })?;
+        let end = start.checked_add(len).ok_or_else(|| {
+            LixError::unknown(format!("changelog {kind} '{id}' locator range overflows"))
+        })?;
+        self.bytes.get(start..end).ok_or_else(|| {
+            LixError::unknown(format!(
+                "changelog {kind} '{id}' locator range is outside segment '{}'",
+                self.segment_id
+            ))
+        })
+    }
+}
+
 impl<S> ChangelogStoreReader<S>
 where
     S: StorageReader,
@@ -115,7 +253,7 @@ where
         for visibility in visibilities.iter().flatten() {
             push_unique(&mut segment_ids, visibility.location.segment_id.clone());
         }
-        let segments = self.load_segment_indexes_by_id(&segment_ids).await?;
+        let segments = self.load_segment_byte_indexes_by_id(&segment_ids).await?;
         let mut entries = Vec::with_capacity(commit_ids.len());
         for (commit_id, visibility) in commit_ids.iter().zip(visibilities.iter()) {
             let Some(visibility) = visibility else {
@@ -134,15 +272,9 @@ where
                     visibility.location.segment_id
                 )));
             };
-            let Some(commit) = segment.commit(commit_id) else {
-                return Err(LixError::unknown(format!(
-                    "visible changelog commit '{commit_id}' was not found in segment '{}'",
-                    segment.segment.header.segment_id
-                )));
-            };
-            segment.validate_commit_location(&visibility.location, commit_id)?;
-            validate_commit_checksum(&visibility.checksum, commit_id, commit)?;
-            entries.push(Some(project_segment_commit(commit, projection)));
+            let commit = segment.load_commit(&visibility.location, commit_id)?;
+            validate_commit_checksum(&visibility.checksum, commit_id, &commit)?;
+            entries.push(Some(project_segment_commit(&commit, projection)));
         }
         Ok(entries)
     }
@@ -157,7 +289,7 @@ where
         for entry in by_commit_entries.iter().flatten() {
             push_unique(&mut segment_ids, entry.location.segment_id.clone());
         }
-        let segments = self.load_segment_indexes_by_id(&segment_ids).await?;
+        let segments = self.load_segment_byte_indexes_by_id(&segment_ids).await?;
         let mut entries = Vec::with_capacity(commit_ids.len());
         for (commit_id, by_commit) in commit_ids.iter().zip(by_commit_entries.iter()) {
             let Some(by_commit) = by_commit else {
@@ -176,14 +308,8 @@ where
                     by_commit.location.segment_id
                 )));
             };
-            let Some(commit) = segment.commit(commit_id) else {
-                return Err(LixError::unknown(format!(
-                    "changelog by_commit entry for '{commit_id}' points to segment '{}' without that commit",
-                    segment.segment.header.segment_id
-                )));
-            };
-            segment.validate_commit_location(&by_commit.location, commit_id)?;
-            entries.push(Some(project_segment_commit(commit, projection)));
+            let commit = segment.load_commit(&by_commit.location, commit_id)?;
+            entries.push(Some(project_segment_commit(&commit, projection)));
         }
         Ok(entries)
     }
@@ -215,7 +341,7 @@ where
         for entry in by_change_entries.iter().flatten() {
             push_unique(&mut segment_ids, entry.location.segment_id.clone());
         }
-        let segments = self.load_segment_indexes_by_id(&segment_ids).await?;
+        let segments = self.load_segment_byte_indexes_by_id(&segment_ids).await?;
         let mut entries = Vec::with_capacity(change_ids.len());
         for (change_id, by_change) in change_ids.iter().zip(by_change_entries.iter()) {
             let Some(by_change) = by_change else {
@@ -234,17 +360,11 @@ where
                     by_change.location.segment_id
                 )));
             };
-            let Some(change) = segment.change(change_id) else {
-                return Err(LixError::unknown(format!(
-                    "changelog by_change entry for '{change_id}' points to segment '{}' without that change",
-                    segment.segment.header.segment_id
-                )));
-            };
-            segment.validate_change_location(&by_change.location, change_id)?;
-            validate_change_checksum(&by_change.location.checksum, change_id, change)?;
+            let change = segment.load_change(&by_change.location, change_id)?;
+            validate_change_checksum(&by_change.location.checksum, change_id, &change)?;
             entries.push(Some(project_change_with_location(
                 by_change.location.clone(),
-                change,
+                &change,
                 projection,
             )));
         }
@@ -261,7 +381,7 @@ where
         for entry in by_change_entries.iter().flatten() {
             push_unique(&mut segment_ids, entry.location.segment_id.clone());
         }
-        let segments = self.load_segment_indexes_by_id(&segment_ids).await?;
+        let segments = self.load_segment_byte_indexes_by_id(&segment_ids).await?;
         let mut entries = Vec::with_capacity(change_ids.len());
         for (change_id, by_change) in change_ids.iter().zip(by_change_entries.iter()) {
             let visible = self.visible_membership_contains_change(change_id).await?;
@@ -277,16 +397,9 @@ where
                     )));
                 }
                 if let Some(segment) = segments.get(&by_change.location.segment_id) {
-                    if let Some(change) = segment.change(change_id) {
-                        segment.validate_change_location(&by_change.location, change_id)?;
-                        validate_change_checksum(&by_change.location.checksum, change_id, change)?;
-                        Some((by_change.location.clone(), change.clone()))
-                    } else {
-                        return Err(LixError::unknown(format!(
-                            "changelog by_change entry for visible change '{change_id}' points to segment '{}' without that change",
-                            segment.segment.header.segment_id
-                        )));
-                    }
+                    let change = segment.load_change(&by_change.location, change_id)?;
+                    validate_change_checksum(&by_change.location.checksum, change_id, &change)?;
+                    Some((by_change.location.clone(), change))
                 } else {
                     return Err(LixError::unknown(format!(
                         "changelog by_change entry for visible change '{change_id}' points to missing segment '{}'",
@@ -490,6 +603,40 @@ where
         for (segment_id, value) in segment_ids.iter().zip(values.into_iter()) {
             if let Some(bytes) = value {
                 out.insert(segment_id.clone(), DecodedSegmentIndex::decode(&bytes)?);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn load_segment_byte_index(
+        &mut self,
+        segment_id: &str,
+    ) -> Result<Option<SegmentByteIndex>, LixError> {
+        let Some(bytes) =
+            get_one(&mut self.store, SEGMENT_NAMESPACE, segment_key(segment_id)).await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(SegmentByteIndex::decode(bytes)?))
+    }
+
+    async fn load_segment_byte_indexes_by_id(
+        &mut self,
+        segment_ids: &[String],
+    ) -> Result<HashMap<String, SegmentByteIndex>, LixError> {
+        let values = get_many(
+            &mut self.store,
+            SEGMENT_NAMESPACE,
+            segment_ids
+                .iter()
+                .map(|segment_id| segment_key(segment_id))
+                .collect(),
+        )
+        .await?;
+        let mut out = HashMap::new();
+        for (segment_id, value) in segment_ids.iter().zip(values.into_iter()) {
+            if let Some(bytes) = value {
+                out.insert(segment_id.clone(), SegmentByteIndex::decode(bytes)?);
             }
         }
         Ok(out)
@@ -747,20 +894,17 @@ where
         let Some(visibility) = self.load_commit_visibility(commit_id).await? else {
             return Ok(false);
         };
-        let Some(segment) = self.load_segment(&visibility.location.segment_id).await? else {
+        let Some(segment) = self
+            .load_segment_byte_index(&visibility.location.segment_id)
+            .await?
+        else {
             return Err(LixError::unknown(format!(
                 "visible changelog commit '{commit_id}' points to missing segment '{}'",
                 visibility.location.segment_id
             )));
         };
-        let Some(commit) = segment_commit(&segment, commit_id) else {
-            return Err(LixError::unknown(format!(
-                "visible changelog commit '{commit_id}' was not found in segment '{}'",
-                segment.header.segment_id
-            )));
-        };
-        validate_commit_location(&visibility.location, &segment, commit_id)?;
-        validate_commit_checksum(&visibility.checksum, commit_id, commit)?;
+        let commit = segment.load_commit(&visibility.location, commit_id)?;
+        validate_commit_checksum(&visibility.checksum, commit_id, &commit)?;
         Ok(commit
             .body
             .membership
@@ -3144,7 +3288,10 @@ mod tests {
             .expect_err("visible membership without physical change must be corruption");
 
         assert!(
-            error.message.contains("without that change"),
+            error.message.contains("without that change")
+                || error
+                    .message
+                    .contains("locator does not match segment directory"),
             "unexpected error: {error}"
         );
     }

@@ -47,6 +47,13 @@ fn cpu_scorecard() -> Result<Vec<(&'static str, Duration)>, LixError> {
             })?,
         ),
         (
+            "view_segment / 1c_1000ch",
+            measure_cpu(samples, || {
+                black_box(changelog_bench::view_bench_segment(&encoded)?);
+                Ok(())
+            })?,
+        ),
+        (
             "validate_segment_shape / 1c_1000ch",
             measure_cpu(samples, || {
                 black_box(changelog_bench::validate_bench_segment_shape(&segment)?);

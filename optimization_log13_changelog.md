@@ -117,3 +117,141 @@ Each optimization entry below should:
 5. keep or revert based on structural correctness first, timings second
 ```
 
+## Entry 1: SegmentView And Real Object Byte Ranges
+
+Change:
+
+```text
+SegmentView now parses only the segment header and directory.
+Segment object locations are real encoded byte_offset + byte_len ranges.
+Canonicalization computes commit/change byte ranges from the encoded segment.
+Validation checks directory byte ranges against the encoded object stream.
+```
+
+Measured with:
+
+```sh
+cargo bench --manifest-path packages/engine/Cargo.toml --features storage-benches --bench changelog_scorecard
+```
+
+### CPU Segment Scoreboard
+
+Times are milliseconds.
+
+| row                                     | entry_1_ms |
+| --------------------------------------- | ---------: |
+| encode_segment / 1c_1000ch              |      0.173 |
+| decode_segment / 1c_1000ch              |      3.968 |
+| view_segment / 1c_1000ch                |      0.636 |
+| validate_segment_shape / 1c_1000ch      |      7.559 |
+| build_decoded_segment_index / 1c_1000ch |     11.112 |
+| build_by_change / 1c_1000ch             |      0.693 |
+| build_by_change_membership / 1c_1000ch  |      0.032 |
+
+### Backend Smoke Scoreboard
+
+Times are milliseconds.
+
+| row                                                  | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms |
+| ---------------------------------------------------- | ----------: | -----------------: | -----------------: |
+| stage_segment_raw_no_indexes / 1c_1000ch             |       0.518 |              3.461 |              4.242 |
+| stage_segment / 1c_1000ch                            |      18.432 |             21.840 |             20.838 |
+| stage_publish_commit / 1c_1ch                        |       0.053 |              0.064 |              0.067 |
+| stage_publish_commit / 1c_100ch                      |      79.292 |             79.355 |             87.995 |
+| stage_publish_commit / 1c_1000ch single-shot         |   10719.812 |          10761.576 |          10757.437 |
+| load_commits_visible_batched / 1c_100ch              |       0.853 |              0.932 |              0.821 |
+| load_changes_visible_batched / 1c_100ch              |      84.318 |             83.075 |             80.455 |
+| load_changes_visible_batched / 1c_1000ch             |   11393.271 |          11270.454 |          11162.575 |
+| load_changes_physical_scattered / 100seg_100c_1000ch |      10.298 |             10.309 |             10.254 |
+| load_changes_visible_scattered / 100seg_100c_1000ch  |     529.561 |            115.931 |             99.827 |
+| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       9.169 |             11.451 |             10.389 |
+| plan_gc / live_50pct_mixed_segments                  |      11.858 |             10.145 |              9.709 |
+| collect_garbage / live_50pct_mixed_segments          |       9.922 |             15.618 |              9.983 |
+
+Read:
+
+```text
+view_segment is now a cheap directory-only parse: 0.636ms for 1c_1000ch.
+
+The raw directory view improved structurally, but validation and DecodedSegmentIndex
+regressed because they now recompute/verify encoded byte ranges on top of the full
+decode path. Keep the semantic cut; the next performance cut should make readers
+use SegmentView + byte ranges directly instead of decoding and validating the whole
+segment for every locator proof.
+```
+
+## Entry 2: Decode Requested Objects From SegmentView Byte Ranges
+
+Change:
+
+```text
+Batch commit/change readers now load segment bytes once, parse SegmentView once,
+validate locator equality against the directory, and decode only the requested
+SegmentCommit or SegmentChange byte slice.
+
+This avoids whole-segment decode + whole-segment validation on normal locator-backed
+read paths.
+```
+
+Measured with:
+
+```sh
+cargo bench --manifest-path packages/engine/Cargo.toml --features storage-benches --bench changelog_scorecard
+```
+
+### CPU Segment Scoreboard
+
+Times are milliseconds.
+
+| row                                     | entry_2_ms |
+| --------------------------------------- | ---------: |
+| encode_segment / 1c_1000ch              |      0.153 |
+| decode_segment / 1c_1000ch              |      3.790 |
+| view_segment / 1c_1000ch                |      0.592 |
+| validate_segment_shape / 1c_1000ch      |      7.642 |
+| build_decoded_segment_index / 1c_1000ch |     11.150 |
+| build_by_change / 1c_1000ch             |      0.810 |
+| build_by_change_membership / 1c_1000ch  |      0.032 |
+
+### Backend Smoke Scoreboard
+
+Times are milliseconds.
+
+| row                                                  | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms |
+| ---------------------------------------------------- | ----------: | -----------------: | -----------------: |
+| stage_segment_raw_no_indexes / 1c_1000ch             |       0.556 |              3.384 |              4.253 |
+| stage_segment / 1c_1000ch                            |      17.422 |             20.760 |             21.492 |
+| stage_publish_commit / 1c_1ch                        |       0.051 |              0.064 |              0.071 |
+| stage_publish_commit / 1c_100ch                      |      88.490 |             83.630 |             78.473 |
+| stage_publish_commit / 1c_1000ch single-shot         |   10971.050 |          10847.920 |          10832.477 |
+| load_commits_visible_batched / 1c_100ch              |       0.271 |              0.233 |              0.229 |
+| load_changes_visible_batched / 1c_100ch              |      26.255 |             22.906 |             22.141 |
+| load_changes_visible_batched / 1c_1000ch             |    2364.192 |           2018.527 |           2046.168 |
+| load_changes_physical_scattered / 100seg_100c_1000ch |       3.721 |              3.679 |              3.832 |
+| load_changes_visible_scattered / 100seg_100c_1000ch  |     451.776 |             45.379 |             31.451 |
+| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       9.162 |             10.552 |              9.203 |
+| plan_gc / live_50pct_mixed_segments                  |      10.962 |              9.213 |              9.342 |
+| collect_garbage / live_50pct_mixed_segments          |       9.696 |             10.154 |              9.909 |
+
+Read:
+
+```text
+The hot read paths moved hard:
+
+load_commits_visible_batched / 1c_100ch:
+  ~0.82-0.93ms -> ~0.23-0.27ms
+
+load_changes_visible_batched / 1c_100ch:
+  ~80-84ms -> ~22-26ms
+
+load_changes_visible_batched / 1c_1000ch:
+  ~11.2-11.4s -> ~2.0-2.4s
+
+load_changes_physical_scattered:
+  ~10.3ms -> ~3.7ms
+
+The remaining 1c_1000ch visible-change cost is now mostly repeated membership
+proof work, not whole-segment decoding. The next cut should batch membership
+proofs by candidate commit and reuse decoded commit membership once per visible
+commit instead of once per change_id.
+```

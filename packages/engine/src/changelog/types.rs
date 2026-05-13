@@ -188,6 +188,44 @@ pub(crate) struct SegmentObjectLocation {
     pub(crate) checksum: SegmentChecksum,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SegmentObjectLocationRef<'a> {
+    pub(crate) segment_id: &'a str,
+    pub(crate) offset: SegmentOffset,
+    pub(crate) len: SegmentLength,
+    pub(crate) checksum: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SegmentDirectoryEntryRef<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) location: SegmentObjectLocationRef<'a>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SegmentObjectSlice<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) offset: SegmentOffset,
+    pub(crate) len: SegmentLength,
+    pub(crate) encoded_checksum: Option<&'a str>,
+    pub(crate) bytes: &'a [u8],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SegmentView<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) segment_id: &'a str,
+    pub(crate) format_version: u32,
+    pub(crate) commit_count: u32,
+    pub(crate) change_count: u32,
+    pub(crate) byte_count: u64,
+    pub(crate) payload_count: u32,
+    pub(crate) checksum: &'a str,
+    pub(crate) directory_commits: Vec<SegmentDirectoryEntryRef<'a>>,
+    pub(crate) directory_changes: Vec<SegmentDirectoryEntryRef<'a>>,
+    pub(crate) object_bytes: &'a [u8],
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SegmentCommit {
     pub(crate) header: CommitHeader,

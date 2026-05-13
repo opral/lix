@@ -23,8 +23,9 @@ mod visibility;
 #[allow(unused_imports)]
 pub(crate) use codec::{
     decode_by_change_entry, decode_by_commit_entry, decode_commit_visibility,
-    decode_empty_index_value, decode_segment, encode_by_change_entry, encode_by_commit_entry,
-    encode_commit_visibility, encode_empty_index_value, encode_segment,
+    decode_empty_index_value, decode_segment, decode_segment_change, decode_segment_commit,
+    encode_by_change_entry, encode_by_commit_entry, encode_commit_visibility,
+    encode_empty_index_value, encode_segment, view_segment,
 };
 #[allow(unused_imports)]
 pub(crate) use context::{ChangelogContext, ChangelogStoreReader, ChangelogStoreWriter};
@@ -38,6 +39,7 @@ pub(crate) use types::{
     CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitVisibility, CommitVisibilityMode,
     GcLiveSet, GcPlan, GcRoot, GcSweepSet, MembershipRecord, MembershipRole, RebuildIndexStats,
     Segment, SegmentChange, SegmentChangeDirectory, SegmentCommit, SegmentCommitDirectory,
-    SegmentDirectory, SegmentHeader, SegmentId, SegmentInlinePayload, SegmentObjectLocation,
-    SegmentOffset, SegmentPayloadLocation, StateRowIdentity,
+    SegmentDirectory, SegmentDirectoryEntryRef, SegmentHeader, SegmentId, SegmentInlinePayload,
+    SegmentObjectLocation, SegmentObjectLocationRef, SegmentObjectSlice, SegmentOffset,
+    SegmentPayloadLocation, SegmentView, StateRowIdentity,
 };

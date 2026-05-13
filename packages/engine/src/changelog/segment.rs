@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::codec::decode_segment;
+use super::codec::{decode_segment, view_segment_object_slices};
 use super::store::segment_value;
 use super::types::{
     MembershipRole, Segment, SegmentChange, SegmentCommit, SegmentDirectory, SegmentObjectLocation,
@@ -183,12 +183,12 @@ pub(super) fn canonicalize_segment(mut segment: Segment) -> Result<Segment, LixE
     }
 
     let mut commit_locations = Vec::with_capacity(segment.commits.len());
-    for (ordinal, commit) in segment.commits.iter().enumerate() {
+    for commit in &segment.commits {
         commit_locations.push((
             commit.header.id.clone(),
             SegmentObjectLocation {
                 segment_id: segment_id.clone(),
-                offset: ordinal as u64,
+                offset: 0,
                 len: 0,
                 checksum: commit.checksum.clone(),
             },
@@ -196,7 +196,7 @@ pub(super) fn canonicalize_segment(mut segment: Segment) -> Result<Segment, LixE
     }
 
     let mut change_locations = Vec::with_capacity(segment.changes.len());
-    for (ordinal, change) in segment.changes.iter_mut().enumerate() {
+    for change in &mut segment.changes {
         change.directory.payloads = change
             .inline_payloads
             .iter()
@@ -211,7 +211,7 @@ pub(super) fn canonicalize_segment(mut segment: Segment) -> Result<Segment, LixE
             change.id.clone(),
             SegmentObjectLocation {
                 segment_id: segment_id.clone(),
-                offset: ordinal as u64,
+                offset: 0,
                 len: 0,
                 checksum: checksum_change(change)?,
             },
@@ -223,10 +223,45 @@ pub(super) fn canonicalize_segment(mut segment: Segment) -> Result<Segment, LixE
         changes: change_locations,
     };
     segment.header.byte_count = 0;
-    segment.header.checksum = checksum_segment(&segment)?;
+    segment.header.checksum = empty_checksum();
+    apply_encoded_object_locations(&mut segment)?;
     segment.header.byte_count = segment_value(&segment)?.len() as u64;
     segment.header.checksum = checksum_segment(&segment)?;
+    apply_encoded_object_locations(&mut segment)?;
     Ok(segment)
+}
+
+fn empty_checksum() -> String {
+    "0".repeat(64)
+}
+
+fn apply_encoded_object_locations(segment: &mut Segment) -> Result<(), LixError> {
+    let bytes = segment_value(segment)?;
+    let (commit_slices, change_slices) = view_segment_object_slices(&bytes)?;
+
+    for (commit_id, location) in &mut segment.directory.commits {
+        let Some(slice) = commit_slices.iter().find(|slice| slice.id == commit_id) else {
+            return Err(LixError::unknown(format!(
+                "changelog segment '{}' could not locate encoded commit '{}'",
+                segment.header.segment_id, commit_id
+            )));
+        };
+        location.offset = slice.offset;
+        location.len = slice.len;
+    }
+
+    for (change_id, location) in &mut segment.directory.changes {
+        let Some(slice) = change_slices.iter().find(|slice| slice.id == change_id) else {
+            return Err(LixError::unknown(format!(
+                "changelog segment '{}' could not locate encoded change '{}'",
+                segment.header.segment_id, change_id
+            )));
+        };
+        location.offset = slice.offset;
+        location.len = slice.len;
+    }
+
+    Ok(())
 }
 
 pub(super) fn validate_segment_shape(segment: &Segment) -> Result<(), LixError> {
@@ -329,6 +364,9 @@ pub(super) fn validate_segment_shape(segment: &Segment) -> Result<(), LixError> 
             .map(|(id, location)| (id.as_str(), location)),
     )?;
 
+    let encoded = segment_value(segment)?;
+    let (encoded_commits, encoded_changes) = view_segment_object_slices(&encoded)?;
+
     for (commit_id, location) in &segment.directory.commits {
         let commit = segment_commit(segment, commit_id).ok_or_else(|| {
             LixError::unknown(format!(
@@ -337,6 +375,20 @@ pub(super) fn validate_segment_shape(segment: &Segment) -> Result<(), LixError> 
             ))
         })?;
         validate_commit_location(location, segment, commit_id)?;
+        validate_encoded_object_location(
+            &segment.header.segment_id,
+            "commit",
+            commit_id,
+            location,
+            encoded_commits.iter().map(|slice| {
+                (
+                    slice.id,
+                    slice.offset,
+                    slice.len,
+                    slice.encoded_checksum.unwrap_or_default(),
+                )
+            }),
+        )?;
         validate_commit_checksum(&location.checksum, commit_id, commit)?;
     }
 
@@ -348,10 +400,19 @@ pub(super) fn validate_segment_shape(segment: &Segment) -> Result<(), LixError> 
                 segment.header.segment_id, change_id
             ))
         })?;
+        validate_encoded_object_location(
+            &segment.header.segment_id,
+            "change",
+            change_id,
+            location,
+            encoded_changes
+                .iter()
+                .map(|slice| (slice.id, slice.offset, slice.len, "")),
+        )?;
         validate_change_checksum(&location.checksum, change_id, change)?;
     }
 
-    let encoded_len = segment_value(segment)?.len() as u64;
+    let encoded_len = encoded.len() as u64;
     if segment.header.byte_count != encoded_len {
         return Err(LixError::unknown(format!(
             "changelog segment '{}' byte_count {} does not match encoded length {}",
@@ -367,6 +428,34 @@ pub(super) fn validate_segment_shape(segment: &Segment) -> Result<(), LixError> 
         )));
     }
 
+    Ok(())
+}
+
+fn validate_encoded_object_location<'a>(
+    segment_id: &str,
+    kind: &str,
+    object_id: &str,
+    location: &SegmentObjectLocation,
+    encoded_locations: impl Iterator<Item = (&'a str, u64, u64, &'a str)>,
+) -> Result<(), LixError> {
+    let Some((_, offset, len, encoded_checksum)) = encoded_locations
+        .into_iter()
+        .find(|(id, _, _, _)| id == &object_id)
+    else {
+        return Err(LixError::unknown(format!(
+            "changelog segment '{segment_id}' is missing encoded {kind} '{object_id}'"
+        )));
+    };
+    if location.offset != offset || location.len != len {
+        return Err(LixError::unknown(format!(
+            "changelog {kind} '{object_id}' locator offset/len does not match encoded byte range"
+        )));
+    }
+    if !encoded_checksum.is_empty() && location.checksum != encoded_checksum {
+        return Err(LixError::unknown(format!(
+            "changelog {kind} '{object_id}' locator checksum does not match encoded object checksum"
+        )));
+    }
     Ok(())
 }
 
@@ -698,19 +787,14 @@ pub(super) fn validate_commit_location(
             "changelog commit '{commit_id}' locator does not match segment directory"
         )));
     }
-    let Some(ordinal) = segment
+    if !segment
         .commits
         .iter()
-        .position(|commit| commit.header.id == commit_id)
-    else {
+        .any(|commit| commit.header.id == commit_id)
+    {
         return Err(LixError::unknown(format!(
             "changelog segment '{}' is missing commit '{}'",
             segment.header.segment_id, commit_id
-        )));
-    };
-    if location.offset != ordinal as u64 || location.len != 0 {
-        return Err(LixError::unknown(format!(
-            "changelog commit '{commit_id}' locator offset/len does not match canonical segment position"
         )));
     }
     Ok(())
@@ -747,19 +831,10 @@ pub(super) fn validate_change_location(
             "changelog change '{change_id}' locator does not match segment directory"
         )));
     }
-    let Some(ordinal) = segment
-        .changes
-        .iter()
-        .position(|change| change.id == change_id)
-    else {
+    if !segment.changes.iter().any(|change| change.id == change_id) {
         return Err(LixError::unknown(format!(
             "changelog segment '{}' is missing change '{}'",
             segment.header.segment_id, change_id
-        )));
-    };
-    if location.offset != ordinal as u64 || location.len != 0 {
-        return Err(LixError::unknown(format!(
-            "changelog change '{change_id}' locator offset/len does not match canonical segment position"
         )));
     }
     Ok(())
@@ -885,6 +960,29 @@ mod tests {
                 .contains("payload directory entry does not match inline payload"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn canonicalization_writes_encoded_byte_ranges() {
+        let segment = test_segment();
+        let commit_location = directory_commit_location(&segment, "commit-1").unwrap();
+        let change_location = directory_change_location(&segment, "change-1").unwrap();
+
+        assert!(
+            commit_location.offset > 0 && commit_location.len > 0,
+            "commit location should be a real encoded byte range"
+        );
+        assert!(
+            change_location.offset > commit_location.offset && change_location.len > 0,
+            "change location should be a real encoded byte range after commits"
+        );
+
+        let encoded = segment_value(&segment).unwrap();
+        let (commit_slices, change_slices) = view_segment_object_slices(&encoded).unwrap();
+        assert_eq!(commit_location.offset, commit_slices[0].offset);
+        assert_eq!(commit_location.len, commit_slices[0].len);
+        assert_eq!(change_location.offset, change_slices[0].offset);
+        assert_eq!(change_location.len, change_slices[0].len);
     }
 
     fn test_segment() -> Segment {

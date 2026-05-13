@@ -44,6 +44,14 @@ fn bench_single_segment_cpu(c: &mut Criterion) {
             )
         });
 
+        group.bench_function("view_segment", |b| {
+            b.iter(|| {
+                black_box(
+                    changelog_bench::view_bench_segment(&encoded).expect("view changelog segment"),
+                )
+            })
+        });
+
         group.bench_function("canonicalize_segment", |b| {
             b.iter_batched(
                 || fixture.segment.clone(),

@@ -10,7 +10,7 @@ use super::by_change_index::by_change_entries_for_segments;
 use super::by_change_membership_index::by_change_membership_entries_for_segments;
 use super::by_commit_index::by_commit_entries_for_segment;
 use super::codec::{
-    decode_by_change_entry, decode_by_commit_entry, decode_segment, encode_segment,
+    decode_by_change_entry, decode_by_commit_entry, decode_segment, encode_segment, view_segment,
 };
 use super::context::ChangelogContext;
 use super::segment::{
@@ -332,6 +332,11 @@ pub fn decode_bench_segment(bytes: &[u8]) -> Result<BenchSegment, LixError> {
     Ok(BenchSegment {
         inner: decode_segment(bytes)?,
     })
+}
+
+pub fn view_bench_segment(bytes: &[u8]) -> Result<usize, LixError> {
+    let view = view_segment(bytes)?;
+    Ok(view.directory_commits.len() + view.directory_changes.len())
 }
 
 pub fn canonicalize_bench_segment(segment: BenchSegment) -> Result<BenchSegment, LixError> {
