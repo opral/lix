@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::codec::{
-    decode_segment, decode_segment_change, decode_segment_commit, encode_segment_with_object_locations,
-    view_segment, view_segment_object_slices,
+    decode_segment, decode_segment_change, decode_segment_commit,
+    encode_segment_with_object_locations, view_segment, view_segment_object_slices,
 };
 use super::store::segment_value;
 use super::types::{
@@ -640,7 +640,10 @@ fn checksum_change(change: &SegmentChange) -> Result<String, LixError> {
         &mut hasher,
         change.authored_commit_id.as_deref().unwrap_or_default(),
     );
-    hash_parts(&mut hasher, change.entity_id.parts.iter().map(String::as_str));
+    hash_parts(
+        &mut hasher,
+        change.entity_id.parts.iter().map(String::as_str),
+    );
     hash_part(&mut hasher, &change.schema_key);
     hash_part(&mut hasher, change.file_id.as_deref().unwrap_or_default());
     hash_optional_json_ref(&mut hasher, change.snapshot_ref.as_ref());

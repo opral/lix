@@ -27,14 +27,8 @@ impl Backend for UnitChangelogBenchBackend {
     async fn begin_read_transaction(
         &self,
     ) -> Result<Box<dyn BackendReadTransaction + Send + Sync + 'static>, LixError> {
-        let snapshot = self
-            .kv
-            .lock()
-            .map_err(|_| lock_error("changelog bench kv"))?
-            .clone();
-        Ok(Box::new(UnitChangelogBenchTransaction {
-            parent: Arc::clone(&self.kv),
-            kv: snapshot,
+        Ok(Box::new(UnitChangelogBenchReadTransaction {
+            kv: Arc::clone(&self.kv),
         }))
     }
 
@@ -46,31 +40,39 @@ impl Backend for UnitChangelogBenchBackend {
             .lock()
             .map_err(|_| lock_error("changelog bench kv"))?
             .clone();
-        Ok(Box::new(UnitChangelogBenchTransaction {
+        Ok(Box::new(UnitChangelogBenchWriteTransaction {
             parent: Arc::clone(&self.kv),
             kv: snapshot,
         }))
     }
 }
 
-struct UnitChangelogBenchTransaction {
+struct UnitChangelogBenchReadTransaction {
+    kv: Arc<Mutex<KvMap>>,
+}
+
+struct UnitChangelogBenchWriteTransaction {
     parent: Arc<Mutex<KvMap>>,
     kv: KvMap,
 }
 
 #[async_trait]
-impl BackendReadTransaction for UnitChangelogBenchTransaction {
+impl BackendReadTransaction for UnitChangelogBenchReadTransaction {
     async fn get_values(
         &mut self,
         request: BackendKvGetRequest,
     ) -> Result<BackendKvValueBatch, LixError> {
+        let kv = self
+            .kv
+            .lock()
+            .map_err(|_| lock_error("changelog bench kv"))?;
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
             let namespace = group.namespace.clone();
             let mut values = BytePageBuilder::with_capacity(group.keys.len(), 0);
             let mut present = Vec::with_capacity(group.keys.len());
             for key in group.keys {
-                if let Some(value) = self.kv.get(&(namespace.clone(), key)) {
+                if let Some(value) = kv.get(&(namespace.clone(), key)) {
                     values.push(value);
                     present.push(true);
                 } else {
@@ -91,13 +93,17 @@ impl BackendReadTransaction for UnitChangelogBenchTransaction {
         &mut self,
         request: BackendKvGetRequest,
     ) -> Result<BackendKvExistsBatch, LixError> {
+        let kv = self
+            .kv
+            .lock()
+            .map_err(|_| lock_error("changelog bench kv"))?;
         let mut groups = Vec::with_capacity(request.groups.len());
         for group in request.groups {
             let namespace = group.namespace.clone();
             let exists = group
                 .keys
                 .into_iter()
-                .map(|key| self.kv.contains_key(&(namespace.clone(), key)))
+                .map(|key| kv.contains_key(&(namespace.clone(), key)))
                 .collect();
             groups.push(BackendKvExistsGroup { namespace, exists });
         }
@@ -108,7 +114,11 @@ impl BackendReadTransaction for UnitChangelogBenchTransaction {
         &mut self,
         request: BackendKvScanRequest,
     ) -> Result<BackendKvKeyPage, LixError> {
-        let (pairs, resume_after) = scan_pairs(&self.kv, &request);
+        let kv = self
+            .kv
+            .lock()
+            .map_err(|_| lock_error("changelog bench kv"))?;
+        let (pairs, resume_after) = scan_pairs(&kv, &request);
         let mut keys = BytePageBuilder::with_capacity(pairs.len(), 0);
         for (key, _) in pairs {
             keys.push(key);
@@ -123,7 +133,11 @@ impl BackendReadTransaction for UnitChangelogBenchTransaction {
         &mut self,
         request: BackendKvScanRequest,
     ) -> Result<BackendKvValuePage, LixError> {
-        let (pairs, resume_after) = scan_pairs(&self.kv, &request);
+        let kv = self
+            .kv
+            .lock()
+            .map_err(|_| lock_error("changelog bench kv"))?;
+        let (pairs, resume_after) = scan_pairs(&kv, &request);
         let mut values = BytePageBuilder::with_capacity(pairs.len(), 0);
         for (_, value) in pairs {
             values.push(value);
@@ -138,7 +152,11 @@ impl BackendReadTransaction for UnitChangelogBenchTransaction {
         &mut self,
         request: BackendKvScanRequest,
     ) -> Result<BackendKvEntryPage, LixError> {
-        let (pairs, resume_after) = scan_pairs(&self.kv, &request);
+        let kv = self
+            .kv
+            .lock()
+            .map_err(|_| lock_error("changelog bench kv"))?;
+        let (pairs, resume_after) = scan_pairs(&kv, &request);
         let mut keys = BytePageBuilder::with_capacity(pairs.len(), 0);
         let mut values = BytePageBuilder::with_capacity(pairs.len(), 0);
         for (key, value) in pairs {
@@ -158,7 +176,49 @@ impl BackendReadTransaction for UnitChangelogBenchTransaction {
 }
 
 #[async_trait]
-impl BackendWriteTransaction for UnitChangelogBenchTransaction {
+impl BackendReadTransaction for UnitChangelogBenchWriteTransaction {
+    async fn get_values(
+        &mut self,
+        request: BackendKvGetRequest,
+    ) -> Result<BackendKvValueBatch, LixError> {
+        read_get_values(&self.kv, request)
+    }
+
+    async fn exists_many(
+        &mut self,
+        request: BackendKvGetRequest,
+    ) -> Result<BackendKvExistsBatch, LixError> {
+        read_exists_many(&self.kv, request)
+    }
+
+    async fn scan_keys(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvKeyPage, LixError> {
+        read_scan_keys(&self.kv, request)
+    }
+
+    async fn scan_values(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvValuePage, LixError> {
+        read_scan_values(&self.kv, request)
+    }
+
+    async fn scan_entries(
+        &mut self,
+        request: BackendKvScanRequest,
+    ) -> Result<BackendKvEntryPage, LixError> {
+        read_scan_entries(&self.kv, request)
+    }
+
+    async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl BackendWriteTransaction for UnitChangelogBenchWriteTransaction {
     async fn write_kv_batch(
         &mut self,
         batch: BackendKvWriteBatch,
@@ -200,6 +260,95 @@ impl BackendWriteTransaction for UnitChangelogBenchTransaction {
             .map_err(|_| lock_error("changelog bench kv"))? = self.kv;
         Ok(())
     }
+}
+
+fn read_get_values(
+    kv: &KvMap,
+    request: BackendKvGetRequest,
+) -> Result<BackendKvValueBatch, LixError> {
+    let mut groups = Vec::with_capacity(request.groups.len());
+    for group in request.groups {
+        let namespace = group.namespace.clone();
+        let mut values = BytePageBuilder::with_capacity(group.keys.len(), 0);
+        let mut present = Vec::with_capacity(group.keys.len());
+        for key in group.keys {
+            if let Some(value) = kv.get(&(namespace.clone(), key)) {
+                values.push(value);
+                present.push(true);
+            } else {
+                values.push([]);
+                present.push(false);
+            }
+        }
+        groups.push(BackendKvValueGroup::new(
+            namespace,
+            values.finish(),
+            present,
+        ));
+    }
+    Ok(BackendKvValueBatch { groups })
+}
+
+fn read_exists_many(
+    kv: &KvMap,
+    request: BackendKvGetRequest,
+) -> Result<BackendKvExistsBatch, LixError> {
+    let mut groups = Vec::with_capacity(request.groups.len());
+    for group in request.groups {
+        let namespace = group.namespace.clone();
+        let exists = group
+            .keys
+            .into_iter()
+            .map(|key| kv.contains_key(&(namespace.clone(), key)))
+            .collect();
+        groups.push(BackendKvExistsGroup { namespace, exists });
+    }
+    Ok(BackendKvExistsBatch { groups })
+}
+
+fn read_scan_keys(kv: &KvMap, request: BackendKvScanRequest) -> Result<BackendKvKeyPage, LixError> {
+    let (pairs, resume_after) = scan_pairs(kv, &request);
+    let mut keys = BytePageBuilder::with_capacity(pairs.len(), 0);
+    for (key, _) in pairs {
+        keys.push(key);
+    }
+    Ok(BackendKvKeyPage {
+        keys: keys.finish(),
+        resume_after,
+    })
+}
+
+fn read_scan_values(
+    kv: &KvMap,
+    request: BackendKvScanRequest,
+) -> Result<BackendKvValuePage, LixError> {
+    let (pairs, resume_after) = scan_pairs(kv, &request);
+    let mut values = BytePageBuilder::with_capacity(pairs.len(), 0);
+    for (_, value) in pairs {
+        values.push(value);
+    }
+    Ok(BackendKvValuePage {
+        values: values.finish(),
+        resume_after,
+    })
+}
+
+fn read_scan_entries(
+    kv: &KvMap,
+    request: BackendKvScanRequest,
+) -> Result<BackendKvEntryPage, LixError> {
+    let (pairs, resume_after) = scan_pairs(kv, &request);
+    let mut keys = BytePageBuilder::with_capacity(pairs.len(), 0);
+    let mut values = BytePageBuilder::with_capacity(pairs.len(), 0);
+    for (key, value) in pairs {
+        keys.push(key);
+        values.push(value);
+    }
+    Ok(BackendKvEntryPage {
+        keys: keys.finish(),
+        values: values.finish(),
+        resume_after,
+    })
 }
 
 fn scan_pairs<'a>(
