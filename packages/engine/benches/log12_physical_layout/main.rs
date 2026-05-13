@@ -768,9 +768,8 @@ fn raw_sqlite_delete_one_by_pk(fixture: RawSqliteFixture, row: &PointerRow) -> u
 async fn prepare_lix_empty(profile: LixBackendProfile) -> LixFixture {
     let engine = match profile {
         LixBackendProfile::Sqlite => {
-            let backend =
-                SqliteBenchBackend::tempfile()
-                    .expect("create sqlite log12 physical layout backend");
+            let backend = SqliteBenchBackend::tempfile()
+                .expect("create sqlite log12 physical layout backend");
             Engine::initialize(Box::new(backend.clone()))
                 .await
                 .expect("initialize sqlite log12 physical layout Lix backend");
@@ -780,8 +779,7 @@ async fn prepare_lix_empty(profile: LixBackendProfile) -> LixFixture {
         }
         LixBackendProfile::RocksDb => {
             let backend =
-                RocksDbBenchBackend::new()
-                    .expect("create rocksdb log12 physical layout backend");
+                RocksDbBenchBackend::new().expect("create rocksdb log12 physical layout backend");
             Engine::initialize(Box::new(backend.clone()))
                 .await
                 .expect("initialize rocksdb log12 physical layout Lix backend");

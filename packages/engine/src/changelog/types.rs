@@ -29,9 +29,43 @@ pub(crate) struct CommitBody {
     pub(crate) membership: Vec<MembershipRecord>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CommitProjection {
+    Header,
+    Body,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CommitVisibilityMode {
+    RequireVisible,
+    PhysicalOnly,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CommitLoadRequest<'a> {
+    pub(crate) commit_ids: &'a [CommitId],
+    pub(crate) projection: CommitProjection,
+    pub(crate) visibility: CommitVisibilityMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CommitLoadBatch {
+    pub(crate) entries: Vec<Option<CommitLoadEntry>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CommitLoadEntry {
+    Header(CommitHeader),
+    Body(CommitBody),
+    Full {
+        header: CommitHeader,
+        body: CommitBody,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MembershipRecord {
-    pub(crate) tracked_key: TrackedKey,
     pub(crate) member_change_id: ChangeId,
     pub(crate) role: MembershipRole,
     pub(crate) source_parent_ordinal: Option<u32>,
@@ -43,8 +77,8 @@ pub(crate) enum MembershipRole {
     Adopted,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct TrackedKey {
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct StateRowIdentity {
     pub(crate) schema_key: CanonicalSchemaKey,
     pub(crate) file_id: FileId,
     pub(crate) entity_id: EntityId,
@@ -87,6 +121,38 @@ pub(crate) struct ChangeRef<'a> {
     pub(crate) snapshot_ref: Option<&'a JsonRef>,
     pub(crate) metadata_ref: Option<&'a JsonRef>,
     pub(crate) created_at: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChangeProjection {
+    Logical,
+    Segment,
+    PhysicalLocation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChangeVisibilityMode {
+    RequireReachableFromVisibleCommit,
+    PhysicalOnly,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ChangeLoadRequest<'a> {
+    pub(crate) change_ids: &'a [ChangeId],
+    pub(crate) projection: ChangeProjection,
+    pub(crate) visibility: ChangeVisibilityMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ChangeLoadBatch {
+    pub(crate) entries: Vec<Option<ChangeLoadEntry>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ChangeLoadEntry {
+    Logical(Change),
+    Segment(SegmentChange),
+    PhysicalLocation(SegmentObjectLocation),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,7 +198,7 @@ pub(crate) struct SegmentCommit {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct SegmentCommitDirectory {
-    pub(crate) tracked_keys: Vec<(TrackedKey, ChangeId)>,
+    pub(crate) state_row_identities: Vec<(StateRowIdentity, ChangeId)>,
     pub(crate) membership_ordinals: Vec<(ChangeId, u32)>,
 }
 
@@ -206,15 +272,34 @@ pub(crate) struct ByChangeEntry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ByKeyValueEntry {
-    pub(crate) tracked_key: TrackedKey,
+    pub(crate) state_row_identity: StateRowIdentity,
     pub(crate) change_id: ChangeId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ByKeyCommitEntry {
-    pub(crate) tracked_key: TrackedKey,
+    pub(crate) state_row_identity: StateRowIdentity,
     pub(crate) commit_id: CommitId,
     pub(crate) member_change_id: ChangeId,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RebuildIndexStats {
+    pub(crate) expected: usize,
+    pub(crate) put: usize,
+    pub(crate) deleted: usize,
+    pub(crate) unchanged: usize,
+}
+
+impl RebuildIndexStats {
+    pub(crate) fn combine(self, other: Self) -> Self {
+        Self {
+            expected: self.expected + other.expected,
+            put: self.put + other.put,
+            deleted: self.deleted + other.deleted,
+            unchanged: self.unchanged + other.unchanged,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -225,7 +310,7 @@ pub(crate) enum GcRoot {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct GcMarkSet {
+pub(crate) struct GcLiveSet {
     pub(crate) commits: Vec<CommitId>,
     pub(crate) changes: Vec<ChangeId>,
     pub(crate) payloads: Vec<JsonRef>,
@@ -233,8 +318,18 @@ pub(crate) struct GcMarkSet {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct GcSweepSet {
+    pub(crate) segments: Vec<SegmentId>,
+    pub(crate) commit_visibility: Vec<CommitId>,
+    pub(crate) by_commit: Vec<CommitId>,
+    pub(crate) by_change: Vec<ChangeId>,
+    pub(crate) by_change_membership: Vec<(ChangeId, CommitId)>,
+    pub(crate) json_payloads: Vec<JsonRef>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct GcPlan {
     pub(crate) roots: Vec<GcRoot>,
-    pub(crate) marked: GcMarkSet,
-    pub(crate) sweep_segments: Vec<SegmentId>,
+    pub(crate) live: GcLiveSet,
+    pub(crate) sweep: GcSweepSet,
 }
