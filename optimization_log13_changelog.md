@@ -472,3 +472,71 @@ payload directories, segment directory construction, and two encodes/views to
 compute stable byte ranges. Next cut should remove the second encode/view pass
 or make directory byte-range patching happen during encode.
 ```
+
+## Entry 6: Record Segment Object Ranges During Encode
+
+Change:
+
+```text
+encode_segment_with_object_locations writes the segment and records each
+SegmentCommit / SegmentChange byte range while writing.
+
+canonicalize_segment now uses those recorded ranges instead of encoding and
+then viewing/skipping the encoded segment to discover object offsets. It also
+avoids the second byte-range discovery pass because header checksum and locator
+fields have fixed encoded widths.
+```
+
+Measured with:
+
+```sh
+cargo bench --manifest-path packages/engine/Cargo.toml --features storage-benches --bench changelog_scorecard
+```
+
+### CPU Segment Scoreboard
+
+Times are milliseconds.
+
+| row                                     | entry_6_ms |
+| --------------------------------------- | ---------: |
+| encode_segment / 1c_1000ch              |      0.269 |
+| decode_segment / 1c_1000ch              |      4.516 |
+| view_segment / 1c_1000ch                |      0.653 |
+| validate_segment_shape / 1c_1000ch      |      7.394 |
+| build_decoded_segment_index / 1c_1000ch |     11.206 |
+| build_by_change / 1c_1000ch             |      0.686 |
+| build_by_change_membership / 1c_1000ch  |      0.032 |
+
+### Backend Smoke Scoreboard
+
+Times are milliseconds.
+
+| row                                                  | mem_unit_ms | sqlite_tempfile_ms | rocksdb_tempdir_ms |
+| ---------------------------------------------------- | ----------: | -----------------: | -----------------: |
+| stage_segment_raw_no_indexes / 1c_1000ch             |       0.528 |              3.409 |              3.988 |
+| stage_segment / 1c_1000ch                            |       5.029 |              7.724 |              7.798 |
+| stage_publish_commit / 1c_1ch                        |       0.060 |              0.063 |              0.063 |
+| stage_publish_commit / 1c_100ch                      |       1.159 |              1.198 |              1.215 |
+| stage_publish_commit / 1c_1000ch single-shot         |      14.988 |             14.796 |             14.656 |
+| load_commits_visible_batched / 1c_100ch              |       0.277 |              0.229 |              0.226 |
+| load_changes_visible_batched / 1c_100ch              |       1.857 |              0.965 |              0.696 |
+| load_changes_visible_batched / 1c_1000ch             |     122.428 |             18.041 |              6.788 |
+| load_changes_physical_scattered / 100seg_100c_1000ch |       3.635 |              3.661 |              3.671 |
+| load_changes_visible_scattered / 100seg_100c_1000ch  |     175.585 |             19.343 |              7.740 |
+| rebuild_mandatory_indexes / 100seg_100c_1000ch       |       9.326 |             10.659 |              9.411 |
+| plan_gc / live_50pct_mixed_segments                  |      11.219 |              9.362 |              9.339 |
+| collect_garbage / live_50pct_mixed_segments          |       9.780 |              9.986 |             13.098 |
+
+Read:
+
+```text
+stage_segment is now close to the original target:
+
+stage_segment / 1c_1000ch:
+  entry 5: ~11-14ms
+  entry 6: ~5-8ms
+
+The remaining gap to raw segment write is mostly canonical checksum and index
+construction cost. The next cut should avoid logical checksum recomputation via
+byte-native object checksums or add borrowed views for checksum/identity fields.
+```
