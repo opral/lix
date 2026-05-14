@@ -588,3 +588,100 @@ Target shape:
   validation remains a required commit-path pass, but no longer adds a tree
   factor to write-set commits.
 ```
+
+### 2026-05-14: Remove Fixture Construction From Storage Benches
+
+Change:
+
+```text
+The storage_v2 benchmark harness now prebuilds write mutations and read fixtures
+outside measured loops.
+
+write_set_lowering:
+  still measures staging, lowering, and commit
+  no longer measures per-iteration format! key construction
+  no longer measures per-iteration value byte generation
+
+conformance_backend/get_many and scan_range:
+  seed once outside the measured loop
+  reuse a read snapshot for read-path timing
+```
+
+Why:
+
+```text
+Post-validation profiles showed benchmark setup dominating the write-set and
+conformance paths. The largest noise source was format! key construction and
+per-iteration seeding, which hid the real storage_v2 costs.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 write_set_lowering
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 conformance_backend
+```
+
+Write-set scorecard:
+
+| Case                       | Previous Mean |  New Mean | Criterion Change |
+| -------------------------- | ------------: | --------: | ---------------: |
+| `puts_k128_g1_v32`         |     5.5251 us | 2.7507 us |   51.127% faster |
+| `puts_k1024_g1_v32`        |     44.867 us | 22.751 us |   48.506% faster |
+| `puts_k1024_g16_v32`       |     45.524 us | 22.982 us |   55.243% faster |
+| `puts_k8192_g16_v32`       |     365.31 us | 196.52 us |   47.594% faster |
+| `puts_k1024_g64_v32`       |     47.089 us | 24.431 us |   48.975% faster |
+| `puts_k4096_g256_v32`      |     191.70 us | 103.79 us |   45.191% faster |
+| `deletes_k1024_g16`        |     40.631 us | 20.753 us |   50.289% faster |
+| `mixed80_20_k1024_g16_v32` |     44.597 us | 25.216 us |   46.112% faster |
+| `puts_k1024_g16_v1024`     |     53.383 us | 26.016 us |   50.024% faster |
+| `puts_k1024_g16_v65536`    |     406.59 us | 40.899 us |   90.224% faster |
+
+Conformance backend scorecard:
+
+| Case                        | Previous Mean |  New Mean | Criterion Change |
+| --------------------------- | ------------: | --------: | ---------------: |
+| `commit_puts_k1024_g16_v32` |     103.03 us | 76.227 us |   25.244% faster |
+| `get_many_m1000_u100`       |     73.467 us | 50.878 us |   29.188% faster |
+| `scan_range_q1000`          |     52.960 us | 9.5034 us |   81.757% faster |
+
+Post-cleanup profiles:
+
+```text
+Profiles:
+  target/storage_v2_profiles/clean_harness/write_k1024_g16.json
+  target/storage_v2_profiles/clean_harness/point_m10000_u100.json
+  target/storage_v2_profiles/clean_harness/conformance_get_many.json
+
+Remaining signals:
+  write-set path:
+    staging Bytes clones/drops
+    duplicate-validation hashing
+    HashMap inserts inside validation
+
+  point read path:
+    PointSlot key cloning
+    ProjectedValue/Bytes cloning
+    HashMap/HashSet hashing
+
+  conformance get_many:
+    storage_v2 point reconstruction dominates
+    conformance backend get_many is visible but secondary
+```
+
+Optimization implications:
+
+```text
+The next large implementation win is likely a values-only point-read result:
+
+  Vec<Option<ProjectedValue>>
+
+instead of:
+
+  Vec<PointSlot { key: Key, value: Option<ProjectedValue> }>
+
+The caller already has the requested keys, so echoing a cloned Key per slot is
+not needed for most storage/domain-store paths.
+```
