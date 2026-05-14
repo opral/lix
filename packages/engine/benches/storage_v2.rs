@@ -30,6 +30,12 @@ enum WriteMix {
     PutDelete80_20,
 }
 
+#[derive(Clone)]
+enum WriteMutation {
+    Put(StorageSpace, Key, StoredValue),
+    Delete(StorageSpace, Key),
+}
+
 #[derive(Clone, Copy)]
 struct PointCase {
     name: &'static str,
@@ -192,6 +198,7 @@ fn bench_write_set_lowering(c: &mut Criterion) {
             0,
             "write cases must divide cleanly across spaces"
         );
+        let mutations = write_mutations(case);
         group.throughput(Throughput::Elements(case.writes as u64));
         group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
             b.iter_batched(
@@ -199,34 +206,13 @@ fn bench_write_set_lowering(c: &mut Criterion) {
                     let backend = CountingBackend::default();
                     let storage = StorageContext::new(backend.clone());
                     let mut writes = storage.new_write_set();
-                    let writes_per_space = case.writes / case.spaces;
-                    for space_id in 0..case.spaces {
-                        for index in 0..writes_per_space {
-                            let global_index = space_id * writes_per_space + index;
-                            match case.mix {
-                                WriteMix::PutsOnly => writes.stage_put(
-                                    space(space_id),
-                                    key(format!("put-{space_id:03}-{index:05}")),
-                                    value(global_index, case.value_size),
-                                ),
-                                WriteMix::DeletesOnly => writes.stage_delete(
-                                    space(space_id),
-                                    key(format!("delete-{space_id:03}-{index:05}")),
-                                ),
-                                WriteMix::PutDelete80_20 => {
-                                    if index % 5 == 0 {
-                                        writes.stage_delete(
-                                            space(space_id),
-                                            key(format!("delete-{space_id:03}-{index:05}")),
-                                        );
-                                    } else {
-                                        writes.stage_put(
-                                            space(space_id),
-                                            key(format!("put-{space_id:03}-{index:05}")),
-                                            value(global_index, case.value_size),
-                                        );
-                                    }
-                                }
+                    for mutation in &mutations {
+                        match mutation {
+                            WriteMutation::Put(space, key, value) => {
+                                writes.stage_put(*space, key.clone(), value.clone());
+                            }
+                            WriteMutation::Delete(space, key) => {
+                                writes.stage_delete(*space, key.clone());
                             }
                         }
                     }
@@ -337,19 +323,28 @@ fn bench_conformance_backend(c: &mut Criterion) {
     group.sample_size(10);
 
     group.throughput(Throughput::Elements(1_024));
+    let commit_case = WriteCase {
+        name: "commit_puts_k1024_g16_v32",
+        writes: 1_024,
+        spaces: 16,
+        value_size: 32,
+        mix: WriteMix::PutsOnly,
+    };
+    let commit_mutations = write_mutations(&commit_case);
     group.bench_function("commit_puts_k1024_g16_v32", |b| {
         b.iter_batched(
             || {
                 let backend = ConformanceBackend::new();
                 let storage = StorageContext::new(backend);
                 let mut writes = storage.new_write_set();
-                for space_id in 0..16 {
-                    for index in 0..64 {
-                        writes.stage_put(
-                            space(space_id),
-                            key(format!("put-{space_id:03}-{index:05}")),
-                            value(space_id * 64 + index, 32),
-                        );
+                for mutation in &commit_mutations {
+                    match mutation {
+                        WriteMutation::Put(space, key, value) => {
+                            writes.stage_put(*space, key.clone(), value.clone());
+                        }
+                        WriteMutation::Delete(space, key) => {
+                            writes.stage_delete(*space, key.clone());
+                        }
                     }
                 }
                 (storage, writes)
@@ -367,59 +362,53 @@ fn bench_conformance_backend(c: &mut Criterion) {
     });
 
     group.throughput(Throughput::Elements(1_000));
+    let get_many_backend = seeded_conformance_backend(1, 100);
+    let get_many_read = get_many_backend
+        .begin_read(ReadOptions::default())
+        .expect("begin read");
+    let get_many_read = StorageReadScope::new(get_many_read);
+    let get_many_keys = point_request_keys(1_000, 100);
     group.bench_function("get_many_m1000_u100", |b| {
-        b.iter_batched(
-            || {
-                let backend = seeded_conformance_backend(1, 100);
-                let read = backend
-                    .begin_read(ReadOptions::default())
-                    .expect("begin read");
-                let keys = point_request_keys(1_000, 100);
-                (StorageReadScope::new(read), keys)
-            },
-            |(read, keys)| {
-                let result = read
-                    .get_many_caller_order_with_stats(space(1), &keys, GetOptions::default())
-                    .expect("point read");
-                assert_eq!(result.stats.requested_keys, 1_000);
-                assert_eq!(result.stats.unique_backend_keys, 100);
-                assert_eq!(result.stats.backend_calls, 1);
-                assert_eq!(result.value.len(), 1_000);
-                black_box(result.value);
-            },
-            BatchSize::LargeInput,
-        );
+        b.iter(|| {
+            let result = get_many_read
+                .get_many_caller_order_with_stats(
+                    space(1),
+                    black_box(&get_many_keys),
+                    GetOptions::default(),
+                )
+                .expect("point read");
+            assert_eq!(result.stats.requested_keys, 1_000);
+            assert_eq!(result.stats.unique_backend_keys, 100);
+            assert_eq!(result.stats.backend_calls, 1);
+            assert_eq!(result.value.len(), 1_000);
+            black_box(result.value);
+        });
     });
 
     group.throughput(Throughput::Elements(1_000));
+    let scan_backend = seeded_conformance_backend(1, 1_000);
+    let scan_read = scan_backend
+        .begin_read(ReadOptions::default())
+        .expect("begin read");
     group.bench_function("scan_range_q1000", |b| {
-        b.iter_batched(
-            || {
-                let backend = seeded_conformance_backend(1, 1_000);
-                backend
-                    .begin_read(ReadOptions::default())
-                    .expect("begin read")
-            },
-            |read| {
-                let page = read
-                    .scan_range(
-                        SpaceId(1),
-                        KeyRange {
-                            lower: Bound::Included(key("point-0000")),
-                            upper: Bound::Excluded(key("point-9999")),
-                        },
-                        ScanOptions {
-                            limit_rows: 1_001,
-                            projection: CoreProjection::KeyOnly,
-                            ..ScanOptions::default()
-                        },
-                    )
-                    .expect("scan range");
-                assert_eq!(page.entries.entries.len(), 1_000);
-                black_box(page);
-            },
-            BatchSize::LargeInput,
-        );
+        b.iter(|| {
+            let page = scan_read
+                .scan_range(
+                    SpaceId(1),
+                    KeyRange {
+                        lower: Bound::Included(key("point-0000")),
+                        upper: Bound::Excluded(key("point-9999")),
+                    },
+                    ScanOptions {
+                        limit_rows: 1_001,
+                        projection: CoreProjection::KeyOnly,
+                        ..ScanOptions::default()
+                    },
+                )
+                .expect("scan range");
+            assert_eq!(page.entries.entries.len(), 1_000);
+            black_box(page);
+        });
     });
 
     group.finish();
@@ -670,6 +659,42 @@ fn seeded_conformance_backend(space_id: u32, rows: u32) -> ConformanceBackend {
         .expect("seed conformance backend");
     assert_eq!(stats.staged_puts, rows as u64);
     backend
+}
+
+fn write_mutations(case: &WriteCase) -> Vec<WriteMutation> {
+    let mut mutations = Vec::with_capacity(case.writes as usize);
+    let writes_per_space = case.writes / case.spaces;
+    for space_id in 0..case.spaces {
+        for index in 0..writes_per_space {
+            let global_index = space_id * writes_per_space + index;
+            match case.mix {
+                WriteMix::PutsOnly => mutations.push(WriteMutation::Put(
+                    space(space_id),
+                    key(format!("put-{space_id:03}-{index:05}")),
+                    value(global_index, case.value_size),
+                )),
+                WriteMix::DeletesOnly => mutations.push(WriteMutation::Delete(
+                    space(space_id),
+                    key(format!("delete-{space_id:03}-{index:05}")),
+                )),
+                WriteMix::PutDelete80_20 => {
+                    if index % 5 == 0 {
+                        mutations.push(WriteMutation::Delete(
+                            space(space_id),
+                            key(format!("delete-{space_id:03}-{index:05}")),
+                        ));
+                    } else {
+                        mutations.push(WriteMutation::Put(
+                            space(space_id),
+                            key(format!("put-{space_id:03}-{index:05}")),
+                            value(global_index, case.value_size),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    mutations
 }
 
 fn point_request_keys(requested_keys: usize, unique_keys: usize) -> Vec<Key> {
