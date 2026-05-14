@@ -430,3 +430,161 @@ After:
 Target shape:
   O(M + U + F) expected
 ```
+
+### 2026-05-14: Fuse Write-Set Stats Into Lowering
+
+Change:
+
+```text
+lower_validated_into() now computes StorageWriteSetStats while lowering
+groups into backend put_many/delete_many calls.
+
+The public StorageWriteSet::stats() helper remains available, but commit()
+and lower_into() no longer call it as a separate full write-set pass.
+```
+
+Why:
+
+```text
+After removing duplicate validation, the write path still had:
+
+  validate pass
+  stats pass
+  lower pass
+
+This patch fuses stats and lower:
+
+  validate pass
+  lower + stats pass
+
+The remaining dominant algorithmic cost is duplicate validation.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2
+```
+
+Write-set scorecard:
+
+| Case                       | Previous Mean |  New Mean | Criterion Change |
+| -------------------------- | ------------: | --------: | ---------------: |
+| `puts_k128_g1_v32`         |     8.7785 us | 8.9700 us |     within noise |
+| `puts_k1024_g1_v32`        |     95.330 us | 95.372 us |        no change |
+| `puts_k1024_g16_v32`       |     75.273 us | 73.993 us |     within noise |
+| `puts_k8192_g16_v32`       |     788.57 us | 790.55 us |        no change |
+| `puts_k1024_g64_v32`       |     65.337 us | 65.358 us |        no change |
+| `puts_k4096_g256_v32`      |     312.20 us | 331.71 us |    7.491% slower |
+| `deletes_k1024_g16`        |     73.561 us | 73.988 us |     within noise |
+| `mixed80_20_k1024_g16_v32` |     72.349 us | 70.676 us |        no change |
+| `puts_k1024_g16_v1024`     |     86.662 us | 82.678 us |    6.513% faster |
+| `puts_k1024_g16_v65536`    |     448.23 us | 440.62 us |        no change |
+
+Other scorecard notes:
+
+```text
+Most write-set cases were unchanged or within noise. The 1 KiB value case
+improved, but the high-space-count G=256 case regressed in this run. Since the
+patch removes a full pass but leaves duplicate validation untouched, the modest
+scorecard is plausible.
+
+Point-read and prefix-scan changes in this run are unrelated variance. The
+ConformanceBackend improvements likely reflect run-to-run variance and should
+not be attributed to this patch.
+```
+
+Complexity impact:
+
+```text
+Before this patch:
+  validate: O(K log K)
+  stats: O(K)
+  lower: O(K + G)
+
+After this patch:
+  validate: O(K log K)
+  lower + stats: O(K + G)
+
+Remaining target:
+  replace duplicate validation with an expected O(K) strategy or canonicalize
+  duplicates during staging/sealing.
+```
+
+### 2026-05-14: Hash Duplicate Validation
+
+Change:
+
+```text
+StorageWriteSet::validate() now uses a pre-sized HashSet for duplicate
+mutation detection instead of BTreeSet.
+
+The duplicate rule is unchanged: a sealed write set may contain at most one
+final mutation per (SpaceId, Key).
+```
+
+Why:
+
+```text
+Focused samply profiles of write_set_lowering showed duplicate validation as
+the strongest real storage_v2 signal after stats fusion, around 20% inclusive
+for small-value write-set commits.
+
+The previous validator was ordered but did not need ordered semantics.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 write_set_lowering
+```
+
+Write-set scorecard:
+
+| Case                       | Previous Mean |  New Mean | Criterion Change |
+| -------------------------- | ------------: | --------: | ---------------: |
+| `puts_k128_g1_v32`         |     8.9700 us | 5.5251 us |   38.658% faster |
+| `puts_k1024_g1_v32`        |     95.372 us | 44.867 us |   53.058% faster |
+| `puts_k1024_g16_v32`       |     73.993 us | 45.524 us |   44.993% faster |
+| `puts_k8192_g16_v32`       |     790.55 us | 365.31 us |   54.088% faster |
+| `puts_k1024_g64_v32`       |     65.358 us | 47.089 us |   28.162% faster |
+| `puts_k4096_g256_v32`      |     331.71 us | 191.70 us |   44.389% faster |
+| `deletes_k1024_g16`        |     73.988 us | 40.631 us |   44.777% faster |
+| `mixed80_20_k1024_g16_v32` |     70.676 us | 44.597 us |   36.842% faster |
+| `puts_k1024_g16_v1024`     |     82.678 us | 53.383 us |   41.230% faster |
+| `puts_k1024_g16_v65536`    |     440.62 us | 406.59 us |    8.044% faster |
+
+Post-change profile:
+
+```text
+Profile:
+  target/storage_v2_profiles/hash_validation/write_k1024_g16.json
+
+Main signals:
+  benchmark key formatting/setup is now the dominant visible cost
+  StorageWriteSet::commit remains visible
+  CountingWrite::put_many remains visible
+  StorageWriteSet::validate is much smaller than before
+
+This suggests the next step should improve the benchmark harness so setup/key
+construction does not obscure storage_v2 internals before chasing smaller
+storage implementation changes.
+```
+
+Complexity impact:
+
+```text
+Before:
+  duplicate validation: O(K log K)
+
+After:
+  duplicate validation: O(K) expected
+
+Target shape:
+  validation remains a required commit-path pass, but no longer adds a tree
+  factor to write-set commits.
+```
