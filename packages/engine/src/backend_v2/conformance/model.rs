@@ -22,10 +22,7 @@ impl ReferenceModel {
         self.entries.remove(&(space, key.clone()));
     }
 
-    pub fn iter_space(
-        &self,
-        space: SpaceId,
-    ) -> impl Iterator<Item = (&Key, &Bytes)> {
+    pub fn iter_space(&self, space: SpaceId) -> impl Iterator<Item = (&Key, &Bytes)> {
         self.entries
             .iter()
             .filter_map(move |((entry_space, key), value)| {

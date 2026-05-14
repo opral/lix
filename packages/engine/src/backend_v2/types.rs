@@ -127,10 +127,7 @@ pub enum ProjectedValue {
     KeyOnly,
     Header(Bytes),
     Refs(Bytes),
-    HeaderAndRefs {
-        header: Bytes,
-        refs: Bytes,
-    },
+    HeaderAndRefs { header: Bytes, refs: Bytes },
     Payload(Bytes),
     FullValue(Bytes),
 }

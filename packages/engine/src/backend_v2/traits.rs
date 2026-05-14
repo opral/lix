@@ -1,7 +1,7 @@
 use crate::backend_v2::{
-    BackendCapabilities, BackendError, Capability, CommitResult, GetManyResult, GetOptions,
-    Key, KeyRange, Precondition, PreconditionSupportReport, Prefix, PutBatch, ReadOptions,
-    ScanOptions, ScanPage, SpaceId, WriteOptions,
+    BackendCapabilities, BackendError, Capability, CommitResult, GetManyResult, GetOptions, Key,
+    KeyRange, Precondition, PreconditionSupportReport, Prefix, PutBatch, ReadOptions, ScanOptions,
+    ScanPage, SpaceId, WriteOptions,
 };
 
 pub trait Backend {
