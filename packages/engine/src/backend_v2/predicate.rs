@@ -47,10 +47,7 @@ pub enum HeaderPredicate {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RefsPredicate {
-    HasRef {
-        kind: RefKind,
-        value: Bytes,
-    },
+    HasRef { kind: RefKind, value: Bytes },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

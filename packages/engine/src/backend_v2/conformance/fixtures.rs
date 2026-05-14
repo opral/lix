@@ -6,8 +6,8 @@ pub fn space(id: u32) -> SpaceId {
     SpaceId(id)
 }
 
-pub fn key(bytes: impl Into<Bytes>) -> Key {
-    Key(bytes.into())
+pub fn key(bytes: impl AsRef<[u8]>) -> Key {
+    Key(Bytes::copy_from_slice(bytes.as_ref()))
 }
 
 pub fn full_put(key: Key, value: impl Into<Bytes>) -> PutEntry {

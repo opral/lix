@@ -20,6 +20,8 @@ pub enum BackendError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Capability {
     Projection(ValueProjection),
+    KeyOrderedPoints,
+    UnorderedPoints,
     ReverseScan,
     DeleteRange,
     Preconditions,

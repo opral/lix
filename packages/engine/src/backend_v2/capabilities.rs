@@ -14,9 +14,7 @@ pub enum BackendProfile {
     /// Ordered byte keys, coherent read views, paged forward scans,
     /// caller-order get_many, readable writes with read-your-writes, and atomic
     /// write commit.
-    V0 {
-        write_concurrency: WriteConcurrency,
-    },
+    V0 { write_concurrency: WriteConcurrency },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

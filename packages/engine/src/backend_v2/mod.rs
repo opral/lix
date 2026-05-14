@@ -25,8 +25,8 @@ pub use predicate::{
 };
 pub use traits::{Backend, BackendRead, BackendWrite};
 pub use types::{
-    CommitResult, Cursor, Durability, GetManyResult, GetOptions, GetSlot, Key, KeyRange, Prefix,
-    ProjectedValue, PutBatch, PutEntry, ReadBatch, ReadConsistency, ReadEntry, ReadOptions,
-    ReadStats, ScanDirection, ScanOptions, ScanPage, SnapshotRef, SpaceId, StoredValue, Value,
-    ValueProjection, WriteOptions, WriteStats,
+    CommitResult, Cursor, Durability, GetManyResult, GetOptions, GetSlot, Key, KeyRange,
+    PointOrder, Prefix, ProjectedValue, PutBatch, PutEntry, ReadBatch, ReadConsistency, ReadEntry,
+    ReadOptions, ReadStats, ScanDirection, ScanOptions, ScanPage, SnapshotRef, SpaceId,
+    StoredValue, Value, ValueProjection, WriteOptions, WriteStats,
 };
