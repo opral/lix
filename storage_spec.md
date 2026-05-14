@@ -5,10 +5,11 @@
 It is not the public persistence plugin API. Most users should bring their own
 backend. `storage_v2` exists so Lix domain stores can share transactions,
 write batching, spaces, prefix lowering, caller-order reconstruction, and other
-domain-neutral storage mechanics. Cursor wrapping, capability-aware lowering,
-fallback accounting, residual filtering loops, and projection/delete-range
-fallbacks are planned optimization-hardening work, not implemented baseline
-behavior yet.
+domain-neutral storage mechanics. It also exposes baseline read/write shape
+stats so later benchmarks and optimizations can prove the physical access shape.
+Cursor wrapping, capability-aware lowering, fallback accounting, residual
+filtering loops, and projection/delete-range fallbacks are planned
+optimization-hardening work, not implemented baseline behavior yet.
 
 ## Layering
 
@@ -35,6 +36,7 @@ Generic storage adapter: storage_v2
   batching helpers
   prefix-to-range lowering
   caller-order point reconstruction
+  read-shape stats
   write-set stats
 
 Planned storage_v2 optimization extensions:
@@ -106,6 +108,7 @@ named space declarations
 caller-order point reconstruction
 duplicate requested-key handling
 prefix-to-range lowering
+read-shape stats
 write-set stats
 baseline storage adapter conformance
 ```
@@ -114,7 +117,7 @@ Planned storage_v2 optimization-hardening responsibilities:
 
 ```text
 storage cursor token construction and validation
-read-side stats and fallback stats
+fallback stats
 capability-aware lowering helpers
 limit-after-residual scan loops
 projection/envelope helpers, only when domain-neutral
@@ -658,6 +661,26 @@ backend_v2 owns atomic persistence.
 
 Storage v2 stats should make the complexity contract observable.
 
+Implemented read-shape stats:
+
+```rust
+pub struct StorageReadStats {
+    pub requested_keys: u64,
+    pub unique_backend_keys: u64,
+    pub backend_calls: u64,
+    pub prefix_lowered: u64,
+}
+
+pub struct StorageReadResult<T> {
+    pub value: T,
+    pub stats: StorageReadStats,
+}
+```
+
+The no-stats read helpers remain available. The `_with_stats` variants expose
+the same operation result together with shape counters for tests, benchmarks,
+and future workload accounting.
+
 Implemented write-set stats:
 
 ```rust
@@ -686,12 +709,11 @@ pub enum FallbackKind {
 }
 ```
 
-Future read/fallback stats should answer questions such as:
+Future fallback stats should answer questions such as:
 
 ```text
 Did this scan hydrate payload bytes?
 Did this query fall back from header/refs projection to FullValue?
-How many backend calls did this write set lower into?
 Was delete_range native or scan-and-delete fallback?
 ```
 
@@ -702,7 +724,7 @@ prove storage_v2 preserves batching and complexity boundaries.
 
 The current code has an internal storage conformance runner over
 `ConformanceBackend`, plus focused counting-backend unit tests for write-set
-batching and failure behavior.
+batching, read-shape stats, and failure behavior.
 
 Implemented storage_v2 test themes:
 
@@ -713,6 +735,10 @@ write_set_batches_by_space:
 caller_order_reconstruction:
   backend returns found entries for unique keys; storage reconstructs requested
   slots, duplicate keys, and duplicate missing keys
+
+read_shape_stats:
+  point reads report requested keys, unique backend keys, and backend calls;
+  range/prefix scans report backend calls and prefix lowering
 
 prefix_lowering:
   empty prefix, normal prefix, and all-0xff prefix lower to correct ranges
