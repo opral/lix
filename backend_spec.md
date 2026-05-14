@@ -266,14 +266,27 @@ pub struct Prefix {
 
 impl Prefix {
     pub fn to_range(&self) -> Result<KeyRange, BackendError> {
-        todo!("storage/backend helper computes [prefix, next_prefix) bounds")
+        let lower = Key(self.bytes.clone());
+        let mut upper = self.bytes.to_vec();
+
+        while let Some(last) = upper.last_mut() {
+            if *last == u8::MAX {
+                upper.pop();
+            } else {
+                *last += 1;
+                return Ok(KeyRange {
+                    lower: Bound::Included(lower),
+                    upper: Bound::Excluded(Key(Bytes::from(upper))),
+                });
+            }
+        }
+
+        Ok(KeyRange {
+            lower: Bound::Included(lower),
+            upper: Bound::Unbounded,
+        })
     }
 }
-
-/// A storage-level cursor token. Backend v0 scan continuation is key-based;
-/// opaque backend cursors are an extension.
-#[derive(Clone, Debug)]
-pub struct StorageCursor(pub Bytes);
 ```
 
 V0 writes store opaque values only. Envelope-aware storage and native envelope
@@ -1493,10 +1506,11 @@ write.rs       -> delete_range, preconditions, idempotent commit
 pushdown.rs    -> exact/inexact/unsupported pushdown reporting
 ```
 
-Storage-level conformance should separately validate caller-order point
-reconstruction, duplicate/missing slots, prefix lowering, public cursor scope,
-limit-zero normalization, projection fallback, residual filtering, delete-range
-fallback, support/stat interpretation, and write-set batching.
+Storage-level conformance currently validates caller-order point reconstruction,
+duplicate/missing slots, prefix lowering, read-scope pinning, named-space
+validation, and write-set batching/lowering. It should grow next to cover public
+cursor scope, projection fallback, residual filtering, delete-range fallback,
+support/stat interpretation, and read-side stats.
 
 The conformance runner should expose a function-first API:
 
