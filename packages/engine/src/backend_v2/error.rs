@@ -2,7 +2,7 @@ use std::fmt;
 
 use bytes::Bytes;
 
-use crate::backend_v2::{Key, KeyRange, SpaceId, Support, ValueProjection};
+use crate::backend_v2::{Key, KeyRange, SpaceId, Support};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendError {
@@ -19,7 +19,7 @@ pub enum BackendError {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Capability {
-    Projection(ValueProjection),
+    EnvelopeProjection,
     KeyOrderedPoints,
     UnorderedPoints,
     ReverseScan,

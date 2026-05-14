@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ops::Bound;
 
 use bytes::Bytes;
@@ -5,11 +6,11 @@ use bytes::Bytes;
 use crate::backend_v2::conformance::{
     fixtures::{full_put, key, put_batch, space},
     model::ReferenceModel,
-    BackendFactory, ConformanceReport, ConformanceResult,
+    open_backend, BackendFactory, ConformanceReport, ConformanceResult,
 };
 use crate::backend_v2::{
-    Backend, BackendRead, BackendWrite, GetOptions, Key, KeyRange, Prefix, ProjectedValue,
-    ReadOptions, ScanOptions, SpaceId, WriteOptions,
+    Backend, BackendRead, BackendWrite, GetOptions, Key, KeyRange, ProjectedValue, ReadOptions,
+    ScanOptions, SpaceId, WriteOptions,
 };
 
 pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
@@ -26,7 +27,7 @@ fn deterministic_history_matches_reference_model<F>(factory: &F) -> ConformanceR
 where
     F: BackendFactory,
 {
-    let backend = factory.fresh();
+    let backend = open_backend(factory);
     let mut model = ReferenceModel::default();
     let mut rng = TinyRng::new(0x51cedeed);
     let spaces = [space(1), space(2)];
@@ -128,22 +129,15 @@ where
     let result = read
         .get_many(target_space, &point_keys, GetOptions::default())
         .map_err(|error| format!("{label}: get_many failed: {error}"))?;
-    let actual = result
-        .entries
-        .iter()
-        .map(|slot| (slot.requested_index, slot.key.clone(), slot_value(slot)))
-        .collect::<Vec<_>>();
+    let actual = entries_to_map(&result.entries.entries);
     let expected = point_keys
         .iter()
-        .enumerate()
-        .map(|(index, key)| {
-            (
-                Some(index),
-                key.clone(),
-                model.get(target_space, key).cloned(),
-            )
+        .filter_map(|key| {
+            model
+                .get(target_space, key)
+                .map(|value| (key.clone(), value.clone()))
         })
-        .collect::<Vec<_>>();
+        .collect::<BTreeMap<_, _>>();
     if actual != expected {
         return Err(format!(
             "{label}: get_many mismatch: expected {expected:?}, got {actual:?}"
@@ -166,7 +160,7 @@ where
             target_space,
             range.clone(),
             ScanOptions {
-                limit_rows: Some(3),
+                limit_rows: 3,
                 ..Default::default()
             },
         )
@@ -176,34 +170,6 @@ where
     if actual_scan != expected_scan {
         return Err(format!(
             "{label}: scan_range mismatch: expected {expected_scan:?}, got {actual_scan:?}"
-        ));
-    }
-
-    let prefix = Prefix {
-        bytes: if rng.bool() {
-            Bytes::from_static(b"a")
-        } else {
-            Bytes::new()
-        },
-    };
-    let page = read
-        .scan_prefix(
-            target_space,
-            prefix.clone(),
-            ScanOptions {
-                limit_rows: Some(4),
-                ..Default::default()
-            },
-        )
-        .map_err(|error| format!("{label}: scan_prefix failed: {error}"))?;
-    let prefix_range = prefix
-        .to_range()
-        .map_err(|error| format!("{label}: prefix range conversion failed: {error}"))?;
-    let actual_prefix = page_entries(&page.entries.entries);
-    let expected_prefix = model_scan(model, target_space, &prefix_range, Some(4));
-    if actual_prefix != expected_prefix {
-        return Err(format!(
-            "{label}: scan_prefix mismatch: expected {expected_prefix:?}, got {actual_prefix:?}"
         ));
     }
 
@@ -245,22 +211,13 @@ fn page_entries(entries: &[crate::backend_v2::ReadEntry]) -> Vec<(Key, Bytes)> {
         .collect()
 }
 
-fn slot_value(slot: &crate::backend_v2::GetSlot) -> Option<Bytes> {
-    slot.value.as_ref().map(projected_value_bytes)
+fn entries_to_map(entries: &[crate::backend_v2::ReadEntry]) -> BTreeMap<Key, Bytes> {
+    page_entries(entries).into_iter().collect()
 }
 
 fn projected_value_bytes(value: &ProjectedValue) -> Bytes {
     match value {
-        ProjectedValue::FullValue(bytes)
-        | ProjectedValue::Header(bytes)
-        | ProjectedValue::Refs(bytes)
-        | ProjectedValue::Payload(bytes) => bytes.clone(),
-        ProjectedValue::HeaderAndRefs { header, refs } => {
-            let mut bytes = Vec::with_capacity(header.len() + refs.len());
-            bytes.extend_from_slice(header);
-            bytes.extend_from_slice(refs);
-            Bytes::from(bytes)
-        }
+        ProjectedValue::FullValue(bytes) => bytes.clone(),
         ProjectedValue::KeyOnly => Bytes::new(),
     }
 }

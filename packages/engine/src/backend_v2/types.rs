@@ -2,7 +2,7 @@ use std::ops::Bound;
 
 use bytes::Bytes;
 
-use crate::backend_v2::{BackendError, BackendPredicate, ReadSupport};
+use crate::backend_v2::BackendError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SpaceId(pub u32);
@@ -36,13 +36,8 @@ pub struct PutBatch {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StoredValue {
-    FullValue(Bytes),
-    Envelope {
-        header: Bytes,
-        refs: Bytes,
-        payload: Bytes,
-    },
+pub struct StoredValue {
+    pub bytes: Bytes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,79 +51,39 @@ pub struct Prefix {
     pub bytes: Bytes,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Cursor(pub Bytes);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GetOptions<'a> {
-    pub projection: ValueProjection,
-    pub order: PointOrder,
-    pub preserve_duplicates: bool,
-    pub predicates: &'a [BackendPredicate],
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PointOrder {
-    Caller,
-    KeyAsc,
-    Unordered,
+    pub projection: CoreProjection,
+    pub _reserved: std::marker::PhantomData<&'a ()>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanOptions<'a> {
-    pub projection: ValueProjection,
-    pub direction: ScanDirection,
-    pub limit_rows: Option<usize>,
-    pub limit_bytes: Option<usize>,
-    pub cursor: Option<&'a Cursor>,
-    pub predicates: &'a [BackendPredicate],
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScanDirection {
-    Forward,
-    Reverse,
+    pub projection: CoreProjection,
+    pub limit_rows: usize,
+    pub resume_after: Option<&'a Key>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanPage {
     pub entries: ReadBatch,
-    pub next_cursor: Option<Cursor>,
-    pub support: ReadSupport,
-    pub stats: ReadStats,
+    pub has_more: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GetManyResult {
-    pub entries: Vec<GetSlot>,
-    pub support: ReadSupport,
-    pub stats: ReadStats,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GetSlot {
-    pub requested_index: Option<usize>,
-    pub key: Key,
-    pub value: Option<ProjectedValue>,
+    pub entries: ReadBatch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ValueProjection {
+pub enum CoreProjection {
     KeyOnly,
-    Header,
-    Refs,
-    HeaderAndRefs,
-    Payload,
     FullValue,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectedValue {
     KeyOnly,
-    Header(Bytes),
-    Refs(Bytes),
-    HeaderAndRefs { header: Bytes, refs: Bytes },
-    Payload(Bytes),
     FullValue(Bytes),
 }
 
@@ -162,16 +117,6 @@ pub enum Durability {
     Default,
     Durable,
     Relaxed,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ReadStats {
-    pub scanned_entries: u64,
-    pub emitted_entries: u64,
-    pub skipped_by_backend: u64,
-    pub decoded_bytes: u64,
-    pub payload_bytes: u64,
-    pub backend_calls: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -216,10 +161,8 @@ impl Prefix {
 impl Default for GetOptions<'_> {
     fn default() -> Self {
         Self {
-            projection: ValueProjection::FullValue,
-            order: PointOrder::Caller,
-            preserve_duplicates: true,
-            predicates: &[],
+            projection: CoreProjection::FullValue,
+            _reserved: std::marker::PhantomData,
         }
     }
 }
@@ -227,12 +170,9 @@ impl Default for GetOptions<'_> {
 impl Default for ScanOptions<'_> {
     fn default() -> Self {
         Self {
-            projection: ValueProjection::FullValue,
-            direction: ScanDirection::Forward,
-            limit_rows: None,
-            limit_bytes: None,
-            cursor: None,
-            predicates: &[],
+            projection: CoreProjection::FullValue,
+            limit_rows: 1024,
+            resume_after: None,
         }
     }
 }

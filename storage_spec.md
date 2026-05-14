@@ -4,8 +4,9 @@
 
 It is not the public persistence plugin API. Most users should bring their own
 backend. `storage_v2` exists so Lix domain stores can share transactions,
-write batching, spaces, capability-aware lowering, fallback accounting, and
-other domain-neutral storage mechanics.
+write batching, spaces, prefix lowering, caller-order reconstruction, cursor
+wrapping, capability-aware lowering, fallback accounting, and other
+domain-neutral storage mechanics.
 
 ## Layering
 
@@ -30,14 +31,20 @@ Generic storage adapter: storage_v2
   read/write scopes
   namespace/space registration
   batching helpers
+  prefix-to-range lowering
+  caller-order point reconstruction
+  storage cursor tokens
   capability-aware lowering
+  projection fallback
+  residual filtering loops
+  delete_range/precondition fallback safety gates
   fallback accounting
 
 Backend: backend_v2
   ordered byte keys
-  byte/envelope values
+  opaque byte values
   get_many
-  scan_range / scan_prefix
+  scan_range
   put_many / delete_many
   begin_read / begin_write
   atomic commit
@@ -92,9 +99,13 @@ read transaction wrapper
 write transaction wrapper
 read scopes shared by multiple domain stores
 namespace/space registration
+caller-order point reconstruction
+duplicate requested-key handling
+prefix-to-range lowering
+storage cursor token construction and validation
 capability-aware lowering helpers
+limit-after-residual scan loops
 fallback stats
-cursor handling policy at the generic adapter boundary
 shared projection/envelope helpers, only when domain-neutral
 ```
 
@@ -361,6 +372,64 @@ context object. But if a high-level operation needs coherent reads across
 domain stores, those reads must share one `StorageReadScope` instead of opening
 independent backend read views.
 
+## Read Adapter Helpers
+
+`backend_v2` intentionally exposes a small physical read API. `storage_v2`
+provides the Lix-friendly read shapes above it.
+
+Point reads:
+
+```text
+domain store requests M keys, possibly with duplicates
+storage_v2 may dedupe to U unique keys
+backend_v2 get_many reads the unique/requested batch
+storage_v2 reconstructs caller-order slots, duplicate slots, and missing slots
+```
+
+Target:
+
+```text
+backend point I/O:
+  O(U) native batch, not O(M) independent physical calls
+
+storage reconstruction:
+  O(M + U) time
+  O(U) memory
+```
+
+Prefix reads:
+
+```text
+prefix -> [prefix, next_prefix) KeyRange
+all-0xff prefix -> [prefix, unbounded)
+empty prefix -> whole space
+```
+
+Native prefix scan is a backend extension. Generic correctness comes from range
+lowering.
+
+Storage cursors:
+
+```text
+public cursor token binds:
+  read scope / snapshot identity
+  space
+  range or prefix
+  projection
+  direction, when reverse fallback is used
+  predicate/residual set
+  last emitted key
+```
+
+A storage cursor must be valid only for the same storage read scope unless the
+backend exposes a long-lived snapshot/cursor extension. A last-key alone is not
+a public cursor; it is only the physical resume point inside a validated storage
+cursor.
+
+If storage exposes an exact "no cursor means no more eligible rows" contract, it
+must perform lookahead or buffering after residual filtering. Otherwise the
+public contract must allow an extra empty-page read.
+
 ## Capability-Aware Lowering
 
 Domain stores express the desired physical access shape:
@@ -376,7 +445,7 @@ cursor
 ```
 
 `storage_v2` may provide helpers for lowering these into backend calls and
-interpreting support metadata.
+interpreting support metadata from extension APIs.
 
 Rules:
 
@@ -398,14 +467,19 @@ If any eligibility-affecting predicate is inexact, final user limits belong
 above residual filtering.
 ```
 
+This means storage must keep scanning backend pages until it has enough rows
+after residual filtering or proves end-of-range. Backend `limit_rows` is a page
+hint whenever predicates/projections are not exact for final eligibility.
+
 For writes, storage_v2 is mandatory. For reads, storage_v2 helpers are
 encouraged; direct backend reads are allowed only when they preserve read scope,
 batching, projection policy, and fallback stats.
 
 ## Envelope Helpers
 
-`backend_v2` supports `FullValue` and `KeyOnly` as core projections, and optional
-envelope slices such as `Header`, `Refs`, `HeaderAndRefs`, and `Payload`.
+`backend_v2` supports opaque `FullValue` and logical `KeyOnly` as core
+projections. Envelope slices such as `Header`, `Refs`, `HeaderAndRefs`, and
+`Payload` are optional backend extensions.
 
 Storage v2 may provide generic helpers for envelope mechanics only if they are
 domain-neutral:
@@ -413,8 +487,8 @@ domain-neutral:
 ```text
 encode/decode stable envelope frame
 split header/refs/payload
-map requested storage projection to backend ValueProjection
-verify returned ProjectedValue shape
+map requested storage projection to core or extension backend projection
+verify returned core or extension projected-value shape
 ```
 
 Domain-specific header fields and refs remain owned by the domain store.
@@ -423,6 +497,10 @@ Storage-level scan helpers must require an explicit storage projection. Payload
 bytes are not read unless the projection requires payload. If storage falls back
 from `Header`, `Refs`, or `HeaderAndRefs` to `FullValue`, that fallback must be
 recorded in stats.
+
+For operations whose contract is "no payload physical I/O," storage must require
+native envelope projection or reject the operation. Projection fallback preserves
+correctness, but it changes the physical I/O cost and must be reported.
 
 ## Complexity Contract
 
@@ -489,10 +567,14 @@ Read-side targets:
 
 ```text
 point batch:
-  O(M) expected via backend get_many
+  O(U) backend batch for U unique keys plus O(M + U) caller-order
+  reconstruction for M requested keys
 
 prefix/range scan:
   O(log_B N + Q) for tree/ordered-backend shaped implementations
+
+storage cursor resume:
+  O(1) cursor validation/construction plus backend range resume cost
 
 payload hydrate:
   O(P + S), only when requested
@@ -518,6 +600,30 @@ fallback:
   O(Q) scan plus delete_many batches
   one commit boundary
 ```
+
+Exact fallback safety:
+
+```text
+scan-and-delete is exact only when one of these holds:
+  storage has single-writer/exclusive access for the affected space/range
+  backend has native conflict detection/preconditions that bind the scanned
+    range to commit
+  the high-level operation explicitly means "delete keys observed in this
+    snapshot"
+
+otherwise:
+  storage must reject exact delete_range or require a native delete-range
+  backend extension
+```
+
+This is the main place where moving behavior upward can silently become a
+correctness bug. A separate read snapshot followed by a write can miss keys
+inserted into the range by a concurrent writer.
+
+Precondition fallback follows the same matrix: storage may emulate only under
+single-writer/exclusive conditions, or when the backend can atomically bind the
+check to commit. Concurrent backends without native preconditions must not get
+silent check-then-write semantics.
 
 The clean write rule:
 
@@ -555,6 +661,8 @@ pub enum FallbackKind {
     PredicateResidualFilter,
     ReverseScanForwardBuffer,
     CallerOrderReorder,
+    PrefixLoweredToRange,
+    StorageCursorLookahead,
 }
 ```
 
@@ -590,13 +698,28 @@ no_direct_write_bypass_for_engine_commits:
 
 delete_range_fallback:
   when native delete_range is unavailable, storage does scan_range plus
-  delete_many batches with one commit boundary
+  delete_many batches with one commit boundary only under the safety matrix
 
 projection_fallback_accounting:
   missing HeaderAndRefs support may read FullValue, but stats record fallback
 
 payload_hydration_guard:
   operations that should inspect only headers/refs report zero payload bytes
+
+caller_order_reconstruction:
+  backend returns found entries for unique keys; storage reconstructs requested
+  slots, duplicate keys, and duplicate missing keys
+
+prefix_lowering:
+  empty prefix, normal prefix, and all-0xff prefix lower to correct ranges
+
+storage_cursor_scope:
+  public cursors reject changed read scope, space, range/prefix, projection, and
+  predicate identity before re-entering backend
+
+residual_limit_correctness:
+  final user limits are applied after residual filtering, not to raw backend
+  pages when predicates are not exact
 ```
 
 ## Suggested Initial File Structure
@@ -610,6 +733,7 @@ packages/engine/src/storage_v2/
   spaces.rs
   write_set.rs
   read_scope.rs
+  cursor.rs
   lowering.rs
   envelope.rs
   stats.rs
@@ -633,8 +757,12 @@ write_set.rs:
 read_scope.rs:
   shared read transaction/scope helpers
 
+cursor.rs:
+  storage cursor token encoding, scope validation, and last-key resume state
+
 lowering.rs:
-  helpers for projections, predicates, support reports, and fallback decisions
+  helpers for prefix lowering, caller-order reconstruction, projections,
+  predicates, support reports, and fallback decisions
 
 envelope.rs:
   optional domain-neutral envelope frame helpers

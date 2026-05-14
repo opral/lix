@@ -2,7 +2,7 @@ use std::ops::Bound;
 
 use bytes::Bytes;
 
-use crate::backend_v2::{Key, KeyRange, Prefix, ValueProjection};
+use crate::backend_v2::{Key, KeyRange, Prefix};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackendPredicate {
@@ -64,46 +64,11 @@ pub enum ScalarValue {
     Bytes(Bytes),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadSupport {
-    pub projection: ProjectionSupport,
-    pub predicates: Vec<PredicatePushdown>,
-    pub order: OrderSupport,
-    pub limit: LimitSupport,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProjectionSupport {
-    pub requested: ValueProjection,
-    pub returned: ValueProjection,
-    pub support: Support,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PredicatePushdown {
-    pub id: PredicateId,
-    pub support: Support,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Support {
     Exact,
     Inexact,
     Unsupported,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OrderSupport {
-    Exact,
-    ChangedToKeyAsc,
-    Unordered,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LimitSupport {
-    Final,
-    PageHintOnly,
-    NotApplied,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -112,19 +77,4 @@ pub enum PredicateSupportLevel {
     None,
     Inexact,
     Exact,
-}
-
-impl ReadSupport {
-    pub fn exact(projection: ValueProjection) -> Self {
-        Self {
-            projection: ProjectionSupport {
-                requested: projection,
-                returned: projection,
-                support: Support::Exact,
-            },
-            predicates: Vec::new(),
-            order: OrderSupport::Exact,
-            limit: LimitSupport::Final,
-        }
-    }
 }

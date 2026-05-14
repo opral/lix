@@ -43,6 +43,13 @@ pub use backend::{
     BackendKvWriteGroup, BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction,
     BytePage, BytePageBuilder,
 };
+pub use backend_v2::conformance::{
+    run_backend_conformance, BackendFactory as BackendV2Factory,
+    BackendFixture as BackendV2Fixture, BackendTestConfig as BackendV2TestConfig,
+    ConformanceReport as BackendV2ConformanceReport,
+    ConformanceResult as BackendV2ConformanceResult,
+    ConformanceStatus as BackendV2ConformanceStatus, ConformanceTest as BackendV2ConformanceTest,
+};
 pub use common::LixError;
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};
 pub use common::{CanonicalPluginKey, CanonicalSchemaKey, EntityId, FileId, VersionId};

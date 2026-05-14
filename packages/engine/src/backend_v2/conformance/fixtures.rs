@@ -13,7 +13,9 @@ pub fn key(bytes: impl AsRef<[u8]>) -> Key {
 pub fn full_put(key: Key, value: impl Into<Bytes>) -> PutEntry {
     PutEntry {
         key,
-        value: StoredValue::FullValue(value.into()),
+        value: StoredValue {
+            bytes: value.into(),
+        },
     }
 }
 

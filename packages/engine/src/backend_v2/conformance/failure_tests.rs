@@ -4,25 +4,32 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
-use super::{run_backend_conformance, BackendFactory, BackendTestConfig, ConformanceStatus};
+use super::{
+    run_backend_conformance, BackendFactory, BackendFixture, BackendTestConfig, ConformanceStatus,
+};
 use crate::backend_v2::{
-    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, Capability,
-    CommitResult, Cursor, GetManyResult, GetOptions, GetSlot, Key, KeyRange, PointOrder,
-    ProjectedValue, PutBatch, ReadBatch, ReadEntry, ReadOptions, ReadStats, ReadSupport,
-    ScanDirection, ScanOptions, ScanPage, SpaceId, StoredValue, ValueProjection, WriteConcurrency,
-    WriteOptions, WriteStats,
+    Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
+    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue,
+    ProjectionCapabilities, PutBatch, ReadBatch, ReadEntry, ReadOptions, ScanOptions, ScanPage,
+    SpaceId, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 
 type BrokenMap = BTreeMap<(SpaceId, Key), Bytes>;
 
 #[derive(Clone, Copy, Debug)]
 enum BrokenMode {
-    KeySortedGetMany,
-    CoalesceDuplicateGetMany,
-    WriteDoesNotReadOwnWrites,
+    GetManyMissesExistingKey,
     ReadSeesLaterCommits,
+    ReadSeesSecondLaterCommit,
+    ScanReadSeesLaterCommits,
+    DeleteManyIgnoresExistingKeys,
+    KeyOnlyScanReturnsFullValues,
+    AdvertisesPendingCapability,
     RollbackCommits,
-    ReverseUnsupportedReturnsForward,
+    BadByteOrdering,
+    KeyResumeRepeatsLastKey,
+    LoseCommittedDataOnReopen,
+    CorruptOpaqueBytes,
 }
 
 #[derive(Clone, Debug)]
@@ -31,45 +38,40 @@ struct BrokenBackendFactory {
 }
 
 #[derive(Clone, Debug)]
+struct BrokenBackendFixture {
+    mode: BrokenMode,
+    entries: Arc<Mutex<BrokenMap>>,
+    commit_count: Arc<Mutex<u64>>,
+    open_count: Arc<Mutex<u64>>,
+}
+
+#[derive(Clone, Debug)]
 struct BrokenBackend {
     mode: BrokenMode,
     entries: Arc<Mutex<BrokenMap>>,
+    commit_count: Arc<Mutex<u64>>,
 }
 
 struct BrokenRead {
     mode: BrokenMode,
     parent: Arc<Mutex<BrokenMap>>,
+    commit_count: Arc<Mutex<u64>>,
+    snapshot_commit_count: u64,
     snapshot: BrokenMap,
 }
 
 struct BrokenWrite {
     mode: BrokenMode,
     parent: Arc<Mutex<BrokenMap>>,
-    base_snapshot: BrokenMap,
+    commit_count: Arc<Mutex<u64>>,
     staged: BrokenMap,
 }
 
 #[test]
-fn detects_get_many_key_order_violation() {
+fn detects_get_many_missing_existing_key_violation() {
     assert_failed(
-        BrokenMode::KeySortedGetMany,
-        "baseline::get_many_preserves_caller_order_duplicates_and_missing",
-    );
-}
-
-#[test]
-fn detects_get_many_duplicate_coalescing_violation() {
-    assert_failed(
-        BrokenMode::CoalesceDuplicateGetMany,
-        "baseline::get_many_preserves_caller_order_duplicates_and_missing",
-    );
-}
-
-#[test]
-fn detects_write_read_your_writes_violation() {
-    assert_failed(
-        BrokenMode::WriteDoesNotReadOwnWrites,
-        "baseline::write_reads_its_own_writes",
+        BrokenMode::GetManyMissesExistingKey,
+        "baseline::get_many_returns_found_entries",
     );
 }
 
@@ -82,6 +84,59 @@ fn detects_read_snapshot_violation() {
 }
 
 #[test]
+fn detects_read_snapshot_second_commit_violation() {
+    assert_failed(
+        BrokenMode::ReadSeesSecondLaterCommit,
+        "baseline::begin_read_pins_coherent_view",
+    );
+}
+
+#[test]
+fn detects_scan_read_snapshot_violation() {
+    assert_failed(
+        BrokenMode::ScanReadSeesLaterCommits,
+        "baseline::begin_read_pins_coherent_view",
+    );
+}
+
+#[test]
+fn detects_delete_many_ignores_existing_keys() {
+    assert_failed(
+        BrokenMode::DeleteManyIgnoresExistingKeys,
+        "baseline::delete_many_removes_existing_keys",
+    );
+}
+
+#[test]
+fn detects_key_only_scan_projection_violation() {
+    assert_failed(
+        BrokenMode::KeyOnlyScanReturnsFullValues,
+        "baseline::full_value_and_key_only_are_core",
+    );
+}
+
+#[test]
+fn detects_advertised_pending_capability() {
+    let report = run_backend_conformance(&BrokenBackendFactory {
+        mode: BrokenMode::AdvertisesPendingCapability,
+    });
+    let pending = report.tests.iter().any(|test| {
+        test.name == "projection::header_returns_header_without_payload"
+            && matches!(test.status, ConformanceStatus::Pending)
+    });
+    assert!(
+        pending,
+        "expected advertised projection capability to create pending test, got {report:#?}"
+    );
+
+    let panic = std::panic::catch_unwind(|| report.assert_no_failures());
+    assert!(
+        panic.is_err(),
+        "assert_no_failures should fail when advertised capabilities are pending"
+    );
+}
+
+#[test]
 fn detects_rollback_commits_violation() {
     assert_failed(
         BrokenMode::RollbackCommits,
@@ -90,10 +145,50 @@ fn detects_rollback_commits_violation() {
 }
 
 #[test]
-fn detects_reverse_unsupported_forward_order_violation() {
+fn detects_rollback_overwrite_delete_violation() {
     assert_failed(
-        BrokenMode::ReverseUnsupportedReturnsForward,
-        "scan::reverse_returns_unsupported_when_not_capable",
+        BrokenMode::RollbackCommits,
+        "baseline::rollback_discards_overwrite_and_delete",
+    );
+}
+
+#[test]
+fn detects_bad_byte_ordering_violation() {
+    assert_failed(
+        BrokenMode::BadByteOrdering,
+        "baseline::scan_range_orders_raw_byte_keys",
+    );
+}
+
+#[test]
+fn detects_multi_page_drain_repeat_violation() {
+    assert_failed(
+        BrokenMode::KeyResumeRepeatsLastKey,
+        "baseline::scan_range_drains_multi_page_limits",
+    );
+}
+
+#[test]
+fn detects_opaque_byte_corruption_violation() {
+    assert_failed(
+        BrokenMode::CorruptOpaqueBytes,
+        "baseline::full_value_preserves_opaque_bytes",
+    );
+}
+
+#[test]
+fn detects_persistent_commit_lost_on_reopen_violation() {
+    assert_failed(
+        BrokenMode::LoseCommittedDataOnReopen,
+        "persistence::committed_data_survives_reopen",
+    );
+}
+
+#[test]
+fn detects_persistent_rollback_on_reopen_violation() {
+    assert_failed(
+        BrokenMode::RollbackCommits,
+        "persistence::rolled_back_data_does_not_survive_reopen",
     );
 }
 
@@ -112,16 +207,42 @@ fn assert_failed(mode: BrokenMode, test_name: &'static str) {
 
 impl BackendFactory for BrokenBackendFactory {
     type Backend = BrokenBackend;
+    type Fixture = BrokenBackendFixture;
 
-    fn fresh(&self) -> Self::Backend {
-        BrokenBackend {
+    fn create_fixture(&self) -> Self::Fixture {
+        BrokenBackendFixture {
             mode: self.mode,
             entries: Arc::new(Mutex::new(BrokenMap::new())),
+            commit_count: Arc::new(Mutex::new(0)),
+            open_count: Arc::new(Mutex::new(0)),
         }
     }
 
     fn config(&self) -> BackendTestConfig {
         BackendTestConfig::default()
+    }
+}
+
+impl BackendFixture for BrokenBackendFixture {
+    type Backend = BrokenBackend;
+
+    fn open(&self) -> Self::Backend {
+        let mut open_count = self
+            .open_count
+            .lock()
+            .expect("broken backend open count lock poisoned");
+        if matches!(self.mode, BrokenMode::LoseCommittedDataOnReopen) && *open_count > 0 {
+            self.entries
+                .lock()
+                .expect("broken backend entries lock poisoned")
+                .clear();
+        }
+        *open_count += 1;
+        BrokenBackend {
+            mode: self.mode,
+            entries: Arc::clone(&self.entries),
+            commit_count: Arc::clone(&self.commit_count),
+        }
     }
 }
 
@@ -137,24 +258,35 @@ impl Backend for BrokenBackend {
         Self: 'a;
 
     fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities::v0(WriteConcurrency::SingleWriter)
+        let mut capabilities = BackendCapabilities::v0(WriteConcurrency::SingleWriter);
+        if matches!(self.mode, BrokenMode::AdvertisesPendingCapability) {
+            capabilities.projection = ProjectionCapabilities {
+                header: true,
+                ..ProjectionCapabilities::default()
+            };
+        }
+        capabilities
     }
 
     fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
         Ok(BrokenRead {
             mode: self.mode,
             parent: Arc::clone(&self.entries),
+            commit_count: Arc::clone(&self.commit_count),
+            snapshot_commit_count: *self
+                .commit_count
+                .lock()
+                .map_err(|_| BackendError::Io("broken backend commit lock poisoned".to_string()))?,
             snapshot: self.snapshot()?,
         })
     }
 
     fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
-        let snapshot = self.snapshot()?;
         Ok(BrokenWrite {
             mode: self.mode,
             parent: Arc::clone(&self.entries),
-            base_snapshot: snapshot.clone(),
-            staged: snapshot,
+            commit_count: Arc::clone(&self.commit_count),
+            staged: self.snapshot()?,
         })
     }
 }
@@ -167,7 +299,14 @@ impl BackendRead for BrokenRead {
         opts: GetOptions<'_>,
     ) -> Result<GetManyResult, BackendError> {
         let live_entries;
-        let entries = if matches!(self.mode, BrokenMode::ReadSeesLaterCommits) {
+        let current_commit_count = *self
+            .commit_count
+            .lock()
+            .map_err(|_| BackendError::Io("broken backend commit lock poisoned".to_string()))?;
+        let entries = if matches!(self.mode, BrokenMode::ReadSeesLaterCommits)
+            || (matches!(self.mode, BrokenMode::ReadSeesSecondLaterCommit)
+                && current_commit_count >= self.snapshot_commit_count + 2)
+        {
             live_entries = self
                 .parent
                 .lock()
@@ -186,35 +325,16 @@ impl BackendRead for BrokenRead {
         range: KeyRange,
         opts: ScanOptions<'_>,
     ) -> Result<ScanPage, BackendError> {
-        scan_range_from_map(&self.snapshot, self.mode, space, range, opts)
-    }
-}
-
-impl BackendRead for BrokenWrite {
-    fn get_many(
-        &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions<'_>,
-    ) -> Result<GetManyResult, BackendError> {
-        let entries = if matches!(self.mode, BrokenMode::WriteDoesNotReadOwnWrites) {
-            &self.base_snapshot
+        let live_entries;
+        let entries = if matches!(self.mode, BrokenMode::ScanReadSeesLaterCommits) {
+            live_entries = self
+                .parent
+                .lock()
+                .map_err(|_| BackendError::Io("broken backend lock poisoned".to_string()))?
+                .clone();
+            &live_entries
         } else {
-            &self.staged
-        };
-        get_many_from_map(entries, self.mode, space, keys, opts)
-    }
-
-    fn scan_range(
-        &self,
-        space: SpaceId,
-        range: KeyRange,
-        opts: ScanOptions<'_>,
-    ) -> Result<ScanPage, BackendError> {
-        let entries = if matches!(self.mode, BrokenMode::WriteDoesNotReadOwnWrites) {
-            &self.base_snapshot
-        } else {
-            &self.staged
+            &self.snapshot
         };
         scan_range_from_map(entries, self.mode, space, range, opts)
     }
@@ -231,6 +351,11 @@ impl BackendWrite for BrokenWrite {
 
     fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
         for key in keys {
+            if matches!(self.mode, BrokenMode::DeleteManyIgnoresExistingKeys)
+                && self.staged.contains_key(&(space, key.clone()))
+            {
+                continue;
+            }
             self.staged.remove(&(space, key.clone()));
         }
         Ok(())
@@ -242,6 +367,10 @@ impl BackendWrite for BrokenWrite {
             .lock()
             .map_err(|_| BackendError::Io("broken backend lock poisoned".to_string()))? =
             self.staged;
+        *self
+            .commit_count
+            .lock()
+            .map_err(|_| BackendError::Io("broken backend commit lock poisoned".to_string()))? += 1;
         Ok(CommitResult {
             commit_id: None,
             stats: WriteStats::default(),
@@ -255,6 +384,9 @@ impl BackendWrite for BrokenWrite {
                 .lock()
                 .map_err(|_| BackendError::Io("broken backend lock poisoned".to_string()))? =
                 self.staged;
+            *self.commit_count.lock().map_err(|_| {
+                BackendError::Io("broken backend commit lock poisoned".to_string())
+            })? += 1;
         }
         Ok(())
     }
@@ -276,58 +408,26 @@ fn get_many_from_map(
     keys: &[Key],
     opts: GetOptions<'_>,
 ) -> Result<GetManyResult, BackendError> {
-    if !opts.predicates.is_empty() {
-        return Err(BackendError::Unsupported(Capability::PredicatePushdown));
-    }
-    match opts.order {
-        PointOrder::Caller => {}
-        PointOrder::KeyAsc => {
-            return Err(BackendError::Unsupported(Capability::KeyOrderedPoints));
+    let mut seen = BTreeSet::new();
+    let mut found = Vec::new();
+    for key in keys {
+        if matches!(mode, BrokenMode::GetManyMissesExistingKey)
+            && key == &Key(Bytes::from_static(b"a"))
+        {
+            continue;
         }
-        PointOrder::Unordered => {
-            return Err(BackendError::Unsupported(Capability::UnorderedPoints));
+        if !seen.insert(key.clone()) {
+            continue;
         }
-    }
-
-    let requested = match mode {
-        BrokenMode::KeySortedGetMany => {
-            let mut sorted = keys.iter().enumerate().collect::<Vec<_>>();
-            sorted.sort_by(|left, right| left.1.cmp(right.1).then(left.0.cmp(&right.0)));
-            sorted
-        }
-        BrokenMode::CoalesceDuplicateGetMany => {
-            let mut seen = BTreeSet::new();
-            keys.iter()
-                .enumerate()
-                .filter(|(_, key)| seen.insert((*key).clone()))
-                .collect()
-        }
-        _ => keys.iter().enumerate().collect(),
-    };
-
-    let slots = requested
-        .into_iter()
-        .map(|(index, key)| {
-            let value = entries
-                .get(&(space, key.clone()))
-                .map(|value| project_value(value, opts.projection))
-                .transpose()?;
-            Ok(GetSlot {
-                requested_index: Some(index),
+        if let Some(value) = entries.get(&(space, key.clone())) {
+            found.push(ReadEntry {
                 key: key.clone(),
-                value,
-            })
-        })
-        .collect::<Result<Vec<_>, BackendError>>()?;
-
+                value: project_value(value, mode, opts.projection, false),
+            });
+        }
+    }
     Ok(GetManyResult {
-        entries: slots,
-        support: ReadSupport::exact(opts.projection),
-        stats: ReadStats {
-            backend_calls: 1,
-            emitted_entries: keys.len() as u64,
-            ..ReadStats::default()
-        },
+        entries: ReadBatch { entries: found },
     })
 }
 
@@ -338,53 +438,40 @@ fn scan_range_from_map(
     range: KeyRange,
     opts: ScanOptions<'_>,
 ) -> Result<ScanPage, BackendError> {
-    if !opts.predicates.is_empty() {
-        return Err(BackendError::Unsupported(Capability::PredicatePushdown));
-    }
-    if opts.direction == ScanDirection::Reverse
-        && !matches!(mode, BrokenMode::ReverseUnsupportedReturnsForward)
-    {
-        return Err(BackendError::Unsupported(Capability::ReverseScan));
-    }
-
-    let after = opts.cursor.map(|cursor| Key(cursor.0.clone()));
-    let limit = opts.limit_rows.unwrap_or(usize::MAX);
-    if limit == 0 {
-        return Ok(ScanPage {
-            entries: ReadBatch {
-                entries: Vec::new(),
-            },
-            next_cursor: None,
-            support: ReadSupport::exact(opts.projection),
-            stats: ReadStats {
-                backend_calls: 1,
-                ..ReadStats::default()
-            },
+    let mut read_entries = Vec::new();
+    let mut has_more = false;
+    let mut candidates = entries
+        .iter()
+        .filter(|((entry_space, key), _)| *entry_space == space && range_contains(&range, key))
+        .collect::<Vec<_>>();
+    if matches!(mode, BrokenMode::BadByteOrdering) {
+        candidates.sort_by(|left, right| {
+            left.0
+                 .1
+                 .0
+                .len()
+                .cmp(&right.0 .1 .0.len())
+                .then(left.0 .1.cmp(&right.0 .1))
         });
     }
 
-    let mut scanned_entries = 0u64;
-    let mut read_entries = Vec::new();
-    let mut next_cursor = None;
-
-    for ((entry_space, key), value) in entries {
-        if *entry_space != space || !range_contains(&range, key) {
+    for ((_, key), value) in candidates {
+        if opts.resume_after.is_some_and(|resume_after| {
+            if matches!(mode, BrokenMode::KeyResumeRepeatsLastKey) {
+                key < resume_after
+            } else {
+                key <= resume_after
+            }
+        }) {
             continue;
         }
-        if after.as_ref().is_some_and(|after| key <= after) {
-            continue;
-        }
-
-        scanned_entries += 1;
-        if read_entries.len() == limit {
-            next_cursor = read_entries
-                .last()
-                .map(|entry: &ReadEntry| Cursor(entry.key.0.clone()));
+        if read_entries.len() == opts.limit_rows {
+            has_more = true;
             break;
         }
         read_entries.push(ReadEntry {
             key: key.clone(),
-            value: project_value(value, opts.projection)?,
+            value: project_value(value, mode, opts.projection, true),
         });
     }
 
@@ -392,14 +479,7 @@ fn scan_range_from_map(
         entries: ReadBatch {
             entries: read_entries,
         },
-        next_cursor,
-        support: ReadSupport::exact(opts.projection),
-        stats: ReadStats {
-            scanned_entries,
-            emitted_entries: scanned_entries.min(limit as u64),
-            backend_calls: 1,
-            ..ReadStats::default()
-        },
+        has_more,
     })
 }
 
@@ -419,28 +499,32 @@ fn range_contains(range: &KeyRange, key: &Key) -> bool {
 
 fn project_value(
     value: &Bytes,
-    projection: ValueProjection,
-) -> Result<ProjectedValue, BackendError> {
+    mode: BrokenMode,
+    projection: CoreProjection,
+    break_key_only: bool,
+) -> ProjectedValue {
+    let value = if matches!(mode, BrokenMode::CorruptOpaqueBytes) {
+        Bytes::from(
+            value
+                .iter()
+                .copied()
+                .filter(|byte| byte.is_ascii_graphic() || *byte == b' ')
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        value.clone()
+    };
     match projection {
-        ValueProjection::KeyOnly => Ok(ProjectedValue::KeyOnly),
-        ValueProjection::FullValue => Ok(ProjectedValue::FullValue(value.clone())),
-        other => Err(BackendError::Unsupported(Capability::Projection(other))),
+        CoreProjection::KeyOnly
+            if break_key_only && matches!(mode, BrokenMode::KeyOnlyScanReturnsFullValues) =>
+        {
+            ProjectedValue::FullValue(value)
+        }
+        CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
+        CoreProjection::FullValue => ProjectedValue::FullValue(value),
     }
 }
 
 fn stored_value_bytes(value: StoredValue) -> Bytes {
-    match value {
-        StoredValue::FullValue(bytes) => bytes,
-        StoredValue::Envelope {
-            header,
-            refs,
-            payload,
-        } => {
-            let mut bytes = Vec::with_capacity(header.len() + refs.len() + payload.len());
-            bytes.extend_from_slice(&header);
-            bytes.extend_from_slice(&refs);
-            bytes.extend_from_slice(&payload);
-            Bytes::from(bytes)
-        }
-    }
+    value.bytes
 }

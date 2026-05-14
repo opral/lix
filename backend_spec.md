@@ -4,13 +4,14 @@ The stable core is:
 
 ```text
 An ordered byte-key entry backend with coherent read views, batched point
-access, paged range/prefix scans, and atomic batched writes.
+access, forward paged range scans, and atomic batched writes.
 ```
 
-Everything else is additive capability: envelope slicing, reverse scans, range
-delete, preconditions, predicate pushdown, object/segment pruning, byte-bounded
-pages, long-lived cursors, parallel scan partitions, and native idempotent
-commits.
+Everything else is either `storage_v2` adapter behavior or an additive backend
+extension: prefix lowering, caller-order reconstruction, storage cursors,
+projection fallback, residual filtering, range delete, preconditions, predicate
+pushdown, envelope slicing, object/segment pruning, byte-bounded pages,
+long-lived cursors, parallel scan partitions, and native idempotent commits.
 
 The public extension point is backend, not "bring your own storage".
 
@@ -35,9 +36,9 @@ The important cut:
 ```text
 Backend:
   ordered byte keys
-  byte values or envelope-sliceable byte values
+  opaque byte values
   get_many
-  scan_range / scan_prefix
+  scan_range
   put_many / delete_many
   begin_read / begin_write
   capabilities
@@ -47,7 +48,14 @@ Generic storage adapter:
   read/write scopes
   namespace/space registration
   batching helpers
+  prefix lowering
+  caller-order point reconstruction
+  storage cursor tokens
   capability-aware lowering
+  projection fallback
+  residual filtering loops
+  delete_range/precondition fallback when safe
+  fallback stats
 
 Domain stores:
   tracked_state roots/chunks/by-file index
@@ -63,9 +71,8 @@ Domain stores:
 ```
 
 This keeps the backend close to FoundationDB/RocksDB-style primitives while
-preserving the important goals: explicit access shape, explicit projection,
-honest pushdown reporting, paged reads, late hydration, batching, snapshots, and
-atomic writes.
+preserving the important goals: explicit access shape, paged reads, batching,
+snapshots, atomic writes, and Big-O-visible fallback costs in `storage_v2`.
 
 Most users should bring their own backend. A backend author implements the
 physical substrate and should not need to know Lix commit visibility,
@@ -88,7 +95,6 @@ begin_read
 begin_write
 get_many
 scan_range
-scan_prefix, via the default range lowering or a native implementation
 put_many
 delete_many
 commit
@@ -100,27 +106,32 @@ Required semantics:
 ```text
 keys:
   bytes, ordered lexicographically within a space
+  ordering is raw unsigned byte order, not text collation or locale order
 
 values:
-  opaque bytes; FullValue and KeyOnly projections are core
+  opaque bytes; FullValue is core, and KeyOnly is a core logical read shape
 
 read transaction:
   coherent read view
+  once opened, the view remains pinned across any number of later commits
 
 write transaction:
-  atomic mutation unit; reads through the write handle observe staged mutations
+  atomic mutation unit; write handles are mutation sinks, not read handles
 
 range scans:
   forward, row-bounded, paged
+  continuation resumes strictly after the last emitted key
 
 point reads:
-  caller-order slots preserve duplicates and missing keys
+  batched reads over requested keys; storage_v2 may reconstruct caller-order,
+  duplicate, and missing-key slots above the raw backend result
 
 batching:
   first-class, not syntactic sugar over loops
 
 capabilities:
-  lack of capability changes cost, not correctness
+  lack of capability changes cost, or causes storage_v2 to reject an operation
+  whose exact semantics cannot be safely emulated
 ```
 
 ### Optional Performance Capabilities
@@ -131,6 +142,7 @@ Optional capabilities include:
 header-only scan
 refs-only scan
 payload-only read
+native prefix scan
 reverse scan
 delete_range
 atomic precondition registration
@@ -142,9 +154,10 @@ byte-bounded pages
 long-lived cursors
 ```
 
-This is the "Ordered KV + Value Envelope Slices" direction: keep the backend
-simple, but let it avoid payload read/decode when it can return key/header/ref
-slices directly.
+This is the "boring ordered KV first" direction: keep v0 tiny, then let
+storage_v2 use extensions to avoid payload read/decode, push predicates down,
+delete ranges natively, or resume scans with backend-native tokens when a
+backend can do that cheaply and correctly.
 
 ## Rust API
 
@@ -177,7 +190,6 @@ Backend author mapping:
 FoundationDB:
   get_many     -> transaction get calls
   scan_range   -> transaction get_range
-  scan_prefix  -> prefix range
   put_many     -> set
   delete_many  -> clear
   commit       -> commit
@@ -185,7 +197,6 @@ FoundationDB:
 RocksDB:
   get_many     -> MultiGet
   scan_range   -> iterator seek + next
-  scan_prefix  -> iterator seek prefix + next until prefix ends
   put_many     -> WriteBatch
   delete_many  -> WriteBatch delete
   commit       -> DB::write / Transaction::Commit
@@ -238,15 +249,8 @@ pub struct PutBatch {
 }
 
 #[derive(Clone, Debug)]
-pub enum StoredValue {
-    FullValue(Bytes),
-
-    /// Optional shape for backends that store envelope columns/slices natively.
-    Envelope {
-        header: Bytes,
-        refs: Bytes,
-        payload: Bytes,
-    },
+pub struct StoredValue {
+    pub bytes: Bytes,
 }
 
 #[derive(Clone, Debug)]
@@ -266,13 +270,14 @@ impl Prefix {
     }
 }
 
+/// A storage-level cursor token. Backend v0 scan continuation is key-based;
+/// opaque backend cursors are an extension.
 #[derive(Clone, Debug)]
-pub struct Cursor(pub Bytes);
+pub struct StorageCursor(pub Bytes);
 ```
 
-Read entries may contain projected values. Write entries never do: `put_many`
-accepts only `StoredValue`, so a backend is never asked to persist `KeyOnly`,
-`Header`, `Refs`, or another partial projection by accident.
+V0 writes store opaque values only. Envelope-aware storage and native envelope
+projection are extension paths above this opaque byte value.
 
 `SpaceId` is a physical namespace. It is not a Lix table name. Storage can map:
 
@@ -304,15 +309,6 @@ pub trait BackendRead {
         opts: ScanOptions<'_>,
     ) -> Result<ScanPage, BackendError>;
 
-    fn scan_prefix(
-        &self,
-        space: SpaceId,
-        prefix: Prefix,
-        opts: ScanOptions<'_>,
-    ) -> Result<ScanPage, BackendError> {
-        self.scan_range(space, prefix.to_range()?, opts)
-    }
-
     fn close(self) -> Result<(), BackendError>
     where
         Self: Sized,
@@ -327,75 +323,51 @@ pub trait BackendRead {
 ```rust
 #[derive(Clone, Copy, Debug)]
 pub struct GetOptions<'a> {
-    pub projection: ValueProjection,
-    pub order: PointOrder,
-    pub preserve_duplicates: bool,
-    pub predicates: &'a [BackendPredicate],
+    pub projection: CoreProjection,
+    /// Reserved for extension traits. Core v0 does not accept predicates.
+    pub _reserved: std::marker::PhantomData<&'a ()>,
 }
 
 impl Default for GetOptions<'_> {
     fn default() -> Self {
         Self {
-            projection: ValueProjection::FullValue,
-            order: PointOrder::Caller,
-            preserve_duplicates: true,
-            predicates: &[],
+            projection: CoreProjection::FullValue,
+            _reserved: std::marker::PhantomData,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PointOrder {
-    /// Return one slot per requested key, preserving duplicates and missing keys.
-    Caller,
-
-    /// Return entries in lexicographic key order. Duplicate requested keys may
-    /// be coalesced unless preserve_duplicates is true.
-    KeyAsc,
-
-    /// Backend may return any order. Duplicate requested keys may be coalesced.
-    Unordered,
 }
 ```
 
 `get_many` is required because point batching is a core backend primitive, not a
 looping convenience.
 
-`PointOrder::Caller` is the only point order that preserves requested position,
-duplicates, and missing keys by default. `PointOrder::KeyAsc` and
-`PointOrder::Unordered` may coalesce duplicate requested keys unless the caller
-sets `preserve_duplicates`.
+V0 `get_many` may return found entries in backend/native order. Missing keys may
+be omitted, and duplicate requested keys may be coalesced. `storage_v2` owns the
+caller-order semantic helper that reconstructs one output slot per requested
+key, including duplicate and missing keys, in `O(M + U)` where `M` is requested
+keys and `U` is unique requested keys. Backends must still implement this as a
+batched point operation over the requested or deduplicated key set, not as a
+required loop of independent physical reads.
 
 ### Scan Options
 
 ```rust
 #[derive(Clone, Copy, Debug)]
 pub struct ScanOptions<'a> {
-    pub projection: ValueProjection,
-    pub direction: ScanDirection,
-    pub limit_rows: Option<usize>,
-    pub limit_bytes: Option<usize>,
-    pub cursor: Option<&'a Cursor>,
-    pub predicates: &'a [BackendPredicate],
+    pub projection: CoreProjection,
+    pub limit_rows: usize,
+    /// Resume strictly after this key within the same range and read view.
+    pub resume_after: Option<&'a Key>,
 }
 
 impl Default for ScanOptions<'_> {
     fn default() -> Self {
         Self {
-            projection: ValueProjection::FullValue,
-            direction: ScanDirection::Forward,
-            limit_rows: None,
-            limit_bytes: None,
-            cursor: None,
-            predicates: &[],
+            projection: CoreProjection::FullValue,
+            limit_rows: 1024,
+            resume_after: None,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScanDirection {
-    Forward,
-    Reverse,
 }
 ```
 
@@ -405,49 +377,55 @@ Scans must be paged:
 #[derive(Clone, Debug)]
 pub struct ScanPage {
     pub entries: ReadBatch,
-    pub next_cursor: Option<Cursor>,
-    pub support: ReadSupport,
-    pub stats: ReadStats,
+    /// True means callers should continue by resuming after the last emitted
+    /// key. False means this backend page reached the end of the requested
+    /// range in this read view.
+    pub has_more: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct GetManyResult {
-    pub entries: Vec<GetSlot>,
-    pub support: ReadSupport,
-    pub stats: ReadStats,
-}
-
-#[derive(Clone, Debug)]
-pub struct GetSlot {
-    /// Present for caller-order results and for ordered/unordered results that
-    /// preserve duplicate request positions.
-    pub requested_index: Option<usize>,
-    pub key: Key,
-    pub value: Option<ProjectedValue>,
+    /// Found entries for requested keys. Missing keys may be omitted.
+    pub entries: ReadBatch,
 }
 ```
 
-If `direction = Reverse` and the backend lacks reverse scan support, the backend
-must return `BackendError::Unsupported(Capability::ReverseScan)`. It must not
-silently return forward order. Storage may explicitly fallback with forward scan
-and bounded buffering only when that is safe for the high-level operation.
+V0 scans are forward only. Reverse scans, byte limits, predicates, and native
+opaque cursors are extension paths. Storage-level helpers may normalize
+`limit_rows = 0`, wrap public cursor tokens, validate cursor scope, and perform
+lookahead/buffering when they want an exact public "no cursor means no more
+eligible rows" promise.
 
-A cursor is valid only for the same backend instance, space, range or prefix,
-direction, projection class, read transaction/snapshot, and predicate set.
-Backends may encode stricter constraints. Resuming with a cursor outside its
-scope must return `BackendError::InvalidCursor`.
+## Projection / Envelope Extensions
 
-## Projection / Envelope API
-
-The required backend value is opaque bytes. The first major performance
-capability is an optional stable envelope layout.
+The required backend value is opaque bytes. V0 has only core logical projection
+shapes:
 
 ```rust
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ValueProjection {
+pub enum CoreProjection {
     /// Core. Backend may internally read value bytes and discard them.
     KeyOnly,
 
+    /// Core.
+    FullValue,
+}
+
+#[derive(Clone, Debug)]
+pub enum ProjectedValue {
+    KeyOnly,
+    FullValue(Bytes),
+}
+```
+
+Envelope slicing is an optional extension. The Lix storage/domain-store layer
+defines the envelope; backends may opt into returning slices of it.
+The current Rust scaffold exposes only the core `ProjectedValue` variants;
+envelope request/result types land with the envelope extension API.
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvelopeProjection {
     /// Optional envelope projection: return small storage-defined header bytes.
     Header,
 
@@ -460,13 +438,10 @@ pub enum ValueProjection {
     /// Optional envelope projection: return payload bytes only.
     Payload,
 
-    /// Core.
-    FullValue,
 }
 
 #[derive(Clone, Debug)]
-pub enum ProjectedValue {
-    KeyOnly,
+pub enum EnvelopeProjectedValue {
     Header(Bytes),
     Refs(Bytes),
     HeaderAndRefs {
@@ -474,12 +449,8 @@ pub enum ProjectedValue {
         refs: Bytes,
     },
     Payload(Bytes),
-    FullValue(Bytes),
 }
 ```
-
-The Lix storage/domain-store layer defines the envelope. Backend only knows how
-to slice it.
 
 Recommended physical envelope:
 
@@ -507,13 +478,16 @@ Object backend:
   header/refs in manifest, payload in objects
 ```
 
-This is the biggest performance hook: Lix scans can return key/header/refs
-without hydrating payload bytes.
+This is the biggest read performance hook: Lix scans can return key/header/refs
+without hydrating payload bytes. If a backend lacks native envelope projection,
+`storage_v2` may fall back to `FullValue` and decode the envelope itself, but
+hot operations that require "no payload physical I/O" must require the extension
+or reject the operation.
 
 ## Write API
 
 ```rust
-pub trait BackendWrite: BackendRead {
+pub trait BackendWrite {
     fn put_many(
         &mut self,
         space: SpaceId,
@@ -525,23 +499,6 @@ pub trait BackendWrite: BackendRead {
         space: SpaceId,
         keys: &[Key],
     ) -> Result<(), BackendError>;
-
-    fn delete_range(
-        &mut self,
-        space: SpaceId,
-        range: KeyRange,
-    ) -> Result<(), BackendError> {
-        let _ = (space, range);
-        Err(BackendError::Unsupported(Capability::DeleteRange))
-    }
-
-    fn require(
-        &mut self,
-        preconditions: &[Precondition],
-    ) -> Result<PreconditionSupportReport, BackendError> {
-        let _ = preconditions;
-        Err(BackendError::Unsupported(Capability::Preconditions))
-    }
 
     fn commit(self) -> Result<CommitResult, BackendError>
     where
@@ -556,10 +513,10 @@ pub trait BackendWrite: BackendRead {
 `commit(self)` and `rollback(self)` consume the write handle. This prevents use
 after commit.
 
-Write handles implement `BackendRead` so storage can perform precondition
-discovery, conflict validation, and fallback reads within the write transaction.
-Reads through a write handle must observe that write transaction's staged
-mutations.
+Write handles are mutation sinks. They do not implement `BackendRead` and are
+not required to support read-your-writes. If storage needs validation reads,
+conflict discovery, or fallback hydration, it uses an explicit `BackendRead`
+view and/or a storage-layer staged-mutation overlay.
 
 Required write semantics:
 
@@ -578,6 +535,30 @@ atomic precondition registration
 idempotent_commit
 delete_range
 ```
+
+Optional write behavior is intended to live behind extension traits. These
+traits are part of the extension design, not the v0 core trait surface:
+
+```rust
+pub trait BackendDeleteRangeExt: BackendWrite {
+    fn delete_range(
+        &mut self,
+        space: SpaceId,
+        range: KeyRange,
+    ) -> Result<(), BackendError>;
+}
+
+pub trait BackendPreconditionExt: BackendWrite {
+    fn require(
+        &mut self,
+        preconditions: &[Precondition],
+    ) -> Result<PreconditionSupportReport, BackendError>;
+}
+```
+
+The current `backend_v2` scaffold may expose only the capability metadata and
+pending conformance entries for these extensions until their positive
+conformance suites are implemented.
 
 ### Preconditions
 
@@ -626,7 +607,7 @@ Storage fallback rule:
 
 ```text
 If backend has exact preconditions:
-  register them with BackendWrite::require.
+  register them with BackendPreconditionExt::require.
 
 Preconditions registered with require():
   must hold at commit.
@@ -643,6 +624,12 @@ If backend lacks preconditions but storage serializes writes:
 If backend lacks preconditions and allows external concurrent writers:
   storage must not emulate silently.
 ```
+
+`delete_range` fallback has the same safety boundary. A scan-and-delete fallback
+is exact only when storage can prevent concurrent range inserts or bind the
+scanned range to commit with native conflict/precondition support. Otherwise,
+storage must reject the exact operation or explicitly downgrade the semantics to
+"delete keys observed in the read snapshot."
 
 ## Capability Model
 
@@ -662,8 +649,7 @@ pub struct BackendCapabilities {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendProfile {
     /// Ordered byte keys, coherent read views, paged forward scans,
-    /// caller-order get_many, readable writes with read-your-writes, and atomic
-    /// write commit.
+    /// batched get_many, and atomic write commit.
     V0 {
         write_concurrency: WriteConcurrency,
     },
@@ -679,6 +665,7 @@ pub enum WriteConcurrency {
 #[derive(Clone, Debug, Default)]
 pub struct ProjectionCapabilities {
     /// FullValue is core. KeyOnly is core as a logical output shape.
+    /// These fields describe optional envelope projection extensions.
     pub header: bool,
     pub refs: bool,
     pub header_and_refs: bool,
@@ -687,23 +674,24 @@ pub struct ProjectionCapabilities {
 
 #[derive(Clone, Debug, Default)]
 pub struct ScanCapabilities {
-    /// Prefix scan is core via range lowering. This means the backend has a
-    /// better native prefix path.
+    /// Prefix scan is storage_v2 range lowering by default. This means the
+    /// backend has a better native prefix path.
     pub native_prefix_scan: bool,
 
     /// Forward scan is core. Reverse is optional.
     pub reverse: bool,
 
-    /// Row-bounded pages are core. Byte-bounded pages are optional.
+    /// Row-bounded forward pages are core. Byte-bounded pages are optional.
     pub limit_bytes: bool,
 
-    /// Caller-order get_many is core. These are optional alternate point-return
-    /// modes.
+    /// Optional point-return modes. Core v0 allows storage_v2 to reconstruct
+    /// caller-order slots from found entries.
     pub unordered_points: bool,
     pub key_ordered_points: bool,
 
-    /// Cursor continuation within the same read transaction is core. This
-    /// means cursors can survive transaction/session boundaries.
+    /// Core v0 scan continuation is key-resume. This means the backend exposes
+    /// native opaque cursors that can survive transaction/session boundaries or
+    /// avoid expensive reseeks.
     pub long_lived_cursors: bool,
 
     pub parallel_partitions: bool,
@@ -714,8 +702,7 @@ pub struct WriteCapabilities {
     /// put_many/delete_many/commit/rollback are core.
     pub delete_range: bool,
 
-    /// Atomic precondition registration. Per-item support is still reported by
-    /// require(...).
+    /// Atomic precondition registration via BackendPreconditionExt.
     pub preconditions: bool,
 
     /// Useful for remote/distributed backends where commit success can be
@@ -777,10 +764,32 @@ pub trait ObjectBackendExt {
 }
 ```
 
-## Pushdown Path
+## Pushdown Extension Path
 
-Do not make a generic SQL-like `ReadPlan` the backend core. Add pushdown through
-`GetOptions.predicates` / `ScanOptions.predicates` and support reporting.
+Do not make a generic SQL-like `ReadPlan` the backend core. Core v0 does not
+accept predicates. Pushdown is a planned extension path with its own result
+types and support reporting:
+
+```rust
+pub trait BackendPushdownExt {
+    fn get_many_pushdown(
+        &self,
+        space: SpaceId,
+        keys: &[Key],
+        opts: PushdownGetOptions<'_>,
+    ) -> Result<PushdownGetResult, BackendError>;
+
+    fn scan_range_pushdown(
+        &self,
+        space: SpaceId,
+        range: KeyRange,
+        opts: PushdownScanOptions<'_>,
+    ) -> Result<PushdownScanPage, BackendError>;
+}
+```
+
+The current `backend_v2` scaffold may expose the predicate/support data model
+before this extension trait is wired into the public Rust API.
 
 Only exact pushdown removes a predicate from residual evaluation.
 
@@ -872,6 +881,9 @@ payload_ref = P
 
 ### Pushdown Support Result
 
+The support structures below belong to pushdown/envelope extension results.
+Core v0 `get_many` and `scan_range` do not return support metadata.
+
 ```rust
 #[derive(Clone, Debug)]
 pub struct ReadSupport {
@@ -883,9 +895,15 @@ pub struct ReadSupport {
 
 #[derive(Clone, Debug)]
 pub struct ProjectionSupport {
-    pub requested: ValueProjection,
-    pub returned: ValueProjection,
+    pub requested: ProjectionRequest,
+    pub returned: ProjectionRequest,
     pub support: Support,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectionRequest {
+    Core(CoreProjection),
+    Envelope(EnvelopeProjection),
 }
 
 #[derive(Clone, Debug)]
@@ -948,17 +966,18 @@ entries.
 
 ## Stats
 
-Stats are part of the API because they make fallback costs visible.
+Stats are layered. Backend stats are optional diagnostics about physical calls
+and bytes. Storage stats are the normative place for fallback/cost accounting:
+projection fallback, residual filtering, caller-order reconstruction,
+scan-and-delete fallback, reverse buffering, payload hydration, and write-set
+lowering.
 
 ```rust
 #[derive(Clone, Debug, Default)]
-pub struct ReadStats {
-    pub scanned_entries: u64,
-    pub emitted_entries: u64,
-    pub skipped_by_backend: u64,
-    pub decoded_bytes: u64,
-    pub payload_bytes: u64,
+pub struct BackendIoStats {
     pub backend_calls: u64,
+    pub bytes_read: Option<u64>,
+    pub bytes_written: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1012,12 +1031,12 @@ pub enum BackendError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Capability {
-    Projection(ValueProjection),
+    Projection(ProjectionRequest),
+    KeyOrderedPoints,
+    UnorderedPoints,
     ReverseScan,
     DeleteRange,
     Preconditions,
-    CompareAndSet,
-    RangeEmpty,
     IdempotentCommit,
     PredicatePushdown,
     ParallelPartitions,
@@ -1077,6 +1096,27 @@ pub enum Durability {
 `idempotency_key` matters for remote/distributed backends where commit success
 can be ambiguous.
 
+For the v0 baseline, conformance only relies on the default option values:
+
+```rust
+ReadOptions {
+    snapshot: None,
+    consistency: ReadConsistency::Snapshot,
+}
+
+WriteOptions {
+    base_snapshot: None,
+    durability: Durability::Default,
+    idempotency_key: None,
+}
+```
+
+Non-default `SnapshotRef`, `ReadConsistency::StaleOk`, `ReadConsistency::Latest`,
+explicit durability modes, `base_snapshot`, and `idempotency_key` are reserved
+extension points until the API exposes a normative way to obtain snapshot refs
+and defines conflict/idempotency semantics. Backends may support them early, but
+the v0 conformance baseline does not require or test them.
+
 ## Zero-Cost Abstraction Path
 
 ### Core Operations Are Native-Shaped
@@ -1092,7 +1132,6 @@ Make the core look like native backend calls:
 ```text
 get_many
 scan_range
-scan_prefix
 put_many
 delete_many
 ```
@@ -1113,9 +1152,9 @@ This lets storage be generic over `B: Backend` and avoid hot-path trait objects.
 For plugin-style dynamic backends, add an object-safe adapter later. Do not make
 that the performance-critical core.
 
-### Keep Pushdown As Slices
+### Keep Pushdown In Extensions
 
-Use:
+Core v0 does not accept predicates. Pushdown extensions should still use slices:
 
 ```rust
 predicates: &'a [BackendPredicate]
@@ -1127,17 +1166,12 @@ Do not use:
 Vec<Box<dyn Predicate>>
 ```
 
-For the common path:
+This keeps extension calls allocation-free without putting predicate rejection
+work on every v0 backend.
 
-```rust
-predicates: &[]
-```
+### Return Support Per Extension Result
 
-there is no expression tree, allocation, or dynamic dispatch.
-
-### Return Support Per Result
-
-Backend support reporting is metadata:
+Backend support reporting is extension metadata:
 
 ```rust
 ReadSupport {
@@ -1148,8 +1182,8 @@ ReadSupport {
 }
 ```
 
-The Lix storage/domain-store layer uses that to decide residual work. No backend
-optimizer is required.
+The Lix storage/domain-store layer uses that to decide residual work. Core v0
+reads either return exact raw results for the core operation or fail.
 
 ## Storage-Side Lowering Examples
 
@@ -1161,24 +1195,22 @@ The domain store wants:
 commit_id -> tracked projection -> root_ref
 ```
 
-Backend call:
+Backend call, using core full-value reads:
 
 ```rust
 let read = backend.begin_read(ReadOptions {
-    snapshot: Some(snapshot),
     consistency: ReadConsistency::Snapshot,
+    ..Default::default()
 })?;
 
 let result = read.get_many(
     TRACKED_ROOT_SPACE,
     &[state_row_key],
-    GetOptions {
-        projection: ValueProjection::Refs,
-        order: PointOrder::Caller,
-        preserve_duplicates: true,
-        predicates: &[],
-    },
+    GetOptions::default(),
 )?;
+
+Storage/domain code decodes the value or uses `BackendEnvelopeExt` when that
+extension is available.
 ```
 
 ### Schema / File Scan
@@ -1192,7 +1224,7 @@ key/header/refs only
 no payload hydration
 ```
 
-Backend call:
+Storage lowering:
 
 ```rust
 let deleted_false = BackendPredicate {
@@ -1200,34 +1232,22 @@ let deleted_false = BackendPredicate {
     expr: PredicateExpr::Header(HeaderPredicate::IsDeleted(false)),
 };
 
-let page = read.scan_prefix(
+let range = Prefix { bytes: schema_file_prefix }.to_range()?;
+let page = read.scan_range(
     TRACKED_BY_FILE_SPACE,
-    Prefix { bytes: schema_file_prefix },
+    range,
     ScanOptions {
-        projection: ValueProjection::HeaderAndRefs,
-        direction: ScanDirection::Forward,
-        limit_rows: Some(2048),
-        limit_bytes: Some(1 << 20),
-        cursor: cursor.as_ref(),
-        predicates: &[deleted_false],
+        projection: CoreProjection::FullValue,
+        limit_rows: 2048,
+        resume_after: storage_cursor.last_key(),
     },
 )?;
 ```
 
-The Lix storage/domain-store layer inspects support:
-
-```rust
-for pushed in &page.support.predicates {
-    match pushed.support {
-        Support::Exact => {
-            // Do not re-evaluate this predicate.
-        }
-        Support::Inexact | Support::Unsupported => {
-            // Apply residual filter in storage.
-        }
-    }
-}
-```
+Storage/domain code then applies residual filtering and projection fallback.
+When pushdown/envelope extensions are available and safe, storage uses their
+extension results and support metadata to decide which predicates still need
+residual evaluation.
 
 ### Commit Write
 
@@ -1243,11 +1263,7 @@ The Lix storage/domain-store layer owns logical publication order:
 Backend sees only ordered byte mutations:
 
 ```rust
-let mut write = backend.begin_write(WriteOptions {
-    durability: Durability::Durable,
-    idempotency_key: Some(commit_id_bytes),
-    ..Default::default()
-})?;
+let mut write = backend.begin_write(WriteOptions::default())?;
 
 write.put_many(PAYLOAD_SPACE, payload_entries)?;
 write.put_many(INDEX_SPACE, index_entries)?;
@@ -1376,7 +1392,6 @@ begin_read
 begin_write
 get_many
 scan_range
-scan_prefix, via the default range lowering or a native implementation
 put_many
 delete_many
 commit
@@ -1388,12 +1403,11 @@ Required guarantees:
 ```text
 ordered keys
 coherent read view
-caller-order get_many with duplicate and missing-key preservation
+batched get_many over requested keys
 forward row-bounded paged scans
-cursor continuation within the same read view
+key-resume continuation within the same read view
 atomic write commit
 FullValue and KeyOnly projections
-read-your-writes through BackendWrite
 ```
 
 ### v1: Envelope Projection
@@ -1439,7 +1453,7 @@ long-lived cursors
 parallel partitions
 object/segment pruning
 native delete_range
-stats-driven fallback reports
+backend diagnostics
 ```
 
 ## Backend Conformance Test Suite
@@ -1454,6 +1468,7 @@ packages/engine/src/backend_v2/conformance/
   runner.rs
   model.rs
   fixtures.rs
+  persistence.rs
   baseline.rs
   projection.rs
   scan.rs
@@ -1462,24 +1477,122 @@ packages/engine/src/backend_v2/conformance/
 ```
 
 `baseline.rs` contains the required tests every backend must pass before
-capabilities matter. It validates the v0 invariants: ordered byte keys,
-coherent reads, caller-order `get_many`, forward row-bounded scans,
-same-read-view cursor continuation, atomic writes, rollback, read-your-writes,
-space isolation, and `FullValue`/`KeyOnly`.
+capabilities matter. It validates the v0 invariants: raw lexicographic byte-key
+ordering, opaque byte value preservation, coherent reads pinned across later
+commits, batched `get_many`, forward row-bounded scans, multi-page key-resume
+draining without repeats/skips, atomic writes, rollback for
+new/overwrite/delete mutations, space isolation, and `FullValue`/`KeyOnly`.
 
-The other conformance modules are capability-gated:
+The other conformance modules are capability-gated or profile-gated:
 
 ```text
-projection.rs -> envelope slices
-scan.rs       -> native prefix, reverse, byte limits, long-lived cursors
-write.rs      -> delete_range, preconditions, idempotent commit
-pushdown.rs   -> exact/inexact/unsupported pushdown reporting
+persistence.rs -> non-ephemeral fixture reopen semantics
+projection.rs  -> envelope slices
+scan.rs        -> native prefix, reverse, byte limits, long-lived cursors
+write.rs       -> delete_range, preconditions, idempotent commit
+pushdown.rs    -> exact/inexact/unsupported pushdown reporting
 ```
+
+Storage-level conformance should separately validate caller-order point
+reconstruction, duplicate/missing slots, prefix lowering, public cursor scope,
+limit-zero normalization, projection fallback, residual filtering, delete-range
+fallback, support/stat interpretation, and write-set batching.
 
 The conformance runner should expose a function-first API:
 
 ```rust
 run_backend_conformance(&factory)
+```
+
+Backend authors should normally only call that one function from their own
+test:
+
+```rust
+#[test]
+fn my_backend_passes_backend_v2_conformance() {
+    run_backend_conformance(&MyBackendFactory).assert_no_failures();
+}
+```
+
+Under the hood, the runner uses an explicit test lifecycle:
+
+```text
+BackendFactory -> BackendFixture -> Backend
+```
+
+`BackendFactory` creates a fresh isolated fixture for each conformance test.
+`BackendFixture` owns the lifecycle identity for one physical test target: a
+temp directory, database file, object-store prefix, remote namespace, or
+in-memory shared state. `BackendFixture::open()` opens a `Backend` handle
+against that same target.
+
+This keeps the public testing API function-first while still allowing the
+runner to test both normal runtime behavior and reopen behavior. Baseline tests
+can simply create a fresh fixture and open one backend handle. Persistence tests
+can open a backend, commit data, drop all handles, reopen the same fixture, and
+verify the committed bytes are still present. Persistence tests run whenever
+`BackendTestConfig::ephemeral` is `false`; they are skipped for ephemeral
+fixtures.
+
+```rust
+pub trait BackendFactory {
+    type Backend: Backend;
+    type Fixture: BackendFixture<Backend = Self::Backend>;
+
+    fn create_fixture(&self) -> Self::Fixture;
+
+    fn config(&self) -> BackendTestConfig {
+        BackendTestConfig::default()
+    }
+}
+
+pub trait BackendFixture {
+    type Backend: Backend;
+
+    fn open(&self) -> Self::Backend;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackendTestConfig {
+    pub max_key_len: usize,
+    pub max_value_len: usize,
+
+    /// If true, committed data is not required to survive reopening the same
+    /// fixture. Persistence/reopen tests are skipped.
+    ///
+    /// If false, committed data must survive dropping all backend handles and
+    /// opening a new handle from the same fixture. This is the default.
+    pub ephemeral: bool,
+
+    pub supports_concurrent_writers: bool,
+}
+```
+
+Example for a file-backed backend:
+
+```rust
+struct MyBackendFactory;
+
+impl BackendFactory for MyBackendFactory {
+    type Backend = MyBackend;
+    type Fixture = MyBackendFixture;
+
+    fn create_fixture(&self) -> Self::Fixture {
+        MyBackendFixture::new_temp_file()
+    }
+}
+
+struct MyBackendFixture {
+    path: PathBuf,
+}
+
+impl BackendFixture for MyBackendFixture {
+    type Backend = MyBackend;
+
+    fn open(&self) -> Self::Backend {
+        MyBackend::open(&self.path).unwrap()
+    }
+}
 ```
 
 Later, rs-sdk can re-export the same conformance API for backend authors.
@@ -1517,18 +1630,9 @@ pub trait BackendRead {
         range: KeyRange,
         opts: ScanOptions<'_>,
     ) -> Result<ScanPage, BackendError>;
-
-    fn scan_prefix(
-        &self,
-        space: SpaceId,
-        prefix: Prefix,
-        opts: ScanOptions<'_>,
-    ) -> Result<ScanPage, BackendError> {
-        self.scan_range(space, prefix.to_range()?, opts)
-    }
 }
 
-pub trait BackendWrite: BackendRead {
+pub trait BackendWrite {
     fn put_many(
         &mut self,
         space: SpaceId,
@@ -1540,23 +1644,6 @@ pub trait BackendWrite: BackendRead {
         space: SpaceId,
         keys: &[Key],
     ) -> Result<(), BackendError>;
-
-    fn delete_range(
-        &mut self,
-        space: SpaceId,
-        range: KeyRange,
-    ) -> Result<(), BackendError> {
-        let _ = (space, range);
-        Err(BackendError::Unsupported(Capability::DeleteRange))
-    }
-
-    fn require(
-        &mut self,
-        preconditions: &[Precondition],
-    ) -> Result<PreconditionSupportReport, BackendError> {
-        let _ = preconditions;
-        Err(BackendError::Unsupported(Capability::Preconditions))
-    }
 
     fn commit(self) -> Result<CommitResult, BackendError>
     where
