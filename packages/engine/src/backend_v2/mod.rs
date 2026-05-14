@@ -14,6 +14,10 @@ pub use capabilities::{
     BackendCapabilities, BackendProfile, ProjectionCapabilities, PushdownCapabilities,
     ScanCapabilities, WriteCapabilities, WriteConcurrency,
 };
+pub use conformance::conformance_backend::{
+    ConformanceBackend, ConformanceBackendFactory, ConformanceBackendFixture, ConformanceRead,
+    ConformanceWrite,
+};
 pub use error::{
     BackendError, Capability, Precondition, PreconditionFailure, PreconditionItemSupport,
     PreconditionSupportReport,
