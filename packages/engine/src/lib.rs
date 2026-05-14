@@ -23,7 +23,11 @@ pub(crate) mod storage;
 #[cfg(feature = "storage-benches")]
 pub mod storage_bench;
 #[allow(dead_code, unused_imports)]
+#[cfg(not(feature = "storage-benches"))]
 pub(crate) mod storage_v2;
+#[allow(dead_code, unused_imports)]
+#[cfg(feature = "storage-benches")]
+pub mod storage_v2;
 #[cfg_attr(feature = "storage-benches", allow(dead_code))]
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) mod test_support;
