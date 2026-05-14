@@ -291,17 +291,17 @@ impl SessionContext {
     /// Executes one DataFusion SQL statement against this Lix session.
     ///
     /// The SQL dialect is DataFusion SQL, not SQLite SQL. Positional
-    /// placeholders use `$1`, `$2`, and so on. SQLite-specific catalog tables
+    /// placeholders use `?` or `$1`, `$2`, and so on. SQLite-specific catalog tables
     /// and transaction statements such as `sqlite_master`, `BEGIN`, and
     /// `COMMIT` are not part of this contract; use `information_schema` for
     /// catalog inspection. Lix owns transaction boundaries for each statement.
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
         let _transaction_guard = self.reserve_session_transaction()?;
-        let kind = sql2::classify_statement(sql)?;
+        let statement = sql2::parse_statement(sql)?;
+        let kind = sql2::classify_datafusion_statement(&statement);
         if kind == sql2::SqlStatementKind::Write {
-            let sql = sql.to_string();
-            let sql_for_error = sql.clone();
+            let sql_for_error = sql.to_string();
             let params = params.to_vec();
             return self
                 .with_write_transaction_reserved(|transaction| {
@@ -309,7 +309,9 @@ impl SessionContext {
                         // Re-plan against the transaction-backed write
                         // session so provider hooks read and stage through the
                         // transaction-owned SQL write context.
-                        let tx_plan = sql2::create_write_logical_plan(transaction, &sql).await?;
+                        let tx_plan =
+                            sql2::create_write_logical_plan_from_parsed(transaction, statement)
+                                .await?;
                         let result = sql2::execute_logical_plan(tx_plan, &params).await?;
                         let affected_rows = affected_rows_from_query_result(result)?;
                         Ok(ExecuteResult::from_rows_affected(affected_rows))
@@ -348,7 +350,7 @@ impl SessionContext {
                 functions: functions.clone(),
             };
 
-            let plan = sql2::create_logical_plan(&ctx, sql).await?;
+            let plan = sql2::create_logical_plan_from_parsed(&ctx, sql, statement).await?;
             let result = sql2::execute_logical_plan(plan, params).await?;
             drop(ctx);
             drop(live_state);
@@ -403,16 +405,23 @@ impl SessionTransaction {
         sql: &str,
         params: &[Value],
     ) -> Result<ExecuteResult, LixError> {
-        let kind = sql2::classify_statement(sql)?;
+        let statement = sql2::parse_statement(sql)?;
+        let kind = sql2::classify_datafusion_statement(&statement);
         let transaction = self.transaction_mut()?;
         match kind {
-            sql2::SqlStatementKind::Write => execute_transaction_write(transaction, sql, params)
-                .await
-                .map_err(|error| normalize_sql_surface_error(error, sql)),
-            sql2::SqlStatementKind::Read => {
-                let plan = sql2::create_transaction_read_logical_plan(transaction, sql)
+            sql2::SqlStatementKind::Write => {
+                execute_transaction_write(transaction, statement, params)
                     .await
-                    .map_err(|error| normalize_sql_surface_error(error, sql))?;
+                    .map_err(|error| normalize_sql_surface_error(error, sql))
+            }
+            sql2::SqlStatementKind::Read => {
+                let plan = sql2::create_transaction_read_logical_plan_from_parsed(
+                    transaction,
+                    sql,
+                    statement,
+                )
+                .await
+                .map_err(|error| normalize_sql_surface_error(error, sql))?;
                 let result = sql2::execute_logical_plan(plan, params)
                     .await
                     .map_err(|error| normalize_sql_surface_error(error, sql))?;
@@ -428,10 +437,10 @@ impl SessionTransaction {
 
 async fn execute_transaction_write(
     transaction: &mut crate::transaction::Transaction,
-    sql: &str,
+    statement: datafusion::sql::parser::Statement,
     params: &[Value],
 ) -> Result<ExecuteResult, LixError> {
-    let tx_plan = sql2::create_write_logical_plan(transaction, sql).await?;
+    let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
     let result = sql2::execute_logical_plan(tx_plan, params).await?;
     let affected_rows = affected_rows_from_query_result(result)?;
     Ok(ExecuteResult::from_rows_affected(affected_rows))

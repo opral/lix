@@ -1,10 +1,9 @@
 use datafusion::logical_expr::{LogicalPlan, WriteOp};
+use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
     Assignment, AssignmentTarget, Delete, FromTable, ObjectName, Statement, TableFactor,
     TableObject, TableWithJoins, Update,
 };
-use datafusion::sql::sqlparser::dialect::GenericDialect;
-use datafusion::sql::sqlparser::parser::Parser;
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
@@ -30,18 +29,25 @@ impl DmlOperation {
     }
 }
 
-pub(crate) fn validate_sql(sql: &str, visible_schemas: &[JsonValue]) -> Result<(), LixError> {
-    let statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| {
-        LixError::new(
-            LixError::CODE_PARSE_ERROR,
-            format!("sql2 SQL parse error: {error}"),
-        )
-    })?;
-    let [statement] = statements.as_slice() else {
-        return Ok(());
-    };
+pub(crate) fn validate_datafusion_statement(
+    statement: &DataFusionStatement,
+    visible_schemas: &[JsonValue],
+) -> Result<(), LixError> {
     let contracts = PublicTableContracts::new(visible_schemas)?;
-    validate_statement(statement, &contracts)
+    validate_datafusion_statement_with_contracts(statement, &contracts)
+}
+
+fn validate_datafusion_statement_with_contracts(
+    statement: &DataFusionStatement,
+    contracts: &PublicTableContracts,
+) -> Result<(), LixError> {
+    match statement {
+        DataFusionStatement::Statement(statement) => validate_statement(statement, contracts),
+        DataFusionStatement::Explain(explain) => {
+            validate_datafusion_statement_with_contracts(explain.statement.as_ref(), contracts)
+        }
+        _ => Ok(()),
+    }
 }
 
 pub(crate) fn validate_plan(
