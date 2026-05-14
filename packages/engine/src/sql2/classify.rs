@@ -3,8 +3,6 @@ use datafusion::sql::sqlparser::ast::{
     FromTable, ObjectName, Query, SetExpr, Statement as SqlStatement, TableFactor, TableObject,
     TableWithJoins,
 };
-use datafusion::sql::sqlparser::dialect::GenericDialect;
-use datafusion::sql::sqlparser::parser::Parser;
 
 use crate::LixError;
 
@@ -15,35 +13,31 @@ pub(crate) enum SqlStatementKind {
     Other,
 }
 
-pub(crate) fn classify_statement(sql: &str) -> Result<SqlStatementKind, LixError> {
-    let statements = parse_sql_statements(sql)?;
-    let [statement] = statements.as_slice() else {
-        return Ok(SqlStatementKind::Other);
-    };
-    Ok(classify_ast_statement(statement))
-}
-
-pub(crate) fn validate_supported_statement_ast(sql: &str) -> Result<(), LixError> {
-    let statements = parse_sql_statements(sql)?;
-    let [statement] = statements.as_slice() else {
-        return Err(unsupported_sql_error(
-            "Lix SQL only supports one statement per execute() call",
-        ));
-    };
-    validate_supported_ast_statement(statement)
-}
-
 pub(crate) fn validate_supported_datafusion_statement_ast(
     statement: &DataFusionStatement,
 ) -> Result<(), LixError> {
     match statement {
         DataFusionStatement::Statement(statement) => validate_supported_ast_statement(statement),
         DataFusionStatement::Explain(explain) => {
+            if classify_datafusion_statement(explain.statement.as_ref()) == SqlStatementKind::Write
+            {
+                return Err(unsupported_sql_error(
+                    "EXPLAIN of write statements is not supported by Lix SQL",
+                ));
+            }
             validate_supported_datafusion_statement_ast(explain.statement.as_ref())
         }
         _ => Err(unsupported_sql_error(format!(
             "SQL statement is not supported by Lix SQL: {statement}"
         ))),
+    }
+}
+
+pub(crate) fn classify_datafusion_statement(statement: &DataFusionStatement) -> SqlStatementKind {
+    match statement {
+        DataFusionStatement::Statement(statement) => classify_ast_statement(statement),
+        DataFusionStatement::Explain(_) => SqlStatementKind::Read,
+        _ => SqlStatementKind::Other,
     }
 }
 
@@ -53,15 +47,6 @@ pub(crate) fn datafusion_statement_dml_target_table_names(
     let mut targets = Vec::new();
     collect_datafusion_statement_dml_target_table_names(statement, &mut targets);
     targets
-}
-
-fn parse_sql_statements(sql: &str) -> Result<Vec<SqlStatement>, LixError> {
-    Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| {
-        LixError::new(
-            LixError::CODE_PARSE_ERROR,
-            format!("sql2 SQL parse error: {error}"),
-        )
-    })
 }
 
 fn collect_datafusion_statement_dml_target_table_names(
@@ -133,7 +118,7 @@ fn classify_ast_statement(statement: &SqlStatement) -> SqlStatementKind {
             SqlStatementKind::Write
         }
         SqlStatement::Query(_) => SqlStatementKind::Read,
-        SqlStatement::Explain { statement, .. } => classify_ast_statement(statement.as_ref()),
+        SqlStatement::Explain { .. } => SqlStatementKind::Read,
         _ => SqlStatementKind::Other,
     }
 }
@@ -142,7 +127,14 @@ fn validate_supported_ast_statement(statement: &SqlStatement) -> Result<(), LixE
     match statement {
         SqlStatement::Query(query) => validate_supported_query(query),
         SqlStatement::Insert(_) | SqlStatement::Update(_) | SqlStatement::Delete(_) => Ok(()),
-        SqlStatement::Explain { statement, .. } => validate_supported_ast_statement(statement),
+        SqlStatement::Explain { statement, .. } => {
+            if classify_ast_statement(statement.as_ref()) == SqlStatementKind::Write {
+                return Err(unsupported_sql_error(
+                    "EXPLAIN of write statements is not supported by Lix SQL",
+                ));
+            }
+            validate_supported_ast_statement(statement)
+        }
         _ => Err(unsupported_sql_error(format!(
             "SQL statement is not supported by Lix SQL: {statement}"
         ))),
