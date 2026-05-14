@@ -254,7 +254,7 @@ mod tests {
 
         assert_eq!(
             read.backend_read().get_many_keys.borrow().as_slice(),
-            &[key("a"), key("b"), key("missing")]
+            &[key("b"), key("a"), key("missing")]
         );
         assert_eq!(
             slots.into_iter().map(|slot| slot.key).collect::<Vec<_>>(),

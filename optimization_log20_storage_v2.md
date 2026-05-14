@@ -353,3 +353,80 @@ Remaining target:
   fuse validate + stats + lower, or replace duplicate validation with an
   expected O(K) strategy.
 ```
+
+### 2026-05-14: Hash-Based Point Read Reconstruction
+
+Change:
+
+```text
+get_many_caller_order_with_stats() now uses:
+
+  HashSet + Vec for first-seen unique backend keys
+  HashMap for found backend entries
+  preallocated Vec<PointSlot> for caller-order reconstruction
+
+The previous implementation used:
+
+  BTreeSet for dedupe
+  BTreeMap for found entries
+  collect() for output slots
+```
+
+Semantic note:
+
+```text
+The storage adapter no longer sorts backend get_many keys as an accidental
+side effect of BTreeSet. It sends unique backend keys in first-seen caller
+order. Storage still reconstructs the final result in exact caller order with
+duplicates and missing slots preserved.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2
+```
+
+Point-read scorecard:
+
+| Case                   | Previous Mean |  New Mean | Criterion Change |
+| ---------------------- | ------------: | --------: | ---------------: |
+| `m100_u100`            |     7.8403 us | 5.9119 us |   23.987% faster |
+| `m1000_u1000`          |     96.331 us | 64.843 us |   31.720% faster |
+| `m1000_u100`           |     64.128 us | 35.089 us |   44.821% faster |
+| `m10000_u100`          |     687.71 us | 317.81 us |   53.705% faster |
+| `m1000_u100_missing10` |     59.064 us | 34.251 us |   42.175% faster |
+| `m1000_u100_missing90` |     50.114 us | 27.673 us |   44.002% faster |
+
+Other scorecard notes:
+
+```text
+Write-set cases were unchanged apart from noise, as expected.
+Prefix scan cases were unchanged apart from noise, as expected.
+ConformanceBackend get_many_m1000_u100 did not show a significant change,
+which suggests that the current correctness/reference in-memory backend costs
+still dominate that group.
+
+ConformanceBackend commit/scan showed regressions in this run, but those paths
+do not use the point-read adapter and should be treated as run-to-run variance
+until reproduced by a targeted profile.
+```
+
+Complexity impact:
+
+```text
+Before:
+  dedupe: BTreeSet, O(M log U)
+  found map: BTreeMap, O(F log F)
+  reconstruct: O(M log F)
+
+After:
+  dedupe: HashSet + Vec, O(M) expected
+  found map: HashMap, O(F) expected
+  reconstruct: O(M) expected
+
+Target shape:
+  O(M + U + F) expected
+```

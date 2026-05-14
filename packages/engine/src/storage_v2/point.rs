@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{HashMap, HashSet};
 
 use crate::backend_v2::{BackendError, BackendRead, GetOptions, Key, ProjectedValue, SpaceId};
 use crate::storage_v2::{StorageReadResult, StorageReadStats};
@@ -30,23 +30,28 @@ pub(crate) fn get_many_caller_order_with_stats<R>(
 where
     R: BackendRead,
 {
-    let unique_keys = keys.iter().cloned().collect::<BTreeSet<_>>();
-    let backend_keys = unique_keys.iter().cloned().collect::<Vec<_>>();
-    let result = read.get_many(space, &backend_keys, opts)?;
-    let found = result
-        .entries
-        .entries
-        .into_iter()
-        .map(|entry| (entry.key, entry.value))
-        .collect::<BTreeMap<_, _>>();
+    let mut seen = HashSet::with_capacity(keys.len());
+    let mut backend_keys = Vec::with_capacity(keys.len());
+    for key in keys {
+        if seen.insert(key.clone()) {
+            backend_keys.push(key.clone());
+        }
+    }
 
-    let slots = keys
-        .iter()
-        .map(|key| PointSlot {
+    let result = read.get_many(space, &backend_keys, opts)?;
+
+    let mut found = HashMap::with_capacity(result.entries.entries.len());
+    for entry in result.entries.entries {
+        found.insert(entry.key, entry.value);
+    }
+
+    let mut slots = Vec::with_capacity(keys.len());
+    for key in keys {
+        slots.push(PointSlot {
             key: key.clone(),
             value: found.get(key).cloned(),
-        })
-        .collect();
+        });
+    }
 
     Ok(StorageReadResult::new(
         slots,
