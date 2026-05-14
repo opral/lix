@@ -3020,6 +3020,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
+ "bytes",
  "cel",
  "chrono",
  "codspeed-criterion-compat",

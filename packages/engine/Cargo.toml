@@ -68,6 +68,7 @@ blake3 = "1"
 fastcdc = "3"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 base64 = "0.22"
+bytes = "1"
 
 [dev-dependencies]
 criterion = { package = "codspeed-criterion-compat", version = "*" }

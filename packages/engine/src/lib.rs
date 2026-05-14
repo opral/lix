@@ -1,4 +1,5 @@
 mod backend;
+pub mod backend_v2;
 mod binary_cas;
 pub(crate) mod catalog;
 pub(crate) mod cel;
