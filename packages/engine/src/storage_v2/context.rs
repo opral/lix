@@ -128,3 +128,237 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod shape_tests {
+    use std::cell::{Cell, RefCell};
+    use std::ops::Bound;
+    use std::rc::Rc;
+
+    use bytes::Bytes;
+
+    use crate::backend_v2::{
+        Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
+        GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, PutBatch, ReadBatch, ReadEntry,
+        ReadOptions, ScanOptions, ScanPage, SpaceId, StoredValue, WriteConcurrency, WriteOptions,
+        WriteStats,
+    };
+    use crate::storage_v2::{StorageContext, StorageReadScope, StorageReader, StorageSpace};
+
+    #[test]
+    fn write_set_across_g_spaces_lowers_to_g_put_many_calls_and_one_commit() {
+        let backend = CountingBackend::default();
+        let storage = StorageContext::new(backend.clone());
+        let mut writes = storage.new_write_set();
+        writes.stage_put(space(1), key("a"), value("A"));
+        writes.stage_put(space(2), key("a"), value("B"));
+        writes.stage_put(space(3), key("a"), value("C"));
+
+        storage
+            .commit_write_set(writes, WriteOptions::default())
+            .expect("commit write set");
+
+        assert_eq!(backend.state.begin_write_calls.get(), 1);
+        assert_eq!(backend.state.commit_calls.get(), 1);
+        assert_eq!(backend.state.put_batches.borrow().len(), 3);
+        assert_eq!(
+            backend
+                .state
+                .put_batches
+                .borrow()
+                .iter()
+                .map(|(space, keys)| (*space, keys.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (SpaceId(1), vec![key("a")]),
+                (SpaceId(2), vec![key("a")]),
+                (SpaceId(3), vec![key("a")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn point_read_m_requested_u_unique_sends_u_backend_keys() {
+        let read = SpyRead::default();
+        let scope = StorageReadScope::new(read.clone());
+
+        let slots = scope
+            .get_many_caller_order(
+                space(1),
+                &[key("b"), key("a"), key("b"), key("missing"), key("a")],
+                GetOptions::default(),
+            )
+            .expect("point read");
+
+        assert_eq!(
+            read.get_many_keys.borrow().clone(),
+            vec![key("a"), key("b"), key("missing")]
+        );
+        assert_eq!(
+            slots
+                .iter()
+                .map(|slot| slot.key.clone())
+                .collect::<Vec<_>>(),
+            vec![key("b"), key("a"), key("b"), key("missing"), key("a")]
+        );
+    }
+
+    #[test]
+    fn prefix_scan_calls_scan_range_once() {
+        let read = SpyRead::default();
+        let scope = StorageReadScope::new(read.clone());
+
+        scope
+            .scan_prefix(
+                space(1),
+                crate::backend_v2::Prefix {
+                    bytes: Bytes::from_static(b"a"),
+                },
+                ScanOptions::default(),
+            )
+            .expect("prefix scan");
+
+        assert_eq!(read.scan_range_calls.get(), 1);
+        assert_eq!(
+            read.scan_range.borrow().clone(),
+            Some(KeyRange {
+                lower: Bound::Included(key("a")),
+                upper: Bound::Excluded(key("b")),
+            })
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct CountingBackend {
+        state: Rc<CountingState>,
+    }
+
+    #[derive(Default)]
+    struct CountingState {
+        begin_write_calls: Cell<u64>,
+        commit_calls: Cell<u64>,
+        put_batches: RefCell<Vec<(SpaceId, Vec<Key>)>>,
+    }
+
+    struct CountingWrite {
+        state: Rc<CountingState>,
+        put_batches: Vec<(SpaceId, Vec<Key>)>,
+    }
+
+    impl Backend for CountingBackend {
+        type Read<'a>
+            = SpyRead
+        where
+            Self: 'a;
+
+        type Write<'a>
+            = CountingWrite
+        where
+            Self: 'a;
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::v0(WriteConcurrency::SingleWriter)
+        }
+
+        fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
+            Ok(SpyRead::default())
+        }
+
+        fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
+            self.state
+                .begin_write_calls
+                .set(self.state.begin_write_calls.get() + 1);
+            Ok(CountingWrite {
+                state: Rc::clone(&self.state),
+                put_batches: Vec::new(),
+            })
+        }
+    }
+
+    impl BackendWrite for CountingWrite {
+        fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+            self.put_batches.push((
+                space,
+                entries.entries.into_iter().map(|entry| entry.key).collect(),
+            ));
+            Ok(())
+        }
+
+        fn delete_many(&mut self, _space: SpaceId, _keys: &[Key]) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn commit(self) -> Result<CommitResult, BackendError> {
+            self.state
+                .commit_calls
+                .set(self.state.commit_calls.get() + 1);
+            self.state.put_batches.borrow_mut().extend(self.put_batches);
+            Ok(CommitResult {
+                commit_id: None,
+                stats: WriteStats::default(),
+            })
+        }
+
+        fn rollback(self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct SpyRead {
+        get_many_keys: Rc<RefCell<Vec<Key>>>,
+        scan_range_calls: Rc<Cell<u64>>,
+        scan_range: Rc<RefCell<Option<KeyRange>>>,
+    }
+
+    impl BackendRead for SpyRead {
+        fn get_many(
+            &self,
+            _space: SpaceId,
+            keys: &[Key],
+            _opts: GetOptions<'_>,
+        ) -> Result<GetManyResult, BackendError> {
+            self.get_many_keys.replace(keys.to_vec());
+            Ok(GetManyResult {
+                entries: ReadBatch {
+                    entries: keys
+                        .iter()
+                        .filter(|key| key.0.as_ref() != b"missing")
+                        .map(|key| ReadEntry {
+                            key: key.clone(),
+                            value: ProjectedValue::FullValue(key.0.clone()),
+                        })
+                        .collect(),
+                },
+            })
+        }
+
+        fn scan_range(
+            &self,
+            _space: SpaceId,
+            range: KeyRange,
+            _opts: ScanOptions<'_>,
+        ) -> Result<ScanPage, BackendError> {
+            self.scan_range_calls.set(self.scan_range_calls.get() + 1);
+            self.scan_range.replace(Some(range));
+            Ok(ScanPage {
+                entries: ReadBatch::default(),
+                has_more: false,
+            })
+        }
+    }
+
+    fn space(id: u32) -> StorageSpace {
+        StorageSpace::new(SpaceId(id), "shape.test.space")
+    }
+
+    fn key(bytes: &'static str) -> Key {
+        Key(Bytes::from_static(bytes.as_bytes()))
+    }
+
+    fn value(bytes: &'static str) -> StoredValue {
+        StoredValue {
+            bytes: Bytes::from_static(bytes.as_bytes()),
+        }
+    }
+}
