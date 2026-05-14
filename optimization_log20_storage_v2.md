@@ -268,3 +268,88 @@ commit_puts: O(K log N) plus one atomic publication step
 - The `ConformanceBackend` group is the first in-memory end-to-end reference:
   it includes `BTreeMap` backend behavior and snapshot cloning, so it should be
   read separately from the fake-backend adapter-only groups.
+
+## Optimization Entries
+
+### 2026-05-14: Remove Duplicate Commit Validation
+
+Change:
+
+```text
+StorageWriteSet::commit() now validates once before opening BackendWrite,
+then lowers through an internal lower_validated_into() path.
+
+StorageWriteSet::lower_into() still validates for direct callers.
+```
+
+Why:
+
+```text
+The previous commit path validated twice:
+
+  commit()
+    validate()
+    lower_into()
+      validate()
+
+This added a second O(K log K) duplicate-detection pass. The first attempted
+patch removed the commit-side validation entirely, but tests caught that this
+opened BackendWrite before rejecting invalid write sets. The final patch keeps
+the pre-open validation invariant while removing the duplicate pass.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2
+```
+
+Write-set scorecard:
+
+| Case                       | Baseline Mean |  New Mean | Criterion Change |
+| -------------------------- | ------------: | --------: | ---------------: |
+| `puts_k128_g1_v32`         |     14.157 us | 9.0113 us |   36.295% faster |
+| `puts_k1024_g1_v32`        |     165.55 us | 97.211 us |   41.334% faster |
+| `puts_k1024_g16_v32`       |     121.41 us | 75.632 us |   40.709% faster |
+| `puts_k8192_g16_v32`       |     1.3470 ms | 809.60 us |   40.026% faster |
+| `puts_k1024_g64_v32`       |     100.53 us | 65.529 us |   34.365% faster |
+| `puts_k4096_g256_v32`      |     500.54 us | 305.77 us |   41.780% faster |
+| `deletes_k1024_g16`        |     121.41 us | 73.754 us |   39.530% faster |
+| `mixed80_20_k1024_g16_v32` |     115.28 us | 70.281 us |   37.419% faster |
+| `puts_k1024_g16_v1024`     |     128.57 us | 82.878 us |   35.268% faster |
+| `puts_k1024_g16_v65536`    |     492.47 us | 435.13 us |   13.489% faster |
+
+ConformanceBackend write-path scorecard:
+
+| Case                        | Baseline Mean |  New Mean | Criterion Change |
+| --------------------------- | ------------: | --------: | ---------------: |
+| `commit_puts_k1024_g16_v32` |     170.02 us | 125.36 us |   28.777% faster |
+
+Read/prefix notes:
+
+```text
+Point-read and prefix-scan cases showed only noise or unrelated variance.
+This patch should affect write-set commit paths only.
+```
+
+Complexity impact:
+
+```text
+Before:
+  commit validate: O(K log K)
+  lower_into validate: O(K log K)
+  stats: O(K)
+  lower: O(K + G)
+
+After:
+  commit validate: O(K log K)
+  lower_into internal path: no second validation
+  stats: O(K)
+  lower: O(K + G)
+
+Remaining target:
+  fuse validate + stats + lower, or replace duplicate validation with an
+  expected O(K) strategy.
+```

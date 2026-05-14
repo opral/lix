@@ -123,6 +123,16 @@ impl StorageWriteSet {
         W: BackendWrite,
     {
         self.validate()?;
+        self.lower_validated_into(write)
+    }
+
+    fn lower_validated_into<W>(
+        self,
+        write: &mut W,
+    ) -> Result<StorageWriteSetStats, StorageWriteSetError>
+    where
+        W: BackendWrite,
+    {
         let mut stats = self.stats();
 
         for group in self.groups.into_values() {
@@ -162,7 +172,7 @@ impl StorageWriteSet {
         let mut write = backend
             .begin_write(opts)
             .map_err(StorageWriteSetError::Backend)?;
-        let stats = match self.lower_into(&mut write) {
+        let stats = match self.lower_validated_into(&mut write) {
             Ok(stats) => stats,
             Err(error) => {
                 let _ = write.rollback();
