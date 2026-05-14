@@ -4,9 +4,11 @@
 
 It is not the public persistence plugin API. Most users should bring their own
 backend. `storage_v2` exists so Lix domain stores can share transactions,
-write batching, spaces, prefix lowering, caller-order reconstruction, cursor
-wrapping, capability-aware lowering, fallback accounting, and other
-domain-neutral storage mechanics.
+write batching, spaces, prefix lowering, caller-order reconstruction, and other
+domain-neutral storage mechanics. Cursor wrapping, capability-aware lowering,
+fallback accounting, residual filtering loops, and projection/delete-range
+fallbacks are planned optimization-hardening work, not implemented baseline
+behavior yet.
 
 ## Layering
 
@@ -29,10 +31,13 @@ Domain stores
 Generic storage adapter: storage_v2
   write sets
   read/write scopes
-  namespace/space registration
+  named space declarations
   batching helpers
   prefix-to-range lowering
   caller-order point reconstruction
+  write-set stats
+
+Planned storage_v2 optimization extensions:
   storage cursor tokens
   capability-aware lowering
   projection fallback
@@ -96,17 +101,24 @@ write set aggregation across domain stores
 conversion from storage write sets to backend PutBatch/delete_many calls
 
 read transaction wrapper
-write transaction wrapper
 read scopes shared by multiple domain stores
-namespace/space registration
+named space declarations
 caller-order point reconstruction
 duplicate requested-key handling
 prefix-to-range lowering
+write-set stats
+baseline storage adapter conformance
+```
+
+Planned storage_v2 optimization-hardening responsibilities:
+
+```text
 storage cursor token construction and validation
+read-side stats and fallback stats
 capability-aware lowering helpers
 limit-after-residual scan loops
-fallback stats
-shared projection/envelope helpers, only when domain-neutral
+projection/envelope helpers, only when domain-neutral
+delete_range/precondition fallback safety gates
 ```
 
 The current engine already has this shape:
@@ -167,8 +179,10 @@ schema.
 `backend_v2` uses numeric `SpaceId`.
 
 Domain stores should not hand-roll numeric `SpaceId` values. `storage_v2` should
-provide a small registry or declaration mechanism so spaces are stable and easy
-to audit.
+provide declaration helpers so spaces are stable and easy to audit. The current
+implementation has named `StorageSpace` declarations and validates conflicting
+same-id/different-name declarations inside a `StorageWriteSet`; it does not have
+a global runtime registry yet.
 
 Example shape:
 
@@ -184,7 +198,7 @@ pub const TRACKED_STATE_CHUNK_SPACE: StorageSpace = StorageSpace {
 };
 ```
 
-Space names are for diagnostics and registration. Backends see only `SpaceId`.
+Space names are for diagnostics and validation. Backends see only `SpaceId`.
 
 Open question: whether space definitions live centrally in `storage_v2/spaces.rs`
 or next to each domain store and are registered centrally. Prefer the second if
@@ -411,6 +425,8 @@ lowering.
 Storage cursors:
 
 ```text
+planned, not implemented yet
+
 public cursor token binds:
   read scope / snapshot identity
   space
@@ -501,6 +517,10 @@ recorded in stats.
 For operations whose contract is "no payload physical I/O," storage must require
 native envelope projection or reject the operation. Projection fallback preserves
 correctness, but it changes the physical I/O cost and must be reported.
+
+This section describes planned envelope/projection hardening. The current
+storage_v2 baseline exposes only backend core projections (`FullValue` and
+`KeyOnly`) and has no envelope fallback API yet.
 
 ## Complexity Contract
 
@@ -638,7 +658,7 @@ backend_v2 owns atomic persistence.
 
 Storage v2 stats should make the complexity contract observable.
 
-Write-set stats:
+Implemented write-set stats:
 
 ```rust
 pub struct StorageWriteSetStats {
@@ -652,7 +672,7 @@ pub struct StorageWriteSetStats {
 }
 ```
 
-Fallback stats:
+Planned fallback stats:
 
 ```rust
 pub enum FallbackKind {
@@ -666,7 +686,7 @@ pub enum FallbackKind {
 }
 ```
 
-Stats should answer questions such as:
+Future read/fallback stats should answer questions such as:
 
 ```text
 Did this scan hydrate payload bytes?
@@ -680,14 +700,40 @@ Was delete_range native or scan-and-delete fallback?
 Backend conformance proves backend correctness. Storage adapter tests should
 prove storage_v2 preserves batching and complexity boundaries.
 
-Use a counting backend for these tests.
+The current code has an internal storage conformance runner over
+`ConformanceBackend`, plus focused counting-backend unit tests for write-set
+batching and failure behavior.
 
-Required storage_v2 test themes:
+Implemented storage_v2 test themes:
 
 ```text
 write_set_batches_by_space:
   K puts across G spaces lowers to G put_many calls and one commit
 
+caller_order_reconstruction:
+  backend returns found entries for unique keys; storage reconstructs requested
+  slots, duplicate keys, and duplicate missing keys
+
+prefix_lowering:
+  empty prefix, normal prefix, and all-0xff prefix lower to correct ranges
+
+read_scope_pinning:
+  one StorageReadScope keeps observing its opened backend read view across later
+  commits
+
+named_space_validation:
+  same SpaceId with different StorageSpace names is rejected before opening a
+  backend write
+
+write_lifecycle_failures:
+  duplicate/conflicting write-set validation happens before begin_write; lower
+  failures roll back once; commit failures are reported without pretending
+  success
+```
+
+Planned optimization-hardening test themes:
+
+```text
 cross_domain_write_aggregation:
   tracked_state, commit_store, json_store, and visibility-style staged writes
   lower through one BackendWrite and one commit
@@ -705,13 +751,6 @@ projection_fallback_accounting:
 
 payload_hydration_guard:
   operations that should inspect only headers/refs report zero payload bytes
-
-caller_order_reconstruction:
-  backend returns found entries for unique keys; storage reconstructs requested
-  slots, duplicate keys, and duplicate missing keys
-
-prefix_lowering:
-  empty prefix, normal prefix, and all-0xff prefix lower to correct ranges
 
 storage_cursor_scope:
   public cursors reject changed read scope, space, range/prefix, projection, and
@@ -733,10 +772,20 @@ packages/engine/src/storage_v2/
   spaces.rs
   write_set.rs
   read_scope.rs
+  reader.rs
+  point.rs
+  scan.rs
+  stats.rs
+  conformance.rs
+```
+
+Planned files once the optimization extensions land:
+
+```text
+packages/engine/src/storage_v2/
   cursor.rs
   lowering.rs
   envelope.rs
-  stats.rs
 ```
 
 Purpose:
@@ -756,6 +805,18 @@ write_set.rs:
 
 read_scope.rs:
   shared read transaction/scope helpers
+
+reader.rs:
+  StorageReader trait over a shared read scope
+
+point.rs:
+  caller-order point reconstruction and requested-key dedupe
+
+scan.rs:
+  prefix lowering and scan helper mechanics
+
+conformance.rs:
+  internal baseline storage adapter conformance tests
 
 cursor.rs:
   storage cursor token encoding, scope validation, and last-key resume state
