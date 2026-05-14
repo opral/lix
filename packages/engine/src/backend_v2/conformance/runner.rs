@@ -1,5 +1,5 @@
 use crate::backend_v2::conformance::{
-    baseline, model_based, projection, pushdown, scan, write, BackendFactory,
+    baseline, model_based, persistence, projection, pushdown, scan, write, BackendFactory,
 };
 
 pub type ConformanceResult = Result<(), String>;
@@ -30,6 +30,9 @@ where
 
     baseline::register(&mut report, factory);
     model_based::register(&mut report, factory);
+    if !factory.config().ephemeral {
+        persistence::register(&mut report, factory);
+    }
     scan::register(&mut report, factory);
     write::register(&mut report, factory);
     projection::register(&mut report, factory);
@@ -60,18 +63,28 @@ impl ConformanceReport {
             .filter(|test| matches!(test.status, ConformanceStatus::Failed(_)))
     }
 
+    pub fn pending(&self) -> impl Iterator<Item = &ConformanceTest> {
+        self.tests
+            .iter()
+            .filter(|test| matches!(test.status, ConformanceStatus::Pending))
+    }
+
     pub fn assert_no_failures(&self) {
-        let failures = self
+        let problems = self
             .failed()
             .map(|test| match &test.status {
                 ConformanceStatus::Failed(error) => format!("{}: {error}", test.name),
                 _ => unreachable!("failed iterator only returns failed tests"),
             })
+            .chain(
+                self.pending()
+                    .map(|test| format!("{}: pending capability conformance", test.name)),
+            )
             .collect::<Vec<_>>();
         assert!(
-            failures.is_empty(),
-            "backend conformance failures:\n{}",
-            failures.join("\n")
+            problems.is_empty(),
+            "backend conformance problems:\n{}",
+            problems.join("\n")
         );
     }
 }

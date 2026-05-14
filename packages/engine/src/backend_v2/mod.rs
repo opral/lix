@@ -19,14 +19,12 @@ pub use error::{
     PreconditionSupportReport,
 };
 pub use predicate::{
-    BackendPredicate, HeaderFieldId, HeaderPredicate, KeyPredicate, LimitSupport, OrderSupport,
-    PredicateExpr, PredicateId, PredicatePushdown, PredicateSupportLevel, ProjectionSupport,
-    ReadSupport, RefKind, RefsPredicate, ScalarValue, Support,
+    BackendPredicate, HeaderFieldId, HeaderPredicate, KeyPredicate, PredicateExpr, PredicateId,
+    PredicateSupportLevel, RefKind, RefsPredicate, ScalarValue, Support,
 };
 pub use traits::{Backend, BackendRead, BackendWrite};
 pub use types::{
-    CommitResult, Cursor, Durability, GetManyResult, GetOptions, GetSlot, Key, KeyRange,
-    PointOrder, Prefix, ProjectedValue, PutBatch, PutEntry, ReadBatch, ReadConsistency, ReadEntry,
-    ReadOptions, ReadStats, ScanDirection, ScanOptions, ScanPage, SnapshotRef, SpaceId,
-    StoredValue, Value, ValueProjection, WriteOptions, WriteStats,
+    CommitResult, CoreProjection, Durability, GetManyResult, GetOptions, Key, KeyRange, Prefix,
+    ProjectedValue, PutBatch, PutEntry, ReadBatch, ReadConsistency, ReadEntry, ReadOptions,
+    ScanOptions, ScanPage, SnapshotRef, SpaceId, StoredValue, Value, WriteOptions, WriteStats,
 };

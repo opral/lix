@@ -1,7 +1,6 @@
 use crate::backend_v2::{
-    BackendCapabilities, BackendError, Capability, CommitResult, GetManyResult, GetOptions, Key,
-    KeyRange, Precondition, PreconditionSupportReport, Prefix, PutBatch, ReadOptions, ScanOptions,
-    ScanPage, SpaceId, WriteOptions,
+    BackendCapabilities, BackendError, CommitResult, GetManyResult, GetOptions, Key, KeyRange,
+    PutBatch, ReadOptions, ScanOptions, ScanPage, SpaceId, WriteOptions,
 };
 
 pub trait Backend {
@@ -35,15 +34,6 @@ pub trait BackendRead {
         opts: ScanOptions<'_>,
     ) -> Result<ScanPage, BackendError>;
 
-    fn scan_prefix(
-        &self,
-        space: SpaceId,
-        prefix: Prefix,
-        opts: ScanOptions<'_>,
-    ) -> Result<ScanPage, BackendError> {
-        self.scan_range(space, prefix.to_range()?, opts)
-    }
-
     fn close(self) -> Result<(), BackendError>
     where
         Self: Sized,
@@ -52,23 +42,10 @@ pub trait BackendRead {
     }
 }
 
-pub trait BackendWrite: BackendRead {
+pub trait BackendWrite {
     fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError>;
 
     fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError>;
-
-    fn delete_range(&mut self, space: SpaceId, range: KeyRange) -> Result<(), BackendError> {
-        let _ = (space, range);
-        Err(BackendError::Unsupported(Capability::DeleteRange))
-    }
-
-    fn require(
-        &mut self,
-        preconditions: &[Precondition],
-    ) -> Result<PreconditionSupportReport, BackendError> {
-        let _ = preconditions;
-        Err(BackendError::Unsupported(Capability::Preconditions))
-    }
 
     fn commit(self) -> Result<CommitResult, BackendError>
     where
