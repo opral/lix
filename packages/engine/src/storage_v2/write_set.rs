@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
 use crate::backend_v2::{
@@ -94,23 +94,26 @@ impl StorageWriteSet {
             }
         }
 
-        let mut seen = BTreeSet::new();
+        let mut mutation_count = 0;
+        for group in self.groups.values() {
+            mutation_count += group.puts.len() + group.deletes.len();
+        }
+
+        let mut seen = HashSet::with_capacity(mutation_count);
         for group in self.groups.values() {
             for put in &group.puts {
-                let key = (group.space.id, put.key.clone());
-                if !seen.insert(key.clone()) {
+                if !seen.insert((group.space.id, put.key.clone())) {
                     return Err(StorageWriteSetError::DuplicateMutation {
                         space: group.space,
-                        key: key.1,
+                        key: put.key.clone(),
                     });
                 }
             }
             for delete in &group.deletes {
-                let key = (group.space.id, delete.clone());
-                if !seen.insert(key.clone()) {
+                if !seen.insert((group.space.id, delete.clone())) {
                     return Err(StorageWriteSetError::DuplicateMutation {
                         space: group.space,
-                        key: key.1,
+                        key: delete.clone(),
                     });
                 }
             }
@@ -133,10 +136,19 @@ impl StorageWriteSet {
     where
         W: BackendWrite,
     {
-        let mut stats = self.stats();
+        let mut stats = StorageWriteSetStats {
+            touched_spaces: self.groups.len() as u64,
+            ..StorageWriteSetStats::default()
+        };
 
         for group in self.groups.into_values() {
             if !group.puts.is_empty() {
+                stats.staged_puts += group.puts.len() as u64;
+                stats.written_bytes += group
+                    .puts
+                    .iter()
+                    .map(|entry| entry.value.bytes.len() as u64)
+                    .sum::<u64>();
                 stats.put_batches += 1;
                 stats.backend_calls += 1;
                 write
@@ -149,6 +161,7 @@ impl StorageWriteSet {
                     .map_err(StorageWriteSetError::Backend)?;
             }
             if !group.deletes.is_empty() {
+                stats.staged_deletes += group.deletes.len() as u64;
                 stats.delete_batches += 1;
                 stats.backend_calls += 1;
                 write
