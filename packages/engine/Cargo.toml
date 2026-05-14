@@ -42,6 +42,12 @@ path = "benches/json_pointer_physical/main.rs"
 harness = false
 required-features = ["storage-benches"]
 
+[[bench]]
+name = "storage_v2"
+path = "benches/storage_v2.rs"
+harness = false
+required-features = ["storage-benches"]
+
 [dependencies]
 async-trait = "0.1"
 cel = { version = "0.12.0", features = ["json"] }
