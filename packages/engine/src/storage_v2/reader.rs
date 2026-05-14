@@ -89,7 +89,10 @@ mod tests {
     }
 
     fn space(id: u32) -> StorageSpace {
-        StorageSpace::new(SpaceId(id))
+        match id {
+            1 => StorageSpace::new(SpaceId(1), "test.space.one"),
+            _ => StorageSpace::new(SpaceId(id), "test.space.other"),
+        }
     }
 
     #[derive(Default)]
