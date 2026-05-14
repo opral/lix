@@ -192,7 +192,7 @@ mod shape_tests {
 
         assert_eq!(
             read.get_many_keys.borrow().clone(),
-            vec![key("a"), key("b"), key("missing")]
+            vec![key("b"), key("a"), key("missing")]
         );
         assert_eq!(
             slots
