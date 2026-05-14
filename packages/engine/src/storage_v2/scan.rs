@@ -1,6 +1,7 @@
 use crate::backend_v2::{
     BackendError, BackendRead, Key, Prefix, ReadBatch, ScanOptions, ScanPage, SpaceId,
 };
+use crate::storage_v2::{StorageReadResult, StorageReadStats};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScanResumeKey {
@@ -28,13 +29,42 @@ pub(crate) fn scan_prefix<R>(
 where
     R: BackendRead,
 {
+    Ok(scan_prefix_with_stats(read, space, prefix, opts)?.value)
+}
+
+pub(crate) fn scan_prefix_with_stats<R>(
+    read: &R,
+    space: SpaceId,
+    prefix: Prefix,
+    opts: ScanOptions<'_>,
+) -> Result<StorageReadResult<ScanPage>, BackendError>
+where
+    R: BackendRead,
+{
     if opts.limit_rows == 0 {
-        return Ok(ScanPage {
-            entries: ReadBatch::default(),
-            has_more: false,
-        });
+        return Ok(StorageReadResult::new(
+            ScanPage {
+                entries: ReadBatch::default(),
+                has_more: false,
+            },
+            StorageReadStats {
+                requested_keys: 0,
+                unique_backend_keys: 0,
+                backend_calls: 0,
+                prefix_lowered: 1,
+            },
+        ));
     }
-    read.scan_range(space, prefix.to_range()?, opts)
+    let page = read.scan_range(space, prefix.to_range()?, opts)?;
+    Ok(StorageReadResult::new(
+        page,
+        StorageReadStats {
+            requested_keys: 0,
+            unique_backend_keys: 0,
+            backend_calls: 1,
+            prefix_lowered: 1,
+        },
+    ))
 }
 
 #[cfg(test)]
