@@ -13,6 +13,9 @@ mod spaces;
 mod stats;
 mod write_set;
 
+#[cfg(test)]
+mod conformance;
+
 pub use context::StorageContext;
 pub(crate) use point::get_many_caller_order;
 pub use point::PointSlot;
