@@ -375,7 +375,7 @@ function BackendLogos() {
   const backends = [
     { name: "SQLite", src: "https://cdn.simpleicons.org/sqlite/003B57" },
     { name: "Postgres", src: "https://cdn.simpleicons.org/postgresql/4169E1" },
-    { name: "S3", src: "https://cdn.simpleicons.org/amazons3/569A31" },
+    { name: "S3", src: "https://cdn.worldvectorlogo.com/logos/amazon-s3-simple-storage-service.svg" },
     { name: "Cloudflare Workers", src: "https://cdn.simpleicons.org/cloudflareworkers/F38020" },
     { name: "Supabase", src: "https://cdn.simpleicons.org/supabase/3FCF8E" },
   ];
@@ -474,7 +474,7 @@ function LangTabs() {
   );
 }
 
-function Hero() {
+export function V2Hero() {
   return (
     <section className={cn(sectionClass, "pt-16 lg:pt-20 lg:pb-16")}>
       <a
@@ -703,12 +703,12 @@ function GetStarted() {
   );
 }
 
-function V2Footer() {
+export function V2Footer() {
   return (
     <footer className={cn(fontMono, "mx-auto flex w-full max-w-[1280px] items-end justify-between gap-8 border-t border-[#e7e6e1] px-6 pb-12 pt-9 text-xs text-[#6b6b66] max-md:block lg:px-14 lg:pb-14")}>
       <div>
-        <LixLogo className="h-auto w-[26px] text-[#08b5d6]" />
-        <p>© 2026 Opral US Inc. · MIT · v0.6.0 (alpha)</p>
+        <LixLogo className="mb-2 h-auto w-[26px] text-[#08b5d6]" />
+        <p>© 2026 Opral US Inc.</p>
       </div>
       <nav className="flex flex-wrap justify-end gap-6 text-[13px] max-md:mt-7 max-md:justify-start max-md:gap-4" aria-label="V2 footer navigation">
         <a href="/docs/what-is-lix">docs</a>
@@ -725,7 +725,7 @@ export function V2LandingPage() {
   return (
     <div className={cn(fontSans, "bg-[#fafaf7] text-[#0a0a0a] tracking-[-0.005em] [font-feature-settings:'ss01','ss02','cv11']")}>
       <main>
-        <Hero />
+        <V2Hero />
         <StatsStrip />
         <WhyBuilt />
         <Inside />

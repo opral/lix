@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/opral/lix/main/assets/logo.svg" alt="Lix" height="60">
 </p>
 
-<h3 align="center">Embeddable version control system</h3>
+<h3 align="center">An embeddable version control system for AI agents</h3>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="weekly downloads on NPM"></a>
@@ -11,33 +11,23 @@
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
 </p>
 
-> [!NOTE]
->
-> **Lix is in alpha** · [Follow progress to v1.0 →](https://github.com/opral/lix/issues/374)
+Lix is an **embeddable version control system** you import as a library. Give agents branches, checkpoints, semantic diffs, rollback, immutable history, and SQL-queryable context without wrapping Git or managing repo internals.
 
----
+- **Runs in-process.** Import it as a library and run it inside your app. No daemon, no protocol.
+- **ACID transactions.** One transaction can cover state, blobs, and history.
+- **Semantic diffs.** Track XLSX rows, DOCX clauses, JSON properties, and more as entities.
+- **SQL interface.** Agents can query history and changes without rereading whole files.
+- **Bring your own backend.** Start in memory, then plug into SQLite, Postgres, S3, Cloudflare, or your own adapter.
 
-Lix is an **embeddable version control system for files of any format** (DOCX, XLSX, CAD, PDF, JSON) with semantic, per-entity diffs. Branches, merge, and an immutable change history, exposed as SQL, all in-process.
-
-Use it inside a contract editor, a feature-flag service, an artifact registry, an AI-agent platform, a versioned filesystem, or a domain-specific CLI.
-
-> Lix is to version control what DuckDB is to analytics: an embeddable engine with pluggable support for file formats.
-
-- **It's just a library.** `npm install`, import, run. No daemon, no protocol, no remote.
-- **Semantic per-entity diffs.** XLSX cells, DOCX clauses, CAD parts. Not line-by-line text.
-- **History is SQL.** Diffs, blame, and audit are direct queries against `lix_change`.
-
-The entity foundation ships today. A plugin API is on the [roadmap](#roadmap); once it lands, anyone can author a plugin that turns a file format (DOCX, XLSX, CAD, PDF, anything else) into entities.
-
-[How does Lix compare to Git? →](https://lix.dev/docs/comparison-to-git)
+<p><img src="https://cdn.simpleicons.org/sqlite/003B57" alt="SQLite" width="18" height="18" /> SQLite · <img src="https://cdn.simpleicons.org/postgresql/4169E1" alt="Postgres" width="18" height="18" /> Postgres · <img src="https://cdn.worldvectorlogo.com/logos/amazon-s3-simple-storage-service.svg" alt="S3" width="18" height="18" /> S3 · <img src="https://cdn.simpleicons.org/cloudflareworkers/F38020" alt="Cloudflare Workers" width="18" height="18" /> Cloudflare Workers · <img src="https://cdn.simpleicons.org/supabase/3FCF8E" alt="Supabase" width="18" height="18" /> Supabase</p>
 
 ## Getting started
 
 <p>
   <img src="https://cdn.simpleicons.org/javascript/F7DF1E" alt="JavaScript" width="18" height="18" /> JavaScript ·
-  <a href="https://github.com/opral/lix/issues/370"><img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/python/python-original.svg" alt="Python" width="18" height="18" /> Python</a> ·
+  <a href="https://github.com/opral/lix/issues/373"><img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/python/python-original.svg" alt="Python" width="18" height="18" /> Python</a> ·
   <a href="https://github.com/opral/lix/issues/371"><img src="https://cdn.simpleicons.org/rust/CE422B" alt="Rust" width="18" height="18" /> Rust</a> ·
-  <a href="https://github.com/opral/lix/issues/373"><img src="https://cdn.simpleicons.org/go/00ADD8" alt="Go" width="18" height="18" /> Go</a>
+  <a href="https://github.com/opral/lix/issues/370"><img src="https://cdn.simpleicons.org/go/00ADD8" alt="Go" width="18" height="18" /> Go</a>
 </p>
 
 ```bash
@@ -46,45 +36,40 @@ npm install @lix-js/sdk
 
 ```ts
 import { openLix } from "@lix-js/sdk";
+import { createBetterSqlite3Backend } from "@lix-js/sdk/sqlite";
 
-const lix = await openLix(); // in-memory by default; pass a backend for persistence
+const lix = await openLix({
+  backend: createBetterSqlite3Backend({ path: "app.lix" }),
+});
 
-// Register a schema for a tracked entity
-await lix.execute(
-  "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
-  [
-    JSON.stringify({
-      "x-lix-key": "task",
-      "x-lix-version": "1",
-      "x-lix-primary-key": ["/id"],
-      type: "object",
-      required: ["id", "title"],
-      properties: {
-        id: { type: "string" },
-        title: { type: "string" },
-      },
-      additionalProperties: false,
-    }),
-  ],
-);
+await lix.file.write("/orders.xlsx", bytes);
 
-// Write rows like any SQL table
-await lix.execute(
-  "INSERT INTO task (id, title) VALUES ($1, $2)",
-  ["t1", "Ship v1"],
-);
+const draft = await lix.branch("explore");
 
-// Every change is journaled; query it with SQL
-const changes = await lix.execute(
-  "SELECT entity_id, schema_key, snapshot_content FROM lix_change",
+const changes = await lix.diff({ from: "main", to: draft });
+
+const rows = await lix.execute(
+  "SELECT path, count(*) FROM lix_change GROUP BY path",
 );
 ```
 
-## Semantic change (delta) tracking
+## Why Lix?
+
+AI agents are creating explosive demand for version control: isolated workspaces, checkpoints, branches, reviewable changes, and rollback.
+
+### Git was not designed to be embedded
+
+Teams reach for Git, but wrapping it means managing repository directories, worktrees, locks, packfiles, garbage collection, LFS, process calls, protocol servers, and transaction coordination around a tool that expects to live outside the app.
+
+Lix is built the other way around: sessions, branches, history, blobs, and semantic changes live in an engine you embed.
+
+[How does Lix compare to Git? →](https://lix.dev/docs/comparison-to-git)
+
+### Semantic change (delta) tracking
 
 Unlike Git's line-based diffs, Lix understands file structure through plugins. Lix sees `price: 10 → 12` or `cell B4: pending → shipped`, not "line 4 changed" or "binary files differ".
 
-### JSON file example
+#### JSON file example
 
 **Before:**
 ```json
@@ -110,23 +95,25 @@ property theme:
 + dark
 ```
 
-### Excel file example
+#### Excel file example
 
 The same approach works for binary formats. With an XLSX plugin, Lix shows cell-level changes:
 
+> **v0.6 status:** entity-level change tracking and the physical storage layout are stable. The file plugin API for writing custom plugins (XLSX, DOCX, PDF, code) is being finalized; see [roadmap](#roadmap).
+
 **Before:**
 ```diff
-  | order_id | product  | status   |
-  | -------- | -------- | -------- |
-  | 1001     | Widget A | shipped  |
+  | order_id | product  | status  |
+  | -------- | -------- | ------- |
+  | 1001     | Widget A | shipped |
   | 1002     | Widget B | pending |
 ```
 
 **After:**
 ```diff
-  | order_id | product  | status   |
-  | -------- | -------- | -------- |
-  | 1001     | Widget A | shipped  |
+  | order_id | product  | status  |
+  | -------- | -------- | ------- |
+  | 1001     | Widget A | shipped |
   | 1002     | Widget B | shipped |
 ```
 
@@ -145,31 +132,55 @@ order_id 1002 status:
 + shipped
 ```
 
+### SQL interface for agents
+
+Agents burn fewer tokens and keep cleaner context when version-control questions are answered with SQL instead of whole-file rereads.
+
+Instead of loading files back into context, an agent can ask Lix what just changed:
+
+> What changed recently?
+
+```ts
+const rows = await lix.execute(`
+  SELECT created_at, schema_key, entity_id, snapshot_content
+  FROM lix_change
+  ORDER BY created_at DESC
+  LIMIT 20
+`);
+```
+
+Every change, across every file and every branch, is a row in `lix_change`. Filter by branch, file, schema, or time without re-reading whole files.
+
+## What you can build with Lix
+
+- **AI agent filesystems** - isolated workspaces, branchable explore steps, semantic change history, and rollback when a run goes sideways.
+- **Version control for Postgres & SQLite** - time-travel and branchable schemas on top of an existing database. Reviewable migrations. Diffable rows.
+- **Apps with version control** - add branches, review, rollback, and history to editors, CMSs, design tools, internal ops apps, and AI-native products.
+- **Review for AI-generated changes** - surface what an agent actually changed at the entity level. Approve, request edits, or revert by symbol instead of patch.
+
 ## How Lix Works
 
-Lix uses SQL databases as query engine and persistence layer. Virtual tables like `file` and `file_history` are exposed on top:
+Lix runs in-process inside your app.
 
-```sql
-SELECT * FROM file_history
-WHERE path = '/orders.xlsx'
-ORDER BY created_at DESC;
-```
+It owns the version-control model: files, blobs, branches, versions, history, transactions, and semantic changes. You plug it into whatever backend you need: in-memory, SQLite, Postgres, S3, Cloudflare, or your own adapter.
 
-When a file is written, a plugin parses it and detects entity-level changes. These changes (deltas) are stored in the database, enabling branching, merging, and audit trails.
+SQL is the query interface on top. Agents can ask what changed without rereading whole files.
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                      Lix                        │
+│                  Your runtime                   │
+│        agent worker · server · CLI · app         │
 │                                                 │
-│ ┌────────────┐ ┌──────────┐ ┌─────────┐ ┌─────┐ │
-│ │ Filesystem │ │ Branches │ │ History │ │ ... │ │
-│ └────────────┘ └──────────┘ └─────────┘ └─────┘ │
-└────────────────────────┬────────────────────────┘
-                         │
+│   ┌─────────────────────────────────────────┐   │
+│   │                  Lix                    │   │
+│   │  Filesystem · Branches · History · SQL  │   │
+│   └────────────────────┬────────────────────┘   │
+│                        │                        │
+└────────────────────────┼────────────────────────┘
                          ▼
 ┌─────────────────────────────────────────────────┐
-│                  SQL database                   │
-│            (SQLite, Postgres, etc.)             │
+│                    Backend                      │
+│      SQLite, Postgres, S3, Cloudflare, custom   │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -177,15 +188,30 @@ When a file is written, a plugin parses it and detects entity-level changes. The
 
 ## Roadmap
 
-- [x] Core API (<v0.5)
-- [x] ACID transactions (v0.6)
-- [x] Branching, diffing, merging (v0.6)
-- [x] SQL API (v0.6)
-- [x] Stable physical storage layout (v0.6)
-- [ ] Plugin API for file formats (community-authored plugins for DOCX, XLSX, CAD, PDF, …)
-- [ ] Merge conflict semantics and resolution
-- [ ] Working changes & checkpointing
-- [ ] Real-time sync
+**v0.6: ready to embed (current)**
+
+- [x] Importable SDK
+- [x] ACID transactions across state, blobs, and history
+- [x] Parallel sessions and versions
+- [x] Entity-level change tracking, queryable via SQL
+- [x] Stable physical storage layout
+- [x] Pluggable backend interface
+
+**v0.7: CLI**
+
+- [ ] CLI for creating, inspecting, and scripting Lix repositories
+
+**v0.8: file plugin API**
+
+- [ ] Finalized file plugin API for DOCX, XLSX, CAD, PDF, and code
+
+**v0.9: merge conflicts**
+
+- [ ] Merge conflicts as first-class citizens
+
+**v0.10: working changes**
+
+- [ ] Working changes and checkpointing
 
 ## Learn More
 
