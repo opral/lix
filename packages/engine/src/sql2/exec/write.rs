@@ -66,10 +66,7 @@ pub(crate) async fn execute_write_logical_plan(
         }
     }
 
-    Err(LixError::new(
-        LixError::CODE_UNSUPPORTED_SQL,
-        "sql2 DataFusion write execution from bound plans is not wired yet",
-    ))
+    super::datafusion::execute_datafusion_write_logical_plan(ctx, &write_plan.plan, params).await
 }
 
 fn validate_write_parameter_count(

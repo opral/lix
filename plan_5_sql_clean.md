@@ -316,6 +316,7 @@ Phase 5 progress:
 - Transaction write execution now calls `execute_write_logical_plan(ctx, SqlLogicalPlan::Write, params)` instead of passing write plans through the DataFusion read executor and parsing an affected-row result.
 - `execute_write_logical_plan` validates bound write parameter counts, tries `optimize::simple_write::try_make_fast_write_plan(&LogicalWritePlan)`, then fails closed with an unsupported error until the DataFusion reference writer is rebuilt from the same `LogicalWritePlan`.
 - The former duplicated public DML validation path is gone: write planning binds through `bind_statement(...)`, and fast-path selection now receives the already-built `LogicalWritePlan` instead of cloning/parsing the AST to decide whether to decline.
+- `SqlLogicalPlan` is owned by `exec/mod.rs`, `WriteLogicalPlan` construction lives in `exec/write.rs`, and fast-path misses now hand off to an explicit `exec/datafusion.rs` reference-writer adapter. The adapter still fails closed until it is rebuilt from `LogicalWritePlan`.
 
 ## Phase 6: Fast Write Optimization
 
