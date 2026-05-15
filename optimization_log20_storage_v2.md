@@ -2844,3 +2844,186 @@ an in-memory map/layout question:
   - or use a domain-shaped/in-memory index once real domain access patterns are
     known.
 ```
+
+### 2026-05-15: Next High-Cut Profile
+
+Profiles:
+
+```text
+target/storage_v2_profiles/next_high_cut/in_memory_planned_visit_unique_m1000_u100_syms.json
+target/storage_v2_profiles/next_high_cut/write_puts_k8192_g16_v32_syms.json
+target/storage_v2_profiles/next_high_cut/write_puts_k4096_g256_v32_syms.json
+```
+
+Commands:
+
+```sh
+samply record --save-only --unstable-presymbolicate \
+  -o target/storage_v2_profiles/next_high_cut/in_memory_planned_visit_unique_m1000_u100_syms.json -- \
+  cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  '^storage_v2/in_memory_backend/planned_visit_unique_m1000_u100$'
+
+samply record --save-only --unstable-presymbolicate \
+  -o target/storage_v2_profiles/next_high_cut/write_puts_k8192_g16_v32_syms.json -- \
+  cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  '^storage_v2/write_set_lowering/puts_k8192_g16_v32$'
+
+samply record --save-only --unstable-presymbolicate \
+  -o target/storage_v2_profiles/next_high_cut/write_puts_k4096_g256_v32_syms.json -- \
+  cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  '^storage_v2/write_set_lowering/puts_k4096_g256_v32$'
+```
+
+Timing results:
+
+| Case                               |      Time |
+| ---------------------------------- | --------: |
+| in-memory planned visit m1000/u100 |  6.303 us |
+| write set puts k8192/g16/v32       | 232.60 us |
+| write set puts k4096/g256/v32      | 170.27 us |
+
+Interpretation:
+
+```text
+The next high-cut area is write-set commit/lowering, not point reads.
+
+Point reads are now single-digit microseconds in the in-memory backend. Write
+set lowering is two orders of magnitude larger in the storage-layer scorecard,
+even with a CountingBackend that only counts put_many calls.
+
+The current write path still performs commit-time O(K) duplicate validation by
+building a HashSet over all staged mutations, then performs another O(K) pass
+to compute stats/written_bytes during lower_validated_into. Those checks are
+correct but they are not structurally necessary at commit time if StorageWriteSet
+becomes a canonical final-mutation set while staging.
+```
+
+Ranked next optimization:
+
+```text
+1. Move duplicate detection and write stats into staging.
+
+   Today:
+     stage_put/stage_delete: append to groups
+     commit: validate O(K) with HashSet
+     lower: recompute staged counts and written bytes O(K)
+
+   Proposed:
+     StorageWriteSet owns a mutation index while staging:
+       seen: HashSet<(SpaceId, Key)> or per-group HashSet<Key>
+       stats: StorageWriteSetStats
+
+     try_stage_put/try_stage_delete detects duplicates immediately and updates
+     stats once. commit then only checks conflicting space declarations and
+     lowers groups.
+
+   Expected shape:
+     staging remains O(1) expected per mutation
+     commit/lower removes one or two O(K) storage-side passes
+     backend calls remain O(G)
+
+2. Keep the existing infallible stage_* methods as convenience wrappers only if
+   we want compatibility, but the hardened path should be fallible:
+     try_stage_put(...) -> Result<(), StorageWriteSetError>
+     try_stage_delete(...) -> Result<(), StorageWriteSetError>
+
+3. After that, rerun write_set_lowering and only then inspect in-memory point
+   map layout. Point read layout is no longer the largest removable cost.
+```
+
+## 2026-05-15: staged write-set duplicate detection
+
+Change:
+
+```text
+StorageWriteSet now records duplicate mutations and write stats while staging.
+
+Before:
+  stage_put/stage_delete appended to groups
+  commit/lower validated duplicates with a fresh HashSet over K mutations
+  lower recomputed staged counts and written bytes
+
+After:
+  stage_put/stage_delete keep compatibility by recording duplicate errors
+  try_stage_put/try_stage_delete expose immediate duplicate rejection
+  commit/lower reuse staged stats and only add batch/backend-call counters
+```
+
+Focused scorecard:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'storage_v2/write_set_lowering/(puts_k8192_g16_v32|puts_k4096_g256_v32)'
+```
+
+| Case                    |    Before | After median | Criterion change |
+| ----------------------- | --------: | -----------: | ---------------: |
+| puts k8192 / g16 / v32  | 232.60 us |    188.54 us |          -37.56% |
+| puts k4096 / g256 / v32 | 170.27 us |     84.95 us |          -51.88% |
+
+Notes:
+
+```text
+The high-G case benefits most because the old lowering still paid the full
+duplicate-validation and stats recomputation cost before issuing many small
+grouped put_many calls. The new shape moves those costs to staging, which is
+where storage already pays O(1) expected work per mutation to build the final
+mutation set.
+```
+
+Follow-up profile:
+
+```text
+After duplicate validation moved out of commit, the remaining write-set frames
+were mostly group lookup during staging (`StorageWriteSet::group_mut`), mutation
+hash entry work, hash-table rehashing, and benchmark value clone/drop.
+```
+
+Follow-up cut:
+
+```text
+Replace BTreeMap<SpaceId, StorageWriteGroup> with:
+  Vec<StorageWriteGroup>
+  HashMap<SpaceId, usize>
+
+The write set does not require sorted group order. The hot operation is finding
+the append bucket for each staged mutation, so a direct group index is a better
+fit than a tree map.
+```
+
+Focused scorecard after Vec+index groups:
+
+| Case                    | Previous median | After median | Criterion note             |
+| ----------------------- | --------------: | -----------: | -------------------------- |
+| puts k8192 / g16 / v32  |       188.54 us |    175.78 us | noisy/no clear change      |
+| puts k4096 / g256 / v32 |        84.95 us |     69.88 us | -52.65% vs stored baseline |
+
+Interpretation:
+
+```text
+The Vec+index group layout helps the many-space case, which matches the profile:
+it removes per-mutation BTreeMap lookup cost when G is large. The low-G case is
+mostly neutral/noisy because group lookup was already cheap relative to moving
+the staged entries and benchmark value clone/drop.
+```
+
+Capacity experiment:
+
+```text
+StorageWriteSet::with_capacity(expected_mutations, expected_spaces) was added so
+callers with known write-set shape can preallocate group and mutation indexes.
+Using it directly in the current write_set_lowering scorecard did not produce a
+stable win, so the scorecard continues to use StorageContext::new_write_set().
+
+Reason: this benchmark measures staging plus lowering, so eager allocation must
+pay for itself immediately. At the current K/G sizes the result was noisy and
+sometimes slower. The API is still useful for future domain stores that already
+know their mutation count, but it is not treated as a baseline speedup yet.
+```
+
+Final focused rerun after keeping normal benchmark staging:
+
+| Case                    |    Median | Criterion note              |
+| ----------------------- | --------: | --------------------------- |
+| puts k8192 / g16 / v32  | 143.43 us | improved vs stored baseline |
+| puts k4096 / g256 / v32 | 132.19 us | noisy/no clear change       |

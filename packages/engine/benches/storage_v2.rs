@@ -19,7 +19,7 @@ use lix_engine::backend_v2::{
 };
 use lix_engine::storage_v2::{
     PointRequestPlan, StorageContext, StorageReadScope, StorageReader, StorageScanBuffer,
-    StorageSpace,
+    StorageSpace, StorageWriteSet,
 };
 use rustc_hash::FxBuildHasher;
 use xxhash_rust::xxh3::Xxh3DefaultBuilder;
@@ -1676,7 +1676,7 @@ impl PointCase {
 fn seeded_conformance_backend(space_id: u32, rows: u32) -> ConformanceBackend {
     let backend = ConformanceBackend::new();
     let storage = StorageContext::new(backend.clone());
-    let mut writes = storage.new_write_set();
+    let mut writes = StorageWriteSet::with_capacity(rows as usize, 1);
     for index in 0..rows {
         writes.stage_put(
             space(space_id),
@@ -1702,7 +1702,7 @@ fn seeded_in_memory_backend_with_value_size(
 ) -> InMemoryBackend {
     let backend = InMemoryBackend::new();
     let storage = StorageContext::new(backend.clone());
-    let mut writes = storage.new_write_set();
+    let mut writes = StorageWriteSet::with_capacity(rows as usize, 1);
     for index in 0..rows {
         writes.stage_put(
             space(space_id),
