@@ -18,7 +18,8 @@ use lix_engine::backend_v2::{
     WriteOptions, WriteStats,
 };
 use lix_engine::storage_v2::{
-    PointRequestPlan, StorageContext, StorageReadScope, StorageReader, StorageSpace,
+    PointRequestPlan, StorageContext, StorageReadScope, StorageReader, StorageScanBuffer,
+    StorageSpace,
 };
 use rustc_hash::FxBuildHasher;
 use xxhash_rust::xxh3::Xxh3DefaultBuilder;
@@ -1041,6 +1042,11 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
     let materialize_read = materialize_backend
         .begin_read(ReadOptions::default())
         .expect("begin read");
+    let storage_materialize_read = StorageReadScope::new(
+        materialize_backend
+            .begin_read(ReadOptions::default())
+            .expect("begin read"),
+    );
     group.throughput(Throughput::Elements(1_000));
     group.bench_function("visit_materialize_key_only_q1000", |b| {
         b.iter(|| {
@@ -1052,6 +1058,53 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("storage_buffer_key_only_q1000", |b| {
+        let mut buffer = StorageScanBuffer::with_capacity(1_001);
+        b.iter(|| {
+            let page = storage_materialize_read
+                .scan_range_into(
+                    space(1),
+                    point_scan_range(),
+                    ScanOptions {
+                        projection: CoreProjection::KeyOnly,
+                        limit_rows: 1_001,
+                        ..ScanOptions::default()
+                    },
+                    &mut buffer,
+                )
+                .expect("storage scan buffer");
+            assert_eq!(page.entries.len(), 1_000);
+            black_box(page.entries);
+            black_box(page.has_more);
+        });
+    });
+
+    group.bench_function("storage_visit_key_only_q1000", |b| {
+        b.iter(|| {
+            let mut visited = 0usize;
+            let result = storage_materialize_read
+                .visit_scan_range(
+                    space(1),
+                    point_scan_range(),
+                    ScanOptions {
+                        projection: CoreProjection::KeyOnly,
+                        limit_rows: 1_001,
+                        ..ScanOptions::default()
+                    },
+                    &mut |key: &Key, value: ProjectedValueRef<'_>| {
+                        visited += 1;
+                        assert_eq!(value, ProjectedValueRef::KeyOnly);
+                        black_box(key);
+                        Ok(())
+                    },
+                )
+                .expect("storage visit scan");
+            assert_eq!(visited, 1_000);
+            assert_eq!(result.emitted, 1_000);
+            black_box(result);
+        });
+    });
+
     group.bench_function("visit_materialize_full_value_q1000_v32", |b| {
         b.iter(|| {
             let page =
@@ -1059,6 +1112,58 @@ fn bench_scan_visitor_baseline(c: &mut Criterion) {
                     .expect("materialize visitor scan");
             assert_eq!(page.entries.entries.len(), 1_000);
             black_box(page);
+        });
+    });
+
+    group.bench_function("storage_visit_full_value_q1000_v32", |b| {
+        b.iter(|| {
+            let mut visited = 0usize;
+            let mut bytes_seen = 0usize;
+            let result = storage_materialize_read
+                .visit_scan_range(
+                    space(1),
+                    point_scan_range(),
+                    ScanOptions {
+                        projection: CoreProjection::FullValue,
+                        limit_rows: 1_001,
+                        ..ScanOptions::default()
+                    },
+                    &mut |key: &Key, value: ProjectedValueRef<'_>| {
+                        visited += 1;
+                        let ProjectedValueRef::FullValue(value) = value else {
+                            panic!("expected full value");
+                        };
+                        bytes_seen += value.len();
+                        black_box((key, value));
+                        Ok(())
+                    },
+                )
+                .expect("storage visit scan");
+            assert_eq!(visited, 1_000);
+            assert_eq!(bytes_seen, 32_000);
+            assert_eq!(result.emitted, 1_000);
+            black_box(result);
+        });
+    });
+
+    group.bench_function("storage_buffer_full_value_q1000_v32", |b| {
+        let mut buffer = StorageScanBuffer::with_capacity(1_001);
+        b.iter(|| {
+            let page = storage_materialize_read
+                .scan_range_into(
+                    space(1),
+                    point_scan_range(),
+                    ScanOptions {
+                        projection: CoreProjection::FullValue,
+                        limit_rows: 1_001,
+                        ..ScanOptions::default()
+                    },
+                    &mut buffer,
+                )
+                .expect("storage scan buffer");
+            assert_eq!(page.entries.len(), 1_000);
+            black_box(page.entries);
+            black_box(page.has_more);
         });
     });
 

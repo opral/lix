@@ -2505,3 +2505,179 @@ The remaining gap to the original experimental visitor path is now much smaller:
 That residual gap is likely from the more general `ProjectedValueRef`/Result
 visitor contract and benchmark noise, not from forced dynamic dispatch.
 ```
+
+### 2026-05-15: Generic Visitor Next Hotspot Profile
+
+Profiles:
+
+```text
+target/storage_v2_profiles/generic_visitor_next/visit_key_only_q1000_syms.json
+target/storage_v2_profiles/generic_visitor_next/visit_materialize_key_only_q1000_syms.json
+target/storage_v2_profiles/generic_visitor_next/planned_lean_m10000_u100_syms.json
+target/storage_v2_profiles/generic_visitor_next/in_memory_planned_get_many_syms.json
+```
+
+Commands:
+
+```sh
+samply record --save-only --unstable-presymbolicate -o ... -- \
+  cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  '^storage_v2/scan_visitor_baseline/visit_key_only_q1000$'
+
+samply record --save-only --unstable-presymbolicate -o ... -- \
+  cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  '^storage_v2/scan_visitor_baseline/visit_materialize_key_only_q1000$'
+
+samply record --save-only --unstable-presymbolicate -o ... -- \
+  cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  '^storage_v2/point_read_planned_lean_backend/m10000_u100$'
+
+samply record --save-only --unstable-presymbolicate -o ... -- \
+  cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  '^storage_v2/in_memory_backend/planned_get_many_m1000_u100$'
+```
+
+Findings:
+
+```text
+Pure streaming scan:
+  The remaining executable samples are concentrated in
+  InMemoryRead::visit_scan_range / its BTreeMap range loop. There is no longer
+  a visible per-row dyn-dispatch hotspot. This is the desired shape.
+
+Materialized key-only scan:
+  The hot leaf frames are now Bytes clone/drop, Vec<ReadEntry> construction,
+  and the ScanVisitor closure. This means the storage-owned materialization
+  path is paying exactly the cost we expect: clone keys into ReadEntry and drop
+  the materialized page after the benchmark iteration.
+
+Planned point read, lean fake backend:
+  The hot frames are mostly Bytes clone/drop and Vec construction for returned
+  value slots. This is a benchmark/backend-return-shape cost, not scan API
+  cost.
+
+Planned point read, InMemoryBackend:
+  The hot path is InMemoryRead::get_many plus Vec::from_iter and Bytes clone.
+  The remaining first-principles question is whether get_many should have a
+  borrowed/visitor-style value path analogous to scan, or whether point reads
+  should remain owned because storage/domain callers naturally materialize
+  point results.
+```
+
+Ranked next optimizations:
+
+```text
+1. Do not tune pure streaming scan further right now.
+   It is down to ordered-map iteration and visitor callback work.
+
+2. If materialized scans are hot, add a storage-owned reusable ScanPage buffer
+   or scan collector so repeated scans can reuse Vec allocation and possibly
+   clear/drop entries more cheaply.
+
+3. For point reads, consider a borrowed/planned point result path for
+   InMemoryBackend:
+     get_many_borrowed_for_plan(plan, visitor/indexed output)
+   This would avoid cloning Bytes values into owned slots for repeated planned
+   reads.
+
+4. Defer deeper in-memory map-layout work until domain-shaped scans exist.
+   BTreeMap iteration itself is not the obvious bottleneck in this profile.
+```
+
+### 2026-05-15: Storage Scan Buffer Experiment
+
+Change:
+
+```text
+Added StorageScanBuffer plus StorageReader::scan_range_into /
+scan_prefix_into. The existing owned scan helpers now materialize through the
+same collector and then move the buffer's Vec into ScanPage, so the default
+owned path does not add another clone.
+```
+
+Validation:
+
+```sh
+cargo check -p lix_engine --features storage-benches
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  storage_v2/scan_visitor_baseline
+samply record --save-only --unstable-presymbolicate \
+  -o target/storage_v2_profiles/storage_scan_buffer/storage_buffer_key_only_q1000_syms.json -- \
+  cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  '^storage_v2/scan_visitor_baseline/storage_buffer_key_only_q1000$'
+```
+
+Focused benchmark results from the scan visitor group:
+
+| Case                 | Existing materialize | StorageScanBuffer |
+| -------------------- | -------------------: | ----------------: |
+| key-only q1000       |            15.787 us |         18.497 us |
+| full-value q1000 v32 |            25.783 us |         26.875 us |
+
+Interpretation:
+
+```text
+The reusable storage buffer does not produce a clear win in this focused run.
+It removes repeated Vec allocation, but materialized scans are dominated by
+owned ReadEntry construction and Bytes clone/drop. That matches the previous
+profile: the cost is not primarily capacity allocation.
+
+The API is still useful as a low-level storage hook for callers that repeatedly
+materialize pages and want ownership over scratch memory, but it should not be
+treated as the main materialized-scan optimization. The first-principles next
+cut would be borrowed scan entries or domain visitors that avoid materializing
+ReadEntry at all, but that is a larger semantic/API decision.
+```
+
+### 2026-05-15: Storage Visitor Cut
+
+Change:
+
+```text
+Added StorageReader::visit_scan_range and visit_scan_prefix. These expose the
+backend's borrowed visitor path through storage_v2, preserving StorageSpace and
+prefix-to-range lowering while avoiding ScanPage / ReadEntry materialization.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  storage_v2/scan_visitor_baseline
+```
+
+Focused benchmark results:
+
+| Case                                   |      Time |
+| -------------------------------------- | --------: |
+| visit_key_only_q1000                   |  1.499 us |
+| storage_visit_key_only_q1000           |  2.998 us |
+| visit_materialize_key_only_q1000       | 18.428 us |
+| storage_buffer_key_only_q1000          | 15.074 us |
+| visit_full_value_q1000_v32             |  2.403 us |
+| storage_visit_full_value_q1000_v32     |  2.589 us |
+| visit_materialize_full_value_q1000_v32 | 23.906 us |
+| storage_buffer_full_value_q1000_v32    | 23.114 us |
+
+Interpretation:
+
+```text
+The storage visitor path is the right cut for scan-heavy domain callers that do
+not need owned rows. It is 5-6x faster than materializing key-only pages in this
+run and about 9x faster than materializing full-value v32 pages.
+
+The storage visitor is not always identical to the raw in-memory inherent
+visitor benchmark. The remaining gap is mostly API shape: storage goes through
+the backend trait visitor with Result-returning callbacks and storage-space
+wrapping, while the raw inherent benchmark is the thinnest in-memory loop.
+
+This confirms the first-principles split:
+  - use visit_scan_* for filtering/counting/index walks that can consume rows
+    immediately;
+  - use scan_* / scan_*_into only when callers need an owned page.
+```
