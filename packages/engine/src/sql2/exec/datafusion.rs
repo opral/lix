@@ -9,6 +9,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::sql2::parse::parse_statement;
+use crate::sql2::plan::LogicalWritePlan;
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
 use crate::sql2::predicate_typecheck::validate_json_predicate_expr_with_dfschema;
@@ -20,7 +21,13 @@ use crate::sql2::write_normalization::lix_file_data_type_lix_error;
 use crate::sql2::{SqlExecutionContext, SqlStatementKind, SqlWriteExecutionContext};
 
 #[allow(dead_code)]
-pub(crate) struct SqlLogicalPlan {
+pub(crate) enum SqlLogicalPlan {
+    DataFusion(SqlDataFusionLogicalPlan),
+    Write(SqlWriteLogicalPlan),
+}
+
+#[allow(dead_code)]
+pub(crate) struct SqlDataFusionLogicalPlan {
     session: SessionContext,
     plan: LogicalPlan,
     kind: SqlStatementKind,
@@ -28,15 +35,23 @@ pub(crate) struct SqlLogicalPlan {
     strict_binary_params: BTreeSet<usize>,
 }
 
+#[allow(dead_code)]
+pub(crate) struct SqlWriteLogicalPlan {
+    plan: LogicalWritePlan,
+}
+
 impl SqlLogicalPlan {
     #[allow(dead_code)]
     pub(crate) fn kind(&self) -> SqlStatementKind {
-        self.kind
+        match self {
+            Self::DataFusion(plan) => plan.kind,
+            Self::Write(_) => SqlStatementKind::Write,
+        }
     }
 
     #[allow(dead_code)]
     pub(crate) fn is_write(&self) -> bool {
-        self.kind == SqlStatementKind::Write
+        self.kind() == SqlStatementKind::Write
     }
 }
 
@@ -87,13 +102,13 @@ pub(crate) async fn create_logical_plan_from_parsed(
     let kind = classify_logical_plan(&plan);
     let notices = history_filter_notices(&plan);
 
-    Ok(SqlLogicalPlan {
+    Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
         session,
         plan,
         kind,
         notices,
         strict_binary_params: BTreeSet::new(),
-    })
+    }))
 }
 
 #[allow(dead_code)]
@@ -112,16 +127,16 @@ pub(crate) async fn create_write_logical_plan_from_parsed(
     let visible_schemas = ctx.list_visible_schemas()?;
     let bound_statement =
         crate::sql2::bind_statement(&statement, &visible_schemas, ctx.active_version_id())?;
-    let crate::sql2::BoundStatement::Write(_bound_write) = bound_statement else {
+    let crate::sql2::BoundStatement::Write(bound_write) = bound_statement else {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "expected SQL write statement after binding",
         ));
     };
-    Err(LixError::new(
-        LixError::CODE_UNSUPPORTED_SQL,
-        "sql2 bound write planning is not wired yet",
-    ))
+    let logical_write = crate::sql2::plan_write(bound_write)?;
+    Ok(SqlLogicalPlan::Write(SqlWriteLogicalPlan {
+        plan: logical_write,
+    }))
 }
 
 pub(crate) async fn create_transaction_read_logical_plan_from_parsed(
@@ -147,13 +162,13 @@ pub(crate) async fn create_transaction_read_logical_plan_from_parsed(
     let kind = classify_logical_plan(&plan);
     let notices = history_filter_notices(&plan);
 
-    Ok(SqlLogicalPlan {
+    Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
         session,
         plan,
         kind,
         notices,
         strict_binary_params: BTreeSet::new(),
-    })
+    }))
 }
 
 fn validate_public_read_sql_surface(sql: &str) -> Result<(), LixError> {
@@ -210,7 +225,13 @@ pub(crate) async fn execute_logical_plan(
     plan: SqlLogicalPlan,
     params: &[Value],
 ) -> Result<SqlQueryResult, LixError> {
-    let SqlLogicalPlan {
+    let SqlLogicalPlan::DataFusion(plan) = plan else {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "sql2 bound write execution is not wired yet",
+        ));
+    };
+    let SqlDataFusionLogicalPlan {
         session,
         plan,
         kind: _,
