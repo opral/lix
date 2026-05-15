@@ -15,24 +15,36 @@ pub struct PointSlot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexedPointValues {
     pub unique_values: Vec<Option<ProjectedValue>>,
-    pub requested_to_unique: Vec<usize>,
+    pub requested_to_unique: RequestedToUnique,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct BorrowedIndexedPointValues<'a> {
     pub unique_values: Vec<Option<ProjectedValue>>,
-    pub requested_to_unique: &'a [usize],
+    pub requested_to_unique: RequestedToUniqueRef<'a>,
 }
 
 #[derive(Clone, Debug)]
 pub struct PointRequestPlan {
     pub unique_keys: Vec<Key>,
-    pub requested_to_unique: Vec<usize>,
+    pub requested_to_unique: RequestedToUnique,
 }
 
 struct BorrowedPointRequestPlan {
     unique_keys: Vec<Key>,
-    requested_to_unique: Vec<usize>,
+    requested_to_unique: RequestedToUnique,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestedToUnique {
+    Identity { len: usize },
+    Indexes(Vec<usize>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestedToUniqueRef<'a> {
+    Identity { len: usize },
+    Indexes(&'a [usize]),
 }
 
 impl PointRequestPlan {
@@ -56,6 +68,8 @@ impl PointRequestPlan {
             requested_to_unique.push(unique_index);
         }
 
+        let requested_to_unique = requested_to_unique_mapping(requested_to_unique, keys.len());
+
         Self {
             unique_keys,
             requested_to_unique,
@@ -67,10 +81,11 @@ impl PointRequestPlan {
             keys_are_unique(&unique_keys),
             "PointRequestPlan::from_unique_keys requires unique keys"
         );
-        let requested_to_unique = (0..unique_keys.len()).collect();
         Self {
+            requested_to_unique: RequestedToUnique::Identity {
+                len: unique_keys.len(),
+            },
             unique_keys,
-            requested_to_unique,
         }
     }
 
@@ -80,6 +95,10 @@ impl PointRequestPlan {
 
     pub fn is_empty(&self) -> bool {
         self.requested_to_unique.is_empty()
+    }
+
+    pub fn requested_to_unique(&self) -> RequestedToUniqueRef<'_> {
+        self.requested_to_unique.as_ref()
     }
 }
 
@@ -112,10 +131,94 @@ impl BorrowedPointRequestPlan {
             requested_to_unique.push(unique_index);
         }
 
+        let requested_to_unique = requested_to_unique_mapping(requested_to_unique, keys.len());
+
         Self {
             unique_keys,
             requested_to_unique,
         }
+    }
+}
+
+impl RequestedToUnique {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Identity { len } => *len,
+            Self::Indexes(indexes) => indexes.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn unique_index(&self, requested_index: usize) -> Option<usize> {
+        match self {
+            Self::Identity { len } => (requested_index < *len).then_some(requested_index),
+            Self::Indexes(indexes) => indexes.get(requested_index).copied(),
+        }
+    }
+
+    pub fn as_ref(&self) -> RequestedToUniqueRef<'_> {
+        match self {
+            Self::Identity { len } => RequestedToUniqueRef::Identity { len: *len },
+            Self::Indexes(indexes) => RequestedToUniqueRef::Indexes(indexes),
+        }
+    }
+
+    pub fn to_vec(&self) -> Vec<usize> {
+        match self {
+            Self::Identity { len } => (0..*len).collect(),
+            Self::Indexes(indexes) => indexes.clone(),
+        }
+    }
+}
+
+impl<'a> RequestedToUniqueRef<'a> {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Identity { len } => *len,
+            Self::Indexes(indexes) => indexes.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn unique_index(&self, requested_index: usize) -> Option<usize> {
+        match self {
+            Self::Identity { len } => (requested_index < *len).then_some(requested_index),
+            Self::Indexes(indexes) => indexes.get(requested_index).copied(),
+        }
+    }
+
+    pub fn to_owned_mapping(self) -> RequestedToUnique {
+        match self {
+            Self::Identity { len } => RequestedToUnique::Identity { len },
+            Self::Indexes(indexes) => RequestedToUnique::Indexes(indexes.to_vec()),
+        }
+    }
+
+    pub fn to_vec(self) -> Vec<usize> {
+        match self {
+            Self::Identity { len } => (0..len).collect(),
+            Self::Indexes(indexes) => indexes.to_vec(),
+        }
+    }
+}
+
+fn requested_to_unique_mapping(indexes: Vec<usize>, requested_len: usize) -> RequestedToUnique {
+    if indexes.len() == requested_len
+        && indexes
+            .iter()
+            .copied()
+            .enumerate()
+            .all(|(requested_index, unique_index)| requested_index == unique_index)
+    {
+        RequestedToUnique::Identity { len: requested_len }
+    } else {
+        RequestedToUnique::Indexes(indexes)
     }
 }
 
@@ -129,13 +232,17 @@ impl IndexedPointValues {
     }
 
     pub fn value_at(&self, requested_index: usize) -> Option<&ProjectedValue> {
-        let unique_index = *self.requested_to_unique.get(requested_index)?;
+        let unique_index = self.requested_to_unique.unique_index(requested_index)?;
         self.unique_values.get(unique_index)?.as_ref()
     }
 
     pub fn materialize_caller_order(self) -> Vec<Option<ProjectedValue>> {
         let mut values = Vec::with_capacity(self.requested_to_unique.len());
-        for unique_index in self.requested_to_unique {
+        for requested_index in 0..self.requested_to_unique.len() {
+            let unique_index = self
+                .requested_to_unique
+                .unique_index(requested_index)
+                .expect("requested index is inside requested_to_unique");
             values.push(self.unique_values[unique_index].clone());
         }
         values
@@ -152,14 +259,14 @@ impl<'a> BorrowedIndexedPointValues<'a> {
     }
 
     pub fn value_at(&self, requested_index: usize) -> Option<&ProjectedValue> {
-        let unique_index = *self.requested_to_unique.get(requested_index)?;
+        let unique_index = self.requested_to_unique.unique_index(requested_index)?;
         self.unique_values.get(unique_index)?.as_ref()
     }
 
     pub fn into_owned(self) -> IndexedPointValues {
         IndexedPointValues {
             unique_values: self.unique_values,
-            requested_to_unique: self.requested_to_unique.to_vec(),
+            requested_to_unique: self.requested_to_unique.to_owned_mapping(),
         }
     }
 }
@@ -334,7 +441,7 @@ where
     Ok(StorageReadResult::new(
         BorrowedIndexedPointValues {
             unique_values: result.values,
-            requested_to_unique: &plan.requested_to_unique,
+            requested_to_unique: plan.requested_to_unique.as_ref(),
         },
         StorageReadStats {
             requested_keys: plan.requested_to_unique.len() as u64,

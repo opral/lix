@@ -1511,3 +1511,83 @@ This does not change arbitrary one-shot point-read complexity. It gives domain
 stores an explicit fast path when uniqueness is already guaranteed by their
 physical key construction.
 ```
+
+### 2026-05-14: Identity Point Plan Mapping
+
+Change:
+
+```text
+PointRequestPlan now stores requested-to-unique mapping as:
+
+  RequestedToUnique::Identity { len }
+  RequestedToUnique::Indexes(Vec<usize>)
+
+Known-unique plans use the implicit identity mapping instead of allocating and
+filling a Vec<usize> with 0..U. Borrowed planned results carry the same mapping
+as a lightweight RequestedToUniqueRef.
+```
+
+Why:
+
+```text
+PointRequestPlan::from_unique_keys() is specifically for domain stores that
+already know the request keys are unique. In that case, requested slot i maps
+to unique slot i by construction, so storing an explicit U-length index vector
+is pure overhead.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo test -p lix_engine backend_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 storage_v2/point_request_plan
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 storage_v2/point_read_planned_lean_backend
+```
+
+Focused point-plan scorecard:
+
+| Case                               | Prior Log Mean | After Mean |
+| ---------------------------------- | -------------: | ---------: |
+| `point_request_plan/m100_u100`     |       0.200 us |   0.159 us |
+| `point_request_plan/m1000_u1000`   |       1.592 us |   1.431 us |
+| `point_request_plan/m10000_u10000` |      16.866 us |  16.023 us |
+
+Focused planned-read scorecard:
+
+| Case                                | After Mean |
+| ----------------------------------- | ---------: |
+| `planned_lean/m100_u100`            |   0.426 us |
+| `planned_lean/m1000_u1000`          |   4.406 us |
+| `planned_lean/m1000_u100`           |   0.366 us |
+| `planned_lean/m10000_u100`          |   0.376 us |
+| `planned_lean/m10000_u10000`        |  48.847 us |
+| `planned_lean/m1000_u100_missing10` |   0.399 us |
+| `planned_lean/m1000_u100_missing90` |   0.102 us |
+
+Interpretation:
+
+```text
+The direct plan-construction win is modest because the known-unique plan still
+owns and drops U keys; the removed work is the identity index vector.
+
+The API/layout result is still important: the repeated-read hot path now has a
+zero-allocation representation for identity requested-to-unique mappings. This
+keeps the fast known-unique path honest without changing backend_v2.
+```
+
+Complexity impact:
+
+```text
+Before:
+  from_unique_keys: O(U) to build an explicit 0..U index vector
+
+After:
+  from_unique_keys: O(1) mapping construction, plus ownership/drop cost for the
+  U keys themselves
+
+Arbitrary PointRequestPlan::new(keys) remains O(M + U) expected because it must
+detect duplicates and build explicit indexes when requested slots are not an
+identity mapping.
+```
