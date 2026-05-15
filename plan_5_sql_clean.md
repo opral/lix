@@ -306,10 +306,15 @@ Phase 4 implementation result:
 - [ ] Move existing `execute.rs` DataFusion plan creation under `exec/datafusion.rs`.
 - [ ] Keep DataFusion as the reference physical executor.
 - [ ] Build DataFusion sessions from bound/catalog state, not separate public validation.
-- [ ] Ensure normal write path and fast write path share the same `LogicalWritePlan`.
+- [x] Ensure normal write path and fast write path share the same `LogicalWritePlan`.
 - [ ] Remove duplicated calls to `validate_public_dml_statement`.
 - [ ] Remove the unconditional full-AST clone in the write fast-path decision.
 - [ ] Ensure fallback large `INSERT ... VALUES` does not clone the AST just to decline fast path.
+
+Phase 5 progress:
+
+- Transaction write execution now calls `execute_write_logical_plan(ctx, SqlLogicalPlan::Write, params)` instead of passing write plans through the DataFusion read executor and parsing an affected-row result.
+- `execute_write_logical_plan` validates bound write parameter counts, tries `optimize::simple_write::try_make_fast_write_plan(&LogicalWritePlan)`, then fails closed with an unsupported error until the DataFusion reference writer is rebuilt from the same `LogicalWritePlan`.
 
 ## Phase 6: Fast Write Optimization
 
