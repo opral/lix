@@ -82,6 +82,7 @@ criterion = { package = "codspeed-criterion-compat", version = "*" }
 iref = "4.0.0"
 paste = "1"
 rocksdb = { version = "0.22", default-features = false }
+redb = "4.1.0"
 rustc-hash = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"

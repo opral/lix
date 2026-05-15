@@ -1,9 +1,12 @@
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
 use std::hash::{BuildHasher, Hasher};
 use std::ops::Bound;
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -21,8 +24,24 @@ use lix_engine::storage_v2::{
     PointRequestPlan, StorageContext, StorageReadScope, StorageReader, StorageScanBuffer,
     StorageSpace, StorageWriteSet,
 };
+use redb_backend_v2::RedbBackend;
+use rocksdb_backend_v2::RocksDbBackend;
 use rustc_hash::FxBuildHasher;
+use sqlite_backend_v2::SqliteBackend;
+use tempfile::TempDir;
 use xxhash_rust::xxh3::Xxh3DefaultBuilder;
+
+#[allow(dead_code)]
+#[path = "../tests/backend/support/redb_backend.rs"]
+mod redb_backend_v2;
+
+#[allow(dead_code)]
+#[path = "../tests/backend/support/rocksdb_backend.rs"]
+mod rocksdb_backend_v2;
+
+#[allow(dead_code)]
+#[path = "../tests/backend/support/sqlite_backend.rs"]
+mod sqlite_backend_v2;
 
 fn storage_benchmark_group<'a>(
     c: &'a mut Criterion,
@@ -125,6 +144,151 @@ impl StorageBenchBackend for InMemoryBenchBackend {
         backend
             .fork_snapshot()
             .expect("fork in-memory bench backend")
+    }
+}
+
+struct SqliteTempBenchBackend {
+    temp_dir: TempDir,
+    next_database_id: AtomicU64,
+}
+
+impl SqliteTempBenchBackend {
+    fn new() -> Self {
+        Self {
+            temp_dir: tempfile::tempdir().expect("create sqlite bench matrix temp dir"),
+            next_database_id: AtomicU64::new(0),
+        }
+    }
+
+    fn next_path(&self) -> PathBuf {
+        let database_id = self.next_database_id.fetch_add(1, Ordering::Relaxed);
+        self.temp_dir
+            .path()
+            .join(format!("storage-v2-matrix-{database_id}.sqlite"))
+    }
+}
+
+impl StorageBenchBackend for SqliteTempBenchBackend {
+    type Backend = SqliteBackend;
+
+    fn name(&self) -> &'static str {
+        "sqlite_temp"
+    }
+
+    fn open_empty(&self) -> Self::Backend {
+        SqliteBackend::open(self.next_path()).expect("open empty sqlite bench backend")
+    }
+
+    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Backend {
+        let backend = self.open_empty();
+        seed_backend_points(&backend, space, rows, value_size, "sqlite bench backend");
+        backend
+            .checkpoint()
+            .expect("checkpoint seeded sqlite bench backend");
+        backend
+    }
+
+    fn fork_for_write(&self, backend: &Self::Backend) -> Self::Backend {
+        backend
+            .checkpoint()
+            .expect("checkpoint sqlite bench seed before fork");
+        let fork_path = self.next_path();
+        fs::copy(backend.path(), &fork_path).expect("copy sqlite bench seed database");
+        SqliteBackend::open(fork_path).expect("open sqlite bench fork")
+    }
+}
+
+struct RedbTempBenchBackend {
+    temp_dir: TempDir,
+    next_database_id: AtomicU64,
+}
+
+impl RedbTempBenchBackend {
+    fn new() -> Self {
+        Self {
+            temp_dir: tempfile::tempdir().expect("create redb bench matrix temp dir"),
+            next_database_id: AtomicU64::new(0),
+        }
+    }
+
+    fn next_path(&self) -> PathBuf {
+        let database_id = self.next_database_id.fetch_add(1, Ordering::Relaxed);
+        self.temp_dir
+            .path()
+            .join(format!("storage-v2-matrix-{database_id}.redb"))
+    }
+}
+
+impl StorageBenchBackend for RedbTempBenchBackend {
+    type Backend = RedbBackend;
+
+    fn name(&self) -> &'static str {
+        "redb_temp"
+    }
+
+    fn open_empty(&self) -> Self::Backend {
+        RedbBackend::open(self.next_path()).expect("open empty redb bench backend")
+    }
+
+    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Backend {
+        let backend = self.open_empty();
+        seed_backend_points(&backend, space, rows, value_size, "redb bench backend");
+        backend
+    }
+
+    fn fork_for_write(&self, backend: &Self::Backend) -> Self::Backend {
+        let fork_path = self.next_path();
+        fs::copy(backend.path(), &fork_path).expect("copy redb bench seed database");
+        RedbBackend::open(fork_path).expect("open redb bench fork")
+    }
+}
+
+struct RocksDbTempBenchBackend {
+    temp_dir: TempDir,
+    next_database_id: AtomicU64,
+}
+
+impl RocksDbTempBenchBackend {
+    fn new() -> Self {
+        Self {
+            temp_dir: tempfile::tempdir().expect("create rocksdb bench matrix temp dir"),
+            next_database_id: AtomicU64::new(0),
+        }
+    }
+
+    fn next_path(&self) -> PathBuf {
+        let database_id = self.next_database_id.fetch_add(1, Ordering::Relaxed);
+        self.temp_dir
+            .path()
+            .join(format!("storage-v2-matrix-{database_id}.rocksdb"))
+    }
+}
+
+impl StorageBenchBackend for RocksDbTempBenchBackend {
+    type Backend = RocksDbBackend;
+
+    fn name(&self) -> &'static str {
+        "rocksdb_temp"
+    }
+
+    fn open_empty(&self) -> Self::Backend {
+        RocksDbBackend::open(self.next_path()).expect("open empty rocksdb bench backend")
+    }
+
+    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Backend {
+        let backend = self.open_empty();
+        seed_backend_points(&backend, space, rows, value_size, "rocksdb bench backend");
+        backend.flush().expect("flush seeded rocksdb bench backend");
+        backend
+    }
+
+    fn fork_for_write(&self, backend: &Self::Backend) -> Self::Backend {
+        backend
+            .flush()
+            .expect("flush rocksdb bench seed before fork");
+        let fork_path = self.next_path();
+        copy_dir_recursive(backend.path(), &fork_path).expect("copy rocksdb bench seed database");
+        RocksDbBackend::open(fork_path).expect("open rocksdb bench fork")
     }
 }
 
@@ -275,6 +439,9 @@ fn storage_v2_benches(c: &mut Criterion) {
     bench_prefix_scan_adapter(c);
     bench_conformance_backend(c);
     bench_storage_backend_matrix(c, InMemoryBenchBackend);
+    bench_storage_backend_matrix(c, SqliteTempBenchBackend::new());
+    bench_storage_backend_matrix(c, RedbTempBenchBackend::new());
+    bench_storage_backend_matrix(c, RocksDbTempBenchBackend::new());
     bench_in_memory_backend(c);
     bench_scan_visitor_baseline(c);
     bench_hash_algorithms(c);
@@ -2153,19 +2320,7 @@ impl PointCase {
 
 fn seeded_conformance_backend(space_id: u32, rows: u32) -> ConformanceBackend {
     let backend = ConformanceBackend::new();
-    let storage = StorageContext::new(backend.clone());
-    let mut writes = StorageWriteSet::with_capacity(rows as usize, 1);
-    for index in 0..rows {
-        writes.stage_put(
-            space(space_id),
-            key(format!("point-{index:04}")),
-            value(index, 32),
-        );
-    }
-    let (_commit, stats) = storage
-        .commit_write_set(writes, WriteOptions::default())
-        .expect("seed conformance backend");
-    assert_eq!(stats.staged_puts, rows as u64);
+    seed_backend_points(&backend, SpaceId(space_id), rows, 32, "conformance backend");
     backend
 }
 
@@ -2179,20 +2334,38 @@ fn seeded_in_memory_backend_with_value_size(
     value_size: usize,
 ) -> InMemoryBackend {
     let backend = InMemoryBackend::new();
+    seed_backend_points(
+        &backend,
+        SpaceId(space_id),
+        rows,
+        value_size,
+        "in-memory backend",
+    );
+    backend
+}
+
+fn seed_backend_points<B>(
+    backend: &B,
+    space_id: SpaceId,
+    rows: u32,
+    value_size: usize,
+    backend_name: &str,
+) where
+    B: Backend + Clone,
+{
     let storage = StorageContext::new(backend.clone());
     let mut writes = StorageWriteSet::with_capacity(rows as usize, 1);
     for index in 0..rows {
         writes.stage_put(
-            space(space_id),
+            space(space_id.0),
             key(format!("point-{index:04}")),
             value(index, value_size),
         );
     }
     let (_commit, stats) = storage
         .commit_write_set(writes, WriteOptions::default())
-        .expect("seed in-memory backend");
+        .unwrap_or_else(|error| panic!("seed {backend_name}: {error}"));
     assert_eq!(stats.staged_puts, rows as u64);
-    backend
 }
 
 fn layered_in_memory_backend(
@@ -2235,6 +2408,22 @@ fn put_batches_by_space(mutations: &[WriteMutation]) -> Vec<(StorageSpace, PutBa
         .into_iter()
         .map(|(space, entries)| (space, PutBatch { entries }))
         .collect()
+}
+
+fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let source = entry.path();
+        let destination = to.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&source, &destination)?;
+        } else if file_type.is_file() {
+            fs::copy(source, destination)?;
+        }
+    }
+    Ok(())
 }
 
 fn point_scan_range() -> KeyRange {

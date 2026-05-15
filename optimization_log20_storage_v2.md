@@ -3425,3 +3425,188 @@ The next backend additions should implement only the StorageBenchBackend fixture
 operations first, then use this exact lane set for SQLite temp-file, redb
 temp-file, and RocksDB temp-dir comparisons.
 ```
+
+## 2026-05-15: SQLite temp backend matrix fixture
+
+Change:
+
+```text
+Added sqlite_temp as the first real backend family in the storage_v2 backend
+matrix.
+
+Fixture shape:
+  open_empty() creates a fresh temp-file SQLite backend
+  seed_points() seeds a temp-file backend and checkpoints WAL
+  fork_for_write() checkpoints the seed and copies the SQLite file to a fresh
+    temp path for mutation benchmarks
+
+The bench fixture reuses the backend-v2 SQLite implementation from integration
+test support, so conformance and perf exercise the same SQLite physical
+contract.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches
+cargo test -p lix_engine --test backend --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+
+STORAGE_V2_BENCH_SMOKE=1 cargo bench -p lix_engine --features storage-benches \
+  --bench storage_v2 \
+  '^storage_v2/backend_matrix/sqlite_temp/(commit_puts_k1024_g16_v32|mixed80_20_k1024_g16_v32|commit_puts_k128_g16_existing10k_touched_v32|planned_visit_unique_m1000_u100|planned_get_many_m1000_u100|scan_range_visit_key_only_q1000|scan_range_q1000|prefix_scan_q1000)$'
+```
+
+Smoke baseline:
+
+| Case                                      | Smoke range |
+| ----------------------------------------- | ----------: |
+| commit puts k1024/g16                     | 2.7-10.0 ms |
+| mixed 80/20 k1024/g16                     | 2.6-5.4 ms  |
+| commit touched existing k128/g16          | 2.8-7.3 ms  |
+| planned visit unique m1000/u100           | 286-658 us  |
+| planned get many m1000/u100               | 275-505 us  |
+| scan range visit key-only q1000           | 220-385 us  |
+| scan range materialized q1000             | 216-642 us  |
+| prefix scan materialized q1000            | 222-800 us  |
+
+Interpretation:
+
+```text
+The SQLite fixture lifecycle works and passes backend-v2 conformance. The write
+lanes are noisy because each measured iteration uses a temp-file write
+transaction and, for seeded-write cases, a copied seed file. That is intentional
+for now: it keeps iterations isolated and prevents writes from accumulating in
+the shared seed.
+
+Next SQLite optimization questions are backend-specific:
+  - put_many/delete_many currently execute one SQLite statement per row inside
+    one transaction;
+  - point get_many builds a VALUES list and returns caller-order values through
+    storage;
+  - scans use ordered BLOB range predicates.
+
+Before optimizing SQLite, add redb/rocksdb to the same fixture contract so the
+matrix can show which costs are SQLite-specific versus generic real-backend
+costs.
+```
+
+## 2026-05-15: redb temp backend matrix fixture
+
+Change:
+
+```text
+Added redb_temp as the second real backend family in the storage_v2 backend
+matrix.
+
+Fixture shape:
+  open_empty() creates a fresh temp-file redb backend
+  seed_points() seeds a temp-file backend
+  fork_for_write() copies the seeded redb file to a fresh temp path for isolated
+    mutation benchmarks
+
+The redb backend is a backend-v2 support implementation with one ordered table:
+  encoded key = big-endian SpaceId || raw backend key
+  value       = raw stored value bytes
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches
+cargo test -p lix_engine --test backend --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+
+STORAGE_V2_BENCH_SMOKE=1 cargo bench -p lix_engine --features storage-benches \
+  --bench storage_v2 \
+  '^storage_v2/backend_matrix/redb_temp/(commit_puts_k1024_g16_v32|mixed80_20_k1024_g16_v32|commit_puts_k128_g16_existing10k_touched_v32|planned_visit_unique_m1000_u100|planned_get_many_m1000_u100|scan_range_visit_key_only_q1000|scan_range_q1000|prefix_scan_q1000)$'
+```
+
+Smoke baseline:
+
+| Case                                      | Smoke range |
+| ----------------------------------------- | ----------: |
+| commit puts k1024/g16                     | 20-27 ms    |
+| mixed 80/20 k1024/g16                     | 23-26 ms    |
+| commit touched existing k128/g16          | 20-27 ms    |
+| planned visit unique m1000/u100           | 38-134 us   |
+| planned get many m1000/u100               | 48-72 us    |
+| scan range visit key-only q1000           | 141-302 us  |
+| scan range materialized q1000             | 313-518 us  |
+| prefix scan materialized q1000            | 223-429 us  |
+
+Interpretation:
+
+```text
+redb passes backend-v2 conformance and fits the matrix fixture contract.
+
+The first smoke numbers show a sharp split:
+  - redb point reads are much faster than SQLite in this simple fixture;
+  - redb writes are much slower than SQLite, likely dominated by redb commit /
+    durability and file-copy isolated setup rather than storage_v2 shape.
+
+Do not optimize redb yet. Add RocksDB to the same matrix first, then profile the
+slowest write lane and fastest point/scan lanes across all real backends.
+```
+
+## 2026-05-15: RocksDB temp backend matrix fixture
+
+Change:
+
+```text
+Added rocksdb_temp as the third real backend family in the storage_v2 backend
+matrix.
+
+Fixture shape:
+  open_empty() creates a fresh temp-dir RocksDB backend
+  seed_points() seeds and flushes the backend
+  fork_for_write() flushes the seed and recursively copies the RocksDB dir to a
+    fresh temp path for isolated mutation benchmarks
+
+The RocksDB backend-v2 support implementation uses:
+  encoded key = big-endian SpaceId || raw backend key
+  value       = raw stored value bytes
+  read txns   = RocksDB snapshots
+  writes      = RocksDB WriteBatch
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches
+cargo test -p lix_engine --test backend --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+
+STORAGE_V2_BENCH_SMOKE=1 cargo bench -p lix_engine --features storage-benches \
+  --bench storage_v2 \
+  '^storage_v2/backend_matrix/rocksdb_temp/(commit_puts_k1024_g16_v32|mixed80_20_k1024_g16_v32|commit_puts_k128_g16_existing10k_touched_v32|planned_visit_unique_m1000_u100|planned_get_many_m1000_u100|scan_range_visit_key_only_q1000|scan_range_q1000|prefix_scan_q1000)$'
+```
+
+Smoke baseline:
+
+| Case                                      | Smoke range |
+| ----------------------------------------- | ----------: |
+| commit puts k1024/g16                     | 596-920 us  |
+| mixed 80/20 k1024/g16                     | 683-965 us  |
+| commit touched existing k128/g16          | 601-1063 us |
+| planned visit unique m1000/u100           | 100-160 us  |
+| planned get many m1000/u100               | 143-246 us  |
+| scan range visit key-only q1000           | 463-701 us  |
+| scan range materialized q1000             | 439-972 us  |
+| prefix scan materialized q1000            | 359-679 us  |
+
+Interpretation:
+
+```text
+RocksDB now passes backend-v2 conformance and fits the matrix fixture contract.
+
+The first smoke numbers are directionally different from both SQLite and redb:
+  - writes are far faster than redb and SQLite in this fixture;
+  - point reads are slower than redb but faster than SQLite;
+  - scans are slower than redb/SQLite in this simple key-only q1000 case.
+
+Now the real-backend matrix is complete enough to rank optimization work.
+```
