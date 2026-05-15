@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::RandomState;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
 use std::ops::Bound;
 use std::rc::Rc;
@@ -13,8 +13,8 @@ use criterion::{
 use lix_engine::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
     ConformanceBackend, CoreProjection, GetManyResult, GetOptions, InMemoryBackend, Key, KeyRange,
-    PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, PutBatch, ReadBatch, ReadEntry,
-    ReadOptions, ScanOptions, ScanPage, ScanResult, ScanVisitor, SpaceId, StoredValue,
+    PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, PutBatch, PutEntry, ReadBatch,
+    ReadEntry, ReadOptions, ScanOptions, ScanPage, ScanResult, ScanVisitor, SpaceId, StoredValue,
     WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::storage_v2::{
@@ -57,6 +57,24 @@ enum WriteMix {
 enum WriteMutation {
     Put(StorageSpace, Key, StoredValue),
     Delete(StorageSpace, Key),
+}
+
+#[derive(Default)]
+struct CountingPointVisitor {
+    visited: usize,
+}
+
+impl PointVisitor for CountingPointVisitor {
+    fn visit(
+        &mut self,
+        index: usize,
+        key: &Key,
+        value: Option<ProjectedValueRef<'_>>,
+    ) -> Result<(), BackendError> {
+        self.visited += 1;
+        black_box((index, key, value));
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -849,6 +867,26 @@ fn bench_in_memory_backend(c: &mut Criterion) {
         );
     });
 
+    let direct_commit_batches = put_batches_by_space(&commit_mutations);
+    group.bench_function("direct_commit_puts_k1024_g16_v32", |b| {
+        b.iter_batched(
+            || (InMemoryBackend::new(), direct_commit_batches.clone()),
+            |(backend, batches)| {
+                let mut write = backend
+                    .begin_write(WriteOptions::default())
+                    .expect("begin direct in-memory write");
+                for (space, batch) in batches {
+                    write.put_many(space.id, batch).expect("put direct batch");
+                }
+                let commit = write.commit().expect("commit direct write");
+                assert_eq!(commit.stats.put_entries, 1_024);
+                assert_eq!(commit.stats.backend_calls, 16);
+                black_box(commit);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
     group.throughput(Throughput::Elements(128));
     let untouched_existing_commit_case = WriteCase {
         name: "commit_puts_k128_g16_existing10k_untouched_v32",
@@ -932,6 +970,88 @@ fn bench_in_memory_backend(c: &mut Criterion) {
             BatchSize::LargeInput,
         );
     });
+
+    let direct_touched_existing_batches = put_batches_by_space(&touched_existing_commit_mutations);
+    group.bench_function("direct_commit_puts_k128_g16_existing10k_touched_v32", |b| {
+        b.iter_batched(
+            || {
+                (
+                    touched_existing_commit_backend
+                        .fork_snapshot()
+                        .expect("fork touched direct existing backend"),
+                    direct_touched_existing_batches.clone(),
+                )
+            },
+            |(backend, batches)| {
+                let mut write = backend
+                    .begin_write(WriteOptions::default())
+                    .expect("begin direct touched write");
+                for (space, batch) in batches {
+                    write
+                        .put_many(space.id, batch)
+                        .expect("put direct touched batch");
+                }
+                let commit = write.commit().expect("commit direct touched write");
+                assert_eq!(commit.stats.put_entries, 128);
+                assert_eq!(commit.stats.backend_calls, 16);
+                black_box(commit);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    for depth in [0_u32, 1, 8, 32] {
+        let layered_backend = layered_in_memory_backend(1, 1_000, depth, 8);
+        let layered_read = layered_backend
+            .begin_read(ReadOptions::default())
+            .expect("begin layered read");
+        let layered_scope = StorageReadScope::new(layered_read);
+        let layered_keys = point_request_keys(1_000, 100);
+        let layered_plan = PointRequestPlan::new(&layered_keys);
+        group.bench_function(
+            format!("overlay_depth_visit_base_d{depth}_m1000_u100"),
+            |b| {
+                b.iter(|| {
+                    let mut visitor = CountingPointVisitor::default();
+                    let stats = layered_scope
+                        .visit_unique_point_values_for_plan(
+                            space(1),
+                            black_box(&layered_plan),
+                            GetOptions::default(),
+                            &mut visitor,
+                        )
+                        .expect("visit layered point values");
+                    assert_eq!(stats.unique_backend_keys, 100);
+                    assert_eq!(visitor.visited, 100);
+                    black_box(stats);
+                });
+            },
+        );
+
+        group.bench_function(format!("overlay_depth_scan_base_q1000_d{depth}"), |b| {
+            b.iter(|| {
+                let mut visitor = |key: &Key, value: ProjectedValueRef<'_>| {
+                    assert!(matches!(value, ProjectedValueRef::KeyOnly));
+                    black_box(key);
+                    Ok(())
+                };
+                let result = layered_scope
+                    .visit_scan_range(
+                        space(1),
+                        point_scan_range(),
+                        ScanOptions {
+                            limit_rows: 1_001,
+                            projection: CoreProjection::KeyOnly,
+                            ..ScanOptions::default()
+                        },
+                        &mut visitor,
+                    )
+                    .expect("scan layered base range");
+                assert_eq!(result.emitted, 1_000);
+                black_box(result);
+            });
+        });
+    }
 
     group.throughput(Throughput::Elements(1_000));
     let get_many_backend = seeded_in_memory_backend(1, 100);
@@ -1803,6 +1923,48 @@ fn seeded_in_memory_backend_with_value_size(
         .expect("seed in-memory backend");
     assert_eq!(stats.staged_puts, rows as u64);
     backend
+}
+
+fn layered_in_memory_backend(
+    space_id: u32,
+    base_rows: u32,
+    overlay_depth: u32,
+    rows_per_layer: u32,
+) -> InMemoryBackend {
+    let backend = seeded_in_memory_backend_with_value_size(space_id, base_rows, 32);
+    for layer in 0..overlay_depth {
+        let entries = (0..rows_per_layer)
+            .map(|index| PutEntry {
+                key: key(format!("zz-layer-{layer:04}-{index:04}")),
+                value: value(layer * rows_per_layer + index, 32),
+            })
+            .collect();
+        let mut write = backend
+            .begin_write(WriteOptions::default())
+            .expect("begin overlay layer write");
+        write
+            .put_many(SpaceId(space_id), PutBatch { entries })
+            .expect("write overlay layer");
+        let commit = write.commit().expect("commit overlay layer");
+        assert_eq!(commit.stats.put_entries, rows_per_layer as u64);
+    }
+    backend
+}
+
+fn put_batches_by_space(mutations: &[WriteMutation]) -> Vec<(StorageSpace, PutBatch)> {
+    let mut batches = BTreeMap::<StorageSpace, Vec<PutEntry>>::new();
+    for mutation in mutations {
+        if let WriteMutation::Put(space, key, value) = mutation {
+            batches.entry(*space).or_default().push(PutEntry {
+                key: key.clone(),
+                value: value.clone(),
+            });
+        }
+    }
+    batches
+        .into_iter()
+        .map(|(space, entries)| (space, PutBatch { entries }))
+        .collect()
 }
 
 fn point_scan_range() -> KeyRange {
