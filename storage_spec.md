@@ -420,6 +420,26 @@ storage reconstruction:
   reusable point plan: O(M + U) once to build, then O(U) per read
 ```
 
+Recommended point-read API choices:
+
+```text
+one-shot arbitrary key list:
+  use the normal caller-order helper
+  cost: O(M + U)
+
+repeated key shape:
+  build PointRequestPlan once and reuse it
+  cost: O(M + U) once, then O(U) per read
+
+already-unique owned key list:
+  build PointRequestPlan::from_unique_keys(...)
+  cost: O(U), no dedupe hash map
+
+structured key family:
+  use scan_range/scan_prefix instead of point reads
+  cost: O(log_B N + Q) for ordered backends
+```
+
 Prefix reads:
 
 ```text
