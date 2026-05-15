@@ -30,9 +30,8 @@ mod version_scope;
 mod write_normalization;
 
 pub(crate) use classify::{
-    classify_statement, datafusion_statement_dml_target_table_names,
-    validate_supported_datafusion_statement_ast, validate_supported_statement_ast,
-    SqlStatementKind,
+    classify_datafusion_statement, datafusion_statement_dml_target_table_names,
+    validate_supported_datafusion_statement_ast, SqlStatementKind,
 };
 pub(crate) use context::{
     CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext, SqlJsonReader,
@@ -41,6 +40,8 @@ pub(crate) use context::{
 };
 #[allow(unused_imports)]
 pub(crate) use execute::{
-    create_logical_plan, create_transaction_read_logical_plan, create_write_logical_plan,
-    execute_logical_plan, execute_sql, SqlLogicalPlan,
+    create_logical_plan, create_logical_plan_from_parsed,
+    create_transaction_read_logical_plan_from_parsed, create_write_logical_plan,
+    create_write_logical_plan_from_parsed, execute_logical_plan, execute_sql, parse_statement,
+    SqlLogicalPlan,
 };

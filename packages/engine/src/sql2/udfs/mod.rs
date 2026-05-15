@@ -15,7 +15,7 @@ use datafusion::logical_expr::ScalarUDF;
 
 use crate::functions::FunctionProviderHandle;
 
-pub(crate) use public_call::validate_public_udf_calls;
+pub(crate) use public_call::validate_public_udf_calls_in_datafusion_statement;
 
 #[cfg(test)]
 pub(crate) fn system_sql2_function_provider() -> FunctionProviderHandle {
