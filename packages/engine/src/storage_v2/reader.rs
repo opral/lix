@@ -1,6 +1,6 @@
 use crate::backend_v2::{
-    BackendError, BackendRead, GetOptions, Key, KeyRange, Prefix, ProjectedValue, ScanOptions,
-    ScanPage,
+    BackendError, BackendRead, GetOptions, Key, KeyRange, Prefix, ProjectedValue,
+    ProjectedValueRef, ScanOptions, ScanPage, ScanResult, ScanVisitor,
 };
 use crate::storage_v2::{
     get_many_borrowed_indexed_values_for_plan,
@@ -8,9 +8,10 @@ use crate::storage_v2::{
     get_many_caller_order_with_stats, get_many_indexed_values_caller_order,
     get_many_indexed_values_caller_order_with_stats, get_many_indexed_values_for_plan,
     get_many_indexed_values_for_plan_with_stats, get_many_values_caller_order,
-    get_many_values_caller_order_with_stats, scan_prefix, scan_prefix_with_stats, scan_range,
-    scan_range_with_stats, BorrowedIndexedPointValues, IndexedPointValues, PointRequestPlan,
-    PointSlot, StorageReadResult, StorageReadScope, StorageReadStats, StorageSpace,
+    get_many_values_caller_order_with_stats, scan_prefix, scan_prefix_into, scan_prefix_with_stats,
+    scan_range, scan_range_into, scan_range_with_stats, visit_scan_prefix, visit_scan_range,
+    BorrowedIndexedPointValues, BorrowedScanPage, IndexedPointValues, PointRequestPlan, PointSlot,
+    StorageReadResult, StorageReadScope, StorageReadStats, StorageScanBuffer, StorageSpace,
 };
 
 pub trait StorageReader {
@@ -97,6 +98,42 @@ pub trait StorageReader {
         prefix: Prefix,
         opts: ScanOptions<'_>,
     ) -> Result<ScanPage, BackendError>;
+
+    fn scan_range_into<'a>(
+        &self,
+        space: StorageSpace,
+        range: KeyRange,
+        opts: ScanOptions<'_>,
+        buffer: &'a mut StorageScanBuffer,
+    ) -> Result<BorrowedScanPage<'a>, BackendError>;
+
+    fn scan_prefix_into<'a>(
+        &self,
+        space: StorageSpace,
+        prefix: Prefix,
+        opts: ScanOptions<'_>,
+        buffer: &'a mut StorageScanBuffer,
+    ) -> Result<BorrowedScanPage<'a>, BackendError>;
+
+    fn visit_scan_range<V>(
+        &self,
+        space: StorageSpace,
+        range: KeyRange,
+        opts: ScanOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized;
+
+    fn visit_scan_prefix<V>(
+        &self,
+        space: StorageSpace,
+        prefix: Prefix,
+        opts: ScanOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized;
 
     fn scan_range_with_stats(
         &self,
@@ -230,6 +267,52 @@ where
         scan_prefix(self.backend_read(), space.id, prefix, opts)
     }
 
+    fn scan_range_into<'a>(
+        &self,
+        space: StorageSpace,
+        range: KeyRange,
+        opts: ScanOptions<'_>,
+        buffer: &'a mut StorageScanBuffer,
+    ) -> Result<BorrowedScanPage<'a>, BackendError> {
+        scan_range_into(self.backend_read(), space.id, range, opts, buffer)
+    }
+
+    fn scan_prefix_into<'a>(
+        &self,
+        space: StorageSpace,
+        prefix: Prefix,
+        opts: ScanOptions<'_>,
+        buffer: &'a mut StorageScanBuffer,
+    ) -> Result<BorrowedScanPage<'a>, BackendError> {
+        scan_prefix_into(self.backend_read(), space.id, prefix, opts, buffer)
+    }
+
+    fn visit_scan_range<V>(
+        &self,
+        space: StorageSpace,
+        range: KeyRange,
+        opts: ScanOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
+        visit_scan_range(self.backend_read(), space.id, range, opts, visitor)
+    }
+
+    fn visit_scan_prefix<V>(
+        &self,
+        space: StorageSpace,
+        prefix: Prefix,
+        opts: ScanOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
+        visit_scan_prefix(self.backend_read(), space.id, prefix, opts, visitor)
+    }
+
     fn scan_range_with_stats(
         &self,
         space: StorageSpace,
@@ -258,10 +341,12 @@ mod tests {
 
     use crate::backend_v2::{
         BackendError, BackendRead, ConformanceBackend, CoreProjection, GetManyResult, GetOptions,
-        Key, KeyRange, Prefix, ProjectedValue, ReadOptions, ScanOptions, ScanResult, ScanVisitor,
-        SpaceId, StoredValue, WriteOptions,
+        Key, KeyRange, Prefix, ProjectedValue, ProjectedValueRef, ReadOptions, ScanOptions,
+        ScanResult, ScanVisitor, SpaceId, StoredValue, WriteOptions,
     };
-    use crate::storage_v2::{PointRequestPlan, StorageContext, StorageReader, StorageSpace};
+    use crate::storage_v2::{
+        PointRequestPlan, StorageContext, StorageReader, StorageScanBuffer, StorageSpace,
+    };
 
     fn key(bytes: &'static str) -> Key {
         Key(Bytes::from_static(bytes.as_bytes()))
@@ -658,6 +743,143 @@ mod tests {
             ]
         );
         assert!(!page.has_more);
+    }
+
+    #[test]
+    fn scan_range_into_reuses_storage_buffer() {
+        let storage = StorageContext::new(ConformanceBackend::new());
+        let mut writes = storage.new_write_set();
+        writes.stage_put(space(1), key("aa"), value("AA"));
+        writes.stage_put(space(1), key("ab"), value("AB"));
+        writes.stage_put(space(1), key("b"), value("B"));
+        storage
+            .commit_write_set(writes, WriteOptions::default())
+            .expect("seed");
+
+        let read = storage
+            .begin_read(ReadOptions::default())
+            .expect("begin read");
+        let mut buffer = StorageScanBuffer::with_capacity(8);
+
+        {
+            let page = read
+                .scan_range_into(
+                    space(1),
+                    KeyRange {
+                        lower: Bound::Included(key("a")),
+                        upper: Bound::Excluded(key("b")),
+                    },
+                    ScanOptions {
+                        projection: CoreProjection::KeyOnly,
+                        limit_rows: 10,
+                        resume_after: None,
+                    },
+                    &mut buffer,
+                )
+                .expect("scan range into");
+
+            assert_eq!(
+                page.entries
+                    .iter()
+                    .map(|entry| (&entry.key, &entry.value))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (&key("aa"), &ProjectedValue::KeyOnly),
+                    (&key("ab"), &ProjectedValue::KeyOnly),
+                ]
+            );
+            assert!(!page.has_more);
+        }
+
+        let capacity_after_first_scan = buffer.capacity();
+        assert!(capacity_after_first_scan >= 8);
+
+        {
+            let page = read
+                .scan_prefix_into(
+                    space(1),
+                    Prefix {
+                        bytes: Bytes::from_static(b"a"),
+                    },
+                    ScanOptions {
+                        projection: CoreProjection::FullValue,
+                        limit_rows: 10,
+                        resume_after: None,
+                    },
+                    &mut buffer,
+                )
+                .expect("scan prefix into");
+
+            assert_eq!(
+                page.entries
+                    .iter()
+                    .map(|entry| (&entry.key, &entry.value))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (
+                        &key("aa"),
+                        &ProjectedValue::FullValue(Bytes::from_static(b"AA"))
+                    ),
+                    (
+                        &key("ab"),
+                        &ProjectedValue::FullValue(Bytes::from_static(b"AB"))
+                    ),
+                ]
+            );
+            assert!(!page.has_more);
+        }
+
+        assert_eq!(buffer.capacity(), capacity_after_first_scan);
+    }
+
+    #[test]
+    fn visit_scan_prefix_lowers_without_materializing_entries() {
+        let storage = StorageContext::new(ConformanceBackend::new());
+        let mut writes = storage.new_write_set();
+        writes.stage_put(space(1), key("aa"), value("AA"));
+        writes.stage_put(space(1), key("ab"), value("AB"));
+        writes.stage_put(space(1), key("b"), value("B"));
+        storage
+            .commit_write_set(writes, WriteOptions::default())
+            .expect("seed");
+
+        let read = storage
+            .begin_read(ReadOptions::default())
+            .expect("begin read");
+        let mut visited = Vec::new();
+        let result = read
+            .visit_scan_prefix(
+                space(1),
+                Prefix {
+                    bytes: Bytes::from_static(b"a"),
+                },
+                ScanOptions {
+                    projection: CoreProjection::FullValue,
+                    limit_rows: 10,
+                    resume_after: None,
+                },
+                &mut |key: &Key, value: ProjectedValueRef<'_>| {
+                    visited.push((key.clone(), value.to_owned()));
+                    Ok(())
+                },
+            )
+            .expect("visit scan prefix");
+
+        assert_eq!(result.emitted, 2);
+        assert!(!result.has_more);
+        assert_eq!(
+            visited,
+            vec![
+                (
+                    key("aa"),
+                    ProjectedValue::FullValue(Bytes::from_static(b"AA"))
+                ),
+                (
+                    key("ab"),
+                    ProjectedValue::FullValue(Bytes::from_static(b"AB"))
+                ),
+            ]
+        );
     }
 
     #[test]

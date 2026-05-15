@@ -1,8 +1,43 @@
 use crate::backend_v2::{
     BackendError, BackendRead, Key, KeyRange, Prefix, ProjectedValueRef, ReadBatch, ReadEntry,
-    ScanOptions, ScanPage, SpaceId,
+    ScanOptions, ScanPage, ScanResult, ScanVisitor, SpaceId,
 };
 use crate::storage_v2::{StorageReadResult, StorageReadStats};
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StorageScanBuffer {
+    entries: Vec<ReadEntry>,
+}
+
+impl StorageScanBuffer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    pub fn entries(&self) -> &[ReadEntry] {
+        &self.entries
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BorrowedScanPage<'a> {
+    pub entries: &'a [ReadEntry],
+    pub has_more: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScanResumeKey {
@@ -42,20 +77,51 @@ pub(crate) fn scan_range<R>(
 where
     R: BackendRead,
 {
+    let mut buffer = StorageScanBuffer::with_capacity(opts.limit_rows);
+    let has_more = {
+        let page = scan_range_into(read, space, range, opts, &mut buffer)?;
+        page.has_more
+    };
+
+    Ok(ScanPage {
+        entries: ReadBatch {
+            entries: buffer.entries,
+        },
+        has_more,
+    })
+}
+
+pub(crate) fn scan_range_into<'a, R>(
+    read: &R,
+    space: SpaceId,
+    range: KeyRange,
+    opts: ScanOptions<'_>,
+    buffer: &'a mut StorageScanBuffer,
+) -> Result<BorrowedScanPage<'a>, BackendError>
+where
+    R: BackendRead,
+{
+    buffer.clear();
+
     if opts.limit_rows == 0 {
-        return Ok(ScanPage {
-            entries: ReadBatch::default(),
+        return Ok(BorrowedScanPage {
+            entries: buffer.entries(),
             has_more: false,
         });
     }
 
-    let mut entries = Vec::with_capacity(opts.limit_rows);
+    if buffer.entries.capacity() < opts.limit_rows {
+        buffer
+            .entries
+            .reserve(opts.limit_rows - buffer.entries.capacity());
+    }
+
     let result = read.visit_range(
         space,
         range,
         opts,
         &mut |key: &Key, value: ProjectedValueRef<'_>| {
-            entries.push(ReadEntry {
+            buffer.entries.push(ReadEntry {
                 key: key.clone(),
                 value: value.to_owned(),
             });
@@ -63,10 +129,28 @@ where
         },
     )?;
 
-    Ok(ScanPage {
-        entries: ReadBatch { entries },
+    Ok(BorrowedScanPage {
+        entries: buffer.entries(),
         has_more: result.has_more,
     })
+}
+
+pub(crate) fn visit_scan_range<R, V>(
+    read: &R,
+    space: SpaceId,
+    range: KeyRange,
+    opts: ScanOptions<'_>,
+    visitor: &mut V,
+) -> Result<ScanResult, BackendError>
+where
+    R: BackendRead,
+    V: ScanVisitor + ?Sized,
+{
+    if opts.limit_rows == 0 {
+        return Ok(ScanResult::default());
+    }
+
+    read.visit_range(space, range, opts, visitor)
 }
 
 pub(crate) fn scan_range_with_stats<R>(
@@ -89,6 +173,33 @@ where
             prefix_lowered: 0,
         },
     ))
+}
+
+pub(crate) fn scan_prefix_into<'a, R>(
+    read: &R,
+    space: SpaceId,
+    prefix: Prefix,
+    opts: ScanOptions<'_>,
+    buffer: &'a mut StorageScanBuffer,
+) -> Result<BorrowedScanPage<'a>, BackendError>
+where
+    R: BackendRead,
+{
+    scan_range_into(read, space, prefix.to_range()?, opts, buffer)
+}
+
+pub(crate) fn visit_scan_prefix<R, V>(
+    read: &R,
+    space: SpaceId,
+    prefix: Prefix,
+    opts: ScanOptions<'_>,
+    visitor: &mut V,
+) -> Result<ScanResult, BackendError>
+where
+    R: BackendRead,
+    V: ScanVisitor + ?Sized,
+{
+    visit_scan_range(read, space, prefix.to_range()?, opts, visitor)
 }
 
 pub(crate) fn scan_prefix_with_stats<R>(
