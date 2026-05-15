@@ -229,106 +229,27 @@ impl TableProvider for LixStateProvider {
     async fn insert_into(
         &self,
         _state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        insert_op: InsertOp,
+        _input: Arc<dyn ExecutionPlan>,
+        _insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if insert_op != InsertOp::Append {
-            return not_impl_err!("{insert_op} not implemented for lix_state yet");
-        }
-
-        let active_version_id = self
-            .version_binding
-            .require_active_version_id("INSERT")
-            .map_err(lix_error_to_datafusion_error)?;
-
-        let write_ctx = self.write_access.require_write("INSERT into lix_state")?;
-
-        self.schema
-            .logically_equivalent_names_and_types(&input.schema())?;
-
-        let sink = LixStateInsertSink::new(
-            Arc::clone(&self.schema),
-            write_ctx.clone(),
-            active_version_id,
-        );
-        Ok(Arc::new(InsertExec::new(input, Arc::new(sink))))
+        not_impl_err!("raw DataFusion INSERT is disabled; use the sql2 bound write pipeline")
     }
 
     async fn delete_from(
         &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
+        _state: &dyn Session,
+        _filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let active_version_id = self
-            .version_binding
-            .require_active_version_id("DELETE")
-            .map_err(lix_error_to_datafusion_error)?;
-
-        let write_ctx = self.write_access.require_write("DELETE FROM lix_state")?;
-
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
-        let physical_filters = filters
-            .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
-            .collect::<Result<Vec<_>>>()?;
-
-        let route = LixStateByVersionRoute::from_filters(&filters);
-        let request =
-            lix_state_scan_request(&self.schema, Some(&active_version_id), None, &route, None);
-
-        Ok(Arc::new(LixStateDeleteExec::new(
-            write_ctx.clone(),
-            Arc::clone(&self.schema),
-            active_version_id,
-            request,
-            physical_filters,
-        )))
+        not_impl_err!("raw DataFusion DELETE is disabled; use the sql2 bound write pipeline")
     }
 
     async fn update(
         &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
+        _state: &dyn Session,
+        _assignments: Vec<(String, Expr)>,
+        _filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let active_version_id = self
-            .version_binding
-            .require_active_version_id("UPDATE")
-            .map_err(lix_error_to_datafusion_error)?;
-
-        let write_ctx = self.write_access.require_write("UPDATE lix_state")?;
-
-        validate_lix_state_update_assignments(&self.schema, &assignments)?;
-
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
-        let physical_assignments = assignments
-            .iter()
-            .map(|(column_name, expr)| {
-                Ok((
-                    column_name.clone(),
-                    create_physical_expr(expr, &df_schema, state.execution_props())?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let physical_filters = filters
-            .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
-            .collect::<Result<Vec<_>>>()?;
-
-        let route = LixStateByVersionRoute::from_filters(&filters);
-        let request =
-            lix_state_scan_request(&self.schema, Some(&active_version_id), None, &route, None);
-
-        Ok(Arc::new(LixStateUpdateExec::new(
-            write_ctx.clone(),
-            Arc::clone(&self.schema),
-            active_version_id,
-            request,
-            physical_assignments,
-            physical_filters,
-        )))
+        not_impl_err!("raw DataFusion UPDATE is disabled; use the sql2 bound write pipeline")
     }
 }
 
@@ -2120,6 +2041,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn insert_into_requires_write_transaction() {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
@@ -2139,6 +2061,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn update_requires_write_transaction() {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
@@ -2161,6 +2084,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn delete_requires_write_transaction() {
         let session = SessionContext::new();
         let live_state = Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>;
@@ -2179,6 +2103,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn delete_returns_lix_state_delete_exec_with_write_ctx() {
         let session = SessionContext::new();
         let mut write_context = DummyWriteContext::default();
@@ -2194,6 +2119,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn update_rejects_read_only_lix_state_columns() {
         let session = SessionContext::new();
         let mut write_context = DummyWriteContext::default();
@@ -2216,6 +2142,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn update_returns_lix_state_update_exec_with_write_ctx() {
         let session = SessionContext::new();
         let mut write_context = DummyWriteContext::default();
@@ -2235,6 +2162,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn insert_into_returns_data_sink_exec_with_write_ctx() {
         let session = SessionContext::new();
         let mut write_context = DummyWriteContext::default();
@@ -2328,6 +2256,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn insert_plan_returns_datafusion_count_uint64() {
         let session = SessionContext::new();
         let mut write_context = CapturingWriteContext::default();
@@ -2361,6 +2290,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn update_plan_evaluates_filters_assignments_and_stages_rows() {
         let session = SessionContext::new();
         let mut write_context = CapturingWriteContext {
@@ -2436,6 +2366,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Phase 1 disables raw DataFusion provider DML; re-enable through bound write pipeline"]
     async fn delete_plan_with_empty_filters_stages_all_visible_rows() {
         let session = SessionContext::new();
         let mut write_context = CapturingWriteContext {

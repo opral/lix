@@ -145,71 +145,27 @@ impl TableProvider for LixVersionProvider {
     async fn insert_into(
         &self,
         _state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        insert_op: InsertOp,
+        _input: Arc<dyn ExecutionPlan>,
+        _insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if insert_op != InsertOp::Append {
-            return not_impl_err!("{insert_op} not implemented for lix_version yet");
-        }
-
-        let write_ctx = self.write_access.require_write("INSERT into lix_version")?;
-        let sink = LixVersionInsertSink::new(input.schema(), write_ctx);
-        Ok(Arc::new(InsertExec::new(input, Arc::new(sink))))
+        not_impl_err!("raw DataFusion INSERT is disabled; use the sql2 bound write pipeline")
     }
 
     async fn delete_from(
         &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
+        _state: &dyn Session,
+        _filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let write_ctx = self.write_access.require_write("DELETE FROM lix_version")?;
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-        let physical_filters = filters
-            .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Arc::new(LixVersionDeleteExec::new(
-            write_ctx,
-            Arc::clone(&self.live_state),
-            Arc::clone(&self.version_ref),
-            Arc::clone(&self.schema),
-            physical_filters,
-        )))
+        not_impl_err!("raw DataFusion DELETE is disabled; use the sql2 bound write pipeline")
     }
 
     async fn update(
         &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
+        _state: &dyn Session,
+        _assignments: Vec<(String, Expr)>,
+        _filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let write_ctx = self.write_access.require_write("UPDATE lix_version")?;
-        validate_lix_version_update_assignments(&assignments)?;
-
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-        let physical_assignments = assignments
-            .iter()
-            .map(|(column_name, expr)| {
-                Ok((
-                    column_name.clone(),
-                    create_physical_expr(expr, &df_schema, state.execution_props())?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let physical_filters = filters
-            .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Arc::new(LixVersionUpdateExec::new(
-            write_ctx,
-            Arc::clone(&self.live_state),
-            Arc::clone(&self.version_ref),
-            Arc::clone(&self.schema),
-            physical_assignments,
-            physical_filters,
-        )))
+        not_impl_err!("raw DataFusion UPDATE is disabled; use the sql2 bound write pipeline")
     }
 }
 

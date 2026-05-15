@@ -259,16 +259,6 @@ impl TableProvider for LixFileProvider {
             Some(projected_schema.as_ref()),
             scan_limit,
         );
-        if self.write_access.is_write() && matches!(self.version_binding, VersionBinding::Explicit)
-        {
-            request.filter.version_ids = explicit_version_ids_from_dml_filters(filters);
-            if request.filter.version_ids.is_empty() {
-                return Err(DataFusionError::Plan(
-                    "DELETE FROM lix_file_by_version requires an explicit lixcol_version_id predicate"
-                        .to_string(),
-                ));
-            }
-        }
         request.filter.version_ids = resolve_provider_version_ids(
             self.version_ref.as_ref(),
             &self.version_binding,
@@ -300,108 +290,27 @@ impl TableProvider for LixFileProvider {
     async fn insert_into(
         &self,
         _state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        insert_op: InsertOp,
+        _input: Arc<dyn ExecutionPlan>,
+        _insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if insert_op != InsertOp::Append {
-            return not_impl_err!("{insert_op} not implemented for lix_file yet");
-        }
-
-        let write_ctx = self.write_access.require_write("INSERT into lix_file")?;
-        let insert_column_intents = InsertColumnIntents::from_input(&input);
-        let include_data_writes = insert_column_intents.includes_column("data");
-        if include_data_writes {
-            reject_non_binary_casts_for_insert_column(&input, "data", "INSERT into lix_file")?;
-        }
-
-        let sink = LixFileInsertSink::new(
-            input.schema(),
-            write_ctx.clone(),
-            self.functions.clone(),
-            self.version_binding.clone(),
-            include_data_writes,
-        );
-        Ok(Arc::new(InsertExec::new(input, Arc::new(sink))))
+        not_impl_err!("raw DataFusion INSERT is disabled; use the sql2 bound write pipeline")
     }
 
     async fn delete_from(
         &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
+        _state: &dyn Session,
+        _filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let write_ctx = self.write_access.require_write("DELETE FROM lix_file")?;
-
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-        let filters = canonicalize_filesystem_path_filters(&filters, FilesystemPathKind::File)?;
-        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
-        let physical_filters = filters
-            .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
-            .collect::<Result<Vec<_>>>()?;
-        let target_file_ids = file_id_constraint_from_filters(&filters)?;
-        let mut request =
-            lix_file_scan_request(self.version_binding.active_version_id(), None, None);
-        if matches!(self.version_binding, VersionBinding::Explicit) {
-            request.filter.version_ids = explicit_version_ids_from_dml_filters(&filters);
-            if request.filter.version_ids.is_empty() {
-                return Err(DataFusionError::Plan(
-                    "DELETE FROM lix_file_by_version requires an explicit lixcol_version_id predicate"
-                        .to_string(),
-                ));
-            }
-        }
-
-        Ok(Arc::new(LixFileDeleteExec::new(
-            Arc::clone(&self.blob_reader),
-            write_ctx.clone(),
-            Arc::clone(&self.schema),
-            self.version_binding.clone(),
-            request,
-            target_file_ids,
-            physical_filters,
-        )))
+        not_impl_err!("raw DataFusion DELETE is disabled; use the sql2 bound write pipeline")
     }
 
     async fn update(
         &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
+        _state: &dyn Session,
+        _assignments: Vec<(String, Expr)>,
+        _filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let write_ctx = self.write_access.require_write("UPDATE lix_file")?;
-
-        validate_lix_file_update_assignments(&self.schema, &assignments)?;
-
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-        let physical_assignments = assignments
-            .iter()
-            .map(|(column_name, expr)| {
-                Ok((
-                    column_name.clone(),
-                    create_physical_expr(expr, &df_schema, state.execution_props())?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let filters = canonicalize_filesystem_path_filters(&filters, FilesystemPathKind::File)?;
-        let target_file_ids = file_id_constraint_from_filters(&filters)?;
-        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
-        let physical_filters = filters
-            .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
-            .collect::<Result<Vec<_>>>()?;
-        let request = lix_file_scan_request(self.version_binding.active_version_id(), None, None);
-
-        Ok(Arc::new(LixFileUpdateExec::new(
-            Arc::clone(&self.blob_reader),
-            write_ctx.clone(),
-            Arc::clone(&self.schema),
-            self.version_binding.clone(),
-            self.functions.clone(),
-            request,
-            target_file_ids,
-            physical_assignments,
-            physical_filters,
-        )))
+        not_impl_err!("raw DataFusion UPDATE is disabled; use the sql2 bound write pipeline")
     }
 }
 

@@ -329,16 +329,6 @@ impl TableProvider for EntityProvider {
             Some(projected_schema.as_ref()),
             limit,
         );
-        if self.write_access.is_write() && matches!(self.version_binding, VersionBinding::Explicit)
-        {
-            request.filter.version_ids = explicit_version_ids_from_dml_filters(filters);
-            if request.filter.version_ids.is_empty() {
-                return Err(DataFusionError::Plan(format!(
-                    "DELETE FROM {}_by_version requires an explicit lixcol_version_id predicate",
-                    self.spec.schema_key
-                )));
-            }
-        }
         request.filter.version_ids = resolve_provider_version_ids(
             self.version_ref.as_ref(),
             &self.version_binding,
@@ -360,145 +350,27 @@ impl TableProvider for EntityProvider {
     async fn insert_into(
         &self,
         _state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        insert_op: InsertOp,
+        _input: Arc<dyn ExecutionPlan>,
+        _insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if insert_op != InsertOp::Append {
-            return not_impl_err!("{insert_op} not implemented for entity surfaces yet");
-        }
-        reject_read_only_entity_surface(&self.spec.schema_key, "INSERT")?;
-
-        let write_ctx = self.write_access.require_write(&format!(
-            "INSERT into {} entity surface",
-            self.spec.schema_key
-        ))?;
-
-        let insert_version_binding = match self.variant {
-            EntityProviderVariant::Active => self.version_binding.clone(),
-            EntityProviderVariant::ByVersion => VersionBinding::explicit(),
-            EntityProviderVariant::History => {
-                return not_impl_err!("INSERT is not implemented for entity history surfaces");
-            }
-        };
-
-        let sink = EntityInsertSink::new(
-            Arc::clone(&self.spec),
-            input.schema(),
-            InsertColumnIntents::from_input(&input),
-            write_ctx.clone(),
-            insert_version_binding,
-        );
-        Ok(Arc::new(InsertExec::new(input, Arc::new(sink))))
+        not_impl_err!("raw DataFusion INSERT is disabled; use the sql2 bound write pipeline")
     }
 
     async fn delete_from(
         &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
+        _state: &dyn Session,
+        _filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        reject_read_only_entity_surface(&self.spec.schema_key, "DELETE")?;
-
-        let write_ctx = self.write_access.require_write(&format!(
-            "DELETE FROM {} entity surface",
-            self.spec.schema_key
-        ))?;
-
-        let version_binding = match self.variant {
-            EntityProviderVariant::Active => self.version_binding.clone(),
-            EntityProviderVariant::ByVersion => VersionBinding::explicit(),
-            EntityProviderVariant::History => {
-                return not_impl_err!("DELETE is not implemented for entity history surfaces");
-            }
-        };
-
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
-        let physical_filters = filters
-            .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
-            .collect::<Result<Vec<_>>>()?;
-        let mut request = entity_live_state_scan_request(
-            &self.spec.schema_key,
-            version_binding.active_version_id(),
-            None,
-            None,
-        );
-        if matches!(version_binding, VersionBinding::Explicit) {
-            let exact_version_ids = exact_version_ids_from_filters(&filters)?;
-            if exact_version_ids.is_none() {
-                return Err(DataFusionError::Plan(format!(
-                    "DELETE FROM {}_by_version requires an explicit lixcol_version_id predicate",
-                    self.spec.schema_key
-                )));
-            }
-            apply_exact_version_id_filter(&mut request, exact_version_ids);
-        }
-        apply_exact_entity_id_filters(&mut request, &self.spec, &filters)?;
-
-        Ok(Arc::new(EntityDeleteExec::new(
-            Arc::clone(&self.spec),
-            write_ctx.clone(),
-            Arc::clone(&self.schema),
-            version_binding,
-            request,
-            physical_filters,
-        )))
+        not_impl_err!("raw DataFusion DELETE is disabled; use the sql2 bound write pipeline")
     }
 
     async fn update(
         &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
+        _state: &dyn Session,
+        _assignments: Vec<(String, Expr)>,
+        _filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        reject_read_only_entity_surface(&self.spec.schema_key, "UPDATE")?;
-
-        let write_ctx = self
-            .write_access
-            .require_write(&format!("UPDATE {} entity surface", self.spec.schema_key))?;
-
-        validate_entity_update_assignments(&self.spec, &self.schema, &assignments)?;
-
-        let version_binding = match self.variant {
-            EntityProviderVariant::Active => self.version_binding.clone(),
-            EntityProviderVariant::ByVersion => VersionBinding::explicit(),
-            EntityProviderVariant::History => {
-                return not_impl_err!("UPDATE is not implemented for entity history surfaces");
-            }
-        };
-
-        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
-        let physical_assignments = assignments
-            .iter()
-            .map(|(column_name, expr)| {
-                Ok((
-                    column_name.clone(),
-                    create_physical_expr(expr, &df_schema, state.execution_props())?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let physical_filters = filters
-            .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
-            .collect::<Result<Vec<_>>>()?;
-        let mut request = entity_live_state_scan_request(
-            &self.spec.schema_key,
-            version_binding.active_version_id(),
-            None,
-            None,
-        );
-        apply_exact_entity_id_filters(&mut request, &self.spec, &filters)?;
-
-        Ok(Arc::new(EntityUpdateExec::new(
-            Arc::clone(&self.spec),
-            write_ctx.clone(),
-            Arc::clone(&self.schema),
-            version_binding,
-            request,
-            physical_assignments,
-            physical_filters,
-        )))
+        not_impl_err!("raw DataFusion UPDATE is disabled; use the sql2 bound write pipeline")
     }
 }
 

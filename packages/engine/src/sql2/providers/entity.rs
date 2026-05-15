@@ -1,0 +1,1 @@
+//! Entity provider module target.

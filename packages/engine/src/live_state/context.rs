@@ -10,7 +10,7 @@ use crate::live_state::{
 use crate::storage::StorageReader;
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateContext, TrackedStateFilter, TrackedStateProjection,
-    TrackedStateRowRequest, TrackedStateScanRequest,
+    TrackedStateScanRequest,
 };
 use crate::untracked_state::{
     UntrackedStateContext, UntrackedStateRowRequest, UntrackedStateScanRequest,
@@ -150,88 +150,21 @@ where
         &self,
         request: &LiveStateRowRequest,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-        let mut store = self.store.lock().await;
-        if !version_ref_exists(&mut *store, &self.untracked_state, &request.version_id).await? {
-            return Ok(None);
-        }
-        if is_commit_derived_schema(&request.schema_key)
-            && request.file_id == NullableKeyFilter::Null
-        {
-            let scope = LiveStateScanScope {
-                storage_version_ids: vec![request.version_id.clone()],
-                projection_version_ids: vec![request.version_id.clone()],
-            };
-            let rows = scan_commit_derived_rows(
-                &mut *store,
-                &self.commit_graph,
-                &LiveStateScanRequest {
-                    filter: crate::live_state::LiveStateFilter {
-                        schema_keys: vec![request.schema_key.clone()],
-                        entity_ids: vec![request.entity_id.clone()],
-                        version_ids: vec![request.version_id.clone()],
-                        file_ids: vec![NullableKeyFilter::Null],
-                        untracked: Some(false),
-                        include_tombstones: false,
-                        ..Default::default()
-                    },
-                    limit: Some(1),
+        let rows = self
+            .scan_rows(&LiveStateScanRequest {
+                filter: crate::live_state::LiveStateFilter {
+                    schema_keys: vec![request.schema_key.clone()],
+                    entity_ids: vec![request.entity_id.clone()],
+                    version_ids: vec![request.version_id.clone()],
+                    file_ids: vec![request.file_id.clone()],
+                    include_tombstones: false,
                     ..Default::default()
                 },
-                &scope,
-            )
+                limit: Some(1),
+                ..Default::default()
+            })
             .await?;
-            if let Some(row) = rows.into_iter().next() {
-                return Ok(Some(row));
-            }
-        }
-        for candidate in load_row_candidates(request) {
-            match candidate.source {
-                LiveStateLookupSource::Untracked => {
-                    let store: &mut dyn StorageReader = &mut *store;
-                    if let Some(row) = self
-                        .untracked_state
-                        .reader(store)
-                        .load_row(&untracked_row_request_from_live(
-                            request,
-                            &candidate.version_id,
-                        ))
-                        .await?
-                    {
-                        return Ok(Some(visibility::project_loaded_row(
-                            MaterializedLiveStateRow::from(row),
-                            &request.version_id,
-                            &candidate.version_id,
-                        )));
-                    }
-                }
-                LiveStateLookupSource::Tracked => {
-                    let Some(commit_id) = load_version_ref_commit_id(
-                        &mut *store,
-                        &self.untracked_state,
-                        &candidate.version_id,
-                    )
-                    .await?
-                    else {
-                        continue;
-                    };
-                    let store: &mut dyn StorageReader = &mut *store;
-                    let tracked_request = tracked_row_request_from_live(request);
-                    let mut rows = self
-                        .tracked_state
-                        .reader(store)
-                        .load_rows_at_commit(&commit_id, &[tracked_request])
-                        .await?;
-                    if let Some(row) = rows.pop().flatten() {
-                        return Ok(Some(project_tracked_row(
-                            row,
-                            &request.version_id,
-                            tracked_source_from_version_id(&candidate.version_id),
-                        )));
-                    }
-                }
-            }
-        }
-        Ok(None)
+        Ok(rows.into_iter().next())
     }
 }
 
@@ -560,66 +493,6 @@ fn project_tracked_row(
         commit_id: Some(row.commit_id),
         untracked: false,
         version_id: view_version_id.to_string(),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LiveStateLookupSource {
-    Untracked,
-    Tracked,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveStateLookupCandidate {
-    source: LiveStateLookupSource,
-    version_id: String,
-}
-
-fn load_row_candidates(request: &LiveStateRowRequest) -> Vec<LiveStateLookupCandidate> {
-    let mut candidates = vec![
-        LiveStateLookupCandidate {
-            source: LiveStateLookupSource::Untracked,
-            version_id: request.version_id.clone(),
-        },
-        LiveStateLookupCandidate {
-            source: LiveStateLookupSource::Tracked,
-            version_id: request.version_id.clone(),
-        },
-    ];
-
-    if request.version_id != GLOBAL_VERSION_ID {
-        candidates.extend([
-            LiveStateLookupCandidate {
-                source: LiveStateLookupSource::Untracked,
-                version_id: GLOBAL_VERSION_ID.to_string(),
-            },
-            LiveStateLookupCandidate {
-                source: LiveStateLookupSource::Tracked,
-                version_id: GLOBAL_VERSION_ID.to_string(),
-            },
-        ]);
-    }
-
-    candidates
-}
-
-fn untracked_row_request_from_live(
-    request: &LiveStateRowRequest,
-    version_id: &str,
-) -> crate::untracked_state::UntrackedStateRowRequest {
-    crate::untracked_state::UntrackedStateRowRequest {
-        schema_key: request.schema_key.clone(),
-        version_id: version_id.to_string(),
-        entity_id: request.entity_id.clone(),
-        file_id: request.file_id.clone(),
-    }
-}
-
-fn tracked_row_request_from_live(request: &LiveStateRowRequest) -> TrackedStateRowRequest {
-    TrackedStateRowRequest {
-        schema_key: request.schema_key.clone(),
-        entity_id: request.entity_id.clone(),
-        file_id: request.file_id.clone(),
     }
 }
 
