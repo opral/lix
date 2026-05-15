@@ -247,6 +247,128 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_state_transaction_insert_global_row_is_visible_before_commit,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+
+        transaction
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+                 ) VALUES (\
+                 '[\"state-tx-global\"]', 'lix_key_value', NULL, '{\"key\":\"state-tx-global\",\"value\":\"global\"}', true, false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("transactional global lix_state insert should succeed");
+
+        let result = transaction
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state \
+                 WHERE entity_id = lix_json('[\"state-tx-global\"]') AND schema_key = 'lix_key_value'",
+                &[],
+            )
+            .await
+            .expect("transactional active read should succeed");
+        assert_single_text(result, "{\"key\":\"state-tx-global\",\"value\":\"global\"}");
+
+        let result = transaction
+            .execute(
+                "UPDATE lix_state \
+                 SET snapshot_content = '{\"key\":\"state-tx-global\",\"value\":\"updated\"}' \
+                 WHERE entity_id = '[\"state-tx-global\"]' AND schema_key = 'lix_key_value'",
+                &[],
+            )
+            .await
+            .expect("transactional active update should see staged global row");
+        assert_eq!(result.rows_affected(), 1);
+
+        let result = transaction
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state \
+                 WHERE entity_id = lix_json('[\"state-tx-global\"]') AND schema_key = 'lix_key_value'",
+                &[],
+            )
+            .await
+            .expect("transactional active read after update should succeed");
+        assert_single_text(
+            result,
+            "{\"key\":\"state-tx-global\",\"value\":\"updated\"}",
+        );
+    }
+);
+
+simulation_test!(
+    lix_state_transaction_global_row_does_not_override_active_row,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+                 ) VALUES (\
+                 '[\"state-tx-global-shadowed\"]', 'lix_key_value', NULL, '{\"key\":\"state-tx-global-shadowed\",\"value\":\"active\"}', false, false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("active lix_state insert should succeed");
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        transaction
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+                 ) VALUES (\
+                 '[\"state-tx-global-shadowed\"]', 'lix_key_value', NULL, '{\"key\":\"state-tx-global-shadowed\",\"value\":\"global\"}', true, false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("transactional global lix_state insert should succeed");
+
+        let result = transaction
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state \
+                 WHERE entity_id = lix_json('[\"state-tx-global-shadowed\"]') AND schema_key = 'lix_key_value'",
+                &[],
+            )
+            .await
+            .expect("transactional active read should succeed");
+        assert_single_text(
+            result,
+            "{\"key\":\"state-tx-global-shadowed\",\"value\":\"active\"}",
+        );
+    }
+);
+
+simulation_test!(
     lix_state_global_rows_are_visible_through_version_overlay,
     |sim| async move {
         let engine = sim.boot_engine().await;
