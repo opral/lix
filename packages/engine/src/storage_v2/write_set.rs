@@ -102,13 +102,13 @@ impl StorageWriteSet {
             mutation_count += group.puts.len() + group.deletes.len();
         }
 
-        let mut seen = HashSet::with_capacity_and_hasher(
+        let mut seen = HashSet::<(SpaceId, &Key), FastHashBuilder>::with_capacity_and_hasher(
             mutation_count,
             FastHashBuilder::with_seeds(0, 0, 0, 0),
         );
         for group in self.groups.values() {
             for put in &group.puts {
-                if !seen.insert((group.space.id, put.key.clone())) {
+                if !seen.insert((group.space.id, &put.key)) {
                     return Err(StorageWriteSetError::DuplicateMutation {
                         space: group.space,
                         key: put.key.clone(),
@@ -116,7 +116,7 @@ impl StorageWriteSet {
                 }
             }
             for delete in &group.deletes {
-                if !seen.insert((group.space.id, delete.clone())) {
+                if !seen.insert((group.space.id, delete)) {
                     return Err(StorageWriteSetError::DuplicateMutation {
                         space: group.space,
                         key: delete.clone(),
