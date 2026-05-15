@@ -2,6 +2,14 @@ use datafusion::sql::sqlparser::ast::ObjectName;
 
 use crate::LixError;
 
+use super::super::catalog::{PublicCatalog, PublicSurfaceContract};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BoundTable {
+    pub(crate) name: String,
+    pub(crate) surface: PublicSurfaceContract,
+}
+
 pub(crate) fn bind_exact_table_name(name: &ObjectName) -> Result<String, LixError> {
     if name.0.len() != 1 {
         return Err(super::error::unsupported(
@@ -11,6 +19,206 @@ pub(crate) fn bind_exact_table_name(name: &ObjectName) -> Result<String, LixErro
     name.0
         .first()
         .and_then(|part| part.as_ident())
-        .map(|ident| ident.value.to_ascii_lowercase())
+        .map(|ident| {
+            if ident.quote_style.is_some() {
+                ident.value.clone()
+            } else {
+                ident.value.to_ascii_lowercase()
+            }
+        })
         .ok_or_else(|| super::error::unsupported("unsupported SQL table name"))
+}
+
+pub(crate) fn bind_public_table(
+    catalog: &PublicCatalog,
+    name: &ObjectName,
+) -> Result<BoundTable, LixError> {
+    let table_name = bind_exact_table_name(name)?;
+    let surface = catalog.require_surface(&table_name)?.clone();
+    Ok(BoundTable {
+        name: table_name,
+        surface,
+    })
+}
+
+pub(crate) fn require_public_column<'a>(
+    table: &'a BoundTable,
+    column_name: &str,
+) -> Result<&'a super::super::catalog::PublicColumn, LixError> {
+    if table.surface.public_column(column_name).is_some() {
+        return Ok(table
+            .surface
+            .public_column(column_name)
+            .expect("checked public column"));
+    }
+    if table.surface.column(column_name).is_some() {
+        return Err(super::error::unsupported(format!(
+            "column '{column_name}' is not part of public SQL surface '{}'",
+            table.name
+        )));
+    }
+    Err(super::error::unsupported(format!(
+        "column '{column_name}' does not exist on SQL table '{}'",
+        table.name
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::sql::sqlparser::ast::{SetExpr, Statement, TableFactor};
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
+    use datafusion::sql::sqlparser::parser::Parser;
+    use serde_json::json;
+
+    use super::*;
+    use crate::sql2::catalog::PublicSurfaceKind;
+
+    #[test]
+    fn rejects_qualified_table_name_even_when_leaf_exists() {
+        let catalog = catalog();
+        let error = bind_public_table(&catalog, &table_name("SELECT * FROM foo.lix_state"))
+            .expect_err("qualified table should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+    }
+
+    #[test]
+    fn rejects_unknown_table_name() {
+        let catalog = catalog();
+        let error = bind_public_table(&catalog, &table_name("SELECT * FROM missing"))
+            .expect_err("unknown table should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert!(error.message.contains("unknown SQL table 'missing'"));
+    }
+
+    #[test]
+    fn base_entity_table_does_not_expose_version_column() {
+        let catalog = catalog();
+        let table = bind_public_table(&catalog, &table_name("SELECT * FROM test_state_schema"))
+            .expect("base entity table should bind");
+
+        assert!(matches!(
+            table.surface.kind,
+            PublicSurfaceKind::EntityBase { .. }
+        ));
+        assert!(require_public_column(&table, "name").is_ok());
+        let error = require_public_column(&table, "lixcol_version_id")
+            .expect_err("base entity surface should not expose version column");
+        assert!(error.message.contains("does not exist"));
+    }
+
+    #[test]
+    fn by_version_entity_exposes_lixcol_version_id_without_version_id_alias() {
+        let catalog = catalog();
+        let table = bind_public_table(
+            &catalog,
+            &table_name("SELECT * FROM test_state_schema_by_version"),
+        )
+        .expect("by-version entity table should bind");
+
+        assert!(matches!(
+            table.surface.kind,
+            PublicSurfaceKind::EntityByVersion { .. }
+        ));
+        assert!(require_public_column(&table, "lixcol_version_id").is_ok());
+        let error = require_public_column(&table, "version_id")
+            .expect_err("by-version entity surface should not alias version_id");
+        assert!(error.message.contains("does not exist"));
+    }
+
+    #[test]
+    fn quoted_table_names_are_case_sensitive() {
+        let catalog = catalog();
+
+        bind_public_table(&catalog, &table_name("SELECT * FROM \"lix_state\""))
+            .expect("quoted exact case should bind");
+        let error = bind_public_table(&catalog, &table_name("SELECT * FROM \"LIX_STATE\""))
+            .expect_err("quoted mixed case should not be folded");
+
+        assert!(error.message.contains("unknown SQL table 'LIX_STATE'"));
+    }
+
+    #[test]
+    fn hidden_columns_cannot_bind_as_public_columns() {
+        let catalog = catalog();
+        let table = bind_public_table(&catalog, &table_name("SELECT * FROM lix_file"))
+            .expect("lix_file should bind");
+
+        let error = require_public_column(&table, "lixcol_schema_key")
+            .expect_err("hidden column should not bind");
+        assert!(error.message.contains("not part of public SQL surface"));
+    }
+
+    #[test]
+    fn catalog_rejects_duplicate_public_surface_names() {
+        let error = PublicCatalog::from_visible_schemas(&[json!({
+            "x-lix-key": "lix_file",
+            "properties": {
+                "id": { "type": "string" }
+            }
+        })])
+        .expect_err("system table collisions should be rejected");
+
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(error
+            .message
+            .contains("duplicate public SQL surface 'lix_file'"));
+    }
+
+    #[test]
+    fn catalog_uses_validated_entity_surface_derivation() {
+        let catalog = PublicCatalog::from_visible_schemas(&[json!({
+            "x-lix-key": "bad_entity",
+            "properties": {
+                "value": { "type": "null" }
+            }
+        })])
+        .expect("invalid entity schemas should match provider behavior and be skipped");
+
+        assert!(catalog.surface("bad_entity").is_none());
+    }
+
+    #[test]
+    fn dynamic_entity_history_surface_uses_provider_history_column_names() {
+        let catalog = catalog();
+        let table = bind_public_table(
+            &catalog,
+            &table_name("SELECT * FROM test_state_schema_history"),
+        )
+        .expect("entity history surface should bind");
+
+        assert!(matches!(
+            table.surface.kind,
+            PublicSurfaceKind::EntityHistory { .. }
+        ));
+        assert!(require_public_column(&table, "lixcol_entity_id").is_ok());
+        assert!(require_public_column(&table, "lixcol_snapshot_content").is_ok());
+    }
+
+    fn catalog() -> PublicCatalog {
+        PublicCatalog::from_visible_schemas(&[json!({
+            "x-lix-key": "test_state_schema",
+            "properties": {
+                "id": { "type": "string" },
+                "name": { "type": "string" },
+                "lixcol_internal": { "type": "string" }
+            }
+        })])
+        .expect("test catalog")
+    }
+
+    fn table_name(sql: &str) -> ObjectName {
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).expect("parse SQL");
+        let Some(Statement::Query(query)) = statements.pop() else {
+            panic!("expected query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        let TableFactor::Table { name, .. } = &select.from[0].relation else {
+            panic!("expected table factor");
+        };
+        name.clone()
+    }
 }

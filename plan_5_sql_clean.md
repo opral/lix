@@ -220,9 +220,9 @@ Phase 1 compiler result:
 
 ## Phase 2: Catalog and Public Surface Contracts
 
-- [ ] Move useful logic from `public_bind/table.rs`, `public_bind/capability.rs`, and provider registration into `catalog/`.
-- [ ] Implement exact table resolution in `bind/table.rs`; reject multi-part names unless explicitly supported.
-- [ ] Represent each public surface as data:
+- [x] Move useful logic from `public_bind/table.rs`, `public_bind/capability.rs`, and provider registration into `catalog/`.
+- [x] Implement exact table resolution in `bind/table.rs`; reject multi-part names unless explicitly supported.
+- [x] Represent each public surface as data:
 
 ```rust
 pub(crate) struct PublicSurfaceContract {
@@ -233,14 +233,22 @@ pub(crate) struct PublicSurfaceContract {
 }
 ```
 
-- [ ] Encode base entity and `_by_version` entity as separate `PublicSurfaceKind` values.
-- [ ] Make hidden/internal columns impossible to bind through public surfaces.
-- [ ] Remove all leaf-name resolution helpers from write execution.
-- [ ] Add unit tests for table resolution:
-  - [ ] `foo.table` rejected if only `table` exists.
-  - [ ] unknown table rejected.
-  - [ ] base entity table does not expose `lixcol_version_id`.
-  - [ ] `_by_version` exposes `lixcol_version_id` but not `version_id` alias unless explicitly desired.
+- [x] Encode base entity and `_by_version` entity as separate `PublicSurfaceKind` values.
+- [x] Make hidden/internal columns impossible to bind through public surfaces.
+- [x] Remove all leaf-name resolution helpers from write execution.
+- [x] Add unit tests for table resolution:
+  - [x] `foo.table` rejected if only `table` exists.
+  - [x] unknown table rejected.
+  - [x] base entity table does not expose `lixcol_version_id`.
+  - [x] `_by_version` exposes `lixcol_version_id` but not `version_id` alias unless explicitly desired.
+
+Phase 2 implementation result:
+
+- Added `catalog::PublicCatalog`, system surface contracts, and dynamic entity surface contracts from visible schemas.
+- Added `PublicSurfaceKind` variants for `lix_state_by_version`, entity base/entity `_by_version`, file/file `_by_version`, and directory/directory `_by_version`.
+- Added `bind::table::bind_public_table` and `require_public_column`, with exact single-part table binding through the catalog.
+- Removed the remaining dead DataFusion write helper that used leaf-name table resolution (`dml.table_name.table()`); write validation now belongs to the bound write pipeline.
+- Current gate: `cargo check -p lix_engine`, `cargo test -p lix_engine sql2::bind::table::tests --lib -- --nocapture`, and `cargo fmt -p lix_engine --check` pass.
 
 ## Phase 3: Binding Writes
 

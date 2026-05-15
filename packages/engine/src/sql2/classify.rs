@@ -1,8 +1,5 @@
 use datafusion::sql::parser::Statement as DataFusionStatement;
-use datafusion::sql::sqlparser::ast::{
-    FromTable, ObjectName, Query, SetExpr, Statement as SqlStatement, TableFactor, TableObject,
-    TableWithJoins,
-};
+use datafusion::sql::sqlparser::ast::{Query, SetExpr, Statement as SqlStatement};
 
 use crate::LixError;
 
@@ -39,77 +36,6 @@ pub(crate) fn classify_datafusion_statement(statement: &DataFusionStatement) -> 
         DataFusionStatement::Explain(_) => SqlStatementKind::Read,
         _ => SqlStatementKind::Other,
     }
-}
-
-pub(crate) fn datafusion_statement_dml_target_table_names(
-    statement: &DataFusionStatement,
-) -> Vec<String> {
-    let mut targets = Vec::new();
-    collect_datafusion_statement_dml_target_table_names(statement, &mut targets);
-    targets
-}
-
-fn collect_datafusion_statement_dml_target_table_names(
-    statement: &DataFusionStatement,
-    targets: &mut Vec<String>,
-) {
-    match statement {
-        DataFusionStatement::Statement(statement) => {
-            collect_dml_target_table_names(statement, targets);
-        }
-        DataFusionStatement::Explain(explain) => {
-            collect_datafusion_statement_dml_target_table_names(
-                explain.statement.as_ref(),
-                targets,
-            );
-        }
-        _ => {}
-    }
-}
-
-fn collect_dml_target_table_names(statement: &SqlStatement, targets: &mut Vec<String>) {
-    match statement {
-        SqlStatement::Insert(insert) => {
-            if let TableObject::TableName(name) = &insert.table {
-                if let Some(table_name) = object_name_table_part(name) {
-                    targets.push(table_name);
-                }
-            }
-        }
-        SqlStatement::Update(update) => {
-            collect_table_with_joins_target(&update.table, targets);
-        }
-        SqlStatement::Delete(delete) => {
-            let tables = match &delete.from {
-                FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
-            };
-            for table in tables {
-                collect_table_with_joins_target(table, targets);
-            }
-        }
-        SqlStatement::Explain { statement, .. } => {
-            collect_dml_target_table_names(statement.as_ref(), targets);
-        }
-        _ => {}
-    }
-}
-
-fn collect_table_with_joins_target(table: &TableWithJoins, targets: &mut Vec<String>) {
-    if let TableFactor::Table { name, .. } = &table.relation {
-        if let Some(table_name) = object_name_table_part(name) {
-            targets.push(table_name);
-        }
-    }
-}
-
-fn object_name_table_part(name: &ObjectName) -> Option<String> {
-    name.0.last().and_then(|part| part.as_ident()).map(|ident| {
-        if ident.quote_style.is_some() {
-            ident.value.clone()
-        } else {
-            ident.value.to_ascii_lowercase()
-        }
-    })
 }
 
 fn classify_ast_statement(statement: &SqlStatement) -> SqlStatementKind {
