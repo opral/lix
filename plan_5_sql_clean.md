@@ -322,14 +322,21 @@ Phase 5 progress:
 
 ## Phase 6: Fast Write Optimization
 
-- [ ] Rebuild current `simple_dml.rs` as two modules:
-  - [ ] `optimize/simple_write.rs`: `LogicalWritePlan -> Option<FastWritePlan>`.
-  - [ ] `exec/fast_write.rs`: `FastWritePlan -> rows_affected`.
-- [ ] The optimizer may inspect only bound targets, bound predicates, and bound assignments.
-- [ ] The executor may inspect only storage-level IDs and values.
-- [ ] Unsupported shapes return `Ok(None)` from optimization.
-- [ ] Invalid SQL is impossible at this layer; if encountered, treat as internal invariant violation.
-- [ ] Add tests that fast optimization declines complex statements without changing normal execution.
+- [x] Rebuild current `simple_dml.rs` as two modules:
+  - [x] `optimize/simple_write.rs`: `LogicalWritePlan -> Option<FastWritePlan>`.
+  - [x] `exec/fast_write.rs`: `FastWritePlan -> rows_affected`.
+- [x] The optimizer may inspect only bound targets, bound predicates, and bound assignments.
+- [x] The executor may inspect only storage-level IDs and values.
+- [x] Unsupported shapes return `Ok(None)` from optimization.
+- [x] Invalid SQL is impossible at this layer; if encountered, treat as internal invariant violation.
+- [x] Add tests that fast optimization declines complex statements without changing normal execution.
+
+Phase 6 progress:
+
+- Fast-write selection now runs only after binding/planning and consumes `LogicalWritePlan`; it does not inspect raw sqlparser/DataFusion AST, identifiers, object names, or SQL strings.
+- The first fast physical plan is intentionally narrow: statically known no-match `lix_state` / `lix_state_by_version` `UPDATE`/`DELETE` plans, derived only from `VersionScope::Empty` or row-level `FilterSet::None`. Inserts, unsupported targets, complex predicates, and column-filter contradictions decline to the reference writer so target support and predicate type validation still run.
+- Fast execution consumes only the closed `FastWritePlan` enum and returns `0` rows affected for no-match writes. The executor is total over emitted fast plans; it does not validate SQL, decline, decode params, scan live state, or inspect write context for this plan shape.
+- Tests cover column-contradiction decline, `WHERE false` deletes, complex update decline, insert decline, unsupported-target no-match decline/error preservation, JSON predicate validation after contradiction decline, no-context fast execution, and an end-to-end complex `lix_state` update that proves declined optimization still falls through to normal write execution and stages the expected row.
 
 ## Phase 7: Storage Visibility Cut
 
