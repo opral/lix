@@ -3876,3 +3876,60 @@ Compared to the original focused profile:
   get_many is now about 8.2x faster
   scan visit is now about 8.4x faster
 ```
+
+## 2026-05-15: RocksDB KeyOnly scan copy removal
+
+Change:
+
+```text
+RocksDbRead::visit_range now branches on CoreProjection.
+For KeyOnly scans it no longer copies the RocksDB value into Bytes only to
+discard it.
+FullValue scans keep the existing value-copy behavior.
+```
+
+Validation:
+
+```sh
+cargo test -p lix_engine --test backend rocksdb -- --nocapture
+```
+
+Result:
+
+```text
+rocksdb_backend_passes_backend_v2_conformance ... ok
+```
+
+Focused bench:
+
+```sh
+STORAGE_V2_BENCH_DIRECT_PROFILE_ONLY=1 \
+STORAGE_V2_BENCH_DIRECT_PROFILE_BACKEND=rocksdb_temp \
+STORAGE_V2_BENCH_DIRECT_PROFILE_CASE=direct_scan_visit_key_only_q1000 \
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  'direct_scan_visit_key_only_q1000'
+```
+
+Delta:
+
+| Case | Before | After |
+| ---- | -----: | ----: |
+| rocksdb direct scan visit q1000 KeyOnly | 477 us | 279 us |
+
+Interpretation:
+
+```text
+About 1.7x faster for direct RocksDB KeyOnly scans.
+
+The post-change profile confirms value-copy cost is gone. Remaining cost is
+mostly RocksDB iterator traversal and key-side allocation/copying:
+  RocksDbRead::visit_range ~79.5%
+  DB iterator next ~50.7%
+  DBIter::Next ~34.1%
+  MergingIterator next ~15-18%
+  allocator/free/memmove/memcmp remain visible
+
+Next RocksDB scan cut, if needed:
+  avoid key Bytes allocation by adding a borrowed-key scan visitor path or by
+  changing backend_v2 visitor semantics to allow borrowed backend keys.
+```
