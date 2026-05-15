@@ -276,18 +276,30 @@ Phase 3 implementation result:
 
 ## Phase 4: Logical Write Plans
 
-- [ ] Implement `plan::write::plan_write(bound: BoundWrite) -> LogicalWritePlan`.
-- [ ] Make `LogicalWritePlan` the common input for DataFusion and fast write execution.
-- [ ] Model version requirements in `VersionScope`:
-  - [ ] base entity writes use `VersionScope::Active`.
-  - [ ] `_by_version` update/delete use `VersionScope::ExplicitRequired`.
-  - [ ] `lix_state` can use explicit versions where public semantics allow it.
-- [ ] Replace `LiveStateFilter.no_match` with `FilterSet::None` or equivalent.
-- [ ] Convert `FilterSet` to storage filters only at the storage boundary.
-- [ ] Add tests for contradictory predicates:
-  - [ ] repeated equality with different values returns zero matches.
-  - [ ] repeated `IN` intersections work.
-  - [ ] contradiction does not corrupt param binding.
+- [x] Implement `plan::write::plan_write(bound: BoundWrite) -> LogicalWritePlan`.
+- [x] Make `LogicalWritePlan` the carried write plan in `SqlLogicalPlan`.
+- [x] Keep planned predicate filters logical: keyed by `BoundColumnRef`, not storage schema/entity/file IDs.
+- [x] Model version requirements in `VersionScope`:
+  - [x] base entity writes use `VersionScope::Active`.
+  - [x] `_by_version` update/delete use `VersionScope::ExplicitRequired`.
+  - [x] `lix_state` can use global/active/explicit scopes where public semantics allow it.
+- [x] Represent logical no-match with `FilterSet::None` via the write-plan row sentinel.
+- [ ] Replace storage-facing `LiveStateFilter.no_match` with `FilterSet::None` or equivalent in Phase 7.
+- [ ] Convert logical write filters to storage filters only at the storage boundary.
+- [x] Add tests for contradictory predicates:
+  - [x] repeated equality with different values returns zero matches.
+  - [x] repeated `IN` intersections work.
+  - [x] contradiction does not corrupt param binding.
+  - [x] `AND false` sets a no-match sentinel.
+  - [x] SQL `NULL` comparisons do not become storage null filters.
+  - [x] user entity columns named like system fields stay logical columns.
+
+Phase 4 implementation result:
+
+- `LogicalWritePlan` now owns the bound write plus logical planned filters. The planner intersects repeated predicates by bound column ID and leaves target/version semantics on `BoundWrite`/`VersionScope`; it does not map to live-state schema keys, entity IDs, file IDs, or `NullableKeyFilter`.
+- `SqlLogicalPlan` is now an enum that carries either a DataFusion read plan or a bound write plan. Write execution still returns the existing unsupported error until Phase 5/6 wire physical execution, but the write plan is no longer built and discarded.
+- Planner tests cover repeated equality contradictions, repeated `IN` intersections, bound parameter preservation, `AND false`, SQL `NULL`, by-version scope preservation, and user columns named `schema_key`.
+- Current gate: `cargo test -p lix_engine sql2::plan::write --lib -- --nocapture`, `cargo test -p lix_engine sql2::bind --lib -- --nocapture`, `cargo check -p lix_engine`, and `cargo fmt -p lix_engine --check` pass with the expected hard-cut unused-code warnings.
 
 ## Phase 5: DataFusion Path From Bound Plans
 

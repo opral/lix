@@ -52,4 +52,4 @@ pub(crate) use exec::{
     create_write_logical_plan_from_parsed, execute_logical_plan, execute_sql, SqlLogicalPlan,
 };
 pub(crate) use parse::parse_statement;
-pub(crate) use plan::{LogicalReadPlan, LogicalWritePlan};
+pub(crate) use plan::{plan_write, LogicalReadPlan, LogicalWritePlan};
