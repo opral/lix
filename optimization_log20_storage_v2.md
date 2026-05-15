@@ -3816,3 +3816,63 @@ Ranked next cuts:
    The slow path is fsync/fcntl. Optimization is mostly durability-mode or
    transaction policy, not storage_v2 write-set shape.
 ```
+
+## 2026-05-15: SQLite read lifecycle optimization
+
+Change:
+
+```text
+SqliteBackend now keeps a small read connection pool.
+SqliteRead owns a pooled connection, rolls it back on close/drop, and returns it
+to the pool.
+begin_read reuses cached BEGIN / snapshot-pin statements.
+get_many and visit_range use rusqlite prepare_cached for repeated query shapes.
+```
+
+Why:
+
+```text
+The focused profile showed SQLite reads were dominated by:
+  begin_read connection/transaction setup
+  sqlite3Prepare/parser
+  pager/WAL shared-lock path
+  SqliteRead close/drop connection path
+
+Opening and dropping a SQLite connection per read was not representative of the
+backend API cost we want to study.
+```
+
+Validation:
+
+```sh
+cargo test -p lix_engine --test backend sqlite -- --nocapture
+```
+
+Result:
+
+```text
+sqlite_backend_passes_backend_v2_conformance ... ok
+```
+
+Focused bench deltas:
+
+| Case | Before focused profile | After read pool | After prepare_cached |
+| ---- | ---------------------: | --------------: | -------------------: |
+| sqlite direct get_many m1000/u100 | 2.439 ms | 528 us | 298 us |
+| sqlite direct scan visit q1000 | 2.571 ms | 347 us | 305 us |
+
+Interpretation:
+
+```text
+The read pool was the big cut:
+  get_many improved about 4.6x
+  scan visit improved about 7.4x
+
+prepare_cached then removed most remaining parser cost:
+  get_many improved another ~1.8x
+  scan visit improved another ~1.1x
+
+Compared to the original focused profile:
+  get_many is now about 8.2x faster
+  scan visit is now about 8.4x faster
+```

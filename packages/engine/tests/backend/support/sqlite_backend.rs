@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use lix_engine::backend_v2::{
@@ -26,13 +27,15 @@ pub struct SqliteBackendFixture {
     path: PathBuf,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SqliteBackend {
     path: PathBuf,
+    read_pool: Arc<Mutex<Vec<Connection>>>,
 }
 
 pub struct SqliteRead {
-    conn: Connection,
+    conn: Option<Connection>,
+    read_pool: Arc<Mutex<Vec<Connection>>>,
 }
 
 pub struct SqliteWrite {
@@ -83,7 +86,10 @@ impl SqliteBackend {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, BackendError> {
         let path = path.into();
         initialize_database(&path)?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            read_pool: Arc::new(Mutex::new(Vec::new())),
+        })
     }
 
     #[allow(dead_code)]
@@ -119,11 +125,19 @@ impl Backend for SqliteBackend {
     }
 
     fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, BackendError> {
-        let conn = self.connect()?;
-        conn.execute_batch("BEGIN DEFERRED TRANSACTION")
-            .map_err(sqlite_error)?;
+        let conn = self
+            .read_pool
+            .lock()
+            .map_err(|error| BackendError::Io(format!("sqlite read pool poisoned: {error}")))?
+            .pop()
+            .map(Ok)
+            .unwrap_or_else(|| self.connect())?;
+        execute_cached(&conn, "BEGIN DEFERRED TRANSACTION")?;
         pin_read_snapshot(&conn)?;
-        Ok(SqliteRead { conn })
+        Ok(SqliteRead {
+            conn: Some(conn),
+            read_pool: Arc::clone(&self.read_pool),
+        })
     }
 
     fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
@@ -144,7 +158,7 @@ impl BackendRead for SqliteRead {
         keys: &[Key],
         opts: GetOptions<'_>,
     ) -> Result<GetManyResult, BackendError> {
-        get_many(&self.conn, space, keys, opts)
+        get_many(self.conn(), space, keys, opts)
     }
 
     fn visit_range<V>(
@@ -157,14 +171,38 @@ impl BackendRead for SqliteRead {
     where
         V: ScanVisitor + ?Sized,
     {
-        visit_range(&self.conn, space, range, opts, visitor)
+        visit_range(self.conn(), space, range, opts, visitor)
     }
 
-    fn close(self) -> Result<(), BackendError> {
+    fn close(mut self) -> Result<(), BackendError> {
+        self.finish()
+    }
+}
+
+impl SqliteRead {
+    fn conn(&self) -> &Connection {
         self.conn
-            .execute_batch("ROLLBACK")
-            .map_err(sqlite_error)
-            .or_else(ignore_no_transaction)
+            .as_ref()
+            .expect("sqlite read connection is present")
+    }
+
+    fn finish(&mut self) -> Result<(), BackendError> {
+        let Some(conn) = self.conn.take() else {
+            return Ok(());
+        };
+        let result = execute_cached(&conn, "ROLLBACK").or_else(ignore_no_transaction);
+        if result.is_ok() {
+            if let Ok(mut pool) = self.read_pool.lock() {
+                pool.push(conn);
+            }
+        }
+        result
+    }
+}
+
+impl Drop for SqliteRead {
+    fn drop(&mut self) {
+        let _ = self.finish();
     }
 }
 
@@ -245,9 +283,16 @@ fn open_connection(path: &Path) -> Result<Connection, BackendError> {
 }
 
 fn pin_read_snapshot(conn: &Connection) -> Result<(), BackendError> {
-    let _: i64 = conn
-        .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+    let mut stmt = conn
+        .prepare_cached("SELECT COUNT(*) FROM entries")
         .map_err(sqlite_error)?;
+    let _: i64 = stmt.query_row([], |row| row.get(0)).map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn execute_cached(conn: &Connection, sql: &str) -> Result<(), BackendError> {
+    let mut stmt = conn.prepare_cached(sql).map_err(sqlite_error)?;
+    stmt.execute([]).map_err(sqlite_error)?;
     Ok(())
 }
 
@@ -282,7 +327,7 @@ fn get_many(
         .collect::<Vec<_>>();
     values.push(SqlValue::Integer(space.0 as i64));
 
-    let mut stmt = conn.prepare(&sql).map_err(sqlite_error)?;
+    let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
     let mut rows = stmt
         .query(rusqlite::params_from_iter(values))
         .map_err(sqlite_error)?;
@@ -329,7 +374,7 @@ where
     sql.push_str(" ORDER BY key ASC LIMIT ?");
     values.push(SqlValue::Integer((limit.saturating_add(1)) as i64));
 
-    let mut stmt = conn.prepare(&sql).map_err(sqlite_error)?;
+    let mut stmt = conn.prepare_cached(&sql).map_err(sqlite_error)?;
     let mut rows = stmt
         .query(rusqlite::params_from_iter(values))
         .map_err(sqlite_error)?;
