@@ -3678,3 +3678,50 @@ Do not change the backend_v2 API based on this smoke pass alone. The matrix now
 shows backend-specific implementation costs more strongly than generic storage
 shape costs.
 ```
+
+## 2026-05-15: direct backend profile harness
+
+Added `storage_v2/backend_direct_profile/{backend}` lanes to separate backend
+hot paths from fixture setup. These benches set up files/seeds once outside the
+sampled loop and measure only:
+
+```text
+write:
+  begin_write -> put_many/delete_many batches -> commit
+
+read:
+  begin_read -> get_many / visit_many / visit_range -> close
+```
+
+Smoke command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 cargo bench -p lix_engine --features storage-benches \
+  --bench storage_v2 'storage_v2/backend_direct_profile'
+```
+
+Representative smoke ranges:
+
+| Case                         | in_memory | sqlite_temp | redb_temp | rocksdb_temp |
+| ---------------------------- | --------: | ----------: | --------: | -----------: |
+| direct commit puts k1024/g16 | 109-257us |  1.8-11.6ms | 4.7-6.3ms |    1.6-4.1ms |
+| direct mixed 80/20 k1024/g16 | 104-185us |   2.3-7.3ms | 5.6-7.5ms |    1.7-4.1ms |
+| direct touched k128/g16      |   10-22us |   2.4-4.9ms | 4.1-4.9ms |    206-554us |
+| direct get_many m1000/u100   |  78-116us |   2.6-4.7ms | 289-430us |   994-2013us |
+| direct visit_many m1000/u100 |  40-109us |   2.1-3.9ms | 362-734us |  1174-3106us |
+| direct scan visit q1000      | 2.2-6.1us |   1.3-2.0ms | 196-460us |   334-5078us |
+| direct scan materialized     |   12-20us |   1.3-1.7ms | 262-423us |    523-858us |
+
+Interpretation:
+
+```text
+The old backend_matrix remains useful for end-to-end storage shape.
+The new direct_profile group is the one to use for flamegraphs and Instruments
+when ranking backend implementation work.
+
+This removes DB open/copy/seed work from the sampled loop. The next profiles
+should target direct_profile lanes first:
+  - redb direct commits
+  - sqlite direct point reads/scans
+  - rocksdb direct scans and get_many
+```
