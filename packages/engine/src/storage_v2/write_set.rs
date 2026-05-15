@@ -6,6 +6,9 @@ use crate::backend_v2::{
     StoredValue, WriteOptions,
 };
 use crate::storage_v2::{StorageSpace, StorageWriteSetStats};
+use ahash::RandomState;
+
+type FastHashBuilder = RandomState;
 
 #[derive(Clone, Debug, Default)]
 pub struct StorageWriteSet {
@@ -99,7 +102,10 @@ impl StorageWriteSet {
             mutation_count += group.puts.len() + group.deletes.len();
         }
 
-        let mut seen = HashSet::with_capacity(mutation_count);
+        let mut seen = HashSet::with_capacity_and_hasher(
+            mutation_count,
+            FastHashBuilder::with_seeds(0, 0, 0, 0),
+        );
         for group in self.groups.values() {
             for put in &group.puts {
                 if !seen.insert((group.space.id, put.key.clone())) {

@@ -3017,6 +3017,7 @@ dependencies = [
 name = "lix_engine"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "async-trait",
  "base64 0.22.1",
  "blake3",
@@ -3035,6 +3036,7 @@ dependencies = [
  "precis-profiles",
  "rocksdb",
  "rusqlite",
+ "rustc-hash 2.1.1",
  "ruzstd",
  "serde",
  "serde_json",

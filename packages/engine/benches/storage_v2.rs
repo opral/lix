@@ -1,4 +1,7 @@
 use std::cell::{Cell, RefCell};
+use std::collections::hash_map::RandomState;
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, Hasher};
 use std::ops::Bound;
 use std::rc::Rc;
 
@@ -13,6 +16,8 @@ use lix_engine::backend_v2::{
     StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::storage_v2::{StorageContext, StorageReadScope, StorageReader, StorageSpace};
+use rustc_hash::FxBuildHasher;
+use xxhash_rust::xxh3::Xxh3DefaultBuilder;
 
 #[derive(Clone, Copy)]
 struct WriteCase {
@@ -186,6 +191,191 @@ fn storage_v2_benches(c: &mut Criterion) {
     bench_point_read_adapter(c);
     bench_prefix_scan_adapter(c);
     bench_conformance_backend(c);
+    bench_hash_algorithms(c);
+}
+
+fn bench_hash_algorithms(c: &mut Criterion) {
+    let mut group = c.benchmark_group("storage_v2/hash_algorithms");
+    group.sample_size(10);
+
+    let point_keys = point_request_keys(10_000, 100);
+    let unique_keys = point_request_keys(1_000, 1_000);
+    let write_mutations = write_mutations(&WriteCase {
+        name: "puts_k1024_g16_v32",
+        writes: 1_024,
+        spaces: 16,
+        value_size: 32,
+        mix: WriteMix::PutsOnly,
+    });
+
+    bench_hash_algorithm(
+        &mut group,
+        "std_siphash",
+        RandomState::new(),
+        &point_keys,
+        &unique_keys,
+        &write_mutations,
+    );
+    bench_hash_algorithm(
+        &mut group,
+        "ahash",
+        ahash::RandomState::new(),
+        &point_keys,
+        &unique_keys,
+        &write_mutations,
+    );
+    bench_hash_algorithm(
+        &mut group,
+        "rustc_fx",
+        FxBuildHasher,
+        &point_keys,
+        &unique_keys,
+        &write_mutations,
+    );
+    bench_hash_algorithm(
+        &mut group,
+        "xxh3",
+        Xxh3DefaultBuilder::new(),
+        &point_keys,
+        &unique_keys,
+        &write_mutations,
+    );
+    bench_hash_algorithm(
+        &mut group,
+        "blake3",
+        Blake3BuildHasher,
+        &point_keys,
+        &unique_keys,
+        &write_mutations,
+    );
+
+    group.finish();
+}
+
+fn bench_hash_algorithm<S>(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    name: &'static str,
+    build_hasher: S,
+    point_keys: &[Key],
+    unique_keys: &[Key],
+    write_mutations: &[WriteMutation],
+) where
+    S: BuildHasher + Clone + 'static,
+{
+    group.throughput(Throughput::Elements(point_keys.len() as u64));
+    group.bench_function(BenchmarkId::new("point_reconstruction", name), |b| {
+        b.iter(|| {
+            let mut seen =
+                HashSet::with_capacity_and_hasher(point_keys.len(), build_hasher.clone());
+            let mut backend_keys = Vec::with_capacity(point_keys.len());
+            for key in black_box(point_keys) {
+                if seen.insert(key) {
+                    backend_keys.push(key.clone());
+                }
+            }
+
+            let mut found =
+                HashMap::with_capacity_and_hasher(backend_keys.len(), build_hasher.clone());
+            for key in &backend_keys {
+                found.insert(key.clone(), ProjectedValue::FullValue(key.0.clone()));
+            }
+
+            let mut values = Vec::with_capacity(point_keys.len());
+            for key in point_keys {
+                values.push(found.get(key).cloned());
+            }
+
+            assert_eq!(backend_keys.len(), 100);
+            assert_eq!(values.len(), point_keys.len());
+            black_box(values);
+        });
+    });
+
+    group.throughput(Throughput::Elements(unique_keys.len() as u64));
+    group.bench_function(BenchmarkId::new("unique_point_reconstruction", name), |b| {
+        b.iter(|| {
+            let mut seen =
+                HashSet::with_capacity_and_hasher(unique_keys.len(), build_hasher.clone());
+            let mut backend_keys = Vec::with_capacity(unique_keys.len());
+            for key in black_box(unique_keys) {
+                if seen.insert(key) {
+                    backend_keys.push(key.clone());
+                }
+            }
+
+            let mut found =
+                HashMap::with_capacity_and_hasher(backend_keys.len(), build_hasher.clone());
+            for key in &backend_keys {
+                found.insert(key.clone(), ProjectedValue::FullValue(key.0.clone()));
+            }
+
+            let mut values = Vec::with_capacity(unique_keys.len());
+            for key in unique_keys {
+                values.push(found.get(key).cloned());
+            }
+
+            assert_eq!(backend_keys.len(), unique_keys.len());
+            assert_eq!(values.len(), unique_keys.len());
+            black_box(values);
+        });
+    });
+
+    group.throughput(Throughput::Elements(write_mutations.len() as u64));
+    group.bench_function(BenchmarkId::new("write_validation", name), |b| {
+        b.iter(|| {
+            let mut seen =
+                HashSet::with_capacity_and_hasher(write_mutations.len(), build_hasher.clone());
+            for mutation in black_box(write_mutations) {
+                match mutation {
+                    WriteMutation::Put(space, key, _) | WriteMutation::Delete(space, key) => {
+                        assert!(seen.insert((space.id, key.clone())));
+                    }
+                }
+            }
+            assert_eq!(seen.len(), write_mutations.len());
+            black_box(seen);
+        });
+    });
+
+    group.throughput(Throughput::Elements(point_keys.len() as u64));
+    group.bench_function(BenchmarkId::new("raw_hash", name), |b| {
+        b.iter(|| {
+            let mut hash = 0;
+            for key in black_box(point_keys) {
+                hash ^= build_hasher.hash_one(key);
+            }
+            black_box(hash);
+        });
+    });
+}
+
+#[derive(Clone, Copy, Default)]
+struct Blake3BuildHasher;
+
+impl BuildHasher for Blake3BuildHasher {
+    type Hasher = Blake3StdHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        Blake3StdHasher::default()
+    }
+}
+
+#[derive(Clone, Default)]
+struct Blake3StdHasher {
+    inner: blake3::Hasher,
+}
+
+impl Hasher for Blake3StdHasher {
+    fn finish(&self) -> u64 {
+        let digest = self.inner.finalize();
+        let mut bytes = [0; 8];
+        bytes.copy_from_slice(&digest.as_bytes()[..8]);
+        u64::from_le_bytes(bytes)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.inner.update(bytes);
+    }
 }
 
 fn bench_write_set_lowering(c: &mut Criterion) {

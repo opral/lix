@@ -2,6 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::backend_v2::{BackendError, BackendRead, GetOptions, Key, ProjectedValue, SpaceId};
 use crate::storage_v2::{StorageReadResult, StorageReadStats};
+use ahash::RandomState;
+
+type FastHashBuilder = RandomState;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PointSlot {
@@ -60,7 +63,10 @@ pub(crate) fn get_many_values_caller_order_with_stats<R>(
 where
     R: BackendRead,
 {
-    let mut seen = HashSet::<&Key>::with_capacity(keys.len());
+    let mut seen = HashSet::<&Key, FastHashBuilder>::with_capacity_and_hasher(
+        keys.len(),
+        FastHashBuilder::with_seeds(0, 0, 0, 0),
+    );
     let mut backend_keys = Vec::with_capacity(keys.len());
     for key in keys {
         if seen.insert(key) {
@@ -70,7 +76,10 @@ where
 
     let result = read.get_many(space, &backend_keys, opts)?;
 
-    let mut found = HashMap::with_capacity(result.entries.entries.len());
+    let mut found = HashMap::with_capacity_and_hasher(
+        result.entries.entries.len(),
+        FastHashBuilder::with_seeds(0, 0, 0, 0),
+    );
     for entry in result.entries.entries {
         found.insert(entry.key, entry.value);
     }
