@@ -3353,3 +3353,75 @@ workloads. If SQLite/RocksDB/redb or domain-shaped traces show deep hot overlays
 add a policy such as "compact after N layers" or "compact when overlay rows /
 base rows crosses a threshold."
 ```
+
+## 2026-05-15: backend matrix scaffold
+
+Change:
+
+```text
+Added a reusable storage backend benchmark family scaffold:
+
+  StorageBenchBackend
+    name()
+    open_empty()
+    seed_points()
+    fork_for_write()
+
+The first backend family is in_memory. SQLite, redb, and RocksDB can now plug
+into the same storage-level lanes without duplicating benchmark logic.
+```
+
+Matrix lanes:
+
+```text
+writes:
+  commit_puts_k1024_g16_v32
+  mixed80_20_k1024_g16_v32
+  commit_puts_k128_g16_existing10k_touched_v32
+
+point reads:
+  planned_visit_unique_m1000_u100
+  planned_get_many_m1000_u100
+
+scans:
+  scan_range_visit_key_only_q1000
+  scan_range_q1000
+  prefix_scan_q1000
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+
+STORAGE_V2_BENCH_SMOKE=1 cargo bench -p lix_engine --features storage-benches \
+  --bench storage_v2 \
+  '^storage_v2/backend_matrix/in_memory/(commit_puts_k1024_g16_v32|mixed80_20_k1024_g16_v32|commit_puts_k128_g16_existing10k_touched_v32|planned_visit_unique_m1000_u100|planned_get_many_m1000_u100|scan_range_visit_key_only_q1000|scan_range_q1000|prefix_scan_q1000)$'
+```
+
+Smoke baseline:
+
+| Case                                      | Smoke range |
+| ----------------------------------------- | ----------: |
+| commit puts k1024/g16                     | 114-354 us  |
+| mixed 80/20 k1024/g16                     |  87-116 us  |
+| commit touched existing k128/g16          | 8.9-10.9 us |
+| planned visit unique m1000/u100           | 4.6-4.8 us  |
+| planned get many m1000/u100               | 3.7-4.3 us  |
+| scan range visit key-only q1000           | 2.0-3.9 us  |
+| scan range materialized q1000             | 21-24 us    |
+| prefix scan materialized q1000            | 12-20 us    |
+
+Interpretation:
+
+```text
+The matrix scaffold is ready for real backends. The in-memory smoke numbers are
+in the same shape as the specialized in-memory benches, so the generic harness
+does not appear to distort the measurement target.
+
+The next backend additions should implement only the StorageBenchBackend fixture
+operations first, then use this exact lane set for SQLite temp-file, redb
+temp-file, and RocksDB temp-dir comparisons.
+```

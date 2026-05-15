@@ -91,6 +91,43 @@ struct PrefixCase {
     rows: usize,
 }
 
+trait StorageBenchBackend {
+    type Backend: Backend;
+
+    fn name(&self) -> &'static str;
+
+    fn open_empty(&self) -> Self::Backend;
+
+    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Backend;
+
+    fn fork_for_write(&self, backend: &Self::Backend) -> Self::Backend;
+}
+
+#[derive(Clone, Copy)]
+struct InMemoryBenchBackend;
+
+impl StorageBenchBackend for InMemoryBenchBackend {
+    type Backend = InMemoryBackend;
+
+    fn name(&self) -> &'static str {
+        "in_memory"
+    }
+
+    fn open_empty(&self) -> Self::Backend {
+        InMemoryBackend::new()
+    }
+
+    fn seed_points(&self, space: SpaceId, rows: u32, value_size: usize) -> Self::Backend {
+        seeded_in_memory_backend_with_value_size(space.0, rows, value_size)
+    }
+
+    fn fork_for_write(&self, backend: &Self::Backend) -> Self::Backend {
+        backend
+            .fork_snapshot()
+            .expect("fork in-memory bench backend")
+    }
+}
+
 const WRITE_CASES: &[WriteCase] = &[
     WriteCase {
         name: "puts_k128_g1_v32",
@@ -237,6 +274,7 @@ fn storage_v2_benches(c: &mut Criterion) {
     bench_point_read_planned_lean_backend(c);
     bench_prefix_scan_adapter(c);
     bench_conformance_backend(c);
+    bench_storage_backend_matrix(c, InMemoryBenchBackend);
     bench_in_memory_backend(c);
     bench_scan_visitor_baseline(c);
     bench_hash_algorithms(c);
@@ -819,6 +857,238 @@ fn bench_conformance_backend(c: &mut Criterion) {
             .expect("scan range");
             assert_eq!(page.entries.entries.len(), 1_000);
             black_box(page);
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_storage_backend_matrix<B>(c: &mut Criterion, backend_family: B)
+where
+    B: StorageBenchBackend,
+{
+    let group_name = format!("storage_v2/backend_matrix/{}", backend_family.name());
+    let mut group = c.benchmark_group(group_name);
+    group.sample_size(10);
+    if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_some() {
+        group.warm_up_time(Duration::from_millis(100));
+        group.measurement_time(Duration::from_millis(250));
+    }
+
+    let commit_case = WriteCase {
+        name: "commit_puts_k1024_g16_v32",
+        writes: 1_024,
+        spaces: 16,
+        value_size: 32,
+        mix: WriteMix::PutsOnly,
+    };
+    let commit_mutations = write_mutations(&commit_case);
+    group.throughput(Throughput::Elements(commit_case.writes as u64));
+    group.bench_function(commit_case.name, |b| {
+        b.iter_batched(
+            || {
+                let backend = backend_family.open_empty();
+                let storage = StorageContext::new(backend);
+                let writes = write_set_from_mutations(&storage, &commit_mutations);
+                (storage, writes)
+            },
+            |(storage, writes)| {
+                let (_commit, stats) = storage
+                    .commit_write_set(writes, WriteOptions::default())
+                    .expect("commit backend matrix write set");
+                assert_eq!(stats.staged_puts, 1_024);
+                assert_eq!(stats.put_batches, 16);
+                black_box(stats);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    let mixed_case = WriteCase {
+        name: "mixed80_20_k1024_g16_v32",
+        writes: 1_024,
+        spaces: 16,
+        value_size: 32,
+        mix: WriteMix::PutDelete80_20,
+    };
+    let mixed_mutations = write_mutations(&mixed_case);
+    group.throughput(Throughput::Elements(mixed_case.writes as u64));
+    group.bench_function(mixed_case.name, |b| {
+        b.iter_batched(
+            || {
+                let backend = backend_family.open_empty();
+                let storage = StorageContext::new(backend);
+                let writes = write_set_from_mutations(&storage, &mixed_mutations);
+                (storage, writes)
+            },
+            |(storage, writes)| {
+                let (_commit, stats) = storage
+                    .commit_write_set(writes, WriteOptions::default())
+                    .expect("commit backend matrix mixed write set");
+                assert_eq!(stats.staged_puts, 816);
+                assert_eq!(stats.staged_deletes, 208);
+                assert_eq!(stats.put_batches, 16);
+                assert_eq!(stats.delete_batches, 16);
+                black_box(stats);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    let touched_case = WriteCase {
+        name: "commit_puts_k128_g16_existing10k_touched_v32",
+        writes: 128,
+        spaces: 16,
+        value_size: 32,
+        mix: WriteMix::PutsOnly,
+    };
+    let touched_mutations = write_mutations(&touched_case);
+    let touched_seed = backend_family.seed_points(SpaceId(1), 10_000, 32);
+    group.throughput(Throughput::Elements(touched_case.writes as u64));
+    group.bench_function(touched_case.name, |b| {
+        b.iter_batched(
+            || {
+                let backend = backend_family.fork_for_write(&touched_seed);
+                let storage = StorageContext::new(backend);
+                let writes = write_set_from_mutations(&storage, &touched_mutations);
+                (storage, writes)
+            },
+            |(storage, writes)| {
+                let (_commit, stats) = storage
+                    .commit_write_set(writes, WriteOptions::default())
+                    .expect("commit backend matrix touched write set");
+                assert_eq!(stats.staged_puts, 128);
+                assert_eq!(stats.put_batches, 16);
+                black_box(stats);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    let point_backend = backend_family.seed_points(SpaceId(1), 100, 32);
+    let point_read = point_backend
+        .begin_read(ReadOptions::default())
+        .expect("begin backend matrix point read");
+    let point_scope = StorageReadScope::new(point_read);
+    let point_keys = point_request_keys(1_000, 100);
+    let point_plan = PointRequestPlan::new(&point_keys);
+    group.throughput(Throughput::Elements(1_000));
+    group.bench_function("planned_visit_unique_m1000_u100", |b| {
+        b.iter(|| {
+            let mut visited = 0usize;
+            let mut bytes_seen = 0usize;
+            let stats = point_scope
+                .visit_unique_point_values_for_plan(
+                    space(1),
+                    black_box(&point_plan),
+                    GetOptions::default(),
+                    &mut |index: usize, key: &Key, value: Option<ProjectedValueRef<'_>>| {
+                        visited += 1;
+                        if let Some(ProjectedValueRef::FullValue(value)) = value {
+                            bytes_seen += value.len();
+                        }
+                        black_box((index, key, value));
+                        Ok(())
+                    },
+                )
+                .expect("backend matrix planned point visitor");
+            assert_eq!(stats.requested_keys, 1_000);
+            assert_eq!(stats.unique_backend_keys, 100);
+            assert_eq!(stats.backend_calls, 1);
+            assert_eq!(visited, 100);
+            assert_eq!(bytes_seen, 3_200);
+            black_box(stats);
+        });
+    });
+
+    group.bench_function("planned_get_many_m1000_u100", |b| {
+        b.iter(|| {
+            let result = point_scope
+                .get_many_borrowed_indexed_values_for_plan_with_stats(
+                    space(1),
+                    black_box(&point_plan),
+                    GetOptions::default(),
+                )
+                .expect("backend matrix planned point read");
+            assert_eq!(result.stats.requested_keys, 1_000);
+            assert_eq!(result.stats.unique_backend_keys, 100);
+            assert_eq!(result.stats.backend_calls, 1);
+            assert_eq!(result.value.unique_values.len(), 100);
+            black_box(result.value);
+        });
+    });
+
+    let scan_backend = backend_family.seed_points(SpaceId(1), 1_000, 32);
+    let scan_read = scan_backend
+        .begin_read(ReadOptions::default())
+        .expect("begin backend matrix scan read");
+    let scan_scope = StorageReadScope::new(scan_read);
+    group.throughput(Throughput::Elements(1_000));
+    group.bench_function("scan_range_visit_key_only_q1000", |b| {
+        b.iter(|| {
+            let mut visited = 0usize;
+            let result = scan_scope
+                .visit_scan_range(
+                    space(1),
+                    point_scan_range(),
+                    ScanOptions {
+                        limit_rows: 1_001,
+                        projection: CoreProjection::KeyOnly,
+                        ..ScanOptions::default()
+                    },
+                    &mut |key: &Key, value: ProjectedValueRef<'_>| {
+                        visited += 1;
+                        assert!(matches!(value, ProjectedValueRef::KeyOnly));
+                        black_box(key);
+                        Ok(())
+                    },
+                )
+                .expect("backend matrix scan visitor");
+            assert_eq!(visited, 1_000);
+            assert_eq!(result.emitted, 1_000);
+            assert!(!result.has_more);
+            black_box(result);
+        });
+    });
+
+    group.bench_function("scan_range_q1000", |b| {
+        b.iter(|| {
+            let page = scan_scope
+                .scan_range_with_stats(
+                    space(1),
+                    point_scan_range(),
+                    ScanOptions {
+                        limit_rows: 1_001,
+                        projection: CoreProjection::KeyOnly,
+                        ..ScanOptions::default()
+                    },
+                )
+                .expect("backend matrix materialized scan");
+            assert_eq!(page.value.entries.entries.len(), 1_000);
+            assert_eq!(page.stats.backend_calls, 1);
+            black_box(page.value);
+        });
+    });
+
+    group.bench_function("prefix_scan_q1000", |b| {
+        b.iter(|| {
+            let page = scan_scope
+                .scan_prefix_with_stats(
+                    space(1),
+                    Prefix {
+                        bytes: Bytes::from_static(b"point-"),
+                    },
+                    ScanOptions {
+                        limit_rows: 1_001,
+                        projection: CoreProjection::KeyOnly,
+                        ..ScanOptions::default()
+                    },
+                )
+                .expect("backend matrix prefix scan");
+            assert_eq!(page.value.entries.entries.len(), 1_000);
+            assert_eq!(page.stats.backend_calls, 1);
+            assert_eq!(page.stats.prefix_lowered, 1);
+            black_box(page.value);
         });
     });
 
@@ -2032,6 +2302,27 @@ fn materialize_scan_visit(
         entries: ReadBatch { entries },
         has_more: result.has_more,
     })
+}
+
+fn write_set_from_mutations<B>(
+    storage: &StorageContext<B>,
+    mutations: &[WriteMutation],
+) -> StorageWriteSet
+where
+    B: Backend,
+{
+    let mut writes = storage.new_write_set();
+    for mutation in mutations {
+        match mutation {
+            WriteMutation::Put(space, key, value) => {
+                writes.stage_put(*space, key.clone(), value.clone());
+            }
+            WriteMutation::Delete(space, key) => {
+                writes.stage_delete(*space, key.clone());
+            }
+        }
+    }
+    writes
 }
 
 fn write_mutations(case: &WriteCase) -> Vec<WriteMutation> {
