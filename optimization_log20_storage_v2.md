@@ -1054,3 +1054,61 @@ The Big-O is unchanged, but the duplicate-heavy constant factor is much lower
 and the output allocation scales with U values plus M indexes instead of M
 values.
 ```
+
+### 2026-05-14: Lean Indexed Point Benchmark Backend
+
+Change:
+
+```text
+Added a second indexed point-read benchmark group:
+
+  storage_v2/point_read_indexed_lean_backend
+
+The existing point-read benchmark backend remains as a shape-checking fixture:
+it records requested backend keys and returns fixture entries. The lean backend
+is intentionally fixture-shaped and avoids that request recording so the bench
+better isolates storage_v2 indexed adapter overhead.
+```
+
+Why:
+
+```text
+After adding IndexedPointValues, the fake benchmark backend became visible in
+the measured path. This split lets us compare:
+
+  shape-checking fake backend
+  lean fake backend
+
+before changing backend_v2 or storage_v2 APIs.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 point_read_indexed_lean_backend
+```
+
+Lean indexed point-read scorecard:
+
+| Case                   |      Mean |
+| ---------------------- | --------: |
+| `m100_u100`            | 2.1063 us |
+| `m1000_u1000`          | 23.640 us |
+| `m1000_u100`           | 7.4548 us |
+| `m10000_u100`          | 53.928 us |
+| `m1000_u100_missing10` | 7.2741 us |
+| `m1000_u100_missing90` | 6.1794 us |
+
+Interpretation:
+
+```text
+The lean backend improves small and unique-heavy indexed point cases, which
+confirms the shape-checking fixture has measurable overhead.
+
+For the large duplicate-heavy m10000/u100 case, the result remains around the
+same 50us band and varies run-to-run. That suggests the dominant remaining cost
+is storage_v2 dedupe/index construction over M requested keys, not fake backend
+request recording.
+```

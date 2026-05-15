@@ -190,6 +190,7 @@ fn storage_v2_benches(c: &mut Criterion) {
     bench_write_set_lowering(c);
     bench_point_read_adapter(c);
     bench_point_read_indexed_adapter(c);
+    bench_point_read_indexed_lean_backend(c);
     bench_prefix_scan_adapter(c);
     bench_conformance_backend(c);
     bench_hash_algorithms(c);
@@ -513,6 +514,46 @@ fn bench_point_read_indexed_adapter(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_point_read_indexed_lean_backend(c: &mut Criterion) {
+    let mut group = c.benchmark_group("storage_v2/point_read_indexed_lean_backend");
+    group.sample_size(10);
+
+    for case in POINT_CASES {
+        let keys = point_request_keys(case.requested_keys, case.unique_keys);
+        let expected_unique_missing = case.unique_keys - case.existing_unique_keys;
+        let read = StorageReadScope::new(LeanPointReadBackend::new(case.existing_unique_keys));
+        group.throughput(Throughput::Elements(case.requested_keys as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
+            b.iter(|| {
+                let result = read
+                    .get_many_indexed_values_caller_order_with_stats(
+                        space(1),
+                        black_box(&keys),
+                        GetOptions::default(),
+                    )
+                    .expect("indexed point read");
+                assert_eq!(result.stats.requested_keys, case.requested_keys as u64);
+                assert_eq!(result.stats.unique_backend_keys, case.unique_keys as u64);
+                assert_eq!(result.stats.backend_calls, 1);
+                assert_eq!(result.value.len(), case.requested_keys);
+                assert_eq!(result.value.unique_values.len(), case.unique_keys);
+                assert_eq!(
+                    result
+                        .value
+                        .unique_values
+                        .iter()
+                        .filter(|value| value.is_none())
+                        .count(),
+                    expected_unique_missing
+                );
+                black_box(result.value);
+            });
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_prefix_scan_adapter(c: &mut Criterion) {
     let mut group = c.benchmark_group("storage_v2/prefix_scan_adapter");
     group.sample_size(10);
@@ -759,6 +800,52 @@ impl BackendRead for PointReadBackend {
         _opts: ScanOptions<'_>,
     ) -> Result<ScanPage, BackendError> {
         unreachable!("point-read benchmark does not scan")
+    }
+}
+
+#[derive(Clone)]
+struct LeanPointReadBackend {
+    values: Rc<Vec<ReadEntry>>,
+}
+
+impl LeanPointReadBackend {
+    fn new(existing_unique_keys: usize) -> Self {
+        let values = (0..existing_unique_keys)
+            .map(|index| {
+                let key = key(format!("point-{index:04}"));
+                ReadEntry {
+                    key: key.clone(),
+                    value: ProjectedValue::FullValue(key.0.clone()),
+                }
+            })
+            .collect();
+        Self {
+            values: Rc::new(values),
+        }
+    }
+}
+
+impl BackendRead for LeanPointReadBackend {
+    fn get_many(
+        &self,
+        _space: SpaceId,
+        keys: &[Key],
+        _opts: GetOptions<'_>,
+    ) -> Result<GetManyResult, BackendError> {
+        let found = keys.len().min(self.values.len());
+        let entries = self.values.iter().take(found).cloned().collect();
+        Ok(GetManyResult {
+            entries: ReadBatch { entries },
+        })
+    }
+
+    fn scan_range(
+        &self,
+        _space: SpaceId,
+        _range: KeyRange,
+        _opts: ScanOptions<'_>,
+    ) -> Result<ScanPage, BackendError> {
+        unreachable!("lean point-read benchmark does not scan")
     }
 }
 
