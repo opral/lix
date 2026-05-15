@@ -261,12 +261,13 @@ async fn try_execute_update(
             spec,
             version_binding,
         } => {
+            let require_version_filter = version_binding.is_none();
             let filter = match simple_entity_filter(
                 update.selection,
                 &mut decoder,
                 &spec,
                 version_binding.as_deref(),
-                false,
+                require_version_filter,
             ) {
                 Ok(filter) => filter,
                 Err(error) if is_fast_path_miss(&error) => return Ok(None),
@@ -745,7 +746,11 @@ fn live_lix_state_write_row(
         change_id: None,
         commit_id: None,
         untracked: row.untracked,
-        version_id: row.version_id.clone(),
+        version_id: if row.global {
+            GLOBAL_VERSION_ID.to_string()
+        } else {
+            row.version_id.clone()
+        },
     })
 }
 
@@ -770,7 +775,11 @@ fn live_entity_write_row(
         change_id: None,
         commit_id: None,
         untracked: row.untracked,
-        version_id: row.version_id.clone(),
+        version_id: if row.global {
+            GLOBAL_VERSION_ID.to_string()
+        } else {
+            row.version_id.clone()
+        },
     })
 }
 
@@ -864,7 +873,15 @@ fn simple_assignments(
                 "simple DML fast path does not support dynamic assignment targets",
             ));
         };
-        result.insert(column, decoder.expr_value(&assignment.value)?);
+        if result
+            .insert(column.clone(), decoder.expr_value(&assignment.value)?)
+            .is_some()
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("simple DML assigns column '{column}' more than once"),
+            ));
+        }
     }
     Ok(result)
 }
@@ -1002,7 +1019,12 @@ fn apply_column_values(
                 filter.no_match = true;
             }
         }
-        "version_id" | "lixcol_version_id" if allow_version_filter => {
+        "version_id" if spec.is_none() && allow_version_filter => {
+            if merge_string_filter(&mut filter.version_ids, string_values(values, &column)?)? {
+                filter.no_match = true;
+            }
+        }
+        "lixcol_version_id" if allow_version_filter => {
             if merge_string_filter(&mut filter.version_ids, string_values(values, &column)?)? {
                 filter.no_match = true;
             }
@@ -1093,6 +1115,15 @@ fn row_cells(
             ),
         ));
     }
+    let mut seen = std::collections::BTreeSet::new();
+    for column in columns {
+        if !seen.insert(column) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("INSERT target column '{column}' is specified more than once"),
+            ));
+        }
+    }
     columns
         .iter()
         .zip(values)
@@ -1105,7 +1136,7 @@ fn simple_dml_target(
     active_version_id: &str,
     visible_schemas: &[JsonValue],
 ) -> Result<Option<SimpleDmlTarget>, LixError> {
-    let Some(target_name) = object_name_leaf(target_name) else {
+    let Some(target_name) = object_name_unqualified(target_name) else {
         return Ok(None);
     };
     if target_name == "lix_state" {
@@ -1433,6 +1464,13 @@ fn object_name_leaf(name: &ObjectName) -> Option<String> {
             ident.value.to_ascii_lowercase()
         }
     })
+}
+
+fn object_name_unqualified(name: &ObjectName) -> Option<String> {
+    if name.0.len() != 1 {
+        return None;
+    }
+    object_name_leaf(name)
 }
 
 fn ident_name(ident: &Ident) -> String {

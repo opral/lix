@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use crate::catalog::SchemaPlanId;
@@ -586,7 +586,6 @@ pub(crate) struct PreparedStateRowOverlay {
 
 pub(crate) struct StagedScanParts {
     pub(crate) rows: Vec<MaterializedLiveStateRow>,
-    pub(crate) hidden_identities: BTreeSet<PreparedStateRowIdentity>,
 }
 
 impl PreparedStateRowOverlay {
@@ -596,7 +595,11 @@ impl PreparedStateRowOverlay {
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        Ok(self.scan_parts(request)?.rows)
+        Ok(crate::live_state::visibility::resolve_scan_rows(
+            self.scan_parts(request)?.rows,
+            &request.filter.version_ids,
+            request.filter.include_tombstones,
+        ))
     }
 
     /// Returns staged rows and base-row identities hidden by staged rows in one pass.
@@ -608,10 +611,7 @@ impl PreparedStateRowOverlay {
         request: &LiveStateScanRequest,
     ) -> Result<StagedScanParts, LixError> {
         if request.filter.no_match {
-            return Ok(StagedScanParts {
-                rows: Vec::new(),
-                hidden_identities: BTreeSet::new(),
-            });
+            return Ok(StagedScanParts { rows: Vec::new() });
         }
 
         let rows_guard = self.staged_writes.rows.lock().map_err(|_| {
@@ -634,8 +634,7 @@ impl PreparedStateRowOverlay {
         })?;
 
         let mut rows = Vec::new();
-        let mut hidden_identities = BTreeSet::new();
-        for (identity, slot) in by_identity_guard.iter() {
+        for slot in by_identity_guard.values() {
             match *slot {
                 RowSlot::State(index) => {
                     let Some(row) = rows_guard.get(index).and_then(Option::as_ref) else {
@@ -644,10 +643,7 @@ impl PreparedStateRowOverlay {
                     if !staged_row_identity_matches_scan(row, request) {
                         continue;
                     }
-                    hidden_identities.insert(identity.clone());
-                    if row.snapshot.is_some() || request.filter.include_tombstones {
-                        rows.push(MaterializedLiveStateRow::from(row));
-                    }
+                    rows.push(MaterializedLiveStateRow::from(row));
                 }
                 RowSlot::Adopted(index) => {
                     let Some(row) = adopted_guard.get(index).and_then(Option::as_ref) else {
@@ -656,17 +652,11 @@ impl PreparedStateRowOverlay {
                     if !adopted_row_identity_matches_scan(row, request) {
                         continue;
                     }
-                    hidden_identities.insert(identity.clone());
-                    if row.snapshot.is_some() || request.filter.include_tombstones {
-                        rows.push(MaterializedLiveStateRow::from(row));
-                    }
+                    rows.push(MaterializedLiveStateRow::from(row));
                 }
             }
         }
-        Ok(StagedScanParts {
-            rows,
-            hidden_identities,
-        })
+        Ok(StagedScanParts { rows })
     }
 
     /// Returns a staged exact-row answer, if this transaction has one.
@@ -1037,9 +1027,7 @@ fn adopted_row_identity_matches_scan(
     {
         return false;
     }
-    if !request.filter.version_ids.is_empty()
-        && !request.filter.version_ids.contains(&row.version_id)
-    {
+    if !staged_version_matches_scan(&row.version_id, request) {
         return false;
     }
     if request.filter.untracked == Some(true) {
@@ -1061,9 +1049,7 @@ fn staged_row_identity_matches_scan(
     {
         return false;
     }
-    if !request.filter.version_ids.is_empty()
-        && !request.filter.version_ids.contains(&row.version_id)
-    {
+    if !staged_version_matches_scan(&row.version_id, request) {
         return false;
     }
     if request
@@ -1084,6 +1070,21 @@ fn nullable_key_matches_filters(
         || filters
             .iter()
             .any(|filter| nullable_key_matches_filter(value, filter))
+}
+
+fn staged_version_matches_scan(version_id: &str, request: &LiveStateScanRequest) -> bool {
+    request.filter.version_ids.is_empty()
+        || request
+            .filter
+            .version_ids
+            .iter()
+            .any(|requested| requested == version_id)
+        || (version_id == GLOBAL_VERSION_ID
+            && request
+                .filter
+                .version_ids
+                .iter()
+                .any(|requested| requested != GLOBAL_VERSION_ID))
 }
 
 fn nullable_key_matches_filter(value: &Option<String>, filter: &NullableKeyFilter<String>) -> bool {
