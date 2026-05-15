@@ -430,19 +430,8 @@ impl TransactionWriteBuffer {
 
     /// Builds the transaction-local read overlay from currently staged writes.
     pub(crate) fn staging_overlay(self: &Arc<Self>) -> Result<PreparedStateRowOverlay, LixError> {
-        let by_identity_guard = self.by_identity.lock().map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "failed to acquire transaction staged identity index lock",
-            )
-        })?;
-        let slots = by_identity_guard
-            .iter()
-            .map(|(identity, slot)| (identity.clone(), *slot))
-            .collect();
         Ok(PreparedStateRowOverlay {
             staged_writes: Arc::clone(self),
-            slots,
         })
     }
 
@@ -593,7 +582,6 @@ impl TransactionWriteBuffer {
 /// Read overlay derived from staged transaction writes.
 pub(crate) struct PreparedStateRowOverlay {
     staged_writes: Arc<TransactionWriteBuffer>,
-    slots: BTreeMap<PreparedStateRowIdentity, RowSlot>,
 }
 
 pub(crate) struct StagedScanParts {
@@ -631,10 +619,16 @@ impl PreparedStateRowOverlay {
                 "failed to acquire transaction staged adopted writes lock",
             )
         })?;
+        let by_identity_guard = self.staged_writes.by_identity.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged identity index lock",
+            )
+        })?;
 
         let mut rows = Vec::new();
         let mut hidden_identities = BTreeSet::new();
-        for (identity, slot) in &self.slots {
+        for (identity, slot) in by_identity_guard.iter() {
             match *slot {
                 RowSlot::State(index) => {
                     let Some(row) = rows_guard.get(index).and_then(Option::as_ref) else {
@@ -699,16 +693,13 @@ impl PreparedStateRowOverlay {
 
     #[cfg(test)]
     fn load_state_slot(&self, identity: &PreparedStateRowIdentity) -> Option<PreparedStateRow> {
-        let Some(RowSlot::State(index)) = self.slots.get(identity).copied() else {
+        let rows_guard = self.staged_writes.rows.lock().ok()?;
+        let _adopted_guard = self.staged_writes.adopted_rows.lock().ok()?;
+        let by_identity_guard = self.staged_writes.by_identity.lock().ok()?;
+        let Some(RowSlot::State(index)) = by_identity_guard.get(identity).copied() else {
             return None;
         };
-        self.staged_writes
-            .rows
-            .lock()
-            .ok()?
-            .get(index)?
-            .as_ref()
-            .cloned()
+        rows_guard.get(index)?.as_ref().cloned()
     }
 
     #[cfg(test)]
@@ -716,16 +707,13 @@ impl PreparedStateRowOverlay {
         &self,
         identity: &PreparedStateRowIdentity,
     ) -> Option<PreparedAdoptedStateRow> {
-        let Some(RowSlot::Adopted(index)) = self.slots.get(identity).copied() else {
+        let _rows_guard = self.staged_writes.rows.lock().ok()?;
+        let adopted_guard = self.staged_writes.adopted_rows.lock().ok()?;
+        let by_identity_guard = self.staged_writes.by_identity.lock().ok()?;
+        let Some(RowSlot::Adopted(index)) = by_identity_guard.get(identity).copied() else {
             return None;
         };
-        self.staged_writes
-            .adopted_rows
-            .lock()
-            .ok()?
-            .get(index)?
-            .as_ref()
-            .cloned()
+        adopted_guard.get(index)?.as_ref().cloned()
     }
 }
 
