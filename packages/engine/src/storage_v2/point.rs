@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use crate::backend_v2::{BackendError, BackendRead, GetOptions, Key, ProjectedValue, SpaceId};
+use crate::backend_v2::{
+    BackendError, BackendRead, GetOptions, Key, PointVisitor, ProjectedValue, SpaceId,
+};
 use crate::storage_v2::{StorageReadResult, StorageReadStats};
 use ahash::RandomState;
 
@@ -450,4 +452,24 @@ where
             prefix_lowered: 0,
         },
     ))
+}
+
+pub(crate) fn visit_unique_point_values_for_plan<R, V>(
+    read: &R,
+    space: SpaceId,
+    plan: &PointRequestPlan,
+    opts: GetOptions<'_>,
+    visitor: &mut V,
+) -> Result<StorageReadStats, BackendError>
+where
+    R: BackendRead,
+    V: PointVisitor + ?Sized,
+{
+    read.visit_many(space, &plan.unique_keys, opts, visitor)?;
+    Ok(StorageReadStats {
+        requested_keys: plan.requested_to_unique.len() as u64,
+        unique_backend_keys: plan.unique_keys.len() as u64,
+        backend_calls: 1,
+        prefix_lowered: 0,
+    })
 }

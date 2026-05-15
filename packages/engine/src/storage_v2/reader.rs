@@ -1,5 +1,5 @@
 use crate::backend_v2::{
-    BackendError, BackendRead, GetOptions, Key, KeyRange, Prefix, ProjectedValue,
+    BackendError, BackendRead, GetOptions, Key, KeyRange, PointVisitor, Prefix, ProjectedValue,
     ProjectedValueRef, ScanOptions, ScanPage, ScanResult, ScanVisitor,
 };
 use crate::storage_v2::{
@@ -10,8 +10,9 @@ use crate::storage_v2::{
     get_many_indexed_values_for_plan_with_stats, get_many_values_caller_order,
     get_many_values_caller_order_with_stats, scan_prefix, scan_prefix_into, scan_prefix_with_stats,
     scan_range, scan_range_into, scan_range_with_stats, visit_scan_prefix, visit_scan_range,
-    BorrowedIndexedPointValues, BorrowedScanPage, IndexedPointValues, PointRequestPlan, PointSlot,
-    StorageReadResult, StorageReadScope, StorageReadStats, StorageScanBuffer, StorageSpace,
+    visit_unique_point_values_for_plan, BorrowedIndexedPointValues, BorrowedScanPage,
+    IndexedPointValues, PointRequestPlan, PointSlot, StorageReadResult, StorageReadScope,
+    StorageReadStats, StorageScanBuffer, StorageSpace,
 };
 
 pub trait StorageReader {
@@ -84,6 +85,16 @@ pub trait StorageReader {
         plan: &'a PointRequestPlan,
         opts: GetOptions<'_>,
     ) -> Result<StorageReadResult<BorrowedIndexedPointValues<'a>>, BackendError>;
+
+    fn visit_unique_point_values_for_plan<V>(
+        &self,
+        space: StorageSpace,
+        plan: &PointRequestPlan,
+        opts: GetOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<StorageReadStats, BackendError>
+    where
+        V: PointVisitor + ?Sized;
 
     fn scan_range(
         &self,
@@ -247,6 +258,19 @@ where
             plan,
             opts,
         )
+    }
+
+    fn visit_unique_point_values_for_plan<V>(
+        &self,
+        space: StorageSpace,
+        plan: &PointRequestPlan,
+        opts: GetOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<StorageReadStats, BackendError>
+    where
+        V: PointVisitor + ?Sized,
+    {
+        visit_unique_point_values_for_plan(self.backend_read(), space.id, plan, opts, visitor)
     }
 
     fn scan_range(
@@ -682,6 +706,58 @@ mod tests {
         assert_eq!(
             result.value.value_at(2),
             Some(&ProjectedValue::FullValue(Bytes::from_static(b"a")))
+        );
+    }
+
+    #[test]
+    fn planned_point_reads_can_visit_unique_values_without_materializing_indexed_result() {
+        let storage = StorageContext::new(ConformanceBackend::new());
+        let mut writes = storage.new_write_set();
+        writes.stage_put(space(1), key("a"), value("A"));
+        writes.stage_put(space(1), key("b"), value("B"));
+        storage
+            .commit_write_set(writes, WriteOptions::default())
+            .expect("seed");
+        let read = storage
+            .begin_read(ReadOptions::default())
+            .expect("begin read");
+        let plan = PointRequestPlan::new(&[key("b"), key("missing"), key("a"), key("b")]);
+
+        let mut visited = Vec::new();
+        let stats = read
+            .visit_unique_point_values_for_plan(
+                space(1),
+                &plan,
+                GetOptions::default(),
+                &mut |unique_index: usize, key: &Key, value: Option<ProjectedValueRef<'_>>| {
+                    visited.push((
+                        unique_index,
+                        key.clone(),
+                        value.map(|value| value.to_owned()),
+                    ));
+                    Ok(())
+                },
+            )
+            .expect("visit unique point values");
+
+        assert_eq!(stats.requested_keys, 4);
+        assert_eq!(stats.unique_backend_keys, 3);
+        assert_eq!(stats.backend_calls, 1);
+        assert_eq!(
+            visited,
+            vec![
+                (
+                    0,
+                    key("b"),
+                    Some(ProjectedValue::FullValue(Bytes::from_static(b"B")))
+                ),
+                (1, key("missing"), None),
+                (
+                    2,
+                    key("a"),
+                    Some(ProjectedValue::FullValue(Bytes::from_static(b"A")))
+                ),
+            ]
         );
     }
 

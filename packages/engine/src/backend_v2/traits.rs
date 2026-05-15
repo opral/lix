@@ -27,6 +27,23 @@ pub trait BackendRead {
         opts: GetOptions<'_>,
     ) -> Result<GetManyResult, BackendError>;
 
+    fn visit_many<V>(
+        &self,
+        space: SpaceId,
+        keys: &[Key],
+        opts: GetOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<(), BackendError>
+    where
+        V: PointVisitor + ?Sized,
+    {
+        let result = self.get_many(space, keys, opts)?;
+        for (index, (key, value)) in keys.iter().zip(result.values.iter()).enumerate() {
+            visitor.visit(index, key, value.as_ref().map(|value| value.as_ref()))?;
+        }
+        Ok(())
+    }
+
     fn visit_range<V>(
         &self,
         space: SpaceId,
@@ -49,12 +66,35 @@ pub trait ScanVisitor {
     fn visit(&mut self, key: &Key, value: ProjectedValueRef<'_>) -> Result<(), BackendError>;
 }
 
+pub trait PointVisitor {
+    fn visit(
+        &mut self,
+        index: usize,
+        key: &Key,
+        value: Option<ProjectedValueRef<'_>>,
+    ) -> Result<(), BackendError>;
+}
+
 impl<F> ScanVisitor for F
 where
     F: for<'a> FnMut(&Key, ProjectedValueRef<'a>) -> Result<(), BackendError>,
 {
     fn visit(&mut self, key: &Key, value: ProjectedValueRef<'_>) -> Result<(), BackendError> {
         self(key, value)
+    }
+}
+
+impl<F> PointVisitor for F
+where
+    F: for<'a> FnMut(usize, &Key, Option<ProjectedValueRef<'a>>) -> Result<(), BackendError>,
+{
+    fn visit(
+        &mut self,
+        index: usize,
+        key: &Key,
+        value: Option<ProjectedValueRef<'_>>,
+    ) -> Result<(), BackendError> {
+        self(index, key, value)
     }
 }
 

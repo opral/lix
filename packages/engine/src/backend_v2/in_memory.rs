@@ -7,9 +7,9 @@ use bytes::Bytes;
 use crate::backend_v2::conformance::{BackendFactory, BackendFixture, BackendTestConfig};
 use crate::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, ProjectedValueRef,
-    PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue,
-    WriteConcurrency, WriteOptions, WriteStats,
+    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, PointVisitor, ProjectedValue,
+    ProjectedValueRef, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
+    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 
 type InMemoryMap = BTreeMap<SpaceId, BTreeMap<Key, Bytes>>;
@@ -130,6 +130,31 @@ impl BackendRead for InMemoryRead {
                 })
                 .unwrap_or_else(|| vec![None; keys.len()]),
         ))
+    }
+
+    fn visit_many<V>(
+        &self,
+        space: SpaceId,
+        keys: &[Key],
+        opts: GetOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<(), BackendError>
+    where
+        V: PointVisitor + ?Sized,
+    {
+        if let Some(space_entries) = self.entries.get(&space) {
+            for (index, key) in keys.iter().enumerate() {
+                let value = space_entries
+                    .get(key)
+                    .map(|value| project_value_ref(value, opts.projection));
+                visitor.visit(index, key, value)?;
+            }
+        } else {
+            for (index, key) in keys.iter().enumerate() {
+                visitor.visit(index, key, None)?;
+            }
+        }
+        Ok(())
     }
 
     fn visit_range<V>(
@@ -314,6 +339,13 @@ fn project_value(value: &Bytes, projection: CoreProjection) -> ProjectedValue {
     match projection {
         CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
         CoreProjection::FullValue => ProjectedValue::FullValue(value.clone()),
+    }
+}
+
+fn project_value_ref(value: &Bytes, projection: CoreProjection) -> ProjectedValueRef<'_> {
+    match projection {
+        CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
+        CoreProjection::FullValue => ProjectedValueRef::FullValue(value),
     }
 }
 

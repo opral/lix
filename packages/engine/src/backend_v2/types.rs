@@ -111,6 +111,15 @@ impl ProjectedValueRef<'_> {
     }
 }
 
+impl ProjectedValue {
+    pub fn as_ref(&self) -> ProjectedValueRef<'_> {
+        match self {
+            ProjectedValue::KeyOnly => ProjectedValueRef::KeyOnly,
+            ProjectedValue::FullValue(value) => ProjectedValueRef::FullValue(value),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReadOptions {
     pub snapshot: Option<SnapshotRef>,
