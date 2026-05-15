@@ -3725,3 +3725,94 @@ should target direct_profile lanes first:
   - sqlite direct point reads/scans
   - rocksdb direct scans and get_many
 ```
+
+## 2026-05-15: focused direct backend profiles
+
+Added direct-profile selectors so `samply` can run exactly one backend and one
+case. Criterion substring filters are not enough by themselves because bench
+group setup still runs before filtering.
+
+Selector environment:
+
+```sh
+STORAGE_V2_BENCH_DIRECT_PROFILE_ONLY=1
+STORAGE_V2_BENCH_DIRECT_PROFILE_BACKEND=sqlite_temp|redb_temp|rocksdb_temp
+STORAGE_V2_BENCH_DIRECT_PROFILE_CASE=<direct case name>
+```
+
+Focused profiles:
+
+```text
+target/storage_v2_profiles/direct_backend_profile_focused/redb_commit_k1024.json
+target/storage_v2_profiles/direct_backend_profile_focused/sqlite_get_many.json
+target/storage_v2_profiles/direct_backend_profile_focused/sqlite_scan_visit.json
+target/storage_v2_profiles/direct_backend_profile_focused/rocksdb_get_many.json
+target/storage_v2_profiles/direct_backend_profile_focused/rocksdb_scan_visit.json
+```
+
+Focused bench means:
+
+| Case                     |     Mean |
+| ------------------------ | -------: |
+| redb commit k1024/g16    | 4.789 ms |
+| sqlite get_many u100     | 2.439 ms |
+| sqlite scan visit q1000  | 2.571 ms |
+| rocksdb get_many u100    | 1.631 ms |
+| rocksdb scan visit q1000 |   477 us |
+
+Profile read:
+
+```text
+redb commit:
+  dominated by commit durability:
+    File::sync_all / fcntl ~66.7% main-thread inclusive
+    redb WriteTransaction::commit_inner ~76%
+    TransactionalMemory::commit ~74.9%
+  Per-row insert work is small by comparison.
+
+sqlite get_many and scan:
+  dominated by begin_read, which prepares BEGIN / transaction statements and
+  opens a SQLite read transaction for every backend read:
+    SqliteBackend::begin_read ~48-51%
+    sqlite3Prepare / parser / sqlite3RunParser ~41-47%
+    SQLite pager/WAL shared-lock path ~22-35%
+    SqliteRead::close/drop connection path ~22-24%
+  Actual row stepping is not the top cost.
+
+rocksdb get_many:
+  dominated by RocksDB MultiGet and block table lookup:
+    RocksDbRead::get_many ~72%
+    rocksdb_multi_get / DBImpl::MultiGet ~56-60%
+    Version::Get / TableCache::Get / BlockBasedTable::Get ~40-46%
+    DataBlockIter::SeekImpl ~17%
+    malloc/free/memcmp/memmove visible in leaves
+
+rocksdb scan:
+  dominated by iterator traversal plus value/key copying:
+    RocksDbRead::visit_range ~79%
+    DB iterator next ~46%
+    DBIter::Next ~31%
+    MergingIterator Next ~15-16%
+    Bytes::copy_from_slice ~12.4%
+    malloc/free are large leaves
+```
+
+Ranked next cuts:
+
+```text
+1. SQLite read transaction/prepared statement lifecycle.
+   Reusing a connection/read transaction or cached BEGIN/COMMIT/SELECT
+   statements is likely higher leverage than changing get_many SQL shape first.
+
+2. RocksDB scan allocation/copying.
+   KeyOnly scans should avoid value copies completely and minimize key Bytes
+   allocation. Investigate whether the backend copies keys before visitor use.
+
+3. RocksDB get_many query shape.
+   MultiGet is doing real block lookup work. Try sorted/deduped unique keys,
+   read options, and possible point-lookup cache behavior before API changes.
+
+4. redb commit durability policy.
+   The slow path is fsync/fcntl. Optimization is mostly durability-mode or
+   transaction policy, not storage_v2 write-set shape.
+```
