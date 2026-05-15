@@ -7,6 +7,6 @@ pub(crate) mod write;
 pub(crate) use datafusion::{
     create_logical_plan, create_logical_plan_from_parsed,
     create_transaction_read_logical_plan_from_parsed, create_write_logical_plan,
-    create_write_logical_plan_from_parsed, execute_logical_plan, execute_sql,
-    execute_write_logical_plan, SqlLogicalPlan,
+    create_write_logical_plan_from_parsed, execute_logical_plan, execute_sql, SqlLogicalPlan,
 };
+pub(crate) use write::execute_write_logical_plan;
