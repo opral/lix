@@ -135,13 +135,16 @@ impl BackendRead for SqliteRead {
         get_many(&self.conn, space, keys, opts)
     }
 
-    fn visit_range(
+    fn visit_range<V>(
         &self,
         space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        visitor: &mut dyn ScanVisitor,
-    ) -> Result<ScanResult, BackendError> {
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
         visit_range(&self.conn, space, range, opts, visitor)
     }
 
@@ -287,13 +290,16 @@ fn get_many(
     ))
 }
 
-fn visit_range(
+fn visit_range<V>(
     conn: &Connection,
     space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
-    visitor: &mut dyn ScanVisitor,
-) -> Result<ScanResult, BackendError> {
+    visitor: &mut V,
+) -> Result<ScanResult, BackendError>
+where
+    V: ScanVisitor + ?Sized,
+{
     let limit = opts.limit_rows;
     if limit == 0 {
         return Ok(ScanResult::default());

@@ -332,13 +332,16 @@ mod shape_tests {
             ))
         }
 
-        fn visit_range(
+        fn visit_range<V>(
             &self,
             _space: SpaceId,
             range: KeyRange,
             _opts: ScanOptions<'_>,
-            _visitor: &mut dyn ScanVisitor,
-        ) -> Result<ScanResult, BackendError> {
+            _visitor: &mut V,
+        ) -> Result<ScanResult, BackendError>
+        where
+            V: ScanVisitor + ?Sized,
+        {
             self.scan_range_calls.set(self.scan_range_calls.get() + 1);
             self.scan_range.replace(Some(range));
             Ok(ScanResult::default())

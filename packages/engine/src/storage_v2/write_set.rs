@@ -654,13 +654,16 @@ mod tests {
             unimplemented!("not used by write-set tests")
         }
 
-        fn visit_range(
+        fn visit_range<V>(
             &self,
             _space: SpaceId,
             _range: KeyRange,
             _opts: ScanOptions<'_>,
-            _visitor: &mut dyn ScanVisitor,
-        ) -> Result<ScanResult, BackendError> {
+            _visitor: &mut V,
+        ) -> Result<ScanResult, BackendError>
+        where
+            V: ScanVisitor + ?Sized,
+        {
             unimplemented!("not used by write-set tests")
         }
     }

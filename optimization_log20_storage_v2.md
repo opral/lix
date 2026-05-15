@@ -2451,3 +2451,57 @@ The point-read numbers should not be interpreted as caused by the scan API
 change. They are included so this run can serve as the new baseline for later
 point-plan/read tuning.
 ```
+
+### 2026-05-15: Generic Visitor Recovery
+
+Change:
+
+```text
+Replace `visitor: &mut dyn ScanVisitor` in BackendRead::visit_range with a
+generic visitor parameter, and split InMemoryBackend's projection branch outside
+the row loop.
+```
+
+Validation:
+
+```sh
+cargo test -p lix_engine backend_v2 --no-fail-fast
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 storage_v2/scan_visitor_baseline
+```
+
+Scan visitor deltas:
+
+| Case                         | dyn visitor baseline | generic visitor |        Delta |
+| ---------------------------- | -------------------: | --------------: | -----------: |
+| key-only q1000               |            1.9936 us |       1.2278 us | 38.4% faster |
+| key-only q10000              |            18.804 us |       17.962 us |  4.5% faster |
+| full-value q1000 v32         |            2.2986 us |       1.4873 us | 35.3% faster |
+| full-value q1000 v1024       |            2.4124 us |       1.4986 us | 37.9% faster |
+| full-value q1000 v65536      |            2.2731 us |       1.4963 us | 34.2% faster |
+| key-only q1000 limit1000     |            1.9792 us |       1.1993 us | 39.4% faster |
+| drain key-only q1000 page100 |            5.8824 us |       4.1289 us | 29.8% faster |
+
+Materialization deltas:
+
+| Case                                   | dyn visitor baseline | generic visitor |        Delta |
+| -------------------------------------- | -------------------: | --------------: | -----------: |
+| visit_materialize_key_only_q1000       |            9.6111 us |       6.5535 us | 31.8% faster |
+| visit_materialize_full_value_q1000_v32 |            8.7213 us |       8.3095 us |  4.7% faster |
+
+Interpretation:
+
+```text
+The lost post-cut scan performance was mostly the per-row dynamic visitor call.
+The generic visitor shape keeps the backend API visitor-first while letting hot
+loops monomorphize. Splitting projection outside the in-memory row loop removes
+one more per-row branch.
+
+The remaining gap to the original experimental visitor path is now much smaller:
+  key-only q1000:     919.73 ns pre-cut experiment vs 1.2278 us generic core
+  full-value q1000:   1.1463 us pre-cut experiment vs 1.4873 us generic core
+
+That residual gap is likely from the more general `ProjectedValueRef`/Result
+visitor contract and benchmark noise, not from forced dynamic dispatch.
+```

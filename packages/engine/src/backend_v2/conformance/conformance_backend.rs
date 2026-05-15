@@ -107,13 +107,16 @@ impl BackendRead for ConformanceRead {
         get_many_from_map(&self.entries, space, keys, opts)
     }
 
-    fn visit_range(
+    fn visit_range<V>(
         &self,
         space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        visitor: &mut dyn ScanVisitor,
-    ) -> Result<ScanResult, BackendError> {
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
         visit_range_from_map(&self.entries, space, range, opts, visitor)
     }
 }
@@ -177,13 +180,16 @@ fn get_many_from_map(
     ))
 }
 
-fn visit_range_from_map(
+fn visit_range_from_map<V>(
     entries: &ConformanceMap,
     space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
-    visitor: &mut dyn ScanVisitor,
-) -> Result<ScanResult, BackendError> {
+    visitor: &mut V,
+) -> Result<ScanResult, BackendError>
+where
+    V: ScanVisitor + ?Sized,
+{
     let mut emitted = 0;
     let mut has_more = false;
 

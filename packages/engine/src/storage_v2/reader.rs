@@ -311,13 +311,16 @@ mod tests {
             ))
         }
 
-        fn visit_range(
+        fn visit_range<V>(
             &self,
             _space: SpaceId,
             range: KeyRange,
             _opts: ScanOptions<'_>,
-            _visitor: &mut dyn ScanVisitor,
-        ) -> Result<ScanResult, BackendError> {
+            _visitor: &mut V,
+        ) -> Result<ScanResult, BackendError>
+        where
+            V: ScanVisitor + ?Sized,
+        {
             *self.scan_range_calls.borrow_mut() += 1;
             self.scan_range.replace(Some(range));
             Ok(ScanResult::default())
@@ -350,13 +353,16 @@ mod tests {
             ))
         }
 
-        fn visit_range(
+        fn visit_range<V>(
             &self,
             _space: SpaceId,
             _range: KeyRange,
             _opts: ScanOptions<'_>,
-            _visitor: &mut dyn ScanVisitor,
-        ) -> Result<ScanResult, BackendError> {
+            _visitor: &mut V,
+        ) -> Result<ScanResult, BackendError>
+        where
+            V: ScanVisitor + ?Sized,
+        {
             unreachable!("requested-order point-read test does not scan")
         }
     }

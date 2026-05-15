@@ -1300,13 +1300,16 @@ impl BackendRead for PointReadBackend {
         ))
     }
 
-    fn visit_range(
+    fn visit_range<V>(
         &self,
         _space: SpaceId,
         _range: KeyRange,
         _opts: ScanOptions<'_>,
-        _visitor: &mut dyn ScanVisitor,
-    ) -> Result<ScanResult, BackendError> {
+        _visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
         unreachable!("point-read benchmark does not scan")
     }
 }
@@ -1351,13 +1354,16 @@ impl BackendRead for LeanPointReadBackend {
         Ok(GetManyResult::new(values))
     }
 
-    fn visit_range(
+    fn visit_range<V>(
         &self,
         _space: SpaceId,
         _range: KeyRange,
         _opts: ScanOptions<'_>,
-        _visitor: &mut dyn ScanVisitor,
-    ) -> Result<ScanResult, BackendError> {
+        _visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
         unreachable!("lean point-read benchmark does not scan")
     }
 }
@@ -1394,13 +1400,16 @@ impl BackendRead for PrefixReadBackend {
         unreachable!("prefix-scan benchmark does not point-read")
     }
 
-    fn visit_range(
+    fn visit_range<V>(
         &self,
         _space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        visitor: &mut dyn ScanVisitor,
-    ) -> Result<ScanResult, BackendError> {
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
         assert_eq!(range.lower, Bound::Included(key("row-")));
         assert_eq!(range.upper, Bound::Excluded(key("row.")));
         let mut emitted = 0;
@@ -1428,13 +1437,16 @@ impl BackendRead for EmptyRead {
         unreachable!("write-set benchmark does not point-read")
     }
 
-    fn visit_range(
+    fn visit_range<V>(
         &self,
         _space: SpaceId,
         _range: KeyRange,
         _opts: ScanOptions<'_>,
-        _visitor: &mut dyn ScanVisitor,
-    ) -> Result<ScanResult, BackendError> {
+        _visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
         unreachable!("write-set benchmark does not scan")
     }
 }
