@@ -2,10 +2,46 @@
 
 use serde_json::json;
 
-use super::datafusion::SqlLogicalPlan;
+use datafusion::sql::parser::Statement as DataFusionStatement;
+
+use super::SqlLogicalPlan;
+use crate::sql2::parse::parse_statement;
 use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::{LixError, Value};
+
+#[allow(dead_code)]
+pub(crate) struct WriteLogicalPlan {
+    pub(super) plan: LogicalWritePlan,
+}
+
+#[allow(dead_code)]
+pub(crate) async fn create_write_logical_plan(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    sql: &str,
+) -> Result<SqlLogicalPlan, LixError> {
+    let statement = parse_statement(sql)?;
+    create_write_logical_plan_from_parsed(ctx, statement).await
+}
+
+pub(crate) async fn create_write_logical_plan_from_parsed(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    statement: DataFusionStatement,
+) -> Result<SqlLogicalPlan, LixError> {
+    let visible_schemas = ctx.list_visible_schemas()?;
+    let bound_statement =
+        crate::sql2::bind_statement(&statement, &visible_schemas, ctx.active_version_id())?;
+    let crate::sql2::BoundStatement::Write(bound_write) = bound_statement else {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "expected SQL write statement after binding",
+        ));
+    };
+    let logical_write = crate::sql2::plan_write(bound_write)?;
+    Ok(SqlLogicalPlan::Write(WriteLogicalPlan {
+        plan: logical_write,
+    }))
+}
 
 pub(crate) async fn execute_write_logical_plan(
     ctx: &mut dyn SqlWriteExecutionContext,
