@@ -266,6 +266,7 @@ async fn try_execute_update(
                 &mut decoder,
                 &spec,
                 version_binding.as_deref(),
+                false,
             ) {
                 Ok(filter) => filter,
                 Err(error) if is_fast_path_miss(&error) => return Ok(None),
@@ -325,12 +326,14 @@ async fn try_execute_delete(
             spec,
             version_binding,
         } => {
+            let require_version_filter = version_binding.is_none();
             let mut decoder = ParamDecoder::new(params);
             let filter = match simple_entity_filter(
                 delete.selection,
                 &mut decoder,
                 &spec,
                 version_binding.as_deref(),
+                require_version_filter,
             ) {
                 Ok(filter) => filter,
                 Err(error) if is_fast_path_miss(&error) => return Ok(None),
@@ -415,6 +418,7 @@ fn decode_entity_insert(
     value_rows: &[Vec<Expr>],
     decoder: &mut ParamDecoder<'_>,
 ) -> Result<Vec<TransactionWriteRow>, LixError> {
+    validate_entity_insert_columns(spec, version_binding, columns)?;
     value_rows
         .iter()
         .map(|values| {
@@ -504,6 +508,42 @@ fn decode_entity_insert(
             })
         })
         .collect()
+}
+
+fn validate_entity_insert_columns(
+    spec: &EntitySurfaceSpec,
+    version_binding: Option<&str>,
+    columns: &[String],
+) -> Result<(), LixError> {
+    for column in columns {
+        let is_visible_column = spec.columns.iter().any(|field| field.name == *column);
+        let is_public_system_column = matches!(
+            column.as_str(),
+            "lixcol_entity_id"
+                | "lixcol_schema_key"
+                | "lixcol_file_id"
+                | "lixcol_snapshot_content"
+                | "lixcol_metadata"
+                | "lixcol_created_at"
+                | "lixcol_updated_at"
+                | "lixcol_global"
+                | "lixcol_change_id"
+                | "lixcol_commit_id"
+                | "lixcol_untracked"
+        );
+        let is_by_version_column = column == "lixcol_version_id" && version_binding.is_none();
+        if is_visible_column || is_public_system_column || is_by_version_column {
+            continue;
+        }
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            format!(
+                "simple DML fast path does not support INSERT column '{column}' for entity surface '{}'",
+                spec.schema_key
+            ),
+        ));
+    }
+    Ok(())
 }
 
 async fn execute_lix_state_delete(
@@ -840,7 +880,7 @@ fn simple_lix_state_filter(
             .unwrap_or_default(),
         ..LiveStateFilter::default()
     };
-    apply_simple_filter(expr, decoder, &mut filter, None)?;
+    apply_simple_filter(expr, decoder, &mut filter, None, true)?;
     if filter.schema_keys.is_empty() && filter.entity_ids.is_empty() && filter.file_ids.is_empty() {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
@@ -855,6 +895,7 @@ fn simple_entity_filter(
     decoder: &mut ParamDecoder<'_>,
     spec: &EntitySurfaceSpec,
     active_version_id: Option<&str>,
+    require_version_filter: bool,
 ) -> Result<LiveStateFilter, LixError> {
     let mut filter = LiveStateFilter {
         schema_keys: vec![spec.schema_key.clone()],
@@ -863,11 +904,23 @@ fn simple_entity_filter(
             .unwrap_or_default(),
         ..LiveStateFilter::default()
     };
-    apply_simple_filter(expr, decoder, &mut filter, Some(spec))?;
+    apply_simple_filter(
+        expr,
+        decoder,
+        &mut filter,
+        Some(spec),
+        active_version_id.is_none(),
+    )?;
     if filter.entity_ids.is_empty() {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "simple entity DML requires a lixcol_entity_id predicate",
+        ));
+    }
+    if require_version_filter && filter.version_ids.is_empty() {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "simple entity DML requires a lixcol_version_id predicate",
         ));
     }
     Ok(filter)
@@ -878,17 +931,34 @@ fn apply_simple_filter(
     decoder: &mut ParamDecoder<'_>,
     filter: &mut LiveStateFilter,
     spec: Option<&EntitySurfaceSpec>,
+    allow_version_filter: bool,
 ) -> Result<(), LixError> {
     match expr {
         Expr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
-            apply_simple_filter(left, decoder, filter, spec)?;
-            apply_simple_filter(right, decoder, filter, spec)
+            apply_simple_filter(left, decoder, filter, spec, allow_version_filter)?;
+            apply_simple_filter(right, decoder, filter, spec, allow_version_filter)
         }
         Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Eq => {
             let right_values = [right.as_ref()];
             let left_values = [left.as_ref()];
-            apply_column_values(left, &right_values, decoder, filter, spec)
-                .or_else(|_| apply_column_values(right, &left_values, decoder, filter, spec))
+            apply_column_values(
+                left,
+                &right_values,
+                decoder,
+                filter,
+                spec,
+                allow_version_filter,
+            )
+            .or_else(|_| {
+                apply_column_values(
+                    right,
+                    &left_values,
+                    decoder,
+                    filter,
+                    spec,
+                    allow_version_filter,
+                )
+            })
         }
         Expr::InList {
             expr,
@@ -896,7 +966,7 @@ fn apply_simple_filter(
             negated,
         } if !negated => {
             let values = list.iter().collect::<Vec<_>>();
-            apply_column_values(expr, &values, decoder, filter, spec)
+            apply_column_values(expr, &values, decoder, filter, spec, allow_version_filter)
         }
         _ => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
@@ -911,6 +981,7 @@ fn apply_column_values(
     decoder: &mut ParamDecoder<'_>,
     filter: &mut LiveStateFilter,
     spec: Option<&EntitySurfaceSpec>,
+    allow_version_filter: bool,
 ) -> Result<(), LixError> {
     let column = column_name(column_expr).ok_or_else(|| {
         LixError::new(
@@ -924,13 +995,20 @@ fn apply_column_values(
         .collect::<Result<Vec<_>, _>>()?;
     match column.as_str() {
         "schema_key" if spec.is_none() => {
-            filter.schema_keys = string_values(values, "schema_key")?;
+            if merge_string_filter(
+                &mut filter.schema_keys,
+                string_values(values, "schema_key")?,
+            )? {
+                filter.no_match = true;
+            }
         }
-        "version_id" | "lixcol_version_id" => {
-            filter.version_ids = string_values(values, &column)?;
+        "version_id" | "lixcol_version_id" if allow_version_filter => {
+            if merge_string_filter(&mut filter.version_ids, string_values(values, &column)?)? {
+                filter.no_match = true;
+            }
         }
         "entity_id" | "lixcol_entity_id" => {
-            filter.entity_ids = string_values(values, &column)?
+            let entity_ids = string_values(values, &column)?
                 .into_iter()
                 .map(|value| {
                     entity_identity(
@@ -940,6 +1018,9 @@ fn apply_column_values(
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            if merge_entity_filter(&mut filter.entity_ids, entity_ids)? {
+                filter.no_match = true;
+            }
         }
         _ => {
             return Err(LixError::new(
@@ -949,6 +1030,39 @@ fn apply_column_values(
         }
     }
     Ok(())
+}
+
+fn merge_string_filter(target: &mut Vec<String>, values: Vec<String>) -> Result<bool, LixError> {
+    if values.is_empty() {
+        return Ok(true);
+    }
+    if target.is_empty() {
+        *target = values;
+        return Ok(false);
+    }
+    target.retain(|value| values.contains(value));
+    if target.is_empty() {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn merge_entity_filter(
+    target: &mut Vec<EntityIdentity>,
+    values: Vec<EntityIdentity>,
+) -> Result<bool, LixError> {
+    if values.is_empty() {
+        return Ok(true);
+    }
+    if target.is_empty() {
+        *target = values;
+        return Ok(false);
+    }
+    target.retain(|value| values.contains(value));
+    if target.is_empty() {
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn string_values(values: Vec<Value>, column: &str) -> Result<Vec<String>, LixError> {

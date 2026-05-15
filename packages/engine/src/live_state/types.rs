@@ -150,6 +150,8 @@ pub(crate) struct LiveStateFilter {
     pub(crate) constraints: Vec<ScanConstraint>,
     #[serde(default)]
     pub(crate) include_tombstones: bool,
+    #[serde(default)]
+    pub(crate) no_match: bool,
 }
 
 impl From<LiveStateFilter> for UntrackedStateFilter {

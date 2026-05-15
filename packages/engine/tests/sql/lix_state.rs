@@ -91,6 +91,162 @@ simulation_test!(lix_state_delete_hides_row, |sim| async move {
 });
 
 simulation_test!(
+    lix_state_update_intersects_repeated_identity_predicates,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+                 ) VALUES \
+                 ('[\"state-repeat-a\"]', 'lix_key_value', NULL, '{\"key\":\"state-repeat-a\",\"value\":\"a\"}', false, false), \
+                 ('[\"state-repeat-b\"]', 'lix_key_value', NULL, '{\"key\":\"state-repeat-b\",\"value\":\"b\"}', false, false)",
+                &[],
+            )
+            .await
+            .expect("lix_state insert should succeed");
+
+        let result = session
+            .execute(
+                "UPDATE lix_state \
+                 SET snapshot_content = '{\"key\":\"state-repeat-b\",\"value\":\"wrong\"}' \
+                 WHERE entity_id = '[\"state-repeat-a\"]' \
+                   AND schema_key = 'lix_key_value' \
+                   AND entity_id = '[\"state-repeat-b\"]'",
+                &[],
+            )
+            .await
+            .expect("contradictory lix_state update should succeed with zero rows");
+        assert_eq!(result.rows_affected(), 0);
+
+        let result = session
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state \
+                 WHERE entity_id = lix_json('[\"state-repeat-b\"]') AND schema_key = 'lix_key_value'",
+                &[],
+            )
+            .await
+            .expect("lix_state read should succeed");
+        assert_single_text(result, "{\"key\":\"state-repeat-b\",\"value\":\"b\"}");
+    }
+);
+
+simulation_test!(
+    lix_state_update_intersects_repeated_identity_predicates_in_transaction,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+
+        transaction
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+                 ) VALUES \
+                 ('[\"state-tx-repeat-a\"]', 'lix_key_value', NULL, '{\"key\":\"state-tx-repeat-a\",\"value\":\"a\"}', false, false), \
+                 ('[\"state-tx-repeat-b\"]', 'lix_key_value', NULL, '{\"key\":\"state-tx-repeat-b\",\"value\":\"b\"}', false, false)",
+                &[],
+            )
+            .await
+            .expect("transactional lix_state insert should succeed");
+
+        let result = transaction
+            .execute(
+                "UPDATE lix_state \
+                 SET snapshot_content = '{\"key\":\"state-tx-repeat-b\",\"value\":\"wrong\"}' \
+                 WHERE entity_id = '[\"state-tx-repeat-a\"]' \
+                   AND schema_key = 'lix_key_value' \
+                   AND entity_id = '[\"state-tx-repeat-b\"]'",
+                &[],
+            )
+            .await
+            .expect("contradictory transactional update should succeed with zero rows");
+        assert_eq!(result.rows_affected(), 0);
+
+        let result = transaction
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state \
+                 WHERE entity_id = lix_json('[\"state-tx-repeat-b\"]') AND schema_key = 'lix_key_value'",
+                &[],
+            )
+            .await
+            .expect("transactional lix_state read should succeed");
+        assert_single_text(result, "{\"key\":\"state-tx-repeat-b\",\"value\":\"b\"}");
+    }
+);
+
+simulation_test!(
+    lix_state_delete_intersects_repeated_identity_predicates,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, schema_key, file_id, snapshot_content, global, untracked\
+                 ) VALUES \
+                 ('[\"state-delete-repeat-a\"]', 'lix_key_value', NULL, '{\"key\":\"state-delete-repeat-a\",\"value\":\"a\"}', false, false), \
+                 ('[\"state-delete-repeat-b\"]', 'lix_key_value', NULL, '{\"key\":\"state-delete-repeat-b\",\"value\":\"b\"}', false, false)",
+                &[],
+            )
+            .await
+            .expect("lix_state insert should succeed");
+
+        let result = session
+            .execute(
+                "DELETE FROM lix_state \
+                 WHERE entity_id = '[\"state-delete-repeat-a\"]' \
+                   AND schema_key = 'lix_key_value' \
+                   AND entity_id = '[\"state-delete-repeat-b\"]'",
+                &[],
+            )
+            .await
+            .expect("contradictory lix_state delete should succeed with zero rows");
+        assert_eq!(result.rows_affected(), 0);
+
+        let result = session
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state \
+                 WHERE entity_id = lix_json('[\"state-delete-repeat-b\"]') AND schema_key = 'lix_key_value'",
+                &[],
+            )
+            .await
+            .expect("lix_state read should succeed");
+        assert_single_text(
+            result,
+            "{\"key\":\"state-delete-repeat-b\",\"value\":\"b\"}",
+        );
+    }
+);
+
+simulation_test!(
     lix_state_global_rows_are_visible_through_version_overlay,
     |sim| async move {
         let engine = sim.boot_engine().await;
