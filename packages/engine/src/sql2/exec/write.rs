@@ -59,11 +59,8 @@ pub(crate) async fn execute_write_logical_plan(
     if let Some(fast_plan) =
         crate::sql2::optimize::simple_write::try_make_fast_write_plan(&write_plan.plan)?
     {
-        if let Some(rows_affected) =
-            crate::sql2::exec::fast_write::try_execute_simple_write(ctx, fast_plan, params).await?
-        {
-            return Ok(rows_affected);
-        }
+        return crate::sql2::exec::fast_write::try_execute_simple_write(ctx, fast_plan, params)
+            .await;
     }
 
     super::datafusion::execute_datafusion_write_logical_plan(ctx, &write_plan.plan, params).await

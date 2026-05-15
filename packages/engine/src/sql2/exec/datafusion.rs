@@ -980,7 +980,10 @@ mod tests {
         LiveStateContext, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
         MaterializedLiveStateRow,
     };
-    use crate::sql2::{create_write_logical_plan, execute_write_logical_plan};
+    use crate::sql2::{
+        bind_statement, create_write_logical_plan, execute_write_logical_plan, parse_statement,
+        plan_write, BoundStatement,
+    };
     use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource};
     use crate::storage::{
         KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch,
@@ -3340,6 +3343,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_sql_update_lix_state_complex_predicate_declines_fast_path_and_executes() {
+        let sql = "UPDATE lix_state \
+             SET snapshot_content = '{\"key\":\"hello\",\"value\":\"updated\"}', \
+                 metadata = '{\"schema_key\":\"lix_key_value\"}' \
+             WHERE metadata = lix_json('{ \"source\" : \"match\" }')";
+        let statement = parse_statement(sql).expect("SQL parses");
+        let BoundStatement::Write(bound_write) =
+            bind_statement(&statement, &[], "version-a").expect("SQL binds")
+        else {
+            panic!("expected write statement");
+        };
+        let plan = plan_write(bound_write).expect("write plans");
+        assert_eq!(
+            crate::sql2::optimize::simple_write::try_make_fast_write_plan(&plan)
+                .expect("fast optimization should not fail"),
+            None
+        );
+
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![live_lix_state_row(
+                "entity-1",
+                Some("{\"source\":\"match\"}"),
+            )],
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_write_sql(&mut ctx, sql, &[])
+            .await
+            .expect("declined fast path should fall through to reference write execution");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+        assert_eq!(
+            staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn execute_sql_update_lix_state_preserves_json_param_metadata() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateReader {
@@ -3681,6 +3735,65 @@ mod tests {
             .expect("staged writes lock")
             .deltas
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_sql_delete_unsupported_target_contradiction_still_falls_back_and_errors() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![],
+        };
+
+        let error = execute_write_sql(
+            &mut ctx,
+            "DELETE FROM lix_file WHERE path = '/a' AND path = '/b'",
+            &[],
+        )
+        .await
+        .expect_err("unsupported reference writer target should not become a fast no-op");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+        assert_eq!(
+            error.message,
+            "sql2 DataFusion reference writer currently supports only lix_state writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_update_lix_state_contradiction_still_validates_json_predicates() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateReader { rows: vec![] });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes,
+            schema_definitions: vec![],
+        };
+
+        let error = execute_write_sql(
+            &mut ctx,
+            "UPDATE lix_state \
+             SET metadata = lix_json('{}') \
+             WHERE metadata = 'not-json-typed' \
+               AND schema_key = 'a' \
+               AND schema_key = 'b'",
+            &[],
+        )
+        .await
+        .expect_err("column contradiction should not bypass JSON predicate validation");
+
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+        assert!(error
+            .message
+            .contains("JSON columns can only be compared with JSON expressions"));
     }
 
     #[tokio::test]
