@@ -36,8 +36,6 @@ pub struct ScanCapabilities {
     pub native_prefix_scan: bool,
     pub reverse: bool,
     pub limit_bytes: bool,
-    pub unordered_points: bool,
-    pub key_ordered_points: bool,
     pub long_lived_cursors: bool,
     pub parallel_partitions: bool,
 }

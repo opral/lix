@@ -28,13 +28,11 @@ pub struct BorrowedIndexedPointValues<'a> {
 pub struct PointRequestPlan {
     pub unique_keys: Vec<Key>,
     pub requested_to_unique: Vec<usize>,
-    unique_index_by_key: HashMap<Key, usize, FastHashBuilder>,
 }
 
-struct BorrowedPointRequestPlan<'a> {
+struct BorrowedPointRequestPlan {
     unique_keys: Vec<Key>,
     requested_to_unique: Vec<usize>,
-    unique_index_by_key: HashMap<&'a Key, usize, FastHashBuilder>,
 }
 
 impl PointRequestPlan {
@@ -61,7 +59,6 @@ impl PointRequestPlan {
         Self {
             unique_keys,
             requested_to_unique,
-            unique_index_by_key,
         }
     }
 
@@ -74,8 +71,8 @@ impl PointRequestPlan {
     }
 }
 
-impl<'a> BorrowedPointRequestPlan<'a> {
-    fn new(keys: &'a [Key]) -> Self {
+impl BorrowedPointRequestPlan {
+    fn new<'a>(keys: &'a [Key]) -> Self {
         let mut unique_index_by_key =
             HashMap::<&'a Key, usize, FastHashBuilder>::with_capacity_and_hasher(
                 keys.len(),
@@ -98,7 +95,6 @@ impl<'a> BorrowedPointRequestPlan<'a> {
         Self {
             unique_keys,
             requested_to_unique,
-            unique_index_by_key,
         }
     }
 }
@@ -254,7 +250,7 @@ where
 fn get_many_indexed_values_for_borrowed_plan_with_stats<R>(
     read: &R,
     space: SpaceId,
-    plan: &BorrowedPointRequestPlan<'_>,
+    plan: &BorrowedPointRequestPlan,
     opts: GetOptions<'_>,
 ) -> Result<StorageReadResult<IndexedPointValues>, BackendError>
 where
@@ -262,17 +258,9 @@ where
 {
     let result = read.get_many(space, &plan.unique_keys, opts)?;
 
-    let mut unique_values = Vec::with_capacity(plan.unique_keys.len());
-    unique_values.resize_with(plan.unique_keys.len(), || None);
-    for entry in result.entries.entries {
-        if let Some(&unique_index) = plan.unique_index_by_key.get(&entry.key) {
-            unique_values[unique_index] = Some(entry.value);
-        }
-    }
-
     Ok(StorageReadResult::new(
         IndexedPointValues {
-            unique_values,
+            unique_values: result.values,
             requested_to_unique: plan.requested_to_unique.clone(),
         },
         StorageReadStats {
@@ -323,17 +311,9 @@ where
 {
     let result = read.get_many(space, &plan.unique_keys, opts)?;
 
-    let mut unique_values = Vec::with_capacity(plan.unique_keys.len());
-    unique_values.resize_with(plan.unique_keys.len(), || None);
-    for entry in result.entries.entries {
-        if let Some(&unique_index) = plan.unique_index_by_key.get(&entry.key) {
-            unique_values[unique_index] = Some(entry.value);
-        }
-    }
-
     Ok(StorageReadResult::new(
         BorrowedIndexedPointValues {
-            unique_values,
+            unique_values: result.values,
             requested_to_unique: &plan.requested_to_unique,
         },
         StorageReadStats {

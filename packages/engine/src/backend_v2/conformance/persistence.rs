@@ -165,14 +165,9 @@ where
         .map_err(|error| format!("get_many failed: {error}"))?;
 
     for (index, (key, expected_value)) in expected.iter().enumerate() {
-        let entry = result
-            .entries
-            .entries
-            .iter()
-            .find(|entry| &entry.key == key);
-        let actual = match entry.map(|entry| &entry.value) {
+        let actual = match result.values.get(index).and_then(|value| value.as_ref()) {
             Some(ProjectedValue::FullValue(bytes)) => Some(
-                std::str::from_utf8(bytes)
+                std::str::from_utf8(bytes.as_ref())
                     .map_err(|error| format!("slot {index} contained non-utf8 bytes: {error}"))?,
             ),
             Some(other) => {

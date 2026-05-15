@@ -71,7 +71,7 @@ struct BrokenWrite {
 fn detects_get_many_missing_existing_key_violation() {
     assert_failed(
         BrokenMode::GetManyMissesExistingKey,
-        "baseline::get_many_returns_found_entries",
+        "baseline::get_many_returns_requested_slots",
     );
 }
 
@@ -409,26 +409,29 @@ fn get_many_from_map(
     opts: GetOptions<'_>,
 ) -> Result<GetManyResult, BackendError> {
     let mut seen = BTreeSet::new();
-    let mut found = Vec::new();
+    let mut values = Vec::new();
     for key in keys {
         if matches!(mode, BrokenMode::GetManyMissesExistingKey)
             && key == &Key(Bytes::from_static(b"a"))
         {
+            values.push(None);
             continue;
         }
         if !seen.insert(key.clone()) {
+            if let Some(value) = entries.get(&(space, key.clone())) {
+                values.push(Some(project_value(value, mode, opts.projection, false)));
+            } else {
+                values.push(None);
+            }
             continue;
         }
-        if let Some(value) = entries.get(&(space, key.clone())) {
-            found.push(ReadEntry {
-                key: key.clone(),
-                value: project_value(value, mode, opts.projection, false),
-            });
-        }
+        values.push(
+            entries
+                .get(&(space, key.clone()))
+                .map(|value| project_value(value, mode, opts.projection, false)),
+        );
     }
-    Ok(GetManyResult {
-        entries: ReadBatch { entries: found },
-    })
+    Ok(GetManyResult::new(values))
 }
 
 fn scan_range_from_map(

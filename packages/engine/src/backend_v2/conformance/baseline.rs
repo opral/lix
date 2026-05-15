@@ -16,8 +16,8 @@ pub(crate) fn register<F>(report: &mut ConformanceReport, factory: &F)
 where
     F: BackendFactory,
 {
-    report.run("baseline::get_many_returns_found_entries", || {
-        get_many_returns_found_entries(factory)
+    report.run("baseline::get_many_returns_requested_slots", || {
+        get_many_returns_requested_slots(factory)
     });
     report.run("baseline::get_many_empty_key_list", || {
         get_many_empty_key_list(factory)
@@ -69,7 +69,7 @@ where
     });
 }
 
-fn get_many_returns_found_entries<F>(factory: &F) -> ConformanceResult
+fn get_many_returns_requested_slots<F>(factory: &F) -> ConformanceResult
 where
     F: BackendFactory,
 {
@@ -77,18 +77,36 @@ where
     let test_space = space(1);
     seed_full_values(&backend, test_space, [("a", "A"), ("b", "B")])?;
 
+    let requested = [key("b"), key("missing"), key("a"), key("b")];
     let result = backend
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?
-        .get_many(
-            test_space,
-            &[key("b"), key("missing"), key("a"), key("b")],
-            GetOptions::default(),
-        )
+        .get_many(test_space, &requested, GetOptions::default())
         .map_err(|error| format!("get_many failed: {error}"))?;
 
+    if result.values.len() != requested.len() {
+        return Err(format!(
+            "get_many returned {} slots for {} requested keys",
+            result.values.len(),
+            requested.len()
+        ));
+    }
+    let expected_values = vec![
+        Some(ProjectedValue::FullValue(Bytes::from_static(b"B"))),
+        None,
+        Some(ProjectedValue::FullValue(Bytes::from_static(b"A"))),
+        Some(ProjectedValue::FullValue(Bytes::from_static(b"B"))),
+    ];
+    if result.values != expected_values {
+        return Err(format!(
+            "get_many slot mismatch: expected {:?}, got {:?}",
+            expected_values, result.values
+        ));
+    }
+
+    let entries = result.entries_for_requested_keys(&requested);
     assert_entry_map(
-        &result.entries.entries,
+        &entries,
         &[
             (key("a"), Bytes::from_static(b"A")),
             (key("b"), Bytes::from_static(b"B")),
@@ -106,12 +124,12 @@ where
         .map_err(|error| format!("begin_read failed: {error}"))?
         .get_many(space(1), &[], GetOptions::default())
         .map_err(|error| format!("get_many failed: {error}"))?;
-    if result.entries.entries.is_empty() {
+    if result.entries_for_requested_keys(&[]).is_empty() {
         Ok(())
     } else {
         Err(format!(
-            "empty get_many returned entries: {:?}",
-            result.entries
+            "empty get_many returned values: {:?}",
+            result.values
         ))
     }
 }
@@ -463,7 +481,10 @@ where
             GetOptions::default(),
         )
         .map_err(|error| format!("get_many before commit failed: {error}"))?;
-    if !before_commit.entries.entries.is_empty() {
+    if !before_commit
+        .entries_for_requested_keys(&[key_a.clone(), key_b.clone()])
+        .is_empty()
+    {
         return Err("uncommitted writes were visible to an independent read".to_string());
     }
 
@@ -531,10 +552,14 @@ where
     seed_full_values(&backend, test_space, [("a", "B")])?;
     seed_full_values(&backend, test_space, [("a", "C")])?;
 
+    let old_keys = [key("a")];
     let old_result = old_read
-        .get_many(test_space, &[key("a")], GetOptions::default())
+        .get_many(test_space, &old_keys, GetOptions::default())
         .map_err(|error| format!("old read get_many failed: {error}"))?;
-    assert_read_entries(&old_result.entries.entries, &[("a", "A")])?;
+    assert_read_entries(
+        &old_result.entries_for_requested_keys(&old_keys),
+        &[("a", "A")],
+    )?;
 
     let old_scan = old_read
         .scan_range(
@@ -585,29 +610,34 @@ where
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?;
 
+    let full_keys = [key("a")];
     let full = read
         .get_many(
             test_space,
-            &[key("a")],
+            &full_keys,
             GetOptions {
                 projection: CoreProjection::FullValue,
                 ..Default::default()
             },
         )
         .map_err(|error| format!("FullValue get_many failed: {error}"))?;
-    assert_read_entries(&full.entries.entries, &[("a", "A")])?;
+    assert_read_entries(&full.entries_for_requested_keys(&full_keys), &[("a", "A")])?;
 
+    let key_only_keys = [key("a")];
     let key_only = read
         .get_many(
             test_space,
-            &[key("a")],
+            &key_only_keys,
             GetOptions {
                 projection: CoreProjection::KeyOnly,
                 ..Default::default()
             },
         )
         .map_err(|error| format!("KeyOnly get_many failed: {error}"))?;
-    assert_key_only_entries(&key_only.entries.entries, &[key("a")])?;
+    assert_key_only_entries(
+        &key_only.entries_for_requested_keys(&key_only_keys),
+        &[key("a")],
+    )?;
 
     let key_only_scan = read
         .scan_range(
@@ -661,12 +691,16 @@ where
         test_space,
         [(opaque_key.0.clone(), opaque_value.clone())],
     )?;
+    let requested = [opaque_key.clone()];
     let result = backend
         .begin_read(ReadOptions::default())
         .map_err(|error| format!("begin_read failed: {error}"))?
-        .get_many(test_space, &[opaque_key.clone()], GetOptions::default())
+        .get_many(test_space, &requested, GetOptions::default())
         .map_err(|error| format!("opaque get_many failed: {error}"))?;
-    assert_read_entries_bytes(&result.entries.entries, &[(opaque_key.0, opaque_value)])
+    assert_read_entries_bytes(
+        &result.entries_for_requested_keys(&requested),
+        &[(opaque_key.0, opaque_value)],
+    )
 }
 
 fn seed_full_values<B, I>(backend: &B, test_space: SpaceId, rows: I) -> ConformanceResult
@@ -732,7 +766,7 @@ where
         .map_err(|error| format!("begin_read failed: {error}"))?
         .get_many(test_space, &keys, GetOptions::default())
         .map_err(|error| format!("get_many failed: {error}"))?;
-    assert_optional_entry_map(&result.entries.entries, expected)
+    assert_optional_entry_map(&result.entries_for_requested_keys(&keys), expected)
 }
 
 fn assert_optional_entry_map(

@@ -399,7 +399,7 @@ Point reads:
 ```text
 domain store requests M keys, possibly with duplicates
 storage_v2 may dedupe to U unique keys
-backend_v2 get_many reads the unique/requested batch
+backend_v2 get_many returns one slot per unique/requested backend key
 storage_v2 reconstructs caller-order slots, duplicate slots, and missing slots
 storage_v2 can return either materialized caller-order values or an indexed
   shape with one value slot per unique key plus requested-slot indexes
@@ -417,8 +417,7 @@ storage reconstruction:
   O(M + U) time
   indexed result: O(U) value slots plus O(M) indexes
   materialized result: O(M) value slots
-  reusable point plan: O(M + U) once to build, then O(U + F) per read plus
-    result index ownership/copy cost
+  reusable point plan: O(M + U) once to build, then O(U) per read
 ```
 
 Prefix reads:
@@ -601,7 +600,9 @@ point batch:
   reconstruction for M requested keys. Indexed point results avoid cloning
   duplicate value slots; materialized point results clone into M caller-order
   slots. A reusable point request plan moves dedupe/index construction out of
-  repeated reads with the same key shape.
+  repeated reads with the same key shape. Backend get_many already returns
+  requested-order slots for the deduped key batch, so planned reads do not need
+  a returned-entry hash-map step.
 
 prefix/range scan:
   O(log_B N + Q) for tree/ordered-backend shaped implementations
@@ -743,8 +744,9 @@ write_set_batches_by_space:
   K puts across G spaces lowers to G put_many calls and one commit
 
 caller_order_reconstruction:
-  backend returns found entries for unique keys; storage reconstructs requested
-  slots, duplicate keys, and duplicate missing keys
+  storage dedupes to unique backend keys; backend returns one slot per unique
+  key; storage reconstructs requested slots, duplicate keys, and duplicate
+  missing keys
 
 read_shape_stats:
   point reads report requested keys, unique backend keys, and backend calls;

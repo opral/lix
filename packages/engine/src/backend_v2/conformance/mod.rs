@@ -48,7 +48,7 @@ mod tests {
         assert_eq!(
             passed,
             vec![
-                "baseline::get_many_returns_found_entries",
+                "baseline::get_many_returns_requested_slots",
                 "baseline::get_many_empty_key_list",
                 "baseline::delete_many_missing_keys_is_idempotent",
                 "baseline::delete_many_removes_existing_keys",

@@ -1394,3 +1394,63 @@ After:
 Owned planned reads still pay the O(M) clone by calling into_owned(), but hot
 repeated read loops can use the borrowed result directly.
 ```
+
+### 2026-05-14: Backend Point Reads Are Requested-Order Slots
+
+Change:
+
+```text
+Changed GetManyResult to the slot-shaped core contract:
+
+  values: Vec<Option<ProjectedValue>>
+
+The vector has one slot per key passed to backend get_many. Storage uses those
+slots directly for planned point reads and no longer supports a backend-native
+found-entry result at the v0 boundary.
+```
+
+Why:
+
+```text
+Post-borrowed-plan profiles showed the planned point-read hot path was mostly:
+
+  backend get_many over U unique keys
+  hash returned ReadEntry keys back into unique indexes
+  Bytes clone/drop in fake backend results
+
+The cleaner contract is also the faster contract: callers already know the
+requested keys, and storage_v2 can dedupe to U unique keys before calling the
+backend when that is useful.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo test -p lix_engine backend_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 storage_v2/point_read_planned_lean_backend/m10000_u100
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 storage_v2/point_read_planned_lean_backend/m1000_u1000
+```
+
+Focused scorecard:
+
+| Case                       | Previous Committed Mean | After Mean | Delta vs Committed |
+| -------------------------- | ----------------------: | ---------: | -----------------: |
+| `planned_lean/m10000_u100` |                1.322 us |  0.344 us  |     ~74.0% faster  |
+| `planned_lean/m1000_u1000` |               15.927 us |  4.065 us  |     ~74.5% faster  |
+
+Complexity impact:
+
+```text
+Old found-entry result:
+  planned read: O(U + F) plus returned-entry hash/index mapping
+
+Requested-order slot result:
+  planned read: O(U) slot copy/fill after backend get_many
+
+This is now the v0 backend contract. Backends preserve duplicate requested keys
+and missing-key slots; storage_v2 handles dedupe/planning above that when it
+wants to reduce backend key count.
+```
