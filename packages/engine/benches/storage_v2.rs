@@ -260,7 +260,7 @@ fn bench_point_read_adapter(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
             b.iter(|| {
                 let result = read
-                    .get_many_caller_order_with_stats(
+                    .get_many_values_caller_order_with_stats(
                         space(1),
                         black_box(&keys),
                         GetOptions::default(),
@@ -271,11 +271,7 @@ fn bench_point_read_adapter(c: &mut Criterion) {
                 assert_eq!(result.stats.backend_calls, 1);
                 assert_eq!(result.value.len(), case.requested_keys);
                 assert_eq!(
-                    result
-                        .value
-                        .iter()
-                        .filter(|slot| slot.value.is_none())
-                        .count(),
+                    result.value.iter().filter(|value| value.is_none()).count(),
                     expected_missing_slots
                 );
                 black_box(result.value);
@@ -371,7 +367,7 @@ fn bench_conformance_backend(c: &mut Criterion) {
     group.bench_function("get_many_m1000_u100", |b| {
         b.iter(|| {
             let result = get_many_read
-                .get_many_caller_order_with_stats(
+                .get_many_values_caller_order_with_stats(
                     space(1),
                     black_box(&get_many_keys),
                     GetOptions::default(),
