@@ -3295,3 +3295,61 @@ Compared with storage commit smoke, this says the remaining storage overhead is
 mostly write-set staging and grouped lowering, which is expected and already
 shape-guarded.
 ```
+
+## 2026-05-15: in-memory final profile and compaction decision
+
+Focused smoke lanes:
+
+| Case                         | Smoke range |
+| ---------------------------- | ----------: |
+| direct commit k1024/g16      |   77-181 us |
+| storage commit k1024/g16     |  100-524 us |
+| overlay point d32 m1000/u100 |    29-58 us |
+| overlay scan d32 q1000       |  2.9-5.1 us |
+
+Profiles:
+
+```text
+target/storage_v2_profiles/in_memory_final/direct_commit_k1024_g16_syms.json
+target/storage_v2_profiles/in_memory_final/storage_commit_k1024_g16_syms.json
+target/storage_v2_profiles/in_memory_final/overlay_point_d32_syms.json
+target/storage_v2_profiles/in_memory_final/overlay_scan_d32_syms.json
+```
+
+Profile read:
+
+```text
+direct commit:
+  dominated by BTreeMap::insert in InMemoryWrite::put_many, plus remaining
+  bench setup noise from seeded_in_memory_backend_with_value_size and
+  write_mutations.
+
+storage commit:
+  adds StorageWriteSet::stage_put / try_stage_put and commit/lowering overhead
+  above the same backend BTreeMap::insert floor.
+
+overlay point d32:
+  dominated by InMemoryRead::visit_many -> SpaceState::get recursion and
+  memcmp/key comparison. This is the expected layered lookup cost.
+
+overlay scan d32:
+  dominated by visit_scan_range -> InMemoryRead::visit_range ->
+  visit_space_range. The expensive merge path is no longer visible for the
+  base-range case; the fast path now delegates through empty overlay ranges.
+```
+
+Decision:
+
+```text
+Do not add compaction yet.
+
+Compaction would improve the d32 point-read lane by reducing layer walking, but
+it would add write-time flattening policy and make snapshot layout more complex.
+The scan lane is already clean, and the point-read cost is only meaningful for
+workloads that stack many tiny commits on one hot point-read space.
+
+Next step: keep compaction as a measured policy hook and move to real backend
+workloads. If SQLite/RocksDB/redb or domain-shaped traces show deep hot overlays,
+add a policy such as "compact after N layers" or "compact when overlay rows /
+base rows crosses a threshold."
+```
