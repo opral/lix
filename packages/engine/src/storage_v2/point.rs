@@ -12,6 +12,35 @@ pub struct PointSlot {
     pub value: Option<ProjectedValue>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedPointValues {
+    pub unique_values: Vec<Option<ProjectedValue>>,
+    pub requested_to_unique: Vec<usize>,
+}
+
+impl IndexedPointValues {
+    pub fn len(&self) -> usize {
+        self.requested_to_unique.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.requested_to_unique.is_empty()
+    }
+
+    pub fn value_at(&self, requested_index: usize) -> Option<&ProjectedValue> {
+        let unique_index = *self.requested_to_unique.get(requested_index)?;
+        self.unique_values.get(unique_index)?.as_ref()
+    }
+
+    pub fn materialize_caller_order(self) -> Vec<Option<ProjectedValue>> {
+        let mut values = Vec::with_capacity(self.requested_to_unique.len());
+        for unique_index in self.requested_to_unique {
+            values.push(self.unique_values[unique_index].clone());
+        }
+        values
+    }
+}
+
 pub(crate) fn get_many_caller_order<R>(
     read: &R,
     space: SpaceId,
@@ -51,7 +80,11 @@ pub(crate) fn get_many_values_caller_order<R>(
 where
     R: BackendRead,
 {
-    Ok(get_many_values_caller_order_with_stats(read, space, keys, opts)?.value)
+    Ok(
+        get_many_indexed_values_caller_order_with_stats(read, space, keys, opts)?
+            .value
+            .materialize_caller_order(),
+    )
 }
 
 pub(crate) fn get_many_values_caller_order_with_stats<R>(
@@ -60,6 +93,34 @@ pub(crate) fn get_many_values_caller_order_with_stats<R>(
     keys: &[Key],
     opts: GetOptions<'_>,
 ) -> Result<StorageReadResult<Vec<Option<ProjectedValue>>>, BackendError>
+where
+    R: BackendRead,
+{
+    let indexed = get_many_indexed_values_caller_order_with_stats(read, space, keys, opts)?;
+    Ok(StorageReadResult::new(
+        indexed.value.materialize_caller_order(),
+        indexed.stats,
+    ))
+}
+
+pub(crate) fn get_many_indexed_values_caller_order<R>(
+    read: &R,
+    space: SpaceId,
+    keys: &[Key],
+    opts: GetOptions<'_>,
+) -> Result<IndexedPointValues, BackendError>
+where
+    R: BackendRead,
+{
+    Ok(get_many_indexed_values_caller_order_with_stats(read, space, keys, opts)?.value)
+}
+
+pub(crate) fn get_many_indexed_values_caller_order_with_stats<R>(
+    read: &R,
+    space: SpaceId,
+    keys: &[Key],
+    opts: GetOptions<'_>,
+) -> Result<StorageReadResult<IndexedPointValues>, BackendError>
 where
     R: BackendRead,
 {
@@ -91,13 +152,11 @@ where
         }
     }
 
-    let mut values = Vec::with_capacity(keys.len());
-    for unique_index in requested_to_unique {
-        values.push(unique_values[unique_index].clone());
-    }
-
     Ok(StorageReadResult::new(
-        values,
+        IndexedPointValues {
+            unique_values,
+            requested_to_unique,
+        },
         StorageReadStats {
             requested_keys: keys.len() as u64,
             unique_backend_keys: backend_keys.len() as u64,

@@ -17,11 +17,12 @@ mod write_set;
 mod conformance;
 
 pub use context::StorageContext;
-pub use point::PointSlot;
 pub(crate) use point::{
-    get_many_caller_order, get_many_caller_order_with_stats, get_many_values_caller_order,
+    get_many_caller_order, get_many_caller_order_with_stats, get_many_indexed_values_caller_order,
+    get_many_indexed_values_caller_order_with_stats, get_many_values_caller_order,
     get_many_values_caller_order_with_stats,
 };
+pub use point::{IndexedPointValues, PointSlot};
 pub use read_scope::StorageReadScope;
 pub use reader::StorageReader;
 pub(crate) use scan::{scan_prefix, scan_prefix_with_stats};

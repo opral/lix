@@ -3,9 +3,11 @@ use crate::backend_v2::{
     ScanPage,
 };
 use crate::storage_v2::{
-    get_many_caller_order, get_many_caller_order_with_stats, get_many_values_caller_order,
-    get_many_values_caller_order_with_stats, scan_prefix, scan_prefix_with_stats, PointSlot,
-    StorageReadResult, StorageReadScope, StorageReadStats, StorageSpace,
+    get_many_caller_order, get_many_caller_order_with_stats, get_many_indexed_values_caller_order,
+    get_many_indexed_values_caller_order_with_stats, get_many_values_caller_order,
+    get_many_values_caller_order_with_stats, scan_prefix, scan_prefix_with_stats,
+    IndexedPointValues, PointSlot, StorageReadResult, StorageReadScope, StorageReadStats,
+    StorageSpace,
 };
 
 pub trait StorageReader {
@@ -36,6 +38,20 @@ pub trait StorageReader {
         keys: &[Key],
         opts: GetOptions<'_>,
     ) -> Result<StorageReadResult<Vec<Option<ProjectedValue>>>, BackendError>;
+
+    fn get_many_indexed_values_caller_order(
+        &self,
+        space: StorageSpace,
+        keys: &[Key],
+        opts: GetOptions<'_>,
+    ) -> Result<IndexedPointValues, BackendError>;
+
+    fn get_many_indexed_values_caller_order_with_stats(
+        &self,
+        space: StorageSpace,
+        keys: &[Key],
+        opts: GetOptions<'_>,
+    ) -> Result<StorageReadResult<IndexedPointValues>, BackendError>;
 
     fn scan_range(
         &self,
@@ -104,6 +120,24 @@ where
         opts: GetOptions<'_>,
     ) -> Result<StorageReadResult<Vec<Option<ProjectedValue>>>, BackendError> {
         get_many_values_caller_order_with_stats(self.backend_read(), space.id, keys, opts)
+    }
+
+    fn get_many_indexed_values_caller_order(
+        &self,
+        space: StorageSpace,
+        keys: &[Key],
+        opts: GetOptions<'_>,
+    ) -> Result<IndexedPointValues, BackendError> {
+        get_many_indexed_values_caller_order(self.backend_read(), space.id, keys, opts)
+    }
+
+    fn get_many_indexed_values_caller_order_with_stats(
+        &self,
+        space: StorageSpace,
+        keys: &[Key],
+        opts: GetOptions<'_>,
+    ) -> Result<StorageReadResult<IndexedPointValues>, BackendError> {
+        get_many_indexed_values_caller_order_with_stats(self.backend_read(), space.id, keys, opts)
     }
 
     fn scan_range(
@@ -319,6 +353,50 @@ mod tests {
 
         assert_eq!(
             values,
+            vec![
+                Some(ProjectedValue::FullValue(Bytes::from_static(b"B"))),
+                None,
+                Some(ProjectedValue::FullValue(Bytes::from_static(b"A"))),
+                Some(ProjectedValue::FullValue(Bytes::from_static(b"B"))),
+            ]
+        );
+    }
+
+    #[test]
+    fn point_reads_can_return_indexed_values_without_duplicate_value_clones() {
+        let storage = StorageContext::new(ConformanceBackend::new());
+        let mut writes = storage.new_write_set();
+        writes.stage_put(space(1), key("a"), value("A"));
+        writes.stage_put(space(1), key("b"), value("B"));
+        storage
+            .commit_write_set(writes, WriteOptions::default())
+            .expect("seed");
+        let read = storage
+            .begin_read(ReadOptions::default())
+            .expect("begin read");
+
+        let indexed = read
+            .get_many_indexed_values_caller_order(
+                space(1),
+                &[key("b"), key("missing"), key("a"), key("b")],
+                GetOptions::default(),
+            )
+            .expect("indexed caller order values");
+
+        assert_eq!(indexed.len(), 4);
+        assert_eq!(indexed.unique_values.len(), 3);
+        assert_eq!(indexed.requested_to_unique, vec![0, 1, 2, 0]);
+        assert_eq!(
+            indexed.value_at(0),
+            Some(&ProjectedValue::FullValue(Bytes::from_static(b"B")))
+        );
+        assert_eq!(indexed.value_at(1), None);
+        assert_eq!(
+            indexed.value_at(2),
+            Some(&ProjectedValue::FullValue(Bytes::from_static(b"A")))
+        );
+        assert_eq!(
+            indexed.materialize_caller_order(),
             vec![
                 Some(ProjectedValue::FullValue(Bytes::from_static(b"B"))),
                 None,

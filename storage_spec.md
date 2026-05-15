@@ -401,6 +401,8 @@ domain store requests M keys, possibly with duplicates
 storage_v2 may dedupe to U unique keys
 backend_v2 get_many reads the unique/requested batch
 storage_v2 reconstructs caller-order slots, duplicate slots, and missing slots
+storage_v2 can return either materialized caller-order values or an indexed
+  shape with one value slot per unique key plus requested-slot indexes
 ```
 
 Target:
@@ -411,7 +413,8 @@ backend point I/O:
 
 storage reconstruction:
   O(M + U) time
-  O(U) memory
+  indexed result: O(U) value slots plus O(M) indexes
+  materialized result: O(M) value slots
 ```
 
 Prefix reads:
@@ -591,7 +594,9 @@ Read-side targets:
 ```text
 point batch:
   O(U) backend batch for U unique keys plus O(M + U) caller-order
-  reconstruction for M requested keys
+  reconstruction for M requested keys. Indexed point results avoid cloning
+  duplicate value slots; materialized point results clone into M caller-order
+  slots.
 
 prefix/range scan:
   O(log_B N + Q) for tree/ordered-backend shaped implementations
@@ -836,7 +841,8 @@ reader.rs:
   StorageReader trait over a shared read scope
 
 point.rs:
-  caller-order point reconstruction and requested-key dedupe
+  caller-order point reconstruction, indexed point values, and requested-key
+  dedupe
 
 scan.rs:
   prefix lowering and scan helper mechanics
