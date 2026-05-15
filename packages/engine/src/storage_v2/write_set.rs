@@ -262,7 +262,8 @@ mod tests {
     use crate::backend_v2::{
         Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
         ConformanceBackend, GetManyResult, GetOptions, Key, KeyRange, PutBatch, ReadOptions,
-        ScanOptions, ScanPage, SpaceId, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+        ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency, WriteOptions,
+        WriteStats,
     };
     use crate::storage_v2::{StorageSpace, StorageWriteSet, StorageWriteSetError};
 
@@ -653,12 +654,13 @@ mod tests {
             unimplemented!("not used by write-set tests")
         }
 
-        fn scan_range(
+        fn visit_range(
             &self,
             _space: SpaceId,
             _range: KeyRange,
             _opts: ScanOptions<'_>,
-        ) -> Result<ScanPage, BackendError> {
+            _visitor: &mut dyn ScanVisitor,
+        ) -> Result<ScanResult, BackendError> {
             unimplemented!("not used by write-set tests")
         }
     }

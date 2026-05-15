@@ -139,8 +139,8 @@ mod shape_tests {
 
     use crate::backend_v2::{
         Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-        GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, PutBatch, ReadBatch, ReadEntry,
-        ReadOptions, ScanOptions, ScanPage, SpaceId, StoredValue, WriteConcurrency, WriteOptions,
+        GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, PutBatch, ReadOptions,
+        ScanOptions, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency, WriteOptions,
         WriteStats,
     };
     use crate::storage_v2::{StorageContext, StorageReadScope, StorageReader, StorageSpace};
@@ -332,18 +332,16 @@ mod shape_tests {
             ))
         }
 
-        fn scan_range(
+        fn visit_range(
             &self,
             _space: SpaceId,
             range: KeyRange,
             _opts: ScanOptions<'_>,
-        ) -> Result<ScanPage, BackendError> {
+            _visitor: &mut dyn ScanVisitor,
+        ) -> Result<ScanResult, BackendError> {
             self.scan_range_calls.set(self.scan_range_calls.get() + 1);
             self.scan_range.replace(Some(range));
-            Ok(ScanPage {
-                entries: ReadBatch::default(),
-                has_more: false,
-            })
+            Ok(ScanResult::default())
         }
     }
 

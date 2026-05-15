@@ -9,9 +9,9 @@ use super::{
 };
 use crate::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue,
-    ProjectionCapabilities, PutBatch, ReadBatch, ReadEntry, ReadOptions, ScanOptions, ScanPage,
-    SpaceId, StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, ProjectedValueRef,
+    ProjectionCapabilities, PutBatch, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
+    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 
 type BrokenMap = BTreeMap<(SpaceId, Key), Bytes>;
@@ -319,12 +319,13 @@ impl BackendRead for BrokenRead {
         get_many_from_map(entries, self.mode, space, keys, opts)
     }
 
-    fn scan_range(
+    fn visit_range(
         &self,
         space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<ScanPage, BackendError> {
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError> {
         let live_entries;
         let entries = if matches!(self.mode, BrokenMode::ScanReadSeesLaterCommits) {
             live_entries = self
@@ -336,7 +337,7 @@ impl BackendRead for BrokenRead {
         } else {
             &self.snapshot
         };
-        scan_range_from_map(entries, self.mode, space, range, opts)
+        visit_range_from_map(entries, self.mode, space, range, opts, visitor)
     }
 }
 
@@ -434,14 +435,15 @@ fn get_many_from_map(
     Ok(GetManyResult::new(values))
 }
 
-fn scan_range_from_map(
+fn visit_range_from_map(
     entries: &BrokenMap,
     mode: BrokenMode,
     space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
-) -> Result<ScanPage, BackendError> {
-    let mut read_entries = Vec::new();
+    visitor: &mut dyn ScanVisitor,
+) -> Result<ScanResult, BackendError> {
+    let mut emitted = 0;
     let mut has_more = false;
     let mut candidates = entries
         .iter()
@@ -468,22 +470,15 @@ fn scan_range_from_map(
         }) {
             continue;
         }
-        if read_entries.len() == opts.limit_rows {
+        if emitted == opts.limit_rows {
             has_more = true;
             break;
         }
-        read_entries.push(ReadEntry {
-            key: key.clone(),
-            value: project_value(value, mode, opts.projection, true),
-        });
+        visitor.visit(key, project_value_ref(value, mode, opts.projection, true))?;
+        emitted += 1;
     }
 
-    Ok(ScanPage {
-        entries: ReadBatch {
-            entries: read_entries,
-        },
-        has_more,
-    })
+    Ok(ScanResult { emitted, has_more })
 }
 
 fn range_contains(range: &KeyRange, key: &Key) -> bool {
@@ -525,6 +520,23 @@ fn project_value(
         }
         CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
         CoreProjection::FullValue => ProjectedValue::FullValue(value),
+    }
+}
+
+fn project_value_ref(
+    value: &Bytes,
+    mode: BrokenMode,
+    projection: CoreProjection,
+    break_key_only: bool,
+) -> ProjectedValueRef<'_> {
+    match projection {
+        CoreProjection::KeyOnly
+            if break_key_only && matches!(mode, BrokenMode::KeyOnlyScanReturnsFullValues) =>
+        {
+            ProjectedValueRef::FullValue(value)
+        }
+        CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
+        CoreProjection::FullValue => ProjectedValueRef::FullValue(value),
     }
 }
 

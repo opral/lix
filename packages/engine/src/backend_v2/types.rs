@@ -70,6 +70,12 @@ pub struct ScanPage {
     pub has_more: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanResult {
+    pub emitted: usize,
+    pub has_more: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GetManyResult {
     /// One slot per key passed to `get_many`, in caller order.
@@ -88,6 +94,21 @@ pub enum CoreProjection {
 pub enum ProjectedValue {
     KeyOnly,
     FullValue(Bytes),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectedValueRef<'a> {
+    KeyOnly,
+    FullValue(&'a Bytes),
+}
+
+impl ProjectedValueRef<'_> {
+    pub fn to_owned(self) -> ProjectedValue {
+        match self {
+            ProjectedValueRef::KeyOnly => ProjectedValue::KeyOnly,
+            ProjectedValueRef::FullValue(value) => ProjectedValue::FullValue(value.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

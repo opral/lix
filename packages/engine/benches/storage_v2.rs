@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
 use std::ops::Bound;
 use std::rc::Rc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use criterion::{
@@ -11,9 +12,10 @@ use criterion::{
 };
 use lix_engine::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
-    ConformanceBackend, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Prefix,
-    ProjectedValue, PutBatch, ReadBatch, ReadEntry, ReadOptions, ScanOptions, ScanPage, SpaceId,
-    StoredValue, WriteConcurrency, WriteOptions, WriteStats,
+    ConformanceBackend, CoreProjection, GetManyResult, GetOptions, InMemoryBackend, Key, KeyRange,
+    Prefix, ProjectedValue, ProjectedValueRef, PutBatch, ReadBatch, ReadEntry, ReadOptions,
+    ScanOptions, ScanPage, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency,
+    WriteOptions, WriteStats,
 };
 use lix_engine::storage_v2::{
     PointRequestPlan, StorageContext, StorageReadScope, StorageReader, StorageSpace,
@@ -203,6 +205,8 @@ fn storage_v2_benches(c: &mut Criterion) {
     bench_point_read_planned_lean_backend(c);
     bench_prefix_scan_adapter(c);
     bench_conformance_backend(c);
+    bench_in_memory_backend(c);
+    bench_scan_visitor_baseline(c);
     bench_hash_algorithms(c);
 }
 
@@ -744,8 +748,157 @@ fn bench_conformance_backend(c: &mut Criterion) {
         .expect("begin read");
     group.bench_function("scan_range_q1000", |b| {
         b.iter(|| {
-            let page = scan_read
-                .scan_range(
+            let page = materialize_backend_scan(
+                &scan_read,
+                SpaceId(1),
+                KeyRange {
+                    lower: Bound::Included(key("point-0000")),
+                    upper: Bound::Excluded(key("point-9999")),
+                },
+                ScanOptions {
+                    limit_rows: 1_001,
+                    projection: CoreProjection::KeyOnly,
+                    ..ScanOptions::default()
+                },
+            )
+            .expect("scan range");
+            assert_eq!(page.entries.entries.len(), 1_000);
+            black_box(page);
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_in_memory_backend(c: &mut Criterion) {
+    let mut group = c.benchmark_group("storage_v2/in_memory_backend");
+    group.sample_size(10);
+
+    group.throughput(Throughput::Elements(1_024));
+    let commit_case = WriteCase {
+        name: "commit_puts_k1024_g16_v32",
+        writes: 1_024,
+        spaces: 16,
+        value_size: 32,
+        mix: WriteMix::PutsOnly,
+    };
+    let commit_mutations = write_mutations(&commit_case);
+    group.bench_function("commit_puts_k1024_g16_v32", |b| {
+        b.iter_batched(
+            || {
+                let backend = InMemoryBackend::new();
+                let storage = StorageContext::new(backend);
+                let mut writes = storage.new_write_set();
+                for mutation in &commit_mutations {
+                    match mutation {
+                        WriteMutation::Put(space, key, value) => {
+                            writes.stage_put(*space, key.clone(), value.clone());
+                        }
+                        WriteMutation::Delete(space, key) => {
+                            writes.stage_delete(*space, key.clone());
+                        }
+                    }
+                }
+                (storage, writes)
+            },
+            |(storage, writes)| {
+                let (_commit, stats) = storage
+                    .commit_write_set(writes, WriteOptions::default())
+                    .expect("commit write set");
+                assert_eq!(stats.staged_puts, 1_024);
+                assert_eq!(stats.put_batches, 16);
+                black_box(stats);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.throughput(Throughput::Elements(1_000));
+    let get_many_backend = seeded_in_memory_backend(1, 100);
+    let get_many_read = get_many_backend
+        .begin_read(ReadOptions::default())
+        .expect("begin read");
+    let get_many_read = StorageReadScope::new(get_many_read);
+    let get_many_keys = point_request_keys(1_000, 100);
+    group.bench_function("get_many_m1000_u100", |b| {
+        b.iter(|| {
+            let result = get_many_read
+                .get_many_values_caller_order_with_stats(
+                    space(1),
+                    black_box(&get_many_keys),
+                    GetOptions::default(),
+                )
+                .expect("point read");
+            assert_eq!(result.stats.requested_keys, 1_000);
+            assert_eq!(result.stats.unique_backend_keys, 100);
+            assert_eq!(result.stats.backend_calls, 1);
+            assert_eq!(result.value.len(), 1_000);
+            black_box(result.value);
+        });
+    });
+
+    group.throughput(Throughput::Elements(1_000));
+    let planned_get_many_backend = seeded_in_memory_backend(1, 100);
+    let planned_get_many_read = planned_get_many_backend
+        .begin_read(ReadOptions::default())
+        .expect("begin read");
+    let planned_get_many_read = StorageReadScope::new(planned_get_many_read);
+    let planned_get_many_keys = point_request_keys(1_000, 100);
+    let planned_get_many_plan = PointRequestPlan::new(&planned_get_many_keys);
+    group.bench_function("planned_get_many_m1000_u100", |b| {
+        b.iter(|| {
+            let result = planned_get_many_read
+                .get_many_borrowed_indexed_values_for_plan_with_stats(
+                    space(1),
+                    black_box(&planned_get_many_plan),
+                    GetOptions::default(),
+                )
+                .expect("planned point read");
+            assert_eq!(result.stats.requested_keys, 1_000);
+            assert_eq!(result.stats.unique_backend_keys, 100);
+            assert_eq!(result.stats.backend_calls, 1);
+            assert_eq!(result.value.len(), 1_000);
+            assert_eq!(result.value.unique_values.len(), 100);
+            black_box(result.value);
+        });
+    });
+
+    group.throughput(Throughput::Elements(1_000));
+    let scan_backend = seeded_in_memory_backend(1, 1_000);
+    let scan_read = scan_backend
+        .begin_read(ReadOptions::default())
+        .expect("begin read");
+    group.bench_function("scan_range_q1000", |b| {
+        b.iter(|| {
+            let page = materialize_backend_scan(
+                &scan_read,
+                SpaceId(1),
+                KeyRange {
+                    lower: Bound::Included(key("point-0000")),
+                    upper: Bound::Excluded(key("point-9999")),
+                },
+                ScanOptions {
+                    limit_rows: 1_001,
+                    projection: CoreProjection::KeyOnly,
+                    ..ScanOptions::default()
+                },
+            )
+            .expect("scan range");
+            assert_eq!(page.entries.entries.len(), 1_000);
+            black_box(page);
+        });
+    });
+
+    group.throughput(Throughput::Elements(1_000));
+    let scan_visit_backend = seeded_in_memory_backend(1, 1_000);
+    let scan_visit_read = scan_visit_backend
+        .begin_read(ReadOptions::default())
+        .expect("begin read");
+    group.bench_function("scan_range_visit_key_only_q1000", |b| {
+        b.iter(|| {
+            let mut visited = 0usize;
+            let result = scan_visit_read
+                .visit_scan_range(
                     SpaceId(1),
                     KeyRange {
                         lower: Bound::Included(key("point-0000")),
@@ -756,12 +909,277 @@ fn bench_conformance_backend(c: &mut Criterion) {
                         projection: CoreProjection::KeyOnly,
                         ..ScanOptions::default()
                     },
+                    |key, value| {
+                        visited += 1;
+                        assert!(value.is_none());
+                        black_box(key);
+                    },
+                )
+                .expect("visit scan range");
+            assert_eq!(visited, 1_000);
+            assert_eq!(result.emitted, 1_000);
+            assert!(!result.has_more);
+            black_box(result);
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_scan_visitor_baseline(c: &mut Criterion) {
+    let mut group = c.benchmark_group("storage_v2/scan_visitor_baseline");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(1));
+
+    for rows in [0usize, 1, 10, 100, 1_000, 10_000] {
+        let backend = seeded_in_memory_backend_with_value_size(1, rows as u32, 32);
+        let read = backend
+            .begin_read(ReadOptions::default())
+            .expect("begin read");
+        group.throughput(Throughput::Elements(rows as u64));
+        group.bench_function(format!("owned_key_only_q{rows}"), |b| {
+            b.iter(|| {
+                let page = materialize_backend_scan(
+                    &read,
+                    SpaceId(1),
+                    point_scan_range(),
+                    ScanOptions {
+                        limit_rows: rows + 1,
+                        projection: CoreProjection::KeyOnly,
+                        ..ScanOptions::default()
+                    },
                 )
                 .expect("scan range");
+                assert_eq!(page.entries.entries.len(), rows);
+                black_box(page);
+            });
+        });
+
+        group.bench_function(format!("visit_key_only_q{rows}"), |b| {
+            b.iter(|| {
+                let mut visited = 0usize;
+                let result = read
+                    .visit_scan_range(
+                        SpaceId(1),
+                        point_scan_range(),
+                        ScanOptions {
+                            limit_rows: rows + 1,
+                            projection: CoreProjection::KeyOnly,
+                            ..ScanOptions::default()
+                        },
+                        |key, value| {
+                            visited += 1;
+                            assert!(value.is_none());
+                            black_box(key);
+                        },
+                    )
+                    .expect("visit scan range");
+                assert_eq!(visited, rows);
+                assert_eq!(result.emitted, rows);
+                assert!(!result.has_more);
+                black_box(result);
+            });
+        });
+    }
+
+    for value_size in [32usize, 1_024, 65_536] {
+        let backend = seeded_in_memory_backend_with_value_size(1, 1_000, value_size);
+        let read = backend
+            .begin_read(ReadOptions::default())
+            .expect("begin read");
+        group.throughput(Throughput::Elements(1_000));
+        group.bench_function(format!("owned_full_value_q1000_v{value_size}"), |b| {
+            b.iter(|| {
+                let page = materialize_backend_scan(
+                    &read,
+                    SpaceId(1),
+                    point_scan_range(),
+                    ScanOptions {
+                        limit_rows: 1_001,
+                        projection: CoreProjection::FullValue,
+                        ..ScanOptions::default()
+                    },
+                )
+                .expect("scan range");
+                assert_eq!(page.entries.entries.len(), 1_000);
+                black_box(page);
+            });
+        });
+
+        group.bench_function(format!("visit_full_value_q1000_v{value_size}"), |b| {
+            b.iter(|| {
+                let mut visited = 0usize;
+                let mut bytes_seen = 0usize;
+                let result = read
+                    .visit_scan_range(
+                        SpaceId(1),
+                        point_scan_range(),
+                        ScanOptions {
+                            limit_rows: 1_001,
+                            projection: CoreProjection::FullValue,
+                            ..ScanOptions::default()
+                        },
+                        |key, value| {
+                            visited += 1;
+                            let value = value.expect("full value");
+                            bytes_seen += value.len();
+                            black_box((key, value));
+                        },
+                    )
+                    .expect("visit scan range");
+                assert_eq!(visited, 1_000);
+                assert_eq!(bytes_seen, value_size * 1_000);
+                assert_eq!(result.emitted, 1_000);
+                assert!(!result.has_more);
+                black_box(result);
+            });
+        });
+    }
+
+    let materialize_backend = seeded_in_memory_backend_with_value_size(1, 1_000, 32);
+    let materialize_read = materialize_backend
+        .begin_read(ReadOptions::default())
+        .expect("begin read");
+    group.throughput(Throughput::Elements(1_000));
+    group.bench_function("visit_materialize_key_only_q1000", |b| {
+        b.iter(|| {
+            let page =
+                materialize_scan_visit(&materialize_read, CoreProjection::KeyOnly, 1_001, None)
+                    .expect("materialize visitor scan");
             assert_eq!(page.entries.entries.len(), 1_000);
             black_box(page);
         });
     });
+
+    group.bench_function("visit_materialize_full_value_q1000_v32", |b| {
+        b.iter(|| {
+            let page =
+                materialize_scan_visit(&materialize_read, CoreProjection::FullValue, 1_001, None)
+                    .expect("materialize visitor scan");
+            assert_eq!(page.entries.entries.len(), 1_000);
+            black_box(page);
+        });
+    });
+
+    for limit_rows in [10usize, 100, 1_000] {
+        let backend = seeded_in_memory_backend_with_value_size(1, 1_000, 32);
+        let read = backend
+            .begin_read(ReadOptions::default())
+            .expect("begin read");
+        group.throughput(Throughput::Elements(limit_rows as u64));
+        group.bench_function(format!("owned_key_only_q1000_limit{limit_rows}"), |b| {
+            b.iter(|| {
+                let page = materialize_backend_scan(
+                    &read,
+                    SpaceId(1),
+                    point_scan_range(),
+                    ScanOptions {
+                        limit_rows,
+                        projection: CoreProjection::KeyOnly,
+                        ..ScanOptions::default()
+                    },
+                )
+                .expect("scan range");
+                assert_eq!(page.entries.entries.len(), limit_rows);
+                assert_eq!(page.has_more, limit_rows < 1_000);
+                black_box(page);
+            });
+        });
+
+        group.bench_function(format!("visit_key_only_q1000_limit{limit_rows}"), |b| {
+            b.iter(|| {
+                let mut visited = 0usize;
+                let result = read
+                    .visit_scan_range(
+                        SpaceId(1),
+                        point_scan_range(),
+                        ScanOptions {
+                            limit_rows,
+                            projection: CoreProjection::KeyOnly,
+                            ..ScanOptions::default()
+                        },
+                        |key, value| {
+                            visited += 1;
+                            assert!(value.is_none());
+                            black_box(key);
+                        },
+                    )
+                    .expect("visit scan range");
+                assert_eq!(visited, limit_rows);
+                assert_eq!(result.emitted, limit_rows);
+                assert_eq!(result.has_more, limit_rows < 1_000);
+                black_box(result);
+            });
+        });
+    }
+
+    for page_size in [10usize, 100] {
+        let backend = seeded_in_memory_backend_with_value_size(1, 1_000, 32);
+        let read = backend
+            .begin_read(ReadOptions::default())
+            .expect("begin read");
+        group.throughput(Throughput::Elements(1_000));
+        group.bench_function(format!("owned_drain_key_only_q1000_page{page_size}"), |b| {
+            b.iter(|| {
+                let mut emitted = 0usize;
+                let mut resume_after = None;
+                loop {
+                    let page = materialize_backend_scan(
+                        &read,
+                        SpaceId(1),
+                        point_scan_range(),
+                        ScanOptions {
+                            limit_rows: page_size,
+                            projection: CoreProjection::KeyOnly,
+                            resume_after: resume_after.as_ref(),
+                        },
+                    )
+                    .expect("scan range");
+                    emitted += page.entries.entries.len();
+                    resume_after = page.entries.entries.last().map(|entry| entry.key.clone());
+                    if !page.has_more {
+                        break;
+                    }
+                }
+                assert_eq!(emitted, 1_000);
+                black_box(resume_after);
+            });
+        });
+
+        group.bench_function(format!("visit_drain_key_only_q1000_page{page_size}"), |b| {
+            b.iter(|| {
+                let mut emitted = 0usize;
+                let mut resume_after = None;
+                loop {
+                    let mut page_last_key = None;
+                    let result = read
+                        .visit_scan_range(
+                            SpaceId(1),
+                            point_scan_range(),
+                            ScanOptions {
+                                limit_rows: page_size,
+                                projection: CoreProjection::KeyOnly,
+                                resume_after: resume_after.as_ref(),
+                            },
+                            |key, value| {
+                                assert!(value.is_none());
+                                page_last_key = Some(key.clone());
+                                black_box(key);
+                            },
+                        )
+                        .expect("visit scan range");
+                    emitted += result.emitted;
+                    resume_after = page_last_key;
+                    if !result.has_more {
+                        break;
+                    }
+                }
+                assert_eq!(emitted, 1_000);
+                black_box(resume_after);
+            });
+        });
+    }
 
     group.finish();
 }
@@ -882,12 +1300,13 @@ impl BackendRead for PointReadBackend {
         ))
     }
 
-    fn scan_range(
+    fn visit_range(
         &self,
         _space: SpaceId,
         _range: KeyRange,
         _opts: ScanOptions<'_>,
-    ) -> Result<ScanPage, BackendError> {
+        _visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError> {
         unreachable!("point-read benchmark does not scan")
     }
 }
@@ -932,12 +1351,13 @@ impl BackendRead for LeanPointReadBackend {
         Ok(GetManyResult::new(values))
     }
 
-    fn scan_range(
+    fn visit_range(
         &self,
         _space: SpaceId,
         _range: KeyRange,
         _opts: ScanOptions<'_>,
-    ) -> Result<ScanPage, BackendError> {
+        _visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError> {
         unreachable!("lean point-read benchmark does not scan")
     }
 }
@@ -974,18 +1394,22 @@ impl BackendRead for PrefixReadBackend {
         unreachable!("prefix-scan benchmark does not point-read")
     }
 
-    fn scan_range(
+    fn visit_range(
         &self,
         _space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-    ) -> Result<ScanPage, BackendError> {
+        visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError> {
         assert_eq!(range.lower, Bound::Included(key("row-")));
         assert_eq!(range.upper, Bound::Excluded(key("row.")));
-        Ok(ScanPage {
-            entries: ReadBatch {
-                entries: self.entries.iter().take(opts.limit_rows).cloned().collect(),
-            },
+        let mut emitted = 0;
+        for entry in self.entries.iter().take(opts.limit_rows) {
+            visitor.visit(&entry.key, ProjectedValueRef::KeyOnly)?;
+            emitted += 1;
+        }
+        Ok(ScanResult {
+            emitted,
             has_more: opts.limit_rows < self.entries.len(),
         })
     }
@@ -1004,12 +1428,13 @@ impl BackendRead for EmptyRead {
         unreachable!("write-set benchmark does not point-read")
     }
 
-    fn scan_range(
+    fn visit_range(
         &self,
         _space: SpaceId,
         _range: KeyRange,
         _opts: ScanOptions<'_>,
-    ) -> Result<ScanPage, BackendError> {
+        _visitor: &mut dyn ScanVisitor,
+    ) -> Result<ScanResult, BackendError> {
         unreachable!("write-set benchmark does not scan")
     }
 }
@@ -1066,6 +1491,99 @@ fn seeded_conformance_backend(space_id: u32, rows: u32) -> ConformanceBackend {
         .expect("seed conformance backend");
     assert_eq!(stats.staged_puts, rows as u64);
     backend
+}
+
+fn seeded_in_memory_backend(space_id: u32, rows: u32) -> InMemoryBackend {
+    seeded_in_memory_backend_with_value_size(space_id, rows, 32)
+}
+
+fn seeded_in_memory_backend_with_value_size(
+    space_id: u32,
+    rows: u32,
+    value_size: usize,
+) -> InMemoryBackend {
+    let backend = InMemoryBackend::new();
+    let storage = StorageContext::new(backend.clone());
+    let mut writes = storage.new_write_set();
+    for index in 0..rows {
+        writes.stage_put(
+            space(space_id),
+            key(format!("point-{index:04}")),
+            value(index, value_size),
+        );
+    }
+    let (_commit, stats) = storage
+        .commit_write_set(writes, WriteOptions::default())
+        .expect("seed in-memory backend");
+    assert_eq!(stats.staged_puts, rows as u64);
+    backend
+}
+
+fn point_scan_range() -> KeyRange {
+    KeyRange {
+        lower: Bound::Included(key("point-0000")),
+        upper: Bound::Excluded(key("point:")),
+    }
+}
+
+fn materialize_backend_scan<R>(
+    read: &R,
+    space: SpaceId,
+    range: KeyRange,
+    opts: ScanOptions<'_>,
+) -> Result<ScanPage, BackendError>
+where
+    R: BackendRead,
+{
+    let mut entries = Vec::with_capacity(opts.limit_rows);
+    let result = read.visit_range(
+        space,
+        range,
+        opts,
+        &mut |key: &Key, value: ProjectedValueRef<'_>| {
+            entries.push(ReadEntry {
+                key: key.clone(),
+                value: value.to_owned(),
+            });
+            Ok(())
+        },
+    )?;
+    Ok(ScanPage {
+        entries: ReadBatch { entries },
+        has_more: result.has_more,
+    })
+}
+
+fn materialize_scan_visit(
+    read: &lix_engine::backend_v2::InMemoryRead,
+    projection: CoreProjection,
+    limit_rows: usize,
+    resume_after: Option<&Key>,
+) -> Result<ScanPage, BackendError> {
+    let mut entries = Vec::with_capacity(limit_rows);
+    let result = read.visit_scan_range(
+        SpaceId(1),
+        point_scan_range(),
+        ScanOptions {
+            projection,
+            limit_rows,
+            resume_after,
+        },
+        |key, value| {
+            let value = match value {
+                None => ProjectedValue::KeyOnly,
+                Some(value) => ProjectedValue::FullValue(value.clone()),
+            };
+            entries.push(ReadEntry {
+                key: key.clone(),
+                value,
+            });
+        },
+    )?;
+    Ok(ScanPage {
+        entries: ReadBatch { entries },
+        has_more: result.has_more,
+    })
 }
 
 fn write_mutations(case: &WriteCase) -> Vec<WriteMutation> {

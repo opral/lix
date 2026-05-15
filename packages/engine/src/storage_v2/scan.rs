@@ -1,5 +1,6 @@
 use crate::backend_v2::{
-    BackendError, BackendRead, Key, Prefix, ReadBatch, ScanOptions, ScanPage, SpaceId,
+    BackendError, BackendRead, Key, KeyRange, Prefix, ProjectedValueRef, ReadBatch, ReadEntry,
+    ScanOptions, ScanPage, SpaceId,
 };
 use crate::storage_v2::{StorageReadResult, StorageReadStats};
 
@@ -32,6 +33,64 @@ where
     Ok(scan_prefix_with_stats(read, space, prefix, opts)?.value)
 }
 
+pub(crate) fn scan_range<R>(
+    read: &R,
+    space: SpaceId,
+    range: KeyRange,
+    opts: ScanOptions<'_>,
+) -> Result<ScanPage, BackendError>
+where
+    R: BackendRead,
+{
+    if opts.limit_rows == 0 {
+        return Ok(ScanPage {
+            entries: ReadBatch::default(),
+            has_more: false,
+        });
+    }
+
+    let mut entries = Vec::with_capacity(opts.limit_rows);
+    let result = read.visit_range(
+        space,
+        range,
+        opts,
+        &mut |key: &Key, value: ProjectedValueRef<'_>| {
+            entries.push(ReadEntry {
+                key: key.clone(),
+                value: value.to_owned(),
+            });
+            Ok(())
+        },
+    )?;
+
+    Ok(ScanPage {
+        entries: ReadBatch { entries },
+        has_more: result.has_more,
+    })
+}
+
+pub(crate) fn scan_range_with_stats<R>(
+    read: &R,
+    space: SpaceId,
+    range: KeyRange,
+    opts: ScanOptions<'_>,
+) -> Result<StorageReadResult<ScanPage>, BackendError>
+where
+    R: BackendRead,
+{
+    let backend_calls = u64::from(opts.limit_rows != 0);
+    let page = scan_range(read, space, range, opts)?;
+    Ok(StorageReadResult::new(
+        page,
+        StorageReadStats {
+            requested_keys: 0,
+            unique_backend_keys: 0,
+            backend_calls,
+            prefix_lowered: 0,
+        },
+    ))
+}
+
 pub(crate) fn scan_prefix_with_stats<R>(
     read: &R,
     space: SpaceId,
@@ -55,7 +114,7 @@ where
             },
         ));
     }
-    let page = read.scan_range(space, prefix.to_range()?, opts)?;
+    let page = scan_range(read, space, prefix.to_range()?, opts)?;
     Ok(StorageReadResult::new(
         page,
         StorageReadStats {
@@ -76,7 +135,8 @@ mod tests {
 
     use crate::backend_v2::{
         BackendError, BackendRead, ConformanceBackend, GetManyResult, GetOptions, Key, KeyRange,
-        Prefix, ReadBatch, ReadOptions, ScanOptions, ScanPage, SpaceId, StoredValue, WriteOptions,
+        Prefix, ProjectedValueRef, ReadOptions, ScanOptions, ScanResult, ScanVisitor, SpaceId,
+        StoredValue, WriteOptions,
     };
     use crate::storage_v2::{scan_prefix, StorageContext, StorageReader, StorageSpace};
 
@@ -223,17 +283,15 @@ mod tests {
             unimplemented!("not used by prefix lowering tests")
         }
 
-        fn scan_range(
+        fn visit_range(
             &self,
             _space: SpaceId,
             range: KeyRange,
             _opts: ScanOptions<'_>,
-        ) -> Result<ScanPage, BackendError> {
+            _visitor: &mut dyn ScanVisitor,
+        ) -> Result<ScanResult, BackendError> {
             self.range.replace(Some(range));
-            Ok(ScanPage {
-                entries: ReadBatch::default(),
-                has_more: false,
-            })
+            Ok(ScanResult::default())
         }
     }
 }
