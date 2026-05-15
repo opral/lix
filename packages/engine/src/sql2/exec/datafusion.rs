@@ -8,9 +8,13 @@ use datafusion::sql::parser::Statement as DataFusionStatement;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+use crate::sql2::bind::expr::{BoundExpr, BoundLiteral};
+use crate::sql2::bind::write::{BoundWriteInput, BoundWriteOp, BoundWriteTarget};
 use crate::sql2::parse::parse_statement;
+use crate::sql2::plan::predicate::BoundPredicate;
+use crate::sql2::plan::version_scope::VersionScope;
 use crate::sql2::plan::LogicalWritePlan;
-use crate::{LixError, LixNotice, SqlQueryResult, Value};
+use crate::{LixError, LixNotice, SqlQueryResult, Value, GLOBAL_VERSION_ID};
 
 use crate::sql2::predicate_typecheck::validate_json_predicate_expr_with_dfschema;
 use crate::sql2::result_metadata::{
@@ -223,14 +227,286 @@ pub(crate) async fn execute_logical_plan(
 }
 
 pub(crate) async fn execute_datafusion_write_logical_plan(
-    _ctx: &mut dyn SqlWriteExecutionContext,
-    _plan: &LogicalWritePlan,
-    _params: &[Value],
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    params: &[Value],
 ) -> Result<u64, LixError> {
-    Err(LixError::new(
-        LixError::CODE_UNSUPPORTED_SQL,
-        "sql2 DataFusion write execution from bound plans is not wired yet",
+    if plan.bound.version_scope == VersionScope::Empty {
+        return Ok(0);
+    }
+
+    let sql = sql_from_logical_write_plan(plan)?;
+    let statement = parse_statement(&sql)?;
+    let session = build_write_session(ctx).await?;
+    let logical_plan = create_logical_plan_from_statement(&session, statement).await?;
+    validate_supported_logical_plan(&logical_plan)?;
+    validate_json_predicates_in_logical_plan(&logical_plan)?;
+
+    let result = execute_logical_plan(
+        SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
+            session,
+            plan: logical_plan,
+            kind: SqlStatementKind::Write,
+            notices: Vec::new(),
+            strict_binary_params: BTreeSet::new(),
+        }),
+        params,
+    )
+    .await?;
+
+    affected_rows_from_query_result(result)
+}
+
+fn sql_from_logical_write_plan(plan: &LogicalWritePlan) -> Result<String, LixError> {
+    let table = write_target_table_name(plan)?;
+    match plan.bound.op {
+        BoundWriteOp::Insert => sql_from_insert_plan(&table, plan),
+        BoundWriteOp::Update => sql_from_update_plan(&table, plan),
+        BoundWriteOp::Delete => sql_from_delete_plan(&table, plan),
+    }
+}
+
+fn sql_from_insert_plan(table: &str, plan: &LogicalWritePlan) -> Result<String, LixError> {
+    let BoundWriteInput::Values(rows) = &plan.bound.input else {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "sql2 DataFusion write fallback does not support INSERT ... SELECT yet",
+        ));
+    };
+    let Some(first_row) = rows.first() else {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "sql2 DataFusion write fallback cannot execute empty INSERT",
+        ));
+    };
+    let mut columns = first_row.values.keys().cloned().collect::<Vec<_>>();
+    let force_global = plan.bound.version_scope == VersionScope::Global;
+    if force_global && !columns.iter().any(|column| column.name == "global") {
+        columns.push(global_column_for_insert(first_row)?);
+    }
+    let column_sql = columns
+        .iter()
+        .map(|column| quote_identifier(&column.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values_sql = rows
+        .iter()
+        .map(|row| {
+            let values = columns
+                .iter()
+                .map(|column| {
+                    row.values
+                        .get(column)
+                        .cloned()
+                        .or_else(|| {
+                            (force_global && column.name == "global")
+                                .then_some(BoundExpr::Literal(BoundLiteral::Bool(true)))
+                        })
+                        .ok_or_else(|| {
+                            LixError::unknown(format!(
+                                "bound INSERT row is missing column '{}'",
+                                column.name
+                            ))
+                        })
+                })
+                .map(|value| value.and_then(|value| sql_from_bound_expr(&value)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(format!("({})", values.join(", ")))
+        })
+        .collect::<Result<Vec<_>, LixError>>()?
+        .join(", ");
+    Ok(format!(
+        "INSERT INTO {} ({column_sql}) VALUES {values_sql}",
+        quote_identifier(table)
     ))
+}
+
+fn global_column_for_insert(
+    row: &crate::sql2::bind::write::BoundInsertRow,
+) -> Result<crate::sql2::bind::expr::BoundColumnRef, LixError> {
+    let Some(column) = row.values.keys().next() else {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "sql2 DataFusion write fallback cannot infer global column for empty INSERT row",
+        ));
+    };
+    Ok(crate::sql2::bind::expr::BoundColumnRef {
+        table: column.table.clone(),
+        column_id: usize::MAX,
+        name: "global".to_string(),
+    })
+}
+
+fn sql_from_update_plan(table: &str, plan: &LogicalWritePlan) -> Result<String, LixError> {
+    let assignments = plan
+        .bound
+        .assignments
+        .iter()
+        .map(|assignment| {
+            Ok(format!(
+                "{} = {}",
+                quote_identifier(&assignment.column.name),
+                sql_from_bound_expr(&assignment.value)?
+            ))
+        })
+        .collect::<Result<Vec<_>, LixError>>()?
+        .join(", ");
+    let predicate = sql_from_write_predicate(plan)?;
+    Ok(format!(
+        "UPDATE {} SET {assignments}{}",
+        quote_identifier(table),
+        where_clause(&predicate)
+    ))
+}
+
+fn sql_from_delete_plan(table: &str, plan: &LogicalWritePlan) -> Result<String, LixError> {
+    let predicate = sql_from_write_predicate(plan)?;
+    Ok(format!(
+        "DELETE FROM {}{}",
+        quote_identifier(table),
+        where_clause(&predicate)
+    ))
+}
+
+fn sql_from_write_predicate(plan: &LogicalWritePlan) -> Result<Option<String>, LixError> {
+    let predicate = sql_from_bound_predicate(&plan.bound.predicate)?;
+    if plan.bound.version_scope != VersionScope::Global {
+        return Ok(predicate);
+    }
+    let global_version_predicate = format!(
+        "{} = {}",
+        quote_identifier("version_id"),
+        quote_string_literal(GLOBAL_VERSION_ID)
+    );
+    Ok(Some(match predicate {
+        Some(predicate) => format!("({predicate}) AND {global_version_predicate}"),
+        None => global_version_predicate,
+    }))
+}
+
+fn sql_from_bound_predicate(predicate: &BoundPredicate) -> Result<Option<String>, LixError> {
+    match predicate {
+        BoundPredicate::True => Ok(None),
+        BoundPredicate::False => Ok(Some("1 = 0".to_string())),
+        BoundPredicate::And(predicates) => {
+            let parts = predicates
+                .iter()
+                .map(sql_from_bound_predicate)
+                .filter_map(|part| part.transpose())
+                .collect::<Result<Vec<_>, _>>()?;
+            if parts.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(parts.join(" AND ")))
+            }
+        }
+        BoundPredicate::Eq(left, right) => Ok(Some(format!(
+            "{} = {}",
+            sql_from_bound_expr(left)?,
+            sql_from_bound_expr(right)?
+        ))),
+        BoundPredicate::In { expr, values } => {
+            let values = values
+                .iter()
+                .map(sql_from_bound_expr)
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ");
+            Ok(Some(format!(
+                "{} IN ({values})",
+                sql_from_bound_expr(expr)?
+            )))
+        }
+    }
+}
+
+fn sql_from_bound_expr(expr: &BoundExpr) -> Result<String, LixError> {
+    match expr {
+        BoundExpr::Column(column) => Ok(quote_identifier(&column.name)),
+        BoundExpr::Param(param) => Ok(format!("${}", param.index)),
+        BoundExpr::Literal(literal) => sql_from_bound_literal(literal),
+        BoundExpr::Function { name, args } => {
+            let args = args
+                .iter()
+                .map(sql_from_bound_expr)
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ");
+            Ok(format!("{}({args})", quote_identifier(name)))
+        }
+    }
+}
+
+fn sql_from_bound_literal(literal: &BoundLiteral) -> Result<String, LixError> {
+    Ok(match literal {
+        BoundLiteral::Null => "NULL".to_string(),
+        BoundLiteral::Bool(value) => value.to_string(),
+        BoundLiteral::Integer(value) => value.to_string(),
+        BoundLiteral::Text(value) => quote_string_literal(value),
+        BoundLiteral::Json(value) => quote_string_literal(
+            &serde_json::to_string(value)
+                .map_err(|error| LixError::unknown(format!("failed to serialize JSON: {error}")))?,
+        ),
+        BoundLiteral::Blob(value) => {
+            let hex = value
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!("X'{hex}'")
+        }
+    })
+}
+
+fn where_clause(predicate: &Option<String>) -> String {
+    predicate
+        .as_ref()
+        .map(|predicate| format!(" WHERE {predicate}"))
+        .unwrap_or_default()
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn quote_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn write_target_table_name(plan: &LogicalWritePlan) -> Result<&'static str, LixError> {
+    match &plan.bound.target {
+        BoundWriteTarget::LixState
+            if plan.bound.version_scope == VersionScope::Global
+                && plan.bound.op != BoundWriteOp::Insert =>
+        {
+            Ok("lix_state_by_version")
+        }
+        BoundWriteTarget::LixState => Ok("lix_state"),
+        BoundWriteTarget::LixStateByVersion => Ok("lix_state_by_version"),
+        _ => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "sql2 DataFusion reference writer currently supports only lix_state writes",
+        )),
+    }
+}
+
+fn affected_rows_from_query_result(result: SqlQueryResult) -> Result<u64, LixError> {
+    let Some(first_row) = result.rows.first() else {
+        return Ok(0);
+    };
+    let Some(first_value) = first_row.first() else {
+        return Ok(0);
+    };
+    match first_value {
+        Value::Integer(value) if *value >= 0 => Ok(*value as u64),
+        Value::Text(value) => value.parse::<u64>().map_err(|error| {
+            LixError::new(
+                LixError::CODE_UNKNOWN,
+                format!("failed to parse affected row count from SQL result: {error}"),
+            )
+        }),
+        other => Err(LixError::new(
+            LixError::CODE_UNKNOWN,
+            format!("expected affected row count, got {other:?}"),
+        )),
+    }
 }
 
 fn validate_strict_binary_params(
@@ -610,7 +886,7 @@ mod tests {
     use serde_json::json;
     use serde_json::Value as JsonValue;
 
-    use super::{execute_logical_plan, execute_sql, SqlExecutionContext, SqlWriteExecutionContext};
+    use super::{execute_sql, SqlExecutionContext, SqlWriteExecutionContext};
     use crate::binary_cas::BlobDataReader;
     use crate::commit_graph::{
         CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
@@ -625,7 +901,7 @@ mod tests {
         LiveStateContext, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
         MaterializedLiveStateRow,
     };
-    use crate::sql2::create_write_logical_plan;
+    use crate::sql2::{create_write_logical_plan, execute_write_logical_plan};
     use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource};
     use crate::storage::{
         KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch,
@@ -640,7 +916,7 @@ mod tests {
     use crate::untracked_state::UntrackedStateContext;
     use crate::version::VersionRefReader;
     use crate::{Engine, ExecuteResult, SessionContext};
-    use crate::{LixError, NullableKeyFilter, Value};
+    use crate::{LixError, NullableKeyFilter, Value, GLOBAL_VERSION_ID};
 
     struct DummyBlobReader;
     struct StaticBlobReader {
@@ -894,7 +1170,12 @@ mod tests {
         params: &[Value],
     ) -> Result<crate::SqlQueryResult, LixError> {
         let plan = create_write_logical_plan(ctx, sql).await?;
-        execute_logical_plan(plan, params).await
+        let count = execute_write_logical_plan(ctx, plan, params).await?;
+        Ok(crate::SqlQueryResult {
+            columns: vec!["count".to_string()],
+            rows: vec![vec![Value::Integer(count as i64)]],
+            notices: Vec::new(),
+        })
     }
 
     #[async_trait]
@@ -1094,6 +1375,13 @@ mod tests {
             created_at: "2026-04-23T00:00:00Z".to_string(),
             updated_at: "2026-04-23T01:00:00Z".to_string(),
         }
+    }
+
+    fn global_lix_state_row(entity_id: &str, metadata: Option<&str>) -> MaterializedLiveStateRow {
+        let mut row = live_lix_state_row(entity_id, metadata);
+        row.version_id = GLOBAL_VERSION_ID.to_string();
+        row.global = true;
+        row
     }
 
     fn live_entity_row(entity_id: &str, version_id: &str, value: &str) -> MaterializedLiveStateRow {
@@ -1870,7 +2158,6 @@ mod tests {
         }
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_insert_into_lix_state_values_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -1915,6 +2202,90 @@ mod tests {
             Some("{\"key\":\"hello\",\"value\":\"world\"}")
         );
         assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"sql\"}"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_lix_state_by_version_stages_explicit_version_write() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_write_sql(
+            &mut ctx,
+            "INSERT INTO lix_state_by_version (\
+             entity_id, schema_key, snapshot_content, version_id, global\
+             ) VALUES (\
+             lix_json('[\"entity-b\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"version-b\"}', 'version-b', false\
+             )",
+            &[],
+        )
+        .await
+        .expect("INSERT INTO lix_state_by_version should stage explicit-version write");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_key_value");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "[\"entity-b\"]");
+        assert_eq!(rows[0].version_id, "version-b");
+        assert!(!rows[0].global);
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some("{\"key\":\"hello\",\"value\":\"version-b\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_lix_state_by_version_global_version_defaults_global_true() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateReader);
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_write_sql(
+            &mut ctx,
+            "INSERT INTO lix_state_by_version (\
+             entity_id, schema_key, snapshot_content, version_id\
+             ) VALUES (\
+             lix_json('[\"entity-global\"]'), 'lix_key_value', '{\"key\":\"hello\",\"value\":\"global\"}', 'global'\
+             )",
+            &[],
+        )
+        .await
+        .expect("INSERT INTO lix_state_by_version with global version should stage global row");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_key_value");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "[\"entity-global\"]");
+        assert_eq!(rows[0].version_id, GLOBAL_VERSION_ID);
+        assert!(rows[0].global);
     }
 
     #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
@@ -2800,7 +3171,6 @@ mod tests {
         assert_eq!(rows[0].snapshot_content, None);
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_update_lix_state_stages_rewritten_rows() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2852,7 +3222,180 @@ mod tests {
         );
     }
 
-    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
+    #[tokio::test]
+    async fn execute_sql_update_lix_state_by_version_stages_explicit_version_rows() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let mut version_b_row = live_lix_state_row("entity-b", Some("{\"source\":\"match\"}"));
+        version_b_row.version_id = "version-b".to_string();
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![
+                live_lix_state_row("entity-a", Some("{\"source\":\"skip\"}")),
+                version_b_row,
+            ],
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_write_sql(
+            &mut ctx,
+            "UPDATE lix_state_by_version \
+             SET metadata = '{\"schema_key\":\"lix_key_value\",\"source\":\"updated\"}' \
+             WHERE version_id = 'version-b' AND schema_key = 'lix_key_value'",
+            &[],
+        )
+        .await
+        .expect("UPDATE lix_state_by_version should stage explicit-version rows");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_key_value");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "[\"entity-b\"]");
+        assert_eq!(rows[0].version_id, "version-b");
+        assert_eq!(
+            rows[0].metadata.as_deref(),
+            Some("{\"schema_key\":\"lix_key_value\",\"source\":\"updated\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_update_lix_state_global_predicate_stages_global_row() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![
+                live_lix_state_row("entity-active", Some("{\"source\":\"active\"}")),
+                global_lix_state_row("entity-global", Some("{\"source\":\"global\"}")),
+            ],
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_write_sql(
+            &mut ctx,
+            "UPDATE lix_state \
+             SET metadata = '{\"schema_key\":\"lix_key_value\",\"source\":\"updated-global\"}' \
+             WHERE global = true AND schema_key = 'lix_key_value'",
+            &[],
+        )
+        .await
+        .expect("UPDATE lix_state global predicate should stage global rows");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_key_value");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "[\"entity-global\"]");
+        assert_eq!(rows[0].version_id, GLOBAL_VERSION_ID);
+        assert!(rows[0].global);
+        assert_eq!(
+            rows[0].metadata.as_deref(),
+            Some("{\"schema_key\":\"lix_key_value\",\"source\":\"updated-global\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_delete_lix_state_by_version_global_predicate_stages_global_tombstone() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![
+                live_lix_state_row("entity-active", Some("{\"source\":\"active\"}")),
+                global_lix_state_row("entity-global", Some("{\"source\":\"global\"}")),
+            ],
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_write_sql(
+            &mut ctx,
+            "DELETE FROM lix_state_by_version \
+             WHERE global = true AND schema_key = 'lix_key_value'",
+            &[],
+        )
+        .await
+        .expect("DELETE lix_state_by_version global predicate should stage global tombstone");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_all_semantic_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "[\"entity-global\"]");
+        assert_eq!(rows[0].version_id, GLOBAL_VERSION_ID);
+        assert!(rows[0].global);
+        assert!(rows[0].tombstone);
+        assert_eq!(rows[0].snapshot_content, None);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_delete_lix_state_by_version_false_predicate_is_noop() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateReader {
+            rows: vec![live_lix_state_row(
+                "entity-active",
+                Some("{\"source\":\"active\"}"),
+            )],
+        });
+        let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            staged_writes: Arc::clone(&staged_writes),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_write_sql(
+            &mut ctx,
+            "DELETE FROM lix_state_by_version WHERE false",
+            &[],
+        )
+        .await
+        .expect("empty by-version scope should execute as a no-op");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(0)]]);
+        assert!(staged_writes
+            .lock()
+            .expect("staged writes lock")
+            .deltas
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn execute_sql_delete_lix_state_without_where_stages_all_rows() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
