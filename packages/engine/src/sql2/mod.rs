@@ -24,6 +24,7 @@ mod record_batch;
 mod result_metadata;
 mod runtime;
 mod session;
+mod simple_dml;
 mod udfs;
 mod version_provider;
 mod version_scope;
@@ -45,3 +46,4 @@ pub(crate) use execute::{
     create_write_logical_plan_from_parsed, execute_logical_plan, execute_sql, parse_statement,
     SqlLogicalPlan,
 };
+pub(crate) use simple_dml::try_execute_simple_write;
