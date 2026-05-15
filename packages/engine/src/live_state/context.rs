@@ -77,6 +77,9 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        if request.filter.no_match {
+            return Ok(Vec::new());
+        }
         let mut store = self.store.lock().await;
         let scope = scan_scope(&mut *store, &self.untracked_state, request).await?;
         let derived_rows =

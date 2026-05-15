@@ -607,6 +607,13 @@ impl PreparedStateRowOverlay {
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<StagedScanParts, LixError> {
+        if request.filter.no_match {
+            return Ok(StagedScanParts {
+                rows: Vec::new(),
+                hidden_identities: BTreeSet::new(),
+            });
+        }
+
         let rows_guard = self.staged_writes.rows.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
