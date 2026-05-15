@@ -819,7 +819,10 @@ fn simple_assignments(
             ));
         };
         let Some(column) = object_name_leaf(name) else {
-            return Ok(std::collections::BTreeMap::new());
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "simple DML fast path does not support dynamic assignment targets",
+            ));
         };
         result.insert(column, decoder.expr_value(&assignment.value)?);
     }
@@ -1455,6 +1458,32 @@ mod tests {
 
         assert_eq!(count, None);
         assert!(staged.lock().expect("staged rows lock").is_empty());
+    }
+
+    #[test]
+    fn dynamic_assignment_target_is_fast_path_miss() {
+        let assignment = Assignment {
+            target: AssignmentTarget::ColumnName(ObjectName(vec![
+                datafusion::sql::sqlparser::ast::ObjectNamePart::Function(
+                    datafusion::sql::sqlparser::ast::ObjectNamePartFunction {
+                        name: Ident::new("IDENTIFIER"),
+                        args: vec![datafusion::sql::sqlparser::ast::FunctionArg::Unnamed(
+                            datafusion::sql::sqlparser::ast::FunctionArgExpr::Expr(Expr::Value(
+                                SqlValue::SingleQuotedString("value".to_string()).into(),
+                            )),
+                        )],
+                    },
+                ),
+            ])),
+            value: Expr::Value(SqlValue::Placeholder("$1".to_string()).into()),
+        };
+        let params = [Value::Text("second".to_string())];
+        let mut decoder = ParamDecoder::new(&params);
+
+        let error = simple_assignments(&[assignment], &mut decoder)
+            .expect_err("dynamic assignment target should miss fast path");
+
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
     }
 
     fn test_schema() -> JsonValue {
