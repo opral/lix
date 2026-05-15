@@ -436,6 +436,23 @@ const PREFIX_CASES: &[PrefixCase] = &[
 ];
 
 fn storage_v2_benches(c: &mut Criterion) {
+    if std::env::var_os("STORAGE_V2_BENCH_DIRECT_PROFILE_ONLY").is_some() {
+        match std::env::var("STORAGE_V2_BENCH_DIRECT_PROFILE_BACKEND").as_deref() {
+            Ok("in_memory") => bench_backend_direct_profile(c, InMemoryBenchBackend),
+            Ok("sqlite_temp") => bench_backend_direct_profile(c, SqliteTempBenchBackend::new()),
+            Ok("redb_temp") => bench_backend_direct_profile(c, RedbTempBenchBackend::new()),
+            Ok("rocksdb_temp") => bench_backend_direct_profile(c, RocksDbTempBenchBackend::new()),
+            Ok(other) => panic!("unknown direct profile backend: {other}"),
+            Err(_) => {
+                bench_backend_direct_profile(c, InMemoryBenchBackend);
+                bench_backend_direct_profile(c, SqliteTempBenchBackend::new());
+                bench_backend_direct_profile(c, RedbTempBenchBackend::new());
+                bench_backend_direct_profile(c, RocksDbTempBenchBackend::new());
+            }
+        }
+        return;
+    }
+
     bench_write_set_lowering(c);
     bench_point_request_plan(c);
     bench_point_read_adapter(c);
@@ -1276,6 +1293,13 @@ fn bench_backend_direct_profile<B>(c: &mut Criterion, backend_family: B)
 where
     B: StorageBenchBackend,
 {
+    let selected_case = std::env::var("STORAGE_V2_BENCH_DIRECT_PROFILE_CASE").ok();
+    let should_run = |case_name: &str| {
+        selected_case
+            .as_deref()
+            .is_none_or(|selected| selected == case_name)
+    };
+
     let group_name = format!(
         "storage_v2/backend_direct_profile/{}",
         backend_family.name()
@@ -1294,26 +1318,28 @@ where
         value_size: 32,
         mix: WriteMix::PutsOnly,
     };
-    let direct_put_mutations = write_mutations(&direct_put_case);
-    let direct_put_batches = direct_write_batches_from_mutations(&direct_put_mutations);
-    let direct_put_backend = backend_family.open_empty();
-    commit_direct_write_batches(&direct_put_backend, direct_put_batches.clone())
-        .expect("warm direct put backend");
-    group.throughput(Throughput::Elements(direct_put_case.writes as u64));
-    group.bench_function(direct_put_case.name, |b| {
-        b.iter_batched(
-            || direct_put_batches.clone(),
-            |batches| {
-                let commit = commit_direct_write_batches(&direct_put_backend, batches)
-                    .expect("direct backend put commit");
-                assert_eq!(commit.stats.put_entries, 1_024);
-                assert_eq!(commit.stats.deleted_entries, 0);
-                assert_eq!(commit.stats.backend_calls, 16);
-                black_box(commit);
-            },
-            BatchSize::LargeInput,
-        );
-    });
+    if should_run(direct_put_case.name) {
+        let direct_put_mutations = write_mutations(&direct_put_case);
+        let direct_put_batches = direct_write_batches_from_mutations(&direct_put_mutations);
+        let direct_put_backend = backend_family.open_empty();
+        commit_direct_write_batches(&direct_put_backend, direct_put_batches.clone())
+            .expect("warm direct put backend");
+        group.throughput(Throughput::Elements(direct_put_case.writes as u64));
+        group.bench_function(direct_put_case.name, |b| {
+            b.iter_batched(
+                || direct_put_batches.clone(),
+                |batches| {
+                    let commit = commit_direct_write_batches(&direct_put_backend, batches)
+                        .expect("direct backend put commit");
+                    assert_eq!(commit.stats.put_entries, 1_024);
+                    assert_eq!(commit.stats.deleted_entries, 0);
+                    assert_eq!(commit.stats.backend_calls, 16);
+                    black_box(commit);
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
 
     let mixed_case = WriteCase {
         name: "direct_mixed80_20_k1024_g16_v32",
@@ -1322,26 +1348,28 @@ where
         value_size: 32,
         mix: WriteMix::PutDelete80_20,
     };
-    let mixed_mutations = write_mutations(&mixed_case);
-    let mixed_batches = direct_write_batches_from_mutations(&mixed_mutations);
-    let mixed_backend = backend_family.open_empty();
-    commit_direct_write_batches(&mixed_backend, mixed_batches.clone())
-        .expect("warm direct mixed backend");
-    group.throughput(Throughput::Elements(mixed_case.writes as u64));
-    group.bench_function(mixed_case.name, |b| {
-        b.iter_batched(
-            || mixed_batches.clone(),
-            |batches| {
-                let commit = commit_direct_write_batches(&mixed_backend, batches)
-                    .expect("direct backend mixed commit");
-                assert_eq!(commit.stats.put_entries, 816);
-                assert_eq!(commit.stats.deleted_entries, 208);
-                assert_eq!(commit.stats.backend_calls, 32);
-                black_box(commit);
-            },
-            BatchSize::LargeInput,
-        );
-    });
+    if should_run(mixed_case.name) {
+        let mixed_mutations = write_mutations(&mixed_case);
+        let mixed_batches = direct_write_batches_from_mutations(&mixed_mutations);
+        let mixed_backend = backend_family.open_empty();
+        commit_direct_write_batches(&mixed_backend, mixed_batches.clone())
+            .expect("warm direct mixed backend");
+        group.throughput(Throughput::Elements(mixed_case.writes as u64));
+        group.bench_function(mixed_case.name, |b| {
+            b.iter_batched(
+                || mixed_batches.clone(),
+                |batches| {
+                    let commit = commit_direct_write_batches(&mixed_backend, batches)
+                        .expect("direct backend mixed commit");
+                    assert_eq!(commit.stats.put_entries, 816);
+                    assert_eq!(commit.stats.deleted_entries, 208);
+                    assert_eq!(commit.stats.backend_calls, 32);
+                    black_box(commit);
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
 
     let touched_case = WriteCase {
         name: "direct_commit_puts_k128_g16_existing10k_touched_v32",
@@ -1350,122 +1378,138 @@ where
         value_size: 32,
         mix: WriteMix::PutsOnly,
     };
-    let touched_mutations = write_mutations(&touched_case);
-    let touched_batches = direct_write_batches_from_mutations(&touched_mutations);
-    let touched_backend = backend_family.seed_points(SpaceId(1), 10_000, 32);
-    commit_direct_write_batches(&touched_backend, touched_batches.clone())
-        .expect("warm direct touched backend");
-    group.throughput(Throughput::Elements(touched_case.writes as u64));
-    group.bench_function(touched_case.name, |b| {
-        b.iter_batched(
-            || touched_batches.clone(),
-            |batches| {
-                let commit = commit_direct_write_batches(&touched_backend, batches)
-                    .expect("direct backend touched commit");
-                assert_eq!(commit.stats.put_entries, 128);
-                assert_eq!(commit.stats.deleted_entries, 0);
-                assert_eq!(commit.stats.backend_calls, 16);
-                black_box(commit);
-            },
-            BatchSize::LargeInput,
-        );
-    });
-
-    let point_backend = backend_family.seed_points(SpaceId(1), 100, 32);
-    let point_keys = point_request_keys(1_000, 100);
-    group.throughput(Throughput::Elements(1_000));
-    group.bench_function("direct_get_many_m1000_u100", |b| {
-        b.iter(|| {
-            let read = point_backend
-                .begin_read(ReadOptions::default())
-                .expect("begin direct point read");
-            let result = read
-                .get_many(SpaceId(1), black_box(&point_keys), GetOptions::default())
-                .expect("direct get_many");
-            assert_eq!(result.values.len(), 1_000);
-            assert_eq!(
-                result.values.iter().filter(|value| value.is_some()).count(),
-                1_000
-            );
-            read.close().expect("close direct point read");
-            black_box(result);
-        });
-    });
-
-    group.bench_function("direct_visit_many_m1000_u100", |b| {
-        b.iter(|| {
-            let read = point_backend
-                .begin_read(ReadOptions::default())
-                .expect("begin direct point visitor read");
-            let mut visitor = CountingPointVisitor::default();
-            read.visit_many(
-                SpaceId(1),
-                black_box(&point_keys),
-                GetOptions::default(),
-                &mut visitor,
-            )
-            .expect("direct visit_many");
-            assert_eq!(visitor.visited, 1_000);
-            read.close().expect("close direct point visitor read");
-            black_box(visitor.visited);
-        });
-    });
-
-    let scan_backend = backend_family.seed_points(SpaceId(1), 1_000, 32);
-    group.throughput(Throughput::Elements(1_000));
-    group.bench_function("direct_scan_visit_key_only_q1000", |b| {
-        b.iter(|| {
-            let read = scan_backend
-                .begin_read(ReadOptions::default())
-                .expect("begin direct scan visitor read");
-            let mut visited = 0usize;
-            let result = read
-                .visit_range(
-                    SpaceId(1),
-                    point_scan_range(),
-                    ScanOptions {
-                        limit_rows: 1_001,
-                        projection: CoreProjection::KeyOnly,
-                        ..ScanOptions::default()
-                    },
-                    &mut |key: &Key, value: ProjectedValueRef<'_>| {
-                        visited += 1;
-                        assert!(matches!(value, ProjectedValueRef::KeyOnly));
-                        black_box(key);
-                        Ok(())
-                    },
-                )
-                .expect("direct scan visitor");
-            assert_eq!(visited, 1_000);
-            assert_eq!(result.emitted, 1_000);
-            assert!(!result.has_more);
-            read.close().expect("close direct scan visitor read");
-            black_box(result);
-        });
-    });
-
-    group.bench_function("direct_scan_materialized_q1000", |b| {
-        b.iter(|| {
-            let read = scan_backend
-                .begin_read(ReadOptions::default())
-                .expect("begin direct materialized scan read");
-            let page = materialize_backend_scan(
-                &read,
-                SpaceId(1),
-                point_scan_range(),
-                ScanOptions {
-                    limit_rows: 1_001,
-                    projection: CoreProjection::KeyOnly,
-                    ..ScanOptions::default()
+    if should_run(touched_case.name) {
+        let touched_mutations = write_mutations(&touched_case);
+        let touched_batches = direct_write_batches_from_mutations(&touched_mutations);
+        let touched_backend = backend_family.seed_points(SpaceId(1), 10_000, 32);
+        commit_direct_write_batches(&touched_backend, touched_batches.clone())
+            .expect("warm direct touched backend");
+        group.throughput(Throughput::Elements(touched_case.writes as u64));
+        group.bench_function(touched_case.name, |b| {
+            b.iter_batched(
+                || touched_batches.clone(),
+                |batches| {
+                    let commit = commit_direct_write_batches(&touched_backend, batches)
+                        .expect("direct backend touched commit");
+                    assert_eq!(commit.stats.put_entries, 128);
+                    assert_eq!(commit.stats.deleted_entries, 0);
+                    assert_eq!(commit.stats.backend_calls, 16);
+                    black_box(commit);
                 },
-            )
-            .expect("direct materialized scan");
-            assert_eq!(page.entries.entries.len(), 1_000);
-            assert!(!page.has_more);
-            read.close().expect("close direct materialized scan read");
-            black_box(page);
+                BatchSize::LargeInput,
+            );
         });
-    });
+    }
+
+    if should_run("direct_get_many_m1000_u100") || should_run("direct_visit_many_m1000_u100") {
+        let point_backend = backend_family.seed_points(SpaceId(1), 100, 32);
+        let point_keys = point_request_keys(1_000, 100);
+        group.throughput(Throughput::Elements(1_000));
+        if should_run("direct_get_many_m1000_u100") {
+            group.bench_function("direct_get_many_m1000_u100", |b| {
+                b.iter(|| {
+                    let read = point_backend
+                        .begin_read(ReadOptions::default())
+                        .expect("begin direct point read");
+                    let result = read
+                        .get_many(SpaceId(1), black_box(&point_keys), GetOptions::default())
+                        .expect("direct get_many");
+                    assert_eq!(result.values.len(), 1_000);
+                    assert_eq!(
+                        result.values.iter().filter(|value| value.is_some()).count(),
+                        1_000
+                    );
+                    read.close().expect("close direct point read");
+                    black_box(result);
+                });
+            });
+        }
+
+        if should_run("direct_visit_many_m1000_u100") {
+            group.bench_function("direct_visit_many_m1000_u100", |b| {
+                b.iter(|| {
+                    let read = point_backend
+                        .begin_read(ReadOptions::default())
+                        .expect("begin direct point visitor read");
+                    let mut visitor = CountingPointVisitor::default();
+                    read.visit_many(
+                        SpaceId(1),
+                        black_box(&point_keys),
+                        GetOptions::default(),
+                        &mut visitor,
+                    )
+                    .expect("direct visit_many");
+                    assert_eq!(visitor.visited, 1_000);
+                    read.close().expect("close direct point visitor read");
+                    black_box(visitor.visited);
+                });
+            });
+        }
+    }
+
+    if should_run("direct_scan_visit_key_only_q1000")
+        || should_run("direct_scan_materialized_q1000")
+    {
+        let scan_backend = backend_family.seed_points(SpaceId(1), 1_000, 32);
+        group.throughput(Throughput::Elements(1_000));
+        if should_run("direct_scan_visit_key_only_q1000") {
+            group.bench_function("direct_scan_visit_key_only_q1000", |b| {
+                b.iter(|| {
+                    let read = scan_backend
+                        .begin_read(ReadOptions::default())
+                        .expect("begin direct scan visitor read");
+                    let mut visited = 0usize;
+                    let result = read
+                        .visit_range(
+                            SpaceId(1),
+                            point_scan_range(),
+                            ScanOptions {
+                                limit_rows: 1_001,
+                                projection: CoreProjection::KeyOnly,
+                                ..ScanOptions::default()
+                            },
+                            &mut |key: &Key, value: ProjectedValueRef<'_>| {
+                                visited += 1;
+                                assert!(matches!(value, ProjectedValueRef::KeyOnly));
+                                black_box(key);
+                                Ok(())
+                            },
+                        )
+                        .expect("direct scan visitor");
+                    assert_eq!(visited, 1_000);
+                    assert_eq!(result.emitted, 1_000);
+                    assert!(!result.has_more);
+                    read.close().expect("close direct scan visitor read");
+                    black_box(result);
+                });
+            });
+        }
+
+        if should_run("direct_scan_materialized_q1000") {
+            group.bench_function("direct_scan_materialized_q1000", |b| {
+                b.iter(|| {
+                    let read = scan_backend
+                        .begin_read(ReadOptions::default())
+                        .expect("begin direct materialized scan read");
+                    let page = materialize_backend_scan(
+                        &read,
+                        SpaceId(1),
+                        point_scan_range(),
+                        ScanOptions {
+                            limit_rows: 1_001,
+                            projection: CoreProjection::KeyOnly,
+                            ..ScanOptions::default()
+                        },
+                    )
+                    .expect("direct materialized scan");
+                    assert_eq!(page.entries.entries.len(), 1_000);
+                    assert!(!page.has_more);
+                    read.close().expect("close direct materialized scan read");
+                    black_box(page);
+                });
+            });
+        }
+    }
 
     group.finish();
 }
