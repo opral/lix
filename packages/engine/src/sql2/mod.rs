@@ -12,7 +12,7 @@ mod file_history_provider;
 mod file_provider;
 pub(crate) mod filesystem_planner;
 mod filesystem_predicates;
-mod filesystem_visibility;
+pub(crate) mod filesystem_visibility;
 mod history_projection;
 mod history_provider;
 mod history_route;

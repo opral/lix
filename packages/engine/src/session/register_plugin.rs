@@ -1,11 +1,5 @@
-use crate::plugin::{
-    parse_plugin_archive_for_install, plugin_storage_archive_file_id, plugin_storage_archive_path,
-};
-use crate::sql2::filesystem_planner::{
-    plan_file_path_write, DirectoryPathResolver, FilePathWriteInput, FilesystemRowContext,
-};
-use crate::transaction::types::{TransactionJson, TransactionWriteRow};
-use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
+use crate::plugin::InstalledPlugin;
+use crate::storage::{StorageReadScope, StorageReadTransaction};
 use crate::LixError;
 
 use super::SessionContext;
@@ -26,84 +20,34 @@ impl SessionContext {
         options: RegisterPluginOptions,
     ) -> Result<RegisterPluginReceipt, LixError> {
         self.ensure_open()?;
-
-        let parsed = parse_plugin_archive_for_install(&options.bytes)?;
-        let plugin_key = parsed.manifest.key.clone();
-        let archive_id = plugin_storage_archive_file_id(&plugin_key);
-        let archive_path = plugin_storage_archive_path(&plugin_key)?;
-        let archive_bytes = options.bytes;
-        let schemas = parsed.schemas;
-
-        self.with_write_transaction(|transaction| {
-            Box::pin(async move {
-                let version_id = transaction.active_version_id().to_string();
-                let mut resolver = DirectoryPathResolver::from_existing(std::iter::empty())?;
-                let mut generate_directory_id = || transaction.functions().call_uuid_v7();
-                let plan = plan_file_path_write(
-                    &mut resolver,
-                    FilePathWriteInput {
-                        id: Some(archive_id),
-                        path: archive_path,
-                        data: Some(archive_bytes),
-                        hidden: Some(false),
-                        context: FilesystemRowContext {
-                            version_id: version_id.clone(),
-                            global: false,
-                            untracked: false,
-                            file_id: None,
-                            metadata: None,
-                        },
-                    },
-                    &mut generate_directory_id,
-                )?;
-
-                transaction
-                    .stage_write(TransactionWrite::RowsWithFileData {
-                        mode: TransactionWriteMode::Insert,
-                        rows: plan.rows,
-                        file_data: plan.file_data,
-                        count: plan.count,
-                    })
-                    .await?;
-
-                let schema_rows = schemas
-                    .into_iter()
-                    .map(|schema| {
-                        Ok(TransactionWriteRow {
-                            entity_id: None,
-                            schema_key: "lix_registered_schema".to_string(),
-                            file_id: None,
-                            snapshot: Some(TransactionJson::from_value(
-                                serde_json::json!({ "value": schema }),
-                                "plugin registered schema",
-                            )?),
-                            metadata: None,
-                            origin: None,
-                            created_at: None,
-                            updated_at: None,
-                            global: false,
-                            change_id: None,
-                            commit_id: None,
-                            untracked: false,
-                            version_id: version_id.clone(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, LixError>>()?;
-
-                if !schema_rows.is_empty() {
-                    transaction
-                        .stage_write(TransactionWrite::Rows {
-                            mode: TransactionWriteMode::Insert,
-                            rows: schema_rows,
-                        })
-                        .await?;
-                }
-
-                Ok(())
-            })
+        let plugin_context = self.plugin_context.clone();
+        self.with_write_transaction(move |transaction| {
+            Box::pin(async move { plugin_context.register_plugin(transaction, options).await })
         })
-        .await?;
+        .await
+    }
 
-        Ok(RegisterPluginReceipt { plugin_key })
+    pub async fn list_plugins(&self) -> Result<Vec<InstalledPlugin>, LixError> {
+        self.ensure_open()?;
+        let active_version_id = self.active_version_id().await?;
+        let transaction = self.storage.begin_read_transaction().await?;
+        let read_scope =
+            StorageReadScope::<Box<dyn StorageReadTransaction + Send + Sync>>::new(transaction);
+        let live_state = std::sync::Arc::new(self.live_state.reader(read_scope.store()));
+        let blob_reader = std::sync::Arc::new(self.binary_cas.reader(read_scope.store()));
+        let result = self
+            .plugin_context
+            .load_installed_plugins_for_version(live_state, blob_reader, &active_version_id)
+            .await;
+        match result {
+            Ok(plugins) => {
+                read_scope.rollback().await?;
+                Ok(plugins)
+            }
+            Err(error) => {
+                let _ = read_scope.rollback().await;
+                Err(error)
+            }
+        }
     }
 }

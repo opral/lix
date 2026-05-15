@@ -165,7 +165,7 @@ pub fn select_best_glob_match<'a, T, C: Copy + PartialEq>(
     required_content_type: impl Fn(&T) -> Option<C>,
 ) -> Option<&'a T> {
     let mut selected: Option<&T> = None;
-    let mut selected_rank: Option<(u8, i32)> = None;
+    let mut selected_rank: Option<(u8, i32, i32)> = None;
 
     for candidate in candidates {
         let pattern = glob(candidate);
@@ -239,15 +239,15 @@ fn validate_plugin_manifest_json(manifest: &JsonValue) -> Result<(), LixError> {
     Ok(())
 }
 
-fn glob_specificity_rank(glob: &str) -> (u8, i32) {
+fn glob_specificity_rank(glob: &str) -> (u8, i32, i32) {
     let normalized = glob.trim();
     if is_catch_all_glob(normalized) {
-        return (0, i32::MIN);
+        return (0, i32::MIN, i32::MIN);
     }
-    (1, glob_specificity_score(normalized))
+    glob_specificity_score(normalized)
 }
 
-fn glob_specificity_score(glob: &str) -> i32 {
+fn glob_specificity_score(glob: &str) -> (u8, i32, i32) {
     let mut literal_chars = 0i32;
     let mut wildcard_chars = 0i32;
     for ch in glob.chars() {
@@ -256,7 +256,7 @@ fn glob_specificity_score(glob: &str) -> i32 {
             _ => literal_chars += 1,
         }
     }
-    literal_chars - wildcard_chars
+    (1, literal_chars, -wildcard_chars)
 }
 
 fn is_catch_all_glob(glob: &str) -> bool {

@@ -130,6 +130,44 @@ impl VisibleFilesystem {
 
         Ok(visible)
     }
+
+    pub(crate) fn file_path(&self, file: &VisibleFile) -> Result<String, LixError> {
+        let Some(directory_id) = file.directory_id.as_deref() else {
+            return Ok(format!("/{}", file.name));
+        };
+        let directory_path = self.directory_path(directory_id, &mut BTreeSet::new())?;
+        Ok(format!("{directory_path}{}", file.name))
+    }
+
+    fn directory_path(
+        &self,
+        directory_id: &str,
+        visiting: &mut BTreeSet<String>,
+    ) -> Result<String, LixError> {
+        if !visiting.insert(directory_id.to_string()) {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!(
+                    "lix_directory_descriptor parent_id cycle while resolving directory '{directory_id}'"
+                ),
+            ));
+        }
+        let directory = self.directories_by_id.get(directory_id).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_FOREIGN_KEY,
+                format!("lix_file_descriptor references missing directory_id '{directory_id}'"),
+            )
+        })?;
+        let path = match directory.parent_id.as_deref() {
+            Some(parent_id) => {
+                let parent_path = self.directory_path(parent_id, visiting)?;
+                format!("{parent_path}{}/", directory.name)
+            }
+            None => format!("/{}/", directory.name),
+        };
+        visiting.remove(directory_id);
+        Ok(path)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

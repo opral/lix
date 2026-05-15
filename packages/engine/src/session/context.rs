@@ -13,6 +13,7 @@ use crate::entity_identity::EntityIdentity;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
+use crate::plugin::PluginContext;
 use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext};
 use crate::storage::{
     ScopedStorageReader, StorageContext, StorageReadScope, StorageReadTransaction, StorageReader,
@@ -52,6 +53,7 @@ pub struct SessionContext {
     pub(super) commit_store: Arc<CommitStoreContext>,
     pub(super) version_ctx: Arc<VersionContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
+    pub(super) plugin_context: Arc<PluginContext>,
     closed: Arc<AtomicBool>,
     active_transaction: Arc<AtomicBool>,
 }
@@ -65,6 +67,7 @@ impl SessionContext {
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
+        plugin_context: Arc<PluginContext>,
     ) -> Result<Self, LixError> {
         let session = Self::new(
             SessionMode::Workspace,
@@ -75,6 +78,7 @@ impl SessionContext {
             commit_store,
             version_ctx,
             catalog_context,
+            plugin_context,
         );
         session.active_version_id().await?;
         Ok(session)
@@ -89,6 +93,7 @@ impl SessionContext {
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
+        plugin_context: Arc<PluginContext>,
     ) -> Result<Self, LixError> {
         Ok(Self::new(
             SessionMode::Pinned {
@@ -101,6 +106,7 @@ impl SessionContext {
             commit_store,
             version_ctx,
             catalog_context,
+            plugin_context,
         ))
     }
 
@@ -113,6 +119,7 @@ impl SessionContext {
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
+        plugin_context: Arc<PluginContext>,
     ) -> Self {
         Self::new_with_closed(
             mode,
@@ -123,6 +130,7 @@ impl SessionContext {
             commit_store,
             version_ctx,
             catalog_context,
+            plugin_context,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         )
@@ -137,6 +145,7 @@ impl SessionContext {
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
+        plugin_context: Arc<PluginContext>,
         closed: Arc<AtomicBool>,
         active_transaction: Arc<AtomicBool>,
     ) -> Self {
@@ -149,6 +158,7 @@ impl SessionContext {
             commit_store,
             version_ctx,
             catalog_context,
+            plugin_context,
             closed,
             active_transaction,
         }

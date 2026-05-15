@@ -8,6 +8,7 @@ use crate::entity_identity::EntityIdentity;
 use crate::init::InitReceipt;
 use crate::live_state::LiveStateContext;
 use crate::live_state::LiveStateRowRequest;
+use crate::plugin::PluginContext;
 use crate::session::SessionContext;
 use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::TrackedStateContext;
@@ -25,6 +26,7 @@ pub struct Engine {
     binary_cas: Arc<BinaryCasContext>,
     commit_store: Arc<CommitStoreContext>,
     catalog_context: Arc<CatalogContext>,
+    plugin_context: Arc<PluginContext>,
 }
 
 impl Engine {
@@ -81,6 +83,7 @@ impl Engine {
             live_state,
             version_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
+            plugin_context: Arc::new(PluginContext::new()),
         })
     }
 
@@ -128,6 +131,7 @@ impl Engine {
             Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.catalog_context),
+            Arc::clone(&self.plugin_context),
         )
         .await
     }
@@ -141,6 +145,7 @@ impl Engine {
             Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.catalog_context),
+            Arc::clone(&self.plugin_context),
         )
         .await
     }

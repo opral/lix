@@ -6,22 +6,29 @@
 
 mod archive;
 pub(crate) mod component;
+mod context;
 mod manifest;
+mod matching;
+mod registry;
 mod storage;
 mod types;
 
 pub(crate) use archive::{
     load_installed_plugin_from_archive_bytes, parse_plugin_archive_for_install, ParsedPluginArchive,
 };
+pub(crate) use context::PluginContext;
 #[allow(unused_imports)]
 pub(crate) use manifest::{
     glob_matches_path, parse_plugin_manifest_json, select_best_glob_match, DetectChangesConfig,
-    DetectStateContextConfig, PluginContentType, PluginManifest, PluginMatch, PluginRuntime,
-    StateContextColumn, ValidatedPluginManifest,
+    DetectStateContextConfig, PluginManifest, PluginMatch, StateContextColumn,
+    ValidatedPluginManifest,
 };
+pub use manifest::{PluginContentType, PluginRuntime};
+#[allow(unused_imports)]
+pub(crate) use matching::select_plugin_for_file;
 #[allow(unused_imports)]
 pub(crate) use storage::{
     plugin_key_from_archive_path, plugin_storage_archive_file_id, plugin_storage_archive_path,
     PLUGIN_ARCHIVE_FILE_EXTENSION, PLUGIN_STORAGE_ROOT_DIRECTORY_PATH,
 };
-pub(crate) use types::InstalledPlugin;
+pub use types::InstalledPlugin;
