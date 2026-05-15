@@ -12,7 +12,8 @@ use crate::backend_v2::{
     StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
 
-type InMemoryMap = BTreeMap<SpaceId, BTreeMap<Key, Bytes>>;
+type SpaceEntries = BTreeMap<Key, Bytes>;
+type InMemoryMap = BTreeMap<SpaceId, Arc<SpaceEntries>>;
 
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryBackend {
@@ -42,6 +43,13 @@ pub struct InMemoryWrite {
 impl InMemoryBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(feature = "storage-benches")]
+    pub fn fork_snapshot(&self) -> Result<Self, BackendError> {
+        Ok(Self {
+            entries: Arc::new(Mutex::new(self.snapshot()?)),
+        })
     }
 
     fn snapshot(&self) -> Result<Arc<InMemoryMap>, BackendError> {
@@ -196,27 +204,35 @@ impl InMemoryRead {
 
 impl BackendWrite for InMemoryWrite {
     fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
+        let space_entries = self
+            .entries
+            .entry(space)
+            .or_insert_with(|| Arc::new(BTreeMap::new()));
+        let space_entries = Arc::make_mut(space_entries);
+
         for entry in entries.entries {
             let value = stored_value_bytes(entry.value);
             self.stats.put_entries += 1;
             self.stats.written_bytes += value.len() as u64;
-            self.entries
-                .entry(space)
-                .or_default()
-                .insert(entry.key, value);
+            space_entries.insert(entry.key, value);
         }
         self.stats.backend_calls += 1;
         Ok(())
     }
 
     fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
+        let mut remove_space = false;
         if let Some(space_entries) = self.entries.get_mut(&space) {
+            let space_entries = Arc::make_mut(space_entries);
             for key in keys {
                 space_entries.remove(key);
             }
             if space_entries.is_empty() {
-                self.entries.remove(&space);
+                remove_space = true;
             }
+        }
+        if remove_space {
+            self.entries.remove(&space);
         }
         self.stats.deleted_entries += keys.len() as u64;
         self.stats.backend_calls += 1;

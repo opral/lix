@@ -3027,3 +3027,120 @@ Final focused rerun after keeping normal benchmark staging:
 | ----------------------- | --------: | --------------------------- |
 | puts k8192 / g16 / v32  | 143.43 us | improved vs stored baseline |
 | puts k4096 / g256 / v32 | 132.19 us | noisy/no clear change       |
+
+## 2026-05-15: storage_v2 smoke bench mode and in-memory backend cut
+
+Change:
+
+```text
+Added STORAGE_V2_BENCH_SMOKE=1 for storage_v2 benches.
+
+Smoke mode keeps the same benchmark names and assertions but uses:
+  warmup:       100 ms
+  measurement: 250 ms
+  samples:      10
+
+This is intentionally noisy. It is for deciding what to inspect next, not for
+claiming final deltas.
+```
+
+Smoke command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 cargo bench -p lix_engine \
+  --features storage-benches --bench storage_v2 \
+  '^storage_v2/in_memory_backend/(commit_puts_k1024_g16_v32|commit_puts_k128_g16_existing10k_untouched_v32|commit_puts_k128_g16_existing10k_touched_v32|planned_visit_unique_m1000_u100|scan_range_q1000|scan_range_visit_key_only_q1000)$'
+```
+
+Smoke scorecard:
+
+| Case                                      | Smoke median |
+| ----------------------------------------- | -----------: |
+| commit puts k1024/g16 into empty backend  |    262.42 us |
+| commit puts k128/g16 into existing 10k    |      2.55 ms |
+| planned visit unique m1000/u100           |      4.19 us |
+| materialized key-only scan q1000          |     15.80 us |
+| borrowed key-only scan q1000              |      2.01 us |
+
+Interpretation:
+
+```text
+The remaining storage + in-memory backend bottleneck is write snapshot/update
+shape, not read adapters.
+
+The new existing-data write smoke case exposes the current InMemoryBackend
+begin_write cost:
+  begin_write clones the whole InMemoryMap snapshot
+  small writes into a large existing backend pay O(N_total) before applying K
+
+That is the wrong shape for a production-oriented in-memory backend. The next
+first-principles cut is copy-on-write by space:
+
+  current:
+    Arc<BTreeMap<SpaceId, BTreeMap<Key, Bytes>>>
+    begin_write clones all spaces and all entries
+
+  proposed:
+    Arc<BTreeMap<SpaceId, Arc<BTreeMap<Key, Bytes>>>>
+    begin_write clones only the outer space map
+    first write to a touched space clones that space map
+    commit publishes a new outer Arc
+
+Expected shape:
+  begin_write: O(number_of_spaces)
+  write to touched spaces: O(entries_in_touched_spaces + K log N_space)
+  untouched spaces: O(1) Arc clone, not O(entries)
+
+Point visitor and borrowed scan are already small enough for now. Materialized
+scan remains intentionally more expensive because it owns cloned ReadEntry keys.
+```
+
+Change applied:
+
+```text
+InMemoryBackend now stores each space as an independently shared ordered map:
+  Arc<BTreeMap<SpaceId, Arc<BTreeMap<Key, Bytes>>>>
+
+begin_write clones the outer space map only. put_many/delete_many call
+Arc::make_mut for touched spaces. This preserves coherent read snapshots while
+avoiding an O(N_total) clone for writes that do not touch existing large spaces.
+
+A bench-only fork_snapshot() helper lets smoke benches start each iteration from
+the same preseeded immutable snapshot without reseeding 10k rows inside the
+timed loop.
+```
+
+Post-change smoke scorecard:
+
+| Case                                         | Smoke median |
+| -------------------------------------------- | -----------: |
+| commit puts k1024/g16 into empty backend     |    127.12 us |
+| commit puts k128/g16 with existing 10k untouched | 11.56 us |
+| commit puts k128/g16 with existing 10k touched   | 346.97 us |
+| planned visit unique m1000/u100              |      8.43 us |
+| materialized key-only scan q1000             |     23.17 us |
+| borrowed key-only scan q1000                 |      3.19 us |
+
+Interpretation:
+
+```text
+The COW-by-space cut worked for the actual target:
+  existing 10k untouched: ~2.55 ms -> ~11.6 us
+
+The touched-space case remains much slower because the first write to that space
+must clone its BTreeMap:
+  existing 10k touched: ~347 us
+
+So the remaining in-memory backend write bottleneck is no longer global snapshot
+copying. It is per-touched-space BTreeMap clone/update. The next harder cut, if
+needed before real backends, is a persistent/overlay per-space write map:
+
+  base Arc<BTreeMap<Key, Bytes>>
+  staged puts/deletes in mutable overlay
+  commit materializes or publishes a layered space map
+
+That would avoid O(entries_in_touched_space) for small writes into large spaces,
+but it is a larger semantic/layout change. The current COW-by-space layout is
+good enough to move on unless domain-shaped workloads prove touched-space small
+writes dominate.
+```
