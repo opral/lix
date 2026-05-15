@@ -78,6 +78,12 @@ enum WriteMutation {
     Delete(StorageSpace, Key),
 }
 
+#[derive(Clone)]
+struct DirectWriteBatches {
+    puts: Vec<(StorageSpace, PutBatch)>,
+    deletes: Vec<(StorageSpace, Vec<Key>)>,
+}
+
 #[derive(Default)]
 struct CountingPointVisitor {
     visited: usize,
@@ -442,6 +448,10 @@ fn storage_v2_benches(c: &mut Criterion) {
     bench_storage_backend_matrix(c, SqliteTempBenchBackend::new());
     bench_storage_backend_matrix(c, RedbTempBenchBackend::new());
     bench_storage_backend_matrix(c, RocksDbTempBenchBackend::new());
+    bench_backend_direct_profile(c, InMemoryBenchBackend);
+    bench_backend_direct_profile(c, SqliteTempBenchBackend::new());
+    bench_backend_direct_profile(c, RedbTempBenchBackend::new());
+    bench_backend_direct_profile(c, RocksDbTempBenchBackend::new());
     bench_in_memory_backend(c);
     bench_scan_visitor_baseline(c);
     bench_hash_algorithms(c);
@@ -1256,6 +1266,204 @@ where
             assert_eq!(page.stats.backend_calls, 1);
             assert_eq!(page.stats.prefix_lowered, 1);
             black_box(page.value);
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_backend_direct_profile<B>(c: &mut Criterion, backend_family: B)
+where
+    B: StorageBenchBackend,
+{
+    let group_name = format!(
+        "storage_v2/backend_direct_profile/{}",
+        backend_family.name()
+    );
+    let mut group = c.benchmark_group(group_name);
+    group.sample_size(10);
+    if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_some() {
+        group.warm_up_time(Duration::from_millis(100));
+        group.measurement_time(Duration::from_millis(250));
+    }
+
+    let direct_put_case = WriteCase {
+        name: "direct_commit_puts_k1024_g16_v32",
+        writes: 1_024,
+        spaces: 16,
+        value_size: 32,
+        mix: WriteMix::PutsOnly,
+    };
+    let direct_put_mutations = write_mutations(&direct_put_case);
+    let direct_put_batches = direct_write_batches_from_mutations(&direct_put_mutations);
+    let direct_put_backend = backend_family.open_empty();
+    commit_direct_write_batches(&direct_put_backend, direct_put_batches.clone())
+        .expect("warm direct put backend");
+    group.throughput(Throughput::Elements(direct_put_case.writes as u64));
+    group.bench_function(direct_put_case.name, |b| {
+        b.iter_batched(
+            || direct_put_batches.clone(),
+            |batches| {
+                let commit = commit_direct_write_batches(&direct_put_backend, batches)
+                    .expect("direct backend put commit");
+                assert_eq!(commit.stats.put_entries, 1_024);
+                assert_eq!(commit.stats.deleted_entries, 0);
+                assert_eq!(commit.stats.backend_calls, 16);
+                black_box(commit);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    let mixed_case = WriteCase {
+        name: "direct_mixed80_20_k1024_g16_v32",
+        writes: 1_024,
+        spaces: 16,
+        value_size: 32,
+        mix: WriteMix::PutDelete80_20,
+    };
+    let mixed_mutations = write_mutations(&mixed_case);
+    let mixed_batches = direct_write_batches_from_mutations(&mixed_mutations);
+    let mixed_backend = backend_family.open_empty();
+    commit_direct_write_batches(&mixed_backend, mixed_batches.clone())
+        .expect("warm direct mixed backend");
+    group.throughput(Throughput::Elements(mixed_case.writes as u64));
+    group.bench_function(mixed_case.name, |b| {
+        b.iter_batched(
+            || mixed_batches.clone(),
+            |batches| {
+                let commit = commit_direct_write_batches(&mixed_backend, batches)
+                    .expect("direct backend mixed commit");
+                assert_eq!(commit.stats.put_entries, 816);
+                assert_eq!(commit.stats.deleted_entries, 208);
+                assert_eq!(commit.stats.backend_calls, 32);
+                black_box(commit);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    let touched_case = WriteCase {
+        name: "direct_commit_puts_k128_g16_existing10k_touched_v32",
+        writes: 128,
+        spaces: 16,
+        value_size: 32,
+        mix: WriteMix::PutsOnly,
+    };
+    let touched_mutations = write_mutations(&touched_case);
+    let touched_batches = direct_write_batches_from_mutations(&touched_mutations);
+    let touched_backend = backend_family.seed_points(SpaceId(1), 10_000, 32);
+    commit_direct_write_batches(&touched_backend, touched_batches.clone())
+        .expect("warm direct touched backend");
+    group.throughput(Throughput::Elements(touched_case.writes as u64));
+    group.bench_function(touched_case.name, |b| {
+        b.iter_batched(
+            || touched_batches.clone(),
+            |batches| {
+                let commit = commit_direct_write_batches(&touched_backend, batches)
+                    .expect("direct backend touched commit");
+                assert_eq!(commit.stats.put_entries, 128);
+                assert_eq!(commit.stats.deleted_entries, 0);
+                assert_eq!(commit.stats.backend_calls, 16);
+                black_box(commit);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    let point_backend = backend_family.seed_points(SpaceId(1), 100, 32);
+    let point_keys = point_request_keys(1_000, 100);
+    group.throughput(Throughput::Elements(1_000));
+    group.bench_function("direct_get_many_m1000_u100", |b| {
+        b.iter(|| {
+            let read = point_backend
+                .begin_read(ReadOptions::default())
+                .expect("begin direct point read");
+            let result = read
+                .get_many(SpaceId(1), black_box(&point_keys), GetOptions::default())
+                .expect("direct get_many");
+            assert_eq!(result.values.len(), 1_000);
+            assert_eq!(
+                result.values.iter().filter(|value| value.is_some()).count(),
+                1_000
+            );
+            read.close().expect("close direct point read");
+            black_box(result);
+        });
+    });
+
+    group.bench_function("direct_visit_many_m1000_u100", |b| {
+        b.iter(|| {
+            let read = point_backend
+                .begin_read(ReadOptions::default())
+                .expect("begin direct point visitor read");
+            let mut visitor = CountingPointVisitor::default();
+            read.visit_many(
+                SpaceId(1),
+                black_box(&point_keys),
+                GetOptions::default(),
+                &mut visitor,
+            )
+            .expect("direct visit_many");
+            assert_eq!(visitor.visited, 1_000);
+            read.close().expect("close direct point visitor read");
+            black_box(visitor.visited);
+        });
+    });
+
+    let scan_backend = backend_family.seed_points(SpaceId(1), 1_000, 32);
+    group.throughput(Throughput::Elements(1_000));
+    group.bench_function("direct_scan_visit_key_only_q1000", |b| {
+        b.iter(|| {
+            let read = scan_backend
+                .begin_read(ReadOptions::default())
+                .expect("begin direct scan visitor read");
+            let mut visited = 0usize;
+            let result = read
+                .visit_range(
+                    SpaceId(1),
+                    point_scan_range(),
+                    ScanOptions {
+                        limit_rows: 1_001,
+                        projection: CoreProjection::KeyOnly,
+                        ..ScanOptions::default()
+                    },
+                    &mut |key: &Key, value: ProjectedValueRef<'_>| {
+                        visited += 1;
+                        assert!(matches!(value, ProjectedValueRef::KeyOnly));
+                        black_box(key);
+                        Ok(())
+                    },
+                )
+                .expect("direct scan visitor");
+            assert_eq!(visited, 1_000);
+            assert_eq!(result.emitted, 1_000);
+            assert!(!result.has_more);
+            read.close().expect("close direct scan visitor read");
+            black_box(result);
+        });
+    });
+
+    group.bench_function("direct_scan_materialized_q1000", |b| {
+        b.iter(|| {
+            let read = scan_backend
+                .begin_read(ReadOptions::default())
+                .expect("begin direct materialized scan read");
+            let page = materialize_backend_scan(
+                &read,
+                SpaceId(1),
+                point_scan_range(),
+                ScanOptions {
+                    limit_rows: 1_001,
+                    projection: CoreProjection::KeyOnly,
+                    ..ScanOptions::default()
+                },
+            )
+            .expect("direct materialized scan");
+            assert_eq!(page.entries.entries.len(), 1_000);
+            assert!(!page.has_more);
+            read.close().expect("close direct materialized scan read");
+            black_box(page);
         });
     });
 
@@ -2408,6 +2616,48 @@ fn put_batches_by_space(mutations: &[WriteMutation]) -> Vec<(StorageSpace, PutBa
         .into_iter()
         .map(|(space, entries)| (space, PutBatch { entries }))
         .collect()
+}
+
+fn direct_write_batches_from_mutations(mutations: &[WriteMutation]) -> DirectWriteBatches {
+    let mut puts = BTreeMap::<StorageSpace, Vec<PutEntry>>::new();
+    let mut deletes = BTreeMap::<StorageSpace, Vec<Key>>::new();
+    for mutation in mutations {
+        match mutation {
+            WriteMutation::Put(space, key, value) => {
+                puts.entry(*space).or_default().push(PutEntry {
+                    key: key.clone(),
+                    value: value.clone(),
+                });
+            }
+            WriteMutation::Delete(space, key) => {
+                deletes.entry(*space).or_default().push(key.clone());
+            }
+        }
+    }
+    DirectWriteBatches {
+        puts: puts
+            .into_iter()
+            .map(|(space, entries)| (space, PutBatch { entries }))
+            .collect(),
+        deletes: deletes.into_iter().collect(),
+    }
+}
+
+fn commit_direct_write_batches<B>(
+    backend: &B,
+    batches: DirectWriteBatches,
+) -> Result<CommitResult, BackendError>
+where
+    B: Backend,
+{
+    let mut write = backend.begin_write(WriteOptions::default())?;
+    for (space, batch) in batches.puts {
+        write.put_many(space.id, batch)?;
+    }
+    for (space, keys) in batches.deletes {
+        write.delete_many(space.id, &keys)?;
+    }
+    write.commit()
 }
 
 fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
