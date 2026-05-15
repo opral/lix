@@ -130,7 +130,7 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: format!("Plugin manifest must be valid JSON: {error}"),
         hint: None,
-            details: None,
+        details: None,
     })?;
 
     validate_plugin_manifest_json(&manifest_json)?;
@@ -148,7 +148,7 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: format!("Failed to normalize plugin manifest JSON: {error}"),
         hint: None,
-            details: None,
+        details: None,
     })?;
 
     Ok(ValidatedPluginManifest {
@@ -220,7 +220,7 @@ fn validate_path_glob(glob: &str) -> Result<(), LixError> {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: format!("Invalid plugin manifest: match.path_glob is invalid: {error}"),
         hint: None,
-            details: None,
+        details: None,
     })?;
     Ok(())
 }
@@ -281,7 +281,7 @@ fn plugin_manifest_validator() -> Result<&'static JSONSchema, LixError> {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 message: format!("Failed to compile plugin manifest schema: {error}"),
                 hint: None,
-            details: None,
+                details: None,
             })
     });
 
@@ -298,7 +298,7 @@ fn plugin_manifest_validator() -> Result<&'static JSONSchema, LixError> {
 
 fn plugin_manifest_schema() -> &'static JsonValue {
     PLUGIN_MANIFEST_SCHEMA.get_or_init(|| {
-        let raw = include_str!("./plugin_manifest.schema.json");
+        let raw = include_str!("./plugin_manifest.json");
         serde_json::from_str(raw).expect("plugin_manifest.schema.json must be valid JSON")
     })
 }

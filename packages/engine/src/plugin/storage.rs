@@ -1,6 +1,6 @@
 use crate::LixError;
 
-pub const PLUGIN_STORAGE_ROOT_DIRECTORY_PATH: &str = "/.lix/plugins/";
+pub const PLUGIN_STORAGE_ROOT_DIRECTORY_PATH: &str = "/.lix_system/plugins/";
 pub const PLUGIN_ARCHIVE_FILE_EXTENSION: &str = ".lixplugin";
 
 pub fn plugin_storage_archive_file_id(plugin_key: &str) -> String {
@@ -56,18 +56,22 @@ mod tests {
     fn computes_storage_archive_paths() {
         assert_eq!(
             plugin_storage_archive_path("plugin_json").expect("path should build"),
-            "/.lix/plugins/plugin_json.lixplugin"
+            "/.lix_system/plugins/plugin_json.lixplugin"
         );
     }
 
     #[test]
     fn extracts_plugin_key_from_storage_path() {
         assert_eq!(
-            plugin_key_from_archive_path("/.lix/plugins/plugin_json.lixplugin"),
+            plugin_key_from_archive_path("/.lix_system/plugins/plugin_json.lixplugin"),
             Some("plugin_json".to_string())
         );
         assert_eq!(
-            plugin_key_from_archive_path("/.lix/plugins/nested/plugin.lixplugin"),
+            plugin_key_from_archive_path("/.lix_system/plugins/nested/plugin.lixplugin"),
+            None
+        );
+        assert_eq!(
+            plugin_key_from_archive_path("/.lix/plugins/plugin_json.lixplugin"),
             None
         );
     }

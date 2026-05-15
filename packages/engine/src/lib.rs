@@ -14,6 +14,8 @@ pub(crate) mod init;
 #[allow(dead_code)]
 pub(crate) mod json_store;
 pub(crate) mod live_state;
+#[allow(dead_code, unused_imports)]
+pub(crate) mod plugin;
 mod schema;
 pub mod session;
 pub(crate) mod sql2;
@@ -55,7 +57,8 @@ pub use session::{
     CreateVersionOptions, CreateVersionReceipt, MergeChangeStats, MergeConflict,
     MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, MergeVersionOptions,
     MergeVersionOutcome, MergeVersionPreview, MergeVersionPreviewOptions, MergeVersionReceipt,
-    SessionContext, SessionTransaction, SwitchVersionOptions, SwitchVersionReceipt,
+    RegisterPluginOptions, RegisterPluginReceipt, SessionContext, SessionTransaction,
+    SwitchVersionOptions, SwitchVersionReceipt,
 };
 pub use session::{ExecuteResult, Row, RowRef, TryFromValue};
 

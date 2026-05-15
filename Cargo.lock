@@ -3042,6 +3042,7 @@ dependencies = [
  "unicode-normalization",
  "uuid",
  "xxhash-rust",
+ "zip",
  "zstd",
 ]
 

@@ -7,8 +7,8 @@
 mod archive;
 pub(crate) mod component;
 mod manifest;
-mod materializer;
 mod storage;
+mod types;
 
 pub(crate) use archive::{
     load_installed_plugin_from_archive_bytes, parse_plugin_archive_for_install, ParsedPluginArchive,
@@ -20,14 +20,8 @@ pub(crate) use manifest::{
     StateContextColumn, ValidatedPluginManifest,
 };
 #[allow(unused_imports)]
-pub(crate) use materializer::{
-    installed_plugin_manifest_key_exists, invalidate_installed_plugins_cache,
-    list_installed_plugin_manifest_keys, load_installed_plugins_from_backend_state,
-    load_installed_plugins_with_runtime_cache, FilesystemPluginMaterializer, InstalledPlugin,
-    PluginMaterializationHost,
-};
-#[allow(unused_imports)]
 pub(crate) use storage::{
     plugin_key_from_archive_path, plugin_storage_archive_file_id, plugin_storage_archive_path,
     PLUGIN_ARCHIVE_FILE_EXTENSION, PLUGIN_STORAGE_ROOT_DIRECTORY_PATH,
 };
+pub(crate) use types::InstalledPlugin;

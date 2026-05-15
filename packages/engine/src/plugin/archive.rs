@@ -25,13 +25,13 @@ pub(crate) fn parse_plugin_archive_for_install(
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: "Plugin archive must contain manifest.json".to_string(),
         hint: None,
-            details: None,
+        details: None,
     })?;
     let manifest_raw = std::str::from_utf8(manifest_bytes).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: format!("Plugin archive manifest.json must be UTF-8: {error}"),
         hint: None,
-            details: None,
+        details: None,
     })?;
     let validated_manifest = parse_plugin_manifest_json(manifest_raw)?;
 
@@ -51,7 +51,7 @@ pub(crate) fn parse_plugin_archive_for_install(
     ensure_valid_plugin_wasm_for_install(&wasm_bytes)?;
 
     let mut schemas = Vec::with_capacity(validated_manifest.manifest.schemas.len());
-    let mut seen_schema_keys = BTreeSet::<(String, String)>::new();
+    let mut seen_schema_keys = BTreeSet::<String>::new();
     for schema_path in &validated_manifest.manifest.schemas {
         let normalized_schema_path = normalize_archive_path_for_install(schema_path)?;
         let schema_bytes = files.get(&normalized_schema_path).ok_or_else(|| LixError {
@@ -63,11 +63,9 @@ pub(crate) fn parse_plugin_archive_for_install(
         let schema_json: JsonValue =
             serde_json::from_slice(schema_bytes).map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                message: format!(
-                    "Plugin archive schema '{schema_path}' is invalid JSON: {error}"
-                ),
+                message: format!("Plugin archive schema '{schema_path}' is invalid JSON: {error}"),
                 hint: None,
-            details: None,
+                details: None,
             })?;
         validate_lix_schema_definition(&schema_json)?;
         let schema_key = schema_key_from_definition(&schema_json)?;
@@ -79,7 +77,7 @@ pub(crate) fn parse_plugin_archive_for_install(
                     schema_key.schema_key
                 ),
                 hint: None,
-            details: None,
+                details: None,
             });
         }
         schemas.push(schema_json);
@@ -104,7 +102,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
             archive_path
         ),
         hint: None,
-            details: None,
+        details: None,
     })?;
     let manifest_raw = std::str::from_utf8(manifest_bytes).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -113,7 +111,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
             archive_path
         ),
         hint: None,
-            details: None,
+        details: None,
     })?;
     let validated_manifest = parse_plugin_manifest_json(manifest_raw)?;
     if validated_manifest.manifest.key != plugin_key {
@@ -137,7 +135,7 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
             archive_path, validated_manifest.manifest.entry
         ),
         hint: None,
-            details: None,
+        details: None,
     })?;
     ensure_valid_plugin_wasm_for_materialization(wasm)?;
 
@@ -172,7 +170,7 @@ fn read_archive_files_for_install(
         code: "LIX_ERROR_UNKNOWN".to_string(),
         message: format!("Plugin archive is not a valid zip file: {error}"),
         hint: None,
-            details: None,
+        details: None,
     })?;
     let mut files = BTreeMap::<String, Vec<u8>>::new();
 
@@ -193,7 +191,7 @@ fn read_archive_files_for_install(
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 message: format!("Plugin archive entry '{raw_name}' must not be a symlink"),
                 hint: None,
-            details: None,
+                details: None,
             });
         }
 
@@ -210,7 +208,7 @@ fn read_archive_files_for_install(
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 message: format!("Plugin archive contains duplicate entry '{normalized_path}'"),
                 hint: None,
-            details: None,
+                details: None,
             });
         }
     }
@@ -241,7 +239,7 @@ fn read_plugin_archive_files(
             archive_path
         ),
         hint: None,
-            details: None,
+        details: None,
     })?;
     let mut files = BTreeMap::<String, Vec<u8>>::new();
 
