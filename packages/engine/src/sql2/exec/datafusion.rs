@@ -9,6 +9,7 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::sql2::parse::parse_statement;
+use crate::sql2::plan::LogicalWritePlan;
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
 use crate::sql2::predicate_typecheck::validate_json_predicate_expr_with_dfschema;
@@ -219,6 +220,17 @@ pub(crate) async fn execute_logical_plan(
     let mut result = query_result_from_batches(&result_fields, &batches)?;
     result.notices = notices;
     Ok(result)
+}
+
+pub(crate) async fn execute_datafusion_write_logical_plan(
+    _ctx: &mut dyn SqlWriteExecutionContext,
+    _plan: &LogicalWritePlan,
+    _params: &[Value],
+) -> Result<u64, LixError> {
+    Err(LixError::new(
+        LixError::CODE_UNSUPPORTED_SQL,
+        "sql2 DataFusion write execution from bound plans is not wired yet",
+    ))
 }
 
 fn validate_strict_binary_params(
@@ -599,7 +611,6 @@ mod tests {
     use serde_json::Value as JsonValue;
 
     use super::{execute_logical_plan, execute_sql, SqlExecutionContext, SqlWriteExecutionContext};
-    use crate::sql2::create_write_logical_plan;
     use crate::binary_cas::BlobDataReader;
     use crate::commit_graph::{
         CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
@@ -614,6 +625,7 @@ mod tests {
         LiveStateContext, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
         MaterializedLiveStateRow,
     };
+    use crate::sql2::create_write_logical_plan;
     use crate::sql2::{CommitStoreQuerySource, SqlCommitStoreQuerySource};
     use crate::storage::{
         KvEntryPage, KvExistsBatch, KvGetRequest, KvKeyPage, KvScanRequest, KvValueBatch,
