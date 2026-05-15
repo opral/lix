@@ -2681,3 +2681,166 @@ This confirms the first-principles split:
     immediately;
   - use scan_* / scan_*_into only when callers need an owned page.
 ```
+
+### 2026-05-15: Isolated Storage Visitor Gap Profile
+
+Profiles:
+
+```text
+target/storage_v2_profiles/storage_visitor_gap/raw_visit_key_only_q1000_syms.json
+target/storage_v2_profiles/storage_visitor_gap/storage_visit_key_only_q1000_syms.json
+```
+
+Commands:
+
+```sh
+samply record --save-only --unstable-presymbolicate \
+  -o target/storage_v2_profiles/storage_visitor_gap/raw_visit_key_only_q1000_syms.json -- \
+  cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  '^storage_v2/scan_visitor_baseline/visit_key_only_q1000$'
+
+samply record --save-only --unstable-presymbolicate \
+  -o target/storage_v2_profiles/storage_visitor_gap/storage_visit_key_only_q1000_syms.json -- \
+  cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  '^storage_v2/scan_visitor_baseline/storage_visit_key_only_q1000$'
+```
+
+Isolated benchmark results:
+
+| Case                         |      Time |
+| ---------------------------- | --------: |
+| raw visit_key_only_q1000     | 818.93 ns |
+| storage_visit_key_only_q1000 | 793.02 ns |
+
+Interpretation:
+
+```text
+The earlier group-run result showed storage_visit_key_only_q1000 around 2.998
+us versus raw visit_key_only_q1000 around 1.499 us. The isolated samply runs do
+not reproduce that gap. Both paths are effectively the same order and the
+storage wrapper is not visible as a first-principles hotspot.
+
+Conclusion: do not optimize the storage visitor wrapper right now. Treat the
+previous gap as benchmark noise/interference from the larger scan group. The
+next useful profiling target should be point-read planning/output or write-set
+lowering, not storage scan wrapper overhead.
+```
+
+### 2026-05-15: Point Read Next Profile
+
+Profiles:
+
+```text
+target/storage_v2_profiles/point_read_next/planned_lean_m10000_u100_syms.json
+target/storage_v2_profiles/point_read_next/planned_lean_m10000_u10000_syms.json
+target/storage_v2_profiles/point_read_next/in_memory_planned_get_many_m1000_u100_syms.json
+target/storage_v2_profiles/point_read_next/direct_planned_lean_m10000_u10000_syms.json
+target/storage_v2_profiles/point_read_next/direct_in_memory_planned_m1000_u100_syms.json
+```
+
+Commands:
+
+```sh
+samply record --save-only --unstable-presymbolicate \
+  -o target/storage_v2_profiles/point_read_next/planned_lean_m10000_u100_syms.json -- \
+  cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  '^storage_v2/point_read_planned_lean_backend/m10000_u100$'
+
+samply record --save-only --unstable-presymbolicate \
+  -o target/storage_v2_profiles/point_read_next/planned_lean_m10000_u10000_syms.json -- \
+  cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  '^storage_v2/point_read_planned_lean_backend/m10000_u10000$'
+
+samply record --save-only --unstable-presymbolicate \
+  -o target/storage_v2_profiles/point_read_next/in_memory_planned_get_many_m1000_u100_syms.json -- \
+  cargo bench -p lix_engine --features storage-benches --bench storage_v2 \
+  '^storage_v2/in_memory_backend/planned_get_many_m1000_u100$'
+```
+
+Timing results:
+
+| Case                                      |      Time |
+| ----------------------------------------- | --------: |
+| planned lean m10000 u100                  | 340.98 ns |
+| planned lean m10000 u10000                | 40.510 us |
+| in-memory planned get_many m1000 u100     |  2.742 us |
+| direct planned lean m10000 u10000 profile | 41.881 us |
+| direct in-memory planned m1000 u100       |  2.638 us |
+
+Interpretation:
+
+```text
+The duplicate-heavy planned path is already extremely cheap once the
+PointRequestPlan exists: m=10000/u=100 completes in ~341 ns against the lean
+backend. That means the repeated-read API shape is doing its job for high
+duplicate ratios.
+
+The all-unique lean path is linear in U: m=10000/u=10000 takes ~40-42 us. That
+is the expected O(U) output/write-slot cost, not a planning cost.
+
+The real in-memory planned get_many m1000/u100 case takes ~2.6-2.7 us. Since the
+lean backend m10000/u100 case is sub-microsecond, most of the real in-memory
+case is backend lookup plus cloning returned Bytes values, not storage
+requested-to-unique reconstruction.
+```
+
+Next optimization implication:
+
+```text
+Do not add more point-read planning APIs yet. The plan reuse path is already
+fast. If point reads are the next target, the first-principles cut is inside the
+in-memory backend/result ownership shape:
+
+  - a borrowed point visitor/result path for in-memory reads, or
+  - a domain-facing API that consumes point values without cloning them.
+
+This mirrors the scan result: materialization/ownership dominates once the
+storage adapter shape is lean.
+```
+
+### 2026-05-15: Point Visitor Cut
+
+Change:
+
+```text
+Added BackendRead::visit_many with a default owned implementation and an
+InMemoryRead override that visits borrowed point values directly. Added
+StorageReader::visit_unique_point_values_for_plan for repeated planned reads
+that can consume one value per unique backend key instead of materializing an
+IndexedPointValues result.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo check -p lix_engine --features storage-benches
+cargo test -p lix_engine backend_v2 --no-fail-fast
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+```
+
+Focused benchmark results:
+
+| Case                         | Owned/result path | Unique visitor |       Delta |
+| ---------------------------- | ----------------: | -------------: | ----------: |
+| planned lean m10000/u100     |          1.345 us |       304.6 ns | 4.4x faster |
+| planned lean m10000/u10000   |         175.97 us |       31.01 us | 5.7x faster |
+| in-memory planned m1000/u100 |          7.069 us |       5.383 us | 1.3x faster |
+
+Interpretation:
+
+```text
+The visitor cut is a large win for the lean backend because it removes owned
+ProjectedValue vector construction. For the real in-memory backend the win is
+smaller because BTreeMap lookup and Arc/BTree snapshot layout dominate more of
+the cost than owned value cloning.
+
+This says the API cut is directionally useful, but the next in-memory-specific
+optimization is probably not another storage point adapter. It is more likely
+an in-memory map/layout question:
+  - reduce BTree lookup overhead for point batches,
+  - specialize point lookups by space,
+  - or use a domain-shaped/in-memory index once real domain access patterns are
+    known.
+```

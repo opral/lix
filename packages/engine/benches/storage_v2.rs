@@ -13,9 +13,9 @@ use criterion::{
 use lix_engine::backend_v2::{
     Backend, BackendCapabilities, BackendError, BackendRead, BackendWrite, CommitResult,
     ConformanceBackend, CoreProjection, GetManyResult, GetOptions, InMemoryBackend, Key, KeyRange,
-    Prefix, ProjectedValue, ProjectedValueRef, PutBatch, ReadBatch, ReadEntry, ReadOptions,
-    ScanOptions, ScanPage, ScanResult, ScanVisitor, SpaceId, StoredValue, WriteConcurrency,
-    WriteOptions, WriteStats,
+    PointVisitor, Prefix, ProjectedValue, ProjectedValueRef, PutBatch, ReadBatch, ReadEntry,
+    ReadOptions, ScanOptions, ScanPage, ScanResult, ScanVisitor, SpaceId, StoredValue,
+    WriteConcurrency, WriteOptions, WriteStats,
 };
 use lix_engine::storage_v2::{
     PointRequestPlan, StorageContext, StorageReadScope, StorageReader, StorageScanBuffer,
@@ -638,6 +638,38 @@ fn bench_point_read_planned_lean_backend(c: &mut Criterion) {
                 black_box(result.value);
             });
         });
+
+        group.bench_with_input(
+            BenchmarkId::new("visit_unique", case.name),
+            case,
+            |b, case| {
+                b.iter(|| {
+                    let mut visited = 0usize;
+                    let mut missing = 0usize;
+                    let stats = read
+                        .visit_unique_point_values_for_plan(
+                            space(1),
+                            black_box(&plan),
+                            GetOptions::default(),
+                            &mut |index: usize, key: &Key, value: Option<ProjectedValueRef<'_>>| {
+                                visited += 1;
+                                if value.is_none() {
+                                    missing += 1;
+                                }
+                                black_box((index, key, value));
+                                Ok(())
+                            },
+                        )
+                        .expect("planned point visitor");
+                    assert_eq!(stats.requested_keys, case.requested_keys as u64);
+                    assert_eq!(stats.unique_backend_keys, case.unique_keys as u64);
+                    assert_eq!(stats.backend_calls, 1);
+                    assert_eq!(visited, case.unique_keys);
+                    assert_eq!(missing, expected_unique_missing);
+                    black_box(stats);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -861,6 +893,34 @@ fn bench_in_memory_backend(c: &mut Criterion) {
             assert_eq!(result.value.len(), 1_000);
             assert_eq!(result.value.unique_values.len(), 100);
             black_box(result.value);
+        });
+    });
+
+    group.bench_function("planned_visit_unique_m1000_u100", |b| {
+        b.iter(|| {
+            let mut visited = 0usize;
+            let mut bytes_seen = 0usize;
+            let stats = planned_get_many_read
+                .visit_unique_point_values_for_plan(
+                    space(1),
+                    black_box(&planned_get_many_plan),
+                    GetOptions::default(),
+                    &mut |index: usize, key: &Key, value: Option<ProjectedValueRef<'_>>| {
+                        visited += 1;
+                        if let Some(ProjectedValueRef::FullValue(value)) = value {
+                            bytes_seen += value.len();
+                        }
+                        black_box((index, key, value));
+                        Ok(())
+                    },
+                )
+                .expect("planned point visitor");
+            assert_eq!(stats.requested_keys, 1_000);
+            assert_eq!(stats.unique_backend_keys, 100);
+            assert_eq!(stats.backend_calls, 1);
+            assert_eq!(visited, 100);
+            assert_eq!(bytes_seen, 3_200);
+            black_box(stats);
         });
     });
 
@@ -1457,6 +1517,27 @@ impl BackendRead for LeanPointReadBackend {
             .chain(std::iter::repeat_with(|| None).take(keys.len().saturating_sub(found)))
             .collect();
         Ok(GetManyResult::new(values))
+    }
+
+    fn visit_many<V>(
+        &self,
+        _space: SpaceId,
+        keys: &[Key],
+        _opts: GetOptions<'_>,
+        visitor: &mut V,
+    ) -> Result<(), BackendError>
+    where
+        V: PointVisitor + ?Sized,
+    {
+        let found = keys.len().min(self.values.len());
+        for (index, key) in keys.iter().take(found).enumerate() {
+            let value = Some(self.values[index].value.as_ref());
+            visitor.visit(index, key, value)?;
+        }
+        for (index, key) in keys.iter().enumerate().skip(found) {
+            visitor.visit(index, key, None)?;
+        }
+        Ok(())
     }
 
     fn visit_range<V>(

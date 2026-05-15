@@ -23,7 +23,7 @@ pub(crate) use point::{
     get_many_caller_order_with_stats, get_many_indexed_values_caller_order,
     get_many_indexed_values_caller_order_with_stats, get_many_indexed_values_for_plan,
     get_many_indexed_values_for_plan_with_stats, get_many_values_caller_order,
-    get_many_values_caller_order_with_stats,
+    get_many_values_caller_order_with_stats, visit_unique_point_values_for_plan,
 };
 pub use point::{
     BorrowedIndexedPointValues, IndexedPointValues, PointRequestPlan, PointSlot, RequestedToUnique,
