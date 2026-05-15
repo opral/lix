@@ -312,8 +312,8 @@ impl SessionContext {
                         let tx_plan =
                             sql2::create_write_logical_plan_from_parsed(transaction, statement)
                                 .await?;
-                        let result = sql2::execute_logical_plan(tx_plan, &params).await?;
-                        let affected_rows = affected_rows_from_query_result(result)?;
+                        let affected_rows =
+                            sql2::execute_write_logical_plan(transaction, tx_plan, &params).await?;
                         Ok(ExecuteResult::from_rows_affected(affected_rows))
                     })
                 })
@@ -499,8 +499,7 @@ async fn execute_transaction_write(
     params: &[Value],
 ) -> Result<ExecuteResult, LixError> {
     let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
-    let result = sql2::execute_logical_plan(tx_plan, params).await?;
-    let affected_rows = affected_rows_from_query_result(result)?;
+    let affected_rows = sql2::execute_write_logical_plan(transaction, tx_plan, params).await?;
     Ok(ExecuteResult::from_rows_affected(affected_rows))
 }
 
@@ -537,28 +536,6 @@ fn normalize_sql_surface_error(error: LixError, sql: &str) -> LixError {
 fn sql_uses_public_filesystem_path_surface(sql: &str) -> bool {
     let lower = sql.to_ascii_lowercase();
     (lower.contains("lix_file") || lower.contains("lix_directory")) && lower.contains("path")
-}
-
-fn affected_rows_from_query_result(result: SqlQueryResult) -> Result<u64, LixError> {
-    let Some(first_row) = result.rows.first() else {
-        return Ok(0);
-    };
-    let Some(first_value) = first_row.first() else {
-        return Ok(0);
-    };
-    match first_value {
-        Value::Integer(value) if *value >= 0 => Ok(*value as u64),
-        Value::Text(value) => value.parse::<u64>().map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("failed to parse affected row count from SQL result: {error}"),
-            )
-        }),
-        other => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("expected affected row count, got {other:?}"),
-        )),
-    }
 }
 
 #[cfg(test)]
