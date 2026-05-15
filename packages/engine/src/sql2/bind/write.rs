@@ -19,6 +19,7 @@ pub(crate) struct BoundWrite {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BoundWriteTarget {
     LixState,
+    LixStateByVersion,
     Entity(EntityWriteSurface),
     File(FileWriteSurface),
     Directory(DirectoryWriteSurface),

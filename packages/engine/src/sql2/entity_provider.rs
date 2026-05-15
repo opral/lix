@@ -2265,11 +2265,11 @@ fn decode_json_pointer_segment(segment: &str) -> std::result::Result<String, Lix
     Ok(out)
 }
 
-fn schema_exposed_as_entity_surface(schema_key: &str) -> bool {
+pub(super) fn schema_exposed_as_entity_surface(schema_key: &str) -> bool {
     !matches!(schema_key, "lix_active_account" | "lix_change")
 }
 
-fn schema_exposed_as_entity_history_surface(schema_key: &str) -> bool {
+pub(super) fn schema_exposed_as_entity_history_surface(schema_key: &str) -> bool {
     !matches!(schema_key, "lix_commit" | "lix_commit_edge")
 }
 

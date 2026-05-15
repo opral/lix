@@ -38,8 +38,7 @@ mod write_normalization;
 
 pub(crate) use bind::{bind_statement, BoundStatement};
 pub(crate) use classify::{
-    classify_datafusion_statement, datafusion_statement_dml_target_table_names,
-    validate_supported_datafusion_statement_ast, SqlStatementKind,
+    classify_datafusion_statement, validate_supported_datafusion_statement_ast, SqlStatementKind,
 };
 pub(crate) use context::{
     CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext, SqlJsonReader,
