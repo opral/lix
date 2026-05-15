@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
@@ -13,7 +13,19 @@ use crate::backend_v2::{
 };
 
 type SpaceEntries = BTreeMap<Key, Bytes>;
-type InMemoryMap = BTreeMap<SpaceId, Arc<SpaceEntries>>;
+type InMemoryMap = BTreeMap<SpaceId, Arc<SpaceState>>;
+
+#[derive(Clone, Debug, Default)]
+enum SpaceState {
+    #[default]
+    Empty,
+    Flat(SpaceEntries),
+    Layered {
+        base: Arc<SpaceState>,
+        puts: SpaceEntries,
+        deletes: BTreeSet<Key>,
+    },
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryBackend {
@@ -36,8 +48,15 @@ pub type InMemoryScanVisitResult = ScanResult;
 
 pub struct InMemoryWrite {
     parent: Arc<Mutex<Arc<InMemoryMap>>>,
-    entries: InMemoryMap,
+    base: Arc<InMemoryMap>,
+    overlays: BTreeMap<SpaceId, SpaceOverlay>,
     stats: WriteStats,
+}
+
+#[derive(Debug, Default)]
+struct SpaceOverlay {
+    puts: SpaceEntries,
+    deletes: BTreeSet<Key>,
 }
 
 impl InMemoryBackend {
@@ -111,7 +130,8 @@ impl Backend for InMemoryBackend {
     fn begin_write(&self, _opts: WriteOptions) -> Result<Self::Write<'_>, BackendError> {
         Ok(InMemoryWrite {
             parent: Arc::clone(&self.entries),
-            entries: self.snapshot()?.as_ref().clone(),
+            base: self.snapshot()?,
+            overlays: BTreeMap::new(),
             stats: WriteStats::default(),
         })
     }
@@ -204,35 +224,24 @@ impl InMemoryRead {
 
 impl BackendWrite for InMemoryWrite {
     fn put_many(&mut self, space: SpaceId, entries: PutBatch) -> Result<(), BackendError> {
-        let space_entries = self
-            .entries
-            .entry(space)
-            .or_insert_with(|| Arc::new(BTreeMap::new()));
-        let space_entries = Arc::make_mut(space_entries);
+        let overlay = self.overlays.entry(space).or_default();
 
         for entry in entries.entries {
             let value = stored_value_bytes(entry.value);
             self.stats.put_entries += 1;
             self.stats.written_bytes += value.len() as u64;
-            space_entries.insert(entry.key, value);
+            overlay.deletes.remove(&entry.key);
+            overlay.puts.insert(entry.key, value);
         }
         self.stats.backend_calls += 1;
         Ok(())
     }
 
     fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), BackendError> {
-        let mut remove_space = false;
-        if let Some(space_entries) = self.entries.get_mut(&space) {
-            let space_entries = Arc::make_mut(space_entries);
-            for key in keys {
-                space_entries.remove(key);
-            }
-            if space_entries.is_empty() {
-                remove_space = true;
-            }
-        }
-        if remove_space {
-            self.entries.remove(&space);
+        let overlay = self.overlays.entry(space).or_default();
+        for key in keys {
+            overlay.puts.remove(key);
+            overlay.deletes.insert(key.clone());
         }
         self.stats.deleted_entries += keys.len() as u64;
         self.stats.backend_calls += 1;
@@ -240,11 +249,35 @@ impl BackendWrite for InMemoryWrite {
     }
 
     fn commit(self) -> Result<CommitResult, BackendError> {
+        let mut entries = self.base.as_ref().clone();
+        for (space, overlay) in self.overlays {
+            if overlay.puts.is_empty() && overlay.deletes.is_empty() {
+                continue;
+            }
+            let base = entries
+                .remove(&space)
+                .unwrap_or_else(|| Arc::new(SpaceState::Empty));
+            if matches!(base.as_ref(), SpaceState::Empty) {
+                if !overlay.puts.is_empty() {
+                    entries.insert(space, Arc::new(SpaceState::Flat(overlay.puts)));
+                }
+            } else {
+                entries.insert(
+                    space,
+                    Arc::new(SpaceState::Layered {
+                        base,
+                        puts: overlay.puts,
+                        deletes: overlay.deletes,
+                    }),
+                );
+            }
+        }
+
         *self
             .parent
             .lock()
             .map_err(|_| BackendError::Io("in-memory backend lock poisoned".to_string()))? =
-            Arc::new(self.entries);
+            Arc::new(entries);
         Ok(CommitResult {
             commit_id: None,
             stats: self.stats,
@@ -253,6 +286,28 @@ impl BackendWrite for InMemoryWrite {
 
     fn rollback(self) -> Result<(), BackendError> {
         Ok(())
+    }
+}
+
+impl SpaceState {
+    fn get(&self, key: &Key) -> Option<&Bytes> {
+        match self {
+            SpaceState::Empty => None,
+            SpaceState::Flat(entries) => entries.get(key),
+            SpaceState::Layered {
+                base,
+                puts,
+                deletes,
+            } => {
+                if let Some(value) = puts.get(key) {
+                    Some(value)
+                } else if deletes.contains(key) {
+                    None
+                } else {
+                    base.get(key)
+                }
+            }
+        }
     }
 }
 
@@ -280,12 +335,39 @@ where
         return Ok(ScanResult::default());
     }
 
+    if let SpaceState::Flat(entries) = space_entries.as_ref() {
+        return visit_flat_range(entries, lower, upper, opts, visitor);
+    }
+
+    let mut rows = BTreeMap::<&Key, Option<&Bytes>>::new();
+    collect_range(space_entries, &lower, &upper, &mut rows);
+
+    match opts.projection {
+        CoreProjection::KeyOnly => visit_rows(rows, opts.limit_rows, visitor, |_, _| {
+            ProjectedValueRef::KeyOnly
+        }),
+        CoreProjection::FullValue => visit_rows(rows, opts.limit_rows, visitor, |_, value| {
+            ProjectedValueRef::FullValue(value)
+        }),
+    }
+}
+
+fn visit_flat_range<V>(
+    entries: &SpaceEntries,
+    lower: Bound<&Key>,
+    upper: Bound<&Key>,
+    opts: ScanOptions<'_>,
+    visitor: &mut V,
+) -> Result<ScanResult, BackendError>
+where
+    V: ScanVisitor + ?Sized,
+{
     let mut emitted = 0;
     let mut has_more = false;
 
     match opts.projection {
         CoreProjection::KeyOnly => {
-            for (key, _) in space_entries.range((lower, upper)) {
+            for (key, _) in entries.range((lower, upper)) {
                 if emitted == opts.limit_rows {
                     has_more = true;
                     break;
@@ -295,7 +377,7 @@ where
             }
         }
         CoreProjection::FullValue => {
-            for (key, value) in space_entries.range((lower, upper)) {
+            for (key, value) in entries.range((lower, upper)) {
                 if emitted == opts.limit_rows {
                     has_more = true;
                     break;
@@ -306,6 +388,61 @@ where
         }
     }
 
+    Ok(ScanResult { emitted, has_more })
+}
+
+fn collect_range<'a>(
+    state: &'a SpaceState,
+    lower: &Bound<&'a Key>,
+    upper: &Bound<&'a Key>,
+    rows: &mut BTreeMap<&'a Key, Option<&'a Bytes>>,
+) {
+    match state {
+        SpaceState::Empty => {}
+        SpaceState::Flat(entries) => {
+            for (key, value) in entries.range((*lower, *upper)) {
+                rows.entry(key).or_insert(Some(value));
+            }
+        }
+        SpaceState::Layered {
+            base,
+            puts,
+            deletes,
+        } => {
+            for delete in deletes.range((*lower, *upper)) {
+                rows.insert(delete, None);
+            }
+            for (key, value) in puts.range((*lower, *upper)) {
+                rows.insert(key, Some(value));
+            }
+            collect_range(base, lower, upper, rows);
+        }
+    }
+}
+
+fn visit_rows<'a, V, F>(
+    rows: BTreeMap<&'a Key, Option<&'a Bytes>>,
+    limit_rows: usize,
+    visitor: &mut V,
+    project: F,
+) -> Result<ScanResult, BackendError>
+where
+    V: ScanVisitor + ?Sized,
+    F: Fn(&'a Key, &'a Bytes) -> ProjectedValueRef<'a>,
+{
+    let mut emitted = 0;
+    let mut has_more = false;
+    for (key, value) in rows {
+        let Some(value) = value else {
+            continue;
+        };
+        if emitted == limit_rows {
+            has_more = true;
+            break;
+        }
+        visitor.visit(key, project(key, value))?;
+        emitted += 1;
+    }
     Ok(ScanResult { emitted, has_more })
 }
 

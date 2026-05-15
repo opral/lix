@@ -3144,3 +3144,80 @@ but it is a larger semantic/layout change. The current COW-by-space layout is
 good enough to move on unless domain-shaped workloads prove touched-space small
 writes dominate.
 ```
+
+## 2026-05-15: in-memory per-space overlay writes
+
+Change:
+
+```text
+InMemoryBackend now supports committed overlay layers per space.
+
+Space state:
+  Empty
+  Flat(BTreeMap<Key, Bytes>)
+  Layered {
+    base: Arc<SpaceState>,
+    puts: BTreeMap<Key, Bytes>,
+    deletes: BTreeSet<Key>,
+  }
+
+Writes stage per-space overlays. commit publishes touched spaces as overlay
+layers instead of cloning the touched space BTreeMap. Point reads walk the layer
+chain. Range scans keep a direct fast path for Flat spaces and merge layered
+spaces into a sorted temporary view.
+```
+
+Expected shape:
+
+```text
+small write into untouched existing data:
+  O(number_of_spaces + K log K)
+
+small write into large touched space:
+  before: O(entries_in_touched_space + K log N)
+  after:  O(K log K) to publish overlay
+
+flat scan:
+  same direct BTreeMap::range fast path
+
+layered scan:
+  merge base/puts/deletes into sorted visible rows
+```
+
+Smoke command:
+
+```sh
+STORAGE_V2_BENCH_SMOKE=1 cargo bench -p lix_engine \
+  --features storage-benches --bench storage_v2 \
+  '^storage_v2/in_memory_backend/(commit_puts_k1024_g16_v32|commit_puts_k128_g16_existing10k_untouched_v32|commit_puts_k128_g16_existing10k_touched_v32|planned_visit_unique_m1000_u100|scan_range_q1000|scan_range_visit_key_only_q1000)$'
+```
+
+Post-overlay smoke scorecard:
+
+| Case                                             | Smoke median |
+| ------------------------------------------------ | -----------: |
+| commit puts k1024/g16 into empty backend         |    124.62 us |
+| commit puts k128/g16 with existing 10k untouched |     12.48 us |
+| commit puts k128/g16 with existing 10k touched   |     10.34 us |
+| planned visit unique m1000/u100                  |      7.35 us |
+| materialized key-only scan q1000                 |     16.42 us |
+| borrowed key-only scan q1000                     |      3.77 us |
+
+Interpretation:
+
+```text
+The overlay cut fixed the touched-space small-write case:
+  COW-by-space touched 10k: ~346.97 us
+  overlay touched 10k:      ~10.34 us
+
+The flat scan fast path kept read-side smoke in the same band. The remaining
+thing to watch is layered scan depth. If many commits stack overlays on the same
+space, point reads walk layers and layered scans perform a merge over each
+layer. A later compaction policy may be useful:
+
+  compact a space after N overlay layers
+  or compact when overlay rows / base rows crosses a threshold
+
+For now this is the right in-memory backend shape for small writes into large
+spaces without penalizing flat read snapshots.
+```
