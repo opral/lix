@@ -132,13 +132,16 @@ impl BackendRead for InMemoryRead {
         ))
     }
 
-    fn visit_range(
+    fn visit_range<V>(
         &self,
         space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        visitor: &mut dyn ScanVisitor,
-    ) -> Result<ScanResult, BackendError> {
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized,
+    {
         visit_range(&self.entries, space, range, opts, visitor)
     }
 }
@@ -212,13 +215,16 @@ impl BackendWrite for InMemoryWrite {
     }
 }
 
-fn visit_range(
+fn visit_range<V>(
     entries: &InMemoryMap,
     space: SpaceId,
     range: KeyRange,
     opts: ScanOptions<'_>,
-    visitor: &mut dyn ScanVisitor,
-) -> Result<ScanResult, BackendError> {
+    visitor: &mut V,
+) -> Result<ScanResult, BackendError>
+where
+    V: ScanVisitor + ?Sized,
+{
     if opts.limit_rows == 0 {
         return Ok(ScanResult::default());
     }
@@ -236,17 +242,27 @@ fn visit_range(
     let mut emitted = 0;
     let mut has_more = false;
 
-    for (key, value) in space_entries.range((lower, upper)) {
-        if emitted == opts.limit_rows {
-            has_more = true;
-            break;
+    match opts.projection {
+        CoreProjection::KeyOnly => {
+            for (key, _) in space_entries.range((lower, upper)) {
+                if emitted == opts.limit_rows {
+                    has_more = true;
+                    break;
+                }
+                visitor.visit(key, ProjectedValueRef::KeyOnly)?;
+                emitted += 1;
+            }
         }
-        let value = match opts.projection {
-            CoreProjection::KeyOnly => ProjectedValueRef::KeyOnly,
-            CoreProjection::FullValue => ProjectedValueRef::FullValue(value),
-        };
-        visitor.visit(key, value)?;
-        emitted += 1;
+        CoreProjection::FullValue => {
+            for (key, value) in space_entries.range((lower, upper)) {
+                if emitted == opts.limit_rows {
+                    has_more = true;
+                    break;
+                }
+                visitor.visit(key, ProjectedValueRef::FullValue(value))?;
+                emitted += 1;
+            }
+        }
     }
 
     Ok(ScanResult { emitted, has_more })

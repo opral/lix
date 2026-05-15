@@ -315,13 +315,15 @@ pub trait BackendRead {
         opts: GetOptions<'_>,
     ) -> Result<GetManyResult, BackendError>;
 
-    fn visit_range(
+    fn visit_range<V>(
         &self,
         space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        visitor: &mut dyn ScanVisitor,
-    ) -> Result<ScanResult, BackendError>;
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized;
 
     fn close(self) -> Result<(), BackendError>
     where
@@ -1663,13 +1665,15 @@ pub trait BackendRead {
         opts: GetOptions<'_>,
     ) -> Result<GetManyResult, BackendError>;
 
-    fn visit_range(
+    fn visit_range<V>(
         &self,
         space: SpaceId,
         range: KeyRange,
         opts: ScanOptions<'_>,
-        visitor: &mut dyn ScanVisitor,
-    ) -> Result<ScanResult, BackendError>;
+        visitor: &mut V,
+    ) -> Result<ScanResult, BackendError>
+    where
+        V: ScanVisitor + ?Sized;
 }
 
 pub trait BackendWrite {
