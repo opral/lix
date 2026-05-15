@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap};
 
 use crate::backend_v2::{BackendError, BackendRead, GetOptions, Key, ProjectedValue, SpaceId};
 use crate::storage_v2::{StorageReadResult, StorageReadStats};
@@ -63,30 +63,37 @@ pub(crate) fn get_many_values_caller_order_with_stats<R>(
 where
     R: BackendRead,
 {
-    let mut seen = HashSet::<&Key, FastHashBuilder>::with_capacity_and_hasher(
+    let mut unique_index_by_key = HashMap::<&Key, usize, FastHashBuilder>::with_capacity_and_hasher(
         keys.len(),
         FastHashBuilder::with_seeds(0, 0, 0, 0),
     );
     let mut backend_keys = Vec::with_capacity(keys.len());
+    let mut requested_to_unique = Vec::with_capacity(keys.len());
     for key in keys {
-        if seen.insert(key) {
-            backend_keys.push(key.clone());
+        let unique_index = backend_keys.len();
+        match unique_index_by_key.entry(key) {
+            Entry::Occupied(entry) => requested_to_unique.push(*entry.get()),
+            Entry::Vacant(entry) => {
+                entry.insert(unique_index);
+                backend_keys.push(key.clone());
+                requested_to_unique.push(unique_index);
+            }
         }
     }
 
     let result = read.get_many(space, &backend_keys, opts)?;
 
-    let mut found = HashMap::with_capacity_and_hasher(
-        result.entries.entries.len(),
-        FastHashBuilder::with_seeds(0, 0, 0, 0),
-    );
+    let mut unique_values = Vec::with_capacity(backend_keys.len());
+    unique_values.resize_with(backend_keys.len(), || None);
     for entry in result.entries.entries {
-        found.insert(entry.key, entry.value);
+        if let Some(&unique_index) = unique_index_by_key.get(&entry.key) {
+            unique_values[unique_index] = Some(entry.value);
+        }
     }
 
     let mut values = Vec::with_capacity(keys.len());
-    for key in keys {
-        values.push(found.get(key).cloned());
+    for unique_index in requested_to_unique {
+        values.push(unique_values[unique_index].clone());
     }
 
     Ok(StorageReadResult::new(
