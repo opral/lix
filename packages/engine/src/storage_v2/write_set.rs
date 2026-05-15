@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::backend_v2::{
@@ -10,9 +11,13 @@ use ahash::RandomState;
 
 type FastHashBuilder = RandomState;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct StorageWriteSet {
-    groups: BTreeMap<SpaceId, StorageWriteGroup>,
+    groups: Vec<StorageWriteGroup>,
+    group_index: HashMap<SpaceId, usize, FastHashBuilder>,
+    mutation_index: HashMap<(SpaceId, Key), StorageSpace, FastHashBuilder>,
+    duplicate_mutations: Vec<(StorageSpace, Key)>,
+    stats: StorageWriteSetStats,
 }
 
 #[derive(Clone, Debug)]
@@ -42,52 +47,90 @@ impl StorageWriteSet {
         Self::default()
     }
 
+    pub fn with_capacity(expected_mutations: usize, expected_spaces: usize) -> Self {
+        Self {
+            groups: Vec::with_capacity(expected_spaces),
+            group_index: HashMap::with_capacity_and_hasher(
+                expected_spaces,
+                FastHashBuilder::with_seeds(0, 0, 0, 0),
+            ),
+            mutation_index: HashMap::with_capacity_and_hasher(
+                expected_mutations,
+                FastHashBuilder::with_seeds(0, 0, 0, 0),
+            ),
+            duplicate_mutations: Vec::new(),
+            stats: StorageWriteSetStats::default(),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.groups
-            .values()
+            .iter()
             .all(|group| group.puts.is_empty() && group.deletes.is_empty())
     }
 
     pub fn stage_put(&mut self, space: StorageSpace, key: Key, value: StoredValue) {
-        self.group_mut(space).puts.push(PutEntry { key, value });
+        if let Err(error) = self.try_stage_put(space, key, value) {
+            self.record_stage_error(error);
+        }
     }
 
     pub fn stage_delete(&mut self, space: StorageSpace, key: Key) {
+        if let Err(error) = self.try_stage_delete(space, key) {
+            self.record_stage_error(error);
+        }
+    }
+
+    pub fn try_stage_put(
+        &mut self,
+        space: StorageSpace,
+        key: Key,
+        value: StoredValue,
+    ) -> Result<(), StorageWriteSetError> {
+        self.record_mutation(space, &key)?;
+        self.stats.staged_puts += 1;
+        self.stats.written_bytes += value.bytes.len() as u64;
+        self.group_mut(space).puts.push(PutEntry { key, value });
+        Ok(())
+    }
+
+    pub fn try_stage_delete(
+        &mut self,
+        space: StorageSpace,
+        key: Key,
+    ) -> Result<(), StorageWriteSetError> {
+        self.record_mutation(space, &key)?;
+        self.stats.staged_deletes += 1;
         self.group_mut(space).deletes.push(key);
+        Ok(())
     }
 
     pub fn extend(&mut self, other: StorageWriteSet) {
-        for group in other.groups.into_values() {
-            let target = self.group_mut(group.space);
-            target.puts.extend(group.puts);
-            target.deletes.extend(group.deletes);
+        self.duplicate_mutations.extend(other.duplicate_mutations);
+
+        for group in other.groups {
+            let space = group.space;
+            let conflicting_declarations = group.conflicting_declarations;
+            for put in group.puts {
+                self.stage_put(space, put.key, put.value);
+            }
+            for delete in group.deletes {
+                self.stage_delete(space, delete);
+            }
+
+            let target = self.group_mut(space);
             target
                 .conflicting_declarations
-                .extend(group.conflicting_declarations);
+                .extend(conflicting_declarations);
         }
     }
 
     pub fn stats(&self) -> StorageWriteSetStats {
-        let mut stats = StorageWriteSetStats {
-            touched_spaces: self.groups.len() as u64,
-            ..StorageWriteSetStats::default()
-        };
-
-        for group in self.groups.values() {
-            stats.staged_puts += group.puts.len() as u64;
-            stats.staged_deletes += group.deletes.len() as u64;
-            stats.written_bytes += group
-                .puts
-                .iter()
-                .map(|entry| entry.value.bytes.len() as u64)
-                .sum::<u64>();
-        }
-
-        stats
+        self.stats.clone()
     }
 
     pub fn validate(&self) -> Result<(), StorageWriteSetError> {
-        for group in self.groups.values() {
+        for group in &self.groups {
             if let Some(incoming) = group.conflicting_declarations.first() {
                 return Err(StorageWriteSetError::ConflictingSpaceDeclaration {
                     id: group.space.id,
@@ -97,32 +140,11 @@ impl StorageWriteSet {
             }
         }
 
-        let mut mutation_count = 0;
-        for group in self.groups.values() {
-            mutation_count += group.puts.len() + group.deletes.len();
-        }
-
-        let mut seen = HashSet::<(SpaceId, &Key), FastHashBuilder>::with_capacity_and_hasher(
-            mutation_count,
-            FastHashBuilder::with_seeds(0, 0, 0, 0),
-        );
-        for group in self.groups.values() {
-            for put in &group.puts {
-                if !seen.insert((group.space.id, &put.key)) {
-                    return Err(StorageWriteSetError::DuplicateMutation {
-                        space: group.space,
-                        key: put.key.clone(),
-                    });
-                }
-            }
-            for delete in &group.deletes {
-                if !seen.insert((group.space.id, delete)) {
-                    return Err(StorageWriteSetError::DuplicateMutation {
-                        space: group.space,
-                        key: delete.clone(),
-                    });
-                }
-            }
+        if let Some((space, key)) = self.duplicate_mutations.first() {
+            return Err(StorageWriteSetError::DuplicateMutation {
+                space: *space,
+                key: key.clone(),
+            });
         }
         Ok(())
     }
@@ -142,19 +164,12 @@ impl StorageWriteSet {
     where
         W: BackendWrite,
     {
-        let mut stats = StorageWriteSetStats {
-            touched_spaces: self.groups.len() as u64,
-            ..StorageWriteSetStats::default()
-        };
+        let StorageWriteSet {
+            groups, mut stats, ..
+        } = self;
 
-        for group in self.groups.into_values() {
+        for group in groups {
             if !group.puts.is_empty() {
-                stats.staged_puts += group.puts.len() as u64;
-                stats.written_bytes += group
-                    .puts
-                    .iter()
-                    .map(|entry| entry.value.bytes.len() as u64)
-                    .sum::<u64>();
                 stats.put_batches += 1;
                 stats.backend_calls += 1;
                 write
@@ -167,7 +182,6 @@ impl StorageWriteSet {
                     .map_err(StorageWriteSetError::Backend)?;
             }
             if !group.deletes.is_empty() {
-                stats.staged_deletes += group.deletes.len() as u64;
                 stats.delete_batches += 1;
                 stats.backend_calls += 1;
                 write
@@ -203,14 +217,64 @@ impl StorageWriteSet {
     }
 
     fn group_mut(&mut self, space: StorageSpace) -> &mut StorageWriteGroup {
-        let group = self
-            .groups
-            .entry(space.id)
-            .or_insert_with(|| StorageWriteGroup::new(space));
+        if let Some(index) = self.group_index.get(&space.id).copied() {
+            let group = &mut self.groups[index];
+            if group.space.name != space.name {
+                group.conflicting_declarations.push(space);
+            }
+            return group;
+        }
+
+        let index = self.groups.len();
+        self.group_index.insert(space.id, index);
+        self.stats.touched_spaces += 1;
+        self.groups.push(StorageWriteGroup::new(space));
+        let group = &mut self.groups[index];
         if group.space.name != space.name {
             group.conflicting_declarations.push(space);
         }
         group
+    }
+
+    fn record_mutation(
+        &mut self,
+        space: StorageSpace,
+        key: &Key,
+    ) -> Result<(), StorageWriteSetError> {
+        match self.mutation_index.entry((space.id, key.clone())) {
+            Entry::Occupied(_) => Err(StorageWriteSetError::DuplicateMutation {
+                space,
+                key: key.clone(),
+            }),
+            Entry::Vacant(entry) => {
+                entry.insert(space);
+                Ok(())
+            }
+        }
+    }
+
+    fn record_stage_error(&mut self, error: StorageWriteSetError) {
+        match error {
+            StorageWriteSetError::DuplicateMutation { space, key } => {
+                self.duplicate_mutations.push((space, key));
+            }
+            StorageWriteSetError::ConflictingSpaceDeclaration { .. }
+            | StorageWriteSetError::Backend(_) => {
+                unreachable!("infallible staging can only record duplicate mutation errors")
+            }
+        }
+    }
+}
+
+impl Default for StorageWriteSet {
+    fn default() -> Self {
+        Self {
+            groups: Vec::new(),
+            group_index: HashMap::with_hasher(FastHashBuilder::with_seeds(0, 0, 0, 0)),
+            mutation_index: HashMap::with_hasher(FastHashBuilder::with_seeds(0, 0, 0, 0)),
+            duplicate_mutations: Vec::new(),
+            stats: StorageWriteSetStats::default(),
+        }
     }
 }
 
@@ -338,6 +402,46 @@ mod tests {
                 key: duplicate_key
             }) if duplicate_space == space(1) && duplicate_key == key("a")
         ));
+    }
+
+    #[test]
+    fn try_stage_put_rejects_duplicate_immediately() {
+        let mut writes = StorageWriteSet::new();
+        writes
+            .try_stage_put(space(1), key("a"), value("A"))
+            .expect("first put");
+
+        assert!(matches!(
+            writes.try_stage_put(space(1), key("a"), value("B")),
+            Err(StorageWriteSetError::DuplicateMutation {
+                space: duplicate_space,
+                key: duplicate_key
+            }) if duplicate_space == space(1) && duplicate_key == key("a")
+        ));
+
+        let stats = writes.stats();
+        assert_eq!(stats.staged_puts, 1);
+        assert_eq!(stats.written_bytes, 1);
+    }
+
+    #[test]
+    fn try_stage_delete_rejects_duplicate_against_put_immediately() {
+        let mut writes = StorageWriteSet::new();
+        writes
+            .try_stage_put(space(1), key("a"), value("A"))
+            .expect("put");
+
+        assert!(matches!(
+            writes.try_stage_delete(space(1), key("a")),
+            Err(StorageWriteSetError::DuplicateMutation {
+                space: duplicate_space,
+                key: duplicate_key
+            }) if duplicate_space == space(1) && duplicate_key == key("a")
+        ));
+
+        let stats = writes.stats();
+        assert_eq!(stats.staged_puts, 1);
+        assert_eq!(stats.staged_deletes, 0);
     }
 
     #[test]
