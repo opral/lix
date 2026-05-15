@@ -1313,11 +1313,11 @@ cargo bench -p lix_engine --features storage-benches --bench storage_v2 point_re
 
 Focused scorecard:
 
-| Case                                      |      Mean |
-| ----------------------------------------- | --------: |
-| `indexed_adapter/m1000_u1000`             | 32.295 us |
-| `indexed_lean_backend/m10000_u100`        | 59.226 us |
-| `planned_lean_backend/m10000_u100`        |  3.101 us |
+| Case                               |      Mean |
+| ---------------------------------- | --------: |
+| `indexed_adapter/m1000_u1000`      | 32.295 us |
+| `indexed_lean_backend/m10000_u100` | 59.226 us |
+| `planned_lean_backend/m10000_u100` |  3.101 us |
 
 Interpretation:
 
@@ -1375,10 +1375,10 @@ cargo bench -p lix_engine --features storage-benches --bench storage_v2 point_re
 
 Focused scorecard:
 
-| Case                                | Before Mean | After Mean | Criterion Change |
-| ----------------------------------- | ----------: | ---------: | ---------------: |
-| `planned_lean/m10000_u100`          |   2.684 us  |  1.322 us  |   48.896% faster |
-| `planned_lean/m1000_u1000`          |  23.134 us  | 15.927 us  |   32.581% faster |
+| Case                       | Before Mean | After Mean | Criterion Change |
+| -------------------------- | ----------: | ---------: | ---------------: |
+| `planned_lean/m10000_u100` |    2.684 us |   1.322 us |   48.896% faster |
+| `planned_lean/m1000_u1000` |   23.134 us |  15.927 us |   32.581% faster |
 
 Complexity impact:
 
@@ -1438,8 +1438,8 @@ Focused scorecard:
 
 | Case                       | Previous Committed Mean | After Mean | Delta vs Committed |
 | -------------------------- | ----------------------: | ---------: | -----------------: |
-| `planned_lean/m10000_u100` |                1.322 us |  0.344 us  |     ~74.0% faster  |
-| `planned_lean/m1000_u1000` |               15.927 us |  4.065 us  |     ~74.5% faster  |
+| `planned_lean/m10000_u100` |                1.322 us |   0.344 us |      ~74.0% faster |
+| `planned_lean/m1000_u1000` |               15.927 us |   4.065 us |      ~74.5% faster |
 
 Complexity impact:
 
@@ -1453,4 +1453,61 @@ Requested-order slot result:
 This is now the v0 backend contract. Backends preserve duplicate requested keys
 and missing-key slots; storage_v2 handles dedupe/planning above that when it
 wants to reduce backend key count.
+```
+
+### 2026-05-14: Known-Unique Point Plans
+
+Change:
+
+```text
+Added PointRequestPlan::from_unique_keys(Vec<Key>).
+
+This constructor is for domain stores that already know the point batch is
+unique. It skips dedupe hashing and builds the identity requested_to_unique
+index directly.
+```
+
+Why:
+
+```text
+After slot-ordered backend get_many, one-shot point-read profiles showed the
+remaining storage-side cost was PointRequestPlan construction:
+
+  arbitrary keys: must inspect M keys and dedupe to U keys
+  already-unique keys: no semantic need to hash/dedupe
+
+The Big-O lower bound for arbitrary caller-order point reads is still O(M), but
+known-unique callers can use the tighter O(U) identity plan path with much lower
+constants.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 storage_v2/point_request_plan
+```
+
+Focused scorecard:
+
+| Case                               | Dedupe Plan | Known-Unique Plan |         Delta |
+| ---------------------------------- | ----------: | ----------------: | ------------: |
+| `point_request_plan/m100_u100`     |    2.037 us |          0.200 us | ~90.2% faster |
+| `point_request_plan/m1000_u1000`   |   18.519 us |          1.592 us | ~91.4% faster |
+| `point_request_plan/m10000_u10000` |  173.410 us |         16.866 us | ~90.3% faster |
+
+Complexity impact:
+
+```text
+PointRequestPlan::new(keys):
+  O(M + U), hashes requested keys to dedupe
+
+PointRequestPlan::from_unique_keys(unique_keys):
+  O(U), builds identity indexes without dedupe hashing
+
+This does not change arbitrary one-shot point-read complexity. It gives domain
+stores an explicit fast path when uniqueness is already guaranteed by their
+physical key construction.
 ```

@@ -156,6 +156,12 @@ const POINT_CASES: &[PointCase] = &[
         existing_unique_keys: 100,
     },
     PointCase {
+        name: "m10000_u10000",
+        requested_keys: 10_000,
+        unique_keys: 10_000,
+        existing_unique_keys: 10_000,
+    },
+    PointCase {
         name: "m1000_u100_missing10",
         requested_keys: 1_000,
         unique_keys: 100,
@@ -190,6 +196,7 @@ const PREFIX_CASES: &[PrefixCase] = &[
 
 fn storage_v2_benches(c: &mut Criterion) {
     bench_write_set_lowering(c);
+    bench_point_request_plan(c);
     bench_point_read_adapter(c);
     bench_point_read_indexed_adapter(c);
     bench_point_read_indexed_lean_backend(c);
@@ -197,6 +204,39 @@ fn storage_v2_benches(c: &mut Criterion) {
     bench_prefix_scan_adapter(c);
     bench_conformance_backend(c);
     bench_hash_algorithms(c);
+}
+
+fn bench_point_request_plan(c: &mut Criterion) {
+    let mut group = c.benchmark_group("storage_v2/point_request_plan");
+    group.sample_size(10);
+
+    for case in POINT_CASES {
+        if case.requested_keys != case.unique_keys {
+            continue;
+        }
+        let keys = point_request_keys(case.requested_keys, case.unique_keys);
+        group.throughput(Throughput::Elements(case.requested_keys as u64));
+        group.bench_with_input(BenchmarkId::new("dedupe", case.name), case, |b, _case| {
+            b.iter(|| {
+                black_box(PointRequestPlan::new(black_box(&keys)));
+            });
+        });
+        group.bench_with_input(
+            BenchmarkId::new("known_unique", case.name),
+            case,
+            |b, _case| {
+                b.iter_batched(
+                    || keys.clone(),
+                    |keys| {
+                        black_box(PointRequestPlan::from_unique_keys(black_box(keys)));
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
 }
 
 fn bench_hash_algorithms(c: &mut Criterion) {

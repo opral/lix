@@ -62,6 +62,18 @@ impl PointRequestPlan {
         }
     }
 
+    pub fn from_unique_keys(unique_keys: Vec<Key>) -> Self {
+        debug_assert!(
+            keys_are_unique(&unique_keys),
+            "PointRequestPlan::from_unique_keys requires unique keys"
+        );
+        let requested_to_unique = (0..unique_keys.len()).collect();
+        Self {
+            unique_keys,
+            requested_to_unique,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.requested_to_unique.len()
     }
@@ -69,6 +81,14 @@ impl PointRequestPlan {
     pub fn is_empty(&self) -> bool {
         self.requested_to_unique.is_empty()
     }
+}
+
+fn keys_are_unique(keys: &[Key]) -> bool {
+    let mut seen = HashMap::<&Key, (), FastHashBuilder>::with_capacity_and_hasher(
+        keys.len(),
+        FastHashBuilder::with_seeds(0, 0, 0, 0),
+    );
+    keys.iter().all(|key| seen.insert(key, ()).is_none())
 }
 
 impl BorrowedPointRequestPlan {

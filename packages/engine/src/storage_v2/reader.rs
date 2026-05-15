@@ -562,6 +562,15 @@ mod tests {
     }
 
     #[test]
+    fn point_request_plan_can_be_built_from_known_unique_keys() {
+        let plan = PointRequestPlan::from_unique_keys(vec![key("a"), key("b"), key("c")]);
+
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan.unique_keys, vec![key("a"), key("b"), key("c")]);
+        assert_eq!(plan.requested_to_unique, vec![0, 1, 2]);
+    }
+
+    #[test]
     fn planned_point_reads_use_backend_requested_order_slots() {
         let read = crate::storage_v2::StorageReadScope::new(RequestedOrderRead::default());
         let plan = PointRequestPlan::new(&[key("b"), key("missing"), key("a"), key("b")]);
