@@ -433,7 +433,8 @@ repeated key shape:
 
 already-unique owned key list:
   build PointRequestPlan::from_unique_keys(...)
-  cost: O(U), no dedupe hash map
+  cost: O(U) to own/drop the key vector, no dedupe hash map, and no
+  requested-to-unique index allocation because the identity mapping is implicit
 
 structured key family:
   use scan_range/scan_prefix instead of point reads

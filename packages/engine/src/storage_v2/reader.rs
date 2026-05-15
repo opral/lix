@@ -487,7 +487,7 @@ mod tests {
 
         assert_eq!(indexed.len(), 4);
         assert_eq!(indexed.unique_values.len(), 3);
-        assert_eq!(indexed.requested_to_unique, vec![0, 1, 2, 0]);
+        assert_eq!(indexed.requested_to_unique.to_vec(), vec![0, 1, 2, 0]);
         assert_eq!(
             indexed.value_at(0),
             Some(&ProjectedValue::FullValue(Bytes::from_static(b"B")))
@@ -524,7 +524,7 @@ mod tests {
 
         assert_eq!(plan.len(), 4);
         assert_eq!(plan.unique_keys, vec![key("b"), key("missing"), key("a")]);
-        assert_eq!(plan.requested_to_unique, vec![0, 1, 2, 0]);
+        assert_eq!(plan.requested_to_unique().to_vec(), vec![0, 1, 2, 0]);
 
         let result = read
             .get_many_indexed_values_for_plan_with_stats(space(1), &plan, GetOptions::default())
@@ -533,7 +533,7 @@ mod tests {
         assert_eq!(result.stats.requested_keys, 4);
         assert_eq!(result.stats.unique_backend_keys, 3);
         assert_eq!(result.stats.backend_calls, 1);
-        assert_eq!(result.value.requested_to_unique, vec![0, 1, 2, 0]);
+        assert_eq!(result.value.requested_to_unique.to_vec(), vec![0, 1, 2, 0]);
         assert_eq!(
             result.value.value_at(0),
             Some(&ProjectedValue::FullValue(Bytes::from_static(b"B")))
@@ -553,7 +553,10 @@ mod tests {
             .expect("borrowed planned indexed read");
 
         assert_eq!(borrowed.stats.requested_keys, 4);
-        assert_eq!(borrowed.value.requested_to_unique, plan.requested_to_unique);
+        assert_eq!(
+            borrowed.value.requested_to_unique,
+            plan.requested_to_unique()
+        );
         assert_eq!(
             borrowed.value.value_at(0),
             Some(&ProjectedValue::FullValue(Bytes::from_static(b"B")))
@@ -567,7 +570,7 @@ mod tests {
 
         assert_eq!(plan.len(), 3);
         assert_eq!(plan.unique_keys, vec![key("a"), key("b"), key("c")]);
-        assert_eq!(plan.requested_to_unique, vec![0, 1, 2]);
+        assert_eq!(plan.requested_to_unique().to_vec(), vec![0, 1, 2]);
     }
 
     #[test]
