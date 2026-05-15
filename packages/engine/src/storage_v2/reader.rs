@@ -4,10 +4,11 @@ use crate::backend_v2::{
 };
 use crate::storage_v2::{
     get_many_caller_order, get_many_caller_order_with_stats, get_many_indexed_values_caller_order,
-    get_many_indexed_values_caller_order_with_stats, get_many_values_caller_order,
+    get_many_indexed_values_caller_order_with_stats, get_many_indexed_values_for_plan,
+    get_many_indexed_values_for_plan_with_stats, get_many_values_caller_order,
     get_many_values_caller_order_with_stats, scan_prefix, scan_prefix_with_stats,
-    IndexedPointValues, PointSlot, StorageReadResult, StorageReadScope, StorageReadStats,
-    StorageSpace,
+    IndexedPointValues, PointRequestPlan, PointSlot, StorageReadResult, StorageReadScope,
+    StorageReadStats, StorageSpace,
 };
 
 pub trait StorageReader {
@@ -50,6 +51,20 @@ pub trait StorageReader {
         &self,
         space: StorageSpace,
         keys: &[Key],
+        opts: GetOptions<'_>,
+    ) -> Result<StorageReadResult<IndexedPointValues>, BackendError>;
+
+    fn get_many_indexed_values_for_plan(
+        &self,
+        space: StorageSpace,
+        plan: &PointRequestPlan,
+        opts: GetOptions<'_>,
+    ) -> Result<IndexedPointValues, BackendError>;
+
+    fn get_many_indexed_values_for_plan_with_stats(
+        &self,
+        space: StorageSpace,
+        plan: &PointRequestPlan,
         opts: GetOptions<'_>,
     ) -> Result<StorageReadResult<IndexedPointValues>, BackendError>;
 
@@ -140,6 +155,24 @@ where
         get_many_indexed_values_caller_order_with_stats(self.backend_read(), space.id, keys, opts)
     }
 
+    fn get_many_indexed_values_for_plan(
+        &self,
+        space: StorageSpace,
+        plan: &PointRequestPlan,
+        opts: GetOptions<'_>,
+    ) -> Result<IndexedPointValues, BackendError> {
+        get_many_indexed_values_for_plan(self.backend_read(), space.id, plan, opts)
+    }
+
+    fn get_many_indexed_values_for_plan_with_stats(
+        &self,
+        space: StorageSpace,
+        plan: &PointRequestPlan,
+        opts: GetOptions<'_>,
+    ) -> Result<StorageReadResult<IndexedPointValues>, BackendError> {
+        get_many_indexed_values_for_plan_with_stats(self.backend_read(), space.id, plan, opts)
+    }
+
     fn scan_range(
         &self,
         space: StorageSpace,
@@ -198,7 +231,7 @@ mod tests {
         Key, KeyRange, Prefix, ProjectedValue, ReadBatch, ReadEntry, ReadOptions, ScanOptions,
         ScanPage, SpaceId, StoredValue, WriteOptions,
     };
-    use crate::storage_v2::{StorageContext, StorageReader, StorageSpace};
+    use crate::storage_v2::{PointRequestPlan, StorageContext, StorageReader, StorageSpace};
 
     fn key(bytes: &'static str) -> Key {
         Key(Bytes::from_static(bytes.as_bytes()))
@@ -403,6 +436,43 @@ mod tests {
                 Some(ProjectedValue::FullValue(Bytes::from_static(b"A"))),
                 Some(ProjectedValue::FullValue(Bytes::from_static(b"B"))),
             ]
+        );
+    }
+
+    #[test]
+    fn point_request_plan_can_be_reused_for_indexed_reads() {
+        let storage = StorageContext::new(ConformanceBackend::new());
+        let mut writes = storage.new_write_set();
+        writes.stage_put(space(1), key("a"), value("A"));
+        writes.stage_put(space(1), key("b"), value("B"));
+        storage
+            .commit_write_set(writes, WriteOptions::default())
+            .expect("seed");
+        let read = storage
+            .begin_read(ReadOptions::default())
+            .expect("begin read");
+        let plan = PointRequestPlan::new(&[key("b"), key("missing"), key("a"), key("b")]);
+
+        assert_eq!(plan.len(), 4);
+        assert_eq!(plan.unique_keys, vec![key("b"), key("missing"), key("a")]);
+        assert_eq!(plan.requested_to_unique, vec![0, 1, 2, 0]);
+
+        let result = read
+            .get_many_indexed_values_for_plan_with_stats(space(1), &plan, GetOptions::default())
+            .expect("planned indexed read");
+
+        assert_eq!(result.stats.requested_keys, 4);
+        assert_eq!(result.stats.unique_backend_keys, 3);
+        assert_eq!(result.stats.backend_calls, 1);
+        assert_eq!(result.value.requested_to_unique, vec![0, 1, 2, 0]);
+        assert_eq!(
+            result.value.value_at(0),
+            Some(&ProjectedValue::FullValue(Bytes::from_static(b"B")))
+        );
+        assert_eq!(result.value.value_at(1), None);
+        assert_eq!(
+            result.value.value_at(2),
+            Some(&ProjectedValue::FullValue(Bytes::from_static(b"A")))
         );
     }
 

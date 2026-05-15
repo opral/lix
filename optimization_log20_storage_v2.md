@@ -1112,3 +1112,164 @@ same 50us band and varies run-to-run. That suggests the dominant remaining cost
 is storage_v2 dedupe/index construction over M requested keys, not fake backend
 request recording.
 ```
+
+### 2026-05-14: Reusable Point Request Plan
+
+Change:
+
+```text
+Added a reusable point request plan:
+
+  PointRequestPlan {
+    unique_keys: Vec<Key>,
+    requested_to_unique: Vec<usize>,
+  }
+
+The plan also stores an internal key -> unique-index map for mapping backend
+returned entries into unique value slots. Existing one-shot point helpers now
+build a plan and execute it, preserving the existing API.
+
+Added planned read helpers:
+
+  get_many_indexed_values_for_plan()
+  get_many_indexed_values_for_plan_with_stats()
+
+and a benchmark group:
+
+  storage_v2/point_read_planned_lean_backend
+```
+
+Why:
+
+```text
+IndexedPointValues removed duplicate value clones, but repeated reads still
+rebuilt the same M-key dedupe/index mapping every call. Domain stores often
+have stable point-read shapes inside loops or repeated query paths, so the
+dedupe/index work can be planned once and reused.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 point_read_planned_lean_backend
+```
+
+Planned lean point-read scorecard:
+
+| Case                   |       Mean |
+| ---------------------- | ---------: |
+| `m100_u100`            |  1.3645 us |
+| `m1000_u1000`          |  14.797 us |
+| `m1000_u100`           |  1.4481 us |
+| `m10000_u100`          |  2.6940 us |
+| `m1000_u100_missing10` |  1.7282 us |
+| `m1000_u100_missing90` | 426-646 ns |
+
+Shape comparison:
+
+```text
+m10000/u100 one-shot indexed lean:
+  about 50-60 us
+
+m10000/u100 planned indexed lean:
+  about 2.7-3.1 us
+
+The win comes from removing repeated O(M) dedupe/index construction from the
+measured read loop. The per-read path still performs one backend get_many over
+U unique keys and fills U unique value slots.
+```
+
+Complexity impact:
+
+```text
+One-shot indexed read:
+  O(M + U + F) per read
+
+Planned indexed read:
+  O(M + U) once to build PointRequestPlan
+  O(U + F) per read, plus copying/owning the requested_to_unique index vector
+  in the current result shape
+
+This keeps backend_v2 unchanged and makes repeated point-read shapes much
+cheaper in storage_v2.
+```
+
+### 2026-05-14: Full Scorecard After Point Request Plans
+
+Command:
+
+```sh
+cargo bench -p lix_engine --features storage-benches --bench storage_v2
+```
+
+Representative results:
+
+| Group / Case                         |      Mean |
+| ------------------------------------ | --------: |
+| `write_set/puts_k1024_g16_v32`       |  9.797 us |
+| `write_set/puts_k8192_g16_v32`       | 74.027 us |
+| `write_set/deletes_k1024_g16`        |  7.327 us |
+| `write_set/mixed80_20_k1024_g16_v32` |  9.464 us |
+| `point materialized m10000/u100`     | 102.00 us |
+| `point indexed m10000/u100`          | 51.751 us |
+| `point indexed lean m10000/u100`     | 51.692 us |
+| `point planned lean m10000/u100`     |  2.684 us |
+| `prefix/q1000`                       |  4.994 us |
+| `prefix/q10000`                      | 49.091 us |
+| `conformance commit k1024/g16`       | 68.936 us |
+| `conformance get_many m1000/u100`    | 29.271 us |
+| `conformance scan q1000`             | 15.122 us |
+
+Point-read comparison:
+
+```text
+m10000/u100 materialized:
+  102.00 us
+
+m10000/u100 indexed:
+  51.751 us
+
+m10000/u100 indexed lean:
+  51.692 us
+
+m10000/u100 planned lean:
+  2.684 us
+```
+
+Interpretation:
+
+```text
+PointRequestPlan is the largest optimization so far for repeated point-read
+shapes. For the duplicate-heavy m10000/u100 case, planned indexed reads are
+roughly 19x faster than one-shot indexed reads because they avoid rebuilding
+the M-key dedupe/index mapping on every read.
+
+The lean benchmark shows fake backend request recording is not the dominant
+cost for the duplicate-heavy one-shot case; storage_v2's dedupe/index
+construction over M requested keys is.
+```
+
+Tradeoff:
+
+```text
+The existing one-shot indexed/materialized helpers now build an owned
+PointRequestPlan internally. That preserves behavior and gives the reusable
+plan path, but it regresses small or unique-heavy one-shot reads compared with
+the earlier borrowed one-shot path.
+
+Example from this scorecard:
+
+  indexed m1000/u1000:
+    35.272 us
+
+  planned m1000/u1000:
+    23.134 us
+
+Next likely fix:
+
+  add an internal BorrowedPointRequestPlan<'a> for one-shot reads and keep the
+  owned PointRequestPlan for reusable reads.
+```

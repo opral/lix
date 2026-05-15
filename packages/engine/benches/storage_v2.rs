@@ -15,7 +15,9 @@ use lix_engine::backend_v2::{
     ProjectedValue, PutBatch, ReadBatch, ReadEntry, ReadOptions, ScanOptions, ScanPage, SpaceId,
     StoredValue, WriteConcurrency, WriteOptions, WriteStats,
 };
-use lix_engine::storage_v2::{StorageContext, StorageReadScope, StorageReader, StorageSpace};
+use lix_engine::storage_v2::{
+    PointRequestPlan, StorageContext, StorageReadScope, StorageReader, StorageSpace,
+};
 use rustc_hash::FxBuildHasher;
 use xxhash_rust::xxh3::Xxh3DefaultBuilder;
 
@@ -191,6 +193,7 @@ fn storage_v2_benches(c: &mut Criterion) {
     bench_point_read_adapter(c);
     bench_point_read_indexed_adapter(c);
     bench_point_read_indexed_lean_backend(c);
+    bench_point_read_planned_lean_backend(c);
     bench_prefix_scan_adapter(c);
     bench_conformance_backend(c);
     bench_hash_algorithms(c);
@@ -532,6 +535,47 @@ fn bench_point_read_indexed_lean_backend(c: &mut Criterion) {
                         GetOptions::default(),
                     )
                     .expect("indexed point read");
+                assert_eq!(result.stats.requested_keys, case.requested_keys as u64);
+                assert_eq!(result.stats.unique_backend_keys, case.unique_keys as u64);
+                assert_eq!(result.stats.backend_calls, 1);
+                assert_eq!(result.value.len(), case.requested_keys);
+                assert_eq!(result.value.unique_values.len(), case.unique_keys);
+                assert_eq!(
+                    result
+                        .value
+                        .unique_values
+                        .iter()
+                        .filter(|value| value.is_none())
+                        .count(),
+                    expected_unique_missing
+                );
+                black_box(result.value);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_point_read_planned_lean_backend(c: &mut Criterion) {
+    let mut group = c.benchmark_group("storage_v2/point_read_planned_lean_backend");
+    group.sample_size(10);
+
+    for case in POINT_CASES {
+        let keys = point_request_keys(case.requested_keys, case.unique_keys);
+        let plan = PointRequestPlan::new(&keys);
+        let expected_unique_missing = case.unique_keys - case.existing_unique_keys;
+        let read = StorageReadScope::new(LeanPointReadBackend::new(case.existing_unique_keys));
+        group.throughput(Throughput::Elements(case.requested_keys as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
+            b.iter(|| {
+                let result = read
+                    .get_many_indexed_values_for_plan_with_stats(
+                        space(1),
+                        black_box(&plan),
+                        GetOptions::default(),
+                    )
+                    .expect("planned indexed point read");
                 assert_eq!(result.stats.requested_keys, case.requested_keys as u64);
                 assert_eq!(result.stats.unique_backend_keys, case.unique_keys as u64);
                 assert_eq!(result.stats.backend_calls, 1);
