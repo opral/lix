@@ -3,6 +3,7 @@ pub(crate) enum BoundExpr {
     Column(BoundColumnRef),
     Param(BoundParamRef),
     Literal(BoundLiteral),
+    Function { name: String, args: Vec<BoundExpr> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -17,7 +18,8 @@ pub(crate) enum BoundLiteral {
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct BoundColumnRef {
-    pub(crate) table: Option<String>,
+    pub(crate) table: String,
+    pub(crate) column_id: usize,
     pub(crate) name: String,
 }
 

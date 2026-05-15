@@ -33,7 +33,9 @@ pub(crate) fn validate_supported_datafusion_statement_ast(
 pub(crate) fn classify_datafusion_statement(statement: &DataFusionStatement) -> SqlStatementKind {
     match statement {
         DataFusionStatement::Statement(statement) => classify_ast_statement(statement),
-        DataFusionStatement::Explain(_) => SqlStatementKind::Read,
+        DataFusionStatement::Explain(explain) => {
+            classify_datafusion_statement(explain.statement.as_ref())
+        }
         _ => SqlStatementKind::Other,
     }
 }

@@ -109,7 +109,6 @@ pub(crate) async fn create_write_logical_plan_from_parsed(
     ctx: &mut dyn SqlWriteExecutionContext,
     statement: DataFusionStatement,
 ) -> Result<SqlLogicalPlan, LixError> {
-    crate::sql2::udfs::validate_public_udf_calls_in_datafusion_statement(&statement)?;
     let visible_schemas = ctx.list_visible_schemas()?;
     let bound_statement =
         crate::sql2::bind_statement(&statement, &visible_schemas, ctx.active_version_id())?;

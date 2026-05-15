@@ -3,6 +3,8 @@ use datafusion::sql::sqlparser::ast::ObjectName;
 use crate::LixError;
 
 use super::super::catalog::{PublicCatalog, PublicSurfaceContract};
+use super::expr::BoundColumnRef;
+use super::write::BoundWriteOp;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BoundTable {
@@ -61,6 +63,42 @@ pub(crate) fn require_public_column<'a>(
         "column '{column_name}' does not exist on SQL table '{}'",
         table.name
     )))
+}
+
+pub(crate) fn require_writable_column(
+    table: &BoundTable,
+    column_name: &str,
+    op: BoundWriteOp,
+) -> Result<BoundColumnRef, LixError> {
+    let column = require_public_column(table, column_name)?;
+    let allowed = match op {
+        BoundWriteOp::Insert => column.is_insertable(),
+        BoundWriteOp::Update => column.is_updatable(),
+        BoundWriteOp::Delete => false,
+    };
+    if !allowed {
+        return Err(super::error::unsupported(format!(
+            "column '{column_name}' is not writable on SQL table '{}'",
+            table.name
+        )));
+    }
+    Ok(BoundColumnRef {
+        table: table.name.clone(),
+        column_id: column.id,
+        name: column.name.clone(),
+    })
+}
+
+pub(crate) fn bind_public_column_ref(
+    table: &BoundTable,
+    column_name: &str,
+) -> Result<BoundColumnRef, LixError> {
+    let column = require_public_column(table, column_name)?;
+    Ok(BoundColumnRef {
+        table: table.name.clone(),
+        column_id: column.id,
+        name: column.name.clone(),
+    })
 }
 
 #[cfg(test)]
