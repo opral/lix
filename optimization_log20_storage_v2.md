@@ -905,3 +905,63 @@ After:
 The Big-O remains O(M + U + F), but the hot duplicate-heavy path now avoids
 hashing the requested key again for every output slot.
 ```
+
+### 2026-05-14: Borrowed Write-Set Validation
+
+Change:
+
+```text
+StorageWriteSet::validate() now stores borrowed keys in its duplicate-check
+HashSet:
+
+  HashSet<(SpaceId, &Key)>
+
+instead of cloning every key into:
+
+  HashSet<(SpaceId, Key)>
+
+The duplicate-mutation error path still clones the offending key to report the
+same owned error value.
+```
+
+Why:
+
+```text
+After hash-based validation, the success path still cloned every staged key
+just to prove there were no duplicate final mutations. Validation does not need
+ownership; it only needs stable references for the duration of the pass.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 write_set_lowering
+```
+
+Write-set scorecard:
+
+| Case                       |       Mean | Criterion Change |
+| -------------------------- | ---------: | ---------------: |
+| `puts_k128_g1_v32`         |  1.1258 us |   36.387% faster |
+| `puts_k1024_g1_v32`        |  9.4771 us |   44.458% faster |
+| `puts_k1024_g16_v32`       |  9.6148 us |   49.473% faster |
+| `puts_k8192_g16_v32`       |  113.00 us |   22.387% faster |
+| `puts_k1024_g64_v32`       |  11.432 us |   32.664% faster |
+| `puts_k4096_g256_v32`      |  42.617 us |   36.093% faster |
+| `deletes_k1024_g16`        |  7.4618 us |   41.389% faster |
+| `mixed80_20_k1024_g16_v32` |  14.864 us | no significant change |
+| `puts_k1024_g16_v1024`     |  10.311 us |   30.596% faster |
+| `puts_k1024_g16_v65536`    |  10.289 us |   30.772% faster |
+
+Complexity impact:
+
+```text
+The asymptotic shape is unchanged:
+
+  validation: O(K) expected
+
+The success path no longer clones K keys during validation, so write-set
+lowering is closer to pure hashing plus grouped batch transfer.
+```
