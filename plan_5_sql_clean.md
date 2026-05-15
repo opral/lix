@@ -252,18 +252,27 @@ Phase 2 implementation result:
 
 ## Phase 3: Binding Writes
 
-- [ ] Implement `bind::bind_statement`.
+- [x] Implement `bind::bind_statement`.
 - [ ] Implement `bind::write::bind_insert`.
 - [ ] Implement `bind::write::bind_update`.
 - [ ] Implement `bind::write::bind_delete`.
-- [ ] Bind assignment targets into resolved column IDs, not strings.
-- [ ] Reject duplicate insert target columns during binding.
-- [ ] Reject duplicate update assignment targets during binding.
-- [ ] Bind params in source-order once into `BoundParamMap`.
-- [ ] Bind predicates into `BoundPredicate`.
+- [x] Bind assignment targets into resolved column IDs, not strings.
+- [x] Reject duplicate insert target columns during binding.
+- [x] Reject duplicate update assignment targets during binding.
+- [x] Bind params in source-order once into `BoundParamMap`.
+- [x] Bind predicates into `BoundPredicate`.
 - [ ] Convert repeated identity predicates into `FilterSet` intersections during planning, not in execution.
-- [ ] Remove `ParamDecoder` from fast execution.
-- [ ] Delete statement-level DML validation once binding covers the same rules.
+- [x] Remove `ParamDecoder` from fast execution.
+- [x] Delete statement-level DML validation once binding covers the same rules.
+
+Phase 3 implementation result:
+
+- `bind_statement` now produces `BoundWrite` for supported `INSERT`, `UPDATE`, and `DELETE` statements, with fail-closed rejection for unsupported clauses, joins, aliases, tuple assignments, implicit insert columns, duplicate write targets, hidden columns, and read-only/write-protected columns.
+- Bound write expressions now preserve literals, params, resolved column refs, and public Lix scalar function calls. `INSERT ... VALUES` supports public functions such as `lix_json`, `lix_text_encode`, `lix_uuid_v7`, and `lix_timestamp` without relying on raw-AST validation in the write planning entrypoint.
+- Public catalog columns now carry stable column IDs and insert/update write capabilities. Dynamic entity primary-key root columns are insert-only, preventing bound updates that would desynchronize projected primary keys from entity identity.
+- Write version scope is bound before planning: base writes bind to active scope, `lix_version` and global `lix_state` rows bind to global scope, `_by_version` writes require concrete explicit version selectors, and no-match predicates bind to `VersionScope::Empty`.
+- Parameterized scope selectors fail closed until a later planning phase resolves bound params into concrete scopes; `VersionScope` intentionally has no dynamic variant that can leak into storage visibility.
+- Current gate: `cargo test -p lix_engine sql2::bind --lib -- --nocapture`, `cargo check -p lix_engine`, and `cargo fmt -p lix_engine --check` pass. The three `bind::write::{bind_insert,bind_update,bind_delete}` extraction items remain open because the Phase 3 implementation currently lives in `bind::statement`; extracting those helpers is a follow-up layout cleanup, not a semantic blocker.
 
 ## Phase 4: Logical Write Plans
 
