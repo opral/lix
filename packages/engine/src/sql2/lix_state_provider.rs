@@ -229,33 +229,99 @@ impl TableProvider for LixStateProvider {
     async fn insert_into(
         &self,
         _state: &dyn Session,
-        _input: Arc<dyn ExecutionPlan>,
-        _insert_op: InsertOp,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        not_impl_err!("raw DataFusion INSERT is disabled; use the sql2 bound write pipeline")
+        if insert_op != InsertOp::Append {
+            return not_impl_err!("{insert_op} not implemented for lix_state yet");
+        }
+
+        let write_ctx = self.write_access.require_write("INSERT into lix_state")?;
+        let version_binding = self.version_binding.active_version_id().map(str::to_owned);
+
+        self.schema
+            .logically_equivalent_names_and_types(&input.schema())?;
+
+        let sink =
+            LixStateInsertSink::new(Arc::clone(&self.schema), write_ctx.clone(), version_binding);
+        Ok(Arc::new(InsertExec::new(input, Arc::new(sink))))
     }
 
     async fn delete_from(
         &self,
-        _state: &dyn Session,
-        _filters: Vec<Expr>,
+        state: &dyn Session,
+        filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        not_impl_err!("raw DataFusion DELETE is disabled; use the sql2 bound write pipeline")
+        let write_ctx = self.write_access.require_write("DELETE FROM lix_state")?;
+
+        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
+        let physical_filters = filters
+            .iter()
+            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
+            .collect::<Result<Vec<_>>>()?;
+
+        let route = LixStateByVersionRoute::from_filters(&filters);
+        require_explicit_lix_state_version_filter(&self.version_binding, &route, "DELETE")?;
+        let version_binding = self.version_binding.active_version_id().map(str::to_owned);
+        let request =
+            lix_state_scan_request(&self.schema, version_binding.as_deref(), None, &route, None);
+
+        Ok(Arc::new(LixStateDeleteExec::new(
+            write_ctx.clone(),
+            Arc::clone(&self.schema),
+            version_binding,
+            request,
+            physical_filters,
+        )))
     }
 
     async fn update(
         &self,
-        _state: &dyn Session,
-        _assignments: Vec<(String, Expr)>,
-        _filters: Vec<Expr>,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        not_impl_err!("raw DataFusion UPDATE is disabled; use the sql2 bound write pipeline")
+        let write_ctx = self.write_access.require_write("UPDATE lix_state")?;
+
+        validate_lix_state_update_assignments(&self.schema, &assignments)?;
+
+        let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
+        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
+        let physical_assignments = assignments
+            .iter()
+            .map(|(column_name, expr)| {
+                Ok((
+                    column_name.clone(),
+                    create_physical_expr(expr, &df_schema, state.execution_props())?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let physical_filters = filters
+            .iter()
+            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
+            .collect::<Result<Vec<_>>>()?;
+
+        let route = LixStateByVersionRoute::from_filters(&filters);
+        require_explicit_lix_state_version_filter(&self.version_binding, &route, "UPDATE")?;
+        let version_binding = self.version_binding.active_version_id().map(str::to_owned);
+        let request =
+            lix_state_scan_request(&self.schema, version_binding.as_deref(), None, &route, None);
+
+        Ok(Arc::new(LixStateUpdateExec::new(
+            write_ctx.clone(),
+            Arc::clone(&self.schema),
+            version_binding,
+            request,
+            physical_assignments,
+            physical_filters,
+        )))
     }
 }
 
 struct LixStateInsertSink {
     write_ctx: SqlWriteContext,
-    version_binding: String,
+    version_binding: Option<String>,
 }
 
 impl std::fmt::Debug for LixStateInsertSink {
@@ -265,7 +331,11 @@ impl std::fmt::Debug for LixStateInsertSink {
 }
 
 impl LixStateInsertSink {
-    fn new(_schema: SchemaRef, write_ctx: SqlWriteContext, version_binding: String) -> Self {
+    fn new(
+        _schema: SchemaRef,
+        write_ctx: SqlWriteContext,
+        version_binding: Option<String>,
+    ) -> Self {
         Self {
             write_ctx,
             version_binding,
@@ -295,7 +365,8 @@ impl InsertSink for LixStateInsertSink {
         for batch in batches {
             rows.extend(lix_state_write_rows_from_batch(
                 &batch,
-                &self.version_binding,
+                self.version_binding.as_deref(),
+                "INSERT into lix_state",
             )?);
         }
         reject_read_only_stage_rows(&rows, "INSERT into lix_state")?;
@@ -318,7 +389,7 @@ impl InsertSink for LixStateInsertSink {
 struct LixStateDeleteExec {
     write_ctx: SqlWriteContext,
     table_schema: SchemaRef,
-    version_binding: String,
+    version_binding: Option<String>,
     request: LiveStateScanRequest,
     filters: Vec<Arc<dyn PhysicalExpr>>,
     result_schema: SchemaRef,
@@ -335,7 +406,7 @@ impl LixStateDeleteExec {
     fn new(
         write_ctx: SqlWriteContext,
         table_schema: SchemaRef,
-        version_binding: String,
+        version_binding: Option<String>,
         request: LiveStateScanRequest,
         filters: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Self {
@@ -428,8 +499,10 @@ impl ExecutionPlan for LixStateDeleteExec {
             let source_batch = lix_state_record_batch(Arc::clone(&table_schema), &rows)
                 .map_err(lix_error_to_datafusion_error)?;
             let matched_batch = filter_lix_state_batch(source_batch, &filters)?;
-            let write_rows =
-                lix_state_deletable_write_rows_from_batch(&matched_batch, &version_binding)?;
+            let write_rows = lix_state_deletable_write_rows_from_batch(
+                &matched_batch,
+                version_binding.as_deref(),
+            )?;
             reject_read_only_stage_rows(&write_rows, "DELETE FROM lix_state")?;
             let count = u64::try_from(write_rows.len())
                 .map_err(|_| DataFusionError::Execution("DELETE row count overflow".to_string()))?;
@@ -460,7 +533,7 @@ impl ExecutionPlan for LixStateDeleteExec {
 struct LixStateUpdateExec {
     write_ctx: SqlWriteContext,
     table_schema: SchemaRef,
-    version_binding: String,
+    version_binding: Option<String>,
     request: LiveStateScanRequest,
     assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
     filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -478,7 +551,7 @@ impl LixStateUpdateExec {
     fn new(
         write_ctx: SqlWriteContext,
         table_schema: SchemaRef,
-        version_binding: String,
+        version_binding: Option<String>,
         request: LiveStateScanRequest,
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -582,7 +655,7 @@ impl ExecutionPlan for LixStateUpdateExec {
             let write_rows = lix_state_update_write_rows_from_batch(
                 &matched_batch,
                 &assignments,
-                &version_binding,
+                version_binding.as_deref(),
             )?;
             reject_read_only_stage_rows(&write_rows, "UPDATE lix_state")?;
             let count = u64::try_from(write_rows.len())
@@ -629,6 +702,22 @@ fn validate_lix_state_update_assignments(
     Ok(())
 }
 
+fn require_explicit_lix_state_version_filter(
+    version_binding: &VersionBinding,
+    route: &LixStateByVersionRoute,
+    action: &str,
+) -> Result<()> {
+    if matches!(version_binding, VersionBinding::Explicit)
+        && route.version_ids.as_ref().is_none_or(BTreeSet::is_empty)
+        && !route.contradictory
+    {
+        return Err(DataFusionError::Execution(format!(
+            "{action} lix_state_by_version requires version_id"
+        )));
+    }
+    Ok(())
+}
+
 fn filter_lix_state_batch(
     batch: RecordBatch,
     filters: &[Arc<dyn PhysicalExpr>],
@@ -671,9 +760,10 @@ fn evaluate_lix_state_filters(
 
 fn lix_state_stageable_write_rows_from_batch(
     batch: &RecordBatch,
-    version_binding: &str,
+    version_binding: Option<&str>,
+    action: &str,
 ) -> Result<Vec<TransactionWriteRow>> {
-    let mut rows = lix_state_write_rows_from_batch(batch, version_binding)?;
+    let mut rows = lix_state_write_rows_from_batch(batch, version_binding, action)?;
     for row in &mut rows {
         row.created_at = None;
         row.updated_at = None;
@@ -686,7 +776,7 @@ fn lix_state_stageable_write_rows_from_batch(
 fn lix_state_update_write_rows_from_batch(
     batch: &RecordBatch,
     assignments: &[(String, Arc<dyn PhysicalExpr>)],
-    version_binding: &str,
+    version_binding: Option<&str>,
 ) -> Result<Vec<TransactionWriteRow>> {
     let assignment_values = UpdateAssignmentValues::evaluate(batch, assignments)?;
     (0..batch.num_rows())
@@ -697,9 +787,14 @@ fn lix_state_update_write_rows_from_batch(
                     if global {
                         GLOBAL_VERSION_ID.to_string()
                     } else {
-                        version_binding.to_string()
+                        version_binding.unwrap_or_default().to_string()
                     }
                 });
+            if !global && version_id.is_empty() {
+                return Err(DataFusionError::Execution(
+                    "UPDATE lix_state_by_version requires version_id".to_string(),
+                ));
+            }
 
             Ok(TransactionWriteRow {
                 entity_id: Some(
@@ -744,9 +839,10 @@ fn lix_state_update_write_rows_from_batch(
 
 fn lix_state_deletable_write_rows_from_batch(
     batch: &RecordBatch,
-    version_binding: &str,
+    version_binding: Option<&str>,
 ) -> Result<Vec<TransactionWriteRow>> {
-    let mut rows = lix_state_stageable_write_rows_from_batch(batch, version_binding)?;
+    let mut rows =
+        lix_state_stageable_write_rows_from_batch(batch, version_binding, "DELETE FROM lix_state")?;
     for row in &mut rows {
         row.snapshot = None;
     }
@@ -818,7 +914,8 @@ fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
 
 fn lix_state_write_rows_from_batch(
     batch: &RecordBatch,
-    version_binding: &str,
+    version_binding: Option<&str>,
+    action: &str,
 ) -> Result<Vec<TransactionWriteRow>> {
     (0..batch.num_rows())
         .map(|row_index| {
@@ -828,9 +925,14 @@ fn lix_state_write_rows_from_batch(
                     if global {
                         GLOBAL_VERSION_ID.to_string()
                     } else {
-                        version_binding.to_string()
+                        version_binding.unwrap_or_default().to_string()
                     }
                 });
+            if !global && version_id.is_empty() {
+                return Err(DataFusionError::Execution(format!(
+                    "{action} requires version_id"
+                )));
+            }
 
             Ok(TransactionWriteRow {
                 entity_id: Some(
@@ -2180,8 +2282,12 @@ mod tests {
 
     #[test]
     fn decodes_lix_state_batch_into_write_rows() {
-        let rows = lix_state_write_rows_from_batch(&one_row_lix_state_batch(false), "version-a")
-            .expect("batch should decode");
+        let rows = lix_state_write_rows_from_batch(
+            &one_row_lix_state_batch(false),
+            Some("version-a"),
+            "INSERT into lix_state",
+        )
+        .expect("batch should decode");
 
         assert_eq!(
             rows,
@@ -2209,8 +2315,12 @@ mod tests {
 
     #[test]
     fn decodes_global_lix_state_batch_into_global_version() {
-        let rows = lix_state_write_rows_from_batch(&one_row_lix_state_batch(true), "version-a")
-            .expect("batch should decode");
+        let rows = lix_state_write_rows_from_batch(
+            &one_row_lix_state_batch(true),
+            Some("version-a"),
+            "INSERT into lix_state",
+        )
+        .expect("batch should decode");
 
         assert_eq!(rows[0].version_id, "global");
         assert!(rows[0].global);
@@ -2220,7 +2330,8 @@ mod tests {
     async fn insert_sink_stages_decoded_lix_state_rows() {
         let mut write_context = CapturingWriteContext::default();
         let write_ctx = SqlWriteContext::new(&mut write_context);
-        let sink = LixStateInsertSink::new(lix_state_schema(), write_ctx, "version-a".to_string());
+        let sink =
+            LixStateInsertSink::new(lix_state_schema(), write_ctx, Some("version-a".to_string()));
         let batch = one_row_lix_state_batch(false);
         let count = sink
             .write_batches(vec![batch], &Arc::new(TaskContext::default()))
