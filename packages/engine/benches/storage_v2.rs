@@ -24,6 +24,19 @@ use lix_engine::storage_v2::{
 use rustc_hash::FxBuildHasher;
 use xxhash_rust::xxh3::Xxh3DefaultBuilder;
 
+fn storage_benchmark_group<'a>(
+    c: &'a mut Criterion,
+    name: &'static str,
+) -> criterion::BenchmarkGroup<'a, criterion::measurement::WallTime> {
+    let mut group = c.benchmark_group(name);
+    group.sample_size(10);
+    if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_some() {
+        group.warm_up_time(Duration::from_millis(100));
+        group.measurement_time(Duration::from_millis(250));
+    }
+    group
+}
+
 #[derive(Clone, Copy)]
 struct WriteCase {
     name: &'static str,
@@ -212,8 +225,7 @@ fn storage_v2_benches(c: &mut Criterion) {
 }
 
 fn bench_point_request_plan(c: &mut Criterion) {
-    let mut group = c.benchmark_group("storage_v2/point_request_plan");
-    group.sample_size(10);
+    let mut group = storage_benchmark_group(c, "storage_v2/point_request_plan");
 
     for case in POINT_CASES {
         if case.requested_keys != case.unique_keys {
@@ -245,8 +257,7 @@ fn bench_point_request_plan(c: &mut Criterion) {
 }
 
 fn bench_hash_algorithms(c: &mut Criterion) {
-    let mut group = c.benchmark_group("storage_v2/hash_algorithms");
-    group.sample_size(10);
+    let mut group = storage_benchmark_group(c, "storage_v2/hash_algorithms");
 
     let point_keys = point_request_keys(10_000, 100);
     let unique_keys = point_request_keys(1_000, 1_000);
@@ -429,8 +440,7 @@ impl Hasher for Blake3StdHasher {
 }
 
 fn bench_write_set_lowering(c: &mut Criterion) {
-    let mut group = c.benchmark_group("storage_v2/write_set_lowering");
-    group.sample_size(10);
+    let mut group = storage_benchmark_group(c, "storage_v2/write_set_lowering");
 
     for case in WRITE_CASES {
         assert_eq!(
@@ -489,8 +499,7 @@ fn bench_write_set_lowering(c: &mut Criterion) {
 }
 
 fn bench_point_read_adapter(c: &mut Criterion) {
-    let mut group = c.benchmark_group("storage_v2/point_read_adapter");
-    group.sample_size(10);
+    let mut group = storage_benchmark_group(c, "storage_v2/point_read_adapter");
 
     for case in POINT_CASES {
         let keys = point_request_keys(case.requested_keys, case.unique_keys);
@@ -523,8 +532,7 @@ fn bench_point_read_adapter(c: &mut Criterion) {
 }
 
 fn bench_point_read_indexed_adapter(c: &mut Criterion) {
-    let mut group = c.benchmark_group("storage_v2/point_read_indexed_adapter");
-    group.sample_size(10);
+    let mut group = storage_benchmark_group(c, "storage_v2/point_read_indexed_adapter");
 
     for case in POINT_CASES {
         let keys = point_request_keys(case.requested_keys, case.unique_keys);
@@ -563,8 +571,7 @@ fn bench_point_read_indexed_adapter(c: &mut Criterion) {
 }
 
 fn bench_point_read_indexed_lean_backend(c: &mut Criterion) {
-    let mut group = c.benchmark_group("storage_v2/point_read_indexed_lean_backend");
-    group.sample_size(10);
+    let mut group = storage_benchmark_group(c, "storage_v2/point_read_indexed_lean_backend");
 
     for case in POINT_CASES {
         let keys = point_request_keys(case.requested_keys, case.unique_keys);
@@ -603,8 +610,7 @@ fn bench_point_read_indexed_lean_backend(c: &mut Criterion) {
 }
 
 fn bench_point_read_planned_lean_backend(c: &mut Criterion) {
-    let mut group = c.benchmark_group("storage_v2/point_read_planned_lean_backend");
-    group.sample_size(10);
+    let mut group = storage_benchmark_group(c, "storage_v2/point_read_planned_lean_backend");
 
     for case in POINT_CASES {
         let keys = point_request_keys(case.requested_keys, case.unique_keys);
@@ -676,8 +682,7 @@ fn bench_point_read_planned_lean_backend(c: &mut Criterion) {
 }
 
 fn bench_prefix_scan_adapter(c: &mut Criterion) {
-    let mut group = c.benchmark_group("storage_v2/prefix_scan_adapter");
-    group.sample_size(10);
+    let mut group = storage_benchmark_group(c, "storage_v2/prefix_scan_adapter");
 
     for case in PREFIX_CASES {
         let read = StorageReadScope::new(PrefixReadBackend::new(case.rows));
@@ -708,8 +713,7 @@ fn bench_prefix_scan_adapter(c: &mut Criterion) {
 }
 
 fn bench_conformance_backend(c: &mut Criterion) {
-    let mut group = c.benchmark_group("storage_v2/conformance_backend");
-    group.sample_size(10);
+    let mut group = storage_benchmark_group(c, "storage_v2/conformance_backend");
 
     group.throughput(Throughput::Elements(1_024));
     let commit_case = WriteCase {
@@ -804,8 +808,7 @@ fn bench_conformance_backend(c: &mut Criterion) {
 }
 
 fn bench_in_memory_backend(c: &mut Criterion) {
-    let mut group = c.benchmark_group("storage_v2/in_memory_backend");
-    group.sample_size(10);
+    let mut group = storage_benchmark_group(c, "storage_v2/in_memory_backend");
 
     group.throughput(Throughput::Elements(1_024));
     let commit_case = WriteCase {
@@ -839,6 +842,90 @@ fn bench_in_memory_backend(c: &mut Criterion) {
                     .commit_write_set(writes, WriteOptions::default())
                     .expect("commit write set");
                 assert_eq!(stats.staged_puts, 1_024);
+                assert_eq!(stats.put_batches, 16);
+                black_box(stats);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.throughput(Throughput::Elements(128));
+    let untouched_existing_commit_case = WriteCase {
+        name: "commit_puts_k128_g16_existing10k_untouched_v32",
+        writes: 128,
+        spaces: 16,
+        value_size: 32,
+        mix: WriteMix::PutsOnly,
+    };
+    let untouched_existing_commit_mutations = write_mutations(&untouched_existing_commit_case);
+    let untouched_existing_commit_backend =
+        seeded_in_memory_backend_with_value_size(999, 10_000, 32);
+    group.bench_function("commit_puts_k128_g16_existing10k_untouched_v32", |b| {
+        b.iter_batched(
+            || {
+                let backend = untouched_existing_commit_backend
+                    .fork_snapshot()
+                    .expect("fork untouched existing backend");
+                let storage = StorageContext::new(backend);
+                let mut writes = storage.new_write_set();
+                for mutation in &untouched_existing_commit_mutations {
+                    match mutation {
+                        WriteMutation::Put(space, key, value) => {
+                            writes.stage_put(*space, key.clone(), value.clone());
+                        }
+                        WriteMutation::Delete(space, key) => {
+                            writes.stage_delete(*space, key.clone());
+                        }
+                    }
+                }
+                (storage, writes)
+            },
+            |(storage, writes)| {
+                let (_commit, stats) = storage
+                    .commit_write_set(writes, WriteOptions::default())
+                    .expect("commit write set");
+                assert_eq!(stats.staged_puts, 128);
+                assert_eq!(stats.put_batches, 16);
+                black_box(stats);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    let touched_existing_commit_case = WriteCase {
+        name: "commit_puts_k128_g16_existing10k_touched_v32",
+        writes: 128,
+        spaces: 16,
+        value_size: 32,
+        mix: WriteMix::PutsOnly,
+    };
+    let touched_existing_commit_mutations = write_mutations(&touched_existing_commit_case);
+    let touched_existing_commit_backend = seeded_in_memory_backend_with_value_size(1, 10_000, 32);
+    group.bench_function("commit_puts_k128_g16_existing10k_touched_v32", |b| {
+        b.iter_batched(
+            || {
+                let backend = touched_existing_commit_backend
+                    .fork_snapshot()
+                    .expect("fork touched existing backend");
+                let storage = StorageContext::new(backend);
+                let mut writes = storage.new_write_set();
+                for mutation in &touched_existing_commit_mutations {
+                    match mutation {
+                        WriteMutation::Put(space, key, value) => {
+                            writes.stage_put(*space, key.clone(), value.clone());
+                        }
+                        WriteMutation::Delete(space, key) => {
+                            writes.stage_delete(*space, key.clone());
+                        }
+                    }
+                }
+                (storage, writes)
+            },
+            |(storage, writes)| {
+                let (_commit, stats) = storage
+                    .commit_write_set(writes, WriteOptions::default())
+                    .expect("commit write set");
+                assert_eq!(stats.staged_puts, 128);
                 assert_eq!(stats.put_batches, 16);
                 black_box(stats);
             },
@@ -988,10 +1075,11 @@ fn bench_in_memory_backend(c: &mut Criterion) {
 }
 
 fn bench_scan_visitor_baseline(c: &mut Criterion) {
-    let mut group = c.benchmark_group("storage_v2/scan_visitor_baseline");
-    group.sample_size(10);
-    group.warm_up_time(Duration::from_millis(500));
-    group.measurement_time(Duration::from_secs(1));
+    let mut group = storage_benchmark_group(c, "storage_v2/scan_visitor_baseline");
+    if std::env::var_os("STORAGE_V2_BENCH_SMOKE").is_none() {
+        group.warm_up_time(Duration::from_millis(500));
+        group.measurement_time(Duration::from_secs(1));
+    }
 
     for rows in [0usize, 1, 10, 100, 1_000, 10_000] {
         let backend = seeded_in_memory_backend_with_value_size(1, rows as u32, 32);
