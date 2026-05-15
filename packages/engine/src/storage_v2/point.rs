@@ -18,6 +18,12 @@ pub struct IndexedPointValues {
     pub requested_to_unique: Vec<usize>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct BorrowedIndexedPointValues<'a> {
+    pub unique_values: Vec<Option<ProjectedValue>>,
+    pub requested_to_unique: &'a [usize],
+}
+
 #[derive(Clone, Debug)]
 pub struct PointRequestPlan {
     pub unique_keys: Vec<Key>,
@@ -120,6 +126,28 @@ impl IndexedPointValues {
     }
 }
 
+impl<'a> BorrowedIndexedPointValues<'a> {
+    pub fn len(&self) -> usize {
+        self.requested_to_unique.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.requested_to_unique.is_empty()
+    }
+
+    pub fn value_at(&self, requested_index: usize) -> Option<&ProjectedValue> {
+        let unique_index = *self.requested_to_unique.get(requested_index)?;
+        self.unique_values.get(unique_index)?.as_ref()
+    }
+
+    pub fn into_owned(self) -> IndexedPointValues {
+        IndexedPointValues {
+            unique_values: self.unique_values,
+            requested_to_unique: self.requested_to_unique.to_vec(),
+        }
+    }
+}
+
 pub(crate) fn get_many_caller_order<R>(
     read: &R,
     space: SpaceId,
@@ -216,7 +244,11 @@ pub(crate) fn get_many_indexed_values_for_plan<R>(
 where
     R: BackendRead,
 {
-    Ok(get_many_indexed_values_for_plan_with_stats(read, space, plan, opts)?.value)
+    Ok(
+        get_many_borrowed_indexed_values_for_plan_with_stats(read, space, plan, opts)?
+            .value
+            .into_owned(),
+    )
 }
 
 fn get_many_indexed_values_for_borrowed_plan_with_stats<R>(
@@ -261,6 +293,34 @@ pub(crate) fn get_many_indexed_values_for_plan_with_stats<R>(
 where
     R: BackendRead,
 {
+    let result = get_many_borrowed_indexed_values_for_plan_with_stats(read, space, plan, opts)?;
+    Ok(StorageReadResult::new(
+        result.value.into_owned(),
+        result.stats,
+    ))
+}
+
+pub(crate) fn get_many_borrowed_indexed_values_for_plan<'a, R>(
+    read: &R,
+    space: SpaceId,
+    plan: &'a PointRequestPlan,
+    opts: GetOptions<'_>,
+) -> Result<BorrowedIndexedPointValues<'a>, BackendError>
+where
+    R: BackendRead,
+{
+    Ok(get_many_borrowed_indexed_values_for_plan_with_stats(read, space, plan, opts)?.value)
+}
+
+pub(crate) fn get_many_borrowed_indexed_values_for_plan_with_stats<'a, R>(
+    read: &R,
+    space: SpaceId,
+    plan: &'a PointRequestPlan,
+    opts: GetOptions<'_>,
+) -> Result<StorageReadResult<BorrowedIndexedPointValues<'a>>, BackendError>
+where
+    R: BackendRead,
+{
     let result = read.get_many(space, &plan.unique_keys, opts)?;
 
     let mut unique_values = Vec::with_capacity(plan.unique_keys.len());
@@ -272,9 +332,9 @@ where
     }
 
     Ok(StorageReadResult::new(
-        IndexedPointValues {
+        BorrowedIndexedPointValues {
             unique_values,
-            requested_to_unique: plan.requested_to_unique.clone(),
+            requested_to_unique: &plan.requested_to_unique,
         },
         StorageReadStats {
             requested_keys: plan.requested_to_unique.len() as u64,

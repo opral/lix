@@ -1334,3 +1334,63 @@ So the storage_v2 point-read API now has both:
   cheap one-shot borrowed planning
   reusable owned planning for repeated read shapes
 ```
+
+### 2026-05-14: Borrowed Planned Point Results
+
+Change:
+
+```text
+Added BorrowedIndexedPointValues<'a> for planned reads:
+
+  BorrowedIndexedPointValues<'a> {
+    unique_values: Vec<Option<ProjectedValue>>,
+    requested_to_unique: &'a [usize],
+  }
+
+The owned planned API still exists, but now converts from the borrowed result
+when ownership is needed. The planned benchmark uses the borrowed result shape.
+```
+
+Why:
+
+```text
+After PointRequestPlan moved dedupe/index construction out of repeated reads,
+the planned hot path still cloned the M-length requested_to_unique vector on
+every read:
+
+  requested_to_unique: plan.requested_to_unique.clone()
+
+Borrowing the index slice from the plan removes that per-read O(M) clone.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 point_read_planned_lean_backend/m10000_u100
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 point_read_planned_lean_backend/m1000_u1000
+```
+
+Focused scorecard:
+
+| Case                                | Before Mean | After Mean | Criterion Change |
+| ----------------------------------- | ----------: | ---------: | ---------------: |
+| `planned_lean/m10000_u100`          |   2.684 us  |  1.322 us  |   48.896% faster |
+| `planned_lean/m1000_u1000`          |  23.134 us  | 15.927 us  |   32.581% faster |
+
+Complexity impact:
+
+```text
+Before:
+  planned read: O(U + F) backend/result work plus O(M) clone of
+  requested_to_unique into the owned result
+
+After:
+  borrowed planned read: O(U + F) backend/result work, with requested indexes
+  borrowed from PointRequestPlan
+
+Owned planned reads still pay the O(M) clone by calling into_owned(), but hot
+repeated read loops can use the borrowed result directly.
+```

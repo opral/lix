@@ -570,7 +570,7 @@ fn bench_point_read_planned_lean_backend(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(case.name), case, |b, case| {
             b.iter(|| {
                 let result = read
-                    .get_many_indexed_values_for_plan_with_stats(
+                    .get_many_borrowed_indexed_values_for_plan_with_stats(
                         space(1),
                         black_box(&plan),
                         GetOptions::default(),
