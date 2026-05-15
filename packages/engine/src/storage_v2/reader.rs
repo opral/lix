@@ -1,9 +1,11 @@
 use crate::backend_v2::{
-    BackendError, BackendRead, GetOptions, Key, KeyRange, Prefix, ScanOptions, ScanPage,
+    BackendError, BackendRead, GetOptions, Key, KeyRange, Prefix, ProjectedValue, ScanOptions,
+    ScanPage,
 };
 use crate::storage_v2::{
-    get_many_caller_order, get_many_caller_order_with_stats, scan_prefix, scan_prefix_with_stats,
-    PointSlot, StorageReadResult, StorageReadScope, StorageReadStats, StorageSpace,
+    get_many_caller_order, get_many_caller_order_with_stats, get_many_values_caller_order,
+    get_many_values_caller_order_with_stats, scan_prefix, scan_prefix_with_stats, PointSlot,
+    StorageReadResult, StorageReadScope, StorageReadStats, StorageSpace,
 };
 
 pub trait StorageReader {
@@ -20,6 +22,20 @@ pub trait StorageReader {
         keys: &[Key],
         opts: GetOptions<'_>,
     ) -> Result<StorageReadResult<Vec<PointSlot>>, BackendError>;
+
+    fn get_many_values_caller_order(
+        &self,
+        space: StorageSpace,
+        keys: &[Key],
+        opts: GetOptions<'_>,
+    ) -> Result<Vec<Option<ProjectedValue>>, BackendError>;
+
+    fn get_many_values_caller_order_with_stats(
+        &self,
+        space: StorageSpace,
+        keys: &[Key],
+        opts: GetOptions<'_>,
+    ) -> Result<StorageReadResult<Vec<Option<ProjectedValue>>>, BackendError>;
 
     fn scan_range(
         &self,
@@ -70,6 +86,24 @@ where
         opts: GetOptions<'_>,
     ) -> Result<StorageReadResult<Vec<PointSlot>>, BackendError> {
         get_many_caller_order_with_stats(self.backend_read(), space.id, keys, opts)
+    }
+
+    fn get_many_values_caller_order(
+        &self,
+        space: StorageSpace,
+        keys: &[Key],
+        opts: GetOptions<'_>,
+    ) -> Result<Vec<Option<ProjectedValue>>, BackendError> {
+        get_many_values_caller_order(self.backend_read(), space.id, keys, opts)
+    }
+
+    fn get_many_values_caller_order_with_stats(
+        &self,
+        space: StorageSpace,
+        keys: &[Key],
+        opts: GetOptions<'_>,
+    ) -> Result<StorageReadResult<Vec<Option<ProjectedValue>>>, BackendError> {
+        get_many_values_caller_order_with_stats(self.backend_read(), space.id, keys, opts)
     }
 
     fn scan_range(
@@ -263,10 +297,42 @@ mod tests {
     }
 
     #[test]
+    fn point_reads_can_return_values_without_echoing_keys() {
+        let storage = StorageContext::new(ConformanceBackend::new());
+        let mut writes = storage.new_write_set();
+        writes.stage_put(space(1), key("a"), value("A"));
+        writes.stage_put(space(1), key("b"), value("B"));
+        storage
+            .commit_write_set(writes, WriteOptions::default())
+            .expect("seed");
+        let read = storage
+            .begin_read(ReadOptions::default())
+            .expect("begin read");
+
+        let values = read
+            .get_many_values_caller_order(
+                space(1),
+                &[key("b"), key("missing"), key("a"), key("b")],
+                GetOptions::default(),
+            )
+            .expect("caller order values");
+
+        assert_eq!(
+            values,
+            vec![
+                Some(ProjectedValue::FullValue(Bytes::from_static(b"B"))),
+                None,
+                Some(ProjectedValue::FullValue(Bytes::from_static(b"A"))),
+                Some(ProjectedValue::FullValue(Bytes::from_static(b"B"))),
+            ]
+        );
+    }
+
+    #[test]
     fn point_reads_report_shape_stats() {
         let read = crate::storage_v2::StorageReadScope::new(SpyRead::default());
         let result = read
-            .get_many_caller_order_with_stats(
+            .get_many_values_caller_order_with_stats(
                 space(1),
                 &[key("b"), key("a"), key("b"), key("missing")],
                 GetOptions::default(),

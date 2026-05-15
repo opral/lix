@@ -685,3 +685,94 @@ instead of:
 The caller already has the requested keys, so echoing a cloned Key per slot is
 not needed for most storage/domain-store paths.
 ```
+
+### 2026-05-14: Values-Only Point Reads
+
+Change:
+
+```text
+Added values-only caller-order point read helpers:
+
+  get_many_values_caller_order()
+  get_many_values_caller_order_with_stats()
+
+The existing PointSlot APIs remain for callers that need echoed keys, but they
+now build on top of the values-only helper.
+
+Point dedupe now uses HashSet<&Key> plus Vec<Key>, cloning each unique backend
+key once instead of cloning keys into both the dedupe set and backend request.
+```
+
+Why:
+
+```text
+After cleaning the benchmark harness, point-read profiles showed the hottest
+storage_v2 costs were:
+
+  PointSlot key cloning
+  ProjectedValue/Bytes cloning
+  HashSet/HashMap hashing
+
+Most domain-store callers already retain the requested keys, so returning
+PointSlot { key, value } on the hot path repeats information they already have.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 point_read_adapter
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 conformance_backend/get_many_m1000_u100
+```
+
+Point-read scorecard:
+
+| Case                   | Previous Mean |  New Mean | Criterion Change |
+| ---------------------- | ------------: | --------: | ---------------: |
+| `m100_u100`            |     6.6343 us | 5.1355 us |   22.575% faster |
+| `m1000_u1000`          |     64.619 us | 52.567 us |   18.646% faster |
+| `m1000_u100`           |     36.681 us | 28.876 us |   21.272% faster |
+| `m10000_u100`          |     335.95 us | 244.80 us |   26.890% faster |
+| `m1000_u100_missing10` |     34.583 us | 26.809 us |   22.479% faster |
+| `m1000_u100_missing90` |     27.616 us | 21.637 us |   21.654% faster |
+
+Conformance backend scorecard:
+
+| Case                  | Previous Mean |  New Mean | Criterion Change |
+| --------------------- | ------------: | --------: | ---------------: |
+| `get_many_m1000_u100` |     49.741 us | 39.572 us |   19.424% faster |
+
+Post-change profiles:
+
+```text
+Profiles:
+  target/storage_v2_profiles/values_point/point_m10000_u100.json
+  target/storage_v2_profiles/values_point/conformance_get_many.json
+
+Remaining signals:
+  point-read path:
+    HashMap insert/hash while building found map
+    hashing while deduping requested keys
+    ProjectedValue/Bytes clone/drop for duplicated result values
+
+  conformance get_many:
+    storage_v2 point reconstruction still dominates
+    ConformanceRead::get_many is visible and currently does a linear duplicate
+    check over returned entries
+```
+
+Optimization implications:
+
+```text
+The next point-read win is likely reducing hash work:
+
+  - use a faster non-cryptographic hasher for storage-local maps, or
+  - specialize small/mostly-unique point batches, or
+  - change backend get_many/result shape to avoid building a found HashMap
+    when a backend can return values aligned with requested unique keys.
+
+The next in-memory-backend win is separate: ConformanceBackend remains a
+correctness backend, not an optimized in-memory backend.
+```
