@@ -595,7 +595,7 @@ impl PreparedStateRowOverlay {
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        Ok(crate::live_state::visibility::resolve_scan_rows(
+        Ok(crate::live_state::resolve_scan_rows(
             self.scan_parts(request)?.rows,
             &request.filter.version_ids,
             request.filter.include_tombstones,

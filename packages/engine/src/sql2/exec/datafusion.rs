@@ -4,22 +4,23 @@ use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
 use datafusion::common::{ParamValues, ScalarValue};
 use datafusion::logical_expr::{Expr, LogicalPlan, WriteOp};
 use datafusion::prelude::SessionContext;
-use datafusion::sql::parser::{DFParserBuilder, Statement as DataFusionStatement};
-use datafusion::sql::sqlparser::dialect::GenericDialect;
-use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
+use datafusion::sql::parser::Statement as DataFusionStatement;
 use serde_json::{json, Value as JsonValue};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::schema::schema_key_from_definition;
+use crate::sql2::parse::parse_statement;
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
-use super::predicate_typecheck::validate_json_predicate_expr_with_dfschema;
-use super::result_metadata::{field_is_json, LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY};
-use super::session::{build_read_session, build_write_session};
-use super::write_normalization::{
+use crate::sql2::predicate_typecheck::validate_json_predicate_expr_with_dfschema;
+use crate::sql2::result_metadata::{
+    field_is_json, LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY,
+};
+use crate::sql2::session::{build_read_session, build_write_session};
+use crate::sql2::write_normalization::{
     is_binary_type, lix_file_data_type_lix_error, logical_expr_is_binary_or_null,
 };
-use super::{SqlExecutionContext, SqlStatementKind, SqlWriteExecutionContext};
+use crate::sql2::{SqlExecutionContext, SqlStatementKind, SqlWriteExecutionContext};
 
 #[allow(dead_code)]
 pub(crate) struct SqlLogicalPlan {
@@ -66,18 +67,22 @@ pub(crate) async fn create_logical_plan(
     create_logical_plan_from_parsed(ctx, sql, statement).await
 }
 
-pub(crate) fn parse_statement(sql: &str) -> Result<DataFusionStatement, LixError> {
-    parse_datafusion_statement(sql)
-}
-
 pub(crate) async fn create_logical_plan_from_parsed(
     ctx: &dyn SqlExecutionContext,
     sql: &str,
     statement: DataFusionStatement,
 ) -> Result<SqlLogicalPlan, LixError> {
     validate_public_read_sql_surface(sql)?;
-    super::validate_supported_datafusion_statement_ast(&statement)?;
-    super::udfs::validate_public_udf_calls_in_datafusion_statement(&statement)?;
+    if crate::sql2::classify_datafusion_statement(&statement)
+        == crate::sql2::SqlStatementKind::Write
+    {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "SQL writes must use the bound write planning path",
+        ));
+    }
+    crate::sql2::validate_supported_datafusion_statement_ast(&statement)?;
+    crate::sql2::udfs::validate_public_udf_calls_in_datafusion_statement(&statement)?;
     let session = build_read_session(ctx).await?;
     let plan = create_logical_plan_from_statement(&session, statement).await?;
     validate_supported_logical_plan(&plan)?;
@@ -107,26 +112,20 @@ pub(crate) async fn create_write_logical_plan_from_parsed(
     ctx: &mut dyn SqlWriteExecutionContext,
     statement: DataFusionStatement,
 ) -> Result<SqlLogicalPlan, LixError> {
-    super::udfs::validate_public_udf_calls_in_datafusion_statement(&statement)?;
+    crate::sql2::udfs::validate_public_udf_calls_in_datafusion_statement(&statement)?;
     let visible_schemas = ctx.list_visible_schemas()?;
-    super::public_bind::validate_public_dml_statement(&statement, &visible_schemas)?;
-    super::validate_supported_datafusion_statement_ast(&statement)?;
-    reject_read_only_history_view_dml_from_statement(&statement, &visible_schemas)?;
-    let session = build_write_session(ctx).await?;
-    let plan = create_logical_plan_from_statement(&session, statement).await?;
-    validate_supported_logical_plan(&plan)?;
-    super::public_bind::validate_public_dml_plan(&plan, &visible_schemas)?;
-    validate_json_predicates_in_logical_plan(&plan)?;
-    let strict_binary_params = validate_strict_lix_file_data_writes(&plan)?;
-    let kind = classify_logical_plan(&plan);
-
-    Ok(SqlLogicalPlan {
-        session,
-        plan,
-        kind,
-        notices: Vec::new(),
-        strict_binary_params,
-    })
+    let bound_statement =
+        crate::sql2::bind_statement(&statement, &visible_schemas, ctx.active_version_id())?;
+    let crate::sql2::BoundStatement::Write(_bound_write) = bound_statement else {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "expected SQL write statement after binding",
+        ));
+    };
+    Err(LixError::new(
+        LixError::CODE_UNSUPPORTED_SQL,
+        "sql2 bound write planning is not wired yet",
+    ))
 }
 
 pub(crate) async fn create_transaction_read_logical_plan_from_parsed(
@@ -135,8 +134,16 @@ pub(crate) async fn create_transaction_read_logical_plan_from_parsed(
     statement: DataFusionStatement,
 ) -> Result<SqlLogicalPlan, LixError> {
     validate_public_read_sql_surface(sql)?;
-    super::validate_supported_datafusion_statement_ast(&statement)?;
-    super::udfs::validate_public_udf_calls_in_datafusion_statement(&statement)?;
+    if crate::sql2::classify_datafusion_statement(&statement)
+        == crate::sql2::SqlStatementKind::Write
+    {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "SQL writes must use the bound write planning path",
+        ));
+    }
+    crate::sql2::validate_supported_datafusion_statement_ast(&statement)?;
+    crate::sql2::udfs::validate_public_udf_calls_in_datafusion_statement(&statement)?;
     let session = build_write_session(ctx).await?;
     let plan = create_logical_plan_from_statement(&session, statement).await?;
     validate_supported_logical_plan(&plan)?;
@@ -170,67 +177,6 @@ fn validate_public_read_sql_surface(sql: &str) -> Result<(), LixError> {
         ));
     }
     Ok(())
-}
-
-fn parse_datafusion_statement(sql: &str) -> Result<DataFusionStatement, LixError> {
-    let dialect = GenericDialect {};
-    let mut next_index = 1usize;
-    let mut has_anonymous = false;
-    let mut explicit_placeholders = Vec::new();
-
-    let mut tokens = Vec::new();
-    Tokenizer::new(&dialect, sql)
-        .tokenize_with_location_into_buf_with_mapper(&mut tokens, |mut token_span| {
-            if let Token::Placeholder(placeholder) = &token_span.token {
-                if placeholder == "?" {
-                    has_anonymous = true;
-                    token_span.token = Token::Placeholder(format!("${next_index}"));
-                    next_index += 1;
-                } else {
-                    explicit_placeholders.push(placeholder.clone());
-                }
-            }
-            token_span
-        })
-        .map_err(|error| {
-            LixError::new(
-                LixError::CODE_PARSE_ERROR,
-                format!("sql2 SQL tokenize error: {error}"),
-            )
-        })?;
-
-    if has_anonymous && !explicit_placeholders.is_empty() {
-        return Err(LixError::new(
-            LixError::CODE_PARSE_ERROR,
-            "SQL mixes anonymous and explicit parameter placeholders",
-        )
-        .with_hint("Use either anonymous placeholders like ?, ? or numbered placeholders like $1, $2, but not both.")
-        .with_details(json!({
-            "operation": "execute",
-            "explicit_placeholders": explicit_placeholders,
-        })));
-    }
-
-    let mut statements = DFParserBuilder::new(tokens)
-        .with_dialect(&dialect)
-        .build()
-        .map_err(datafusion_error_to_lix_error)?
-        .parse_statements()
-        .map_err(datafusion_error_to_lix_error)?;
-
-    if statements.len() > 1 {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "Lix SQL only supports one statement per execute() call",
-        ));
-    }
-
-    statements.pop_front().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_PARSE_ERROR,
-            "sql2 DataFusion error: No SQL statements were provided in the query string",
-        )
-    })
 }
 
 async fn create_logical_plan_from_statement(
@@ -397,7 +343,7 @@ pub(crate) async fn execute_logical_plan(
         .iter()
         .map(|field| field.as_ref().clone())
         .collect::<Vec<_>>();
-    let batches = super::runtime::collect_dataframe(dataframe)
+    let batches = crate::sql2::runtime::collect_dataframe(dataframe)
         .await
         .map_err(datafusion_error_to_lix_error)?;
     let mut result = query_result_from_batches(&result_fields, &batches)?;
@@ -488,7 +434,7 @@ fn reject_read_only_history_view_dml_from_statement(
     statement: &DataFusionStatement,
     visible_schemas: &[JsonValue],
 ) -> Result<(), LixError> {
-    let target_names = super::datafusion_statement_dml_target_table_names(statement);
+    let target_names = crate::sql2::datafusion_statement_dml_target_table_names(statement);
     for target_name in target_names {
         if is_history_view_name(&target_name, visible_schemas)? {
             return Err(read_only_history_view_error(&target_name));
@@ -600,7 +546,7 @@ fn json_field_metadata() -> FieldMetadata {
 }
 
 fn datafusion_error_to_lix_error(error: datafusion::error::DataFusionError) -> LixError {
-    super::error::datafusion_error_to_lix_error(error)
+    crate::sql2::error::datafusion_error_to_lix_error(error)
 }
 
 fn query_result_from_batches(
@@ -855,9 +801,12 @@ mod tests {
     use crate::untracked_state::UntrackedStateContext;
     use crate::version::VersionRefReader;
     use crate::{Engine, ExecuteResult, SessionContext};
-    use crate::{LixError, Value};
+    use crate::{LixError, NullableKeyFilter, Value};
 
     struct DummyBlobReader;
+    struct StaticBlobReader {
+        bytes: Vec<u8>,
+    }
     struct DummyLiveStateReader;
     struct RowsLiveStateReader {
         rows: Vec<MaterializedLiveStateRow>,
@@ -1113,13 +1062,22 @@ mod tests {
     impl VersionRefReader for DummyVersionRefReader {
         async fn load_head(
             &self,
-            _version_id: &str,
+            version_id: &str,
         ) -> Result<Option<crate::version::VersionHead>, LixError> {
-            Ok(None)
+            Ok(Some(crate::version::VersionHead {
+                version_id: version_id.to_string(),
+                commit_id: format!("commit-{version_id}"),
+            }))
         }
 
         async fn scan_heads(&self) -> Result<Vec<crate::version::VersionHead>, LixError> {
-            Ok(Vec::new())
+            Ok(["version-a", "version-b"]
+                .into_iter()
+                .map(|version_id| crate::version::VersionHead {
+                    version_id: version_id.to_string(),
+                    commit_id: format!("commit-{version_id}"),
+                })
+                .collect())
         }
     }
 
@@ -1196,9 +1154,41 @@ mod tests {
     impl LiveStateReader for RowsLiveStateReader {
         async fn scan_rows(
             &self,
-            _request: &LiveStateScanRequest,
+            request: &LiveStateScanRequest,
         ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            Ok(self.rows.clone())
+            if request.filter.no_match {
+                return Ok(Vec::new());
+            }
+            let mut rows = self
+                .rows
+                .iter()
+                .filter(|row| {
+                    (request.filter.schema_keys.is_empty()
+                        || request.filter.schema_keys.contains(&row.schema_key))
+                        && (request.filter.entity_ids.is_empty()
+                            || request.filter.entity_ids.contains(&row.entity_id))
+                        && (request.filter.version_ids.is_empty()
+                            || request.filter.version_ids.contains(&row.version_id))
+                        && request
+                            .filter
+                            .untracked
+                            .is_none_or(|untracked| row.untracked == untracked)
+                        && (request.filter.include_tombstones || !row.deleted)
+                        && (request.filter.file_ids.is_empty()
+                            || request.filter.file_ids.iter().any(|filter| match filter {
+                                NullableKeyFilter::Any => true,
+                                NullableKeyFilter::Null => row.file_id.is_none(),
+                                NullableKeyFilter::Value(file_id) => {
+                                    row.file_id.as_ref() == Some(file_id)
+                                }
+                            }))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if let Some(limit) = request.limit {
+                rows.truncate(limit);
+            }
+            Ok(rows)
         }
 
         async fn load_row(
@@ -1217,6 +1207,21 @@ mod tests {
         ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
             Ok(crate::binary_cas::BlobBytesBatch::new(vec![
                 None;
+                hashes.len()
+            ]))
+        }
+    }
+
+    #[async_trait]
+    impl BlobDataReader for StaticBlobReader {
+        async fn load_bytes_many(
+            &self,
+            hashes: &[crate::binary_cas::BlobHash],
+        ) -> Result<crate::binary_cas::BlobBytesBatch, LixError> {
+            Ok(crate::binary_cas::BlobBytesBatch::new(vec![
+                Some(
+                    self.bytes.clone()
+                );
                 hashes.len()
             ]))
         }
@@ -1327,6 +1332,35 @@ mod tests {
             version_id: version_id.to_string(),
             change_id: Some(format!("change-{entity_id}")),
             commit_id: Some(format!("commit-{entity_id}")),
+            global: false,
+            untracked: false,
+            created_at: "2026-04-23T00:00:00Z".to_string(),
+            updated_at: "2026-04-23T01:00:00Z".to_string(),
+        }
+    }
+
+    fn live_blob_ref_row(
+        entity_id: &str,
+        version_id: &str,
+        bytes: &[u8],
+    ) -> MaterializedLiveStateRow {
+        MaterializedLiveStateRow {
+            entity_id: crate::entity_identity::EntityIdentity::single(entity_id),
+            schema_key: "lix_binary_blob_ref".to_string(),
+            file_id: Some(entity_id.to_string()),
+            snapshot_content: Some(
+                json!({
+                    "id": entity_id,
+                    "blob_hash": crate::common::stable_content_fingerprint_hex(bytes),
+                    "size_bytes": bytes.len()
+                })
+                .to_string(),
+            ),
+            metadata: Some(json!({ "source": entity_id }).to_string()),
+            deleted: false,
+            version_id: version_id.to_string(),
+            change_id: Some(format!("change-{entity_id}-blob")),
+            commit_id: Some(format!("commit-{entity_id}-blob")),
             global: false,
             untracked: false,
             created_at: "2026-04-23T00:00:00Z".to_string(),
@@ -1513,6 +1547,7 @@ mod tests {
         Ok((session, head_commit_id))
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn lix_file_path_predicates_canonicalize_bound_values_like_writes() {
         let backend = crate::backend::testing::UnitTestBackend::new();
@@ -1620,6 +1655,7 @@ mod tests {
         assert_eq!(delete_result.rows_affected(), 1);
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn lix_file_path_predicates_reject_non_literal_path_values() {
         let backend = crate::backend::testing::UnitTestBackend::new();
@@ -1655,6 +1691,7 @@ mod tests {
         );
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn lix_directory_path_predicates_canonicalize_bound_values_like_writes() {
         let backend = crate::backend::testing::UnitTestBackend::new();
@@ -1711,6 +1748,7 @@ mod tests {
         assert!(rows_from_execute_result(not_in_result).1.is_empty());
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn lix_directory_path_predicates_reject_non_literal_path_values() {
         let backend = crate::backend::testing::UnitTestBackend::new();
@@ -1757,6 +1795,7 @@ mod tests {
         )
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_reads_lix_state_history_from_history_context() {
         let (session, head_commit_id) = setup_engine_history_fixture()
@@ -1796,6 +1835,7 @@ mod tests {
         assert_eq!(rows[0][4], Value::Text(head_commit_id.clone()));
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_reads_entity_history_view_from_history_context() {
         let (session, head_commit_id) = setup_engine_history_fixture()
@@ -1833,6 +1873,7 @@ mod tests {
         assert!(matches!(rows[0][4], Value::Integer(_)));
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_reads_directory_history_view_from_history_context() {
         let (session, head_commit_id) = setup_engine_history_fixture()
@@ -1895,6 +1936,7 @@ mod tests {
         );
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_reads_file_history_view_from_history_context() {
         let (session, head_commit_id) = setup_engine_history_fixture()
@@ -1958,6 +2000,7 @@ mod tests {
         );
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_rejects_writes_to_history_views_before_planning() {
         for sql in [
@@ -1988,6 +2031,7 @@ mod tests {
         }
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_insert_into_lix_state_values_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2034,6 +2078,7 @@ mod tests {
         assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"sql\"}"));
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_insert_into_lix_state_defaults_global_and_untracked_to_false() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2075,6 +2120,7 @@ mod tests {
         assert!(!rows[0].untracked);
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_insert_into_lix_state_select_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2125,6 +2171,7 @@ mod tests {
         assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"select\"}"));
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_insert_into_entity_by_version_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2174,6 +2221,7 @@ mod tests {
         );
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_insert_into_active_entity_defaults_active_version() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2222,6 +2270,7 @@ mod tests {
         );
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_insert_into_directory_by_version_stages_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2265,6 +2314,7 @@ mod tests {
         );
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_insert_into_active_directory_defaults_active_version() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2303,6 +2353,7 @@ mod tests {
         assert!(!rows[0].untracked);
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_update_directory_stages_rewritten_descriptor() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2353,6 +2404,7 @@ mod tests {
         );
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_update_directory_rejects_path_assignment() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2393,6 +2445,7 @@ mod tests {
             .is_empty());
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_delete_directory_by_version_stages_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2436,6 +2489,7 @@ mod tests {
         assert_eq!(rows[0].snapshot_content, None);
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_insert_into_file_by_version_stages_descriptor_write() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2482,6 +2536,7 @@ mod tests {
         assert_eq!(snapshot["hidden"], false);
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_insert_into_active_file_defaults_active_version() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2520,6 +2575,7 @@ mod tests {
         assert!(!rows[0].untracked);
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_insert_into_file_with_data_stages_blob_ref() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2569,6 +2625,7 @@ mod tests {
             .is_some_and(|value| !value.is_empty()));
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_update_file_stages_rewritten_descriptor() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2635,6 +2692,7 @@ mod tests {
         );
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_update_file_stages_data_blob_ref() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2688,6 +2746,7 @@ mod tests {
         assert_eq!(snapshot["size_bytes"], 2);
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_update_file_stages_path_assignment() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2737,6 +2796,7 @@ mod tests {
         assert_eq!(snapshot["name"], "renamed.md");
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_delete_file_by_version_stages_descriptor_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2794,6 +2854,7 @@ mod tests {
         assert_eq!(rows[0].snapshot_content, None);
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_update_entity_surface_stages_rewritten_snapshot() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2850,6 +2911,7 @@ mod tests {
         );
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_delete_entity_by_version_stages_tombstone() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2899,6 +2961,7 @@ mod tests {
         assert_eq!(rows[0].snapshot_content, None);
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_update_lix_state_stages_rewritten_rows() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -2950,6 +3013,7 @@ mod tests {
         );
     }
 
+    #[ignore = "Phase 1 disables raw DataFusion write execution; re-enable through bound write pipeline"]
     #[tokio::test]
     async fn execute_sql_delete_lix_state_without_where_stages_all_rows() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -3038,40 +3102,8 @@ mod tests {
         }
     }
 
-    async fn setup_sql2_state_fixture(
-    ) -> Result<(crate::backend::testing::UnitTestBackend, JsonValue), crate::LixError> {
-        let backend = crate::backend::testing::UnitTestBackend::new();
-        let init_receipt = Engine::initialize(Box::new(backend.clone())).await?;
-        let storage = crate::storage::StorageContext::new(std::sync::Arc::new(backend.clone()));
-        {
-            let mut transaction = storage.begin_write_transaction().await?;
-            let version_ctx = crate::version::VersionContext::new(Arc::new(
-                crate::untracked_state::UntrackedStateContext::new(),
-            ));
-            let mut writes = StorageWriteSet::new();
-            let canonical_rows = vec![
-                prepare_version_ref_row(
-                    "version-a",
-                    &init_receipt.initial_commit_id,
-                    "1970-01-01T00:00:00.000Z",
-                )?,
-                prepare_version_ref_row(
-                    "version-b",
-                    &init_receipt.initial_commit_id,
-                    "1970-01-01T00:00:00.000Z",
-                )?,
-            ];
-            let rows = canonical_rows
-                .into_iter()
-                .map(|prepared| prepared.row)
-                .collect::<Vec<_>>();
-            version_ctx.stage_canonical_ref_rows(&mut writes, &rows)?;
-            writes.apply(&mut transaction.as_mut()).await?;
-            transaction.commit().await?;
-        }
-        let engine = Engine::new(Box::new(backend.clone())).await?;
-        let session_a = engine.open_session("version-a").await?;
-        let session_b = engine.open_session("version-b").await?;
+    async fn setup_sql2_state_fixture() -> Result<DummySqlExecutionContext<'static>, crate::LixError>
+    {
         let schema_definition = json!({
             "x-lix-key": "test_state_schema",
             "type": "object",
@@ -3081,66 +3113,22 @@ mod tests {
             "required": ["value"],
             "additionalProperties": false
         });
-        session_a
-            .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                 VALUES (\
-                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
-                &[],
-            )
-            .await?;
-        session_b
-            .execute(
-                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
-                 VALUES (\
-                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}'),\
-                 false,\
-                 false\
-                 )",
-                &[],
-            )
-            .await?;
-        session_a
-            .execute(
-                "INSERT INTO lix_state (\
-	         entity_id, schema_key, file_id, snapshot_content, global, untracked\
-	         ) VALUES (\
-	         lix_json('[\"entity-a\"]'), 'test_state_schema', NULL, '{\"value\":\"A\"}', false, false\
-	         )",
-                &[],
-            )
-            .await?;
-        session_b
-            .execute(
-                "INSERT INTO lix_state (\
-	         entity_id, schema_key, file_id, snapshot_content, global, untracked\
-	         ) VALUES (\
-	         lix_json('[\"entity-b\"]'), 'test_state_schema', NULL, '{\"value\":\"B\"}', false, false\
-	         )",
-                &[],
-            )
-            .await?;
-        session_a
-		.execute(
-			"INSERT INTO lix_state (\
-	         entity_id, schema_key, file_id, snapshot_content, global, untracked\
-	         ) VALUES (\
-	         lix_json('[\"dir-docs\"]'), 'lix_directory_descriptor', NULL, '{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}', false, false\
-	         )",
-			&[],
-		)
-            .await?;
-        session_a
-            .execute(
-                "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-a', '/docs/readme.md', X'4142')",
-                &[],
-            )
-            .await?;
-        Ok((backend, schema_definition))
+        Ok(DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader: Arc::new(StaticBlobReader {
+                bytes: vec![0x41, 0x42],
+            }),
+            live_state: Arc::new(RowsLiveStateReader {
+                rows: vec![
+                    live_entity_row("entity-a", "version-a", "A"),
+                    live_entity_row("entity-b", "version-b", "B"),
+                    live_directory_row("dir-docs", "version-a", None, "docs", false),
+                    live_file_row("file-a", "version-a", Some("dir-docs"), "readme.md", false),
+                    live_blob_ref_row("file-a", "version-a", &[0x41, 0x42]),
+                ],
+            }),
+            schema_definitions: vec![schema_definition],
+        })
     }
 
     fn test_live_state_context() -> LiveStateContext {
@@ -3173,21 +3161,9 @@ mod tests {
     fn execute_sql_reads_lix_state_by_version() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
-                let (backend, schema_definition) = setup_sql2_state_fixture()
+                let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
-                let backend = Arc::new(backend);
-                let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
-                let storage = StorageContext::new(Arc::clone(&backend_ref));
-                let blob_reader: Arc<dyn BlobDataReader> =
-                    Arc::new(BackendBlobReader(storage.clone()));
-                let ctx = BackendSqlExecutionContext {
-                    active_version_id: "version-a",
-                    storage: storage.clone(),
-                    blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(test_live_state_context().reader(storage.clone())),
-                    schema_definitions: vec![schema_definition],
-                };
 
                 let result = execute_sql(
                     &ctx,
@@ -3219,21 +3195,9 @@ mod tests {
     fn execute_sql_supports_broad_lix_state_by_version_reads() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
-                let (backend, schema_definition) = setup_sql2_state_fixture()
+                let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
-                let backend = Arc::new(backend);
-                let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
-                let storage = StorageContext::new(Arc::clone(&backend_ref));
-                let blob_reader: Arc<dyn BlobDataReader> =
-                    Arc::new(BackendBlobReader(storage.clone()));
-                let ctx = BackendSqlExecutionContext {
-                    active_version_id: "version-a",
-                    storage: storage.clone(),
-                    blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(test_live_state_context().reader(storage.clone())),
-                    schema_definitions: vec![schema_definition],
-                };
 
                 let result = execute_sql(
                     &ctx,
@@ -3257,21 +3221,9 @@ mod tests {
     fn execute_sql_reads_lix_state_from_active_version() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
-                let (backend, schema_definition) = setup_sql2_state_fixture()
+                let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
-                let backend = Arc::new(backend);
-                let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
-                let storage = StorageContext::new(Arc::clone(&backend_ref));
-                let blob_reader: Arc<dyn BlobDataReader> =
-                    Arc::new(BackendBlobReader(storage.clone()));
-                let ctx = BackendSqlExecutionContext {
-                    active_version_id: "version-a",
-                    storage: storage.clone(),
-                    blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(test_live_state_context().reader(storage.clone())),
-                    schema_definitions: vec![schema_definition],
-                };
 
                 let result = execute_sql(
                     &ctx,
@@ -3295,21 +3247,9 @@ mod tests {
     fn execute_sql_reads_entity_view_from_active_version() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
-                let (backend, schema_definition) = setup_sql2_state_fixture()
+                let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
-                let backend = Arc::new(backend);
-                let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
-                let storage = StorageContext::new(Arc::clone(&backend_ref));
-                let blob_reader: Arc<dyn BlobDataReader> =
-                    Arc::new(BackendBlobReader(storage.clone()));
-                let ctx = BackendSqlExecutionContext {
-                    active_version_id: "version-a",
-                    storage: storage.clone(),
-                    blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(test_live_state_context().reader(storage.clone())),
-                    schema_definitions: vec![schema_definition],
-                };
 
                 let result = execute_sql(
                     &ctx,
@@ -3332,21 +3272,9 @@ mod tests {
     fn execute_sql_reads_entity_by_version_view() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
-                let (backend, schema_definition) = setup_sql2_state_fixture()
+                let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
-                let backend = Arc::new(backend);
-                let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
-                let storage = StorageContext::new(Arc::clone(&backend_ref));
-                let blob_reader: Arc<dyn BlobDataReader> =
-                    Arc::new(BackendBlobReader(storage.clone()));
-                let ctx = BackendSqlExecutionContext {
-                    active_version_id: "version-a",
-                    storage: storage.clone(),
-                    blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(test_live_state_context().reader(storage.clone())),
-                    schema_definitions: vec![schema_definition],
-                };
 
                 let result = execute_sql(
                     &ctx,
@@ -3370,21 +3298,9 @@ mod tests {
     fn execute_sql_reads_lix_directory_by_version_view() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
-                let (backend, schema_definition) = setup_sql2_state_fixture()
+                let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
-                let backend = Arc::new(backend);
-                let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
-                let storage = StorageContext::new(Arc::clone(&backend_ref));
-                let blob_reader: Arc<dyn BlobDataReader> =
-                    Arc::new(BackendBlobReader(storage.clone()));
-                let ctx = BackendSqlExecutionContext {
-                    active_version_id: "version-a",
-                    storage: storage.clone(),
-                    blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(test_live_state_context().reader(storage.clone())),
-                    schema_definitions: vec![schema_definition],
-                };
 
                 let result = execute_sql(
                     &ctx,
@@ -3409,21 +3325,9 @@ mod tests {
     fn execute_sql_reads_lix_directory_from_active_version() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
-                let (backend, schema_definition) = setup_sql2_state_fixture()
+                let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
-                let backend = Arc::new(backend);
-                let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
-                let storage = StorageContext::new(Arc::clone(&backend_ref));
-                let blob_reader: Arc<dyn BlobDataReader> =
-                    Arc::new(BackendBlobReader(storage.clone()));
-                let ctx = BackendSqlExecutionContext {
-                    active_version_id: "version-a",
-                    storage: storage.clone(),
-                    blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(test_live_state_context().reader(storage.clone())),
-                    schema_definitions: vec![schema_definition],
-                };
 
                 let result = execute_sql(
                     &ctx,
@@ -3447,21 +3351,9 @@ mod tests {
     fn execute_sql_reads_lix_file_by_version_view() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
-                let (backend, schema_definition) = setup_sql2_state_fixture()
+                let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
-                let backend = Arc::new(backend);
-                let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
-                let storage = StorageContext::new(Arc::clone(&backend_ref));
-                let blob_reader: Arc<dyn BlobDataReader> =
-                    Arc::new(BackendBlobReader(storage.clone()));
-                let ctx = BackendSqlExecutionContext {
-                    active_version_id: "version-a",
-                    storage: storage.clone(),
-                    blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(test_live_state_context().reader(storage.clone())),
-                    schema_definitions: vec![schema_definition],
-                };
 
                 let result = execute_sql(
                     &ctx,
@@ -3493,21 +3385,9 @@ mod tests {
     fn execute_sql_reads_lix_file_from_active_version() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
-                let (backend, schema_definition) = setup_sql2_state_fixture()
+                let ctx = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
-                let backend = Arc::new(backend);
-                let backend_ref: Arc<dyn crate::Backend + Send + Sync> = backend;
-                let storage = StorageContext::new(Arc::clone(&backend_ref));
-                let blob_reader: Arc<dyn BlobDataReader> =
-                    Arc::new(BackendBlobReader(storage.clone()));
-                let ctx = BackendSqlExecutionContext {
-                    active_version_id: "version-a",
-                    storage: storage.clone(),
-                    blob_reader: Arc::clone(&blob_reader),
-                    live_state: Arc::new(test_live_state_context().reader(storage.clone())),
-                    schema_definitions: vec![schema_definition],
-                };
 
                 let result = execute_sql(
                     &ctx,

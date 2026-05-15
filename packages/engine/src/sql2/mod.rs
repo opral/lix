@@ -1,3 +1,5 @@
+mod bind;
+mod catalog;
 mod change_provider;
 mod classify;
 mod context;
@@ -7,7 +9,7 @@ mod dml;
 mod entity_history_provider;
 mod entity_provider;
 mod error;
-mod execute;
+mod exec;
 mod file_history_provider;
 mod file_provider;
 mod filesystem_planner;
@@ -17,19 +19,24 @@ mod history_projection;
 mod history_provider;
 mod history_route;
 mod lix_state_provider;
+mod optimize;
+mod parse;
+mod plan;
 mod predicate_typecheck;
-mod public_bind;
+mod providers;
 mod read_only;
 mod record_batch;
 mod result_metadata;
 mod runtime;
 mod session;
-mod simple_dml;
+pub(crate) mod storage;
+mod test_support;
 mod udfs;
 mod version_provider;
 mod version_scope;
 mod write_normalization;
 
+pub(crate) use bind::{bind_statement, BoundStatement};
 pub(crate) use classify::{
     classify_datafusion_statement, datafusion_statement_dml_target_table_names,
     validate_supported_datafusion_statement_ast, SqlStatementKind,
@@ -40,10 +47,10 @@ pub(crate) use context::{
     WriteContextVersionRefReader,
 };
 #[allow(unused_imports)]
-pub(crate) use execute::{
+pub(crate) use exec::{
     create_logical_plan, create_logical_plan_from_parsed,
     create_transaction_read_logical_plan_from_parsed, create_write_logical_plan,
-    create_write_logical_plan_from_parsed, execute_logical_plan, execute_sql, parse_statement,
-    SqlLogicalPlan,
+    create_write_logical_plan_from_parsed, execute_logical_plan, execute_sql, SqlLogicalPlan,
 };
-pub(crate) use simple_dml::try_execute_simple_write;
+pub(crate) use parse::parse_statement;
+pub(crate) use plan::{LogicalReadPlan, LogicalWritePlan};

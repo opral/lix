@@ -93,9 +93,9 @@ packages/engine/src/sql2/
 
 ## Phase 1: Hard Type/API Cut
 
-- [ ] Create the new directories and `mod.rs` files.
-- [ ] Move `udfs/` as-is under the new layout if needed, or keep existing `udfs/` and re-export from the new root until the rest compiles.
-- [ ] Replace `sql2/mod.rs` exports with the desired public API surface:
+- [x] Create the new directories and `mod.rs` files.
+- [x] Move `udfs/` as-is under the new layout if needed, or keep existing `udfs/` and re-export from the new root until the rest compiles.
+- [x] Replace `sql2/mod.rs` exports with the desired public API surface:
 
 ```rust
 pub(crate) use parse::parse_statement;
@@ -109,12 +109,11 @@ pub(crate) use exec::{
     create_write_logical_plan_from_parsed,
     execute_logical_plan,
     execute_sql,
-    try_execute_simple_write,
     SqlLogicalPlan,
 };
 ```
 
-- [ ] Define the canonical bound types before adapting any old code:
+- [x] Define the canonical bound types before adapting any old code:
 
 ```rust
 pub(crate) enum BoundStatement {
@@ -141,10 +140,7 @@ pub(crate) enum BoundWriteTarget {
 }
 
 pub(crate) enum EntityWriteSurface {
-    Base {
-        schema_key: String,
-        active_version_id: String,
-    },
+    Base { schema_key: String },
     ByVersion {
         schema_key: String,
     },
@@ -163,7 +159,7 @@ pub(crate) enum BoundWriteInput {
 }
 ```
 
-- [ ] Define canonical filter/predicate/version types:
+- [x] Define canonical filter/predicate/version types:
 
 ```rust
 pub(crate) enum FilterSet<T> {
@@ -192,7 +188,7 @@ pub(crate) enum BoundPredicate {
 }
 ```
 
-- [ ] Define `FastWritePlan` as an optimization output, not a semantic input:
+- [x] Define `FastWritePlan` as an optimization output, not a semantic input:
 
 ```rust
 pub(crate) enum FastWritePlan {
@@ -206,8 +202,21 @@ pub(crate) fn try_make_fast_write_plan(
 ) -> Result<Option<FastWritePlan>, LixError>;
 ```
 
-- [ ] Intentionally break existing imports by removing direct `pub(crate) use simple_dml::try_execute_simple_write`.
-- [ ] Run `cargo check -p lix_engine` and save the first compiler-error class as the next task list.
+- [x] Intentionally break existing imports by removing direct `pub(crate) use simple_dml::try_execute_simple_write`.
+- [x] Run `cargo check -p lix_engine` and save the first compiler-error class as the next task list.
+
+Phase 1 compiler result:
+
+- First compiler-error class: canonical bound types incorrectly derived `Eq` for fields containing `Value`, and the new parser used a non-existent error-code constant.
+- Resolution: removed `Eq` derives from value-bearing bound types and delegated DataFusion parser errors to the existing sql2 error classifier.
+- Review hardening: removed the pre-bind fast-write hook from session execution, changed fast execution to consume `FastWritePlan`, put `bind_statement` on the write planning path, removed old `simple_dml` and `public_bind`, made `VersionScope` the sole entity version authority, made write values bound expressions instead of runtime `Value`s, added planned `FilterSet`s to `LogicalWritePlan`, and routed transaction overlay visibility through the `live_state` visibility owner with `sql2::storage::visibility` as a wrapper.
+- Review hardening: transaction overlay candidate scans now remove pre-visibility `limit` and force `include_tombstones = true`, then apply caller limit/tombstone filtering only after shared visibility resolution.
+- Review hardening: read planning entrypoints now reject write ASTs before DataFusion planning, live-state point loads and transaction schema point loads route through scan/overlay visibility, empty-version overlay dedupe happens before tombstone filtering, and stale raw-DataFusion write tests are explicitly ignored until the bound write pipeline is implemented.
+- Current gate: `cargo check -p lix_engine` passes with warnings from intentionally-unused Phase 1 target types. Write execution intentionally stops at the new binder/planner boundary until Phase 2/3 implement catalog, write binding, and bound write execution; this is the hard cut that prevents falling back to raw-AST DML semantics.
+- Current gate: `cargo test -p lix_engine sql2::exec::datafusion::tests --lib -- --nocapture` passes with active SQL2 read coverage restored through non-SQL fixtures; only write/history-write-dependent tests are ignored until the bound write pipeline is implemented.
+- Current gate: `cargo test -p lix_engine sql2::lix_state_provider::tests --lib -- --nocapture`, `cargo test -p lix_engine live_state::visibility::tests --lib -- --nocapture`, and `cargo test -p lix_engine overlay_ --lib -- --nocapture` pass. Raw provider DML hooks now fail closed, and shared live-state visibility owns overlay tombstone/dedupe/global projection semantics for both transaction and sql2 callers.
+- Review hardening: overlay merge precedence is explicit now: version-specific rows beat projected global rows, staged rows beat base rows inside the same scope tier, and tracked/untracked only breaks ties within the same tier. Regression coverage includes staged tracked rows beating base untracked rows and tracked version tombstones beating staged untracked global rows.
+- Current gate: `cargo test -p lix_engine create_version_from_main --test branching -- --nocapture`, `cargo test -p lix_engine --test transaction -- --nocapture`, `cargo test -p lix_engine --test code_structure -- --nocapture`, `cargo test -p lix_engine --test sql -- --nocapture`, and `cargo fmt -p lix_engine --check` pass. The global `simulation_test!` macro is not ignored; only the public SQL integration harness is explicitly ignored for Phase 1 because it depends on disabled public SQL writes. The deterministic-mode SQL-write seed is skipped on the expected `LIX_UNSUPPORTED_SQL` hard-cut error.
 
 ## Phase 2: Catalog and Public Surface Contracts
 

@@ -309,11 +309,6 @@ impl SessionContext {
                         // Re-plan against the transaction-backed write
                         // session so provider hooks read and stage through the
                         // transaction-owned SQL write context.
-                        if let Some(affected_rows) =
-                            sql2::try_execute_simple_write(transaction, &statement, &params).await?
-                        {
-                            return Ok(ExecuteResult::from_rows_affected(affected_rows));
-                        }
                         let tx_plan =
                             sql2::create_write_logical_plan_from_parsed(transaction, statement)
                                 .await?;
@@ -445,11 +440,6 @@ async fn execute_transaction_write(
     statement: datafusion::sql::parser::Statement,
     params: &[Value],
 ) -> Result<ExecuteResult, LixError> {
-    if let Some(affected_rows) =
-        sql2::try_execute_simple_write(transaction, &statement, params).await?
-    {
-        return Ok(ExecuteResult::from_rows_affected(affected_rows));
-    }
     let tx_plan = sql2::create_write_logical_plan_from_parsed(transaction, statement).await?;
     let result = sql2::execute_logical_plan(tx_plan, params).await?;
     let affected_rows = affected_rows_from_query_result(result)?;
