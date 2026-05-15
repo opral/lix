@@ -304,8 +304,8 @@ Phase 4 implementation result:
 ## Phase 5: DataFusion Path From Bound Plans
 
 - [x] Move existing `execute.rs` DataFusion plan creation under `exec/datafusion.rs`.
-- [ ] Keep DataFusion as the reference physical executor.
-- [ ] Build DataFusion sessions from bound/catalog state, not separate public validation.
+- [x] Keep DataFusion as the reference physical executor.
+- [x] Build DataFusion sessions from bound/catalog state, not separate public validation.
 - [x] Ensure normal write path and fast write path share the same `LogicalWritePlan`.
 - [x] Remove duplicated calls to `validate_public_dml_statement`.
 - [x] Remove the unconditional full-AST clone in the write fast-path decision.
@@ -314,10 +314,11 @@ Phase 4 implementation result:
 Phase 5 progress:
 
 - Transaction write execution now calls `execute_write_logical_plan(ctx, SqlLogicalPlan::Write, params)` instead of passing write plans through the DataFusion read executor and parsing an affected-row result.
-- `execute_write_logical_plan` validates bound write parameter counts, tries `optimize::simple_write::try_make_fast_write_plan(&LogicalWritePlan)`, then fails closed with an unsupported error until the DataFusion reference writer is rebuilt from the same `LogicalWritePlan`.
+- `execute_write_logical_plan` validates bound write parameter counts, tries `optimize::simple_write::try_make_fast_write_plan(&LogicalWritePlan)`, then hands fast-path misses to the DataFusion reference writer using the same `LogicalWritePlan`.
 - The former duplicated public DML validation path is gone: write planning binds through `bind_statement(...)`, and fast-path selection now receives the already-built `LogicalWritePlan` instead of cloning/parsing the AST to decide whether to decline.
-- `SqlLogicalPlan` is owned by `exec/mod.rs`, `WriteLogicalPlan` construction lives in `exec/write.rs`, and fast-path misses now hand off to an explicit `exec/datafusion.rs` reference-writer adapter. The adapter still fails closed until it is rebuilt from `LogicalWritePlan`.
-- The DataFusion reference-writer adapter now reconstructs a DataFusion write statement from the validated `LogicalWritePlan` and executes it through a write session. This slice is intentionally fenced to `lix_state` and `lix_state_by_version` so dynamic entity/file/directory catalogs are not re-resolved through the SQL round-trip. `lix_state` insert/update/delete provider DML is re-enabled behind that route, and the lix_state write execution regression tests are unignored.
+- `SqlLogicalPlan` is owned by `exec/mod.rs`, `WriteLogicalPlan` construction lives in `exec/write.rs`, and fast-path misses now hand off to an explicit `exec/datafusion.rs` reference-writer adapter.
+- The DataFusion reference writer no longer regenerates SQL or reparses raw AST. It lowers the validated `LogicalWritePlan` directly into registered table-provider DML calls: `insert_into`, `update`, or `delete_from`, with bound expressions converted to DataFusion logical expressions only at that physical boundary.
+- This slice remains intentionally fenced to `lix_state` and `lix_state_by_version` so dynamic entity/file/directory catalogs are not re-resolved through the reference executor before their storage boundary is cut. `lix_state` insert/update/delete provider DML is re-enabled behind that route, and the lix_state write execution regression tests are unignored.
 
 ## Phase 6: Fast Write Optimization
 
