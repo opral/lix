@@ -2274,7 +2274,7 @@ fn projected_schema(schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Resu
     Ok(Arc::new(schema.project(projection)?))
 }
 
-fn derive_entity_surface_spec_from_schema(
+pub(super) fn derive_entity_surface_spec_from_schema(
     schema: &JsonValue,
 ) -> std::result::Result<EntitySurfaceSpec, LixError> {
     let schema_key = schema

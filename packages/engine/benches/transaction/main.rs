@@ -4,7 +4,8 @@ use lix_engine::storage_bench::{self, TransactionAccountingReport};
 use lix_engine::{
     Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvGetRequest, BackendKvKeyPage,
     BackendKvScanRequest, BackendKvValueBatch, BackendKvValuePage, BackendKvWriteBatch,
-    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, LixError,
+    BackendKvWriteStats, BackendReadTransaction, BackendWriteTransaction, Engine, LixError,
+    SessionContext, Value,
 };
 use std::collections::{BTreeMap, HashSet};
 use std::sync::OnceLock;
@@ -22,6 +23,7 @@ const LARGE_ENTITY_ROWS: usize = 1_000;
 const UPDATE_ROWS_SMALL: usize = 1;
 const UPDATE_ROWS_BATCH: usize = 100;
 const SCALING_ROWS: &[usize] = &[1_000, 2_000, 5_000, 10_000, 20_000];
+const TRANSACTION_LOGIC_ROWS: &[usize] = &[250, 500, 1_000, 2_000];
 
 fn transaction_benches(c: &mut Criterion) {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -645,6 +647,133 @@ fn transaction_benches(c: &mut Criterion) {
 
     io_group.finish();
 
+    let mut logic_group = c.benchmark_group("transaction_logic");
+    for &rows in TRANSACTION_LOGIC_ROWS {
+        let label = row_count_label(rows);
+
+        logic_group.bench_function(
+            format!("stage_rows_batch_no_payload/{label}"),
+            |b| {
+                b.iter_batched(
+                    || {
+                        runtime
+                            .block_on(
+                                storage_bench::prepare_transaction_commit_entities_no_payload(
+                                    BenchBackend::new(),
+                                    rows,
+                                ),
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "prepare transaction_logic/stage_rows_batch_no_payload/{label}: {error}"
+                                )
+                            })
+                    },
+                    |fixture| {
+                        stage_only(
+                            &runtime,
+                            fixture,
+                            "transaction_logic/stage_rows_batch_no_payload",
+                        )
+                    },
+                    BatchSize::LargeInput,
+                )
+            },
+        );
+
+        logic_group.bench_function(
+            format!("stage_rows_individual_no_payload/{label}"),
+            |b| {
+                b.iter_batched(
+                    || {
+                        runtime
+                            .block_on(
+                                storage_bench::prepare_transaction_commit_entities_no_payload(
+                                    BenchBackend::new(),
+                                    rows,
+                                ),
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "prepare transaction_logic/stage_rows_individual_no_payload/{label}: {error}"
+                                )
+                            })
+                    },
+                    |fixture| {
+                        stage_rows_individually(
+                            &runtime,
+                            fixture,
+                            "transaction_logic/stage_rows_individual_no_payload",
+                        )
+                    },
+                    BatchSize::LargeInput,
+                )
+            },
+        );
+    }
+    logic_group.finish();
+
+    let mut sql_group = c.benchmark_group("transaction_sql_fast_path");
+    for &rows in TRANSACTION_LOGIC_ROWS {
+        let label = row_count_label(rows);
+
+        sql_group.bench_function(format!("insert_values_batch_no_payload/{label}"), |b| {
+            b.iter_batched(
+                || {
+                    runtime
+                        .block_on(prepare_sql_fast_path_fixture(rows))
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "prepare transaction_sql_fast_path/insert_values_batch_no_payload/{label}: {error}"
+                            )
+                        })
+                },
+                |fixture| {
+                    black_box(
+                        runtime
+                            .block_on(sql_fast_path_insert_batch(fixture))
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "transaction_sql_fast_path/insert_values_batch_no_payload/{label}: {error}"
+                                )
+                            }),
+                    )
+                },
+                BatchSize::LargeInput,
+            )
+        });
+
+        sql_group.bench_function(
+            format!("insert_values_individual_no_payload/{label}"),
+            |b| {
+                b.iter_batched(
+                    || {
+                        runtime
+                            .block_on(prepare_sql_fast_path_fixture(rows))
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "prepare transaction_sql_fast_path/insert_values_individual_no_payload/{label}: {error}"
+                                )
+                            })
+                    },
+                    |fixture| {
+                        black_box(
+                            runtime
+                                .block_on(sql_fast_path_insert_individual(fixture))
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "transaction_sql_fast_path/insert_values_individual_no_payload/{label}: {error}"
+                                    )
+                                }),
+                        )
+                    },
+                    BatchSize::LargeInput,
+                )
+            },
+        );
+    }
+    sql_group.finish();
+
     let mut scaling_group = c.benchmark_group("transaction_scaling");
     for &rows in SCALING_ROWS {
         let label = row_count_label(rows);
@@ -844,6 +973,98 @@ fn stage_only(
             .block_on(storage_bench::transaction_stage_only_prepared(&fixture))
             .unwrap_or_else(|error| panic!("{label} succeeds: {error}")),
     )
+}
+
+fn stage_rows_individually(
+    runtime: &Runtime,
+    fixture: storage_bench::TransactionBenchFixture,
+    label: &str,
+) -> storage_bench::StorageBenchReport {
+    black_box(
+        runtime
+            .block_on(storage_bench::transaction_stage_rows_individually_prepared(
+                &fixture,
+            ))
+            .unwrap_or_else(|error| panic!("{label} succeeds: {error}")),
+    )
+}
+
+struct SqlFastPathFixture {
+    session: SessionContext,
+    batch_sql: String,
+    row_params: Vec<[Value; 2]>,
+}
+
+async fn prepare_sql_fast_path_fixture(rows: usize) -> Result<SqlFastPathFixture, LixError> {
+    let backend = backend::BenchBackend::default();
+    Engine::initialize(Box::new(backend.clone())).await?;
+    let engine = Engine::new(Box::new(backend)).await?;
+    let session = engine.open_workspace_session().await?;
+    register_sql_fast_path_schema(&session).await?;
+    let batch_sql = sql_fast_path_batch_insert_sql(rows);
+    let row_params = (0..rows)
+        .map(|index| {
+            [
+                Value::Text(format!("entity-{index:06}")),
+                Value::Text(format!("value-{index:06}")),
+            ]
+        })
+        .collect();
+    Ok(SqlFastPathFixture {
+        session,
+        batch_sql,
+        row_params,
+    })
+}
+
+async fn register_sql_fast_path_schema(session: &SessionContext) -> Result<(), LixError> {
+    let schema = r#"{
+        "x-lix-key": "bench_fast_path",
+        "x-lix-primary-key": ["/id"],
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "value": { "type": "string" }
+        },
+        "required": ["id", "value"],
+        "additionalProperties": false
+    }"#;
+    let sql = format!(
+        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json('{}'), false, false)",
+        schema.replace('\'', "''")
+    );
+    let affected = session.execute(&sql, &[]).await?.rows_affected();
+    assert_eq!(affected, 1);
+    Ok(())
+}
+
+async fn sql_fast_path_insert_batch(fixture: SqlFastPathFixture) -> Result<usize, LixError> {
+    let mut tx = fixture.session.begin_transaction().await?;
+    let affected = tx.execute(&fixture.batch_sql, &[]).await?.rows_affected() as usize;
+    tx.rollback().await?;
+    Ok(affected)
+}
+
+async fn sql_fast_path_insert_individual(fixture: SqlFastPathFixture) -> Result<usize, LixError> {
+    let mut tx = fixture.session.begin_transaction().await?;
+    let sql = "INSERT INTO bench_fast_path (id, value) VALUES (?, ?)";
+    let mut affected = 0usize;
+    for params in &fixture.row_params {
+        affected += tx.execute(sql, params.as_slice()).await?.rows_affected() as usize;
+    }
+    tx.rollback().await?;
+    Ok(affected)
+}
+
+fn sql_fast_path_batch_insert_sql(rows: usize) -> String {
+    let mut sql = String::from("INSERT INTO bench_fast_path (id, value) VALUES ");
+    for index in 0..rows {
+        if index > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("('entity-{index:06}', 'value-{index:06}')"));
+    }
+    sql
 }
 
 fn commit_only(
