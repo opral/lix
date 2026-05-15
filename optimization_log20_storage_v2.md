@@ -776,3 +776,132 @@ The next point-read win is likely reducing hash work:
 The next in-memory-backend win is separate: ConformanceBackend remains a
 correctness backend, not an optimized in-memory backend.
 ```
+
+### 2026-05-14: Fast Storage Hash Maps
+
+Change:
+
+```text
+Storage-local hash maps/sets now use ahash with fixed seeds for the hot
+storage_v2 adapter paths:
+
+  point read dedupe/reconstruction
+  write-set duplicate validation
+
+The hash choice is intentionally local to storage adapter internals. It is not
+used for persistence, content identity, checksums, or externally visible order.
+```
+
+Why:
+
+```text
+Hash microbenchmarks showed the storage hot paths are dominated by Rust
+HashMap/HashSet behavior over many small structured keys, not by hashing large
+contiguous byte buffers.
+
+ahash was fastest for the actual map/set workloads, even when raw hash-only
+benchmarks were close or favored another hasher.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 hash_algorithms
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 point_read_adapter
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 write_set_lowering
+```
+
+Representative hash scorecard:
+
+| Case                                  |      std |    ahash |  rustc_fx |     xxh3 |    blake3 |
+| ------------------------------------- | -------: | -------: | --------: | -------: | --------: |
+| `point_reconstruct_m10000_u100`       | 248.83us | 127.43us |  129.76us | 252.03us | 1.3980 ms |
+| `point_reconstruct_m1000_u1000`       | 47.209us | 26.844us |  29.718us | 48.829us | 219.53 us |
+| `write_validate_k1024`                | 19.233us | 9.6647us |  11.169us | 20.832us | 79.382 us |
+
+Complexity impact:
+
+```text
+The asymptotic shape is unchanged:
+
+  point reads: O(M + U + F) expected
+  write validation: O(K) expected
+
+The constant factor for storage-local hash work is substantially lower.
+```
+
+### 2026-05-14: Index-Based Point Reconstruction
+
+Change:
+
+```text
+get_many_values_caller_order_with_stats() now dedupes into:
+
+  unique backend keys
+  requested-slot -> unique-key indexes
+
+After the backend call, returned values are placed into a unique-value vector
+and caller-order results are rebuilt by integer index.
+
+This removes the second found-entry HashMap and removes one hash lookup per
+requested caller-order slot.
+```
+
+Why:
+
+```text
+Post-ahash profiles showed the top remaining point-read cost was algorithmic:
+
+  dedupe requested keys
+  build found HashMap from returned entries
+  hash every requested key again while reconstructing M output slots
+
+For duplicate-heavy reads like M=10000/U=100, that final M hash-lookup pass is
+avoidable. Integer reconstruction preserves the same API and shape guards.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 point_read_adapter
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 conformance_backend/get_many_m1000_u100
+```
+
+Point-read scorecard:
+
+| Case                   |       Mean | Criterion Change |
+| ---------------------- | ---------: | ---------------: |
+| `m100_u100`            |  3.1521 us |    5.190% faster |
+| `m1000_u1000`          |  33.029 us |    8.943% faster |
+| `m1000_u100`           |  12.905 us |   20.518% faster |
+| `m10000_u100`          |  102.99 us |   26.439% faster |
+| `m1000_u100_missing10` |  12.476 us |   18.951% faster |
+| `m1000_u100_missing90` |  9.0254 us |   11.695% faster |
+
+Conformance backend scorecard:
+
+| Case                  |      Mean | Criterion Change |
+| --------------------- | --------: | ---------------: |
+| `get_many_m1000_u100` | 26.742 us |    8.999% faster |
+
+Complexity impact:
+
+```text
+Before:
+  dedupe/index requested keys: O(M) expected
+  found map from backend entries: O(F) expected
+  reconstruct caller slots: O(M) expected with M hash lookups
+
+After:
+  dedupe/index requested keys: O(M) expected
+  assign backend entries to unique slots: O(F) expected
+  reconstruct caller slots: O(M) integer indexing
+
+The Big-O remains O(M + U + F), but the hot duplicate-heavy path now avoids
+hashing the requested key again for every output slot.
+```
