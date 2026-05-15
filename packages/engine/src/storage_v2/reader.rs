@@ -308,22 +308,16 @@ mod tests {
             opts: GetOptions<'_>,
         ) -> Result<GetManyResult, BackendError> {
             self.get_many_keys.replace(keys.to_vec());
-            Ok(GetManyResult {
-                entries: ReadBatch {
-                    entries: keys
-                        .iter()
-                        .map(|key| ReadEntry {
-                            key: key.clone(),
-                            value: match opts.projection {
-                                CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
-                                CoreProjection::FullValue => {
-                                    ProjectedValue::FullValue(key.0.clone())
-                                }
-                            },
+            Ok(GetManyResult::new(
+                keys.iter()
+                    .map(|key| {
+                        Some(match opts.projection {
+                            CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
+                            CoreProjection::FullValue => ProjectedValue::FullValue(key.0.clone()),
                         })
-                        .collect(),
-                },
-            })
+                    })
+                    .collect(),
+            ))
         }
 
         fn scan_range(
@@ -338,6 +332,42 @@ mod tests {
                 entries: ReadBatch::default(),
                 has_more: false,
             })
+        }
+    }
+
+    #[derive(Default)]
+    struct RequestedOrderRead {
+        get_many_keys: RefCell<Vec<Key>>,
+    }
+
+    impl BackendRead for RequestedOrderRead {
+        fn get_many(
+            &self,
+            _space: SpaceId,
+            keys: &[Key],
+            _opts: GetOptions<'_>,
+        ) -> Result<GetManyResult, BackendError> {
+            self.get_many_keys.replace(keys.to_vec());
+            Ok(GetManyResult::new(
+                keys.iter()
+                    .map(|key| {
+                        if key.0.as_ref() == b"missing" {
+                            None
+                        } else {
+                            Some(ProjectedValue::FullValue(key.0.clone()))
+                        }
+                    })
+                    .collect(),
+            ))
+        }
+
+        fn scan_range(
+            &self,
+            _space: SpaceId,
+            _range: KeyRange,
+            _opts: ScanOptions<'_>,
+        ) -> Result<ScanPage, BackendError> {
+            unreachable!("requested-order point-read test does not scan")
         }
     }
 
@@ -529,6 +559,37 @@ mod tests {
             Some(&ProjectedValue::FullValue(Bytes::from_static(b"B")))
         );
         assert_eq!(borrowed.value.value_at(1), None);
+    }
+
+    #[test]
+    fn planned_point_reads_use_backend_requested_order_slots() {
+        let read = crate::storage_v2::StorageReadScope::new(RequestedOrderRead::default());
+        let plan = PointRequestPlan::new(&[key("b"), key("missing"), key("a"), key("b")]);
+
+        let result = read
+            .get_many_borrowed_indexed_values_for_plan_with_stats(
+                space(1),
+                &plan,
+                GetOptions::default(),
+            )
+            .expect("borrowed planned indexed read");
+
+        assert_eq!(
+            read.backend_read().get_many_keys.borrow().as_slice(),
+            &[key("b"), key("missing"), key("a")]
+        );
+        assert_eq!(result.stats.requested_keys, 4);
+        assert_eq!(result.stats.unique_backend_keys, 3);
+        assert_eq!(result.stats.backend_calls, 1);
+        assert_eq!(
+            result.value.value_at(0),
+            Some(&ProjectedValue::FullValue(Bytes::from_static(b"b")))
+        );
+        assert_eq!(result.value.value_at(1), None);
+        assert_eq!(
+            result.value.value_at(2),
+            Some(&ProjectedValue::FullValue(Bytes::from_static(b"a")))
+        );
     }
 
     #[test]

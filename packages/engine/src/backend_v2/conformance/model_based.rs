@@ -129,7 +129,7 @@ where
     let result = read
         .get_many(target_space, &point_keys, GetOptions::default())
         .map_err(|error| format!("{label}: get_many failed: {error}"))?;
-    let actual = entries_to_map(&result.entries.entries);
+    let actual = entries_to_map(&result.entries_for_requested_keys(&point_keys));
     let expected = point_keys
         .iter()
         .filter_map(|key| {

@@ -72,7 +72,10 @@ pub struct ScanPage {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GetManyResult {
-    pub entries: ReadBatch,
+    /// One slot per key passed to `get_many`, in caller order.
+    ///
+    /// Duplicates are preserved. `None` means the requested key was missing.
+    pub values: Vec<Option<ProjectedValue>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,6 +167,20 @@ impl Default for GetOptions<'_> {
             projection: CoreProjection::FullValue,
             _reserved: std::marker::PhantomData,
         }
+    }
+}
+
+impl GetManyResult {
+    pub fn new(values: Vec<Option<ProjectedValue>>) -> Self {
+        Self { values }
+    }
+
+    pub fn entries_for_requested_keys(&self, keys: &[Key]) -> Vec<ReadEntry> {
+        keys.iter()
+            .cloned()
+            .zip(self.values.iter().cloned())
+            .filter_map(|(key, value)| value.map(|value| ReadEntry { key, value }))
+            .collect()
     }
 }
 

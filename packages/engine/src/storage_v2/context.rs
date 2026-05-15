@@ -319,18 +319,17 @@ mod shape_tests {
             _opts: GetOptions<'_>,
         ) -> Result<GetManyResult, BackendError> {
             self.get_many_keys.replace(keys.to_vec());
-            Ok(GetManyResult {
-                entries: ReadBatch {
-                    entries: keys
-                        .iter()
-                        .filter(|key| key.0.as_ref() != b"missing")
-                        .map(|key| ReadEntry {
-                            key: key.clone(),
-                            value: ProjectedValue::FullValue(key.0.clone()),
-                        })
-                        .collect(),
-                },
-            })
+            Ok(GetManyResult::new(
+                keys.iter()
+                    .map(|key| {
+                        if key.0.as_ref() == b"missing" {
+                            None
+                        } else {
+                            Some(ProjectedValue::FullValue(key.0.clone()))
+                        }
+                    })
+                    .collect(),
+            ))
         }
 
         fn scan_range(

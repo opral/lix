@@ -354,13 +354,16 @@ impl Default for GetOptions<'_> {
 `get_many` is required because point batching is a core backend primitive, not a
 looping convenience.
 
-V0 `get_many` may return found entries in backend/native order. Missing keys may
-be omitted, and duplicate requested keys may be coalesced. `storage_v2` owns the
-caller-order semantic helper that reconstructs one output slot per requested
-key, including duplicate and missing keys, in `O(M + U)` where `M` is requested
-keys and `U` is unique requested keys. Backends must still implement this as a
-batched point operation over the requested or deduplicated key set, not as a
-required loop of independent physical reads.
+V0 `get_many` returns one output slot per requested key, in the exact order of
+the key slice passed to the backend. Duplicate requested keys must produce
+duplicate output slots. Missing keys are represented as `None`.
+
+This slot-shaped contract is part of the core API because it is both simpler and
+faster than a backend-native found-entry result: callers already know the
+requested keys, and `storage_v2` can dedupe to unique keys before calling the
+backend when that is useful. Backends must still implement `get_many` as a
+batched point operation over the requested key set, not as a required loop of
+independent physical reads.
 
 ### Scan Options
 
@@ -398,8 +401,9 @@ pub struct ScanPage {
 
 #[derive(Clone, Debug)]
 pub struct GetManyResult {
-    /// Found entries for requested keys. Missing keys may be omitted.
-    pub entries: ReadBatch,
+    /// One value slot per key passed to get_many, in caller order.
+    /// None means the requested key was missing.
+    pub values: Vec<Option<ProjectedValue>>,
 }
 ```
 
@@ -696,11 +700,6 @@ pub struct ScanCapabilities {
 
     /// Row-bounded forward pages are core. Byte-bounded pages are optional.
     pub limit_bytes: bool,
-
-    /// Optional point-return modes. Core v0 allows storage_v2 to reconstruct
-    /// caller-order slots from found entries.
-    pub unordered_points: bool,
-    pub key_ordered_points: bool,
 
     /// Core v0 scan continuation is key-resume. This means the backend exposes
     /// native opaque cursors that can survive transaction/session boundaries or

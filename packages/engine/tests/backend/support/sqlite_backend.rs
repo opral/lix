@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -245,9 +246,7 @@ fn get_many(
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     if unique_keys.is_empty() {
-        return Ok(GetManyResult {
-            entries: ReadBatch::default(),
-        });
+        return Ok(GetManyResult::new(Vec::new()));
     }
 
     let placeholders = std::iter::repeat("(?)")
@@ -271,18 +270,20 @@ fn get_many(
     let mut rows = stmt
         .query(rusqlite::params_from_iter(values))
         .map_err(sqlite_error)?;
-    let mut entries = Vec::new();
+    let mut found = BTreeMap::new();
     while let Some(row) = rows.next().map_err(sqlite_error)? {
         let key_bytes: Vec<u8> = row.get(0).map_err(sqlite_error)?;
         let value_bytes: Vec<u8> = row.get(1).map_err(sqlite_error)?;
-        entries.push(ReadEntry {
-            key: Key(Bytes::from(key_bytes)),
-            value: project_value(Bytes::from(value_bytes), opts.projection),
-        });
+        found.insert(
+            Key(Bytes::from(key_bytes)),
+            project_value(Bytes::from(value_bytes), opts.projection),
+        );
     }
-    Ok(GetManyResult {
-        entries: ReadBatch { entries },
-    })
+    Ok(GetManyResult::new(
+        keys.iter()
+            .map(|key| found.get(key).cloned())
+            .collect::<Vec<_>>(),
+    ))
 }
 
 fn scan_range(

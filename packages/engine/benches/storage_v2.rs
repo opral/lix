@@ -830,11 +830,16 @@ impl BackendRead for PointReadBackend {
         _opts: GetOptions<'_>,
     ) -> Result<GetManyResult, BackendError> {
         self.requested_keys.replace(keys.to_vec());
-        Ok(GetManyResult {
-            entries: ReadBatch {
-                entries: self.values.iter().cloned().collect(),
-            },
-        })
+        Ok(GetManyResult::new(
+            keys.iter()
+                .map(|key| {
+                    self.values
+                        .iter()
+                        .find(|entry| entry.key == *key)
+                        .map(|entry| entry.value.clone())
+                })
+                .collect(),
+        ))
     }
 
     fn scan_range(
@@ -877,10 +882,14 @@ impl BackendRead for LeanPointReadBackend {
         _opts: GetOptions<'_>,
     ) -> Result<GetManyResult, BackendError> {
         let found = keys.len().min(self.values.len());
-        let entries = self.values.iter().take(found).cloned().collect();
-        Ok(GetManyResult {
-            entries: ReadBatch { entries },
-        })
+        let values = self
+            .values
+            .iter()
+            .take(found)
+            .map(|entry| Some(entry.value.clone()))
+            .chain(std::iter::repeat_with(|| None).take(keys.len().saturating_sub(found)))
+            .collect();
+        Ok(GetManyResult::new(values))
     }
 
     fn scan_range(

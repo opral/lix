@@ -165,21 +165,15 @@ fn get_many_from_map(
     keys: &[Key],
     opts: GetOptions<'_>,
 ) -> Result<GetManyResult, BackendError> {
-    let mut found = Vec::new();
-    for key in keys {
-        if found.iter().any(|entry: &ReadEntry| entry.key == *key) {
-            continue;
-        }
-        if let Some(value) = entries.get(&(space, key.clone())) {
-            found.push(ReadEntry {
-                key: key.clone(),
-                value: project_value(value, opts.projection),
-            });
-        }
-    }
-    Ok(GetManyResult {
-        entries: ReadBatch { entries: found },
-    })
+    Ok(GetManyResult::new(
+        keys.iter()
+            .map(|key| {
+                entries
+                    .get(&(space, key.clone()))
+                    .map(|value| project_value(value, opts.projection))
+            })
+            .collect(),
+    ))
 }
 
 fn scan_range_from_map(

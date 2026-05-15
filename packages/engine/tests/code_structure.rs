@@ -352,6 +352,7 @@ fn build_adjacency_map(
 
 fn parse_top_level_modules(lib_source: &str) -> Vec<String> {
     let mut modules = Vec::new();
+    let mut seen = BTreeSet::new();
     let mut pending_attributes = Vec::new();
 
     for line in lib_source.lines() {
@@ -382,7 +383,7 @@ fn parse_top_level_modules(lib_source: &str) -> Vec<String> {
                     .any(|attribute| attribute.contains("cfg(test)"));
                 if !is_test_only {
                     let name = module_name.trim();
-                    if !name.is_empty() {
+                    if !name.is_empty() && seen.insert(name.to_string()) {
                         modules.push(name.to_string());
                     }
                 }
