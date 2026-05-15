@@ -86,6 +86,18 @@ impl SqliteBackend {
         Ok(Self { path })
     }
 
+    #[allow(dead_code)]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[allow(dead_code)]
+    pub fn checkpoint(&self) -> Result<(), BackendError> {
+        let conn = self.connect()?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .map_err(sqlite_error)
+    }
+
     fn connect(&self) -> Result<Connection, BackendError> {
         open_connection(&self.path)
     }
