@@ -59,7 +59,149 @@ simulation_test!(
     }
 );
 
-simulation_test!(sql_question_mark_placeholder_has_hint, |sim| async move {
+simulation_test!(
+    sql_question_mark_placeholders_bind_positionally,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("main session should open");
+
+        let result = session
+            .execute(
+                "SELECT * FROM lix_file WHERE id = ?",
+                &[Value::Text("missing-file".to_string())],
+            )
+            .await
+            .expect("anonymous placeholder should still bind when no rows match");
+        assert_eq!(result.len(), 0);
+
+        let result = session
+            .execute(
+                "SELECT '?' AS literal, ? AS first, ? AS second",
+                &[Value::Integer(10), Value::Text("second".to_string())],
+            )
+            .await
+            .expect("anonymous placeholders should bind left to right");
+        let row = result.rows().first().expect("query should return one row");
+        assert_eq!(
+            row.values(),
+            &[
+                Value::Text("?".to_string()),
+                Value::Integer(10),
+                Value::Text("second".to_string()),
+            ]
+        );
+
+        let result = session
+            .execute(
+                "SELECT 'it''s ?' AS escaped_literal, ? AS bound_value -- ? in comment\n",
+                &[Value::Integer(42)],
+            )
+            .await
+            .expect("normalization should preserve escaped literals and comments");
+        let row = result.rows().first().expect("query should return one row");
+        assert_eq!(
+            row.values(),
+            &[Value::Text("it's ?".to_string()), Value::Integer(42)]
+        );
+
+        let error = session
+            .execute("SELECT ? AS missing_param", &[])
+            .await
+            .expect_err("anonymous placeholder without a value should fail");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+    }
+);
+
+simulation_test!(
+    sql_mixed_anonymous_and_explicit_placeholders_are_rejected,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute(
+                "SELECT ? AS anonymous_value, $2 AS numbered_value",
+                &[Value::Integer(1), Value::Integer(2)],
+            )
+            .await
+            .expect_err("mixed placeholder styles should fail");
+
+        assert_eq!(error.code, LixError::CODE_PARSE_ERROR);
+        assert!(
+            error.hint().is_some_and(|hint| hint.contains("not both")),
+            "expected mixed-placeholder hint: {error}"
+        );
+    }
+);
+
+simulation_test!(
+    sql_transaction_execute_accepts_anonymous_placeholders,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+
+        let result = transaction
+            .execute(
+                "SELECT ? AS first, ? AS second",
+                &[Value::Integer(1), Value::Text("two".to_string())],
+            )
+            .await
+            .expect("anonymous parameter read in transaction should succeed");
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Integer(1), Value::Text("two".to_string())]
+        );
+
+        transaction
+            .execute(
+                "INSERT INTO lix_file (id, path) VALUES (?, ?)",
+                &[
+                    Value::Text("anonymous-transaction-file".to_string()),
+                    Value::Text("/anonymous-transaction.txt".to_string()),
+                ],
+            )
+            .await
+            .expect("anonymous parameter write in transaction should succeed");
+
+        transaction
+            .commit()
+            .await
+            .expect("transaction commit should succeed");
+
+        let result = session
+            .execute(
+                "SELECT path FROM lix_file WHERE id = ?",
+                &[Value::Text("anonymous-transaction-file".to_string())],
+            )
+            .await
+            .expect("committed anonymous parameter write should be visible");
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Text("/anonymous-transaction.txt".to_string())]
+        );
+    }
+);
+
+simulation_test!(sql_explain_is_read_shaped, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
@@ -69,16 +211,24 @@ simulation_test!(sql_question_mark_placeholder_has_hint, |sim| async move {
         &engine,
     );
 
-    let error = session
-        .execute("SELECT * FROM lix_file WHERE id = ?", &[])
+    let result = session
+        .execute("EXPLAIN SELECT ? AS explained_value", &[Value::Integer(1)])
         .await
-        .expect_err("question mark placeholders should fail");
+        .expect("EXPLAIN SELECT should return explain rows");
+    assert!(!result.columns().is_empty());
+    assert!(!result.rows().is_empty());
 
-    assert_eq!(error.code, LixError::CODE_PARSE_ERROR);
-    assert!(
-        error.hint().is_some_and(|hint| hint.contains("$1")),
-        "expected placeholder hint: {error}"
-    );
+    let error = session
+        .execute(
+            "EXPLAIN INSERT INTO lix_file (id, path) VALUES (?, ?)",
+            &[
+                Value::Text("explained-write".to_string()),
+                Value::Text("/explained-write.txt".to_string()),
+            ],
+        )
+        .await
+        .expect_err("EXPLAIN of write statements should not route through write execution");
+    assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
 });
 
 simulation_test!(sql_json_function_miss_has_lix_udf_hint, |sim| async move {

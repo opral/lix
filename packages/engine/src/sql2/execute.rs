@@ -4,7 +4,9 @@ use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
 use datafusion::common::{ParamValues, ScalarValue};
 use datafusion::logical_expr::{Expr, LogicalPlan, WriteOp};
 use datafusion::prelude::SessionContext;
-use datafusion::sql::parser::Statement as DataFusionStatement;
+use datafusion::sql::parser::{DFParserBuilder, Statement as DataFusionStatement};
+use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
 use serde_json::{json, Value as JsonValue};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -13,7 +15,7 @@ use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
 use super::predicate_typecheck::validate_json_predicate_expr_with_dfschema;
 use super::result_metadata::{field_is_json, LIX_VALUE_TYPE_JSON, LIX_VALUE_TYPE_METADATA_KEY};
-use super::session::{build_read_session, build_write_session, new_sql_session_context};
+use super::session::{build_read_session, build_write_session};
 use super::write_normalization::{
     is_binary_type, lix_file_data_type_lix_error, logical_expr_is_binary_or_null,
 };
@@ -60,15 +62,24 @@ pub(crate) async fn create_logical_plan(
     ctx: &dyn SqlExecutionContext,
     sql: &str,
 ) -> Result<SqlLogicalPlan, LixError> {
-    super::validate_supported_statement_ast(sql)?;
-    super::udfs::validate_public_udf_calls(sql)?;
+    let statement = parse_statement(sql)?;
+    create_logical_plan_from_parsed(ctx, sql, statement).await
+}
+
+pub(crate) fn parse_statement(sql: &str) -> Result<DataFusionStatement, LixError> {
+    parse_datafusion_statement(sql)
+}
+
+pub(crate) async fn create_logical_plan_from_parsed(
+    ctx: &dyn SqlExecutionContext,
+    sql: &str,
+    statement: DataFusionStatement,
+) -> Result<SqlLogicalPlan, LixError> {
     validate_public_read_sql_surface(sql)?;
+    super::validate_supported_datafusion_statement_ast(&statement)?;
+    super::udfs::validate_public_udf_calls_in_datafusion_statement(&statement)?;
     let session = build_read_session(ctx).await?;
-    let plan = session
-        .state()
-        .create_logical_plan(sql)
-        .await
-        .map_err(datafusion_error_to_lix_error)?;
+    let plan = create_logical_plan_from_statement(&session, statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
     let kind = classify_logical_plan(&plan);
@@ -88,10 +99,17 @@ pub(crate) async fn create_write_logical_plan(
     ctx: &mut dyn SqlWriteExecutionContext,
     sql: &str,
 ) -> Result<SqlLogicalPlan, LixError> {
-    super::udfs::validate_public_udf_calls(sql)?;
+    let statement = parse_statement(sql)?;
+    create_write_logical_plan_from_parsed(ctx, statement).await
+}
+
+pub(crate) async fn create_write_logical_plan_from_parsed(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    statement: DataFusionStatement,
+) -> Result<SqlLogicalPlan, LixError> {
+    super::udfs::validate_public_udf_calls_in_datafusion_statement(&statement)?;
     let visible_schemas = ctx.list_visible_schemas()?;
-    super::public_bind::validate_public_dml_sql(sql, &visible_schemas)?;
-    let statement = parse_datafusion_statement(sql)?;
+    super::public_bind::validate_public_dml_statement(&statement, &visible_schemas)?;
     super::validate_supported_datafusion_statement_ast(&statement)?;
     reject_read_only_history_view_dml_from_statement(&statement, &visible_schemas)?;
     let session = build_write_session(ctx).await?;
@@ -111,19 +129,16 @@ pub(crate) async fn create_write_logical_plan(
     })
 }
 
-pub(crate) async fn create_transaction_read_logical_plan(
+pub(crate) async fn create_transaction_read_logical_plan_from_parsed(
     ctx: &mut dyn SqlWriteExecutionContext,
     sql: &str,
+    statement: DataFusionStatement,
 ) -> Result<SqlLogicalPlan, LixError> {
-    super::validate_supported_statement_ast(sql)?;
-    super::udfs::validate_public_udf_calls(sql)?;
     validate_public_read_sql_surface(sql)?;
+    super::validate_supported_datafusion_statement_ast(&statement)?;
+    super::udfs::validate_public_udf_calls_in_datafusion_statement(&statement)?;
     let session = build_write_session(ctx).await?;
-    let plan = session
-        .state()
-        .create_logical_plan(sql)
-        .await
-        .map_err(datafusion_error_to_lix_error)?;
+    let plan = create_logical_plan_from_statement(&session, statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
     let kind = classify_logical_plan(&plan);
@@ -158,12 +173,64 @@ fn validate_public_read_sql_surface(sql: &str) -> Result<(), LixError> {
 }
 
 fn parse_datafusion_statement(sql: &str) -> Result<DataFusionStatement, LixError> {
-    let session = new_sql_session_context();
-    let dialect = session.state().config_options().sql_parser.dialect;
-    session
-        .state()
-        .sql_to_statement(sql, &dialect)
-        .map_err(datafusion_error_to_lix_error)
+    let dialect = GenericDialect {};
+    let mut next_index = 1usize;
+    let mut has_anonymous = false;
+    let mut explicit_placeholders = Vec::new();
+
+    let mut tokens = Vec::new();
+    Tokenizer::new(&dialect, sql)
+        .tokenize_with_location_into_buf_with_mapper(&mut tokens, |mut token_span| {
+            if let Token::Placeholder(placeholder) = &token_span.token {
+                if placeholder == "?" {
+                    has_anonymous = true;
+                    token_span.token = Token::Placeholder(format!("${next_index}"));
+                    next_index += 1;
+                } else {
+                    explicit_placeholders.push(placeholder.clone());
+                }
+            }
+            token_span
+        })
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_PARSE_ERROR,
+                format!("sql2 SQL tokenize error: {error}"),
+            )
+        })?;
+
+    if has_anonymous && !explicit_placeholders.is_empty() {
+        return Err(LixError::new(
+            LixError::CODE_PARSE_ERROR,
+            "SQL mixes anonymous and explicit parameter placeholders",
+        )
+        .with_hint("Use either anonymous placeholders like ?, ? or numbered placeholders like $1, $2, but not both.")
+        .with_details(json!({
+            "operation": "execute",
+            "explicit_placeholders": explicit_placeholders,
+        })));
+    }
+
+    let mut statements = DFParserBuilder::new(tokens)
+        .with_dialect(&dialect)
+        .build()
+        .map_err(datafusion_error_to_lix_error)?
+        .parse_statements()
+        .map_err(datafusion_error_to_lix_error)?;
+
+    if statements.len() > 1 {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "Lix SQL only supports one statement per execute() call",
+        ));
+    }
+
+    statements.pop_front().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_PARSE_ERROR,
+            "sql2 DataFusion error: No SQL statements were provided in the query string",
+        )
+    })
 }
 
 async fn create_logical_plan_from_statement(
@@ -294,7 +361,7 @@ fn placeholder_index(id: &str) -> Result<usize, LixError> {
                 LixError::CODE_PARSE_ERROR,
                 format!("unsupported SQL parameter placeholder '{id}'"),
             )
-            .with_hint("Use numbered placeholders like $1, $2, ...")
+            .with_hint("Use placeholders like ?, ? or numbered placeholders like $1, $2, ...")
         })
 }
 
@@ -389,7 +456,7 @@ fn expected_positional_parameter_count(
                 LixError::CODE_PARSE_ERROR,
                 format!("unsupported SQL parameter placeholder '{name}'"),
             )
-            .with_hint("Use numbered placeholders like $1, $2, ...")
+            .with_hint("Use placeholders like ?, ? or numbered placeholders like $1, $2, ...")
             .with_details(json!({
                 "operation": "execute",
                 "placeholder": name,
@@ -400,7 +467,7 @@ fn expected_positional_parameter_count(
                 LixError::CODE_PARSE_ERROR,
                 "SQL parameter placeholders are 1-indexed",
             )
-            .with_hint("Use numbered placeholders like $1, $2, ...")
+            .with_hint("Use placeholders like ?, ? or numbered placeholders like $1, $2, ...")
             .with_details(json!({
                 "operation": "execute",
                 "placeholder": name,
@@ -1897,7 +1964,6 @@ mod tests {
             "DELETE FROM lix_state_history",
             "DELETE FROM LIX_STATE_HISTORY",
             "DELETE FROM main.LIX_STATE_HISTORY",
-            "EXPLAIN DELETE FROM lix_state_history",
         ] {
             let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
             let live_state = Arc::new(DummyLiveStateReader);

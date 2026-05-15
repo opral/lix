@@ -1,14 +1,18 @@
 use std::ops::ControlFlow;
 
+use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart, Statement,
     Value, Visit, Visitor,
 };
+#[cfg(test)]
 use datafusion::sql::sqlparser::dialect::GenericDialect;
+#[cfg(test)]
 use datafusion::sql::sqlparser::parser::Parser;
 
 use crate::LixError;
 
+#[cfg(test)]
 pub(crate) fn validate_public_udf_calls(sql: &str) -> Result<(), LixError> {
     let statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| {
         LixError::new(
@@ -63,6 +67,29 @@ fn validate_public_function_call(function: &Function) -> Result<(), LixError> {
         "lix_text_encode" | "lix_text_decode" => {
             expect_arity_range(name, arity, 1, 2)?;
             validate_literal_utf8_encoding(name, &function.args)
+        }
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn validate_public_udf_calls_in_datafusion_statement(
+    statement: &DataFusionStatement,
+) -> Result<(), LixError> {
+    let mut visitor = PublicUdfCallVisitor;
+    visit_datafusion_statement(statement, &mut visitor)
+}
+
+fn visit_datafusion_statement(
+    statement: &DataFusionStatement,
+    visitor: &mut PublicUdfCallVisitor,
+) -> Result<(), LixError> {
+    match statement {
+        DataFusionStatement::Statement(statement) => match statement.visit(visitor) {
+            ControlFlow::Continue(()) => Ok(()),
+            ControlFlow::Break(error) => Err(*error),
+        },
+        DataFusionStatement::Explain(explain) => {
+            visit_datafusion_statement(explain.statement.as_ref(), visitor)
         }
         _ => Ok(()),
     }
