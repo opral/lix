@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
-use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobHash};
+use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobHash};
 use crate::catalog::CatalogContext;
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
 use crate::commit_store::CommitStoreContext;
@@ -12,10 +12,12 @@ use crate::domain::Domain;
 use crate::entity_identity::EntityIdentity;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::live_state::{
-    LiveStateContext, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+    LiveStateContext, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
+    MaterializedLiveStateRow,
 };
 use crate::plugin::{PluginContext, PLUGIN_STORAGE_ROOT_DIRECTORY_PATH};
 use crate::session::{SessionMode, WORKSPACE_VERSION_KEY};
+use crate::sql2::filesystem_planner::FILE_DESCRIPTOR_SCHEMA_KEY;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage::{StorageContext, StorageWriteSet, StorageWriteTransaction};
 use crate::tracked_state::{TrackedStateContext, TrackedStateStoreReader};
@@ -25,7 +27,11 @@ use crate::transaction::normalization::{
     normalize_transaction_write_row, remember_pending_registered_schema,
     NormalizedTransactionWriteRow, REGISTERED_SCHEMA_KEY,
 };
-use crate::transaction::plugin_logic::{select_plugins_for_file_data_writes, FilePluginMatch};
+use crate::transaction::plugin_logic::{
+    pending_plugin_detections_for_file_data_writes, plugin_changes_to_transaction_rows,
+    plugin_detect_changes_input, plugin_tombstone_rows_for_file_deletes, PendingPluginDetection,
+    PluginFileDeleteInput, PluginFileWriteInput,
+};
 use crate::transaction::prepare_version_ref_row;
 use crate::transaction::schema_resolver::TransactionSchemaResolver;
 use crate::transaction::staging::{PreparedWriteSet, TransactionWriteBuffer};
@@ -63,7 +69,8 @@ pub(crate) struct Transaction {
     plugin_context: Arc<PluginContext>,
     schema_resolver: TransactionSchemaResolver,
     staged_writes: Arc<TransactionWriteBuffer>,
-    file_plugin_matches: Vec<FilePluginMatch>,
+    pending_plugin_detections: Vec<PendingPluginDetection>,
+    poisoned: bool,
     storage_transaction: Box<dyn StorageWriteTransaction + Send + Sync + 'static>,
     visible_schemas: Vec<JsonValue>,
     functions: FunctionProviderHandle,
@@ -146,7 +153,8 @@ impl Transaction {
                 plugin_context,
                 schema_resolver,
                 staged_writes,
-                file_plugin_matches: Vec::new(),
+                pending_plugin_detections: Vec::new(),
+                poisoned: false,
                 storage_transaction,
                 visible_schemas,
                 functions,
@@ -164,6 +172,13 @@ impl Transaction {
         mut self,
         runtime_functions: &FunctionContext,
     ) -> Result<TransactionCommitOutcome, LixError> {
+        if self.poisoned {
+            let _ = self.storage_transaction.rollback().await;
+            return Err(LixError::new(
+                LixError::CODE_UNKNOWN,
+                "transaction cannot commit after a failed staged plugin detection write",
+            ));
+        }
         let prepared_writes = match self.staged_writes.drain() {
             Ok(prepared_writes) => prepared_writes,
             Err(error) => {
@@ -216,6 +231,7 @@ impl Transaction {
         &mut self,
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
+        self.require_not_poisoned()?;
         require_valid_transaction_write_storage_scopes(&write)?;
         #[cfg(feature = "storage-benches")]
         {
@@ -236,23 +252,76 @@ impl Transaction {
                 .collect(),
             _ => Vec::new(),
         };
-        let write = self.prepare_transaction_write(write).await?;
-        let outcome = self.staged_writes.stage_write(write)?;
-        if !file_data_writes.is_empty() {
+        // MVP plugin detection is byte-write driven. Path-only reconciliation
+        // is intentionally deferred until plugin ownership is persisted instead
+        // of inferred from the current path match.
+        let file_deletes = file_delete_inputs_from_write(&write)?;
+        let mut detected_rows = Vec::new();
+        if !file_data_writes.is_empty() || !file_deletes.is_empty() {
             let plugin_context = Arc::clone(&self.plugin_context);
             let write_ctx = crate::sql2::SqlWriteContext::new(self);
-            let live_state = Arc::new(crate::sql2::WriteContextLiveStateReader::new(
-                write_ctx.clone(),
-            ));
-            let blob_reader = Arc::new(crate::sql2::WriteContextBlobDataReader::new(write_ctx));
-            let mut matches = select_plugins_for_file_data_writes(
-                plugin_context.as_ref(),
-                live_state,
-                blob_reader,
-                &file_data_writes,
-            )
-            .await?;
-            self.file_plugin_matches.append(&mut matches);
+            let live_state: Arc<dyn LiveStateReader> = Arc::new(
+                crate::sql2::WriteContextLiveStateReader::new(write_ctx.clone()),
+            );
+            let blob_reader: Arc<dyn BlobDataReader> =
+                Arc::new(crate::sql2::WriteContextBlobDataReader::new(write_ctx));
+            if !file_data_writes.is_empty() {
+                let mut pending = pending_plugin_detections_for_file_data_writes(
+                    plugin_context.as_ref(),
+                    Arc::clone(&live_state),
+                    Arc::clone(&blob_reader),
+                    &file_data_writes,
+                )
+                .await?;
+                for detection in &pending {
+                    let changes = plugin_context
+                        .detect_changes_with_plugin(
+                            &detection.plugin,
+                            plugin_detect_changes_input(detection),
+                        )
+                        .await?;
+                    detected_rows.extend(plugin_changes_to_transaction_rows(
+                        &detection.plugin,
+                        PluginFileWriteInput {
+                            file_id: detection.file_id.clone(),
+                            path: detection.path.clone(),
+                            version_id: detection.version_id.clone(),
+                            global: detection.global,
+                            untracked: detection.untracked,
+                            data: detection.data.clone(),
+                        },
+                        changes,
+                    )?);
+                }
+                self.pending_plugin_detections.append(&mut pending);
+            }
+            if !file_deletes.is_empty() {
+                detected_rows.extend(
+                    plugin_tombstone_rows_for_file_deletes(
+                        plugin_context.as_ref(),
+                        live_state,
+                        blob_reader,
+                        &file_deletes,
+                    )
+                    .await?,
+                );
+            }
+        }
+        let write = self.prepare_transaction_write(write).await?;
+        let plugin_write = if detected_rows.is_empty() {
+            None
+        } else {
+            Some(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: self.prepare_transaction_rows(detected_rows).await?,
+            })
+        };
+        let outcome = self.staged_writes.stage_write(write)?;
+        if let Some(plugin_write) = plugin_write {
+            if let Err(error) = self.staged_writes.stage_write(plugin_write) {
+                self.poisoned = true;
+                return Err(error);
+            }
         }
         Ok(outcome)
     }
@@ -572,9 +641,19 @@ impl Transaction {
         CommitGraphContext::new().reader(self.storage_transaction.as_mut())
     }
 
+    pub(crate) fn require_not_poisoned(&self) -> Result<(), LixError> {
+        if self.poisoned {
+            return Err(LixError::new(
+                LixError::CODE_UNKNOWN,
+                "transaction cannot continue after a failed staged plugin detection write",
+            ));
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
-    pub(crate) fn file_plugin_matches_for_test(&self) -> &[FilePluginMatch] {
-        &self.file_plugin_matches
+    pub(crate) fn pending_plugin_detections_for_test(&self) -> &[PendingPluginDetection] {
+        &self.pending_plugin_detections
     }
 }
 
@@ -738,26 +817,40 @@ impl SqlWriteExecutionContext for Transaction {
     }
 
     fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
+        self.require_not_poisoned()?;
         Ok(self.visible_schemas.clone())
     }
 
     async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
-        self.binary_cas
+        self.require_not_poisoned()?;
+        let committed = self
+            .binary_cas
             .reader(self.storage_transaction.as_mut())
             .load_bytes_many(hashes)
-            .await
+            .await?
+            .into_vec();
+        let staged = self.staged_writes.staged_file_bytes_by_hash(hashes)?;
+        Ok(BlobBytesBatch::new(
+            committed
+                .into_iter()
+                .zip(staged)
+                .map(|(committed, staged)| committed.or(staged))
+                .collect(),
+        ))
     }
 
     async fn scan_live_state(
         &mut self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        self.require_not_poisoned()?;
         let staged = self.staged_writes.staging_overlay()?;
         let base = self.live_state.reader(self.storage_transaction.as_mut());
         overlay_scan_rows(&base, &staged, request).await
     }
 
     async fn load_version_head(&mut self, version_id: &str) -> Result<Option<String>, LixError> {
+        self.require_not_poisoned()?;
         self.version_ctx
             .ref_reader(self.storage_transaction.as_mut())
             .load_head_commit_id(version_id)
@@ -852,6 +945,38 @@ fn stage_file_data_version_ids(file_data: &[TransactionFileData]) -> BTreeSet<St
         .collect()
 }
 
+fn file_delete_inputs_from_write(
+    write: &TransactionWrite,
+) -> Result<Vec<PluginFileDeleteInput>, LixError> {
+    let rows = match write {
+        TransactionWrite::Rows { rows, .. } => rows,
+        TransactionWrite::RowsWithFileData { rows, .. } => rows,
+        TransactionWrite::AdoptedChanges { .. } => return Ok(Vec::new()),
+    };
+
+    rows.iter()
+        .filter(|row| row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && row.snapshot.is_none())
+        .map(|row| {
+            let entity_id = row
+                .entity_id
+                .as_ref()
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_UNKNOWN,
+                        "lix_file delete tombstone is missing a file id",
+                    )
+                })?
+                .as_single_string_owned()?;
+            Ok(PluginFileDeleteInput {
+                file_id: entity_id,
+                version_id: row.version_id.clone(),
+                global: row.global,
+                untracked: row.untracked,
+            })
+        })
+        .collect()
+}
+
 async fn resolve_active_version_id(
     mode: &SessionMode,
     live_state: &LiveStateContext,
@@ -929,6 +1054,7 @@ async fn load_workspace_version_id(
 mod tests {
     use std::sync::Arc;
 
+    use async_trait::async_trait;
     use serde_json::json;
     use std::io::{Cursor, Write};
     use zip::write::SimpleFileOptions;
@@ -944,6 +1070,46 @@ mod tests {
     use crate::Backend;
     use crate::NullableKeyFilter;
     use crate::GLOBAL_VERSION_ID;
+
+    #[derive(Debug, Clone, Copy)]
+    struct EmptyDetectWasmRuntime;
+
+    #[async_trait]
+    impl crate::wasm::WasmRuntime for EmptyDetectWasmRuntime {
+        async fn init_component(
+            &self,
+            _bytes: Vec<u8>,
+            _limits: crate::wasm::WasmLimits,
+        ) -> Result<Arc<dyn crate::wasm::WasmComponentInstance>, LixError> {
+            Ok(Arc::new(EmptyDetectWasmInstance))
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct EmptyDetectWasmInstance;
+
+    #[async_trait]
+    impl crate::wasm::WasmComponentInstance for EmptyDetectWasmInstance {
+        async fn call(&self, export: &str, _input: &[u8]) -> Result<Vec<u8>, LixError> {
+            match export {
+                "detect-changes" | "api#detect-changes" => Ok(b"[]".to_vec()),
+                _ => Err(LixError::new(
+                    LixError::CODE_UNKNOWN,
+                    format!("unexpected test wasm export: {export}"),
+                )),
+            }
+        }
+    }
+
+    fn empty_detect_wasm_runtime() -> Arc<dyn crate::wasm::WasmRuntime> {
+        Arc::new(EmptyDetectWasmRuntime)
+    }
+
+    fn empty_detect_plugin_context() -> Arc<PluginContext> {
+        Arc::new(PluginContext::new_with_wasm_runtime(
+            empty_detect_wasm_runtime(),
+        ))
+    }
 
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(
@@ -977,7 +1143,7 @@ mod tests {
             Arc::clone(&commit_store),
             Arc::clone(&version_ctx),
             Arc::clone(&catalog_context),
-            Arc::new(PluginContext::new()),
+            empty_detect_plugin_context(),
         )
         .await
         .expect("transaction should open");
@@ -1106,7 +1272,7 @@ mod tests {
         let commit_store = Arc::new(CommitStoreContext::new());
         let version_ctx = Arc::new(VersionContext::new(Arc::new(UntrackedStateContext::new())));
         let catalog_context = Arc::new(CatalogContext::new());
-        let plugin_context = Arc::new(PluginContext::new());
+        let plugin_context = empty_detect_plugin_context();
         let opened = open_transaction(
             &SessionMode::Pinned {
                 version_id: "version-a".to_string(),
@@ -1190,12 +1356,12 @@ mod tests {
             .await
             .expect("file write should stage");
 
-        let matches = transaction.file_plugin_matches_for_test();
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].file_id, "file-json");
-        assert_eq!(matches[0].path, "/foo.json");
-        assert_eq!(matches[0].version_id, "version-a");
-        assert_eq!(matches[0].plugin.key, "test_plugin_json");
+        let pending = transaction.pending_plugin_detections_for_test();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].file_id, "file-json");
+        assert_eq!(pending[0].path, "/foo.json");
+        assert_eq!(pending[0].version_id, "version-a");
+        assert_eq!(pending[0].plugin.key, "test_plugin_json");
     }
 
     #[tokio::test]
@@ -1220,7 +1386,7 @@ mod tests {
             Arc::clone(&commit_store),
             Arc::clone(&version_ctx),
             Arc::clone(&catalog_context),
-            Arc::new(PluginContext::new()),
+            empty_detect_plugin_context(),
         )
         .await
         .expect("transaction should open");
@@ -1524,6 +1690,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn poisoned_transaction_rejects_reads_writes_and_commit() {
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let (
+            _live_state,
+            _binary_cas,
+            _changelog,
+            _version_ctx,
+            runtime_functions,
+            mut transaction,
+        ) = open_test_transaction(&backend).await;
+
+        transaction.poisoned = true;
+
+        transaction
+            .stage_rows(vec![key_value_stage_row("after-poison", "value", false)])
+            .await
+            .expect_err("poisoned transaction must reject writes");
+        crate::sql2::SqlWriteExecutionContext::list_visible_schemas(&transaction)
+            .expect_err("poisoned transaction must reject read planning state");
+        crate::sql2::SqlWriteExecutionContext::scan_live_state(
+            &mut transaction,
+            &LiveStateScanRequest::default(),
+        )
+        .await
+        .expect_err("poisoned transaction must reject live-state reads");
+
+        transaction
+            .commit(&runtime_functions)
+            .await
+            .expect_err("poisoned transaction must reject commit");
+    }
+
     async fn open_test_transaction(
         backend: &Arc<dyn Backend + Send + Sync>,
     ) -> (
@@ -1553,7 +1752,7 @@ mod tests {
             Arc::clone(&commit_store),
             Arc::clone(&version_ctx),
             catalog_context,
-            Arc::new(PluginContext::new()),
+            empty_detect_plugin_context(),
         )
         .await
         .expect("transaction should open");

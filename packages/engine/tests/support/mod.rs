@@ -1,3 +1,4 @@
+pub(crate) mod kv_backend;
 pub mod simulation_test;
 
 #[macro_export]

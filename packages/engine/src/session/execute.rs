@@ -405,6 +405,7 @@ impl SessionTransaction {
     ) -> Result<ExecuteResult, LixError> {
         let kind = sql2::classify_statement(sql)?;
         let transaction = self.transaction_mut()?;
+        transaction.require_not_poisoned()?;
         match kind {
             sql2::SqlStatementKind::Write => execute_transaction_write(transaction, sql, params)
                 .await

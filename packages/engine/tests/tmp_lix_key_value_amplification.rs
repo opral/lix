@@ -10,7 +10,7 @@ use lix_engine::{
 };
 
 #[allow(dead_code)]
-#[path = "support/simulation_test/engine/kv_backend.rs"]
+#[path = "support/kv_backend.rs"]
 mod kv_backend;
 
 use kv_backend::{InMemoryKvBackend, KvMap};

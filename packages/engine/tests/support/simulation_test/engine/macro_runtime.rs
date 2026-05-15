@@ -3,8 +3,9 @@ use std::future::Future;
 use lix_engine::LixError;
 use lix_engine::{Engine, InitReceipt};
 
+use crate::support::kv_backend::{InMemoryKvBackend, KvMap};
+
 use super::expect_same::{SharedExpectSameRun, SharedExpectSameRunGuard, SimulationAssertions};
-use super::kv_backend::{InMemoryKvBackend, KvMap};
 use super::mode::{SimulationMode, SimulationOptions};
 use super::rebuild_tracked_state::deterministic_timestamp_shuffle_for;
 use super::simulation::Simulation;

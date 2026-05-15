@@ -3041,6 +3041,8 @@ dependencies = [
  "tokio",
  "unicode-normalization",
  "uuid",
+ "wasmtime",
+ "wasmtime-wasi",
  "xxhash-rust",
  "zip",
  "zstd",
@@ -3068,7 +3070,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "lix_engine",
+ "serde_json",
  "tokio",
+ "zip",
 ]
 
 [[package]]

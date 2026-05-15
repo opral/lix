@@ -97,12 +97,11 @@ impl DetectStateContextConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StateContextColumn {
     EntityId,
     SchemaKey,
-    SchemaVersion,
     SnapshotContent,
     FileId,
     PluginKey,
@@ -119,7 +118,6 @@ impl StateContextColumn {
         &[
             StateContextColumn::EntityId,
             StateContextColumn::SchemaKey,
-            StateContextColumn::SchemaVersion,
             StateContextColumn::SnapshotContent,
         ]
     }

@@ -2,12 +2,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use lix_engine::wasm::WasmRuntime;
 use lix_engine::{
     Backend, BackendReadTransaction, BackendWriteTransaction, CreateVersionOptions,
     CreateVersionReceipt as CreateVersionResult, Engine, ExecuteResult, LixError,
     MergeVersionOptions, MergeVersionPreview, MergeVersionPreviewOptions,
-    MergeVersionReceipt as MergeVersionResult, SessionContext, SwitchVersionOptions,
-    SwitchVersionReceipt as SwitchVersionResult, Value,
+    MergeVersionReceipt as MergeVersionResult, RegisterPluginOptions, RegisterPluginReceipt,
+    SessionContext, SwitchVersionOptions, SwitchVersionReceipt as SwitchVersionResult, Value,
 };
 
 use crate::in_memory_backend::InMemoryBackend;
@@ -16,6 +17,7 @@ use crate::in_memory_backend::InMemoryBackend;
 #[derive(Default)]
 pub struct OpenLixOptions {
     pub backend: Option<Box<dyn Backend + Send + Sync>>,
+    pub wasm_runtime: Option<Arc<dyn WasmRuntime>>,
 }
 
 /// Workspace-session handle for a Lix repository.
@@ -36,7 +38,7 @@ pub async fn open_lix(options: OpenLixOptions) -> Result<Lix, LixError> {
         .backend
         .unwrap_or_else(|| Box::new(InMemoryBackend::new()));
     let backend = SharedBackend::new(backend);
-    let engine = open_or_initialize_engine(&backend).await?;
+    let engine = open_or_initialize_engine(&backend, options.wasm_runtime).await?;
     let session = engine.open_workspace_session().await?;
     Ok(Lix {
         _engine: engine,
@@ -99,6 +101,13 @@ impl Lix {
         self.session.merge_version_preview(options).await
     }
 
+    pub async fn register_plugin(
+        &self,
+        options: RegisterPluginOptions,
+    ) -> Result<RegisterPluginReceipt, LixError> {
+        self.session.register_plugin(options).await
+    }
+
     pub async fn close(&self) -> Result<(), LixError> {
         self.session.close().await?;
         if !self.backend_closed.swap(true, Ordering::SeqCst) {
@@ -134,14 +143,29 @@ impl LixTransaction {
     }
 }
 
-async fn open_or_initialize_engine(backend: &SharedBackend) -> Result<Engine, LixError> {
-    match Engine::new(Box::new(backend.clone())).await {
+async fn open_or_initialize_engine(
+    backend: &SharedBackend,
+    wasm_runtime: Option<Arc<dyn WasmRuntime>>,
+) -> Result<Engine, LixError> {
+    match open_engine(backend, wasm_runtime.clone()).await {
         Ok(engine) => Ok(engine),
         Err(error) if error.code == "LIX_ERROR_NOT_INITIALIZED" => {
             Engine::initialize(Box::new(backend.clone())).await?;
-            Engine::new(Box::new(backend.clone())).await
+            open_engine(backend, wasm_runtime).await
         }
         Err(error) => Err(error),
+    }
+}
+
+async fn open_engine(
+    backend: &SharedBackend,
+    wasm_runtime: Option<Arc<dyn WasmRuntime>>,
+) -> Result<Engine, LixError> {
+    match wasm_runtime {
+        Some(wasm_runtime) => {
+            Engine::new_with_wasm_runtime(Box::new(backend.clone()), wasm_runtime).await
+        }
+        None => Engine::new(Box::new(backend.clone())).await,
     }
 }
 

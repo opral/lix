@@ -1532,6 +1532,7 @@ fn stage_lix_file_data_write(
         file_id,
         path,
         version_id: context.version_id,
+        global: context.global,
         untracked: context.untracked,
         data,
     });

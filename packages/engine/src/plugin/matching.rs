@@ -71,6 +71,7 @@ mod tests {
             path_glob: path_glob.to_string(),
             content_type,
             entry: "plugin.wasm".to_string(),
+            schema_keys: Vec::new(),
             manifest_json: "{}".to_string(),
             wasm: b"\0asm\x01\0\0\0".to_vec(),
         }

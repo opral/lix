@@ -548,6 +548,7 @@ pub(crate) fn plan_file_path_write(
             file_id,
             path: input.path,
             version_id: input.context.version_id,
+            global: input.context.global,
             untracked: input.context.untracked,
             data,
         });

@@ -14,6 +14,7 @@ use crate::storage::{StorageContext, StorageWriteSet};
 use crate::tracked_state::TrackedStateContext;
 use crate::untracked_state::UntrackedStateContext;
 use crate::version::{VersionContext, VersionRefReader};
+use crate::wasm::{NoopWasmRuntime, WasmRuntime};
 use crate::GLOBAL_VERSION_ID;
 use crate::{Backend, LixError, NullableKeyFilter};
 
@@ -56,6 +57,13 @@ impl Engine {
     /// SessionContext, execution, and transaction overlays are layered below the
     /// instance instead of being hidden behind a legacy boot path.
     pub async fn new(backend: Box<dyn Backend + Send + Sync>) -> Result<Self, LixError> {
+        Self::new_with_wasm_runtime(backend, Arc::new(NoopWasmRuntime)).await
+    }
+
+    pub async fn new_with_wasm_runtime(
+        backend: Box<dyn Backend + Send + Sync>,
+        wasm_runtime: Arc<dyn WasmRuntime>,
+    ) -> Result<Self, LixError> {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::from(backend);
         let storage = StorageContext::new(backend);
 
@@ -83,7 +91,7 @@ impl Engine {
             live_state,
             version_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
-            plugin_context: Arc::new(PluginContext::new()),
+            plugin_context: Arc::new(PluginContext::new_with_wasm_runtime(wasm_runtime)),
         })
     }
 

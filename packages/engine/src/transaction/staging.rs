@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
+use crate::binary_cas::BlobHash;
 use crate::catalog::SchemaPlanId;
 use crate::domain::{Domain, DomainRowIdentity};
 use crate::entity_identity::EntityIdentity;
@@ -402,6 +403,28 @@ impl TransactionWriteBuffer {
         Ok(guard
             .get(version_id)
             .map(|members| members.commit_id.clone()))
+    }
+
+    pub(crate) fn staged_file_bytes_by_hash(
+        &self,
+        hashes: &[BlobHash],
+    ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
+        let file_data_guard = self.file_data_writes.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged file data lock",
+            )
+        })?;
+        Ok(hashes
+            .iter()
+            .map(|hash| {
+                file_data_guard
+                    .iter()
+                    .rev()
+                    .find(|write| BlobHash::from_content(&write.data) == *hash)
+                    .map(|write| write.data.clone())
+            })
+            .collect())
     }
 
     /// Stages a commit for `version_id` even if no tracked state rows changed.
@@ -1297,6 +1320,7 @@ mod tests {
                     file_id: "file-readme".to_string(),
                     path: "/README.md".to_string(),
                     version_id: "global".to_string(),
+                    global: true,
                     untracked: true,
                     data: b"hello".to_vec(),
                 }],

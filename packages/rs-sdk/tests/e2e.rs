@@ -99,6 +99,7 @@ async fn rs_sdk_close_is_idempotent_and_rejects_later_operations() {
     let close_count = backend.close_count();
     let lix = open_lix(OpenLixOptions {
         backend: Some(Box::new(backend)),
+        ..OpenLixOptions::default()
     })
     .await
     .unwrap();
@@ -131,6 +132,7 @@ async fn rs_sdk_close_does_not_destroy_committed_data() {
     let backend = SharedTestBackend::new();
     let first = open_lix(OpenLixOptions {
         backend: Some(Box::new(backend.clone())),
+        ..OpenLixOptions::default()
     })
     .await
     .unwrap();
@@ -155,6 +157,7 @@ async fn rs_sdk_close_does_not_destroy_committed_data() {
 
     let second = open_lix(OpenLixOptions {
         backend: Some(Box::new(backend)),
+        ..OpenLixOptions::default()
     })
     .await
     .unwrap();
@@ -179,6 +182,7 @@ async fn failed_write_validation_does_not_poison_backend_transaction() {
     let rollback_count = backend.rollback_count();
     let lix = open_lix(OpenLixOptions {
         backend: Some(Box::new(backend)),
+        ..OpenLixOptions::default()
     })
     .await
     .unwrap();

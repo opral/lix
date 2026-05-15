@@ -129,7 +129,7 @@ mod tests {
 
     struct NoopComponent;
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl WasmRuntime for CountingRuntime {
         async fn init_component(
             &self,
@@ -141,7 +141,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl WasmComponentInstance for NoopComponent {
         async fn call(&self, _export: &str, _input: &[u8]) -> Result<Vec<u8>, LixError> {
             Ok(Vec::new())
@@ -162,6 +162,7 @@ mod tests {
             path_glob: "*.json".to_string(),
             content_type: None,
             entry: "plugin.wasm".to_string(),
+            schema_keys: Vec::new(),
             manifest_json: "{}".to_string(),
             wasm: vec![1],
         };

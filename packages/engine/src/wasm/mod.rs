@@ -21,7 +21,7 @@ impl Default for WasmLimits {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 pub trait WasmRuntime: Send + Sync {
     async fn init_component(
         &self,
@@ -30,7 +30,7 @@ pub trait WasmRuntime: Send + Sync {
     ) -> Result<Arc<dyn WasmComponentInstance>, LixError>;
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 pub trait WasmComponentInstance: Send + Sync {
     async fn call(&self, export: &str, input: &[u8]) -> Result<Vec<u8>, LixError>;
 
@@ -42,7 +42,7 @@ pub trait WasmComponentInstance: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopWasmRuntime;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl WasmRuntime for NoopWasmRuntime {
     async fn init_component(
         &self,

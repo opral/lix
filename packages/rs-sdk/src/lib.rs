@@ -8,6 +8,7 @@ mod in_memory_backend;
 mod lix;
 
 pub use lix::{open_lix, Lix, LixTransaction, OpenLixOptions};
+pub use lix_engine::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
 pub use lix_engine::{
     Backend, BackendKvEntryPage, BackendKvExistsBatch, BackendKvExistsGroup, BackendKvGetGroup,
     BackendKvGetRequest, BackendKvKeyPage, BackendKvScanRange, BackendKvScanRequest,
@@ -17,6 +18,6 @@ pub use lix_engine::{
     ExecuteResult, LixError, LixNotice, MergeChangeStats, MergeConflict, MergeConflictChangeKind,
     MergeConflictKind, MergeConflictSide, MergeVersionOptions, MergeVersionOutcome,
     MergeVersionPreview, MergeVersionPreviewOptions, MergeVersionReceipt as MergeVersionResult,
-    Row, SqlQueryResult, SwitchVersionOptions, SwitchVersionReceipt as SwitchVersionResult,
-    TryFromValue, Value,
+    RegisterPluginOptions, RegisterPluginReceipt, Row, SqlQueryResult, SwitchVersionOptions,
+    SwitchVersionReceipt as SwitchVersionResult, TryFromValue, Value,
 };

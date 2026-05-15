@@ -13,7 +13,7 @@ use lix_engine::{
 pub(crate) type KvKey = (String, Vec<u8>);
 pub(crate) type KvMap = BTreeMap<KvKey, Vec<u8>>;
 
-/// KV-only backend used by simulation tests.
+/// KV-only backend used by engine integration tests.
 #[derive(Clone, Default)]
 pub(crate) struct InMemoryKvBackend {
     data: Arc<Mutex<KvMap>>,

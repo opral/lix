@@ -82,5 +82,9 @@ tokio = { version = "1", features = ["rt", "macros", "sync"] }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zstd = "0.13"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+wasmtime = { version = "30", features = ["component-model"] }
+wasmtime-wasi = "30"
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ruzstd = { version = "0.8", default-features = false, features = ["std"] }

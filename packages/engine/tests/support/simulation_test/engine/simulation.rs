@@ -6,9 +6,9 @@ use lix_engine::{
 };
 
 use super::expect_same::SimulationAssertions;
-use super::kv_backend::InMemoryKvBackend;
 use super::mode::{SimulationMode, SimulationOptions};
 use super::rebuild_tracked_state::RebuildTrackedStateSimulation;
+use crate::support::kv_backend::{InMemoryKvBackend, KvMap};
 
 /// Per-mode handle exposed to tests using `simulation_test!`.
 #[derive(Clone)]
@@ -27,7 +27,7 @@ impl Simulation {
     pub(super) async fn from_bootstrap(
         mode: SimulationMode,
         options: SimulationOptions,
-        snapshot: super::kv_backend::KvMap,
+        snapshot: KvMap,
         receipt: InitReceipt,
         assertions: SimulationAssertions,
     ) -> Result<Self, LixError> {
