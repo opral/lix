@@ -14,6 +14,7 @@ use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::live_state::{
     LiveStateContext, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
 };
+use crate::plugin::{PluginContext, PLUGIN_STORAGE_ROOT_DIRECTORY_PATH};
 use crate::session::{SessionMode, WORKSPACE_VERSION_KEY};
 use crate::sql2::SqlWriteExecutionContext;
 use crate::storage::{StorageContext, StorageWriteSet, StorageWriteTransaction};
@@ -24,6 +25,7 @@ use crate::transaction::normalization::{
     normalize_transaction_write_row, remember_pending_registered_schema,
     NormalizedTransactionWriteRow, REGISTERED_SCHEMA_KEY,
 };
+use crate::transaction::plugin_logic::{select_plugins_for_file_data_writes, FilePluginMatch};
 use crate::transaction::prepare_version_ref_row;
 use crate::transaction::schema_resolver::TransactionSchemaResolver;
 use crate::transaction::staging::{PreparedWriteSet, TransactionWriteBuffer};
@@ -58,8 +60,10 @@ pub(crate) struct Transaction {
     binary_cas: Arc<BinaryCasContext>,
     commit_store: Arc<CommitStoreContext>,
     version_ctx: Arc<VersionContext>,
+    plugin_context: Arc<PluginContext>,
     schema_resolver: TransactionSchemaResolver,
     staged_writes: Arc<TransactionWriteBuffer>,
+    file_plugin_matches: Vec<FilePluginMatch>,
     storage_transaction: Box<dyn StorageWriteTransaction + Send + Sync + 'static>,
     visible_schemas: Vec<JsonValue>,
     functions: FunctionProviderHandle,
@@ -77,6 +81,7 @@ impl Transaction {
         commit_store: Arc<CommitStoreContext>,
         version_ctx: Arc<VersionContext>,
         catalog_context: Arc<CatalogContext>,
+        plugin_context: Arc<PluginContext>,
     ) -> Result<OpenTransaction, LixError> {
         let mut storage_transaction = storage.begin_write_transaction().await?;
         let setup_result = async {
@@ -138,8 +143,10 @@ impl Transaction {
                 binary_cas,
                 commit_store,
                 version_ctx,
+                plugin_context,
                 schema_resolver,
                 staged_writes,
+                file_plugin_matches: Vec::new(),
                 storage_transaction,
                 visible_schemas,
                 functions,
@@ -221,8 +228,33 @@ impl Transaction {
         }
         self.require_existing_transaction_write_version_ids(&write)
             .await?;
+        let file_data_writes = match &write {
+            TransactionWrite::RowsWithFileData { file_data, .. } => file_data
+                .iter()
+                .filter(|write| !write.path.starts_with(PLUGIN_STORAGE_ROOT_DIRECTORY_PATH))
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        };
         let write = self.prepare_transaction_write(write).await?;
-        self.staged_writes.stage_write(write)
+        let outcome = self.staged_writes.stage_write(write)?;
+        if !file_data_writes.is_empty() {
+            let plugin_context = Arc::clone(&self.plugin_context);
+            let write_ctx = crate::sql2::SqlWriteContext::new(self);
+            let live_state = Arc::new(crate::sql2::WriteContextLiveStateReader::new(
+                write_ctx.clone(),
+            ));
+            let blob_reader = Arc::new(crate::sql2::WriteContextBlobDataReader::new(write_ctx));
+            let mut matches = select_plugins_for_file_data_writes(
+                plugin_context.as_ref(),
+                live_state,
+                blob_reader,
+                &file_data_writes,
+            )
+            .await?;
+            self.file_plugin_matches.append(&mut matches);
+        }
+        Ok(outcome)
     }
 
     async fn prepare_transaction_write(
@@ -539,6 +571,11 @@ impl Transaction {
     ) -> CommitGraphStoreReader<&mut dyn StorageWriteTransaction> {
         CommitGraphContext::new().reader(self.storage_transaction.as_mut())
     }
+
+    #[cfg(test)]
+    pub(crate) fn file_plugin_matches_for_test(&self) -> &[FilePluginMatch] {
+        &self.file_plugin_matches
+    }
 }
 
 fn prepare_state_row(
@@ -674,6 +711,7 @@ pub(crate) async fn open_transaction(
     commit_store: Arc<CommitStoreContext>,
     version_ctx: Arc<VersionContext>,
     catalog_context: Arc<CatalogContext>,
+    plugin_context: Arc<PluginContext>,
 ) -> Result<OpenTransaction, LixError> {
     Transaction::open(
         mode,
@@ -684,6 +722,7 @@ pub(crate) async fn open_transaction(
         commit_store,
         version_ctx,
         catalog_context,
+        plugin_context,
     )
     .await
 }
@@ -891,6 +930,9 @@ mod tests {
     use std::sync::Arc;
 
     use serde_json::json;
+    use std::io::{Cursor, Write};
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
 
     use super::*;
     use crate::backend::testing::UnitTestBackend;
@@ -935,6 +977,7 @@ mod tests {
             Arc::clone(&commit_store),
             Arc::clone(&version_ctx),
             Arc::clone(&catalog_context),
+            Arc::new(PluginContext::new()),
         )
         .await
         .expect("transaction should open");
@@ -1053,6 +1096,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_data_write_selects_active_version_tracked_local_plugin() {
+        let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
+        let storage = StorageContext::new(Arc::clone(&backend));
+        let live_state = Arc::new(live_state_context());
+        seed_visible_schema_rows(storage.clone()).await;
+        seed_version_head(storage.clone(), "version-a", SCHEMA_FIXTURE_COMMIT_ID).await;
+        let binary_cas = Arc::new(BinaryCasContext::new());
+        let commit_store = Arc::new(CommitStoreContext::new());
+        let version_ctx = Arc::new(VersionContext::new(Arc::new(UntrackedStateContext::new())));
+        let catalog_context = Arc::new(CatalogContext::new());
+        let plugin_context = Arc::new(PluginContext::new());
+        let opened = open_transaction(
+            &SessionMode::Pinned {
+                version_id: "version-a".to_string(),
+            },
+            storage.clone(),
+            Arc::clone(&live_state),
+            Arc::new(crate::tracked_state::TrackedStateContext::new()),
+            Arc::clone(&binary_cas),
+            Arc::clone(&commit_store),
+            Arc::clone(&version_ctx),
+            Arc::clone(&catalog_context),
+            Arc::clone(&plugin_context),
+        )
+        .await
+        .expect("transaction should open");
+        let mut transaction = opened.transaction;
+        let runtime_functions = opened.runtime_functions;
+
+        plugin_context
+            .register_plugin(
+                &mut transaction,
+                crate::session::RegisterPluginOptions {
+                    bytes: test_plugin_archive("test_plugin_json"),
+                },
+            )
+            .await
+            .expect("plugin should install in the active version");
+        transaction
+            .commit(&runtime_functions)
+            .await
+            .expect("plugin install should commit");
+
+        let opened = open_transaction(
+            &SessionMode::Pinned {
+                version_id: "version-a".to_string(),
+            },
+            storage.clone(),
+            Arc::clone(&live_state),
+            Arc::new(crate::tracked_state::TrackedStateContext::new()),
+            Arc::clone(&binary_cas),
+            Arc::clone(&commit_store),
+            Arc::clone(&version_ctx),
+            Arc::clone(&catalog_context),
+            Arc::clone(&plugin_context),
+        )
+        .await
+        .expect("file write transaction should open");
+        let mut transaction = opened.transaction;
+
+        let mut resolver = crate::sql2::filesystem_planner::DirectoryPathResolver::from_existing(
+            std::iter::empty(),
+        )
+        .expect("empty filesystem resolver should build");
+        let mut generate_directory_id = || transaction.functions().call_uuid_v7();
+        let plan = crate::sql2::filesystem_planner::plan_file_path_write(
+            &mut resolver,
+            crate::sql2::filesystem_planner::FilePathWriteInput {
+                id: Some("file-json".to_string()),
+                path: "/foo.json".to_string(),
+                data: Some(br#"{"hello":"world"}"#.to_vec()),
+                hidden: Some(false),
+                context: crate::sql2::filesystem_planner::FilesystemRowContext {
+                    version_id: "version-a".to_string(),
+                    global: false,
+                    untracked: false,
+                    file_id: None,
+                    metadata: None,
+                },
+            },
+            &mut generate_directory_id,
+        )
+        .expect("file write should plan");
+
+        transaction
+            .stage_write(TransactionWrite::RowsWithFileData {
+                mode: TransactionWriteMode::Insert,
+                rows: plan.rows,
+                file_data: plan.file_data,
+                count: plan.count,
+            })
+            .await
+            .expect("file write should stage");
+
+        let matches = transaction.file_plugin_matches_for_test();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].file_id, "file-json");
+        assert_eq!(matches[0].path, "/foo.json");
+        assert_eq!(matches[0].version_id, "version-a");
+        assert_eq!(matches[0].plugin.key, "test_plugin_json");
+    }
+
+    #[tokio::test]
     async fn commit_validates_staged_rows_before_persistence() {
         let backend: Arc<dyn Backend + Send + Sync> = Arc::new(UnitTestBackend::new());
         let storage = StorageContext::new(Arc::clone(&backend));
@@ -1074,6 +1220,7 @@ mod tests {
             Arc::clone(&commit_store),
             Arc::clone(&version_ctx),
             Arc::clone(&catalog_context),
+            Arc::new(PluginContext::new()),
         )
         .await
         .expect("transaction should open");
@@ -1406,6 +1553,7 @@ mod tests {
             Arc::clone(&commit_store),
             Arc::clone(&version_ctx),
             catalog_context,
+            Arc::new(PluginContext::new()),
         )
         .await
         .expect("transaction should open");
@@ -1476,6 +1624,78 @@ mod tests {
             .commit()
             .await
             .expect("schema fixture transaction should commit");
+    }
+
+    async fn seed_version_head(storage: StorageContext, version_id: &str, commit_id: &str) {
+        let version_ref_row =
+            prepare_version_ref_row(version_id, commit_id, "1970-01-01T00:00:00.000Z")
+                .expect("version ref should stage");
+        let mut writes = StorageWriteSet::new();
+        crate::untracked_state::UntrackedStateContext::new()
+            .writer(&mut writes)
+            .stage_rows([version_ref_row.row.as_ref()])
+            .expect("version ref should stage");
+        let mut storage_transaction = storage
+            .begin_write_transaction()
+            .await
+            .expect("version ref transaction should open");
+        writes
+            .apply(&mut storage_transaction.as_mut())
+            .await
+            .expect("version ref should apply");
+        storage_transaction
+            .commit()
+            .await
+            .expect("version ref transaction should commit");
+    }
+
+    fn test_plugin_archive(plugin_key: &str) -> Vec<u8> {
+        let mut buffer = Cursor::new(Vec::new());
+        {
+            let mut zip = ZipWriter::new(&mut buffer);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zip.start_file("manifest.json", options)
+                .expect("manifest entry should start");
+            zip.write_all(test_plugin_manifest(plugin_key).to_string().as_bytes())
+                .expect("manifest should write");
+            zip.start_file("plugin.wasm", options)
+                .expect("wasm entry should start");
+            zip.write_all(b"\0asm\x01\0\0\0")
+                .expect("wasm should write");
+            zip.start_file("schema/test_json_entity.json", options)
+                .expect("schema entry should start");
+            zip.write_all(test_json_entity_schema().to_string().as_bytes())
+                .expect("schema should write");
+            zip.finish().expect("zip should finish");
+        }
+        buffer.into_inner()
+    }
+
+    fn test_plugin_manifest(plugin_key: &str) -> serde_json::Value {
+        json!({
+            "key": plugin_key,
+            "runtime": "wasm-component-v1",
+            "api_version": "0.1.0",
+            "match": { "path_glob": "*.json", "content_type": "text" },
+            "entry": "plugin.wasm",
+            "schemas": ["schema/test_json_entity.json"]
+        })
+    }
+
+    fn test_json_entity_schema() -> serde_json::Value {
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "test_json_entity",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        })
     }
 
     async fn assert_no_persistence_after_validation_failure(

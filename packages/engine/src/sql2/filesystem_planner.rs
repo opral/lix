@@ -546,6 +546,7 @@ pub(crate) fn plan_file_path_write(
         })?);
         file_data.push(TransactionFileData {
             file_id,
+            path: input.path,
             version_id: input.context.version_id,
             untracked: input.context.untracked,
             data,

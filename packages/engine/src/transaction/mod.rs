@@ -2,6 +2,7 @@ mod commit;
 mod context;
 mod live_state_overlay;
 mod normalization;
+mod plugin_logic;
 mod prep;
 mod schema_resolver;
 mod staging;

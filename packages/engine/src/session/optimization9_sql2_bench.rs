@@ -35,6 +35,7 @@ pub async fn plan_write_only(session: &SessionContext, sql: &str) -> Result<(), 
         std::sync::Arc::clone(&session.commit_store),
         std::sync::Arc::clone(&session.version_ctx),
         std::sync::Arc::clone(&session.catalog_context),
+        std::sync::Arc::clone(&session.plugin_context),
     )
     .await?;
     let mut transaction = opened.transaction;

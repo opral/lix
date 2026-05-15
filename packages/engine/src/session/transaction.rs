@@ -26,6 +26,7 @@ impl SessionContext {
             Arc::clone(&self.commit_store),
             Arc::clone(&self.version_ctx),
             Arc::clone(&self.catalog_context),
+            Arc::clone(&self.plugin_context),
         )
         .await
         {

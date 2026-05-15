@@ -1295,6 +1295,7 @@ mod tests {
                 rows: vec![state_row("file-readme", "descriptor")],
                 file_data: vec![TransactionFileData {
                     file_id: "file-readme".to_string(),
+                    path: "/README.md".to_string(),
                     version_id: "global".to_string(),
                     untracked: true,
                     data: b"hello".to_vec(),

@@ -1225,7 +1225,8 @@ fn lix_file_existing_update_stage_from_batch(
 
         if include_data_writes {
             let data = update_required_binary_value(batch, assignment_values, row_index, "data")?;
-            stage_lix_file_data_write(&mut staged, id, data, context, None)?;
+            let path = required_string_value(batch, row_index, "path")?;
+            stage_lix_file_data_write(&mut staged, id, path, data, context, None)?;
         }
 
         staged.count = staged
@@ -1342,7 +1343,7 @@ fn lix_file_path_update_stage_from_batch(
         let plan = plan_file_path_update(
             resolver,
             id.clone(),
-            path,
+            path.clone(),
             hidden,
             None,
             context.clone(),
@@ -1352,7 +1353,7 @@ fn lix_file_path_update_stage_from_batch(
         staged.extend_filesystem_plan(plan);
 
         if let Some(data) = assigned_data {
-            stage_lix_file_data_write(&mut staged, id, data, context, None)?;
+            stage_lix_file_data_write(&mut staged, id, path, data, context, None)?;
         }
     }
 
@@ -1492,7 +1493,11 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 
         if let (Some(id), Some(data)) = (id, data) {
             let origin = Some(lix_file_insert_origin(surface_name, &id));
-            stage_lix_file_data_write(&mut staged, id, data, context, origin)?;
+            let path = match directory_id.as_ref() {
+                None => format!("/{name}"),
+                Some(_) => name.clone(),
+            };
+            stage_lix_file_data_write(&mut staged, id, path, data, context, origin)?;
         }
         staged.count = staged
             .count
@@ -1506,6 +1511,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 fn stage_lix_file_data_write(
     staged: &mut LixFileStagedBatch,
     file_id: String,
+    path: String,
     data: Vec<u8>,
     context: FilesystemRowContext,
     origin: Option<TransactionWriteOrigin>,
@@ -1524,6 +1530,7 @@ fn stage_lix_file_data_write(
     staged.state_rows.push(row);
     staged.file_data_writes.push(TransactionFileData {
         file_id,
+        path,
         version_id: context.version_id,
         untracked: context.untracked,
         data,

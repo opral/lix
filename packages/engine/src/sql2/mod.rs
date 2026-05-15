@@ -36,8 +36,8 @@ pub(crate) use classify::{
 };
 pub(crate) use context::{
     CommitStoreQuerySource, SqlCommitStoreQuerySource, SqlExecutionContext, SqlJsonReader,
-    SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextLiveStateReader,
-    WriteContextVersionRefReader,
+    SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextBlobDataReader,
+    WriteContextLiveStateReader, WriteContextVersionRefReader,
 };
 #[allow(unused_imports)]
 pub(crate) use execute::{

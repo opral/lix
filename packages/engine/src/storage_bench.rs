@@ -11,6 +11,7 @@ use crate::json_store::types::{
     JsonRef, JsonWritePlacementRef, NormalizedJsonRef,
 };
 use crate::live_state::LiveStateContext;
+use crate::plugin::PluginContext;
 use crate::session::SessionMode;
 use crate::storage::{
     KvGetGroup, KvGetRequest, KvScanRange, KvScanRequest, KvWriteBatch, StorageContext,
@@ -170,6 +171,7 @@ pub struct TransactionBenchFixture {
     commit_store: Arc<CommitStoreContext>,
     version_ctx: Arc<VersionContext>,
     catalog_context: Arc<CatalogContext>,
+    plugin_context: Arc<PluginContext>,
     rows: Vec<TransactionWriteRow>,
 }
 
@@ -407,6 +409,7 @@ pub async fn transaction_commit_prepared(
         Arc::clone(&fixture.commit_store),
         Arc::clone(&fixture.version_ctx),
         Arc::clone(&fixture.catalog_context),
+        Arc::clone(&fixture.plugin_context),
     )
     .await?;
     let mut transaction = opened.transaction;
@@ -443,6 +446,7 @@ pub async fn transaction_open_empty_prepared(
         Arc::clone(&fixture.commit_store),
         Arc::clone(&fixture.version_ctx),
         Arc::clone(&fixture.catalog_context),
+        Arc::clone(&fixture.plugin_context),
     )
     .await?;
     let elapsed = started_at.elapsed();
@@ -468,6 +472,7 @@ pub async fn transaction_stage_only_prepared(
         Arc::clone(&fixture.commit_store),
         Arc::clone(&fixture.version_ctx),
         Arc::clone(&fixture.catalog_context),
+        Arc::clone(&fixture.plugin_context),
     )
     .await?;
     let mut transaction = opened.transaction;
@@ -503,6 +508,7 @@ pub async fn prepare_transaction_commit_only(
         Arc::clone(&fixture.commit_store),
         Arc::clone(&fixture.version_ctx),
         Arc::clone(&fixture.catalog_context),
+        Arc::clone(&fixture.plugin_context),
     )
     .await?;
     let mut transaction = opened.transaction;
@@ -577,6 +583,7 @@ async fn prepare_transaction_fixture(
     let binary_cas = Arc::new(BinaryCasContext::new());
     let version_ctx = Arc::new(VersionContext::new(untracked_state));
     let catalog_context = Arc::new(CatalogContext::new());
+    let plugin_context = Arc::new(PluginContext::new());
     seed_transaction_visible_schema_rows(storage.clone()).await?;
     Ok(TransactionBenchFixture {
         storage,
@@ -586,6 +593,7 @@ async fn prepare_transaction_fixture(
         commit_store,
         version_ctx,
         catalog_context,
+        plugin_context,
         rows,
     })
 }
