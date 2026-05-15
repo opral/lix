@@ -9,7 +9,6 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::sql2::parse::parse_statement;
-use crate::sql2::plan::LogicalWritePlan;
 use crate::{LixError, LixNotice, SqlQueryResult, Value};
 
 use crate::sql2::predicate_typecheck::validate_json_predicate_expr_with_dfschema;
@@ -20,38 +19,20 @@ use crate::sql2::session::{build_read_session, build_write_session};
 use crate::sql2::write_normalization::lix_file_data_type_lix_error;
 use crate::sql2::{SqlExecutionContext, SqlStatementKind, SqlWriteExecutionContext};
 
-#[allow(dead_code)]
-pub(crate) enum SqlLogicalPlan {
-    DataFusion(SqlDataFusionLogicalPlan),
-    Write(SqlWriteLogicalPlan),
-}
+use super::{SqlDataFusionLogicalPlan, SqlLogicalPlan};
 
 #[allow(dead_code)]
-pub(crate) struct SqlDataFusionLogicalPlan {
-    session: SessionContext,
-    plan: LogicalPlan,
-    kind: SqlStatementKind,
-    notices: Vec<LixNotice>,
-    strict_binary_params: BTreeSet<usize>,
+pub(crate) struct DataFusionLogicalPlan {
+    pub(super) session: SessionContext,
+    pub(super) plan: LogicalPlan,
+    pub(super) kind: SqlStatementKind,
+    pub(super) notices: Vec<LixNotice>,
+    pub(super) strict_binary_params: BTreeSet<usize>,
 }
 
-#[allow(dead_code)]
-pub(crate) struct SqlWriteLogicalPlan {
-    pub(super) plan: LogicalWritePlan,
-}
-
-impl SqlLogicalPlan {
-    #[allow(dead_code)]
+impl DataFusionLogicalPlan {
     pub(crate) fn kind(&self) -> SqlStatementKind {
-        match self {
-            Self::DataFusion(plan) => plan.kind,
-            Self::Write(_) => SqlStatementKind::Write,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn is_write(&self) -> bool {
-        self.kind() == SqlStatementKind::Write
+        self.kind
     }
 }
 
@@ -112,33 +93,6 @@ pub(crate) async fn create_logical_plan_from_parsed(
 }
 
 #[allow(dead_code)]
-pub(crate) async fn create_write_logical_plan(
-    ctx: &mut dyn SqlWriteExecutionContext,
-    sql: &str,
-) -> Result<SqlLogicalPlan, LixError> {
-    let statement = parse_statement(sql)?;
-    create_write_logical_plan_from_parsed(ctx, statement).await
-}
-
-pub(crate) async fn create_write_logical_plan_from_parsed(
-    ctx: &mut dyn SqlWriteExecutionContext,
-    statement: DataFusionStatement,
-) -> Result<SqlLogicalPlan, LixError> {
-    let visible_schemas = ctx.list_visible_schemas()?;
-    let bound_statement =
-        crate::sql2::bind_statement(&statement, &visible_schemas, ctx.active_version_id())?;
-    let crate::sql2::BoundStatement::Write(bound_write) = bound_statement else {
-        return Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "expected SQL write statement after binding",
-        ));
-    };
-    let logical_write = crate::sql2::plan_write(bound_write)?;
-    Ok(SqlLogicalPlan::Write(SqlWriteLogicalPlan {
-        plan: logical_write,
-    }))
-}
-
 pub(crate) async fn create_transaction_read_logical_plan_from_parsed(
     ctx: &mut dyn SqlWriteExecutionContext,
     sql: &str,
@@ -644,10 +598,8 @@ mod tests {
     use serde_json::json;
     use serde_json::Value as JsonValue;
 
-    use super::{
-        create_write_logical_plan, execute_logical_plan, execute_sql, SqlExecutionContext,
-        SqlWriteExecutionContext,
-    };
+    use super::{execute_logical_plan, execute_sql, SqlExecutionContext, SqlWriteExecutionContext};
+    use crate::sql2::create_write_logical_plan;
     use crate::binary_cas::BlobDataReader;
     use crate::commit_graph::{
         CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
