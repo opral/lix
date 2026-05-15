@@ -815,11 +815,11 @@ cargo bench -p lix_engine --features storage-benches --bench storage_v2 write_se
 
 Representative hash scorecard:
 
-| Case                                  |      std |    ahash |  rustc_fx |     xxh3 |    blake3 |
-| ------------------------------------- | -------: | -------: | --------: | -------: | --------: |
-| `point_reconstruct_m10000_u100`       | 248.83us | 127.43us |  129.76us | 252.03us | 1.3980 ms |
-| `point_reconstruct_m1000_u1000`       | 47.209us | 26.844us |  29.718us | 48.829us | 219.53 us |
-| `write_validate_k1024`                | 19.233us | 9.6647us |  11.169us | 20.832us | 79.382 us |
+| Case                            |      std |    ahash | rustc_fx |     xxh3 |    blake3 |
+| ------------------------------- | -------: | -------: | -------: | -------: | --------: |
+| `point_reconstruct_m10000_u100` | 248.83us | 127.43us | 129.76us | 252.03us | 1.3980 ms |
+| `point_reconstruct_m1000_u1000` | 47.209us | 26.844us | 29.718us | 48.829us | 219.53 us |
+| `write_validate_k1024`          | 19.233us | 9.6647us | 11.169us | 20.832us | 79.382 us |
 
 Complexity impact:
 
@@ -874,14 +874,14 @@ cargo bench -p lix_engine --features storage-benches --bench storage_v2 conforma
 
 Point-read scorecard:
 
-| Case                   |       Mean | Criterion Change |
-| ---------------------- | ---------: | ---------------: |
-| `m100_u100`            |  3.1521 us |    5.190% faster |
-| `m1000_u1000`          |  33.029 us |    8.943% faster |
-| `m1000_u100`           |  12.905 us |   20.518% faster |
-| `m10000_u100`          |  102.99 us |   26.439% faster |
-| `m1000_u100_missing10` |  12.476 us |   18.951% faster |
-| `m1000_u100_missing90` |  9.0254 us |   11.695% faster |
+| Case                   |      Mean | Criterion Change |
+| ---------------------- | --------: | ---------------: |
+| `m100_u100`            | 3.1521 us |    5.190% faster |
+| `m1000_u1000`          | 33.029 us |    8.943% faster |
+| `m1000_u100`           | 12.905 us |   20.518% faster |
+| `m10000_u100`          | 102.99 us |   26.439% faster |
+| `m1000_u100_missing10` | 12.476 us |   18.951% faster |
+| `m1000_u100_missing90` | 9.0254 us |   11.695% faster |
 
 Conformance backend scorecard:
 
@@ -942,18 +942,18 @@ cargo bench -p lix_engine --features storage-benches --bench storage_v2 write_se
 
 Write-set scorecard:
 
-| Case                       |       Mean | Criterion Change |
-| -------------------------- | ---------: | ---------------: |
-| `puts_k128_g1_v32`         |  1.1258 us |   36.387% faster |
-| `puts_k1024_g1_v32`        |  9.4771 us |   44.458% faster |
-| `puts_k1024_g16_v32`       |  9.6148 us |   49.473% faster |
-| `puts_k8192_g16_v32`       |  113.00 us |   22.387% faster |
-| `puts_k1024_g64_v32`       |  11.432 us |   32.664% faster |
-| `puts_k4096_g256_v32`      |  42.617 us |   36.093% faster |
-| `deletes_k1024_g16`        |  7.4618 us |   41.389% faster |
-| `mixed80_20_k1024_g16_v32` |  14.864 us | no significant change |
-| `puts_k1024_g16_v1024`     |  10.311 us |   30.596% faster |
-| `puts_k1024_g16_v65536`    |  10.289 us |   30.772% faster |
+| Case                       |      Mean |      Criterion Change |
+| -------------------------- | --------: | --------------------: |
+| `puts_k128_g1_v32`         | 1.1258 us |        36.387% faster |
+| `puts_k1024_g1_v32`        | 9.4771 us |        44.458% faster |
+| `puts_k1024_g16_v32`       | 9.6148 us |        49.473% faster |
+| `puts_k8192_g16_v32`       | 113.00 us |        22.387% faster |
+| `puts_k1024_g64_v32`       | 11.432 us |        32.664% faster |
+| `puts_k4096_g256_v32`      | 42.617 us |        36.093% faster |
+| `deletes_k1024_g16`        | 7.4618 us |        41.389% faster |
+| `mixed80_20_k1024_g16_v32` | 14.864 us | no significant change |
+| `puts_k1024_g16_v1024`     | 10.311 us |        30.596% faster |
+| `puts_k1024_g16_v65536`    | 10.289 us |        30.772% faster |
 
 Complexity impact:
 
@@ -964,4 +964,93 @@ The asymptotic shape is unchanged:
 
 The success path no longer clones K keys during validation, so write-set
 lowering is closer to pure hashing plus grouped batch transfer.
+```
+
+### 2026-05-14: Indexed Point Read Results
+
+Change:
+
+```text
+Added an indexed point-read result shape:
+
+  IndexedPointValues {
+    unique_values: Vec<Option<ProjectedValue>>,
+    requested_to_unique: Vec<usize>,
+  }
+
+The existing materialized caller-order values API remains, but now layers over
+the indexed representation by cloning values into caller-order slots only when
+that materialized shape is requested.
+```
+
+Why:
+
+```text
+After index-based reconstruction, duplicate-heavy point reads still cloned the
+same ProjectedValue once per requested caller-order slot. For M=10000/U=100,
+that means materializing 10k value slots even though only 100 unique backend
+values exist.
+
+The indexed shape preserves caller-order semantics while letting domain stores
+that can consume indexes avoid duplicate value clones.
+```
+
+Validation:
+
+```sh
+cargo fmt -p lix_engine
+cargo test -p lix_engine storage_v2 --no-fail-fast
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 --no-run
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 point_read_adapter
+cargo bench -p lix_engine --features storage-benches --bench storage_v2 point_read_indexed_adapter
+```
+
+Materialized point-read scorecard:
+
+| Case                   |      Mean | Criterion Change |
+| ---------------------- | --------: | ---------------: |
+| `m100_u100`            | 2.8788 us |   18.022% faster |
+| `m1000_u1000`          | 31.483 us |   15.404% faster |
+| `m1000_u100`           | 12.353 us |   24.999% faster |
+| `m10000_u100`          | 102.57 us |     within noise |
+| `m1000_u100_missing10` | 11.931 us |    9.077% faster |
+| `m1000_u100_missing90` | 8.5907 us |    7.067% faster |
+
+Indexed point-read scorecard:
+
+| Case                   |      Mean |
+| ---------------------- | --------: |
+| `m100_u100`            | 2.4703 us |
+| `m1000_u1000`          | 26.701 us |
+| `m1000_u100`           | 7.3173 us |
+| `m10000_u100`          | 51.644 us |
+| `m1000_u100_missing10` | 7.1528 us |
+| `m1000_u100_missing90` | 6.1998 us |
+
+Shape comparison:
+
+```text
+m10000/u100 materialized:
+  102.57 us
+
+m10000/u100 indexed:
+  51.644 us
+
+Indexed is about 2x faster for the large duplicate-heavy case because it
+avoids cloning duplicate value slots.
+```
+
+Complexity impact:
+
+```text
+Materialized shape:
+  O(M + U + F) plus cloning one output value per requested slot
+
+Indexed shape:
+  O(M + U + F) with one value slot per unique backend key and integer indexes
+  for caller-order reconstruction
+
+The Big-O is unchanged, but the duplicate-heavy constant factor is much lower
+and the output allocation scales with U values plus M indexes instead of M
+values.
 ```
