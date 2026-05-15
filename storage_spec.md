@@ -403,6 +403,8 @@ backend_v2 get_many reads the unique/requested batch
 storage_v2 reconstructs caller-order slots, duplicate slots, and missing slots
 storage_v2 can return either materialized caller-order values or an indexed
   shape with one value slot per unique key plus requested-slot indexes
+storage_v2 can reuse a PointRequestPlan when the same requested-key shape is
+  read repeatedly
 ```
 
 Target:
@@ -415,6 +417,8 @@ storage reconstruction:
   O(M + U) time
   indexed result: O(U) value slots plus O(M) indexes
   materialized result: O(M) value slots
+  reusable point plan: O(M + U) once to build, then O(U + F) per read plus
+    result index ownership/copy cost
 ```
 
 Prefix reads:
@@ -596,7 +600,8 @@ point batch:
   O(U) backend batch for U unique keys plus O(M + U) caller-order
   reconstruction for M requested keys. Indexed point results avoid cloning
   duplicate value slots; materialized point results clone into M caller-order
-  slots.
+  slots. A reusable point request plan moves dedupe/index construction out of
+  repeated reads with the same key shape.
 
 prefix/range scan:
   O(log_B N + Q) for tree/ordered-backend shaped implementations

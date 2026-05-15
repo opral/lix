@@ -1,4 +1,4 @@
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::HashMap;
 
 use crate::backend_v2::{BackendError, BackendRead, GetOptions, Key, ProjectedValue, SpaceId};
 use crate::storage_v2::{StorageReadResult, StorageReadStats};
@@ -16,6 +16,50 @@ pub struct PointSlot {
 pub struct IndexedPointValues {
     pub unique_values: Vec<Option<ProjectedValue>>,
     pub requested_to_unique: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PointRequestPlan {
+    pub unique_keys: Vec<Key>,
+    pub requested_to_unique: Vec<usize>,
+    unique_index_by_key: HashMap<Key, usize, FastHashBuilder>,
+}
+
+impl PointRequestPlan {
+    pub fn new(keys: &[Key]) -> Self {
+        let mut unique_index_by_key =
+            HashMap::<Key, usize, FastHashBuilder>::with_capacity_and_hasher(
+                keys.len(),
+                FastHashBuilder::with_seeds(0, 0, 0, 0),
+            );
+        let mut unique_keys = Vec::with_capacity(keys.len());
+        let mut requested_to_unique = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(&unique_index) = unique_index_by_key.get(key) {
+                requested_to_unique.push(unique_index);
+                continue;
+            }
+
+            let unique_index = unique_keys.len();
+            unique_index_by_key.insert(key.clone(), unique_index);
+            unique_keys.push(key.clone());
+            requested_to_unique.push(unique_index);
+        }
+
+        Self {
+            unique_keys,
+            requested_to_unique,
+            unique_index_by_key,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.requested_to_unique.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.requested_to_unique.is_empty()
+    }
 }
 
 impl IndexedPointValues {
@@ -124,30 +168,37 @@ pub(crate) fn get_many_indexed_values_caller_order_with_stats<R>(
 where
     R: BackendRead,
 {
-    let mut unique_index_by_key = HashMap::<&Key, usize, FastHashBuilder>::with_capacity_and_hasher(
-        keys.len(),
-        FastHashBuilder::with_seeds(0, 0, 0, 0),
-    );
-    let mut backend_keys = Vec::with_capacity(keys.len());
-    let mut requested_to_unique = Vec::with_capacity(keys.len());
-    for key in keys {
-        let unique_index = backend_keys.len();
-        match unique_index_by_key.entry(key) {
-            Entry::Occupied(entry) => requested_to_unique.push(*entry.get()),
-            Entry::Vacant(entry) => {
-                entry.insert(unique_index);
-                backend_keys.push(key.clone());
-                requested_to_unique.push(unique_index);
-            }
-        }
-    }
+    let plan = PointRequestPlan::new(keys);
+    get_many_indexed_values_for_plan_with_stats(read, space, &plan, opts)
+}
 
-    let result = read.get_many(space, &backend_keys, opts)?;
+pub(crate) fn get_many_indexed_values_for_plan<R>(
+    read: &R,
+    space: SpaceId,
+    plan: &PointRequestPlan,
+    opts: GetOptions<'_>,
+) -> Result<IndexedPointValues, BackendError>
+where
+    R: BackendRead,
+{
+    Ok(get_many_indexed_values_for_plan_with_stats(read, space, plan, opts)?.value)
+}
 
-    let mut unique_values = Vec::with_capacity(backend_keys.len());
-    unique_values.resize_with(backend_keys.len(), || None);
+pub(crate) fn get_many_indexed_values_for_plan_with_stats<R>(
+    read: &R,
+    space: SpaceId,
+    plan: &PointRequestPlan,
+    opts: GetOptions<'_>,
+) -> Result<StorageReadResult<IndexedPointValues>, BackendError>
+where
+    R: BackendRead,
+{
+    let result = read.get_many(space, &plan.unique_keys, opts)?;
+
+    let mut unique_values = Vec::with_capacity(plan.unique_keys.len());
+    unique_values.resize_with(plan.unique_keys.len(), || None);
     for entry in result.entries.entries {
-        if let Some(&unique_index) = unique_index_by_key.get(&entry.key) {
+        if let Some(&unique_index) = plan.unique_index_by_key.get(&entry.key) {
             unique_values[unique_index] = Some(entry.value);
         }
     }
@@ -155,11 +206,11 @@ where
     Ok(StorageReadResult::new(
         IndexedPointValues {
             unique_values,
-            requested_to_unique,
+            requested_to_unique: plan.requested_to_unique.clone(),
         },
         StorageReadStats {
-            requested_keys: keys.len() as u64,
-            unique_backend_keys: backend_keys.len() as u64,
+            requested_keys: plan.requested_to_unique.len() as u64,
+            unique_backend_keys: plan.unique_keys.len() as u64,
             backend_calls: 1,
             prefix_lowered: 0,
         },
